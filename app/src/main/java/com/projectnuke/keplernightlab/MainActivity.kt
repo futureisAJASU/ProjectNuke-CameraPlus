@@ -223,7 +223,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            KeplerNightLabApp()
+            KeplerAppRoot()
         }
     }
 }
@@ -365,6 +365,18 @@ fun KeplerNightLabApp() {
                         }
                     ) {
                         Text("YUV 평균 합성")
+                    }
+
+                    Button(
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = {
+                            rawStatus = "최근 Motion Job 요약 생성 중..."
+                            summarizeLatestYuvMotionJob(context) { status ->
+                                rawStatus = status
+                            }
+                        }
+                    ) {
+                        Text("최근 Job 요약")
                     }
 
                     Button(
@@ -1315,9 +1327,8 @@ fun captureYuvBurstGrayWithMotion(
                             finish(
                                 "YUV Burst + Motion 저장 완료\n" +
                                         "프레임: $savedFrames 장\n" +
-                                        "motionInfo: $motionInfo\n" +
-                                        "gyro samples: ${finalLogger?.gyroCount() ?: 0}\n" +
-                                        "rotation samples: ${finalLogger?.rotationVectorCount() ?: 0}\n" +
+                                        "gyro samples: $finalGyroCount\n" +
+                                        "rotation samples: $finalRotationCount\n" +
                                         "job.json / gyro.csv / rotation_vector.csv 생성 시도 완료\n" +
                                         "폴더:\n${burstDir.absolutePath}"
                             )
@@ -1547,6 +1558,200 @@ fun averageLatestYuvBurstGray(
         }
     }
 }
+
+fun summarizeLatestYuvMotionJob(
+    context: Context,
+    onStatus: (String) -> Unit
+) {
+    val mainHandler = Handler(Looper.getMainLooper())
+
+    fun postStatus(message: String) {
+        mainHandler.post {
+            onStatus(message)
+        }
+    }
+
+    val workerThread = HandlerThread("KeplerMotionSummaryThread").apply { start() }
+    val workerHandler = Handler(workerThread.looper)
+
+    workerHandler.post {
+        try {
+            val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+
+            if (picturesDir == null) {
+                postStatus("Pictures 폴더를 찾지 못함")
+                workerThread.quitSafely()
+                return@post
+            }
+
+            val yuvRoot = File(picturesDir, "KeplerYuvBurst")
+
+            if (!yuvRoot.exists()) {
+                postStatus("KeplerYuvBurst 폴더가 없음. 먼저 YUV 4장 + 센서를 찍어야 함.")
+                workerThread.quitSafely()
+                return@post
+            }
+
+            val latestJobDir = yuvRoot
+                .listFiles()
+                ?.filter { it.isDirectory && File(it, "job.json").exists() }
+                ?.maxByOrNull { it.lastModified() }
+
+            if (latestJobDir == null) {
+                postStatus("YUV job을 찾지 못함")
+                workerThread.quitSafely()
+                return@post
+            }
+
+            val jobFile = File(latestJobDir, "job.json")
+            val job = JSONObject(jobFile.readText())
+
+            val status = job.optString("status", "unknown")
+            val cameraId = job.optString("cameraId", "unknown")
+            val width = job.optInt("width", -1)
+            val height = job.optInt("height", -1)
+            val framesArray = job.optJSONArray("frames") ?: JSONArray()
+            val motion = job.optJSONObject("motion")
+
+            val frameTimestamps = mutableListOf<Long>()
+
+            for (i in 0 until framesArray.length()) {
+                val frame = framesArray.optJSONObject(i) ?: continue
+                if (frame.has("timestampNs")) {
+                    frameTimestamps.add(frame.optLong("timestampNs"))
+                }
+            }
+
+            val frameMin = frameTimestamps.minOrNull()
+            val frameMax = frameTimestamps.maxOrNull()
+
+            fun cleanFileName(value: String?): String? {
+                if (value == null) return null
+                if (value.isBlank()) return null
+                if (value == "null") return null
+                return value
+            }
+
+            val gyroFileName = cleanFileName(motion?.optString("gyroFile", null))
+            val rotationFileName = cleanFileName(motion?.optString("rotationVectorFile", null))
+
+            val gyroStats = gyroFileName?.let { name ->
+                readMotionCsvStats(File(latestJobDir, name))
+            }
+
+            val rotationStats = rotationFileName?.let { name ->
+                readMotionCsvStats(File(latestJobDir, name))
+            }
+
+            fun rangeText(min: Long?, max: Long?): String {
+                return if (min == null || max == null) {
+                    "없음"
+                } else {
+                    "$min ~ $max"
+                }
+            }
+
+            fun overlapText(stats: MotionCsvStats?): String {
+                if (frameMin == null || frameMax == null) return "프레임 timestamp 없음"
+                if (stats == null || stats.count == 0 || stats.minTimestampNs == null || stats.maxTimestampNs == null) {
+                    return "센서 로그 없음"
+                }
+
+                val inside = stats.minTimestampNs <= frameMin && stats.maxTimestampNs >= frameMax
+                val beforeMs = (frameMin - stats.minTimestampNs) / 1_000_000.0
+                val afterMs = (stats.maxTimestampNs - frameMax) / 1_000_000.0
+
+                return if (inside) {
+                    "OK, frame range inside sensor range (앞 ${"%.1f".format(beforeMs)}ms / 뒤 ${"%.1f".format(afterMs)}ms)"
+                } else {
+                    "WARN, frame range 밖으로 벗어남 (앞 ${"%.1f".format(beforeMs)}ms / 뒤 ${"%.1f".format(afterMs)}ms)"
+                }
+            }
+
+            val summary = buildString {
+                appendLine("Latest YUV Motion Job")
+                appendLine("folder: ${latestJobDir.name}")
+                appendLine("status: $status")
+                appendLine("cameraId: $cameraId")
+                appendLine("size: ${width}x${height}")
+                appendLine("frames: ${framesArray.length()}")
+                appendLine()
+                appendLine("Frame timestamp range:")
+                appendLine(rangeText(frameMin, frameMax))
+                appendLine()
+                appendLine("Gyro:")
+                appendLine("file: ${gyroFileName ?: "없음"}")
+                appendLine("samples: ${gyroStats?.count ?: 0}")
+                appendLine("range: ${rangeText(gyroStats?.minTimestampNs, gyroStats?.maxTimestampNs)}")
+                appendLine("check: ${overlapText(gyroStats)}")
+                appendLine()
+                appendLine("Rotation Vector:")
+                appendLine("file: ${rotationFileName ?: "없음"}")
+                appendLine("samples: ${rotationStats?.count ?: 0}")
+                appendLine("range: ${rangeText(rotationStats?.minTimestampNs, rotationStats?.maxTimestampNs)}")
+                appendLine("check: ${overlapText(rotationStats)}")
+            }
+
+            postStatus(summary)
+        } catch (e: Exception) {
+            postStatus("최근 Motion Job 요약 실패\n${e.stackTraceToString()}")
+        } finally {
+            workerThread.quitSafely()
+        }
+    }
+}
+
+data class MotionCsvStats(
+    val count: Int,
+    val minTimestampNs: Long?,
+    val maxTimestampNs: Long?
+)
+
+fun readMotionCsvStats(file: File): MotionCsvStats {
+    if (!file.exists()) {
+        return MotionCsvStats(
+            count = 0,
+            minTimestampNs = null,
+            maxTimestampNs = null
+        )
+    }
+
+    var count = 0
+    var minTimestamp: Long? = null
+    var maxTimestamp: Long? = null
+
+    file.bufferedReader().useLines { lines ->
+        lines.drop(1).forEach { line ->
+            val timestamp = line
+                .substringBefore(',')
+                .trim()
+                .toLongOrNull()
+
+            if (timestamp != null) {
+                count++
+
+                minTimestamp = if (minTimestamp == null) {
+                    timestamp
+                } else {
+                    kotlin.math.min(minTimestamp!!, timestamp)
+                }
+
+                maxTimestamp = if (maxTimestamp == null) {
+                    timestamp
+                } else {
+                    kotlin.math.max(maxTimestamp!!, timestamp)
+                }
+            }
+        }
+    }
+
+    return MotionCsvStats(
+        count = count,
+        minTimestampNs = minTimestamp,
+        maxTimestampNs = maxTimestamp
+    )
+}
+
 
 fun writeYPlaneCompact(image: Image, outFile: File) {
     val width = image.width
