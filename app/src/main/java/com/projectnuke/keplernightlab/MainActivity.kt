@@ -1,50 +1,68 @@
 package com.projectnuke.keplernightlab
 
 import android.Manifest
-import android.content.Context
-import android.content.pm.PackageManager
-import android.graphics.ImageFormat
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraManager
-import android.hardware.camera2.CameraMetadata
-import android.os.Bundle
-import android.util.Size
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
+import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
-import android.widget.Toast
-import android.annotation.SuppressLint
+import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
 import android.media.Image
 import android.media.ImageReader
+import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.util.Size
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import android.hardware.camera2.CaptureResult
-import org.json.JSONArray
-import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -58,6 +76,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun KeplerNightLabApp() {
     val context = LocalContext.current
+
     var hasCameraPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(
@@ -68,6 +87,7 @@ fun KeplerNightLabApp() {
     }
 
     var report by remember { mutableStateOf("카메라 권한 확인 중...") }
+    var rawStatus by remember { mutableStateOf("촬영 대기 중") }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -87,8 +107,6 @@ fun KeplerNightLabApp() {
             report = buildCameraReport(context)
         }
     }
-
-    var rawStatus by remember { mutableStateOf("RAW 촬영 대기 중") }
 
     MaterialTheme {
         Surface(
@@ -114,31 +132,40 @@ fun KeplerNightLabApp() {
 
                 Spacer(modifier = Modifier.height(16.dp))
 
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Button(
-                        onClick = {
-                            report = if (hasCameraPermission) {
-                                buildCameraReport(context)
-                            } else {
-                                permissionLauncher.launch(Manifest.permission.CAMERA)
-                                "카메라 권한 요청 중..."
-                            }
-                        }
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("진단 다시 실행")
+                        Button(
+                            modifier = Modifier.weight(1f),
+                            onClick = {
+                                report = if (hasCameraPermission) {
+                                    buildCameraReport(context)
+                                } else {
+                                    permissionLauncher.launch(Manifest.permission.CAMERA)
+                                    "카메라 권한 요청 중..."
+                                }
+                            }
+                        ) {
+                            Text("진단")
+                        }
+
+                        Button(
+                            modifier = Modifier.weight(1f),
+                            onClick = {
+                                copyToClipboard(context, "Kepler Camera Report", report)
+                            }
+                        ) {
+                            Text("복사")
+                        }
                     }
 
                     Button(
-                        onClick = {
-                            copyToClipboard(context, "Kepler Camera Report", report)
-                        }
-                    ) {
-                        Text("복사")
-                    }
-                    Button(
+                        modifier = Modifier.fillMaxWidth(),
                         onClick = {
                             rawStatus = "RAW 촬영 시작..."
                             captureSingleRawDng(context, cameraId = "0") { status ->
@@ -148,7 +175,9 @@ fun KeplerNightLabApp() {
                     ) {
                         Text("RAW DNG 촬영")
                     }
+
                     Button(
+                        modifier = Modifier.fillMaxWidth(),
                         onClick = {
                             rawStatus = "RAW Burst 촬영 시작..."
                             captureRawBurstDng(context, cameraId = "0", frameCount = 4) { status ->
@@ -158,15 +187,42 @@ fun KeplerNightLabApp() {
                     ) {
                         Text("RAW 4장")
                     }
+
                     Button(
+                        modifier = Modifier.fillMaxWidth(),
                         onClick = {
-                            val deleted = deleteKeplerRawCache(context)
-                            rawStatus = "RAW 캐시 삭제 완료\n삭제된 파일: $deleted 개"
+                            rawStatus = "YUV Burst 촬영 시작..."
+                            captureYuvBurstGray(context, cameraId = "0", frameCount = 4) { status ->
+                                rawStatus = status
+                            }
                         }
                     ) {
-                        Text("RAW 캐시 삭제")
+                        Text("YUV 4장")
+                    }
+
+                    Button(
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = {
+                            rawStatus = "YUV 평균 합성 시작..."
+                            averageLatestYuvBurstGray(context) { status ->
+                                rawStatus = status
+                            }
+                        }
+                    ) {
+                        Text("YUV 평균 합성")
+                    }
+
+                    Button(
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = {
+                            val deleted = deleteKeplerCache(context)
+                            rawStatus = "캐시 삭제 완료\n삭제된 파일/폴더: $deleted 개"
+                        }
+                    ) {
+                        Text("캐시 삭제")
                     }
                 }
+
                 Spacer(modifier = Modifier.height(12.dp))
 
                 Text(
@@ -233,6 +289,7 @@ fun buildCameraReport(context: Context): String {
             sb.appendLine()
 
             sb.appendLine("Output Sizes:")
+
             sb.appendLine("RAW_SENSOR:")
             sb.appendLine(formatSizes(map?.getOutputSizes(ImageFormat.RAW_SENSOR)))
 
@@ -287,12 +344,16 @@ fun formatSizes(sizes: Array<Size>?): String {
     if (sizes.isNullOrEmpty()) return "  none"
 
     return sizes
-        .sortedWith(compareByDescending<Size> { it.width * it.height }.thenByDescending { it.width })
+        .sortedWith(
+            compareByDescending<Size> { it.width * it.height }
+                .thenByDescending { it.width }
+        )
         .take(12)
         .joinToString(separator = "\n") { size ->
             "  ${size.width} x ${size.height}"
         }
 }
+
 fun copyToClipboard(context: Context, label: String, text: String) {
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     val clip = ClipData.newPlainText(label, text)
@@ -300,6 +361,7 @@ fun copyToClipboard(context: Context, label: String, text: String) {
 
     Toast.makeText(context, "진단 결과 복사됨", Toast.LENGTH_SHORT).show()
 }
+
 @SuppressLint("MissingPermission")
 fun captureSingleRawDng(
     context: Context,
@@ -315,7 +377,6 @@ fun captureSingleRawDng(
     }
 
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-
     val backgroundThread = HandlerThread("KeplerRawCaptureThread").apply { start() }
     val backgroundHandler = Handler(backgroundThread.looper)
 
@@ -345,8 +406,8 @@ fun captureSingleRawDng(
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
 
-        val rawSizes = map?.getOutputSizes(ImageFormat.RAW_SENSOR)
-        val rawSize = rawSizes
+        val rawSize = map
+            ?.getOutputSizes(ImageFormat.RAW_SENSOR)
             ?.maxByOrNull { it.width * it.height }
 
         if (rawSize == null) {
@@ -402,7 +463,9 @@ fun captureSingleRawDng(
                     }
 
                     postStatus(
-                        "DNG 저장 완료\n${file.absolutePath}\n크기: ${file.length() / 1024 / 1024} MB"
+                        "DNG 저장 완료\n" +
+                                "${file.absolutePath}\n" +
+                                "크기: ${file.length() / 1024 / 1024} MB"
                     )
                 } catch (e: Exception) {
                     postStatus("DNG 저장 실패\n${e.stackTraceToString()}")
@@ -537,6 +600,7 @@ fun captureSingleRawDng(
         cleanup()
     }
 }
+
 @SuppressLint("MissingPermission")
 fun captureRawBurstDng(
     context: Context,
@@ -641,6 +705,7 @@ fun captureRawBurstDng(
         }
 
         val jobFile = File(burstDir, "job.json")
+        val savedFrameFiles = mutableListOf<String>()
 
         writeBurstJobJson(
             jobFile = jobFile,
@@ -652,8 +717,6 @@ fun captureRawBurstDng(
             savedFrames = 0,
             frameFiles = emptyList()
         )
-
-        val savedFrameFiles = mutableListOf<String>()
 
         fun trySaveReadyFrames() {
             val readyTimestamps = images.keys
@@ -865,13 +928,437 @@ fun captureRawBurstDng(
         finish("RAW Burst 초기화 실패\n${e.stackTraceToString()}")
     }
 }
-fun deleteKeplerRawCache(context: Context): Int {
+
+@SuppressLint("MissingPermission")
+fun captureYuvBurstGray(
+    context: Context,
+    cameraId: String = "0",
+    frameCount: Int = 4,
+    onStatus: (String) -> Unit
+) {
+    val mainHandler = Handler(Looper.getMainLooper())
+
+    fun postStatus(message: String) {
+        mainHandler.post {
+            onStatus(message)
+        }
+    }
+
+    val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    val backgroundThread = HandlerThread("KeplerYuvBurstThread").apply { start() }
+    val backgroundHandler = Handler(backgroundThread.looper)
+
+    var cameraDevice: CameraDevice? = null
+    var captureSession: CameraCaptureSession? = null
+    var imageReader: ImageReader? = null
+
+    var savedFrames = 0
+    var finished = false
+
+    fun cleanup() {
+        try {
+            captureSession?.close()
+        } catch (_: Exception) {}
+
+        try {
+            cameraDevice?.close()
+        } catch (_: Exception) {}
+
+        try {
+            imageReader?.close()
+        } catch (_: Exception) {}
+
+        try {
+            backgroundThread.quitSafely()
+        } catch (_: Exception) {}
+    }
+
+    fun finish(message: String) {
+        if (finished) return
+        finished = true
+        postStatus(message)
+        cleanup()
+    }
+
+    try {
+        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+
+        val yuvSize = map
+            ?.getOutputSizes(ImageFormat.YUV_420_888)
+            ?.maxByOrNull { it.width * it.height }
+
+        if (yuvSize == null) {
+            finish("YUV_420_888 출력 크기를 찾지 못함")
+            return
+        }
+
+        val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+        val keplerDir = File(picturesDir, "KeplerYuvBurst").apply {
+            if (!exists()) mkdirs()
+        }
+
+        val burstTimestamp = SimpleDateFormat(
+            "yyyyMMdd_HHmmss",
+            Locale.US
+        ).format(Date())
+
+        val burstDir = File(keplerDir, "KPL_YUV_BURST_$burstTimestamp").apply {
+            if (!exists()) mkdirs()
+        }
+
+        val jobFile = File(burstDir, "job.json")
+        val savedFrameFiles = mutableListOf<String>()
+
+        writeYuvJobJson(
+            jobFile = jobFile,
+            status = "CAPTURING",
+            cameraId = cameraId,
+            width = yuvSize.width,
+            height = yuvSize.height,
+            requestedFrames = frameCount,
+            savedFrames = 0,
+            frameFiles = emptyList()
+        )
+
+        postStatus(
+            "YUV Burst 준비\n" +
+                    "Camera $cameraId / ${yuvSize.width}x${yuvSize.height} / ${frameCount}장"
+        )
+
+        val reader = ImageReader.newInstance(
+            yuvSize.width,
+            yuvSize.height,
+            ImageFormat.YUV_420_888,
+            frameCount + 2
+        )
+
+        imageReader = reader
+
+        reader.setOnImageAvailableListener(
+            { r ->
+                if (finished) return@setOnImageAvailableListener
+
+                var image: Image? = null
+
+                try {
+                    image = r.acquireNextImage()
+
+                    if (savedFrames >= frameCount) {
+                        image.close()
+                        return@setOnImageAvailableListener
+                    }
+
+                    val frameIndex = savedFrames
+                    val fileName = "frame_${frameIndex.toString().padStart(2, '0')}_y.gray"
+                    val outFile = File(burstDir, fileName)
+
+                    writeYPlaneCompact(image, outFile)
+
+                    savedFrames++
+                    savedFrameFiles.add(fileName)
+
+                    writeYuvJobJson(
+                        jobFile = jobFile,
+                        status = "CAPTURING",
+                        cameraId = cameraId,
+                        width = yuvSize.width,
+                        height = yuvSize.height,
+                        requestedFrames = frameCount,
+                        savedFrames = savedFrames,
+                        frameFiles = savedFrameFiles
+                    )
+
+                    postStatus(
+                        "YUV 저장 중...\n" +
+                                "저장: $savedFrames / $frameCount\n" +
+                                "폴더:\n${burstDir.absolutePath}"
+                    )
+
+                    if (savedFrames >= frameCount) {
+                        writeYuvJobJson(
+                            jobFile = jobFile,
+                            status = "CAPTURE_COMPLETE",
+                            cameraId = cameraId,
+                            width = yuvSize.width,
+                            height = yuvSize.height,
+                            requestedFrames = frameCount,
+                            savedFrames = savedFrames,
+                            frameFiles = savedFrameFiles
+                        )
+
+                        finish(
+                            "YUV Burst 저장 완료\n" +
+                                    "프레임: $savedFrames 장\n" +
+                                    "job.json 생성 완료\n" +
+                                    "폴더:\n${burstDir.absolutePath}"
+                        )
+                    }
+                } catch (e: Exception) {
+                    finish("YUV 이미지 저장 실패\n${e.stackTraceToString()}")
+                } finally {
+                    try {
+                        image?.close()
+                    } catch (_: Exception) {}
+                }
+            },
+            backgroundHandler
+        )
+
+        cameraManager.openCamera(
+            cameraId,
+            object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    cameraDevice = camera
+                    postStatus("카메라 열림. YUV Burst 세션 생성 중...")
+
+                    try {
+                        camera.createCaptureSession(
+                            listOf(reader.surface),
+                            object : CameraCaptureSession.StateCallback() {
+                                override fun onConfigured(session: CameraCaptureSession) {
+                                    captureSession = session
+                                    postStatus("YUV Burst 세션 준비 완료. $frameCount 장 촬영 중...")
+
+                                    try {
+                                        val requests = List(frameCount) {
+                                            camera.createCaptureRequest(
+                                                CameraDevice.TEMPLATE_STILL_CAPTURE
+                                            ).apply {
+                                                addTarget(reader.surface)
+
+                                                set(
+                                                    CaptureRequest.CONTROL_MODE,
+                                                    CaptureRequest.CONTROL_MODE_AUTO
+                                                )
+
+                                                set(
+                                                    CaptureRequest.CONTROL_AF_MODE,
+                                                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                                                )
+
+                                                set(
+                                                    CaptureRequest.NOISE_REDUCTION_MODE,
+                                                    CaptureRequest.NOISE_REDUCTION_MODE_OFF
+                                                )
+
+                                                set(
+                                                    CaptureRequest.EDGE_MODE,
+                                                    CaptureRequest.EDGE_MODE_OFF
+                                                )
+                                            }.build()
+                                        }
+
+                                        session.captureBurst(
+                                            requests,
+                                            object : CameraCaptureSession.CaptureCallback() {},
+                                            backgroundHandler
+                                        )
+                                    } catch (e: Exception) {
+                                        finish("YUV Burst 캡처 요청 실패\n${e.stackTraceToString()}")
+                                    }
+                                }
+
+                                override fun onConfigureFailed(session: CameraCaptureSession) {
+                                    finish("YUV Burst 세션 구성 실패")
+                                }
+                            },
+                            backgroundHandler
+                        )
+                    } catch (e: Exception) {
+                        finish("YUV Burst 세션 생성 실패\n${e.stackTraceToString()}")
+                    }
+                }
+
+                override fun onDisconnected(camera: CameraDevice) {
+                    finish("카메라 연결 해제됨")
+                }
+
+                override fun onError(camera: CameraDevice, error: Int) {
+                    finish("카메라 오류: $error")
+                }
+            },
+            backgroundHandler
+        )
+    } catch (e: Exception) {
+        finish("YUV Burst 초기화 실패\n${e.stackTraceToString()}")
+    }
+}
+
+fun averageLatestYuvBurstGray(
+    context: Context,
+    onStatus: (String) -> Unit
+) {
+    val mainHandler = Handler(Looper.getMainLooper())
+
+    fun postStatus(message: String) {
+        mainHandler.post {
+            onStatus(message)
+        }
+    }
+
+    val workerThread = HandlerThread("KeplerAverageGrayThread").apply { start() }
+    val workerHandler = Handler(workerThread.looper)
+
+    workerHandler.post {
+        try {
+            val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+
+            if (picturesDir == null) {
+                postStatus("Pictures 폴더를 찾지 못함")
+                workerThread.quitSafely()
+                return@post
+            }
+
+            val yuvRoot = File(picturesDir, "KeplerYuvBurst")
+
+            if (!yuvRoot.exists()) {
+                postStatus("KeplerYuvBurst 폴더가 없음. 먼저 YUV 4장을 찍어야 함.")
+                workerThread.quitSafely()
+                return@post
+            }
+
+            val latestJobDir = yuvRoot
+                .listFiles()
+                ?.filter { it.isDirectory && File(it, "job.json").exists() }
+                ?.maxByOrNull { it.lastModified() }
+
+            if (latestJobDir == null) {
+                postStatus("YUV job을 찾지 못함")
+                workerThread.quitSafely()
+                return@post
+            }
+
+            val jobFile = File(latestJobDir, "job.json")
+            val job = JSONObject(jobFile.readText())
+
+            val width = job.getInt("width")
+            val height = job.getInt("height")
+            val framesArray = job.getJSONArray("frames")
+
+            if (framesArray.length() == 0) {
+                postStatus("job.json에 프레임이 없음")
+                workerThread.quitSafely()
+                return@post
+            }
+
+            val pixelCount = width * height
+            val accumulator = IntArray(pixelCount)
+            var usedFrames = 0
+
+            postStatus(
+                "평균 합성 준비\n" +
+                        "폴더: ${latestJobDir.name}\n" +
+                        "해상도: ${width}x${height}\n" +
+                        "프레임: ${framesArray.length()}장"
+            )
+
+            for (i in 0 until framesArray.length()) {
+                val frameObj = framesArray.getJSONObject(i)
+                val fileName = frameObj.getString("file")
+                val frameFile = File(latestJobDir, fileName)
+
+                if (!frameFile.exists()) {
+                    continue
+                }
+
+                val bytes = frameFile.readBytes()
+
+                if (bytes.size < pixelCount) {
+                    continue
+                }
+
+                for (p in 0 until pixelCount) {
+                    accumulator[p] += bytes[p].toInt() and 0xFF
+                }
+
+                usedFrames++
+
+                postStatus(
+                    "평균 합성 중...\n" +
+                            "사용 프레임: $usedFrames / ${framesArray.length()}"
+                )
+            }
+
+            if (usedFrames == 0) {
+                postStatus("사용 가능한 gray 프레임이 없음")
+                workerThread.quitSafely()
+                return@post
+            }
+
+            val pixels = IntArray(pixelCount)
+
+            for (p in 0 until pixelCount) {
+                val y = accumulator[p] / usedFrames
+                pixels[p] = Color.rgb(y, y, y)
+            }
+
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
+
+            val outFile = File(latestJobDir, "average_gray.png")
+
+            FileOutputStream(outFile).use { output ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+            }
+
+            bitmap.recycle()
+
+            val updatedJob = JSONObject(job.toString())
+                .put("processStatus", "AVERAGE_GRAY_COMPLETE")
+                .put("averageGrayFile", outFile.name)
+                .put("averageUsedFrames", usedFrames)
+                .put("processedAt", System.currentTimeMillis())
+
+            jobFile.writeText(updatedJob.toString(2))
+
+            postStatus(
+                "YUV 평균 합성 완료\n" +
+                        "사용 프레임: $usedFrames 장\n" +
+                        "결과:\n${outFile.absolutePath}\n" +
+                        "크기: ${outFile.length() / 1024 / 1024} MB"
+            )
+        } catch (e: Exception) {
+            postStatus("YUV 평균 합성 실패\n${e.stackTraceToString()}")
+        } finally {
+            workerThread.quitSafely()
+        }
+    }
+}
+
+fun writeYPlaneCompact(image: Image, outFile: File) {
+    val width = image.width
+    val height = image.height
+
+    val plane = image.planes[0]
+    val buffer: ByteBuffer = plane.buffer
+    val rowStride = plane.rowStride
+    val pixelStride = plane.pixelStride
+
+    FileOutputStream(outFile).use { output ->
+        val compactRow = ByteArray(width)
+
+        for (y in 0 until height) {
+            val rowStart = y * rowStride
+
+            for (x in 0 until width) {
+                val index = rowStart + x * pixelStride
+                compactRow[x] = buffer.get(index)
+            }
+
+            output.write(compactRow)
+        }
+    }
+}
+
+fun deleteKeplerCache(context: Context): Int {
     val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
         ?: return 0
 
     val targets = listOf(
         File(picturesDir, "KeplerRaw"),
-        File(picturesDir, "KeplerRawBurst")
+        File(picturesDir, "KeplerRawBurst"),
+        File(picturesDir, "KeplerYuvBurst")
     )
 
     var deletedCount = 0
@@ -896,6 +1383,7 @@ fun deleteKeplerRawCache(context: Context): Int {
 
     return deletedCount
 }
+
 fun writeBurstJobJson(
     jobFile: File,
     status: String,
@@ -916,6 +1404,8 @@ fun writeBurstJobJson(
         )
     }
 
+    val now = System.currentTimeMillis()
+
     val json = JSONObject()
         .put("app", "Kepler Night Lab")
         .put("jobType", "RAW_BURST")
@@ -926,8 +1416,64 @@ fun writeBurstJobJson(
         .put("requestedFrames", requestedFrames)
         .put("savedFrames", savedFrames)
         .put("frames", framesArray)
-        .put("createdAt", System.currentTimeMillis())
-        .put("updatedAt", System.currentTimeMillis())
+        .put("updatedAt", now)
+
+    if (!jobFile.exists()) {
+        json.put("createdAt", now)
+    } else {
+        val oldCreatedAt = runCatching {
+            JSONObject(jobFile.readText()).optLong("createdAt", now)
+        }.getOrDefault(now)
+
+        json.put("createdAt", oldCreatedAt)
+    }
+
+    jobFile.writeText(json.toString(2))
+}
+
+fun writeYuvJobJson(
+    jobFile: File,
+    status: String,
+    cameraId: String,
+    width: Int,
+    height: Int,
+    requestedFrames: Int,
+    savedFrames: Int,
+    frameFiles: List<String>
+) {
+    val framesArray = JSONArray()
+
+    frameFiles.forEachIndexed { index, fileName ->
+        framesArray.put(
+            JSONObject()
+                .put("index", index)
+                .put("file", fileName)
+        )
+    }
+
+    val now = System.currentTimeMillis()
+
+    val json = JSONObject()
+        .put("app", "Kepler Night Lab")
+        .put("jobType", "YUV_BURST_GRAY")
+        .put("status", status)
+        .put("cameraId", cameraId)
+        .put("width", width)
+        .put("height", height)
+        .put("requestedFrames", requestedFrames)
+        .put("savedFrames", savedFrames)
+        .put("frames", framesArray)
+        .put("updatedAt", now)
+
+    if (!jobFile.exists()) {
+        json.put("createdAt", now)
+    } else {
+        val oldCreatedAt = runCatching {
+            JSONObject(jobFile.readText()).optLong("createdAt", now)
+        }.getOrDefault(now)
+
+        json.put("createdAt", oldCreatedAt)
+    }
 
     jobFile.writeText(json.toString(2))
 }
