@@ -9,6 +9,10 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.ImageFormat
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -63,6 +67,157 @@ import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+
+data class MotionSample(
+    val timestampNs: Long,
+    val values: FloatArray
+)
+
+class MotionLogger(context: Context) {
+    private val sensorManager =
+        context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+
+    private val gyroSensor: Sensor? =
+        sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+            ?: sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE_UNCALIBRATED)
+
+    private val rotationVectorSensor: Sensor? =
+        sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
+            ?: sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+
+    private val lock = Any()
+    private val gyroSamples = mutableListOf<MotionSample>()
+    private val rotationVectorSamples = mutableListOf<MotionSample>()
+
+    private var running = false
+    private var sensorThread: HandlerThread? = null
+    private var sensorHandler: Handler? = null
+
+    private val listener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            val sample = MotionSample(
+                timestampNs = event.timestamp,
+                values = event.values.copyOf()
+            )
+
+            synchronized(lock) {
+                when (event.sensor.type) {
+                    Sensor.TYPE_GYROSCOPE,
+                    Sensor.TYPE_GYROSCOPE_UNCALIBRATED -> gyroSamples.add(sample)
+                    Sensor.TYPE_GAME_ROTATION_VECTOR,
+                    Sensor.TYPE_ROTATION_VECTOR -> rotationVectorSamples.add(sample)
+                }
+            }
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+    }
+
+    fun start(): String {
+        synchronized(lock) {
+            gyroSamples.clear()
+            rotationVectorSamples.clear()
+        }
+
+        if (running) return "motion logger already running"
+
+        val thread = HandlerThread("KeplerMotionSensorThread").apply { start() }
+        val handler = Handler(thread.looper)
+
+        sensorThread = thread
+        sensorHandler = handler
+
+        var registered = 0
+
+        gyroSensor?.let {
+            val ok = sensorManager.registerListener(
+                listener,
+                it,
+                SensorManager.SENSOR_DELAY_FASTEST,
+                handler
+            )
+            if (ok) registered++
+        }
+
+        rotationVectorSensor?.let {
+            val ok = sensorManager.registerListener(
+                listener,
+                it,
+                SensorManager.SENSOR_DELAY_FASTEST,
+                handler
+            )
+            if (ok) registered++
+        }
+
+        running = registered > 0
+
+        return "gyro=${gyroSensor != null}, rotation=${rotationVectorSensor != null}, registered=$registered"
+    }
+
+    fun stop() {
+        if (!running && sensorThread == null) return
+
+        try {
+            sensorManager.unregisterListener(listener)
+        } catch (_: Exception) {}
+
+        running = false
+
+        try {
+            sensorThread?.quitSafely()
+        } catch (_: Exception) {}
+
+        sensorThread = null
+        sensorHandler = null
+    }
+
+    fun gyroCount(): Int = synchronized(lock) { gyroSamples.size }
+
+    fun rotationVectorCount(): Int = synchronized(lock) { rotationVectorSamples.size }
+
+    fun saveToDirectory(dir: File): Pair<String?, String?> {
+        val gyroCopy: List<MotionSample>
+        val rotationCopy: List<MotionSample>
+
+        synchronized(lock) {
+            gyroCopy = gyroSamples.toList()
+            rotationCopy = rotationVectorSamples.toList()
+        }
+
+        var gyroFileName: String? = null
+        var rotationFileName: String? = null
+
+        if (gyroCopy.isNotEmpty()) {
+            val gyroFile = File(dir, "gyro.csv")
+            gyroFile.printWriter().use { out ->
+                out.println("timestampNs,xRadPerSec,yRadPerSec,zRadPerSec")
+                gyroCopy.forEach { sample ->
+                    val x = sample.values.getOrNull(0) ?: 0f
+                    val y = sample.values.getOrNull(1) ?: 0f
+                    val z = sample.values.getOrNull(2) ?: 0f
+                    out.println("${sample.timestampNs},$x,$y,$z")
+                }
+            }
+            gyroFileName = gyroFile.name
+        }
+
+        if (rotationCopy.isNotEmpty()) {
+            val rotationFile = File(dir, "rotation_vector.csv")
+            rotationFile.printWriter().use { out ->
+                out.println("timestampNs,v0,v1,v2,v3,v4")
+                rotationCopy.forEach { sample ->
+                    val values = (0 until 5).joinToString(",") { index ->
+                        (sample.values.getOrNull(index) ?: 0f).toString()
+                    }
+                    out.println("${sample.timestampNs},$values")
+                }
+            }
+            rotationFileName = rotationFile.name
+        }
+
+        return Pair(gyroFileName, rotationFileName)
+    }
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -191,13 +346,13 @@ fun KeplerNightLabApp() {
                     Button(
                         modifier = Modifier.fillMaxWidth(),
                         onClick = {
-                            rawStatus = "YUV Burst 촬영 시작..."
-                            captureYuvBurstGray(context, cameraId = "0", frameCount = 4) { status ->
+                            rawStatus = "YUV Burst + Motion 촬영 시작..."
+                            captureYuvBurstGrayWithMotion(context, cameraId = "0", frameCount = 4) { status ->
                                 rawStatus = status
                             }
                         }
                     ) {
-                        Text("YUV 4장")
+                        Text("YUV 4장 + 센서")
                     }
 
                     Button(
@@ -385,21 +540,10 @@ fun captureSingleRawDng(
     var imageReader: ImageReader? = null
 
     fun cleanup() {
-        try {
-            captureSession?.close()
-        } catch (_: Exception) {}
-
-        try {
-            cameraDevice?.close()
-        } catch (_: Exception) {}
-
-        try {
-            imageReader?.close()
-        } catch (_: Exception) {}
-
-        try {
-            backgroundThread.quitSafely()
-        } catch (_: Exception) {}
+        try { captureSession?.close() } catch (_: Exception) {}
+        try { cameraDevice?.close() } catch (_: Exception) {}
+        try { imageReader?.close() } catch (_: Exception) {}
+        try { backgroundThread.quitSafely() } catch (_: Exception) {}
     }
 
     try {
@@ -445,6 +589,11 @@ fun captureSingleRawDng(
 
                 try {
                     val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+                    if (picturesDir == null) {
+                        postStatus("DNG 저장 실패: Pictures 폴더가 null임")
+                        return
+                    }
+
                     val keplerDir = File(picturesDir, "KeplerRaw").apply {
                         if (!exists()) mkdirs()
                     }
@@ -470,10 +619,7 @@ fun captureSingleRawDng(
                 } catch (e: Exception) {
                     postStatus("DNG 저장 실패\n${e.stackTraceToString()}")
                 } finally {
-                    try {
-                        image.close()
-                    } catch (_: Exception) {}
-
+                    try { image.close() } catch (_: Exception) {}
                     cleanup()
                 }
             }
@@ -516,26 +662,10 @@ fun captureSingleRawDng(
                                             CameraDevice.TEMPLATE_STILL_CAPTURE
                                         ).apply {
                                             addTarget(reader.surface)
-
-                                            set(
-                                                CaptureRequest.CONTROL_MODE,
-                                                CaptureRequest.CONTROL_MODE_AUTO
-                                            )
-
-                                            set(
-                                                CaptureRequest.CONTROL_AF_MODE,
-                                                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-                                            )
-
-                                            set(
-                                                CaptureRequest.NOISE_REDUCTION_MODE,
-                                                CaptureRequest.NOISE_REDUCTION_MODE_OFF
-                                            )
-
-                                            set(
-                                                CaptureRequest.EDGE_MODE,
-                                                CaptureRequest.EDGE_MODE_OFF
-                                            )
+                                            set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                                            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                                            set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_OFF)
+                                            set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
                                         }.build()
 
                                         session.capture(
@@ -634,21 +764,10 @@ fun captureRawBurstDng(
     var finished = false
 
     fun cleanup() {
-        try {
-            captureSession?.close()
-        } catch (_: Exception) {}
-
-        try {
-            cameraDevice?.close()
-        } catch (_: Exception) {}
-
-        try {
-            imageReader?.close()
-        } catch (_: Exception) {}
-
-        try {
-            backgroundThread.quitSafely()
-        } catch (_: Exception) {}
+        try { captureSession?.close() } catch (_: Exception) {}
+        try { cameraDevice?.close() } catch (_: Exception) {}
+        try { imageReader?.close() } catch (_: Exception) {}
+        try { backgroundThread.quitSafely() } catch (_: Exception) {}
     }
 
     fun finish(message: String) {
@@ -658,9 +777,7 @@ fun captureRawBurstDng(
         postStatus(message)
 
         images.values.forEach { image ->
-            try {
-                image.close()
-            } catch (_: Exception) {}
+            try { image.close() } catch (_: Exception) {}
         }
 
         cleanup()
@@ -691,6 +808,11 @@ fun captureRawBurstDng(
         imageReader = reader
 
         val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+        if (picturesDir == null) {
+            finish("RAW Burst 초기화 실패: Pictures 폴더가 null임")
+            return
+        }
+
         val keplerDir = File(picturesDir, "KeplerRawBurst").apply {
             if (!exists()) mkdirs()
         }
@@ -719,6 +841,8 @@ fun captureRawBurstDng(
         )
 
         fun trySaveReadyFrames() {
+            if (finished) return
+
             val readyTimestamps = images.keys
                 .filter { timestamp ->
                     results.containsKey(timestamp) && !savedTimestamps.contains(timestamp)
@@ -726,8 +850,12 @@ fun captureRawBurstDng(
                 .sorted()
 
             for (timestamp in readyTimestamps) {
+                if (finished) return
+
                 val image = images[timestamp] ?: continue
                 val result = results[timestamp] ?: continue
+
+                savedTimestamps.add(timestamp)
 
                 try {
                     val file = File(
@@ -741,9 +869,11 @@ fun captureRawBurstDng(
                         }
                     }
 
-                    savedTimestamps.add(timestamp)
                     savedFrames++
                     savedFrameFiles.add(file.name)
+                    images.remove(timestamp)
+
+                    try { image.close() } catch (_: Exception) {}
 
                     writeBurstJobJson(
                         jobFile = jobFile,
@@ -755,12 +885,6 @@ fun captureRawBurstDng(
                         savedFrames = savedFrames,
                         frameFiles = savedFrameFiles
                     )
-
-                    try {
-                        image.close()
-                    } catch (_: Exception) {}
-
-                    images.remove(timestamp)
 
                     postStatus(
                         "RAW Burst 저장 중...\n" +
@@ -839,26 +963,10 @@ fun captureRawBurstDng(
                                                 CameraDevice.TEMPLATE_STILL_CAPTURE
                                             ).apply {
                                                 addTarget(reader.surface)
-
-                                                set(
-                                                    CaptureRequest.CONTROL_MODE,
-                                                    CaptureRequest.CONTROL_MODE_AUTO
-                                                )
-
-                                                set(
-                                                    CaptureRequest.CONTROL_AF_MODE,
-                                                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-                                                )
-
-                                                set(
-                                                    CaptureRequest.NOISE_REDUCTION_MODE,
-                                                    CaptureRequest.NOISE_REDUCTION_MODE_OFF
-                                                )
-
-                                                set(
-                                                    CaptureRequest.EDGE_MODE,
-                                                    CaptureRequest.EDGE_MODE_OFF
-                                                )
+                                                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                                                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                                                set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_OFF)
+                                                set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
                                             }.build()
                                         }
 
@@ -870,9 +978,7 @@ fun captureRawBurstDng(
                                                     request: CaptureRequest,
                                                     result: TotalCaptureResult
                                                 ) {
-                                                    val timestamp = result.get(
-                                                        CaptureResult.SENSOR_TIMESTAMP
-                                                    )
+                                                    val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
 
                                                     if (timestamp != null) {
                                                         results[timestamp] = result
@@ -930,7 +1036,7 @@ fun captureRawBurstDng(
 }
 
 @SuppressLint("MissingPermission")
-fun captureYuvBurstGray(
+fun captureYuvBurstGrayWithMotion(
     context: Context,
     cameraId: String = "0",
     frameCount: Int = 4,
@@ -948,29 +1054,29 @@ fun captureYuvBurstGray(
     val backgroundThread = HandlerThread("KeplerYuvBurstThread").apply { start() }
     val backgroundHandler = Handler(backgroundThread.looper)
 
+    var motionLogger: MotionLogger? = null
     var cameraDevice: CameraDevice? = null
     var captureSession: CameraCaptureSession? = null
     var imageReader: ImageReader? = null
 
     var savedFrames = 0
     var finished = false
+    var motionSaved = false
+    var motionFiles: Pair<String?, String?> = Pair(null, null)
+    var motionInfo = "motion_not_started"
+
+    val motionWarmupMs = 500L
+    val motionTailMs = 500L
+
+    val frameTimestampsNs = mutableListOf<Long>()
+    val savedFrameFiles = mutableListOf<String>()
 
     fun cleanup() {
-        try {
-            captureSession?.close()
-        } catch (_: Exception) {}
-
-        try {
-            cameraDevice?.close()
-        } catch (_: Exception) {}
-
-        try {
-            imageReader?.close()
-        } catch (_: Exception) {}
-
-        try {
-            backgroundThread.quitSafely()
-        } catch (_: Exception) {}
+        try { captureSession?.close() } catch (_: Exception) {}
+        try { cameraDevice?.close() } catch (_: Exception) {}
+        try { imageReader?.close() } catch (_: Exception) {}
+        try { motionLogger?.stop() } catch (_: Exception) {}
+        try { backgroundThread.quitSafely() } catch (_: Exception) {}
     }
 
     fun finish(message: String) {
@@ -980,22 +1086,75 @@ fun captureYuvBurstGray(
         cleanup()
     }
 
+    fun saveMotionOnce(dir: File): Pair<String?, String?> {
+        if (motionSaved) return motionFiles
+
+        return try {
+            val logger = motionLogger
+            if (logger == null) {
+                motionSaved = true
+                motionFiles = Pair(null, null)
+                motionFiles
+            } else {
+                logger.stop()
+                motionFiles = logger.saveToDirectory(dir)
+                motionSaved = true
+                motionFiles
+            }
+        } catch (e: Exception) {
+            motionSaved = true
+            motionFiles = Pair(null, null)
+            postStatus("Motion 저장 실패, YUV는 유지\n${e.stackTraceToString()}")
+            motionFiles
+        }
+    }
+
     try {
+        postStatus("YUV+Motion 초기화 1/7: 카메라 특성 확인 중...")
+
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
 
-        val yuvSize = map
-            ?.getOutputSizes(ImageFormat.YUV_420_888)
-            ?.maxByOrNull { it.width * it.height }
-
-        if (yuvSize == null) {
-            finish("YUV_420_888 출력 크기를 찾지 못함")
+        if (map == null) {
+            finish("YUV+Motion 초기화 실패: StreamConfigurationMap이 null임")
             return
         }
 
+        val yuvSizes = map.getOutputSizes(ImageFormat.YUV_420_888)
+
+        if (yuvSizes.isNullOrEmpty()) {
+            finish("YUV+Motion 초기화 실패: YUV_420_888 출력 크기를 찾지 못함")
+            return
+        }
+
+        val yuvSize = yuvSizes
+            .filter { it.width <= 1920 && it.height <= 1080 }
+            .maxByOrNull { it.width * it.height }
+            ?: yuvSizes.minByOrNull { kotlin.math.abs(it.width - 1920) + kotlin.math.abs(it.height - 1080) }
+            ?: yuvSizes.maxByOrNull { it.width * it.height }
+
+        if (yuvSize == null) {
+            finish("YUV+Motion 초기화 실패: 선택 가능한 YUV 크기가 없음")
+            return
+        }
+
+        postStatus("YUV+Motion 초기화 2/7: 저장 폴더 준비 중...")
+
         val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+
+        if (picturesDir == null) {
+            finish("YUV+Motion 초기화 실패: getExternalFilesDir(Pictures)가 null임")
+            return
+        }
+
         val keplerDir = File(picturesDir, "KeplerYuvBurst").apply {
-            if (!exists()) mkdirs()
+            if (!exists()) {
+                val ok = mkdirs()
+                if (!ok && !exists()) {
+                    finish("YUV+Motion 초기화 실패: KeplerYuvBurst 폴더 생성 실패\n$absolutePath")
+                    return
+                }
+            }
         }
 
         val burstTimestamp = SimpleDateFormat(
@@ -1004,11 +1163,18 @@ fun captureYuvBurstGray(
         ).format(Date())
 
         val burstDir = File(keplerDir, "KPL_YUV_BURST_$burstTimestamp").apply {
-            if (!exists()) mkdirs()
+            if (!exists()) {
+                val ok = mkdirs()
+                if (!ok && !exists()) {
+                    finish("YUV+Motion 초기화 실패: Burst 폴더 생성 실패\n$absolutePath")
+                    return
+                }
+            }
         }
 
         val jobFile = File(burstDir, "job.json")
-        val savedFrameFiles = mutableListOf<String>()
+
+        postStatus("YUV+Motion 초기화 3/7: job.json 생성 중...")
 
         writeYuvJobJson(
             jobFile = jobFile,
@@ -1018,13 +1184,16 @@ fun captureYuvBurstGray(
             height = yuvSize.height,
             requestedFrames = frameCount,
             savedFrames = 0,
-            frameFiles = emptyList()
+            frameFiles = emptyList(),
+            frameTimestampsNs = emptyList(),
+            gyroFile = null,
+            rotationVectorFile = null,
+            gyroSampleCount = 0,
+            rotationVectorSampleCount = 0,
+            motionInfo = "not_started"
         )
 
-        postStatus(
-            "YUV Burst 준비\n" +
-                    "Camera $cameraId / ${yuvSize.width}x${yuvSize.height} / ${frameCount}장"
-        )
+        postStatus("YUV+Motion 초기화 4/7: ImageReader 생성 중...")
 
         val reader = ImageReader.newInstance(
             yuvSize.width,
@@ -1034,6 +1203,28 @@ fun captureYuvBurstGray(
         )
 
         imageReader = reader
+
+        postStatus("YUV+Motion 초기화 5/7: 모션 센서 시작 중...")
+
+        motionLogger = try {
+            MotionLogger(context).also { logger ->
+                motionInfo = logger.start()
+            }
+        } catch (e: Exception) {
+            motionInfo = "motion_failed_but_continue: ${e.javaClass.simpleName}: ${e.message}"
+            null
+        }
+
+        postStatus(
+            "YUV Burst + Motion 준비 완료\n" +
+                    "Camera $cameraId\n" +
+                    "Size: ${yuvSize.width}x${yuvSize.height}\n" +
+                    "Frames: $frameCount\n" +
+                    "Motion: $motionInfo\n" +
+                    "Sensor warmup: ${motionWarmupMs}ms\n" +
+                    "Sensor tail: ${motionTailMs}ms\n" +
+                    "Folder:\n${burstDir.absolutePath}"
+        )
 
         reader.setOnImageAvailableListener(
             { r ->
@@ -1050,6 +1241,8 @@ fun captureYuvBurstGray(
                     }
 
                     val frameIndex = savedFrames
+                    val imageTimestampNs = image.timestamp
+
                     val fileName = "frame_${frameIndex.toString().padStart(2, '0')}_y.gray"
                     val outFile = File(burstDir, fileName)
 
@@ -1057,6 +1250,9 @@ fun captureYuvBurstGray(
 
                     savedFrames++
                     savedFrameFiles.add(fileName)
+                    frameTimestampsNs.add(imageTimestampNs)
+
+                    val logger = motionLogger
 
                     writeYuvJobJson(
                         jobFile = jobFile,
@@ -1066,122 +1262,148 @@ fun captureYuvBurstGray(
                         height = yuvSize.height,
                         requestedFrames = frameCount,
                         savedFrames = savedFrames,
-                        frameFiles = savedFrameFiles
+                        frameFiles = savedFrameFiles,
+                        frameTimestampsNs = frameTimestampsNs,
+                        gyroFile = null,
+                        rotationVectorFile = null,
+                        gyroSampleCount = logger?.gyroCount() ?: 0,
+                        rotationVectorSampleCount = logger?.rotationVectorCount() ?: 0,
+                        motionInfo = motionInfo
                     )
 
                     postStatus(
                         "YUV 저장 중...\n" +
                                 "저장: $savedFrames / $frameCount\n" +
+                                "timestampNs: $imageTimestampNs\n" +
+                                "gyro samples: ${logger?.gyroCount() ?: 0}\n" +
+                                "rotation samples: ${logger?.rotationVectorCount() ?: 0}\n" +
                                 "폴더:\n${burstDir.absolutePath}"
                     )
 
                     if (savedFrames >= frameCount) {
-                        writeYuvJobJson(
-                            jobFile = jobFile,
-                            status = "CAPTURE_COMPLETE",
-                            cameraId = cameraId,
-                            width = yuvSize.width,
-                            height = yuvSize.height,
-                            requestedFrames = frameCount,
-                            savedFrames = savedFrames,
-                            frameFiles = savedFrameFiles
+                        postStatus(
+                            "프레임 저장 완료. 센서 tail ${motionTailMs}ms 추가 수집 중...\n" +
+                                    "현재 gyro samples: ${logger?.gyroCount() ?: 0}\n" +
+                                    "현재 rotation samples: ${logger?.rotationVectorCount() ?: 0}"
                         )
 
-                        finish(
-                            "YUV Burst 저장 완료\n" +
-                                    "프레임: $savedFrames 장\n" +
-                                    "job.json 생성 완료\n" +
-                                    "폴더:\n${burstDir.absolutePath}"
-                        )
+                        backgroundHandler.postDelayed({
+                            if (finished) return@postDelayed
+
+                            val savedMotionFiles = saveMotionOnce(burstDir)
+                            val finalLogger = motionLogger
+                            val finalGyroCount = finalLogger?.gyroCount() ?: 0
+                            val finalRotationCount = finalLogger?.rotationVectorCount() ?: 0
+
+                            writeYuvJobJson(
+                                jobFile = jobFile,
+                                status = "CAPTURE_COMPLETE",
+                                cameraId = cameraId,
+                                width = yuvSize.width,
+                                height = yuvSize.height,
+                                requestedFrames = frameCount,
+                                savedFrames = savedFrames,
+                                frameFiles = savedFrameFiles,
+                                frameTimestampsNs = frameTimestampsNs,
+                                gyroFile = savedMotionFiles.first,
+                                rotationVectorFile = savedMotionFiles.second,
+                                gyroSampleCount = finalGyroCount,
+                                rotationVectorSampleCount = finalRotationCount,
+                                motionInfo = motionInfo
+                            )
+
+                            finish(
+                                "YUV Burst + Motion 저장 완료\n" +
+                                        "프레임: $savedFrames 장\n" +
+                                        "motionInfo: $motionInfo\n" +
+                                        "gyro samples: ${finalLogger?.gyroCount() ?: 0}\n" +
+                                        "rotation samples: ${finalLogger?.rotationVectorCount() ?: 0}\n" +
+                                        "job.json / gyro.csv / rotation_vector.csv 생성 시도 완료\n" +
+                                        "폴더:\n${burstDir.absolutePath}"
+                            )
+                        }, motionTailMs)
                     }
                 } catch (e: Exception) {
                     finish("YUV 이미지 저장 실패\n${e.stackTraceToString()}")
                 } finally {
-                    try {
-                        image?.close()
-                    } catch (_: Exception) {}
+                    try { image?.close() } catch (_: Exception) {}
                 }
             },
             backgroundHandler
         )
 
-        cameraManager.openCamera(
-            cameraId,
-            object : CameraDevice.StateCallback() {
-                override fun onOpened(camera: CameraDevice) {
-                    cameraDevice = camera
-                    postStatus("카메라 열림. YUV Burst 세션 생성 중...")
+        postStatus("YUV+Motion 초기화 6/7: 센서 warmup ${motionWarmupMs}ms 후 카메라 열기...")
 
-                    try {
-                        camera.createCaptureSession(
-                            listOf(reader.surface),
-                            object : CameraCaptureSession.StateCallback() {
-                                override fun onConfigured(session: CameraCaptureSession) {
-                                    captureSession = session
-                                    postStatus("YUV Burst 세션 준비 완료. $frameCount 장 촬영 중...")
+        backgroundHandler.postDelayed({
+            if (finished) return@postDelayed
 
-                                    try {
-                                        val requests = List(frameCount) {
-                                            camera.createCaptureRequest(
-                                                CameraDevice.TEMPLATE_STILL_CAPTURE
-                                            ).apply {
-                                                addTarget(reader.surface)
+            postStatus("YUV+Motion 초기화 6/7: 카메라 여는 중...")
 
-                                                set(
-                                                    CaptureRequest.CONTROL_MODE,
-                                                    CaptureRequest.CONTROL_MODE_AUTO
-                                                )
+            cameraManager.openCamera(
+                cameraId,
+                object : CameraDevice.StateCallback() {
+                    override fun onOpened(camera: CameraDevice) {
+                        cameraDevice = camera
+                        postStatus("카메라 열림. YUV Burst 세션 생성 중...")
 
-                                                set(
-                                                    CaptureRequest.CONTROL_AF_MODE,
-                                                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-                                                )
+                        try {
+                            camera.createCaptureSession(
+                                listOf(reader.surface),
+                                object : CameraCaptureSession.StateCallback() {
+                                    override fun onConfigured(session: CameraCaptureSession) {
+                                        captureSession = session
+                                        postStatus("YUV+Motion 초기화 7/7: 세션 준비 완료. $frameCount 장 촬영 중...")
 
-                                                set(
-                                                    CaptureRequest.NOISE_REDUCTION_MODE,
-                                                    CaptureRequest.NOISE_REDUCTION_MODE_OFF
-                                                )
+                                        try {
+                                            val requests = List(frameCount) {
+                                                camera.createCaptureRequest(
+                                                    CameraDevice.TEMPLATE_STILL_CAPTURE
+                                                ).apply {
+                                                    addTarget(reader.surface)
+                                                    set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                                                    set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                                                    set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_OFF)
+                                                    set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
+                                                }.build()
+                                            }
 
-                                                set(
-                                                    CaptureRequest.EDGE_MODE,
-                                                    CaptureRequest.EDGE_MODE_OFF
-                                                )
-                                            }.build()
+                                            session.captureBurst(
+                                                requests,
+                                                object : CameraCaptureSession.CaptureCallback() {},
+                                                backgroundHandler
+                                            )
+                                        } catch (e: Exception) {
+                                            finish("YUV Burst 캡처 요청 실패\n${e.stackTraceToString()}")
                                         }
-
-                                        session.captureBurst(
-                                            requests,
-                                            object : CameraCaptureSession.CaptureCallback() {},
-                                            backgroundHandler
-                                        )
-                                    } catch (e: Exception) {
-                                        finish("YUV Burst 캡처 요청 실패\n${e.stackTraceToString()}")
                                     }
-                                }
 
-                                override fun onConfigureFailed(session: CameraCaptureSession) {
-                                    finish("YUV Burst 세션 구성 실패")
-                                }
-                            },
-                            backgroundHandler
-                        )
-                    } catch (e: Exception) {
-                        finish("YUV Burst 세션 생성 실패\n${e.stackTraceToString()}")
+                                    override fun onConfigureFailed(session: CameraCaptureSession) {
+                                        finish("YUV Burst 세션 구성 실패")
+                                    }
+                                },
+                                backgroundHandler
+                            )
+                        } catch (e: Exception) {
+                            finish("YUV Burst 세션 생성 실패\n${e.stackTraceToString()}")
+                        }
                     }
-                }
 
-                override fun onDisconnected(camera: CameraDevice) {
-                    finish("카메라 연결 해제됨")
-                }
+                    override fun onDisconnected(camera: CameraDevice) {
+                        finish("카메라 연결 해제됨")
+                    }
 
-                override fun onError(camera: CameraDevice, error: Int) {
-                    finish("카메라 오류: $error")
-                }
-            },
-            backgroundHandler
-        )
+                    override fun onError(camera: CameraDevice, error: Int) {
+                        finish("카메라 오류: $error")
+                    }
+                },
+                backgroundHandler
+            )
+        }, motionWarmupMs)
     } catch (e: Exception) {
-        finish("YUV Burst 초기화 실패\n${e.stackTraceToString()}")
+        finish(
+            "YUV Burst + Motion 초기화 실패\n" +
+                    "원인:\n${e.stackTraceToString()}"
+        )
     }
 }
 
@@ -1334,6 +1556,7 @@ fun writeYPlaneCompact(image: Image, outFile: File) {
     val buffer: ByteBuffer = plane.buffer
     val rowStride = plane.rowStride
     val pixelStride = plane.pixelStride
+    val limit = buffer.limit()
 
     FileOutputStream(outFile).use { output ->
         val compactRow = ByteArray(width)
@@ -1343,7 +1566,11 @@ fun writeYPlaneCompact(image: Image, outFile: File) {
 
             for (x in 0 until width) {
                 val index = rowStart + x * pixelStride
-                compactRow[x] = buffer.get(index)
+                compactRow[x] = if (index in 0 until limit) {
+                    buffer.get(index)
+                } else {
+                    0
+                }
             }
 
             output.write(compactRow)
@@ -1439,17 +1666,34 @@ fun writeYuvJobJson(
     height: Int,
     requestedFrames: Int,
     savedFrames: Int,
-    frameFiles: List<String>
+    frameFiles: List<String>,
+    frameTimestampsNs: List<Long>,
+    gyroFile: String?,
+    rotationVectorFile: String?,
+    gyroSampleCount: Int,
+    rotationVectorSampleCount: Int,
+    motionInfo: String
 ) {
     val framesArray = JSONArray()
 
     frameFiles.forEachIndexed { index, fileName ->
-        framesArray.put(
-            JSONObject()
-                .put("index", index)
-                .put("file", fileName)
-        )
+        val frameObject = JSONObject()
+            .put("index", index)
+            .put("file", fileName)
+
+        if (index < frameTimestampsNs.size) {
+            frameObject.put("timestampNs", frameTimestampsNs[index])
+        }
+
+        framesArray.put(frameObject)
     }
+
+    val motionObject = JSONObject()
+        .put("gyroFile", gyroFile ?: JSONObject.NULL)
+        .put("rotationVectorFile", rotationVectorFile ?: JSONObject.NULL)
+        .put("gyroSampleCount", gyroSampleCount)
+        .put("rotationVectorSampleCount", rotationVectorSampleCount)
+        .put("info", motionInfo)
 
     val now = System.currentTimeMillis()
 
@@ -1463,6 +1707,7 @@ fun writeYuvJobJson(
         .put("requestedFrames", requestedFrames)
         .put("savedFrames", savedFrames)
         .put("frames", framesArray)
+        .put("motion", motionObject)
         .put("updatedAt", now)
 
     if (!jobFile.exists()) {
