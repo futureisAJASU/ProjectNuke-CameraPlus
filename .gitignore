@@ -1,0 +1,32 @@
+﻿# Gradle
+.gradle/
+build/
+*/build/
+
+# Android Studio
+.idea/
+*.iml
+
+# Local config
+local.properties
+
+# Kotlin / Java
+*.class
+
+# Generated
+captures/
+.externalNativeBuild/
+.cxx/
+
+# APK / bundles
+*.apk
+*.aab
+*.ap_
+
+# Logs
+*.log
+
+# Kepler generated camera data
+KeplerRaw/
+KeplerRawBurst/
+.processing/
