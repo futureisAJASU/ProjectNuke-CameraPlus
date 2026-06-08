@@ -431,6 +431,12 @@ fun buildCameraReport(context: Context): String {
             val isoRange = c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
             val exposureRange = c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
             val fpsRanges = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            val whiteLevel = c.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL)
+            val blackLevelPattern = c.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)
+            val cfaPattern = c.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
+            val sensorOrientation = c.get(CameraCharacteristics.SENSOR_ORIENTATION)
+            val activeArray = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            val preCorrectionArray = c.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
 
             val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
 
@@ -453,6 +459,12 @@ fun buildCameraReport(context: Context): String {
             sb.appendLine("ISO Range: ${isoRange ?: "unknown"}")
             sb.appendLine("Exposure Time Range: ${exposureRange ?: "unknown"} ns")
             sb.appendLine("AE FPS Ranges: ${fpsRanges?.joinToString() ?: "unknown"}")
+            sb.appendLine("Sensor Orientation: ${sensorOrientation ?: "unknown"}")
+            sb.appendLine("Active Array: ${activeArray ?: "unknown"}")
+            sb.appendLine("Pre-correction Active Array: ${preCorrectionArray ?: "unknown"}")
+            sb.appendLine("RAW White Level: ${whiteLevel ?: "unknown"}")
+            sb.appendLine("RAW Black Level Pattern: ${blackLevelPattern ?: "unknown"}")
+            sb.appendLine("CFA Pattern: ${cfaPattern ?: "unknown"}")
             sb.appendLine()
 
             sb.appendLine("Output Sizes:")
@@ -460,11 +472,20 @@ fun buildCameraReport(context: Context): String {
             sb.appendLine("RAW_SENSOR:")
             sb.appendLine(formatSizes(map?.getOutputSizes(ImageFormat.RAW_SENSOR)))
 
+            sb.appendLine("High-res RAW_SENSOR:")
+            sb.appendLine(formatSizes(map?.getHighResolutionOutputSizes(ImageFormat.RAW_SENSOR)))
+
             sb.appendLine("YUV_420_888:")
             sb.appendLine(formatSizes(map?.getOutputSizes(ImageFormat.YUV_420_888)))
 
+            sb.appendLine("High-res YUV_420_888:")
+            sb.appendLine(formatSizes(map?.getHighResolutionOutputSizes(ImageFormat.YUV_420_888)))
+
             sb.appendLine("JPEG:")
             sb.appendLine(formatSizes(map?.getOutputSizes(ImageFormat.JPEG)))
+
+            sb.appendLine("High-res JPEG:")
+            sb.appendLine(formatSizes(map?.getHighResolutionOutputSizes(ImageFormat.JPEG)))
 
             sb.appendLine("HEIC:")
             sb.appendLine(formatSizes(map?.getOutputSizes(ImageFormat.HEIC)))
@@ -1790,7 +1811,8 @@ fun deleteKeplerCache(context: Context): Int {
     val targets = listOf(
         File(picturesDir, "KeplerRaw"),
         File(picturesDir, "KeplerRawBurst"),
-        File(picturesDir, "KeplerYuvBurst")
+        File(picturesDir, "KeplerYuvBurst"),
+        File(picturesDir, "KeplerColorBurst")
     )
 
     var deletedCount = 0
