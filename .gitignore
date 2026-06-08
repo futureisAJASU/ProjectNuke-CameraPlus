@@ -13,10 +13,10 @@ local.properties
 # Kotlin / Java
 *.class
 
-# Generated
-captures/
-.externalNativeBuild/
+# Native / generated build
 .cxx/
+.externalNativeBuild/
+app/.cxx/
 
 # APK / bundles
 *.apk
@@ -27,6 +27,9 @@ captures/
 *.log
 
 # Kepler generated camera data
+captures/
 KeplerRaw/
 KeplerRawBurst/
+KeplerRawFusion/
+KeplerColorBurst/
 .processing/

@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Handler
 import android.os.Looper
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -31,13 +32,17 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
@@ -58,13 +63,53 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.delay
 import org.json.JSONObject
 import java.io.File
+import kotlin.math.roundToInt
 
 data class LatestKeplerResult(
     val bitmap: Bitmap?,
     val summary: String
 )
+
+data class ZoomUiState(
+    val zoomRatio: Float = 1.0f,
+    val minZoom: Float = 0.6f,
+    val maxZoom: Float = 3.0f,
+    val lensSlot: LensSlot = LensSlot.MAIN_1X,
+    val useOpticalTeleAt3x: Boolean = true
+)
+
+fun lensSlotForZoomRatio(zoomRatio: Float): LensSlot {
+    return when {
+        zoomRatio < 0.85f -> LensSlot.ULTRAWIDE
+        zoomRatio < 1.5f -> LensSlot.MAIN_1X
+        zoomRatio < 2.7f -> LensSlot.MAIN_2X
+        else -> LensSlot.THREE_X
+    }
+}
+
+private fun lensSlotForZoomRatioHysteresis(
+    zoomRatio: Float,
+    current: LensSlot,
+    useOpticalTeleAt3x: Boolean
+): LensSlot {
+    return when (current) {
+        LensSlot.ULTRAWIDE -> if (zoomRatio > 0.85f) LensSlot.MAIN_1X else LensSlot.ULTRAWIDE
+        LensSlot.MAIN_1X -> when {
+            zoomRatio < 0.75f -> LensSlot.ULTRAWIDE
+            zoomRatio >= 1.5f -> LensSlot.MAIN_2X
+            else -> LensSlot.MAIN_1X
+        }
+        LensSlot.MAIN_2X -> when {
+            zoomRatio < 1.35f -> LensSlot.MAIN_1X
+            zoomRatio >= 2.9f && useOpticalTeleAt3x -> LensSlot.THREE_X
+            else -> LensSlot.MAIN_2X
+        }
+        LensSlot.THREE_X -> if (zoomRatio < 2.7f) LensSlot.MAIN_2X else LensSlot.THREE_X
+    }
+}
 
 private val KeplerDarkScheme = darkColorScheme(
     background = Color.Black,
@@ -74,6 +119,96 @@ private val KeplerDarkScheme = darkColorScheme(
     onBackground = Color.White,
     onSurface = Color.White
 )
+
+private enum class MainScreen {
+    CAMERA,
+    SETTINGS
+}
+
+private val progressPairRegex = Regex("(saved|images|results)\\s+(\\d+)\\s*/\\s*(\\d+)", RegexOption.IGNORE_CASE)
+private val usedFramesRegex = Regex("Used\\s+(\\d+)\\s*/\\s*(\\d+)\\s+frames", RegexOption.IGNORE_CASE)
+private val yuvSavedRegex = Regex("YUV capture:\\s*saved\\s+(\\d+)\\s*/\\s*(\\d+)", RegexOption.IGNORE_CASE)
+private val colorSavedRegex = Regex("Color frame saved\\s+(\\d+)\\s*/\\s*(\\d+)", RegexOption.IGNORE_CASE)
+
+fun parseCaptureProgress(
+    text: String,
+    fallback: CaptureProgressState
+): CaptureProgressState {
+    val lower = text.lowercase()
+    val stage = when {
+        text.contains("CAPTURE_TIMEOUT", ignoreCase = true) ||
+            text.contains("PROCESS_TIMEOUT", ignoreCase = true) ||
+            text.contains("EXPORT_TIMEOUT", ignoreCase = true) ||
+            lower.contains("timeout") -> CaptureStage.TIMEOUT
+        text.contains("PIPELINE_FAILED", ignoreCase = true) ||
+            lower.contains("failed") ||
+            text.contains("실패") ||
+            text.contains("오류") -> CaptureStage.FAILED
+        text.contains("PIPELINE_COMPLETE", ignoreCase = true) ||
+            text.contains("완료") ||
+            lower.contains("saved to gallery") -> CaptureStage.COMPLETE
+        lower.contains("cleanup") || lower.contains("cleaning") -> CaptureStage.CLEANING
+        lower.contains("verifying") || lower.contains("verification") -> CaptureStage.VERIFYING
+        lower.contains("exporting") || lower.contains("export ") -> CaptureStage.EXPORTING
+        lower.contains("demosaic") -> CaptureStage.DEMOSAICING
+        text.contains("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true) ||
+            lower.contains("processing") || lower.contains("merging") || lower.contains("loading frames") -> CaptureStage.PROCESSING
+        lower.contains("capture") || lower.contains("capturing") || lower.contains("frame saved") -> CaptureStage.CAPTURING
+        lower.contains("prepar") || text.contains("준비") || text.contains("초기화") -> CaptureStage.PREPARING
+        else -> fallback.stage
+    }
+
+    var requested = fallback.requestedFrames
+    var saved = fallback.savedFrames
+    var images = fallback.receivedImages
+    var results = fallback.completedResults
+
+    progressPairRegex.findAll(text).forEach { match ->
+        val value = match.groupValues[2].toIntOrNull() ?: return@forEach
+        val total = match.groupValues[3].toIntOrNull() ?: return@forEach
+        requested = total
+        when (match.groupValues[1].lowercase()) {
+            "saved" -> saved = value
+            "images" -> images = value
+            "results" -> results = value
+        }
+    }
+
+    listOf(yuvSavedRegex, colorSavedRegex).forEach { regex ->
+        regex.find(text)?.let { match ->
+            saved = match.groupValues[1].toIntOrNull() ?: saved
+            requested = match.groupValues[2].toIntOrNull() ?: requested
+        }
+    }
+    usedFramesRegex.find(text)?.let { match ->
+        saved = match.groupValues[1].toIntOrNull() ?: saved
+        requested = match.groupValues[2].toIntOrNull() ?: requested
+    }
+
+    val progress = when (stage) {
+        CaptureStage.IDLE -> 0f
+        CaptureStage.PREPARING -> 0.05f
+        CaptureStage.CAPTURING -> if (requested > 0) saved.toFloat() / requested.toFloat() else fallback.progressPercent
+        CaptureStage.PROCESSING -> 0.65f
+        CaptureStage.DEMOSAICING -> 0.75f
+        CaptureStage.EXPORTING -> 0.85f
+        CaptureStage.VERIFYING -> 0.92f
+        CaptureStage.CLEANING -> 0.97f
+        CaptureStage.COMPLETE,
+        CaptureStage.FAILED,
+        CaptureStage.TIMEOUT -> 1f
+    }.coerceIn(0f, 1f)
+
+    return fallback.copy(
+        stage = stage,
+        message = text.lineSequence().firstOrNull()?.trim().orEmpty().ifBlank { fallback.message },
+        requestedFrames = requested,
+        savedFrames = saved,
+        receivedImages = images,
+        completedResults = results,
+        progressPercent = progress
+    )
+}
 
 @Composable
 fun KeplerAppRoot() {
@@ -187,14 +322,19 @@ fun MainCameraScreen(
     var status by remember { mutableStateOf("대기 중") }
     var previewEnabled by remember { mutableStateOf(true) }
     var isCapturing by remember { mutableStateOf(false) }
-    var showSettings by remember { mutableStateOf(false) }
+    var currentScreen by remember { mutableStateOf(MainScreen.CAMERA) }
+    var captureProgress by remember { mutableStateOf(CaptureProgressState()) }
 
     var selectedMode by remember { mutableStateOf("사진") }
     var selectedResolution by remember { mutableStateOf(CaptureResolutionMode.MP12) }
     var selectedLensSlot by remember { mutableStateOf(LensSlot.MAIN_1X) }
     var selectedThreeXSource by remember { mutableStateOf(ThreeXSourceMode.OPTICAL) }
+    var zoomUiState by remember { mutableStateOf(ZoomUiState()) }
     var pipelineMode by remember { mutableStateOf(PipelineMode.RAW_NIGHT_FUSION) }
+    var finalOutputFormat by remember { mutableStateOf(OutputSettingsStore.load(context)) }
     var focusAeState by remember { mutableStateOf(FocusAeState()) }
+    var showFocusAeControls by remember { mutableStateOf(false) }
+    var focusAeUiNonce by remember { mutableStateOf(0) }
     var overlaySettings by remember {
         mutableStateOf(UiOverlaySettingsStore.load(context))
     }
@@ -219,13 +359,42 @@ fun MainCameraScreen(
         resolutionMode = selectedResolution,
         threeXSourceMode = selectedThreeXSource
     )
-    val cameraSelection = remember(selectedLensSlot, selectedResolution, selectedThreeXSource) {
-        selectCameraForOptions(context, options)
+    val cameraSelection = remember(selectedLensSlot, selectedThreeXSource) {
+        selectCameraForOptions(
+            context,
+            SelectedCaptureOptions(
+                lensSlot = selectedLensSlot,
+                resolutionMode = CaptureResolutionMode.MP12,
+                threeXSourceMode = selectedThreeXSource
+            )
+        )
+    }
+    val resolutionCapability = remember(cameraSelection.cameraId, selectedLensSlot, selectedThreeXSource) {
+        runCatching {
+            queryCameraResolutionCapability(context, cameraSelection.cameraId, selectedLensSlot)
+        }.getOrNull()
+    }
+    val resolutionPlans = remember(selectedLensSlot, selectedThreeXSource, pipelineMode, resolutionCapability) {
+        resolutionCapability
+            ?.let { buildResolutionCapturePlans(selectedLensSlot, selectedThreeXSource, pipelineMode, it) }
+            .orEmpty()
+    }
+    val allowedResolutionModes = remember(resolutionPlans) {
+        resolutionPlans
+            .filter { it.isAvailable }
+            .map { it.requestedMode }
+            .ifEmpty { listOf(CaptureResolutionMode.MP12) }
+    }
+    val selectedResolutionPlan = remember(selectedResolution, resolutionPlans) {
+        resolutionPlans.firstOrNull { it.requestedMode == selectedResolution && it.isAvailable }
+            ?: resolutionPlans.firstOrNull { it.requestedMode == CaptureResolutionMode.MP12 }
     }
     val previewZoomRatio = if (cameraSelection.useCrop) {
-        cameraSelection.effectiveZoomRatio
-    } else {
+        zoomUiState.zoomRatio.coerceIn(1.0f, zoomUiState.maxZoom)
+    } else if (selectedLensSlot == LensSlot.THREE_X && selectedThreeXSource == ThreeXSourceMode.OPTICAL) {
         1.0f
+    } else {
+        zoomUiState.zoomRatio
     }
     val levelState = rememberDeviceLevelState(enabled = overlaySettings.showLevel)
 
@@ -233,7 +402,7 @@ fun MainCameraScreen(
     var latestSummary by remember { mutableStateOf("최근 결과 없음") }
 
     fun refreshLatestResult() {
-        val result = loadLatestKeplerResult(context)
+        val result = loadLatestKeplerResultV2(context)
         latestBitmap = result.bitmap
         latestSummary = result.summary
         val estimate = estimateLatestColorBurstScene(context)
@@ -243,6 +412,20 @@ fun MainCameraScreen(
 
     LaunchedEffect(Unit) {
         refreshLatestResult()
+    }
+
+    LaunchedEffect(focusAeUiNonce, focusAeState.locked) {
+        if (showFocusAeControls) {
+            delay(2_000L)
+            showFocusAeControls = false
+        }
+    }
+
+    LaunchedEffect(selectedLensSlot, selectedThreeXSource, allowedResolutionModes) {
+        if (selectedResolution !in allowedResolutionModes) {
+            selectedResolution = CaptureResolutionMode.MP12
+            status = "Resolution changed to 12M: selected lens does not support current mode."
+        }
     }
 
     LaunchedEffect(frameCountMode, autoMinFrames, autoMaxFrames, manualFrames, selectedMode, latestSceneLuma, latestMotionScore) {
@@ -261,7 +444,14 @@ fun MainCameraScreen(
     }
 
     fun isTerminalStatus(text: String): Boolean {
-        return text.contains("완료") ||
+        return text.contains("PIPELINE_COMPLETE", ignoreCase = true) ||
+                text.contains("PIPELINE_FAILED", ignoreCase = true) ||
+                text.contains("CAPTURE_TIMEOUT", ignoreCase = true) ||
+                text.contains("PROCESS_TIMEOUT", ignoreCase = true) ||
+                text.contains("EXPORT_TIMEOUT", ignoreCase = true) ||
+                text.contains("timeout", ignoreCase = true) ||
+                text.contains("failed", ignoreCase = true) ||
+                text.contains("완료") ||
                 text.contains("실패") ||
                 text.contains("오류") ||
                 text.contains("연결 해제")
@@ -271,36 +461,68 @@ fun MainCameraScreen(
         return text.lineSequence().firstOrNull()?.trim()?.take(42) ?: "대기 중"
     }
 
+    fun applyZoomRatio(newZoom: Float, explicitLensSlot: LensSlot? = null) {
+        val clamped = newZoom.coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
+        val nextSlot = explicitLensSlot ?: lensSlotForZoomRatioHysteresis(
+            zoomRatio = clamped,
+            current = selectedLensSlot,
+            useOpticalTeleAt3x = selectedThreeXSource == ThreeXSourceMode.OPTICAL
+        )
+        val displayZoom = (clamped * 10f).roundToInt() / 10f
+        zoomUiState = zoomUiState.copy(
+            zoomRatio = clamped,
+            lensSlot = nextSlot,
+            useOpticalTeleAt3x = selectedThreeXSource == ThreeXSourceMode.OPTICAL
+        )
+        if (nextSlot != selectedLensSlot) {
+            selectedLensSlot = nextSlot
+        }
+        status = "Zoom ${"%.1f".format(displayZoom)}x"
+    }
+
     fun runCameraJob(
         startMessage: String,
+        requestedFrames: Int = 0,
+        timeoutMillis: Long = 120_000L,
         job: ((String) -> Unit) -> Unit
     ) {
         status = startMessage
         isCapturing = true
         previewEnabled = false
+        captureProgress = CaptureProgressState(
+            stage = CaptureStage.PREPARING,
+            message = "Preparing capture...",
+            requestedFrames = requestedFrames,
+            progressPercent = 0.05f
+        )
+        val watchdog = Runnable {
+            val timeoutStatus = "CAPTURE_TIMEOUT: Capture timeout. Preview recovered."
+            status = timeoutStatus
+            captureProgress = parseCaptureProgress(timeoutStatus, captureProgress)
+            isCapturing = false
+            previewEnabled = true
+        }
+        mainHandler.postDelayed(watchdog, timeoutMillis)
+
+        fun finishIfTerminal(newStatus: String) {
+            captureProgress = parseCaptureProgress(newStatus, captureProgress)
+            if (isTerminalStatus(newStatus)) {
+                mainHandler.removeCallbacks(watchdog)
+                isCapturing = false
+                refreshLatestResult()
+
+                mainHandler.postDelayed(
+                    { previewEnabled = true },
+                    250L
+                )
+            }
+        }
 
         mainHandler.postDelayed(
             {
                 job { newStatus ->
                     status = newStatus
-
-                    if (isTerminalStatus(newStatus)) {
-                        isCapturing = false
-                        refreshLatestResult()
-
-                        mainHandler.postDelayed(
-                            { previewEnabled = true },
-                            250L
-                        )
-                    }
-                    if (newStatus.contains("Saved to Gallery", ignoreCase = true)) {
-                        isCapturing = false
-                        refreshLatestResult()
-                        mainHandler.postDelayed(
-                            { previewEnabled = true },
-                            250L
-                        )
-                    }
+                    finishIfTerminal(newStatus)
                 }
             },
             250L
@@ -321,17 +543,28 @@ fun MainCameraScreen(
             CameraTopBar(
                 status = shortStatus(status),
                 selectedResolution = selectedResolution,
+                allowedResolutionModes = allowedResolutionModes,
+                onHideFocusAeControls = { showFocusAeControls = false },
                 onResolutionClick = {
-                    val next = when (selectedResolution) {
-                        CaptureResolutionMode.MP12 -> CaptureResolutionMode.MP24_FUSION
-                        CaptureResolutionMode.MP24_FUSION -> CaptureResolutionMode.MP50
-                        CaptureResolutionMode.MP50 -> CaptureResolutionMode.MP12
+                    val modes = allowedResolutionModes.ifEmpty { listOf(CaptureResolutionMode.MP12) }
+                    val capabilityText = resolutionCapability?.let {
+                        "${selectedLensSlot.label} cameraId=${it.cameraId} ultra=${it.supportsUltraHighResolution} maxRAW=${"%.1f".format(it.maxAvailableRawMp)}MP maxYUV=${"%.1f".format(it.maxAvailableYuvMp)}MP maxJPEG=${"%.1f".format(it.maxAvailableJpegMp)}MP modes=${modes.joinToString { mode -> mode.label }}"
+                    } ?: "Resolution capability unavailable."
+                    if (modes.size <= 1) {
+                        val reason = resolutionPlans
+                            .firstOrNull { it.requestedMode != CaptureResolutionMode.MP12 && !it.isAvailable }
+                            ?.reason
+                            ?: "no 50MP RAW/YUV/JPEG stream exposed for selected main camera."
+                        status = "Only 12M: $reason $capabilityText"
+                    } else {
+                        val index = modes.indexOf(selectedResolution).coerceAtLeast(0)
+                        val next = modes[(index + 1) % modes.size]
+                        selectedResolution = next
+                        status = "Resolution: ${next.label}. $capabilityText"
                     }
-                    selectedResolution = next
-                    status = "Resolution: ${next.label}"
                 },
                 onSettings = {
-                    showSettings = true
+                    currentScreen = MainScreen.SETTINGS
                 }
             )
             Box(
@@ -347,6 +580,8 @@ fun MainCameraScreen(
                                 point = NormalizedPoint(x, y),
                                 locked = false
                             )
+                            showFocusAeControls = true
+                            focusAeUiNonce++
                             status = "AF/AE point set"
                         }
                     },
@@ -387,23 +622,29 @@ fun MainCameraScreen(
                     )
                 }
 
-                FocusAeOverlay(
-                    focusAeState = focusAeState,
-                    onToggleLock = {
-                        val locked = !focusAeState.locked
-                        focusAeState = focusAeState.copy(locked = locked)
-                        status = if (locked) "AF/AE locked" else "AF/AE unlocked"
-                    },
-                    onExposureStep = { delta ->
-                        val index = (focusAeState.exposureCompensationIndex + delta)
-                            .coerceIn(focusAeState.supportedMinIndex, focusAeState.supportedMaxIndex)
-                        focusAeState = focusAeState.copy(
-                            exposureCompensationIndex = index,
-                            exposureCompensationEv = index * focusAeState.exposureStepEv
-                        )
-                        status = "EV ${"%.1f".format(index * focusAeState.exposureStepEv)}"
-                    }
-                )
+                if (focusAeState.point != null && showFocusAeControls) {
+                    FocusAeOverlay(
+                        focusAeState = focusAeState,
+                        onToggleLock = {
+                            val locked = !focusAeState.locked
+                            focusAeState = focusAeState.copy(locked = locked)
+                            showFocusAeControls = true
+                            focusAeUiNonce++
+                            status = if (locked) "AF/AE locked" else "AF/AE unlocked"
+                        },
+                        onExposureStep = { delta ->
+                            val index = (focusAeState.exposureCompensationIndex + delta)
+                                .coerceIn(focusAeState.supportedMinIndex, focusAeState.supportedMaxIndex)
+                            focusAeState = focusAeState.copy(
+                                exposureCompensationIndex = index,
+                                exposureCompensationEv = index * focusAeState.exposureStepEv
+                            )
+                            showFocusAeControls = true
+                            focusAeUiNonce++
+                            status = "EV ${"%.1f".format(index * focusAeState.exposureStepEv)}"
+                        }
+                    )
+                }
 
                 if (!previewEnabled) {
                     Box(
@@ -425,7 +666,13 @@ fun MainCameraScreen(
                 latestBitmap = latestBitmap,
                 selectedLensSlot = selectedLensSlot,
                 onLensSlotChange = { lensSlot ->
-                    selectedLensSlot = lensSlot
+                    applyZoomRatio(
+                        newZoom = lensSlot.targetZoomRatio.coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom),
+                        explicitLensSlot = lensSlot
+                    )
+                    if (lensSlot == LensSlot.ULTRAWIDE || (lensSlot == LensSlot.THREE_X && selectedThreeXSource == ThreeXSourceMode.OPTICAL)) {
+                        selectedResolution = CaptureResolutionMode.MP12
+                    }
                     val updatedSelection = selectCameraForOptions(
                         context,
                         options.copy(lensSlot = lensSlot)
@@ -435,6 +682,10 @@ fun MainCameraScreen(
                 selectedThreeXSource = selectedThreeXSource,
                 onThreeXSourceChange = { source ->
                     selectedThreeXSource = source
+                    zoomUiState = zoomUiState.copy(useOpticalTeleAt3x = source == ThreeXSourceMode.OPTICAL)
+                    if (source == ThreeXSourceMode.OPTICAL) {
+                        selectedResolution = CaptureResolutionMode.MP12
+                    }
                     val updatedOptions = options.copy(
                         lensSlot = LensSlot.THREE_X,
                         threeXSourceMode = source
@@ -445,9 +696,13 @@ fun MainCameraScreen(
                 frameCountMode = frameCountMode,
                 latestFramePlan = latestFramePlan,
                 pipelineMode = pipelineMode,
+                zoomUiState = zoomUiState,
+                onZoomRatioChange = { applyZoomRatio(it) },
                 selectedMode = selectedMode,
                 onModeChange = { selectedMode = it },
                 isCapturing = isCapturing,
+                captureProgress = captureProgress,
+                onHideFocusAeControls = { showFocusAeControls = false },
                 onCapture = {
                     val settings = currentFrameCountSettings(
                         mode = frameCountMode,
@@ -463,13 +718,19 @@ fun MainCameraScreen(
                     )
                     latestFramePlan = plan
                     val selection = selectCameraForOptions(context, options)
-                    val captureZoomRatio = if (selection.useCrop) {
-                        selection.effectiveZoomRatio
-                    } else {
+                    val captureZoomRatio = if (
+                        selectedLensSlot == LensSlot.THREE_X &&
+                        selectedThreeXSource == ThreeXSourceMode.OPTICAL &&
+                        !selection.useCrop
+                    ) {
                         1.0f
+                    } else {
+                        zoomUiState.zoomRatio.coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
                     }
                     runCameraJob(
-                        "Night Fusion ${selectedLensSlot.label} ${selectedResolution.label} cameraId=${selection.cameraId}, zoom=${captureZoomRatio}x. Frame mode: ${settings.mode.label}, capture frames: ${plan.framesToCapture}, auto max: ${plan.maxFrames}. ${plan.reason}. ${selection.note}"
+                        startMessage = "Night Fusion ${selectedLensSlot.label} ${selectedResolution.label} cameraId=${selection.cameraId}, zoom=${captureZoomRatio}x. ${selectedResolutionPlan?.reason.orEmpty()} Frame mode: ${settings.mode.label}, capture frames: ${plan.framesToCapture}, auto max: ${plan.maxFrames}. ${plan.reason}. ${selection.note}",
+                        requestedFrames = plan.framesToCapture,
+                        timeoutMillis = if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) 120_000L else 60_000L
                     ) { callback ->
                         if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
                             captureProcessExportRawNightFusion(
@@ -477,6 +738,7 @@ fun MainCameraScreen(
                                 cameraId = selection.cameraId,
                                 frameCount = plan.framesToCapture,
                                 resolutionMode = selectedResolution,
+                                finalOutputFormat = finalOutputFormat,
                                 zoomRatio = captureZoomRatio,
                                 focusAeState = focusAeState,
                                 cleanupPolicy = CacheCleanupPolicy.KEEP_ALL,
@@ -488,6 +750,7 @@ fun MainCameraScreen(
                                 cameraId = selection.cameraId,
                                 frameCount = plan.framesToCapture,
                                 resolutionMode = selectedResolution,
+                                finalOutputFormat = finalOutputFormat,
                                 zoomRatio = captureZoomRatio,
                                 focusAeState = focusAeState,
                                 cleanupPolicy = CacheCleanupPolicy.DELETE_SOURCE_FRAMES_AFTER_VERIFIED_EXPORT,
@@ -515,7 +778,7 @@ fun MainCameraScreen(
                     }
                 },
                 onRaw = {
-                    runCameraJob("RAW DNG 촬영 준비 중...") { callback ->
+                    runCameraJob("RAW DNG 촬영 준비 중...", requestedFrames = 1) { callback ->
                         captureSingleRawDng(
                             context = context,
                             cameraId = "0",
@@ -524,7 +787,7 @@ fun MainCameraScreen(
                     }
                 },
                 onRawBurst = {
-                    runCameraJob("RAW Burst 촬영 준비 중...") { callback ->
+                    runCameraJob("RAW Burst 촬영 준비 중...", requestedFrames = 4) { callback ->
                         captureRawBurstDng(
                             context = context,
                             cameraId = "0",
@@ -546,8 +809,8 @@ fun MainCameraScreen(
             )
         }
 
-        if (showSettings) {
-            SettingsOverlay(
+        if (currentScreen == MainScreen.SETTINGS) {
+            SettingsScreen(
                 frameCountMode = frameCountMode,
                 onFrameCountModeChange = { frameCountMode = it },
                 autoMinFrames = autoMinFrames,
@@ -565,6 +828,12 @@ fun MainCameraScreen(
                 latestFramePlan = latestFramePlan,
                 pipelineMode = pipelineMode,
                 onPipelineModeChange = { pipelineMode = it },
+                finalOutputFormat = finalOutputFormat,
+                onFinalOutputFormatChange = { newFormat ->
+                    finalOutputFormat = newFormat
+                    OutputSettingsStore.save(context, newFormat)
+                    status = "Output: ${newFormat.label}"
+                },
                 overlaySettings = overlaySettings,
                 onOverlaySettingsChange = { newSettings ->
                     overlaySettings = newSettings
@@ -577,11 +846,11 @@ fun MainCameraScreen(
                         exposureCompensationIndex = 0,
                         exposureCompensationEv = 0f
                     )
+                    showFocusAeControls = false
                     status = "AF/AE reset"
-                    showSettings = false
                 },
                 onRaw = {
-                    showSettings = false
+                    currentScreen = MainScreen.CAMERA
                     runCameraJob("RAW DNG capture preparing...") { callback ->
                         captureSingleRawDng(
                             context = context,
@@ -591,7 +860,7 @@ fun MainCameraScreen(
                     }
                 },
                 onRawBurst = {
-                    showSettings = false
+                    currentScreen = MainScreen.CAMERA
                     runCameraJob("RAW Burst capture preparing...") { callback ->
                         captureRawBurstDng(
                             context = context,
@@ -601,15 +870,44 @@ fun MainCameraScreen(
                         )
                     }
                 },
-                onDismiss = {
-                    showSettings = false
+                onTest50MRaw = {
+                    currentScreen = MainScreen.CAMERA
+                    val mainSelection = selectCameraForOptions(
+                        context,
+                        SelectedCaptureOptions(LensSlot.MAIN_1X, CaptureResolutionMode.MP50, ThreeXSourceMode.MAIN_CROP)
+                    )
+                    runCameraJob("Test 50M RAW Capture: cameraId=${mainSelection.cameraId}", requestedFrames = 1) { callback ->
+                        captureRawBurstForFusion(
+                            context = context,
+                            cameraId = mainSelection.cameraId,
+                            frameCount = 1,
+                            resolutionMode = CaptureResolutionMode.MP50,
+                            zoomRatio = 1.0f,
+                            focusAeState = focusAeState,
+                            onStatus = callback,
+                            onComplete = { jobDir ->
+                                val job = JSONObject(File(jobDir, "job.json").readText())
+                                callback(
+                                    "PIPELINE_COMPLETE: Test 50M RAW Capture success. cameraId=${mainSelection.cameraId}, size=${job.optInt("rawWidth")}x${job.optInt("rawHeight")} ${"%.1f".format(job.optInt("rawWidth") * job.optInt("rawHeight") / 1_000_000.0)}MP, source=${job.optString("rawSizeSource")}, maxPixelMode=${job.optBoolean("requiresMaximumResolutionPixelMode")}, job=${jobDir.name}"
+                                )
+                            },
+                            onError = { callback("PIPELINE_FAILED: Test 50M RAW Capture failed. $it") }
+                        )
+                    }
+                },
+                onPrintResolutionReport = {
+                    status = buildResolutionCapabilityReport(context)
+                    currentScreen = MainScreen.CAMERA
+                },
+                onBack = {
+                    currentScreen = MainScreen.CAMERA
                 },
                 onOpenDebug = {
-                    showSettings = false
+                    currentScreen = MainScreen.CAMERA
                     onOpenDebug()
                 },
                 onOpenCacheJobs = {
-                    showSettings = false
+                    currentScreen = MainScreen.CAMERA
                     onOpenCacheJobs()
                 },
                 onClearCache = {
@@ -617,7 +915,7 @@ fun MainCameraScreen(
                     latestBitmap = null
                     latestSummary = "최근 결과 없음"
                     status = "캐시 삭제 완료 ($deleted)"
-                    showSettings = false
+                    currentScreen = MainScreen.CAMERA
                 }
             )
         }
@@ -628,6 +926,8 @@ fun MainCameraScreen(
 fun CameraTopBar(
     status: String,
     selectedResolution: CaptureResolutionMode,
+    allowedResolutionModes: List<CaptureResolutionMode>,
+    onHideFocusAeControls: () -> Unit,
     onResolutionClick: () -> Unit,
     onSettings: () -> Unit
 ) {
@@ -648,20 +948,25 @@ fun CameraTopBar(
                 onClick = onSettings
             )
 
-            Spacer(modifier = Modifier.weight(1f))
+            Spacer(
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable(onClick = onHideFocusAeControls)
+            )
 
             Row(
                 horizontalArrangement = Arrangement.spacedBy(24.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                TopIcon("×")
                 TopText(
-                    text = selectedResolution.label,
+                    text = when (selectedResolution) {
+                        CaptureResolutionMode.MP24_FUSION -> "24M Fusion"
+                        else -> selectedResolution.label
+                    },
                     onClick = onResolutionClick
                 )
                 TopIcon("◷")
                 TopIcon("☾")
-                TopIcon("☺")
             }
         }
 
@@ -704,11 +1009,7 @@ fun CircleMiniButton(
 
 @Composable
 fun TopIcon(text: String) {
-    Text(
-        text = text,
-        color = Color.White,
-        style = MaterialTheme.typography.titleLarge
-    )
+    Spacer(modifier = Modifier.size(0.dp))
 }
 
 @Composable
@@ -803,9 +1104,13 @@ fun CameraBottomPanel(
     frameCountMode: FrameCountMode,
     latestFramePlan: FramePlan,
     pipelineMode: PipelineMode,
+    zoomUiState: ZoomUiState,
+    onZoomRatioChange: (Float) -> Unit,
     selectedMode: String,
     onModeChange: (String) -> Unit,
     isCapturing: Boolean,
+    captureProgress: CaptureProgressState,
+    onHideFocusAeControls: () -> Unit,
     onCapture: () -> Unit,
     onAverage: () -> Unit,
     onRaw: () -> Unit,
@@ -841,6 +1146,24 @@ fun CameraBottomPanel(
             }
         }
 
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text(
+                text = "${"%.1f".format(zoomUiState.zoomRatio)}x",
+                color = Color.White.copy(alpha = 0.72f),
+                style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier.align(Alignment.CenterHorizontally)
+            )
+            Slider(
+                value = zoomUiState.zoomRatio,
+                onValueChange = onZoomRatioChange,
+                valueRange = zoomUiState.minZoom..zoomUiState.maxZoom,
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+
         Text(
             text = if (frameCountMode == FrameCountMode.AUTO) {
                 "${pipelineMode.label}  |  Auto: ${latestFramePlan.framesToCapture} / ${latestFramePlan.maxFrames} frames"
@@ -852,6 +1175,10 @@ fun CameraBottomPanel(
             modifier = Modifier.align(Alignment.CenterHorizontally)
         )
 
+        if (isCapturing) {
+            CaptureProgressRow(captureProgress = captureProgress)
+        }
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
@@ -861,14 +1188,24 @@ fun CameraBottomPanel(
                 onClick = onThumbnail
             )
 
-            Spacer(modifier = Modifier.weight(1f))
+            Spacer(
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable(onClick = onHideFocusAeControls)
+            )
 
             ShutterButton(
                 enabled = !isCapturing,
+                isCapturing = isCapturing,
+                progress = captureProgress.progressPercent,
                 onClick = onCapture
             )
 
-            Spacer(modifier = Modifier.weight(1f))
+            Spacer(
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable(onClick = onHideFocusAeControls)
+            )
 
             CameraSwitchButton(
                 enabled = !isCapturing,
@@ -908,6 +1245,88 @@ fun CameraBottomPanel(
             )
         }
         }
+    }
+}
+
+@Composable
+fun CaptureProgressRow(
+    captureProgress: CaptureProgressState
+) {
+    val stageText = when (captureProgress.stage) {
+        CaptureStage.IDLE -> "Ready"
+        CaptureStage.PREPARING -> "Preparing"
+        CaptureStage.CAPTURING -> "Capturing"
+        CaptureStage.PROCESSING -> "Processing"
+        CaptureStage.DEMOSAICING -> "Demosaicing"
+        CaptureStage.EXPORTING -> "Exporting"
+        CaptureStage.VERIFYING -> "Verifying"
+        CaptureStage.CLEANING -> "Cleaning"
+        CaptureStage.COMPLETE -> "Complete"
+        CaptureStage.FAILED -> "Failed"
+        CaptureStage.TIMEOUT -> "Timeout"
+    }
+    val frameText = if (captureProgress.requestedFrames > 0) {
+        "${captureProgress.savedFrames} / ${captureProgress.requestedFrames}"
+    } else {
+        ""
+    }
+    val detailText = buildString {
+        if (captureProgress.receivedImages > 0 || captureProgress.completedResults > 0) {
+            append("Images ${captureProgress.receivedImages}")
+            if (captureProgress.requestedFrames > 0) append(" / ${captureProgress.requestedFrames}")
+            append(" · Results ${captureProgress.completedResults}")
+            if (captureProgress.requestedFrames > 0) append(" / ${captureProgress.requestedFrames}")
+        } else {
+            append(captureProgress.message)
+        }
+    }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = listOf(stageText, frameText).filter { it.isNotBlank() }.joinToString(" "),
+                color = Color.White,
+                style = MaterialTheme.typography.labelLarge,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = "${(captureProgress.progressPercent * 100).toInt()}%",
+                color = Color.White.copy(alpha = 0.68f),
+                style = MaterialTheme.typography.labelMedium
+            )
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(6.dp)
+                .clip(RoundedCornerShape(999.dp))
+                .background(Color.White.copy(alpha = 0.18f))
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth(captureProgress.progressPercent.coerceIn(0f, 1f))
+                    .height(6.dp)
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(Color.White)
+            )
+        }
+
+        Text(
+            text = detailText,
+            color = Color.White.copy(alpha = 0.62f),
+            style = MaterialTheme.typography.labelSmall,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }
 
@@ -1016,21 +1435,23 @@ fun ModeTabs(
 @Composable
 fun ShutterButton(
     enabled: Boolean,
+    isCapturing: Boolean,
+    progress: Float,
     onClick: () -> Unit
 ) {
     Box(
         modifier = Modifier
-            .size(92.dp)
+            .size(96.dp)
             .clip(CircleShape)
-            .background(Color.White.copy(alpha = if (enabled) 0.16f else 0.07f))
-            .clickable(enabled = enabled, onClick = onClick),
+            .background(Color.White.copy(alpha = if (enabled) 0.18f else 0.08f))
+            .clickable(enabled = enabled && !isCapturing, onClick = onClick),
         contentAlignment = Alignment.Center
     ) {
         Box(
             modifier = Modifier
                 .size(74.dp)
                 .clip(CircleShape)
-                .background(if (enabled) Color.White else Color(0xFF74747A))
+                .background(if (enabled && !isCapturing) Color.White else Color(0xFFB8B8B8))
         )
     }
 }
@@ -1134,7 +1555,7 @@ fun RuleOfThirdsGridOverlay(
 }
 
 @Composable
-fun SettingsOverlay(
+fun SettingsScreen(
     frameCountMode: FrameCountMode,
     onFrameCountModeChange: (FrameCountMode) -> Unit,
     autoMinFrames: Int,
@@ -1146,30 +1567,58 @@ fun SettingsOverlay(
     latestFramePlan: FramePlan,
     pipelineMode: PipelineMode,
     onPipelineModeChange: (PipelineMode) -> Unit,
+    finalOutputFormat: FinalOutputFormat,
+    onFinalOutputFormatChange: (FinalOutputFormat) -> Unit,
     overlaySettings: UiOverlaySettings,
     onOverlaySettingsChange: (UiOverlaySettings) -> Unit,
     onResetFocusAe: () -> Unit,
     onRaw: () -> Unit,
     onRawBurst: () -> Unit,
-    onDismiss: () -> Unit,
+    onTest50MRaw: () -> Unit,
+    onPrintResolutionReport: () -> Unit,
+    onBack: () -> Unit,
     onOpenDebug: () -> Unit,
     onOpenCacheJobs: () -> Unit,
     onClearCache: () -> Unit
 ) {
-    Box(
+    BackHandler { onBack() }
+
+    Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0x99000000))
-            .clickable(onClick = onDismiss),
-        contentAlignment = Alignment.TopStart
+            .background(Color.Black)
+            .windowInsetsPadding(WindowInsets.safeDrawing)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 18.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp)
     ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Button(
+                onClick = onBack,
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF232633),
+                    contentColor = Color.White
+                )
+            ) {
+                Text("Back")
+            }
+
+            Spacer(modifier = Modifier.size(12.dp))
+
+            Text(
+                text = "Settings",
+                color = Color.White,
+                style = MaterialTheme.typography.titleLarge
+            )
+        }
+
         Surface(
-            modifier = Modifier
-                .windowInsetsPadding(WindowInsets.safeDrawing)
-                .padding(start = 14.dp, top = 72.dp)
-                .fillMaxWidth(0.72f)
-                .clickable(onClick = {}),
-            color = Color(0xEE11131B),
+            modifier = Modifier.fillMaxWidth(),
+            color = Color(0xFF11131B),
             shape = RoundedCornerShape(24.dp)
         ) {
             Column(
@@ -1205,6 +1654,11 @@ fun SettingsOverlay(
                     onPipelineModeChange = onPipelineModeChange
                 )
 
+                OutputFormatSettingsSection(
+                    finalOutputFormat = finalOutputFormat,
+                    onFinalOutputFormatChange = onFinalOutputFormatChange
+                )
+
                 OverlaySettingsSection(
                     overlaySettings = overlaySettings,
                     onOverlaySettingsChange = onOverlaySettingsChange
@@ -1226,6 +1680,16 @@ fun SettingsOverlay(
                 )
 
                 MiniSettingsButton(
+                    text = "Test 50M RAW Capture",
+                    onClick = onTest50MRaw
+                )
+
+                MiniSettingsButton(
+                    text = "Print Resolution Capability Report",
+                    onClick = onPrintResolutionReport
+                )
+
+                MiniSettingsButton(
                     text = "Cache / Jobs",
                     onClick = onOpenCacheJobs
                 )
@@ -1242,10 +1706,61 @@ fun SettingsOverlay(
 
                 MiniSettingsButton(
                     text = "닫기",
-                    onClick = onDismiss
+                    onClick = onBack
                 )
             }
         }
+    }
+}
+
+@Composable
+fun OutputFormatSettingsSection(
+    finalOutputFormat: FinalOutputFormat,
+    onFinalOutputFormatChange: (FinalOutputFormat) -> Unit
+) {
+    Column(
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Text(
+            text = "Output",
+            color = Color.White,
+            style = MaterialTheme.typography.titleMedium
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            listOf(
+                FinalOutputFormat.HEIF,
+                FinalOutputFormat.JPEG
+            ).forEach { format ->
+                FrameModeChip(
+                    text = format.label,
+                    selected = finalOutputFormat == format,
+                    onClick = { onFinalOutputFormatChange(format) }
+                )
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            listOf(
+                FinalOutputFormat.HEIF_PLUS_RAW,
+                FinalOutputFormat.JPEG_PLUS_RAW
+            ).forEach { format ->
+                FrameModeChip(
+                    text = format.label,
+                    selected = finalOutputFormat == format,
+                    onClick = { onFinalOutputFormatChange(format) }
+                )
+            }
+        }
+        FrameModeChip(
+            text = FinalOutputFormat.PNG_DEBUG.label,
+            selected = finalOutputFormat == FinalOutputFormat.PNG_DEBUG,
+            onClick = { onFinalOutputFormatChange(FinalOutputFormat.PNG_DEBUG) }
+        )
     }
 }
 
@@ -1578,5 +2093,66 @@ fun loadLatestKeplerResult(context: Context): LatestKeplerResult {
             bitmap = null,
             summary = "최근 결과 로드 실패: ${e.javaClass.simpleName}"
         )
+    }
+}
+
+fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
+    return try {
+        val picturesDir = context.getExternalFilesDir(android.os.Environment.DIRECTORY_PICTURES)
+            ?: return LatestKeplerResult(null, "Pictures folder unavailable")
+
+        val latestJobDir = listOf(
+            File(picturesDir, "KeplerColorBurst"),
+            File(picturesDir, "KeplerRawFusion")
+        )
+            .flatMap { root ->
+                root.listFiles()
+                    ?.filter { it.isDirectory && File(it, "job.json").exists() }
+                    .orEmpty()
+            }
+            .maxByOrNull { it.lastModified() }
+            ?: return LatestKeplerResult(null, "No Kepler jobs found")
+
+        val job = JSONObject(File(latestJobDir, "job.json").readText())
+        val firstFrameName = job.optJSONArray("frames")
+            ?.optJSONObject(0)
+            ?.optString("file")
+            .orEmpty()
+        val previewName = listOf(
+            job.optString("finalNightFusionFile", ""),
+            job.optString("finalFile", ""),
+            job.optString("averageColorFile", ""),
+            firstFrameName
+        ).firstOrNull { it.isNotBlank() }.orEmpty()
+        val bitmap = previewName.takeIf { it.isNotBlank() }
+            ?.let { File(latestJobDir, it) }
+            ?.takeIf { it.exists() }
+            ?.let { BitmapFactory.decodeFile(it.absolutePath) }
+
+        val summary = buildString {
+            append("status=")
+            append(job.optString("status", "unknown"))
+            append(", frames=")
+            append(job.optInt("savedFrames", 0))
+            append(", export=")
+            append(job.optString("exportStatus", "not_exported"))
+            append(" ")
+            append(job.optString("exportFormatUsed", ""))
+            append(" verified=")
+            append(job.optBoolean("exportVerified", false))
+            append(", output=")
+            append(job.optString("finalOutputFormatSetting", ""))
+            append(", public=")
+            append(job.optString("exportDisplayName", "").ifBlank { "none" })
+            append(", rawSidecar=")
+            append(job.optString("rawSidecarExportStatus", "NOT_REQUESTED"))
+            append(", cleanup=")
+            append(job.optString("cleanupStatus", "none"))
+            append(", job=")
+            append(latestJobDir.name)
+        }
+        LatestKeplerResult(bitmap, summary)
+    } catch (e: Exception) {
+        LatestKeplerResult(null, "Latest result load failed: ${e.javaClass.simpleName}")
     }
 }

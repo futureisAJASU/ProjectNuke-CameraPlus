@@ -13,23 +13,27 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.DngCreator
+import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.TotalCaptureResult
 import android.media.Image
 import android.media.ImageReader
 import android.os.Environment
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.util.Size
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -42,6 +46,16 @@ data class RawFusionProcessResult(
     val previewPngFile: File?,
     val finalPngFile: File?,
     val errorMessage: String?
+)
+
+private const val MIN_RAW_FUSION_FRAMES = 2
+
+data class RawSizeSelection(
+    val size: Size,
+    val source: String,
+    val requiresMaximumResolutionPixelMode: Boolean,
+    val isHighResolutionSlowPath: Boolean,
+    val fallbackReason: String?
 )
 
 @SuppressLint("MissingPermission")
@@ -70,12 +84,28 @@ fun captureRawBurstForFusion(
     var session: CameraCaptureSession? = null
     var reader: ImageReader? = null
     var motionLogger: MotionLogger? = null
-    val pendingResults = mutableMapOf<Long, TotalCaptureResult>()
     val frameObjects = JSONArray()
+    val requestedFrames = frameCount
+    var attemptedFrames = 0
     var savedFrames = 0
-    var finished = false
+    var receivedImages = 0
+    var completedResults = 0
+    val finished = AtomicBoolean(false)
+    val imagesByTimestamp = mutableMapOf<Long, Image>()
+    val resultsByTimestamp = mutableMapOf<Long, TotalCaptureResult>()
+    val savedTimestamps = mutableSetOf<Long>()
+    var failedCaptures = 0
+    var timeoutRunnable: Runnable? = null
+    fun postCaptureProgress() {
+        post("RAW capture: saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames, failed $failedCaptures")
+    }
 
     fun cleanup() {
+        timeoutRunnable?.let { handler.removeCallbacks(it) }
+        timeoutRunnable = null
+        imagesByTimestamp.values.forEach { runCatching { it.close() } }
+        imagesByTimestamp.clear()
+        resultsByTimestamp.clear()
         try { session?.close() } catch (_: Exception) {}
         try { cameraDevice?.close() } catch (_: Exception) {}
         try { reader?.close() } catch (_: Exception) {}
@@ -83,14 +113,52 @@ fun captureRawBurstForFusion(
         try { thread.quitSafely() } catch (_: Exception) {}
     }
 
+    fun writeJobStatus(jobFile: File?, baseJob: JSONObject?, status: String, error: String? = null) {
+        if (jobFile == null || baseJob == null) return
+        runCatching {
+            val job = JSONObject(baseJob.toString())
+                .put("status", status)
+                .put("requestedFrames", requestedFrames)
+                .put("attemptedFrames", attemptedFrames)
+                .put("savedFrames", savedFrames)
+                .put("receivedImages", receivedImages)
+                .put("completedResults", completedResults)
+                .put("failedCaptures", failedCaptures)
+                .put("captureCompleteness", if (savedFrames >= requestedFrames) "FULL" else if (savedFrames >= MIN_RAW_FUSION_FRAMES) "PARTIAL" else "FAILED")
+                .put("partialCapture", savedFrames in MIN_RAW_FUSION_FRAMES until requestedFrames)
+                .put("frames", frameObjects)
+                .put("updatedAt", System.currentTimeMillis())
+            if (error != null) job.put("error", error)
+            jobFile.writeText(job.toString(2))
+        }
+    }
+
     try {
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?: error("Stream configuration map missing")
-        val rawSizes = map.getOutputSizes(ImageFormat.RAW_SENSOR)
-        if (rawSizes.isNullOrEmpty()) error("RAW_SENSOR not exposed for cameraId=$cameraId")
-        val rawSize = chooseRawFusionSize(rawSizes, resolutionMode)
+        val rawSelection = chooseRawFusionSizeV2(characteristics, resolutionMode)
+        val rawSize = rawSelection.size
+        val actualInputMode = if (resolutionMode == CaptureResolutionMode.MP24_FUSION) {
+            CaptureResolutionMode.MP50
+        } else {
+            resolutionMode
+        }
+        val fusion24Strategy = if (resolutionMode == CaptureResolutionMode.MP24_FUSION) {
+            if (zoomRatio >= 1.9f) "50MP_2X_CROP_UPSCALE_V0" else "50MP_DETAIL_DOWNSAMPLE_V0"
+        } else {
+            null
+        }
         val cropApplied = zoomRatio > 1f && buildCenterCropRegion(characteristics, zoomRatio) != null
+        val blackLevelPattern = characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)
+        val blackLevelJson = blackLevelPattern?.let {
+            JSONArray(listOf(
+                it.getOffsetForIndex(0, 0),
+                it.getOffsetForIndex(1, 0),
+                it.getOffsetForIndex(0, 1),
+                it.getOffsetForIndex(1, 1)
+            ))
+        }
 
         val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
             ?: error("Pictures dir unavailable")
@@ -106,104 +174,175 @@ fun captureRawBurstForFusion(
             .put("processStatus", "NOT_PROCESSED")
             .put("cameraId", cameraId)
             .put("resolutionMode", resolutionMode.label)
+            .put("requestedResolutionMode", resolutionMode.name)
+            .put("actualInputResolutionMode", actualInputMode.name)
+            .put("outputResolutionMode", resolutionMode.name)
             .put("zoomRatio", zoomRatio.toDouble())
             .put("cropApplied", cropApplied)
             .put("rawWidth", rawSize.width)
             .put("rawHeight", rawSize.height)
+            .put("inputWidth", rawSize.width)
+            .put("inputHeight", rawSize.height)
+            .put("usesMaximumResolution", rawSelection.requiresMaximumResolutionPixelMode)
+            .put("usesHighResolutionSlowPath", rawSelection.isHighResolutionSlowPath)
+            .put("fusion24Strategy", fusion24Strategy ?: JSONObject.NULL)
+            .put("nativeCropMpApprox", if (resolutionMode == CaptureResolutionMode.MP24_FUSION && zoomRatio >= 1.9f) megapixels(rawSize) / (zoomRatio * zoomRatio) else JSONObject.NULL)
+            .put("outputIsUpscaled", resolutionMode == CaptureResolutionMode.MP24_FUSION && zoomRatio >= 1.9f)
+            .put("rawSizeSource", rawSelection.source)
+            .put("requiresMaximumResolutionPixelMode", rawSelection.requiresMaximumResolutionPixelMode)
+            .put("isHighResolutionSlowPath", rawSelection.isHighResolutionSlowPath)
+            .put("rawSizeFallbackReason", rawSelection.fallbackReason ?: JSONObject.NULL)
             .put("sensorOrientation", characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: JSONObject.NULL)
             .put("activeArray", characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)?.toString() ?: JSONObject.NULL)
             .put("preCorrectionActiveArray", characteristics.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)?.toString() ?: JSONObject.NULL)
             .put("whiteLevel", characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: JSONObject.NULL)
             .put("cfaPattern", characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: JSONObject.NULL)
-            .put("blackLevelPattern", characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)?.toString() ?: JSONObject.NULL)
-            .put("requestedFrames", frameCount)
+            .put("blackLevelPattern", blackLevelJson ?: JSONObject.NULL)
+            .put("requestedFrames", requestedFrames)
+            .put("attemptedFrames", attemptedFrames)
+            .put("captureCompleteness", "FAILED")
+            .put("partialCapture", false)
             .put("frames", frameObjects)
             .put("createdAt", System.currentTimeMillis())
-            .put("notes", "True RAW fusion input. Stores RAW_SENSOR DNG backup plus compact raw16 per frame.")
+            .put("notes", "True RAW fusion input. Stores RAW_SENSOR DNG backup plus compact raw16 per frame. TODO retry budget: targetFrames=8, maxAttempts=9 or 10, continue until target saved or maxAttempts/timeout.")
         jobFile.writeText(baseJob.toString(2))
 
         val imageReader = ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, frameCount + 2)
         reader = imageReader
 
         motionLogger = runCatching { MotionLogger(context).also { it.start() } }.getOrNull()
+        postCaptureProgress()
 
-        imageReader.setOnImageAvailableListener({ r ->
-            if (finished) return@setOnImageAvailableListener
-            var image: Image? = null
-            try {
-                image = r.acquireNextImage()
-                if (savedFrames >= frameCount) {
-                    image.close()
-                    return@setOnImageAvailableListener
-                }
-                val timestamp = image.timestamp
-                val result = pendingResults.remove(timestamp)
-                if (result == null) {
-                    image.close()
-                    fail("RAW capture failed: no matching CaptureResult for timestamp=$timestamp")
-                    finished = true
-                    cleanup()
-                    return@setOnImageAvailableListener
-                }
+        fun finishError(status: String, message: String) {
+            if (!finished.compareAndSet(false, true)) return
+            writeJobStatus(jobFile, baseJob, status, message)
+            post(message)
+            mainHandler.post { onError(message) }
+            cleanup()
+        }
 
+        fun finishSuccess(partial: Boolean = false, reason: String? = null) {
+            if (!finished.compareAndSet(false, true)) return
+            val motionFiles = runCatching { motionLogger?.saveToDirectory(jobDir) }.getOrNull()
+            val status = if (partial) "CAPTURE_COMPLETE_PARTIAL" else "CAPTURE_COMPLETE"
+            val completeness = if (partial) "PARTIAL" else "FULL"
+            val partialReason = reason ?: "saved $savedFrames/$requestedFrames frames; failedCaptures=$failedCaptures"
+            val completeJob = JSONObject(baseJob.toString())
+                .put("status", status)
+                .put("savedFrames", savedFrames)
+                .put("requestedFrames", requestedFrames)
+                .put("attemptedFrames", attemptedFrames)
+                .put("receivedImages", receivedImages)
+                .put("completedResults", completedResults)
+                .put("failedCaptures", failedCaptures)
+                .put("captureCompleteness", completeness)
+                .put("partialCapture", partial)
+                .put("frames", frameObjects)
+                .put("gyroFile", motionFiles?.first ?: JSONObject.NULL)
+                .put("rotationVectorFile", motionFiles?.second ?: JSONObject.NULL)
+                .put("capturedAt", System.currentTimeMillis())
+            if (partial) completeJob.put("partialReason", partialReason)
+            jobFile.writeText(completeJob.toString(2))
+            if (partial) {
+                post("CAPTURE_COMPLETE_PARTIAL: RAW capture saved $savedFrames/$requestedFrames frames; processing partial fusion.")
+            } else {
+                post("CAPTURE_COMPLETE: RAW capture saved $savedFrames/$requestedFrames frames")
+            }
+            mainHandler.post { onComplete(jobDir) }
+            cleanup()
+        }
+
+        fun trySaveReadyFrames() {
+            if (finished.get()) return
+            val ready = imagesByTimestamp.keys
+                .filter { it !in savedTimestamps && resultsByTimestamp.containsKey(it) }
+                .sorted()
+            for (timestamp in ready) {
+                if (savedFrames >= requestedFrames || finished.get()) return
+                val image = imagesByTimestamp.remove(timestamp) ?: continue
+                val result = resultsByTimestamp.remove(timestamp) ?: run {
+                    imagesByTimestamp[timestamp] = image
+                    continue
+                }
+                savedTimestamps.add(timestamp)
                 val index = savedFrames
                 val raw16Name = "frame_${index.toString().padStart(2, '0')}.raw16"
                 val dngName = "frame_${index.toString().padStart(2, '0')}.dng"
-                writeCompactRaw16(image, File(jobDir, raw16Name))
-                FileOutputStream(File(jobDir, dngName)).use { output ->
-                    DngCreator(characteristics, result).use { creator ->
-                        creator.writeImage(output, image)
+                try {
+                    post("RAW saving frame ${index + 1}/$requestedFrames...")
+                    writeCompactRaw16(image, File(jobDir, raw16Name))
+                    FileOutputStream(File(jobDir, dngName)).use { output ->
+                        DngCreator(characteristics, result).use { creator ->
+                            creator.writeImage(output, image)
+                        }
                     }
+                    val dynamicBlackLevel = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
+                    val plane = image.planes[0]
+                    frameObjects.put(
+                        JSONObject()
+                            .put("index", index)
+                            .put("raw16File", raw16Name)
+                            .put("dngFile", dngName)
+                            .put("timestampNs", timestamp)
+                            .put("exposureTimeNs", result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: JSONObject.NULL)
+                            .put("sensitivityIso", result.get(CaptureResult.SENSOR_SENSITIVITY) ?: JSONObject.NULL)
+                            .put("frameDurationNs", result.get(CaptureResult.SENSOR_FRAME_DURATION) ?: JSONObject.NULL)
+                            .put("rawWidth", image.width)
+                            .put("rawHeight", image.height)
+                            .put("rowStride", plane.rowStride)
+                            .put("pixelStride", plane.pixelStride)
+                            .put("dynamicBlackLevel", dynamicBlackLevel?.let { JSONArray(it.toList()) } ?: JSONObject.NULL)
+                            .put("dynamicWhiteLevel", result.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL) ?: JSONObject.NULL)
+                            .put("colorCorrectionGains", result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.toString() ?: JSONObject.NULL)
+                            .put("colorCorrectionTransform", result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.toString() ?: JSONObject.NULL)
+                            .put("cameraId", cameraId)
+                            .put("zoomRatio", zoomRatio.toDouble())
+                            .put("cropApplied", cropApplied)
+                    )
+                    savedFrames++
+                    post("RAW saved frame $savedFrames/$requestedFrames")
+                    writeJobStatus(jobFile, baseJob, "CAPTURING")
+                    postCaptureProgress()
+                    if (savedFrames >= requestedFrames) {
+                        finishSuccess()
+                        return
+                    }
+                } catch (e: Exception) {
+                    finishError("CAPTURE_FAILED", "RAW fusion capture failed\n${e.stackTraceToString()}")
+                    return
+                } finally {
+                    runCatching { image.close() }
                 }
-
-                val plane = image.planes[0]
-                frameObjects.put(
-                    JSONObject()
-                        .put("index", index)
-                        .put("raw16File", raw16Name)
-                        .put("dngFile", dngName)
-                        .put("timestampNs", timestamp)
-                        .put("exposureTimeNs", result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: JSONObject.NULL)
-                        .put("sensitivityIso", result.get(CaptureResult.SENSOR_SENSITIVITY) ?: JSONObject.NULL)
-                        .put("frameDurationNs", result.get(CaptureResult.SENSOR_FRAME_DURATION) ?: JSONObject.NULL)
-                        .put("rawWidth", image.width)
-                        .put("rawHeight", image.height)
-                        .put("rowStride", plane.rowStride)
-                        .put("pixelStride", plane.pixelStride)
-                        .put("dynamicBlackLevel", result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)?.joinToString() ?: JSONObject.NULL)
-                        .put("dynamicWhiteLevel", result.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL) ?: JSONObject.NULL)
-                        .put("colorCorrectionGains", result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.toString() ?: JSONObject.NULL)
-                        .put("colorCorrectionTransform", result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.toString() ?: JSONObject.NULL)
-                        .put("cameraId", cameraId)
-                        .put("zoomRatio", zoomRatio.toDouble())
-                        .put("cropApplied", cropApplied)
-                )
-                savedFrames++
-                jobFile.writeText(JSONObject(baseJob.toString()).put("savedFrames", savedFrames).put("frames", frameObjects).toString(2))
-                post("Capturing RAW burst... $savedFrames / $frameCount")
-
-                if (savedFrames >= frameCount) {
-                    val motionFiles = runCatching { motionLogger?.saveToDirectory(jobDir) }.getOrNull()
-                    val completeJob = JSONObject(baseJob.toString())
-                        .put("status", "CAPTURE_COMPLETE")
-                        .put("savedFrames", savedFrames)
-                        .put("frames", frameObjects)
-                        .put("gyroFile", motionFiles?.first ?: JSONObject.NULL)
-                        .put("rotationVectorFile", motionFiles?.second ?: JSONObject.NULL)
-                        .put("capturedAt", System.currentTimeMillis())
-                    jobFile.writeText(completeJob.toString(2))
-                    finished = true
-                    post("RAW burst capture complete.")
-                    onComplete(jobDir)
-                    cleanup()
-                }
-            } catch (e: Exception) {
-                finished = true
-                fail("RAW fusion capture failed\n${e.stackTraceToString()}")
-                cleanup()
-            } finally {
-                try { image?.close() } catch (_: Exception) {}
             }
+        }
+
+        timeoutRunnable = Runnable {
+            if (savedFrames < requestedFrames) {
+                if (savedFrames >= MIN_RAW_FUSION_FRAMES) {
+                    finishSuccess(partial = true, reason = "saved $savedFrames/$requestedFrames frames; timeout; failedCaptures=$failedCaptures")
+                } else {
+                    val message = "CAPTURE_TIMEOUT: RAW capture saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames, failed $failedCaptures"
+                    finishError("CAPTURE_TIMEOUT", message)
+                }
+            }
+        }.also { handler.postDelayed(it, max(30_000L, requestedFrames * 8_000L)) }
+
+        imageReader.setOnImageAvailableListener({ r ->
+            if (finished.get()) return@setOnImageAvailableListener
+            val image = try {
+                r.acquireNextImage()
+            } catch (e: Exception) {
+                finishError("CAPTURE_FAILED", "PIPELINE_FAILED: acquireNextImage failed\n${e.stackTraceToString()}")
+                return@setOnImageAvailableListener
+            }
+            if (image == null) {
+                post("RAW capture: acquireNextImage returned null; waiting for next image")
+                return@setOnImageAvailableListener
+            }
+            receivedImages++
+            imagesByTimestamp[image.timestamp] = image
+            postCaptureProgress()
+            trySaveReadyFrames()
         }, handler)
 
         cameraManager.openCamera(
@@ -216,13 +355,25 @@ fun captureRawBurstForFusion(
                         object : CameraCaptureSession.StateCallback() {
                             override fun onConfigured(configured: CameraCaptureSession) {
                                 session = configured
-                                val requests = List(frameCount) {
+                                val requests = List(requestedFrames) {
                                     camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                                         addTarget(imageReader.surface)
                                         set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                                        if (rawSelection.requiresMaximumResolutionPixelMode) {
+                                            runCatching {
+                                                set(
+                                                    CaptureRequest.SENSOR_PIXEL_MODE,
+                                                    CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION
+                                                )
+                                            }.onFailure {
+                                                post("RAW max-resolution pixel mode not accepted; continuing safely.")
+                                            }
+                                        }
                                         applyZoomAndFocusAe(characteristics, zoomRatio, focusAeState)
                                     }.build()
                                 }
+                                attemptedFrames = requests.size
+                                writeJobStatus(jobFile, baseJob, "CAPTURING")
                                 configured.captureBurst(
                                     requests,
                                     object : CameraCaptureSession.CaptureCallback() {
@@ -232,7 +383,47 @@ fun captureRawBurstForFusion(
                                             result: TotalCaptureResult
                                         ) {
                                             val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
-                                            if (timestamp != null) pendingResults[timestamp] = result
+                                            if (timestamp != null && !finished.get()) {
+                                                resultsByTimestamp[timestamp] = result
+                                                completedResults++
+                                                postCaptureProgress()
+                                                trySaveReadyFrames()
+                                            }
+                                        }
+
+                                        override fun onCaptureFailed(
+                                            session: CameraCaptureSession,
+                                            request: CaptureRequest,
+                                            failure: android.hardware.camera2.CaptureFailure
+                                        ) {
+                                            failedCaptures++
+                                            post("RAW capture failure: reason=${failure.reason}, saved $savedFrames/$requestedFrames")
+                                            if (savedFrames + failedCaptures >= attemptedFrames) {
+                                                if (savedFrames >= MIN_RAW_FUSION_FRAMES) {
+                                                    finishSuccess(partial = true, reason = "saved $savedFrames/$requestedFrames frames; failedCaptures=$failedCaptures")
+                                                } else {
+                                                    finishError("CAPTURE_FAILED", "PIPELINE_FAILED: RAW capture failed; saved $savedFrames/$requestedFrames, failed $failedCaptures")
+                                                }
+                                            }
+                                        }
+
+                                        override fun onCaptureSequenceAborted(
+                                            session: CameraCaptureSession,
+                                            sequenceId: Int
+                                        ) {
+                                            if (savedFrames >= MIN_RAW_FUSION_FRAMES && savedFrames < requestedFrames) {
+                                                finishSuccess(partial = true, reason = "saved $savedFrames/$requestedFrames frames; sequence aborted; failedCaptures=$failedCaptures")
+                                            } else {
+                                                finishError("CAPTURE_ABORTED", "PIPELINE_FAILED: RAW capture sequence aborted; saved $savedFrames/$requestedFrames")
+                                            }
+                                        }
+
+                                        override fun onCaptureSequenceCompleted(
+                                            session: CameraCaptureSession,
+                                            sequenceId: Int,
+                                            frameNumber: Long
+                                        ) {
+                                            post("RAW capture sequence done: saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames")
                                         }
                                     },
                                     handler
@@ -240,8 +431,7 @@ fun captureRawBurstForFusion(
                             }
 
                             override fun onConfigureFailed(session: CameraCaptureSession) {
-                                fail("RAW fusion session configure failed")
-                                cleanup()
+                                finishError("CAPTURE_FAILED", "PIPELINE_FAILED: RAW fusion session configure failed")
                             }
                         },
                         handler
@@ -249,13 +439,11 @@ fun captureRawBurstForFusion(
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
-                    fail("RAW fusion camera disconnected")
-                    cleanup()
+                    finishError("CAPTURE_FAILED", "PIPELINE_FAILED: RAW fusion camera disconnected")
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
-                    fail("RAW fusion camera error: $error")
-                    cleanup()
+                    finishError("CAPTURE_FAILED", "PIPELINE_FAILED: RAW fusion camera error: $error")
                 }
             },
             handler
@@ -278,76 +466,176 @@ fun processRawFusionJob(
         val width = job.getInt("rawWidth")
         val height = job.getInt("rawHeight")
         val pixelCount = width * height
-        val rawFrames = mutableListOf<ShortArray>()
+        val frameInputs = mutableListOf<RawFrameInput>()
         val frameMeta = mutableListOf<JSONObject>()
 
         for (i in 0 until frames.length()) {
             val frame = frames.getJSONObject(i)
             val rawFile = File(jobDir, frame.getString("raw16File"))
             if (rawFile.exists() && rawFile.length() >= pixelCount * 2L) {
-                rawFrames.add(readRaw16(rawFile, pixelCount))
+                frameInputs.add(RawFrameInput(rawFile, frame))
                 frameMeta.add(frame)
             }
         }
-        if (rawFrames.isEmpty()) error("No usable raw16 frames.")
+        if (frameInputs.size < MIN_RAW_FUSION_FRAMES) {
+            error("Not enough RAW frames for fusion: ${frameInputs.size}/$MIN_RAW_FUSION_FRAMES")
+        }
+        val requestedFrames = job.optInt("requestedFrames", frameInputs.size)
+        val savedFrames = job.optInt("savedFrames", frameInputs.size)
+        val partialCapture = job.optBoolean("partialCapture", false)
+        val captureCompleteness = job.optString(
+            "captureCompleteness",
+            if (partialCapture || frameInputs.size < requestedFrames) "PARTIAL" else "FULL"
+        )
 
-        onStatus("Processing RAW fusion...")
-        val blackLevel = estimateBlackLevel(job, rawFrames)
-        val whiteLevel = estimateWhiteLevel(job, rawFrames, blackLevel)
+        onStatus("Processing RAW fusion: loading frames...")
+        val fallbackSample = if (needsRawBlackLevelFallback(job, frameMeta)) {
+            readRaw16(frameInputs.first().file, min(pixelCount, 4096))
+        } else {
+            null
+        }
+        val blackLevelEstimate = estimateBlackLevel(job, frameMeta, fallbackSample)
+        val blackLevel = blackLevelEstimate.value
+        val cfa = job.optInt("cfaPattern", 0)
         val refExposure = frameMeta.first().optDouble("exposureTimeNs", 1.0).coerceAtLeast(1.0)
         val refIso = frameMeta.first().optDouble("sensitivityIso", 100.0).coerceAtLeast(1.0)
         val gyroSamples = readRawGyroSamples(File(jobDir, "gyro.csv"))
-        val acc = FloatArray(pixelCount)
-        val weights = FloatArray(pixelCount)
-
-        rawFrames.forEachIndexed { frameIndex, raw ->
-            val meta = frameMeta[frameIndex]
+        val exposureScales = FloatArray(frameInputs.size)
+        val frameWeights = FloatArray(frameInputs.size)
+        val motionScores = DoubleArray(frameInputs.size)
+        frameInputs.forEachIndexed { index, input ->
+            val meta = input.meta
             val exposure = meta.optDouble("exposureTimeNs", refExposure).coerceAtLeast(1.0)
             val iso = meta.optDouble("sensitivityIso", refIso).coerceAtLeast(1.0)
-            val exposureScale = ((refExposure * refIso) / (exposure * iso)).coerceIn(0.5, 2.0)
+            exposureScales[index] = ((refExposure * refIso) / (exposure * iso)).coerceIn(0.5, 2.0).toFloat()
             val motionScore = if (gyroSamples.isNotEmpty()) {
                 motionNearRaw(gyroSamples, meta.optLong("timestampNs", 0L))
             } else {
                 0.0
             }
-            val weight = (1.0 / (1.0 + motionScore * 8.0)).coerceIn(0.25, 1.0).toFloat()
-            for (p in 0 until pixelCount) {
-                val corrected = ((raw[p].toInt() and 0xFFFF) - blackLevel).coerceAtLeast(0)
-                acc[p] += (corrected * exposureScale).toFloat() * weight
-                weights[p] += weight
-            }
+            motionScores[index] = motionScore
+            frameWeights[index] = (1.0 / (1.0 + motionScore * 8.0)).coerceIn(0.25, 1.0).toFloat()
         }
+        val referenceSelection = chooseRawReferenceFrame(frameInputs, motionScores, gyroSamples.isNotEmpty())
+        var observedMax = fallbackSample?.maxOfOrNull { it.toInt() and 0xFFFF } ?: 0
+        val whiteLevelEstimate = estimateWhiteLevel(job, observedMax, blackLevel)
+        val whiteLevel = whiteLevelEstimate.value
 
-        val merged = ShortArray(pixelCount)
-        for (p in 0 until pixelCount) {
-            val value = (acc[p] / weights[p].coerceAtLeast(0.001f)).toInt().coerceIn(0, whiteLevel - blackLevel)
-            merged[p] = value.toShort()
-        }
+        onStatus("Processing RAW fusion: using ${frameInputs.size}/$requestedFrames frames")
         val mergedRawFile = File(jobDir, "merged_raw.raw16")
-        writeRaw16(merged, mergedRawFile)
+        val alignmentFile = File(jobDir, "alignment.json")
+        val nativeStatus = if (isNativeRawEngineAvailable()) {
+            onStatus("Processing RAW fusion: native alignment...")
+            runCatching {
+                NativeRawEngine.alignAndMergeRaw16(
+                    framePaths = frameInputs.map { it.file.absolutePath }.toTypedArray(),
+                    exposureScales = exposureScales,
+                    frameWeights = frameWeights,
+                    width = width,
+                    height = height,
+                    cfaPattern = cfa,
+                    blackLevel = blackLevel,
+                    whiteLevel = whiteLevel,
+                    referenceIndex = referenceSelection.index,
+                    downscale = 8,
+                    searchRadius = 24,
+                    outputMergedRawPath = mergedRawFile.absolutePath,
+                    outputAlignmentJsonPath = alignmentFile.absolutePath
+                )
+            }.getOrElse { "ERROR: ${it.javaClass.simpleName}: ${it.message}" }
+        } else {
+            "ERROR: native library unavailable"
+        }
+        val nativeMergedOk = nativeStatus.startsWith("OK:") &&
+            mergedRawFile.exists() &&
+            mergedRawFile.length() >= pixelCount * 2L &&
+            alignmentFile.exists()
+        if (nativeMergedOk) {
+            onStatus("Processing RAW fusion: native Bayer merge complete")
+        } else {
+            onStatus("Processing RAW fusion: native failed, falling back to Kotlin merge")
+            val acc = FloatArray(pixelCount)
+            val weights = FloatArray(pixelCount)
+            observedMax = 0
+            onStatus("Processing RAW fusion: merging Bayer...")
+            frameInputs.forEachIndexed { frameIndex, input ->
+                val raw = readRaw16(input.file, pixelCount)
+                val exposureScale = exposureScales[frameIndex].toDouble()
+                val weight = frameWeights[frameIndex]
+                for (p in 0 until pixelCount) {
+                    val rawValue = raw[p].toInt() and 0xFFFF
+                    if (rawValue > observedMax) observedMax = rawValue
+                    val x = p % width
+                    val y = p / width
+                    val pixelBlack = blackLevelForPixel(x, y, cfa, blackLevelEstimate)
+                    val corrected = (rawValue - pixelBlack).coerceAtLeast(0)
+                    acc[p] += (corrected * exposureScale).toFloat() * weight
+                    weights[p] += weight
+                }
+                onStatus("Processing RAW fusion: merged ${frameIndex + 1}/${frameInputs.size}")
+            }
+            val fallbackWhite = estimateWhiteLevel(job, observedMax, blackLevel).value
+            val merged = ShortArray(pixelCount)
+            for (p in 0 until pixelCount) {
+                val value = (acc[p] / weights[p].coerceAtLeast(0.001f)).toInt().coerceIn(0, fallbackWhite - blackLevel)
+                merged[p] = value.toShort()
+            }
+            writeRaw16(merged, mergedRawFile)
+        }
 
-        onStatus("Demosaicing RAW fusion...")
-        val cfa = job.optInt("cfaPattern", 0)
-        val preview = demosaicBilinear(merged, width, height, cfa, whiteLevel - blackLevel)
+        onStatus("Processing RAW fusion: demosaicing...")
+        val mergedForDemosaic = readRaw16(mergedRawFile, pixelCount)
+        val preview = demosaicBilinear(mergedForDemosaic, width, height, cfa, whiteLevel - blackLevel)
         val previewFile = File(jobDir, "raw_fusion_preview.png")
         saveRawFusionPng(preview, previewFile)
-        val finalBitmap = sharpenRawFusion(toneMapRawFusion(preview))
+        onStatus("Processing RAW fusion: tone/sharpen...")
+        val finalBitmap = resizeFinalForResolutionMode(
+            source = sharpenRawFusion(toneMapRawFusion(preview)),
+            mode = CaptureResolutionMode.entries.firstOrNull { it.name == job.optString("outputResolutionMode") }
+                ?: CaptureResolutionMode.entries.firstOrNull { it.label == job.optString("resolutionMode") }
+                ?: CaptureResolutionMode.MP12,
+            onStatus = onStatus
+        )
         val finalFile = File(jobDir, "raw_fusion_final.png")
         saveRawFusionPng(finalBitmap, finalFile)
         preview.recycle()
         finalBitmap.recycle()
 
-        val notes = "RAW Fusion MVP: Bayer weighted merge, black-level correction, exposure/ISO normalization, simple bilinear demosaic, gray-world-ish tone. Merged DNG skipped because CaptureResult metadata was not available after process restart. TODO gyro Bayer alignment, image micro-alignment, ghost suppression, RAW super-resolution/detail fusion, proper Camera2 color matrices."
+        val partialNote = if (partialCapture || frameInputs.size < requestedFrames) {
+            "Partial RAW fusion used ${frameInputs.size}/$requestedFrames requested frames."
+        } else {
+            "Full RAW fusion used ${frameInputs.size}/$requestedFrames requested frames."
+        }
+        val notes = "RAW Fusion MVP: Bayer weighted merge, black-level correction, exposure/ISO normalization, simple bilinear demosaic, gray-world-ish tone. $partialNote Merged DNG skipped because CaptureResult metadata was not available after process restart. TODO gyro Bayer alignment, image micro-alignment, ghost suppression, RAW super-resolution/detail fusion, proper Camera2 color matrices."
         val updated = JSONObject(job.toString())
             .put("processStatus", "RAW_FUSION_COMPLETE")
             .put("mergedRawFile", mergedRawFile.name)
             .put("mergedDngFile", JSONObject.NULL)
             .put("previewFile", previewFile.name)
             .put("finalFile", finalFile.name)
-            .put("usedFrameCount", rawFrames.size)
+            .put("usedFrameCount", frameInputs.size)
+            .put("requestedFrames", requestedFrames)
+            .put("savedFrames", savedFrames)
+            .put("captureCompleteness", captureCompleteness)
+            .put("partialCapture", partialCapture || frameInputs.size < requestedFrames)
+            .put("processingNotes", partialNote)
             .put("rawFusionNotes", notes)
             .put("blackLevelUsed", blackLevel)
+            .put("blackLevelSource", blackLevelEstimate.source)
+            .put("blackLevelMode", blackLevelEstimate.mode)
             .put("whiteLevelUsed", whiteLevel)
+            .put("whiteLevelSource", whiteLevelEstimate.source)
+            .put("outputWidth", BitmapFactory.decodeFile(finalFile.absolutePath)?.width ?: JSONObject.NULL)
+            .put("outputHeight", BitmapFactory.decodeFile(finalFile.absolutePath)?.height ?: JSONObject.NULL)
+            .put("referenceFrameIndex", referenceSelection.index)
+            .put("referenceFrameReason", referenceSelection.reason)
+            .put("alignmentStatus", if (nativeMergedOk) "NATIVE_GLOBAL_SHIFT_COMPLETE" else "FAILED_FALLBACK_KOTLIN_NO_ALIGNMENT")
+            .put("nativeRawMerge", nativeMergedOk)
+            .put("alignmentFile", if (nativeMergedOk) alignmentFile.name else JSONObject.NULL)
+            .put("alignmentError", if (nativeMergedOk) JSONObject.NULL else nativeStatus)
+            .put("mergedRawFormat", if (nativeMergedOk) "black_level_subtracted_aligned_compact_raw16" else "black_level_subtracted_kotlin_compact_raw16")
+            .put("sensorOrientation", job.opt("sensorOrientation") ?: JSONObject.NULL)
+            .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
             .put("processedAt", System.currentTimeMillis())
         jobFile.writeText(updated.toString(2))
 
@@ -362,6 +650,7 @@ fun captureProcessExportRawNightFusion(
     cameraId: String,
     frameCount: Int,
     resolutionMode: CaptureResolutionMode,
+    finalOutputFormat: FinalOutputFormat,
     zoomRatio: Float,
     focusAeState: FocusAeState = FocusAeState(),
     cleanupPolicy: CacheCleanupPolicy = CacheCleanupPolicy.KEEP_ALL,
@@ -369,7 +658,7 @@ fun captureProcessExportRawNightFusion(
 ) {
     val main = Handler(Looper.getMainLooper())
     fun post(message: String) = main.post { onStatus(message) }
-    post("Capturing RAW burst...")
+    post("RAW capture: saved 0/$frameCount, images 0/$frameCount, results 0/$frameCount")
     captureRawBurstForFusion(
         context = context,
         cameraId = cameraId,
@@ -384,42 +673,139 @@ fun captureProcessExportRawNightFusion(
                 try {
                     val process = processRawFusionJob(context, jobDir) { post(it) }
                     if (!process.success || process.finalPngFile == null) {
-                        updateRawExportFailure(jobDir, process.errorMessage ?: "RAW fusion process failed")
-                        post("RAW Night Fusion failed; keeping RAW cache. ${process.errorMessage}")
+                        updateExportFailure(
+                            jobDir = jobDir,
+                            error = process.errorMessage ?: "RAW fusion process failed",
+                            finalOutputFormat = finalOutputFormat
+                        )
+                        post("PIPELINE_FAILED: RAW Night Fusion failed; keeping RAW cache. ${process.errorMessage}")
                         return@post
                     }
-                    post("Exporting RAW Night Fusion...")
+                    val processedJobFile = File(jobDir, "job.json")
+                    val processedJob = JSONObject(processedJobFile.readText())
+                    val requestedFrames = processedJob.optInt("requestedFrames", frameCount)
+                    val usedFrameCount = processedJob.optInt("usedFrameCount", processedJob.optInt("savedFrames", requestedFrames))
+                    val partialCapture = processedJob.optBoolean("partialCapture", usedFrameCount < requestedFrames)
+                    val requestedOutputFormat = requestedOutputFormatForSetting(finalOutputFormat)
+                    post("Exporting ${requestedOutputFormat.label}...")
                     val bitmap = BitmapFactory.decodeFile(process.finalPngFile.absolutePath)
                         ?: error("Final RAW fusion PNG decode failed")
                     val result = exportNightFusionBitmapToGallery(
                         context = context,
                         bitmap = bitmap,
                         displayNameBase = "Kepler_RAW_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}",
-                        requestedFormat = OutputFormat.HEIF
+                        requestedFormat = requestedOutputFormat
                     )
                     bitmap.recycle()
                     if (!result.success || result.uriString.isNullOrBlank()) {
-                        updateRawExportFailure(jobDir, result.errorMessage ?: "Export failed")
-                        post("RAW export failed; keeping RAW cache. ${result.errorMessage}")
+                        updateExportFailure(
+                            jobDir = jobDir,
+                            error = result.errorMessage ?: "Export failed",
+                            finalOutputFormat = finalOutputFormat
+                        )
+                        post("PIPELINE_FAILED: RAW export failed; keeping RAW cache. ${result.errorMessage}")
                         return@post
                     }
+                    post("Verifying gallery export...")
                     val verified = verifyGalleryExport(context, result.uriString)
-                    updateRawExportMetadata(jobDir, result, verified, cleanupPolicy)
                     if (!verified) {
-                        post("RAW export verification failed; keeping RAW cache.")
+                        updateExportFailure(
+                            jobDir = jobDir,
+                            error = "Export verification failed",
+                            finalOutputFormat = finalOutputFormat
+                        )
+                        post("PIPELINE_FAILED: RAW export verification failed; keeping RAW cache.")
                         return@post
                     }
-                    val album = "Pictures/Kepler/${result.displayName}"
-                    post("Saved to Gallery: $album\nRAW cache kept for reprocessing.")
+                    val rawSidecarResult = if (finalOutputFormat.shouldExportRawSidecar) {
+                        exportRawSidecarsToPublicStorage(
+                            context = context,
+                            jobDir = jobDir,
+                            displayNameBase = "Kepler_RAW_${jobDir.name}"
+                        ).also { sidecars ->
+                            if (sidecars.success) {
+                                post("Exported RAW sidecars: ${sidecars.exportedFiles.size} DNG files")
+                            } else if (sidecars.errorMessage != null) {
+                                post("RAW sidecar export failed: ${sidecars.errorMessage}")
+                            }
+                        }
+                    } else {
+                        null
+                    }
+                    updateExportMetadata(
+                        jobDir = jobDir,
+                        export = result,
+                        verified = true,
+                        finalOutputFormat = finalOutputFormat,
+                        rawSidecarResult = rawSidecarResult
+                    )
+                    if (partialCapture) {
+                        post("PIPELINE_COMPLETE_PARTIAL: Saved ${result.formatUsed.label}${if (finalOutputFormat.shouldExportRawSidecar) " + RAW" else ""}. Used $usedFrameCount/$requestedFrames frames. Partial fallback was used.\nRAW cache kept for reprocessing.")
+                    } else {
+                        post("PIPELINE_COMPLETE: Saved ${result.formatUsed.label}${if (finalOutputFormat.shouldExportRawSidecar) " + RAW" else ""}. Used $usedFrameCount/$requestedFrames frames.\nRAW cache kept for reprocessing.")
+                    }
                 } catch (e: Exception) {
-                    post("RAW Night Fusion pipeline failed; keeping RAW cache.\n${e.stackTraceToString()}")
+                    post("PIPELINE_FAILED: RAW Night Fusion pipeline failed; keeping RAW cache.\n${e.stackTraceToString()}")
                 } finally {
                     thread.quitSafely()
                 }
             }
         },
-        onError = { post("RAW capture failed; keeping cache.\n$it") }
+        onError = { post("PIPELINE_FAILED: RAW capture failed; keeping cache.\n$it") }
     )
+}
+
+fun chooseRawFusionSizeV2(
+    characteristics: CameraCharacteristics,
+    resolutionMode: CaptureResolutionMode
+): RawSizeSelection {
+    val normalMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        ?: error("Stream configuration map missing")
+    val normalRaw = normalMap.getOutputSizes(ImageFormat.RAW_SENSOR)?.toList().orEmpty()
+    if (normalRaw.isEmpty()) error("RAW_SENSOR not exposed")
+    val maxRaw = if (Build.VERSION.SDK_INT >= 31) {
+        characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
+            ?.getOutputSizes(ImageFormat.RAW_SENSOR)
+            ?.toList()
+            .orEmpty()
+    } else {
+        emptyList()
+    }
+    val highRaw = runCatching {
+        normalMap.getHighResolutionOutputSizes(ImageFormat.RAW_SENSOR)?.toList().orEmpty()
+    }.getOrDefault(emptyList())
+
+    fun List<Size>.largestAtLeast(minMp: Double) = filter { megapixels(it) >= minMp }.maxByOrNull { it.width * it.height }
+    fun List<Size>.native24() = filter { megapixels(it) in 20.0..30.0 }.minByOrNull { abs(megapixels(it) - 24.0) }
+    fun mp12() = normalRaw.filter { megapixels(it) <= 14.5 }.maxByOrNull { it.width * it.height }
+        ?: normalRaw.maxByOrNull { it.width * it.height }
+        ?: error("RAW_SENSOR not exposed")
+    fun mp50(): RawSizeSelection? {
+        maxRaw.largestAtLeast(40.0)?.let {
+            return RawSizeSelection(it, "maximum_resolution_raw", true, false, null)
+        }
+        highRaw.largestAtLeast(40.0)?.let {
+            return RawSizeSelection(it, "high_resolution_raw", false, true, null)
+        }
+        normalRaw.largestAtLeast(40.0)?.let {
+            return RawSizeSelection(it, "normal_raw", false, false, null)
+        }
+        return null
+    }
+
+    return when (resolutionMode) {
+        CaptureResolutionMode.MP12 -> RawSizeSelection(mp12(), "normal_raw_12mp", false, false, null)
+        CaptureResolutionMode.MP50 -> mp50()
+            ?: error("50M RAW unavailable; no >=40MP RAW stream exposed through public Camera2.")
+        CaptureResolutionMode.MP24_FUSION -> {
+            (maxRaw + highRaw + normalRaw).native24()?.let {
+                val fromMax = it in maxRaw
+                return RawSizeSelection(it, "native_24mp_raw", fromMax, it in highRaw, null)
+            }
+            mp50()?.copy(source = "50mp_detail_for_24mp_fusion")
+                ?: error("24M Fusion unavailable: 50MP detail input is not exposed.")
+        }
+    }
 }
 
 private fun chooseRawFusionSize(sizes: Array<Size>, mode: CaptureResolutionMode): Size {
@@ -434,54 +820,174 @@ private fun chooseRawFusionSize(sizes: Array<Size>, mode: CaptureResolutionMode)
 private fun writeCompactRaw16(image: Image, file: File) {
     val plane = image.planes[0]
     val buffer = plane.buffer
-    FileOutputStream(file).use { output ->
-        val rowStride = plane.rowStride
-        val pixelStride = plane.pixelStride
-        for (y in 0 until image.height) {
+    val width = image.width
+    val height = image.height
+    val rowStride = plane.rowStride
+    val pixelStride = plane.pixelStride
+    val limit = buffer.limit()
+    val rowBytes = ByteArray(width * 2)
+    BufferedOutputStream(FileOutputStream(file)).use { output ->
+        for (y in 0 until height) {
             val row = y * rowStride
-            for (x in 0 until image.width) {
+            var out = 0
+            for (x in 0 until width) {
                 val index = row + x * pixelStride
-                output.write(buffer.get(index).toInt())
-                output.write(buffer.get(index + 1).toInt())
+                if (index + 1 < limit) {
+                    rowBytes[out++] = buffer.get(index)
+                    rowBytes[out++] = buffer.get(index + 1)
+                } else {
+                    rowBytes[out++] = 0
+                    rowBytes[out++] = 0
+                }
             }
+            output.write(rowBytes)
         }
+    }
+    val expectedSize = width * height * 2L
+    if (!file.exists() || file.length() < expectedSize) {
+        error("RAW16 output invalid: ${file.absolutePath}, size=${file.length()}, expected=$expectedSize")
     }
 }
 
 private fun readRaw16(file: File, pixelCount: Int): ShortArray {
-    val bytes = file.readBytes()
-    val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-    return ShortArray(pixelCount) { if (buffer.remaining() >= 2) buffer.short else 0 }
+    val values = ShortArray(pixelCount)
+    val bytes = ByteArray(1024 * 1024)
+    var byteCarry: Int? = null
+    var out = 0
+    BufferedInputStream(FileInputStream(file)).use { input ->
+        while (out < pixelCount) {
+            val read = input.read(bytes)
+            if (read <= 0) break
+            var index = 0
+            if (byteCarry != null && index < read) {
+                values[out++] = ((bytes[index].toInt() and 0xFF) shl 8 or byteCarry!!).toShort()
+                byteCarry = null
+                index++
+            }
+            while (index + 1 < read && out < pixelCount) {
+                val lo = bytes[index].toInt() and 0xFF
+                val hi = bytes[index + 1].toInt() and 0xFF
+                values[out++] = ((hi shl 8) or lo).toShort()
+                index += 2
+            }
+            if (index < read && out < pixelCount) {
+                byteCarry = bytes[index].toInt() and 0xFF
+            }
+        }
+    }
+    return values
 }
 
 private fun writeRaw16(values: ShortArray, file: File) {
-    val buffer = ByteBuffer.allocate(values.size * 2).order(ByteOrder.LITTLE_ENDIAN)
-    values.forEach { buffer.putShort(it) }
-    file.writeBytes(buffer.array())
+    val row = ByteArray(1024 * 1024)
+    BufferedOutputStream(FileOutputStream(file)).use { output ->
+        var offset = 0
+        while (offset < values.size) {
+            val count = min(values.size - offset, row.size / 2)
+            var out = 0
+            for (i in 0 until count) {
+                val value = values[offset + i].toInt()
+                row[out++] = (value and 0xFF).toByte()
+                row[out++] = ((value ushr 8) and 0xFF).toByte()
+            }
+            output.write(row, 0, out)
+            offset += count
+        }
+    }
 }
 
-private fun estimateBlackLevel(job: JSONObject, frames: List<ShortArray>): Int {
-    val dynamic = job.optJSONArray("dynamicBlackLevel")?.optDouble(0)?.toInt()
-    if (dynamic != null) return dynamic
-    val sample = frames.first().asSequence().take(4096).map { it.toInt() and 0xFFFF }.sorted().toList()
-    return sample.getOrNull((sample.size * 0.01).toInt()) ?: 64
+private data class RawFrameInput(val file: File, val meta: JSONObject)
+
+private data class RawReferenceSelection(val index: Int, val reason: String)
+
+private fun chooseRawReferenceFrame(
+    frameInputs: List<RawFrameInput>,
+    motionScores: DoubleArray,
+    hasGyro: Boolean
+): RawReferenceSelection {
+    if (frameInputs.isEmpty()) return RawReferenceSelection(0, "no_frames_default")
+    if (hasGyro && motionScores.size >= frameInputs.size) {
+        val best = motionScores.indices.minByOrNull { motionScores[it] } ?: 0
+        return RawReferenceSelection(best, "lowest_gyro_motion")
+    }
+    return RawReferenceSelection(frameInputs.size / 2, "middle_frame_no_gyro")
 }
 
-private fun estimateWhiteLevel(job: JSONObject, frames: List<ShortArray>, blackLevel: Int): Int {
+private data class BlackLevelEstimate(
+    val value: Int,
+    val source: String,
+    val pattern: IntArray? = null,
+    val mode: String = "scalar_fallback"
+)
+
+private fun needsRawBlackLevelFallback(job: JSONObject, frameMeta: List<JSONObject>): Boolean {
+    if (frameMeta.any { (it.optJSONArray("dynamicBlackLevel")?.length() ?: 0) > 0 }) return false
+    val patternArray = job.optJSONArray("blackLevelPattern")
+    if (patternArray != null && patternArray.length() > 0) return false
+    return Regex("\\d+").find(job.optString("blackLevelPattern")) == null
+}
+
+private fun estimateBlackLevel(job: JSONObject, frameMeta: List<JSONObject>, fallbackSample: ShortArray?): BlackLevelEstimate {
+    for (frame in frameMeta) {
+        val dynamic = frame.optJSONArray("dynamicBlackLevel")
+        if (dynamic != null && dynamic.length() >= 4) {
+            val pattern = IntArray(4) { dynamic.optDouble(it).toInt() }
+            return BlackLevelEstimate(pattern.average().toInt(), "frame.dynamicBlackLevel", pattern, "per_cfa")
+        }
+        if (dynamic != null && dynamic.length() > 0) {
+            return BlackLevelEstimate(dynamic.optDouble(0).toInt(), "frame.dynamicBlackLevel")
+        }
+    }
+    val patternArray = job.optJSONArray("blackLevelPattern")
+    val patternValues = if (patternArray != null) {
+        List(patternArray.length()) { patternArray.optInt(it) }
+    } else {
+        Regex("\\d+").findAll(job.optString("blackLevelPattern")).mapNotNull { it.value.toIntOrNull() }.toList()
+    }
+    if (patternValues.size >= 4) {
+        val pattern = IntArray(4) { patternValues[it] }
+        return BlackLevelEstimate(pattern.average().toInt(), "job.blackLevelPattern", pattern, "per_cfa")
+    }
+    if (patternValues.isNotEmpty()) return BlackLevelEstimate(patternValues.average().toInt(), "job.blackLevelPattern")
+    val sample = fallbackSample?.asSequence()?.map { it.toInt() and 0xFFFF }?.sorted()?.toList().orEmpty()
+    return BlackLevelEstimate(sample.getOrNull((sample.size * 0.01).toInt()) ?: 64, "percentile.fallback")
+}
+
+private fun blackLevelForPixel(x: Int, y: Int, cfa: Int, estimate: BlackLevelEstimate): Int {
+    val pattern = estimate.pattern ?: return estimate.value
+    return pattern[blackLevelPatternIndex(x, y, cfa)]
+}
+
+private fun blackLevelPatternIndex(x: Int, y: Int, cfa: Int): Int {
+    val evenX = x % 2 == 0
+    val evenY = y % 2 == 0
+    return when (cfa) {
+        1 -> if (evenY) if (evenX) 0 else 1 else if (evenX) 2 else 3 // GRBG
+        2 -> if (evenY) if (evenX) 0 else 1 else if (evenX) 2 else 3 // GBRG
+        3 -> if (evenY) if (evenX) 0 else 1 else if (evenX) 2 else 3 // BGGR
+        else -> if (evenY) if (evenX) 0 else 1 else if (evenX) 2 else 3 // RGGB
+    }
+}
+
+private data class WhiteLevelEstimate(val value: Int, val source: String)
+
+private fun estimateWhiteLevel(job: JSONObject, maxValue: Int, blackLevel: Int): WhiteLevelEstimate {
     val white = job.optInt("whiteLevel", 0)
-    if (white > blackLevel) return white
-    val maxValue = frames.maxOf { frame -> frame.maxOf { it.toInt() and 0xFFFF } }
-    return when {
+    if (white > blackLevel) return WhiteLevelEstimate(white, "cameraCharacteristics.whiteLevel")
+    val fallback = when {
         maxValue <= 1023 -> 1023
         maxValue <= 4095 -> 4095
         maxValue <= 16383 -> 16383
         else -> 65535
     }
+    return WhiteLevelEstimate(max(fallback, maxValue), "observedMax.fallback")
 }
 
 private fun demosaicBilinear(raw: ShortArray, width: Int, height: Int, cfa: Int, whiteLevel: Int): Bitmap {
     val pixels = IntArray(width * height)
     fun rawAt(x: Int, y: Int): Int = raw[y.coerceIn(0, height - 1) * width + x.coerceIn(0, width - 1)].toInt() and 0xFFFF
+    fun avg2(a: Int, b: Int): Int = (a + b) / 2
+    fun avg4(a: Int, b: Int, c: Int, d: Int): Int = (a + b + c + d) / 4
     fun colorAt(x: Int, y: Int): Char {
         val evenY = y % 2 == 0
         val evenX = x % 2 == 0
@@ -492,7 +998,10 @@ private fun demosaicBilinear(raw: ShortArray, width: Int, height: Int, cfa: Int,
             else -> if (evenY) if (evenX) 'R' else 'G' else if (evenX) 'G' else 'B' // RGGB
         }
     }
-    fun avg(points: List<Pair<Int, Int>>) = points.sumOf { rawAt(it.first, it.second) } / points.size
+    fun greenOnRedRow(y: Int): Boolean = when (cfa) {
+        2, 3 -> y % 2 != 0 // GBRG/BGGR red samples live on odd rows.
+        else -> y % 2 == 0 // RGGB/GRBG red samples live on even rows.
+    }
     for (y in 0 until height) {
         for (x in 0 until width) {
             val c = colorAt(x, y)
@@ -503,18 +1012,23 @@ private fun demosaicBilinear(raw: ShortArray, width: Int, height: Int, cfa: Int,
             when (c) {
                 'R' -> {
                     r = value
-                    g = avg(listOf(x - 1 to y, x + 1 to y, x to y - 1, x to y + 1))
-                    b = avg(listOf(x - 1 to y - 1, x + 1 to y - 1, x - 1 to y + 1, x + 1 to y + 1))
+                    g = avg4(rawAt(x - 1, y), rawAt(x + 1, y), rawAt(x, y - 1), rawAt(x, y + 1))
+                    b = avg4(rawAt(x - 1, y - 1), rawAt(x + 1, y - 1), rawAt(x - 1, y + 1), rawAt(x + 1, y + 1))
                 }
                 'B' -> {
                     b = value
-                    g = avg(listOf(x - 1 to y, x + 1 to y, x to y - 1, x to y + 1))
-                    r = avg(listOf(x - 1 to y - 1, x + 1 to y - 1, x - 1 to y + 1, x + 1 to y + 1))
+                    g = avg4(rawAt(x - 1, y), rawAt(x + 1, y), rawAt(x, y - 1), rawAt(x, y + 1))
+                    r = avg4(rawAt(x - 1, y - 1), rawAt(x + 1, y - 1), rawAt(x - 1, y + 1), rawAt(x + 1, y + 1))
                 }
                 else -> {
                     g = value
-                    r = avg(listOf(x - 1 to y, x + 1 to y))
-                    b = avg(listOf(x to y - 1, x to y + 1))
+                    if (greenOnRedRow(y)) {
+                        r = avg2(rawAt(x - 1, y), rawAt(x + 1, y))
+                        b = avg2(rawAt(x, y - 1), rawAt(x, y + 1))
+                    } else {
+                        r = avg2(rawAt(x, y - 1), rawAt(x, y + 1))
+                        b = avg2(rawAt(x - 1, y), rawAt(x + 1, y))
+                    }
                 }
             }
             pixels[y * width + x] = Color.rgb(curveRaw(r, whiteLevel), curveRaw(g, whiteLevel), curveRaw(b, whiteLevel))
@@ -528,15 +1042,85 @@ private fun curveRaw(value: Int, whiteLevel: Int): Int {
     return (x.pow(1.0 / 2.2) * 255.0).toInt().coerceIn(0, 255)
 }
 
-private fun toneMapRawFusion(source: Bitmap): Bitmap = source.copy(Bitmap.Config.ARGB_8888, false)
+private fun toneMapRawFusion(source: Bitmap): Bitmap {
+    val width = source.width
+    val height = source.height
+    val pixels = IntArray(width * height)
+    source.getPixels(pixels, 0, width, 0, 0, width, height)
+    for (i in pixels.indices) {
+        val color = pixels[i]
+        val r = toneChannel(Color.red(color))
+        val g = toneChannel(Color.green(color))
+        val b = toneChannel(Color.blue(color))
+        pixels[i] = Color.rgb(r, g, b)
+    }
+    return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
+}
+
+private fun toneChannel(value: Int): Int {
+    val x = value / 255.0
+    val lifted = (x * 1.06 + 0.012).coerceIn(0.0, 1.0)
+    val shouldered = lifted / (lifted + 0.10)
+    return (shouldered / (1.0 / 1.10) * 255.0).toInt().coerceIn(0, 255)
+}
+
+private fun resizeFinalForResolutionMode(
+    source: Bitmap,
+    mode: CaptureResolutionMode,
+    onStatus: (String) -> Unit
+): Bitmap {
+    if (mode != CaptureResolutionMode.MP24_FUSION) return source
+    val targetWidth = 4896
+    val targetHeight = 3672
+    return try {
+        onStatus("24M Fusion v0: resizing final output to ${targetWidth}x$targetHeight")
+        val resized = Bitmap.createScaledBitmap(source, targetWidth, targetHeight, true)
+        if (resized !== source) source.recycle()
+        resized
+    } catch (e: OutOfMemoryError) {
+        onStatus("24M Fusion resize failed; keeping source output. ${e.javaClass.simpleName}")
+        source
+    }
+}
 
 private fun sharpenRawFusion(source: Bitmap): Bitmap {
-    // Mild placeholder; RAW merge already denoises. TODO better chroma denoise/unsharp.
-    return source.copy(Bitmap.Config.ARGB_8888, false)
+    val width = source.width
+    val height = source.height
+    val input = IntArray(width * height)
+    val output = IntArray(width * height)
+    source.getPixels(input, 0, width, 0, 0, width, height)
+    fun pixel(x: Int, y: Int): Int = input[y.coerceIn(0, height - 1) * width + x.coerceIn(0, width - 1)]
+    for (y in 0 until height) {
+        for (x in 0 until width) {
+            val center = pixel(x, y)
+            var blurR = 0
+            var blurG = 0
+            var blurB = 0
+            for (dy in -1..1) {
+                for (dx in -1..1) {
+                    val c = pixel(x + dx, y + dy)
+                    blurR += Color.red(c)
+                    blurG += Color.green(c)
+                    blurB += Color.blue(c)
+                }
+            }
+            val r = (Color.red(center) * 1.35f - (blurR / 9f) * 0.35f).toInt().coerceIn(0, 255)
+            val g = (Color.green(center) * 1.35f - (blurG / 9f) * 0.35f).toInt().coerceIn(0, 255)
+            val b = (Color.blue(center) * 1.35f - (blurB / 9f) * 0.35f).toInt().coerceIn(0, 255)
+            output[y * width + x] = Color.rgb(r, g, b)
+        }
+    }
+    return Bitmap.createBitmap(output, width, height, Bitmap.Config.ARGB_8888)
 }
 
 private fun saveRawFusionPng(bitmap: Bitmap, file: File) {
-    FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+    FileOutputStream(file).use {
+        val ok = bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)
+        if (!ok) error("Bitmap.compress PNG failed for ${file.name}")
+    }
+    if (!file.exists() || file.length() < 1024L) {
+        error("PNG output invalid or too small: ${file.absolutePath}, size=${file.length()}")
+    }
 }
 
 private data class RawGyro(val timestamp: Long, val magnitude: Double)
@@ -556,31 +1140,4 @@ private fun readRawGyroSamples(file: File): List<RawGyro> {
 private fun motionNearRaw(samples: List<RawGyro>, timestamp: Long): Double {
     val window = 80_000_000L
     return samples.filter { abs(it.timestamp - timestamp) <= window }.map { it.magnitude }.average().takeIf { !it.isNaN() } ?: 0.0
-}
-
-private fun updateRawExportMetadata(jobDir: File, result: GalleryExportResult, verified: Boolean, cleanupPolicy: CacheCleanupPolicy) {
-    val file = File(jobDir, "job.json")
-    val job = JSONObject(file.readText())
-    job.put("exportStatus", if (verified) "EXPORTED" else "EXPORT_UNVERIFIED")
-        .put("exportVerified", verified)
-        .put("exportUri", result.uriString ?: JSONObject.NULL)
-        .put("exportDisplayName", result.displayName ?: JSONObject.NULL)
-        .put("exportMimeType", result.mimeType ?: JSONObject.NULL)
-        .put("exportFormatUsed", result.formatUsed.label)
-        .put("exportFallbackUsed", result.fallbackUsed)
-        .put("exportFileSizeBytes", result.fileSizeBytes)
-        .put("cleanupPolicy", cleanupPolicy.name)
-        .put("cleanupStatus", "RAW_CACHE_KEPT")
-        .put("exportedAt", System.currentTimeMillis())
-    file.writeText(job.toString(2))
-}
-
-private fun updateRawExportFailure(jobDir: File, error: String) {
-    val file = File(jobDir, "job.json")
-    val job = if (file.exists()) JSONObject(file.readText()) else JSONObject()
-    job.put("exportStatus", "FAILED")
-        .put("exportVerified", false)
-        .put("exportError", error)
-        .put("cleanupStatus", "SKIPPED_RAW_CACHE_KEPT")
-    file.writeText(job.toString(2))
 }

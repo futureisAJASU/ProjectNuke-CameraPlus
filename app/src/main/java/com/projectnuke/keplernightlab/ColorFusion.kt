@@ -218,6 +218,7 @@ fun captureYuvBurstColorWithMotion(
         )
 
         imageReader = reader
+        postStatus("YUV capture: saved 0/$frameCount")
 
         postStatus("Color Fusion 초기화 5/7: 모션 센서 시작 중...")
 
@@ -305,6 +306,8 @@ fun captureYuvBurstColorWithMotion(
                         framePlanReason = framePlanReason
                     )
 
+                    postStatus("YUV capture: saved $savedFrames/$frameCount")
+
                     postStatus(
                         "컬러 프레임 저장 중...\n" +
                             "저장: $savedFrames / $frameCount\n" +
@@ -347,6 +350,7 @@ fun captureYuvBurstColorWithMotion(
                             framePlanReason = framePlanReason
                         )
 
+                        postStatus("YUV capture complete: saved $savedFrames/$frameCount")
                         onComplete(burstDir)
 
                         finish(

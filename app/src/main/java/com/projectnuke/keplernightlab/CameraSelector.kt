@@ -16,6 +16,8 @@ data class CameraCandidate(
     val focalLengths: List<Float>,
     val maxYuvMegapixels: Double,
     val maxRawMegapixels: Double,
+    val maxHighResMegapixels: Double,
+    val supportsUltraHighResolution: Boolean,
     val supportsRaw: Boolean
 )
 
@@ -42,6 +44,10 @@ fun findBackCameraCandidates(context: Context): List<CameraCandidate> {
             val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
                 ?: intArrayOf()
             val supportsRaw = capabilities.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW)
+            val supportsUltraHighResolution = capabilities.contains(
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_ULTRA_HIGH_RESOLUTION_SENSOR
+            )
+            val capability = queryCameraResolutionCapability(context, cameraId, LensSlot.MAIN_1X)
 
             CameraCandidate(
                 cameraId = cameraId,
@@ -52,6 +58,11 @@ fun findBackCameraCandidates(context: Context): List<CameraCandidate> {
                     .orEmpty(),
                 maxYuvMegapixels = maxMegapixels(map?.getOutputSizes(ImageFormat.YUV_420_888)),
                 maxRawMegapixels = maxMegapixels(map?.getOutputSizes(ImageFormat.RAW_SENSOR)),
+                maxHighResMegapixels = max(
+                    capability.maxAvailableRawMp,
+                    max(capability.maxAvailableYuvMp, capability.maxAvailableJpegMp)
+                ),
+                supportsUltraHighResolution = supportsUltraHighResolution,
                 supportsRaw = supportsRaw
             )
         }.getOrNull()
@@ -91,7 +102,7 @@ fun selectCameraForOptions(
                 cameraId = main.cameraId,
                 effectiveZoomRatio = 1.0f,
                 useCrop = false,
-                note = "Main candidate cameraId=${main.cameraId}."
+                note = "Main selected by max high-res capability: cameraId=${main.cameraId}."
             )
         }
 
@@ -101,7 +112,7 @@ fun selectCameraForOptions(
                 cameraId = main.cameraId,
                 effectiveZoomRatio = 2.0f,
                 useCrop = true,
-                note = "2x uses main camera crop on cameraId=${main.cameraId}."
+                note = "2x uses main high-res camera crop on cameraId=${main.cameraId}. 2x 24M is fusion/SR, not native crop."
             )
         }
 
@@ -133,7 +144,7 @@ fun selectCameraForOptions(
                         cameraId = main.cameraId,
                         effectiveZoomRatio = 3.0f,
                         useCrop = true,
-                        note = "3x uses main camera crop on cameraId=${main.cameraId}."
+                        note = "3x uses main high-res camera crop on cameraId=${main.cameraId}."
                     )
                 }
             }
@@ -156,6 +167,8 @@ fun buildCameraSelectionDebugReport(context: Context): String {
                     "focalLengths=${camera.focalLengths}, " +
                     "maxYuvMp=${"%.1f".format(camera.maxYuvMegapixels)}, " +
                     "maxRawMp=${"%.1f".format(camera.maxRawMegapixels)}, " +
+                    "maxHighResMp=${"%.1f".format(camera.maxHighResMegapixels)}, " +
+                    "ultraHighRes=${camera.supportsUltraHighResolution}, " +
                     "supportsRaw=${camera.supportsRaw}"
             )
         }
@@ -186,7 +199,9 @@ private fun selectMainCamera(candidates: List<CameraCandidate>): CameraCandidate
     val middleFocal = sortedFocalLengths.getOrNull(sortedFocalLengths.size / 2) ?: 0f
 
     return candidates.maxWithOrNull(
-        compareBy<CameraCandidate> { max(it.maxYuvMegapixels, it.maxRawMegapixels) }
+        compareBy<CameraCandidate> { if (it.supportsUltraHighResolution) 1 else 0 }
+            .thenBy { it.maxHighResMegapixels }
+            .thenBy { max(it.maxYuvMegapixels, it.maxRawMegapixels) }
             .thenBy { -abs(it.primaryFocalLength() - middleFocal) }
     ) ?: candidates.first()
 }

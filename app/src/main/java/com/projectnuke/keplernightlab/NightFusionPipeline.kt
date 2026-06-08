@@ -16,6 +16,7 @@ fun captureProcessExportNightFusion(
     cameraId: String,
     frameCount: Int,
     resolutionMode: CaptureResolutionMode,
+    finalOutputFormat: FinalOutputFormat,
     zoomRatio: Float,
     focusAeState: FocusAeState = FocusAeState(),
     cleanupPolicy: CacheCleanupPolicy = CacheCleanupPolicy.DELETE_SOURCE_FRAMES_AFTER_VERIFIED_EXPORT,
@@ -31,7 +32,7 @@ fun captureProcessExportNightFusion(
         mainHandler.post { onStatus(message) }
     }
 
-    post("Capturing $frameCount frames...")
+    post("YUV capture: saved 0/$frameCount")
     captureYuvBurstColorWithMotion(
         context = context,
         cameraId = cameraId,
@@ -51,7 +52,8 @@ fun captureProcessExportNightFusion(
                     post("Processing Night Fusion...")
                     val finalFile = processNightFusionJobV02Sync(jobDir) { post(it) }
 
-                    post("Exporting HEIF...")
+                    val requestedOutputFormat = requestedOutputFormatForSetting(finalOutputFormat)
+                    post("Exporting ${requestedOutputFormat.label}...")
                     val bitmap = BitmapFactory.decodeFile(finalFile.absolutePath)
                         ?: error("Could not decode final Night Fusion image.")
                     val displayNameBase = "Kepler_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}"
@@ -59,46 +61,66 @@ fun captureProcessExportNightFusion(
                         context = context,
                         bitmap = bitmap,
                         displayNameBase = displayNameBase,
-                        requestedFormat = OutputFormat.HEIF
+                        requestedFormat = requestedOutputFormat
                     )
                     bitmap.recycle()
 
                     if (!export.success || export.uriString.isNullOrBlank()) {
-                        updateNightFusionExportFailure(jobDir, export.errorMessage ?: "Unknown export failure")
-                        post("Export failed; keeping cache. ${export.errorMessage}")
+                        updateExportFailure(
+                            jobDir = jobDir,
+                            error = export.errorMessage ?: "Unknown export failure",
+                            finalOutputFormat = finalOutputFormat,
+                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
+                        )
+                        post("PIPELINE_FAILED: Export failed; keeping cache. ${export.errorMessage}")
                         return@post
                     }
 
                     post("Verifying gallery output...")
                     val verified = verifyGalleryExport(context, export.uriString)
-                    updateNightFusionExportMetadata(jobDir, export, verified)
+                    updateExportMetadata(
+                        jobDir = jobDir,
+                        export = export,
+                        verified = verified,
+                        finalOutputFormat = finalOutputFormat,
+                        rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
+                    )
 
                     if (!verified) {
-                        updateNightFusionExportFailure(jobDir, "Export verification failed")
-                        post("Export verification failed; keeping source frames.")
+                        updateExportFailure(
+                            jobDir = jobDir,
+                            error = "Export verification failed",
+                            finalOutputFormat = finalOutputFormat,
+                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
+                        )
+                        post("PIPELINE_FAILED: Export verification failed; keeping source frames.")
                         return@post
                     }
 
+                    post("Cleanup...")
                     val cleanup = cleanupNightFusionJobAfterVerifiedExport(
                         jobDir = jobDir,
                         policy = cleanupPolicy,
                         onStatus = { post(it) }
                     )
                     val album = "Pictures/Kepler/${export.displayName}"
-                    if (export.fallbackUsed) {
-                        post("HEIF failed, saved ${export.formatUsed.label} to Gallery: $album\nCleanup complete. Deleted ${cleanup.deletedFiles} files.")
+                    if (finalOutputFormat.shouldExportRawSidecar) {
+                        post("RAW sidecar unavailable for YUV pipeline.")
+                    }
+                    if (export.fallbackUsed && requestedOutputFormat == OutputFormat.HEIF) {
+                        post("PIPELINE_COMPLETE: HEIF failed, saved ${export.formatUsed.label} to Gallery: $album\nCleanup complete. Deleted ${cleanup.deletedFiles} files.")
                     } else {
-                        post("Saved to Gallery: $album\nCleanup complete. Deleted ${cleanup.deletedFiles} files.")
+                        post("PIPELINE_COMPLETE: Saved ${export.formatUsed.label} to Gallery: $album\nCleanup complete. Deleted ${cleanup.deletedFiles} files.")
                     }
                 } catch (e: Exception) {
-                    post("Night Fusion pipeline failed; keeping cache.\n${e.stackTraceToString()}")
+                    post("PIPELINE_FAILED: Night Fusion pipeline failed; keeping cache.\n${e.stackTraceToString()}")
                 } finally {
                     workerThread.quitSafely()
                 }
             }
         },
         onError = { error ->
-            post("Capture failed; keeping cache.\n$error")
+            post("PIPELINE_FAILED: Capture failed; keeping cache.\n$error")
         },
         onStatus = { message ->
             post(message)
@@ -167,38 +189,6 @@ fun cleanupNightFusionJobAfterVerifiedExport(
         freedBytes = freed,
         keptFiles = jobDir.listFiles()?.map { it.name }.orEmpty()
     )
-}
-
-private fun updateNightFusionExportMetadata(
-    jobDir: File,
-    export: GalleryExportResult,
-    verified: Boolean
-) {
-    val jobFile = File(jobDir, "job.json")
-    val job = JSONObject(jobFile.readText())
-    job.put("exportStatus", if (verified) "EXPORTED" else "EXPORT_UNVERIFIED")
-        .put("exportVerified", verified)
-        .put("exportUri", export.uriString ?: JSONObject.NULL)
-        .put("exportDisplayName", export.displayName ?: JSONObject.NULL)
-        .put("exportMimeType", export.mimeType ?: JSONObject.NULL)
-        .put("exportFormatRequested", OutputFormat.HEIF.label)
-        .put("exportFormatUsed", export.formatUsed.label)
-        .put("exportFallbackUsed", export.fallbackUsed)
-        .put("exportFileSizeBytes", export.fileSizeBytes)
-        .put("exportedAt", System.currentTimeMillis())
-    jobFile.writeText(job.toString(2))
-}
-
-private fun updateNightFusionExportFailure(jobDir: File, error: String) {
-    val jobFile = File(jobDir, "job.json")
-    val job = JSONObject(jobFile.readText())
-    job.put("processStatus", "EXPORT_FAILED_KEEPING_CACHE")
-        .put("exportStatus", "FAILED")
-        .put("exportVerified", false)
-        .put("exportError", error)
-        .put("cleanupStatus", "SKIPPED")
-        .put("exportedAt", System.currentTimeMillis())
-    jobFile.writeText(job.toString(2))
 }
 
 private fun updateCleanupMetadata(

@@ -14,21 +14,25 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.os.Handler
 import android.os.HandlerThread
+import android.util.Log
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import kotlin.math.abs
-import kotlin.math.max
+
+private const val PREVIEW_ROTATION_FIX_DEGREES = 90f
 
 @Composable
 fun Camera2Preview(
@@ -41,21 +45,22 @@ fun Camera2Preview(
 ) {
     val context = LocalContext.current
     var textureView by remember { mutableStateOf<TextureView?>(null) }
+    val latestOnAeCapabilitiesChanged = rememberUpdatedState(onAeCapabilitiesChanged)
 
-    val controller = remember(
-        cameraId,
-        zoomRatio,
-        focusAeState.point,
-        focusAeState.locked,
-        focusAeState.exposureCompensationIndex
-    ) {
+    val controller = remember(cameraId) {
         CameraPreviewController(
             context = context.applicationContext,
             cameraId = cameraId,
-            zoomRatio = zoomRatio,
-            focusAeState = focusAeState,
-            onAeCapabilitiesChanged = onAeCapabilitiesChanged
+            onAeCapabilitiesChangedProvider = { latestOnAeCapabilitiesChanged.value }
         )
+    }
+
+    LaunchedEffect(zoomRatio) {
+        controller.updateZoomRatio(zoomRatio)
+    }
+
+    LaunchedEffect(focusAeState) {
+        controller.updateFocusAeState(focusAeState)
     }
 
     AndroidView(
@@ -71,10 +76,6 @@ fun Camera2Preview(
         textureView,
         enabled,
         cameraId,
-        zoomRatio,
-        focusAeState.point,
-        focusAeState.locked,
-        focusAeState.exposureCompensationIndex,
         controller
     ) {
         val view = textureView
@@ -94,21 +95,22 @@ fun Camera2Preview(
 private class CameraPreviewController(
     private val context: Context,
     private val cameraId: String,
-    private val zoomRatio: Float,
-    private val focusAeState: FocusAeState,
-    private val onAeCapabilitiesChanged: (minIndex: Int, maxIndex: Int, stepEv: Float) -> Unit
+    private val onAeCapabilitiesChangedProvider: () -> (minIndex: Int, maxIndex: Int, stepEv: Float) -> Unit
 ) {
-    private val rotationOverrideDegrees: Int? = null
+    private val lock = Any()
+    private var generation = 0
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
+    private var cameraCharacteristics: CameraCharacteristics? = null
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
     private var previewSurface: Surface? = null
-    private var started = false
+    private var currentPreviewSize: Size? = null
+    @Volatile private var latestZoomRatio: Float = 1.0f
+    @Volatile private var latestFocusAeState: FocusAeState = FocusAeState()
+    @Volatile private var started = false
 
     fun start(textureView: TextureView) {
-        if (started) return
-
         if (
             ContextCompat.checkSelfPermission(
                 context,
@@ -118,13 +120,21 @@ private class CameraPreviewController(
             return
         }
 
+        val localGeneration = synchronized(lock) {
+            if (started && backgroundHandler != null && previewSurface != null) return
+            generation += 1
+            started = true
+            generation
+        }
+        Log.d(TAG, "start generation=$localGeneration cameraId=$cameraId zoom=$latestZoomRatio")
+
         textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(
                 surface: SurfaceTexture,
                 width: Int,
                 height: Int
             ) {
-                openCamera(textureView)
+                openCamera(textureView, localGeneration)
             }
 
             override fun onSurfaceTextureSizeChanged(
@@ -132,7 +142,9 @@ private class CameraPreviewController(
                 width: Int,
                 height: Int
             ) {
-                applyPreviewTransform(textureView)
+                currentPreviewSize?.let { previewSize ->
+                    configureTransform(textureView, previewSize)
+                }
             }
 
             override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
@@ -144,45 +156,95 @@ private class CameraPreviewController(
         }
 
         if (textureView.isAvailable) {
-            openCamera(textureView)
+            openCamera(textureView, localGeneration)
         }
     }
 
     fun stop() {
-        try { captureSession?.stopRepeating() } catch (_: Exception) {}
-        try { captureSession?.close() } catch (_: Exception) {}
-        try { cameraDevice?.close() } catch (_: Exception) {}
-        try { previewSurface?.release() } catch (_: Exception) {}
-        try { backgroundThread?.quitSafely() } catch (_: Exception) {}
+        val refs = synchronized(lock) {
+            generation += 1
+            started = false
+            Log.d(TAG, "stop generation=$generation")
+            StopRefs(captureSession, cameraDevice, previewSurface, backgroundThread)
+                .also {
+                    captureSession = null
+                    cameraDevice = null
+                    cameraCharacteristics = null
+                    previewSurface = null
+                    backgroundThread = null
+                    backgroundHandler = null
+                    currentPreviewSize = null
+                }
+        }
 
-        captureSession = null
-        cameraDevice = null
-        previewSurface = null
-        backgroundThread = null
-        backgroundHandler = null
-        started = false
+        runCatching { refs.session?.stopRepeating() }
+        runCatching { refs.session?.close() }
+        runCatching { refs.device?.close() }
+        runCatching { refs.surface?.release() }
+        runCatching { refs.thread?.quitSafely() }
+    }
+
+    fun updateFocusAeState(newState: FocusAeState) {
+        val previous = latestFocusAeState
+        latestFocusAeState = newState
+        val handler = backgroundHandler ?: return
+        val localGeneration = synchronized(lock) { generation }
+        handler.post {
+            applyFocusAeStateOnCameraThread(
+                newState = newState,
+                previousState = previous,
+                localGeneration = localGeneration
+            )
+        }
+    }
+
+    fun updateZoomRatio(newZoomRatio: Float) {
+        val previous = latestZoomRatio
+        latestZoomRatio = newZoomRatio.coerceAtLeast(0.1f)
+        val handler = backgroundHandler ?: return
+        val localGeneration = synchronized(lock) { generation }
+        handler.post {
+            if (!isActive(localGeneration)) return@post
+            applyFocusAeStateOnCameraThread(
+                newState = latestFocusAeState,
+                previousState = latestFocusAeState,
+                localGeneration = localGeneration
+            )
+            if (kotlin.math.abs(previous - latestZoomRatio) >= 0.02f) {
+                Log.d(TAG, "zoom changed ratio=$latestZoomRatio")
+            }
+        }
     }
 
     @SuppressLint("MissingPermission")
-    private fun openCamera(textureView: TextureView) {
-        if (started) return
-        started = true
+    private fun openCamera(textureView: TextureView, localGeneration: Int) {
+        if (!isActive(localGeneration) || !textureView.isAvailable) return
 
         val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
 
-        backgroundThread = HandlerThread("KeplerPreviewThread").apply { start() }
-        backgroundHandler = Handler(backgroundThread!!.looper)
+        val thread = HandlerThread("KeplerPreviewThread").apply { start() }
+        val handler = Handler(thread.looper)
+        synchronized(lock) {
+            if (!isActiveLocked(localGeneration)) {
+                thread.quitSafely()
+                return
+            }
+            backgroundThread = thread
+            backgroundHandler = handler
+        }
 
         try {
             val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+            cameraCharacteristics = characteristics
             val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
             val aeStep = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
-            onAeCapabilitiesChanged(
+            onAeCapabilitiesChangedProvider().invoke(
                 aeRange?.lower ?: 0,
                 aeRange?.upper ?: 0,
                 aeStep?.toFloat() ?: 0f
             )
             val previewSize = choosePreviewSize(characteristics)
+            currentPreviewSize = previewSize
 
             val surfaceTexture = textureView.surfaceTexture
             if (surfaceTexture == null) {
@@ -191,28 +253,40 @@ private class CameraPreviewController(
             }
 
             surfaceTexture.setDefaultBufferSize(previewSize.width, previewSize.height)
-            applyPreviewTransform(textureView)
+            configureTransform(textureView, previewSize)
 
             val surface = Surface(surfaceTexture)
+            if (!isActive(localGeneration) || !textureView.isAvailable) {
+                runCatching { surface.release() }
+                return
+            }
             previewSurface = surface
 
             cameraManager.openCamera(
                 cameraId,
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
+                        if (!isActive(localGeneration) || !textureView.isAvailable) {
+                            Log.w(TAG, "stale onOpened ignored generation=$localGeneration")
+                            runCatching { camera.close() }
+                            return
+                        }
                         cameraDevice = camera
-                        createPreviewSession(camera, surface, characteristics)
+                        createPreviewSession(camera, surface, characteristics, localGeneration, textureView)
                     }
 
                     override fun onDisconnected(camera: CameraDevice) {
-                        stop()
+                        runCatching { camera.close() }
+                        if (isActive(localGeneration)) stop()
                     }
 
                     override fun onError(camera: CameraDevice, error: Int) {
-                        stop()
+                        Log.w(TAG, "camera error=$error generation=$localGeneration")
+                        runCatching { camera.close() }
+                        if (isActive(localGeneration)) stop()
                     }
                 },
-                backgroundHandler
+                handler
             )
         } catch (_: Exception) {
             stop()
@@ -222,66 +296,41 @@ private class CameraPreviewController(
     private fun createPreviewSession(
         camera: CameraDevice,
         surface: Surface,
-        characteristics: CameraCharacteristics
+        characteristics: CameraCharacteristics,
+        localGeneration: Int,
+        textureView: TextureView
     ) {
+        if (!isActive(localGeneration) || !textureView.isAvailable) {
+            runCatching { camera.close() }
+            return
+        }
         try {
             camera.createCaptureSession(
                 listOf(surface),
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
+                        if (!isActive(localGeneration) || !textureView.isAvailable) {
+                            Log.w(TAG, "stale onConfigured ignored generation=$localGeneration")
+                            runCatching { session.close() }
+                            return
+                        }
                         captureSession = session
 
                         try {
-                            val request = camera.createCaptureRequest(
-                                CameraDevice.TEMPLATE_PREVIEW
-                            ).apply {
-                                addTarget(surface)
-
-                                set(
-                                    CaptureRequest.CONTROL_MODE,
-                                    CaptureRequest.CONTROL_MODE_AUTO
-                                )
-
-                                set(
-                                    CaptureRequest.CONTROL_AF_MODE,
-                                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-                                )
-
-                                set(
-                                    CaptureRequest.CONTROL_AE_MODE,
-                                    CaptureRequest.CONTROL_AE_MODE_ON
-                                )
-
-                                applyZoomAndFocusAe(characteristics, zoomRatio, focusAeState)
-                            }.build()
-
-                            session.setRepeatingRequest(
-                                request,
-                                null,
-                                backgroundHandler
+                            applyFocusAeStateOnCameraThread(
+                                newState = latestFocusAeState,
+                                previousState = FocusAeState(),
+                                localGeneration = localGeneration,
+                                forceTrigger = latestFocusAeState.point != null
                             )
-
-                            if (focusAeState.point != null) {
-                                val triggerRequest = camera.createCaptureRequest(
-                                    CameraDevice.TEMPLATE_PREVIEW
-                                ).apply {
-                                    addTarget(surface)
-                                    set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                                    set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
-                                    set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                                    applyZoomAndFocusAe(characteristics, zoomRatio, focusAeState)
-                                    set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
-                                    // TODO: robust AF state machine; currently one trigger then repeating regions.
-                                }.build()
-                                session.capture(triggerRequest, null, backgroundHandler)
-                            }
                         } catch (_: Exception) {
                             stop()
                         }
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
-                        stop()
+                        runCatching { session.close() }
+                        if (isActive(localGeneration)) stop()
                     }
                 },
                 backgroundHandler
@@ -305,7 +354,8 @@ private class CameraPreviewController(
         }
 
         val fourByThree = sizes.filter { size ->
-            abs((size.width.toFloat() / size.height.toFloat()) - (4f / 3f)) < 0.05f
+            size.width > size.height &&
+                    abs((size.width.toFloat() / size.height.toFloat()) - (4f / 3f)) < 0.05f
         }
 
         return fourByThree
@@ -316,64 +366,138 @@ private class CameraPreviewController(
             ?: Size(1440, 1080)
     }
 
-    private fun applyPreviewTransform(textureView: TextureView) {
+    private fun applyFocusAeStateOnCameraThread(
+        newState: FocusAeState,
+        previousState: FocusAeState,
+        localGeneration: Int,
+        forceTrigger: Boolean = false
+    ) {
+        if (!isActive(localGeneration)) return
+        val session = captureSession ?: return
+        val camera = cameraDevice ?: return
+        val surface = previewSurface ?: return
+        val characteristics = cameraCharacteristics ?: return
+        val handler = backgroundHandler ?: return
+        val zoom = latestZoomRatio
+        val pointChanged = previousState.point != newState.point
+        val lockChanged = previousState.locked != newState.locked
+        val evChanged = previousState.exposureCompensationIndex != newState.exposureCompensationIndex
+
+        runCatching {
+            if ((pointChanged || forceTrigger) && newState.point != null) {
+                // Tap is focus trigger. LOCK only holds current AE/AF behavior.
+                session.capture(
+                    buildPreviewRequest(
+                        camera = camera,
+                        surface = surface,
+                        characteristics = characteristics,
+                        state = newState,
+                        zoomRatio = zoom,
+                        afMode = CaptureRequest.CONTROL_AF_MODE_AUTO,
+                        afTrigger = CaptureRequest.CONTROL_AF_TRIGGER_START
+                    ),
+                    null,
+                    handler
+                )
+                Log.d(TAG, "AF trigger sent point=${newState.point}")
+            }
+
+            session.setRepeatingRequest(
+                buildPreviewRequest(
+                    camera = camera,
+                    surface = surface,
+                    characteristics = characteristics,
+                    state = newState,
+                    zoomRatio = zoom,
+                    afMode = if (newState.point != null) {
+                        CaptureRequest.CONTROL_AF_MODE_AUTO
+                    } else {
+                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                    },
+                    afTrigger = CaptureRequest.CONTROL_AF_TRIGGER_IDLE
+                ),
+                null,
+                handler
+            )
+            if (pointChanged) Log.d(TAG, "AF/AE point applied point=${newState.point}")
+            if (lockChanged) Log.d(TAG, "AE lock changed locked=${newState.locked}")
+            if (evChanged) Log.d(TAG, "EV compensation changed index=${newState.exposureCompensationIndex}")
+        }.onFailure {
+            Log.w(TAG, "applyFocusAeState failed", it)
+        }
+    }
+
+    private fun buildPreviewRequest(
+        camera: CameraDevice,
+        surface: Surface,
+        characteristics: CameraCharacteristics,
+        state: FocusAeState,
+        zoomRatio: Float,
+        afMode: Int,
+        afTrigger: Int
+    ) = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+        addTarget(surface)
+        set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+        set(CaptureRequest.CONTROL_AF_MODE, afMode)
+        set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+        set(CaptureRequest.CONTROL_AF_TRIGGER, afTrigger)
+        applyZoomAndFocusAe(characteristics, zoomRatio, state)
+    }.build()
+
+    private fun isActive(localGeneration: Int): Boolean = synchronized(lock) {
+        isActiveLocked(localGeneration)
+    }
+
+    private fun isActiveLocked(localGeneration: Int): Boolean {
+        return started && generation == localGeneration
+    }
+
+    private fun configureTransform(
+        textureView: TextureView,
+        previewSize: Size
+    ) {
         val viewWidth = textureView.width.toFloat()
         val viewHeight = textureView.height.toFloat()
 
         if (viewWidth <= 0f || viewHeight <= 0f) return
 
-        val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val characteristics = runCatching {
-            cameraManager.getCameraCharacteristics(cameraId)
-        }.getOrNull() ?: return
-        val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-        val lensFacing = characteristics.get(CameraCharacteristics.LENS_FACING)
-        val displayRotation = textureView.display?.rotation ?: Surface.ROTATION_0
-        val displayDegrees = surfaceRotationToDegrees(displayRotation)
-        val rotationDegrees = rotationOverrideDegrees ?: calculatePreviewRotationDegrees(
-            sensorOrientation = sensorOrientation,
-            displayDegrees = displayDegrees,
-            lensFacing = lensFacing
-        )
-
         val centerX = viewWidth / 2f
         val centerY = viewHeight / 2f
-        val bufferWidth = viewHeight
-        val bufferHeight = viewWidth
         val viewRect = RectF(0f, 0f, viewWidth, viewHeight)
-        val bufferRect = RectF(0f, 0f, bufferWidth, bufferHeight).apply {
+
+        val rotatedBufferWidth = previewSize.height.toFloat()
+        val rotatedBufferHeight = previewSize.width.toFloat()
+        val bufferRect = RectF(
+            0f,
+            0f,
+            rotatedBufferWidth,
+            rotatedBufferHeight
+        ).apply {
             offset(centerX - centerX(), centerY - centerY())
         }
 
-        // TODO: replace temporary rotationOverrideDegrees with fully verified device matrix table.
         val matrix = Matrix().apply {
-            setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
-            val scale = max(viewHeight / bufferHeight, viewWidth / bufferWidth)
+            setRectToRect(bufferRect, viewRect, Matrix.ScaleToFit.CENTER)
+            val scale = kotlin.math.max(
+                viewWidth / rotatedBufferWidth,
+                viewHeight / rotatedBufferHeight
+            )
             postScale(scale, scale, centerX, centerY)
-            postRotate(rotationDegrees.toFloat(), centerX, centerY)
+            // TODO: replace manual preview rotation fix with verified sensor/display mapping table.
+            postRotate(PREVIEW_ROTATION_FIX_DEGREES, centerX, centerY)
         }
 
         textureView.setTransform(matrix)
     }
 
-    private fun surfaceRotationToDegrees(rotation: Int): Int {
-        return when (rotation) {
-            Surface.ROTATION_90 -> 90
-            Surface.ROTATION_180 -> 180
-            Surface.ROTATION_270 -> 270
-            else -> 0
-        }
-    }
+    private data class StopRefs(
+        val session: CameraCaptureSession?,
+        val device: CameraDevice?,
+        val surface: Surface?,
+        val thread: HandlerThread?
+    )
 
-    private fun calculatePreviewRotationDegrees(
-        sensorOrientation: Int,
-        displayDegrees: Int,
-        lensFacing: Int?
-    ): Int {
-        return if (lensFacing == CameraCharacteristics.LENS_FACING_FRONT) {
-            (360 - ((sensorOrientation + displayDegrees) % 360)) % 360
-        } else {
-            (sensorOrientation - displayDegrees + 360) % 360
-        }
+    private companion object {
+        private const val TAG = "KeplerCameraPreview"
     }
 }
