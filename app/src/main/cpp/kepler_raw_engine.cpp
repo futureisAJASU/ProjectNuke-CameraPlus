@@ -314,6 +314,7 @@ struct WhiteBalanceGains {
     float g = 1.0f;
     float b = 1.0f;
     bool fallback = false;
+    uint64_t sampleCount = 0;
 };
 
 uint8_t toneRawV02(float value, int whiteRange) {
@@ -351,20 +352,23 @@ bool writePostprocessMetadata(
            << "  \"outputWidth\": " << outputWidth << ",\n"
            << "  \"outputHeight\": " << outputHeight << ",\n"
            << "  \"demosaic\": \"edge_aware_scaled_bilinear_v0_2\",\n"
-           << "  \"wbMode\": \"gray_world_v0_2\",\n"
+           << "  \"wbMode\": \"" << (wb.fallback ? "identity_fallback" : "gray_world_v0_2") << "\",\n"
            << "  \"wbGainR\": " << wb.r << ",\n"
            << "  \"wbGainG\": " << wb.g << ",\n"
            << "  \"wbGainB\": " << wb.b << ",\n"
+           << "  \"wbSampleCount\": " << wb.sampleCount << ",\n"
            << "  \"wbFallback\": " << (wb.fallback ? "true" : "false") << ",\n"
            << "  \"toneMap\": \"filmic_shoulder_v0_2\",\n"
            << "  \"blackLift\": 0.008,\n"
            << "  \"gamma\": 2.20,\n"
            << "  \"shoulderStrength\": 0.16,\n"
-           << "  \"chromaDenoise\": \"mild_v0_2\",\n"
+           << "  \"exposureBias\": 0.0,\n"
+           << "  \"chromaDenoise\": \"mild_chroma_v0_2\",\n"
            << "  \"chromaDenoiseStrength\": 0.18,\n"
-           << "  \"sharpen\": \"adaptive_unsharp_v0_2\",\n"
+           << "  \"sharpen\": \"adaptive_luma_unsharp_v0_2\",\n"
            << "  \"sharpenStrength\": 0.22,\n"
            << "  \"darkSharpenSuppression\": 0.70,\n"
+           << "  \"highlightSharpenSuppression\": 0.85,\n"
            << "  \"status\": \"OK\",\n"
            << "  \"outputPath\": \"" << outputPath << "\",\n"
            << "  \"outputName\": \"" << outputPath.substr(outputPath.find_last_of("/\\\\") + 1) << "\",\n"
@@ -755,6 +759,7 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
         } else {
             wb.fallback = true;
         }
+        wb.sampleCount = sampleCount;
 
         // Single output-sized RGB buffer. Denoise and sharpen are applied while rows are written.
         std::vector<uint8_t> toned(static_cast<size_t>(outputPixels) * 3);

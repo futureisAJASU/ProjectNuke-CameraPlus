@@ -316,17 +316,17 @@ fun buildResolutionCapturePlans(
             if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
                 plans += plan50(has50DetailForRaw, raw50, if (has50DetailForRaw) "50M RAW input available." else "50M unavailable: no >=40MP RAW stream exposed through public Camera2 for selected main camera.")
                 plans += when {
-                    native24Raw != null -> plan24(
-                        native24Raw,
-                        "native_24mp_raw",
-                        "Native 24MP RAW stream selected. $PUBLIC_CAMERA2_24MP_NOTICE",
-                        false
-                    )
                     raw50 != null -> plan24(
                         raw50,
                         "50MP_DETAIL_TO_24MP_FUSION_V0",
                         "50MP-class RAW detail input selected for 24MP Fusion v0. $PUBLIC_CAMERA2_24MP_NOTICE",
                         true
+                    )
+                    native24Raw != null -> plan24(
+                        native24Raw,
+                        "native_24mp_raw_fallback",
+                        "No 50MP-class RAW stream is exposed; using native 20-30MP public Camera2 RAW fallback. $PUBLIC_CAMERA2_24MP_NOTICE",
+                        false
                     )
                     else -> plan24(
                         null,
@@ -352,11 +352,33 @@ fun buildResolutionCapturePlans(
         }
         LensSlot.MAIN_2X -> {
             if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
-                plans += plan24(raw50, if (raw50 != null) "50MP_DETAIL_TO_24MP_FUSION_V0" else null, if (raw50 != null) "2x 24MP Fusion uses 50MP-class public Camera2 RAW detail input. $PUBLIC_CAMERA2_24MP_NOTICE" else "24MP unavailable through public Camera2. $PUBLIC_CAMERA2_24MP_NOTICE", true)
+                val input = raw50 ?: native24Raw
+                val strategy = when {
+                    raw50 != null -> "50MP_DETAIL_TO_24MP_FUSION_V0"
+                    native24Raw != null -> "native_24mp_raw_fallback"
+                    else -> null
+                }
+                val reason = when {
+                    raw50 != null -> "2x 24MP Fusion uses 50MP-class public Camera2 RAW detail input. $PUBLIC_CAMERA2_24MP_NOTICE"
+                    native24Raw != null -> "No 50MP-class RAW stream is exposed; using native 20-30MP public Camera2 RAW fallback. $PUBLIC_CAMERA2_24MP_NOTICE"
+                    else -> "24MP unavailable through public Camera2. $PUBLIC_CAMERA2_24MP_NOTICE"
+                }
+                plans += plan24(input, strategy, reason, raw50 != null)
             }
         }
         LensSlot.THREE_X -> if (threeXSourceMode == ThreeXSourceMode.MAIN_CROP && pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
-            plans += plan24(raw50, if (raw50 != null) "50MP_DETAIL_TO_24MP_FUSION_V0" else null, if (raw50 != null) "3x 24MP Fusion uses 50MP-class public Camera2 RAW detail input. $PUBLIC_CAMERA2_24MP_NOTICE" else "24MP unavailable through public Camera2. $PUBLIC_CAMERA2_24MP_NOTICE", true)
+            val input = raw50 ?: native24Raw
+            val strategy = when {
+                raw50 != null -> "50MP_DETAIL_TO_24MP_FUSION_V0"
+                native24Raw != null -> "native_24mp_raw_fallback"
+                else -> null
+            }
+            val reason = when {
+                raw50 != null -> "3x 24MP Fusion uses 50MP-class public Camera2 RAW detail input. $PUBLIC_CAMERA2_24MP_NOTICE"
+                native24Raw != null -> "No 50MP-class RAW stream is exposed; using native 20-30MP public Camera2 RAW fallback. $PUBLIC_CAMERA2_24MP_NOTICE"
+                else -> "24MP unavailable through public Camera2. $PUBLIC_CAMERA2_24MP_NOTICE"
+            }
+            plans += plan24(input, strategy, reason, raw50 != null)
         }
     }
     return plans
@@ -388,11 +410,11 @@ fun choose24MpFusionStrategy(
     zoomRatio: Float,
     capability: CameraResolutionCapability
 ): Fusion24Strategy {
-    if (capability.native24RawAvailable) return Fusion24Strategy.NATIVE_24MP_STREAM
     val has50 = capability.highResRawInputAvailable
     return when {
         lensSlot == LensSlot.MAIN_1X && has50 -> Fusion24Strategy.TWELVE_PLUS_FIFTY_DETAIL
         zoomRatio >= 1.9f && has50 -> Fusion24Strategy.FIFTY_DETAIL_DOWNSAMPLE
+        capability.native24RawAvailable -> Fusion24Strategy.NATIVE_24MP_STREAM
         else -> Fusion24Strategy.UNAVAILABLE
     }
 }

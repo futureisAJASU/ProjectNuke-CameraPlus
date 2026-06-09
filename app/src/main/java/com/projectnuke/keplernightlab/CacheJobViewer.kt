@@ -86,7 +86,8 @@ data class AlignmentFrameSummary(
     val validProxyFraction: Double,
     val acceptedForMerge: Boolean,
     val rejectReason: String?,
-    val finalFrameWeightScale: Double
+    val finalFrameWeightScale: Double,
+    val searchBoundaryHit: Boolean
 )
 
 data class JobFileEntry(
@@ -437,11 +438,13 @@ private fun CaptureSection(job: JSONObject?) {
 private fun HighResolutionSection(job: JSONObject?) {
     InspectorSection("24MP / High-res Fusion") {
         listOf(
-            "selected24MpStrategy", "nativePostprocessRequired", "nativePostprocessUsed",
+            "selected24MpStrategy", "selected24MpReason", "nativePostprocessRequired", "nativePostprocessUsed",
             "nativePostprocessStatus", "nativePostprocessMetadataFile", "nativePostprocessRgbaFile",
             "fullSizeKotlinDemosaicUsed", "outputFallbackReason", "highResRawInputThresholdPixels",
             "highResRawInputThresholdMp", "memoryRiskLevel", "estimatedRawFusionMemoryMb",
-            "outputWidth", "outputHeight"
+            "outputWidth", "outputHeight", "highResRawInputAvailable", "highResRawInputUsed",
+            "native24RawAvailable", "native24RawUsed", "frameClampApplied", "frameClampReason",
+            "requestedFramesOriginal", "requestedFramesEffective", "highResRawFrameLimit"
         ).forEach { key ->
             val warning = key == "nativePostprocessStatus" &&
                 job.value(key).contains("ERROR", ignoreCase = true)
@@ -478,7 +481,7 @@ private fun AlignmentSection(job: JSONObject?, detail: KeplerJobDetail) {
             DetailField("mergeWarning", alignment.value("mergeWarning"))
         }
         detail.alignmentFrames.forEach { frame ->
-            val warning = frame.confidence < 0.4 || !frame.acceptedForMerge
+            val warning = frame.confidence < 0.4 || !frame.acceptedForMerge || frame.searchBoundaryHit
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -497,7 +500,7 @@ private fun AlignmentSection(job: JSONObject?, detail: KeplerJobDetail) {
                     color = inspectorMuted
                 )
                 Text(
-                    "normalizedError=${"%.4f".format(Locale.US, frame.normalizedError)} | valid=${"%.3f".format(Locale.US, frame.validProxyFraction)} | weight=${"%.3f".format(Locale.US, frame.finalFrameWeightScale)}",
+                    "normalizedError=${"%.4f".format(Locale.US, frame.normalizedError)} | valid=${"%.3f".format(Locale.US, frame.validProxyFraction)} | weight=${"%.3f".format(Locale.US, frame.finalFrameWeightScale)} | boundary=${frame.searchBoundaryHit}",
                     color = inspectorMuted
                 )
                 frame.rejectReason?.let { Text("rejectReason=$it", color = inspectorWarning) }
@@ -516,9 +519,10 @@ private fun NativePostprocessSection(job: JSONObject?, detail: KeplerJobDetail) 
             listOf(
                 "nativePostprocessVersion", "inputWidth", "inputHeight", "outputWidth",
                 "outputHeight", "demosaic", "wbMode", "wbGainR", "wbGainG", "wbGainB",
-                "wbFallback", "toneMap", "blackLift", "gamma", "shoulderStrength",
+                "wbSampleCount", "wbFallback", "toneMap", "blackLift", "gamma", "shoulderStrength",
+                "exposureBias",
                 "chromaDenoise", "chromaDenoiseStrength", "sharpen", "sharpenStrength",
-                "darkSharpenSuppression", "status", "outputPath", "outputName",
+                "darkSharpenSuppression", "highlightSharpenSuppression", "status", "outputPath", "outputName",
                 "outputFormat", "nativePostprocess", "highResRawInput"
             ).forEach { DetailField(it, native.value(it)) }
         } else {
@@ -531,6 +535,8 @@ private fun NativePostprocessSection(job: JSONObject?, detail: KeplerJobDetail) 
                 color = if (required) inspectorWarning else inspectorMuted
             )
         }
+        DetailField("exportBitmapSource", job.value("exportBitmapSource"))
+        DetailField("nativeRgbaDirectExportUsed", job.value("nativeRgbaDirectExportUsed"))
         detail.nativePostprocessJsonError?.let { Text(it, color = inspectorWarning) }
     }
 }
@@ -541,6 +547,8 @@ private fun ExportSection(job: JSONObject?) {
         listOf(
             "exportStatus", "exportVerified", "exportUri", "exportDisplayName", "exportMimeType",
             "exportFormatRequested", "exportFormatUsed", "exportFallbackUsed", "exportFileSizeBytes",
+            "exportBitmapSource", "nativeRgbaDirectExportUsed", "nativeRgbaBitmapLoadedForExport",
+            "finalPngDecodeSkippedForExport",
             "rawSidecarRequested", "rawSidecarExportStatus", "rawSidecarExportedFiles",
             "rawSidecarError"
         ).forEach { DetailField(it, job.value(it)) }
@@ -736,7 +744,8 @@ fun loadKeplerJobDetail(jobDir: File): KeplerJobDetail {
             },
             rejectReason = frame.optString("rejectReason", "")
                 .takeIf { it.isNotBlank() && it != "null" },
-            finalFrameWeightScale = frame.optDouble("finalFrameWeightScale", 1.0)
+            finalFrameWeightScale = frame.optDouble("finalFrameWeightScale", 1.0),
+            searchBoundaryHit = frame.optBoolean("searchBoundaryHit", false)
         )
     }
     return KeplerJobDetail(
