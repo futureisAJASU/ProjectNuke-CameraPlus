@@ -76,6 +76,12 @@ fun queryCameraResolutionCapability(
     context: Context,
     cameraId: String,
     lensSlot: LensSlot
+): CameraResolutionCapability = CameraCapabilityCache.getResolutionCapability(context, cameraId, lensSlot)
+
+fun loadCameraResolutionCapability(
+    context: Context,
+    cameraId: String,
+    lensSlot: LensSlot
 ): CameraResolutionCapability {
     val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     val c = manager.getCameraCharacteristics(cameraId)
@@ -208,7 +214,14 @@ fun buildResolutionCapturePlans(
     val jpeg50 = largest(capability.maxJpegSizes.filter { megapixels(it) >= 40.0 })
         ?: largest(capability.highResJpegSizes.filter { megapixels(it) >= 40.0 })
         ?: largest(capability.normalJpegSizes.filter { megapixels(it) >= 40.0 })
-    val normal12 = largest((capability.normalRawSizes + capability.normalYuvSizes + capability.normalJpegSizes).filter { megapixels(it) in 8.0..14.5 })
+    val raw12 = largest(capability.normalRawSizes.filter { megapixels(it) in 8.0..14.5 })
+    val yuv12 = largest(capability.normalYuvSizes.filter { megapixels(it) in 8.0..14.5 })
+    val jpeg12 = largest(capability.normalJpegSizes.filter { megapixels(it) in 8.0..14.5 })
+    val normal12 = if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
+        raw12
+    } else {
+        yuv12 ?: jpeg12
+    } ?: raw12 ?: yuv12 ?: jpeg12
     val has50DetailForRaw = raw50 != null
     val has50ForYuv = yuv50 != null
 
@@ -331,8 +344,27 @@ fun buildResolutionCapabilityReport(context: Context): String {
         manager.cameraIdList.forEach { id ->
             val lensSlot = LensSlot.MAIN_1X
             val cap = queryCameraResolutionCapability(context, id, lensSlot)
+            val characteristics = manager.getCameraCharacteristics(id)
+            val activeArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            val maxActiveArray = if (Build.VERSION.SDK_INT >= 31) {
+                characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE_MAXIMUM_RESOLUTION)
+            } else {
+                null
+            }
+            val hasSensorPixelModeRequestKey = characteristics
+                .get(CameraCharacteristics.REQUEST_AVAILABLE_REQUEST_KEYS)
+                ?.contains(android.hardware.camera2.CaptureRequest.SENSOR_PIXEL_MODE) == true
+            val hasMaximumResolutionMap = if (Build.VERSION.SDK_INT >= 31) {
+                characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION) != null
+            } else {
+                false
+            }
             appendLine("cameraId=$id")
             appendLine("Ultra high resolution: ${if (cap.supportsUltraHighResolution) "YES" else "NO"}")
+            appendLine("activeArray: ${activeArray ?: "none"}")
+            appendLine("maximumResolutionActiveArray: ${maxActiveArray ?: "none"}")
+            appendLine("SENSOR_PIXEL_MODE request key: ${if (hasSensorPixelModeRequestKey) "YES" else "NO"}")
+            appendLine("maximum-resolution stream map: ${if (hasMaximumResolutionMap) "YES" else "NO"}")
             appendLine("normal RAW: ${cap.normalRawSizes.describe()}")
             appendLine("normal YUV: ${cap.normalYuvSizes.describe()}")
             appendLine("normal JPEG: ${cap.normalJpegSizes.describe()}")

@@ -6,6 +6,7 @@ import android.graphics.Rect
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
+import android.os.Build
 import android.util.Size
 import kotlin.math.abs
 import kotlin.math.max
@@ -29,6 +30,10 @@ data class CameraSelection(
 )
 
 fun findBackCameraCandidates(context: Context): List<CameraCandidate> {
+    return CameraCapabilityCache.getBackCameraCandidates(context)
+}
+
+fun loadBackCameraCandidates(context: Context): List<CameraCandidate> {
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
 
     return cameraManager.cameraIdList.mapNotNull { cameraId ->
@@ -179,17 +184,43 @@ fun buildCenterCropRegion(
     characteristics: CameraCharacteristics,
     zoomRatio: Float
 ): Rect? {
-    if (zoomRatio <= 1f) return null
+    return buildCenterCropRegionForPixelMode(
+        characteristics = characteristics,
+        zoomRatio = zoomRatio,
+        useMaximumResolutionActiveArray = false
+    ).region
+}
 
-    val activeArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-        ?: return null
+data class CropRegionSelection(
+    val region: Rect?,
+    val activeArraySource: String
+)
+
+fun buildCenterCropRegionForPixelMode(
+    characteristics: CameraCharacteristics,
+    zoomRatio: Float,
+    useMaximumResolutionActiveArray: Boolean
+): CropRegionSelection {
+    if (zoomRatio <= 1f) return CropRegionSelection(null, "NORMAL")
+
+    val maxActiveArray = if (useMaximumResolutionActiveArray && Build.VERSION.SDK_INT >= 31) {
+        characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE_MAXIMUM_RESOLUTION)
+    } else {
+        null
+    }
+    val activeArray = maxActiveArray
+        ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        ?: return CropRegionSelection(null, if (maxActiveArray != null) "MAXIMUM_RESOLUTION" else "NORMAL")
 
     val cropWidth = (activeArray.width() / zoomRatio).toInt().coerceAtLeast(1)
     val cropHeight = (activeArray.height() / zoomRatio).toInt().coerceAtLeast(1)
     val left = activeArray.left + (activeArray.width() - cropWidth) / 2
     val top = activeArray.top + (activeArray.height() - cropHeight) / 2
 
-    return Rect(left, top, left + cropWidth, top + cropHeight)
+    return CropRegionSelection(
+        region = Rect(left, top, left + cropWidth, top + cropHeight),
+        activeArraySource = if (maxActiveArray != null) "MAXIMUM_RESOLUTION" else "NORMAL"
+    )
 }
 
 private fun selectMainCamera(candidates: List<CameraCandidate>): CameraCandidate {

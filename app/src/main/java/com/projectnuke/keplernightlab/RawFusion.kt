@@ -64,6 +64,7 @@ fun captureRawBurstForFusion(
     cameraId: String,
     frameCount: Int,
     resolutionMode: CaptureResolutionMode = CaptureResolutionMode.MP12,
+    resolutionPlan: ResolutionCapturePlan? = null,
     zoomRatio: Float = 1.0f,
     focusAeState: FocusAeState = FocusAeState(),
     onStatus: (String) -> Unit,
@@ -95,6 +96,7 @@ fun captureRawBurstForFusion(
     val resultsByTimestamp = mutableMapOf<Long, TotalCaptureResult>()
     val savedTimestamps = mutableSetOf<Long>()
     var failedCaptures = 0
+    var maxResolutionPixelModeFailure: String? = null
     var timeoutRunnable: Runnable? = null
     fun postCaptureProgress() {
         post("RAW capture: saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames, failed $failedCaptures")
@@ -129,6 +131,10 @@ fun captureRawBurstForFusion(
                 .put("frames", frameObjects)
                 .put("updatedAt", System.currentTimeMillis())
             if (error != null) job.put("error", error)
+            if (maxResolutionPixelModeFailure != null) {
+                job.put("resolutionFallbackReason", maxResolutionPixelModeFailure)
+                job.put("maxResolutionPixelModeFailure", maxResolutionPixelModeFailure)
+            }
             jobFile.writeText(job.toString(2))
         }
     }
@@ -137,19 +143,22 @@ fun captureRawBurstForFusion(
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?: error("Stream configuration map missing")
-        val rawSelection = chooseRawFusionSizeV2(characteristics, resolutionMode)
+        val rawSelection = chooseRawFusionSizeV2(characteristics, resolutionMode, resolutionPlan)
         val rawSize = rawSelection.size
-        val actualInputMode = if (resolutionMode == CaptureResolutionMode.MP24_FUSION) {
-            CaptureResolutionMode.MP50
-        } else {
-            resolutionMode
-        }
+        val actualInputMode = resolutionPlan?.actualInputMode
+            ?: if (resolutionMode == CaptureResolutionMode.MP24_FUSION) CaptureResolutionMode.MP50 else resolutionMode
+        val outputMode = resolutionPlan?.outputMode ?: resolutionMode
         val fusion24Strategy = if (resolutionMode == CaptureResolutionMode.MP24_FUSION) {
             if (zoomRatio >= 1.9f) "50MP_2X_CROP_UPSCALE_V0" else "50MP_DETAIL_DOWNSAMPLE_V0"
         } else {
             null
         }
-        val cropApplied = zoomRatio > 1f && buildCenterCropRegion(characteristics, zoomRatio) != null
+        val cropSelection = buildCenterCropRegionForPixelMode(
+            characteristics = characteristics,
+            zoomRatio = zoomRatio,
+            useMaximumResolutionActiveArray = rawSelection.requiresMaximumResolutionPixelMode
+        )
+        val cropApplied = zoomRatio > 1f && cropSelection.region != null
         val blackLevelPattern = characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)
         val blackLevelJson = blackLevelPattern?.let {
             JSONArray(listOf(
@@ -176,9 +185,17 @@ fun captureRawBurstForFusion(
             .put("resolutionMode", resolutionMode.label)
             .put("requestedResolutionMode", resolutionMode.name)
             .put("actualInputResolutionMode", actualInputMode.name)
-            .put("outputResolutionMode", resolutionMode.name)
+            .put("outputResolutionMode", outputMode.name)
+            .put("selectedPlanReason", resolutionPlan?.reason ?: JSONObject.NULL)
+            .put("planInputWidth", resolutionPlan?.inputSize?.width ?: JSONObject.NULL)
+            .put("planInputHeight", resolutionPlan?.inputSize?.height ?: JSONObject.NULL)
+            .put("planUsesMaximumResolution", resolutionPlan?.usesMaximumResolution ?: rawSelection.requiresMaximumResolutionPixelMode)
+            .put("planUsesHighResolutionSlowPath", resolutionPlan?.usesHighResolutionSlowPath ?: rawSelection.isHighResolutionSlowPath)
+            .put("planIsFusionOrUpscale", resolutionPlan?.isFusionOrUpscale ?: (resolutionMode == CaptureResolutionMode.MP24_FUSION))
             .put("zoomRatio", zoomRatio.toDouble())
             .put("cropApplied", cropApplied)
+            .put("cropActiveArraySource", cropSelection.activeArraySource)
+            .put("cropRegion", cropSelection.region?.toString() ?: JSONObject.NULL)
             .put("rawWidth", rawSize.width)
             .put("rawHeight", rawSize.height)
             .put("inputWidth", rawSize.width)
@@ -194,6 +211,15 @@ fun captureRawBurstForFusion(
             .put("rawSizeFallbackReason", rawSelection.fallbackReason ?: JSONObject.NULL)
             .put("sensorOrientation", characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: JSONObject.NULL)
             .put("activeArray", characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)?.toString() ?: JSONObject.NULL)
+            .put(
+                "maximumResolutionActiveArray",
+                if (Build.VERSION.SDK_INT >= 31) {
+                    characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE_MAXIMUM_RESOLUTION)?.toString()
+                        ?: JSONObject.NULL
+                } else {
+                    JSONObject.NULL
+                }
+            )
             .put("preCorrectionActiveArray", characteristics.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)?.toString() ?: JSONObject.NULL)
             .put("whiteLevel", characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: JSONObject.NULL)
             .put("cfaPattern", characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: JSONObject.NULL)
@@ -207,7 +233,19 @@ fun captureRawBurstForFusion(
             .put("notes", "True RAW fusion input. Stores RAW_SENSOR DNG backup plus compact raw16 per frame. TODO retry budget: targetFrames=8, maxAttempts=9 or 10, continue until target saved or maxAttempts/timeout.")
         jobFile.writeText(baseJob.toString(2))
 
-        val imageReader = ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, frameCount + 2)
+        val imageReader = try {
+            ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, frameCount + 2)
+        } catch (e: Exception) {
+            val reason = "ImageReader failed for selected RAW plan ${rawSize.width}x${rawSize.height}: ${e.javaClass.simpleName}: ${e.message}"
+            post("RAW selected resolution plan failed: $reason")
+            val failedJob = JSONObject(baseJob.toString())
+                .put("status", "CAPTURE_FAILED")
+                .put("resolutionFallbackReason", reason)
+                .put("rawSizeFallbackReason", rawSelection.fallbackReason ?: reason)
+                .put("updatedAt", System.currentTimeMillis())
+            jobFile.writeText(failedJob.toString(2))
+            throw e
+        }
         reader = imageReader
 
         motionLogger = runCatching { MotionLogger(context).also { it.start() } }.getOrNull()
@@ -215,6 +253,9 @@ fun captureRawBurstForFusion(
 
         fun finishError(status: String, message: String) {
             if (!finished.compareAndSet(false, true)) return
+            if (rawSelection.requiresMaximumResolutionPixelMode && maxResolutionPixelModeFailure == null) {
+                maxResolutionPixelModeFailure = "Maximum-resolution RAW capture failed: $message"
+            }
             writeJobStatus(jobFile, baseJob, status, message)
             post(message)
             mainHandler.post { onError(message) }
@@ -298,6 +339,8 @@ fun captureRawBurstForFusion(
                             .put("cameraId", cameraId)
                             .put("zoomRatio", zoomRatio.toDouble())
                             .put("cropApplied", cropApplied)
+                            .put("cropActiveArraySource", cropSelection.activeArraySource)
+                            .put("cropRegion", cropSelection.region?.toString() ?: JSONObject.NULL)
                     )
                     savedFrames++
                     post("RAW saved frame $savedFrames/$requestedFrames")
@@ -366,10 +409,17 @@ fun captureRawBurstForFusion(
                                                     CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION
                                                 )
                                             }.onFailure {
+                                                maxResolutionPixelModeFailure = "SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION failed: ${it.javaClass.simpleName}: ${it.message}"
+                                                writeJobStatus(jobFile, baseJob, "CAPTURING")
                                                 post("RAW max-resolution pixel mode not accepted; continuing safely.")
                                             }
                                         }
-                                        applyZoomAndFocusAe(characteristics, zoomRatio, focusAeState)
+                                        applyZoomAndFocusAe(
+                                            characteristics = characteristics,
+                                            zoomRatio = zoomRatio,
+                                            focusAeState = focusAeState,
+                                            useMaximumResolutionActiveArray = rawSelection.requiresMaximumResolutionPixelMode
+                                        )
                                     }.build()
                                 }
                                 attemptedFrames = requests.size
@@ -650,6 +700,7 @@ fun captureProcessExportRawNightFusion(
     cameraId: String,
     frameCount: Int,
     resolutionMode: CaptureResolutionMode,
+    resolutionPlan: ResolutionCapturePlan? = null,
     finalOutputFormat: FinalOutputFormat,
     zoomRatio: Float,
     focusAeState: FocusAeState = FocusAeState(),
@@ -664,6 +715,7 @@ fun captureProcessExportRawNightFusion(
         cameraId = cameraId,
         frameCount = frameCount,
         resolutionMode = resolutionMode,
+        resolutionPlan = resolutionPlan,
         zoomRatio = zoomRatio,
         focusAeState = focusAeState,
         onStatus = { post(it) },
@@ -757,7 +809,8 @@ fun captureProcessExportRawNightFusion(
 
 fun chooseRawFusionSizeV2(
     characteristics: CameraCharacteristics,
-    resolutionMode: CaptureResolutionMode
+    resolutionMode: CaptureResolutionMode,
+    resolutionPlan: ResolutionCapturePlan? = null
 ): RawSizeSelection {
     val normalMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         ?: error("Stream configuration map missing")
@@ -774,6 +827,25 @@ fun chooseRawFusionSizeV2(
     val highRaw = runCatching {
         normalMap.getHighResolutionOutputSizes(ImageFormat.RAW_SENSOR)?.toList().orEmpty()
     }.getOrDefault(emptyList())
+
+    resolutionPlan?.inputSize?.takeIf { resolutionPlan.isAvailable }?.let { planSize ->
+        val inMax = planSize in maxRaw
+        val inHigh = planSize in highRaw
+        val inNormal = planSize in normalRaw
+        if (inMax || inHigh || inNormal) {
+            return RawSizeSelection(
+                size = planSize,
+                source = when {
+                    inMax -> "selected_plan_maximum_resolution_raw"
+                    inHigh -> "selected_plan_high_resolution_raw"
+                    else -> "selected_plan_normal_raw"
+                },
+                requiresMaximumResolutionPixelMode = resolutionPlan.usesMaximumResolution || inMax,
+                isHighResolutionSlowPath = resolutionPlan.usesHighResolutionSlowPath || inHigh,
+                fallbackReason = null
+            )
+        }
+    }
 
     fun List<Size>.largestAtLeast(minMp: Double) = filter { megapixels(it) >= minMp }.maxByOrNull { it.width * it.height }
     fun List<Size>.native24() = filter { megapixels(it) in 20.0..30.0 }.minByOrNull { abs(megapixels(it) - 24.0) }

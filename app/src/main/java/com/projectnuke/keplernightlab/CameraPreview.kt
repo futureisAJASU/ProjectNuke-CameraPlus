@@ -32,7 +32,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import kotlin.math.abs
 
-private const val PREVIEW_ROTATION_FIX_DEGREES = 90f
+// Galaxy S24 temporary preview rotation override. Try 0/90/180/270 only while sensor/display transform is being verified.
+private const val PREVIEW_ROTATION_FIX_DEGREES = 0f
 
 @Composable
 fun Camera2Preview(
@@ -382,6 +383,8 @@ private class CameraPreviewController(
         val pointChanged = previousState.point != newState.point
         val lockChanged = previousState.locked != newState.locked
         val evChanged = previousState.exposureCompensationIndex != newState.exposureCompensationIndex
+        val meteringRegion = buildFocusAeMeteringRectangle(characteristics, zoom, newState.point)
+        val cropRegion = buildCenterCropRegion(characteristics, zoom)
 
         runCatching {
             if ((pointChanged || forceTrigger) && newState.point != null) {
@@ -418,6 +421,12 @@ private class CameraPreviewController(
                 ),
                 null,
                 handler
+            )
+            Log.d(
+                TAG,
+                "AF/AE apply pointChanged=$pointChanged lockChanged=$lockChanged evChanged=$evChanged " +
+                    "afRegions=${if (meteringRegion != null) 1 else 0} aeRegions=${if (meteringRegion != null) 1 else 0} " +
+                    "zoomRatio=$zoom cropRegion=$cropRegion"
             )
             if (pointChanged) Log.d(TAG, "AF/AE point applied point=${newState.point}")
             if (lockChanged) Log.d(TAG, "AE lock changed locked=${newState.locked}")
@@ -464,6 +473,14 @@ private class CameraPreviewController(
         val centerX = viewWidth / 2f
         val centerY = viewHeight / 2f
         val viewRect = RectF(0f, 0f, viewWidth, viewHeight)
+        val characteristics = cameraCharacteristics
+        val sensorOrientation = characteristics?.get(CameraCharacteristics.SENSOR_ORIENTATION)
+        val displayRotation = textureView.display?.rotation ?: Surface.ROTATION_0
+        Log.d(
+            TAG,
+            "configureTransform view=${viewWidth}x$viewHeight previewSize=${previewSize.width}x${previewSize.height} " +
+                "sensorOrientation=$sensorOrientation displayRotation=$displayRotation rotationFix=$PREVIEW_ROTATION_FIX_DEGREES"
+        )
 
         val rotatedBufferWidth = previewSize.height.toFloat()
         val rotatedBufferHeight = previewSize.width.toFloat()

@@ -387,7 +387,6 @@ fun MainCameraScreen(
     }
     val selectedResolutionPlan = remember(selectedResolution, resolutionPlans) {
         resolutionPlans.firstOrNull { it.requestedMode == selectedResolution && it.isAvailable }
-            ?: resolutionPlans.firstOrNull { it.requestedMode == CaptureResolutionMode.MP12 }
     }
     val previewZoomRatio = if (cameraSelection.useCrop) {
         zoomUiState.zoomRatio.coerceIn(1.0f, zoomUiState.maxZoom)
@@ -703,7 +702,17 @@ fun MainCameraScreen(
                 isCapturing = isCapturing,
                 captureProgress = captureProgress,
                 onHideFocusAeControls = { showFocusAeControls = false },
-                onCapture = {
+                onCapture = captureClick@{
+                    val activeResolutionPlan = selectedResolutionPlan
+                    if (activeResolutionPlan == null) {
+                        val reason = resolutionPlans
+                            .firstOrNull { it.requestedMode == selectedResolution }
+                            ?.reason
+                            ?: "Selected resolution has no valid capture plan."
+                        selectedResolution = CaptureResolutionMode.MP12
+                        status = "Resolution changed to 12M: $reason"
+                        return@captureClick
+                    }
                     val settings = currentFrameCountSettings(
                         mode = frameCountMode,
                         autoMinFrames = autoMinFrames,
@@ -738,6 +747,7 @@ fun MainCameraScreen(
                                 cameraId = selection.cameraId,
                                 frameCount = plan.framesToCapture,
                                 resolutionMode = selectedResolution,
+                                resolutionPlan = activeResolutionPlan,
                                 finalOutputFormat = finalOutputFormat,
                                 zoomRatio = captureZoomRatio,
                                 focusAeState = focusAeState,
@@ -1439,6 +1449,9 @@ fun ShutterButton(
     progress: Float,
     onClick: () -> Unit
 ) {
+    LaunchedEffect(Unit) {
+        android.util.Log.d("KeplerShutter", "Rendering circular ShutterButton size=96dp inner=74dp")
+    }
     Box(
         modifier = Modifier
             .size(96.dp)

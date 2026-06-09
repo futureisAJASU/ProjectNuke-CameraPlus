@@ -10,9 +10,14 @@ import kotlin.math.roundToInt
 fun CaptureRequest.Builder.applyZoomAndFocusAe(
     characteristics: CameraCharacteristics,
     zoomRatio: Float,
-    focusAeState: FocusAeState
+    focusAeState: FocusAeState,
+    useMaximumResolutionActiveArray: Boolean = false
 ) {
-    val crop = buildCenterCropRegion(characteristics, zoomRatio)
+    val crop = buildCenterCropRegionForPixelMode(
+        characteristics = characteristics,
+        zoomRatio = zoomRatio,
+        useMaximumResolutionActiveArray = useMaximumResolutionActiveArray
+    ).region
     crop?.let { set(CaptureRequest.SCALER_CROP_REGION, it) }
 
     if (zoomRatio > 1f && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
