@@ -52,7 +52,7 @@ data class RawFusionProcessResult(
 
 private const val MIN_RAW_FUSION_FRAMES = 2
 // 50MP-class high-resolution RAW threshold.
-private const val HIGH_RES_RAW_MIN_MP = 40_000_000L
+private const val HIGH_RES_RAW_MIN_PIXELS = 40_000_000L
 private const val HIGH_RES_RAW_FRAME_LIMIT = 4
 private const val TARGET_12MP_PIXELS = 12_000_000L
 
@@ -152,7 +152,7 @@ fun captureRawBurstForFusion(
         val rawSelection = chooseRawFusionSizeV2(characteristics, resolutionMode, resolutionPlan)
         val rawSize = rawSelection.size
         val rawPixelCount = rawSize.width.toLong() * rawSize.height.toLong()
-        val highResolutionRaw = rawPixelCount >= HIGH_RES_RAW_MIN_MP
+        val highResolutionRaw = rawPixelCount >= HIGH_RES_RAW_MIN_PIXELS
         val frameClampReason = if (highResolutionRaw && requestedFrames > HIGH_RES_RAW_FRAME_LIMIT) {
             requestedFrames = HIGH_RES_RAW_FRAME_LIMIT
             "50MP-class high-resolution RAW capture limited to $HIGH_RES_RAW_FRAME_LIMIT frames for memory safety."
@@ -218,6 +218,8 @@ fun captureRawBurstForFusion(
             .put("selected24MpReason", resolutionPlan?.selected24MpReason ?: JSONObject.NULL)
             .put("nativePostprocessRequired", resolutionMode == CaptureResolutionMode.MP24_FUSION && highResolutionRaw)
             .put("nativePostprocessUsed", false)
+            .put("highResRawInputThresholdPixels", HIGH_RES_RAW_MIN_PIXELS)
+            .put("highResRawInputThresholdMp", 40.0)
             .put("planInputWidth", resolutionPlan?.inputSize?.width ?: JSONObject.NULL)
             .put("planInputHeight", resolutionPlan?.inputSize?.height ?: JSONObject.NULL)
             .put("planUsesMaximumResolution", resolutionPlan?.usesMaximumResolution ?: rawSelection.requiresMaximumResolutionPixelMode)
@@ -562,7 +564,7 @@ fun processRawFusionJob(
         val estimatedMemoryBytes = estimatedArgbBytes + estimatedShortBytes + estimatedNativeFallbackBytes
         val estimatedMemoryMb = estimatedMemoryBytes.toDouble() / (1024.0 * 1024.0)
         val memoryRiskLevel = when {
-            pixelCountLong >= HIGH_RES_RAW_MIN_MP || estimatedMemoryMb >= 512.0 -> "HIGH"
+            pixelCountLong >= HIGH_RES_RAW_MIN_PIXELS || estimatedMemoryMb >= 512.0 -> "HIGH"
             estimatedMemoryMb >= 256.0 -> "MEDIUM"
             else -> "LOW"
         }
@@ -573,7 +575,7 @@ fun processRawFusionJob(
             .put("memoryRiskLevel", memoryRiskLevel)
             .put("memoryEstimateUpdatedAt", System.currentTimeMillis())
         jobFile.writeText(job.toString(2))
-        val highResolutionRaw = pixelCountLong >= HIGH_RES_RAW_MIN_MP
+        val highResolutionRaw = pixelCountLong >= HIGH_RES_RAW_MIN_PIXELS
         val frameInputs = mutableListOf<RawFrameInput>()
         val frameMeta = mutableListOf<JSONObject>()
 
@@ -858,6 +860,8 @@ fun processRawFusionJob(
             .put("fullSizeKotlinDemosaicUsed", !highResolutionRaw)
             .put("nativePostprocessRequired", false)
             .put("nativePostprocessUsed", false)
+            .put("highResRawInputThresholdPixels", HIGH_RES_RAW_MIN_PIXELS)
+            .put("highResRawInputThresholdMp", 40.0)
             .put("usedFrameCount", frameInputs.size)
             .put("requestedFrames", requestedFrames)
             .put("savedFrames", savedFrames)

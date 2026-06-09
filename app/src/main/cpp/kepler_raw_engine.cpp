@@ -226,6 +226,7 @@ uint8_t toneRaw(int value, int whiteRange) {
 
 bool writePostprocessMetadata(
     const std::string& path,
+    const std::string& outputPath,
     int inputWidth,
     int inputHeight,
     int outputWidth,
@@ -245,6 +246,10 @@ bool writePostprocessMetadata(
            << "  \"outputHeight\": " << outputHeight << ",\n"
            << "  \"demosaic\": \"scaled_bilinear_v0\",\n"
            << "  \"toneMap\": \"simple_v0\",\n"
+           << "  \"sharpen\": \"mild_unsharp_v0\",\n"
+           << "  \"status\": \"OK\",\n"
+           << "  \"outputPath\": \"" << outputPath << "\",\n"
+           << "  \"outputName\": \"" << outputPath.substr(outputPath.find_last_of("/\\\\") + 1) << "\",\n"
            << "  \"highResRawInput\": true,\n"
            << "  \"outputFormat\": \"RGBA_8888_RAW\"\n"
            << "}\n";
@@ -452,7 +457,8 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
             }
         }
 
-        std::ofstream output(getString(env, outputPath), std::ios::binary);
+        const std::string rgbaOutputPath = getString(env, outputPath);
+        std::ofstream output(rgbaOutputPath, std::ios::binary);
         if (!output) return env->NewStringUTF("ERROR: RGBA output open failed");
         std::vector<uint8_t> rgbaRow(static_cast<size_t>(outputWidth) * 4);
         for (int y = 0; y < outputHeight; ++y) {
@@ -479,6 +485,7 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
 
         if (!writePostprocessMetadata(
                 getString(env, outputMetadataJsonPath),
+                rgbaOutputPath,
                 width,
                 height,
                 outputWidth,
