@@ -2,6 +2,7 @@
 #include <android/log.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -308,12 +309,23 @@ char bayerColorAt(int x, int y, int cfa) {
     }
 }
 
-uint8_t toneRaw(int value, int whiteRange) {
-    const float linear = std::clamp(static_cast<float>(value) / std::max(1, whiteRange), 0.0f, 1.0f);
-    const float gamma = std::pow(linear, 1.0f / 2.2f);
-    const float lifted = std::clamp(gamma * 1.06f + 0.012f, 0.0f, 1.0f);
-    const float shouldered = lifted / (lifted + 0.10f);
-    return static_cast<uint8_t>(std::clamp(std::lround(shouldered * 1.10f * 255.0f), 0L, 255L));
+struct WhiteBalanceGains {
+    float r = 1.0f;
+    float g = 1.0f;
+    float b = 1.0f;
+    bool fallback = false;
+};
+
+uint8_t toneRawV02(float value, int whiteRange) {
+    constexpr float kBlackLift = 0.008f;
+    constexpr float kGamma = 2.20f;
+    constexpr float kShoulderStrength = 0.16f;
+    const float linear = std::clamp(value / std::max(1, whiteRange), 0.0f, 1.0f);
+    const float lifted = std::clamp(linear + kBlackLift * (1.0f - linear), 0.0f, 1.0f);
+    const float gammaMapped = std::pow(lifted, 1.0f / kGamma);
+    const float shouldered = gammaMapped /
+        std::max(0.0001f, gammaMapped + kShoulderStrength * (1.0f - gammaMapped));
+    return static_cast<uint8_t>(std::clamp(std::lround(shouldered * 255.0f), 0L, 255L));
 }
 
 bool writePostprocessMetadata(
@@ -323,6 +335,7 @@ bool writePostprocessMetadata(
     int inputHeight,
     int outputWidth,
     int outputHeight,
+    const WhiteBalanceGains& wb,
     std::string& error
 ) {
     std::ofstream output(path);
@@ -332,17 +345,32 @@ bool writePostprocessMetadata(
     }
     output << "{\n"
            << "  \"nativePostprocess\": true,\n"
+           << "  \"nativePostprocessVersion\": \"NATIVE_POSTPROCESS_V0_2\",\n"
            << "  \"inputWidth\": " << inputWidth << ",\n"
            << "  \"inputHeight\": " << inputHeight << ",\n"
            << "  \"outputWidth\": " << outputWidth << ",\n"
            << "  \"outputHeight\": " << outputHeight << ",\n"
-           << "  \"demosaic\": \"scaled_bilinear_v0\",\n"
-           << "  \"toneMap\": \"simple_v0\",\n"
-           << "  \"sharpen\": \"mild_unsharp_v0\",\n"
+           << "  \"demosaic\": \"edge_aware_scaled_bilinear_v0_2\",\n"
+           << "  \"wbMode\": \"gray_world_v0_2\",\n"
+           << "  \"wbGainR\": " << wb.r << ",\n"
+           << "  \"wbGainG\": " << wb.g << ",\n"
+           << "  \"wbGainB\": " << wb.b << ",\n"
+           << "  \"wbFallback\": " << (wb.fallback ? "true" : "false") << ",\n"
+           << "  \"toneMap\": \"filmic_shoulder_v0_2\",\n"
+           << "  \"blackLift\": 0.008,\n"
+           << "  \"gamma\": 2.20,\n"
+           << "  \"shoulderStrength\": 0.16,\n"
+           << "  \"chromaDenoise\": \"mild_v0_2\",\n"
+           << "  \"chromaDenoiseStrength\": 0.18,\n"
+           << "  \"sharpen\": \"adaptive_unsharp_v0_2\",\n"
+           << "  \"sharpenStrength\": 0.22,\n"
+           << "  \"darkSharpenSuppression\": 0.70,\n"
            << "  \"status\": \"OK\",\n"
            << "  \"outputPath\": \"" << outputPath << "\",\n"
            << "  \"outputName\": \"" << outputPath.substr(outputPath.find_last_of("/\\\\") + 1) << "\",\n"
-           << "  \"highResRawInput\": true,\n"
+           << "  \"highResRawInput\": "
+           << (static_cast<int64_t>(inputWidth) * inputHeight >= 40000000LL ? "true" : "false")
+           << ",\n"
            << "  \"outputFormat\": \"RGBA_8888_RAW\"\n"
            << "}\n";
     return output.good();
@@ -608,45 +636,137 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
         };
         auto average2 = [](int a, int b) { return (a + b) / 2; };
         auto average4 = [](int a, int b, int c, int d) { return (a + b + c + d) / 4; };
+        auto sourceCoordinate = [](int outputCoordinate, int inputSize, int outputSize) {
+            int source = static_cast<int>(
+                (static_cast<int64_t>(outputCoordinate) * inputSize) / outputSize
+            );
+            return std::clamp(
+                (source / 2) * 2 + (outputCoordinate & 1),
+                0,
+                inputSize - 1
+            );
+        };
+        auto demosaicAt = [&](int sx, int sy) -> std::array<float, 3> {
+            const int value = rawAt(sx, sy);
+            float r = 0.0f;
+            float g = 0.0f;
+            float b = 0.0f;
+            const char color = bayerColorAt(sx, sy, cfaPattern);
+            if (color == 'R' || color == 'B') {
+                const int horizontalGradient =
+                    std::abs(rawAt(sx - 1, sy) - rawAt(sx + 1, sy)) +
+                    std::abs(2 * value - rawAt(sx - 2, sy) - rawAt(sx + 2, sy));
+                const int verticalGradient =
+                    std::abs(rawAt(sx, sy - 1) - rawAt(sx, sy + 1)) +
+                    std::abs(2 * value - rawAt(sx, sy - 2) - rawAt(sx, sy + 2));
+                if (horizontalGradient < verticalGradient) {
+                    g = static_cast<float>(average2(rawAt(sx - 1, sy), rawAt(sx + 1, sy)));
+                } else if (verticalGradient < horizontalGradient) {
+                    g = static_cast<float>(average2(rawAt(sx, sy - 1), rawAt(sx, sy + 1)));
+                } else {
+                    g = static_cast<float>(average4(
+                        rawAt(sx - 1, sy),
+                        rawAt(sx + 1, sy),
+                        rawAt(sx, sy - 1),
+                        rawAt(sx, sy + 1)
+                    ));
+                }
+                const int diagonalOneGradient =
+                    std::abs(rawAt(sx - 1, sy - 1) - rawAt(sx + 1, sy + 1));
+                const int diagonalTwoGradient =
+                    std::abs(rawAt(sx + 1, sy - 1) - rawAt(sx - 1, sy + 1));
+                const float opposite = diagonalOneGradient < diagonalTwoGradient
+                    ? static_cast<float>(average2(rawAt(sx - 1, sy - 1), rawAt(sx + 1, sy + 1)))
+                    : diagonalTwoGradient < diagonalOneGradient
+                        ? static_cast<float>(average2(rawAt(sx + 1, sy - 1), rawAt(sx - 1, sy + 1)))
+                        : static_cast<float>(average4(
+                            rawAt(sx - 1, sy - 1),
+                            rawAt(sx + 1, sy - 1),
+                            rawAt(sx - 1, sy + 1),
+                            rawAt(sx + 1, sy + 1)
+                        ));
+                if (color == 'R') {
+                    r = static_cast<float>(value);
+                    b = opposite;
+                } else {
+                    b = static_cast<float>(value);
+                    r = opposite;
+                }
+            } else {
+                g = static_cast<float>(value);
+                const bool greenOnRedRow =
+                    (cfaPattern == 2 || cfaPattern == 3) ? ((sy & 1) != 0) : ((sy & 1) == 0);
+                const float horizontalColor = static_cast<float>(
+                    average2(rawAt(sx - 1, sy), rawAt(sx + 1, sy))
+                );
+                const float verticalColor = static_cast<float>(
+                    average2(rawAt(sx, sy - 1), rawAt(sx, sy + 1))
+                );
+                const float horizontalGreen = static_cast<float>(
+                    average2(rawAt(sx - 2, sy), rawAt(sx + 2, sy))
+                );
+                const float verticalGreen = static_cast<float>(
+                    average2(rawAt(sx, sy - 2), rawAt(sx, sy + 2))
+                );
+                const float correctedHorizontal = horizontalColor + 0.5f * (g - horizontalGreen);
+                const float correctedVertical = verticalColor + 0.5f * (g - verticalGreen);
+                if (greenOnRedRow) {
+                    r = correctedHorizontal;
+                    b = correctedVertical;
+                } else {
+                    r = correctedVertical;
+                    b = correctedHorizontal;
+                }
+            }
+            return {
+                std::clamp(r, 0.0f, static_cast<float>(whiteRange)),
+                std::clamp(g, 0.0f, static_cast<float>(whiteRange)),
+                std::clamp(b, 0.0f, static_cast<float>(whiteRange))
+            };
+        };
 
+        WhiteBalanceGains wb;
+        double sampleR = 0.0;
+        double sampleG = 0.0;
+        double sampleB = 0.0;
+        uint64_t sampleCount = 0;
+        const int sampleStepX = std::max(8, static_cast<int>(outputWidth) / 160);
+        const int sampleStepY = std::max(8, static_cast<int>(outputHeight) / 120);
+        for (int oy = sampleStepY / 2; oy < outputHeight; oy += sampleStepY) {
+            const int sy = sourceCoordinate(oy, height, outputHeight);
+            for (int ox = sampleStepX / 2; ox < outputWidth; ox += sampleStepX) {
+                const int sx = sourceCoordinate(ox, width, outputWidth);
+                const auto rgb = demosaicAt(sx, sy);
+                const float luma = 0.25f * rgb[0] + 0.50f * rgb[1] + 0.25f * rgb[2];
+                if (luma < whiteRange * 0.03f || luma > whiteRange * 0.92f) continue;
+                sampleR += rgb[0];
+                sampleG += rgb[1];
+                sampleB += rgb[2];
+                ++sampleCount;
+            }
+        }
+        if (sampleCount >= 64 && sampleR > 1.0 && sampleG > 1.0 && sampleB > 1.0) {
+            const double meanR = sampleR / sampleCount;
+            const double meanG = sampleG / sampleCount;
+            const double meanB = sampleB / sampleCount;
+            wb.r = std::clamp(static_cast<float>(meanG / meanR), 0.6f, 2.2f);
+            wb.g = 1.0f;
+            wb.b = std::clamp(static_cast<float>(meanG / meanB), 0.6f, 2.2f);
+        } else {
+            wb.fallback = true;
+        }
+
+        // Single output-sized RGB buffer. Denoise and sharpen are applied while rows are written.
         std::vector<uint8_t> toned(static_cast<size_t>(outputPixels) * 3);
         for (int oy = 0; oy < outputHeight; ++oy) {
-            int sy = static_cast<int>((static_cast<int64_t>(oy) * height) / outputHeight);
-            sy = std::clamp((sy / 2) * 2 + (oy & 1), 0, static_cast<int>(height) - 1);
+            const int sy = sourceCoordinate(oy, height, outputHeight);
             for (int ox = 0; ox < outputWidth; ++ox) {
-                int sx = static_cast<int>((static_cast<int64_t>(ox) * width) / outputWidth);
-                sx = std::clamp((sx / 2) * 2 + (ox & 1), 0, static_cast<int>(width) - 1);
-                const int value = rawAt(sx, sy);
-                int r = 0;
-                int g = 0;
-                int b = 0;
-                switch (bayerColorAt(sx, sy, cfaPattern)) {
-                    case 'R':
-                        r = value;
-                        g = average4(rawAt(sx - 1, sy), rawAt(sx + 1, sy), rawAt(sx, sy - 1), rawAt(sx, sy + 1));
-                        b = average4(rawAt(sx - 1, sy - 1), rawAt(sx + 1, sy - 1), rawAt(sx - 1, sy + 1), rawAt(sx + 1, sy + 1));
-                        break;
-                    case 'B':
-                        b = value;
-                        g = average4(rawAt(sx - 1, sy), rawAt(sx + 1, sy), rawAt(sx, sy - 1), rawAt(sx, sy + 1));
-                        r = average4(rawAt(sx - 1, sy - 1), rawAt(sx + 1, sy - 1), rawAt(sx - 1, sy + 1), rawAt(sx + 1, sy + 1));
-                        break;
-                    default: {
-                        g = value;
-                        const bool greenOnRedRow = (cfaPattern == 2 || cfaPattern == 3) ? ((sy & 1) != 0) : ((sy & 1) == 0);
-                        if (greenOnRedRow) {
-                            r = average2(rawAt(sx - 1, sy), rawAt(sx + 1, sy));
-                            b = average2(rawAt(sx, sy - 1), rawAt(sx, sy + 1));
-                        } else {
-                            r = average2(rawAt(sx, sy - 1), rawAt(sx, sy + 1));
-                            b = average2(rawAt(sx - 1, sy), rawAt(sx + 1, sy));
-                        }
-                    }
-                }
+                const int sx = sourceCoordinate(ox, width, outputWidth);
+                const auto rgb = demosaicAt(sx, sy);
                 const size_t p = (static_cast<size_t>(oy) * outputWidth + ox) * 3;
-                toned[p] = toneRaw(r, whiteRange);
-                toned[p + 1] = toneRaw(g, whiteRange);
-                toned[p + 2] = toneRaw(b, whiteRange);
+                toned[p] = toneRawV02(rgb[0] * wb.r, whiteRange);
+                toned[p + 1] = toneRawV02(rgb[1] * wb.g, whiteRange);
+                toned[p + 2] = toneRawV02(rgb[2] * wb.b, whiteRange);
             }
         }
 
@@ -654,22 +774,56 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
         std::ofstream output(rgbaOutputPath, std::ios::binary);
         if (!output) return env->NewStringUTF("ERROR: RGBA output open failed");
         std::vector<uint8_t> rgbaRow(static_cast<size_t>(outputWidth) * 4);
+        constexpr float kChromaDenoiseStrength = 0.18f;
+        constexpr float kSharpenStrength = 0.22f;
         for (int y = 0; y < outputHeight; ++y) {
             for (int x = 0; x < outputWidth; ++x) {
                 const size_t center = (static_cast<size_t>(y) * outputWidth + x) * 3;
                 const size_t out = static_cast<size_t>(x) * 4;
-                for (int channel = 0; channel < 3; ++channel) {
-                    int blur = 0;
-                    for (int dy = -1; dy <= 1; ++dy) {
-                        const int yy = std::clamp(y + dy, 0, static_cast<int>(outputHeight) - 1);
-                        for (int dx = -1; dx <= 1; ++dx) {
-                            const int xx = std::clamp(x + dx, 0, static_cast<int>(outputWidth) - 1);
-                            blur += toned[(static_cast<size_t>(yy) * outputWidth + xx) * 3 + channel];
-                        }
+                const float centerR = toned[center];
+                const float centerG = toned[center + 1];
+                const float centerB = toned[center + 2];
+                const float centerLuma = 0.25f * centerR + 0.50f * centerG + 0.25f * centerB;
+                double lumaSum = 0.0;
+                double chromaRSum = 0.0;
+                double chromaBSum = 0.0;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    const int yy = std::clamp(y + dy, 0, static_cast<int>(outputHeight) - 1);
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int xx = std::clamp(x + dx, 0, static_cast<int>(outputWidth) - 1);
+                        const size_t p = (static_cast<size_t>(yy) * outputWidth + xx) * 3;
+                        const float r = toned[p];
+                        const float g = toned[p + 1];
+                        const float b = toned[p + 2];
+                        const float luma = 0.25f * r + 0.50f * g + 0.25f * b;
+                        lumaSum += luma;
+                        chromaRSum += r - luma;
+                        chromaBSum += b - luma;
                     }
-                    const float sharpened = toned[center + channel] * 1.20f - (blur / 9.0f) * 0.20f;
-                    rgbaRow[out + channel] = static_cast<uint8_t>(std::clamp(std::lround(sharpened), 0L, 255L));
                 }
+                const float localLuma = static_cast<float>(lumaSum / 9.0);
+                const float centerChromaR = centerR - centerLuma;
+                const float centerChromaB = centerB - centerLuma;
+                const float denoisedChromaR = centerChromaR * (1.0f - kChromaDenoiseStrength) +
+                    static_cast<float>(chromaRSum / 9.0) * kChromaDenoiseStrength;
+                const float denoisedChromaB = centerChromaB * (1.0f - kChromaDenoiseStrength) +
+                    static_cast<float>(chromaBSum / 9.0) * kChromaDenoiseStrength;
+                const float darkFactor = std::clamp((centerLuma - 18.0f) / 72.0f, 0.30f, 1.0f);
+                const float highlightFactor = std::clamp((245.0f - centerLuma) / 45.0f, 0.15f, 1.0f);
+                const float adaptiveStrength = kSharpenStrength * darkFactor * highlightFactor;
+                const float sharpenedLuma = std::clamp(
+                    centerLuma + (centerLuma - localLuma) * adaptiveStrength,
+                    0.0f,
+                    255.0f
+                );
+                const float outR = sharpenedLuma + denoisedChromaR;
+                const float outB = sharpenedLuma + denoisedChromaB;
+                const float outG = sharpenedLuma -
+                    0.5f * denoisedChromaR -
+                    0.5f * denoisedChromaB;
+                rgbaRow[out] = static_cast<uint8_t>(std::clamp(std::lround(outR), 0L, 255L));
+                rgbaRow[out + 1] = static_cast<uint8_t>(std::clamp(std::lround(outG), 0L, 255L));
+                rgbaRow[out + 2] = static_cast<uint8_t>(std::clamp(std::lround(outB), 0L, 255L));
                 rgbaRow[out + 3] = 255;
             }
             output.write(reinterpret_cast<const char*>(rgbaRow.data()), static_cast<std::streamsize>(rgbaRow.size()));
@@ -683,6 +837,7 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
                 height,
                 outputWidth,
                 outputHeight,
+                wb,
                 error
             )) {
             return env->NewStringUTF(("ERROR: " + error).c_str());

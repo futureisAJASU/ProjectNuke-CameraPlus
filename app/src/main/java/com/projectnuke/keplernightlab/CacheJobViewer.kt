@@ -514,9 +514,12 @@ private fun NativePostprocessSection(job: JSONObject?, detail: KeplerJobDetail) 
         val native = detail.nativePostprocess
         if (native != null) {
             listOf(
-                "inputWidth", "inputHeight", "outputWidth", "outputHeight", "demosaic",
-                "toneMap", "sharpen", "status", "outputPath", "outputName", "outputFormat",
-                "nativePostprocess", "highResRawInput"
+                "nativePostprocessVersion", "inputWidth", "inputHeight", "outputWidth",
+                "outputHeight", "demosaic", "wbMode", "wbGainR", "wbGainG", "wbGainB",
+                "wbFallback", "toneMap", "blackLift", "gamma", "shoulderStrength",
+                "chromaDenoise", "chromaDenoiseStrength", "sharpen", "sharpenStrength",
+                "darkSharpenSuppression", "status", "outputPath", "outputName",
+                "outputFormat", "nativePostprocess", "highResRawInput"
             ).forEach { DetailField(it, native.value(it)) }
         } else {
             Text(
