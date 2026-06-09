@@ -17,7 +17,29 @@ struct Alignment {
     int proxyDy = 0;
     int rawDx = 0;
     int rawDy = 0;
+    int64_t validProxyPixels = 0;
+    float validProxyFraction = 1.0f;
+    double sad = 0.0;
+    float meanAbsDiff = 0.0f;
+    float normalizedError = 0.0f;
     float confidence = 1.0f;
+    bool acceptedForMerge = true;
+    bool searchBoundaryHit = false;
+    std::string rejectReason;
+    float finalFrameWeightScale = 1.0f;
+};
+
+struct MergeStats {
+    int acceptedFrameCount = 0;
+    int rejectedFrameCount = 0;
+    int lowConfidenceFrameCount = 0;
+    int searchBoundaryHitCount = 0;
+    uint64_t totalCandidateSamples = 0;
+    uint64_t rejectedGhostSamples = 0;
+    uint64_t downweightedGhostSamples = 0;
+    uint64_t referencePreservedPixelCount = 0;
+    uint64_t totalOutputPixels = 0;
+    std::string mergeWarning;
 };
 
 std::string getString(JNIEnv* env, jstring value) {
@@ -123,9 +145,18 @@ std::vector<float> buildLumaProxy(
     return proxy;
 }
 
-Alignment alignProxy(const std::vector<float>& ref, const std::vector<float>& cur, int w, int h, int radius, int downscale) {
+Alignment alignProxy(
+    const std::vector<float>& ref,
+    const std::vector<float>& cur,
+    int w,
+    int h,
+    int radius,
+    int downscale,
+    float proxyDynamicRange
+) {
     double bestSad = std::numeric_limits<double>::max();
-    double bestNorm = 1.0;
+    double bestMeanAbsDiff = std::numeric_limits<double>::max();
+    int64_t bestCount = 0;
     int bestDx = 0;
     int bestDy = 0;
     for (int dy = -radius; dy <= radius; ++dy) {
@@ -136,8 +167,7 @@ Alignment alignProxy(const std::vector<float>& ref, const std::vector<float>& cu
             const int x1 = std::min(w, w - dx);
             if (x1 <= x0 || y1 <= y0) continue;
             double sad = 0.0;
-            double norm = 0.0;
-            int count = 0;
+            int64_t count = 0;
             for (int y = y0; y < y1; ++y) {
                 const size_t refRow = static_cast<size_t>(y) * w;
                 const size_t curRow = static_cast<size_t>(y + dy) * w;
@@ -145,13 +175,14 @@ Alignment alignProxy(const std::vector<float>& ref, const std::vector<float>& cu
                     const float a = ref[refRow + x];
                     const float b = cur[curRow + x + dx];
                     sad += std::abs(static_cast<double>(a - b));
-                    norm += std::abs(static_cast<double>(a)) + 1.0;
                     ++count;
                 }
             }
-            if (count > 0 && sad < bestSad) {
+            const double meanAbsDiff = count > 0 ? sad / count : std::numeric_limits<double>::max();
+            if (meanAbsDiff < bestMeanAbsDiff) {
                 bestSad = sad;
-                bestNorm = norm;
+                bestMeanAbsDiff = meanAbsDiff;
+                bestCount = count;
                 bestDx = dx;
                 bestDy = dy;
             }
@@ -164,13 +195,37 @@ Alignment alignProxy(const std::vector<float>& ref, const std::vector<float>& cu
     out.rawDy = bestDy * downscale;
     if ((out.rawDx & 1) != 0) out.rawDx += out.rawDx > 0 ? -1 : 1;
     if ((out.rawDy & 1) != 0) out.rawDy += out.rawDy > 0 ? -1 : 1;
-    out.confidence = static_cast<float>(1.0 / (1.0 + bestSad / std::max(1.0, bestNorm)));
+    out.validProxyPixels = bestCount;
+    out.validProxyFraction = static_cast<float>(
+        static_cast<double>(bestCount) / std::max<int64_t>(1, static_cast<int64_t>(w) * h)
+    );
+    out.sad = std::isfinite(bestSad) ? bestSad : 0.0;
+    out.meanAbsDiff = bestCount > 0 ? static_cast<float>(out.sad / bestCount) : proxyDynamicRange;
+    out.normalizedError = out.meanAbsDiff / std::max(1.0f, proxyDynamicRange);
+    constexpr float kConfidenceScale = 3.0f;
+    out.confidence = std::clamp(1.0f - out.normalizedError * kConfidenceScale, 0.0f, 1.0f);
+    out.searchBoundaryHit = std::abs(bestDx) == radius || std::abs(bestDy) == radius;
+    if (out.validProxyFraction < 0.55f) {
+        out.acceptedForMerge = false;
+        out.rejectReason = "LOW_VALID_PROXY_FRACTION";
+    } else if (out.normalizedError > 0.35f) {
+        out.acceptedForMerge = false;
+        out.rejectReason = "EXTREME_NORMALIZED_ERROR";
+    } else if (out.confidence < 0.20f) {
+        out.acceptedForMerge = false;
+        out.rejectReason = "LOW_ALIGNMENT_CONFIDENCE";
+    } else if (out.searchBoundaryHit && out.confidence < 0.45f) {
+        out.acceptedForMerge = false;
+        out.rejectReason = "SEARCH_BOUNDARY_WEAK_CONFIDENCE";
+    }
+    out.finalFrameWeightScale = out.acceptedForMerge ? out.confidence : 0.0f;
     return out;
 }
 
 bool writeAlignmentJson(
     const std::string& path,
     const std::vector<Alignment>& alignments,
+    const MergeStats& stats,
     int downscale,
     int searchRadius,
     int referenceIndex,
@@ -182,21 +237,58 @@ bool writeAlignmentJson(
         return false;
     }
     output << "{\n";
-    output << "  \"type\": \"NATIVE_GLOBAL_SHIFT_V0_1\",\n";
+    const double ghostRejectedSampleRatio = stats.totalCandidateSamples > 0
+        ? static_cast<double>(stats.rejectedGhostSamples) / stats.totalCandidateSamples
+        : 0.0;
+    const double referencePreservedPixelRatio = stats.totalOutputPixels > 0
+        ? static_cast<double>(stats.referencePreservedPixelCount) /
+            stats.totalOutputPixels
+        : 0.0;
+    output << "  \"type\": \"NATIVE_GLOBAL_SHIFT_V0_2\",\n";
+    output << "  \"nativeMergeVersion\": \"NATIVE_RAW_FUSION_V0_2_CONFIDENCE_GHOST\",\n";
+    output << "  \"ghostSuppressionEnabled\": true,\n";
+    output << "  \"frameRejectEnabled\": true,\n";
     output << "  \"downscale\": " << downscale << ",\n";
     output << "  \"searchRadius\": " << searchRadius << ",\n";
     output << "  \"referenceIndex\": " << referenceIndex << ",\n";
     output << "  \"cfaPhasePreserved\": true,\n";
     output << "  \"mergedRawFormat\": \"black_level_subtracted_compact_raw16\",\n";
+    output << "  \"acceptedFrameCount\": " << stats.acceptedFrameCount << ",\n";
+    output << "  \"rejectedFrameCount\": " << stats.rejectedFrameCount << ",\n";
+    output << "  \"totalCandidateSamples\": " << stats.totalCandidateSamples << ",\n";
+    output << "  \"rejectedGhostSamples\": " << stats.rejectedGhostSamples << ",\n";
+    output << "  \"downweightedGhostSamples\": " << stats.downweightedGhostSamples << ",\n";
+    output << "  \"ghostRejectedSampleRatio\": " << ghostRejectedSampleRatio << ",\n";
+    output << "  \"referencePreservedPixelCount\": " << stats.referencePreservedPixelCount << ",\n";
+    output << "  \"referencePreservedPixelRatio\": " << referencePreservedPixelRatio << ",\n";
+    output << "  \"lowConfidenceFrameCount\": " << stats.lowConfidenceFrameCount << ",\n";
+    output << "  \"searchBoundaryHitCount\": " << stats.searchBoundaryHitCount << ",\n";
+    output << "  \"mergeWarning\": ";
+    if (stats.mergeWarning.empty()) output << "null,\n";
+    else output << "\"" << stats.mergeWarning << "\",\n";
     output << "  \"frames\": [\n";
     for (size_t i = 0; i < alignments.size(); ++i) {
         const auto& a = alignments[i];
         output << "    {\"index\": " << i
+               << ", \"frameIndex\": " << i
+               << ", \"dx\": " << a.proxyDx
+               << ", \"dy\": " << a.proxyDy
                << ", \"proxyDx\": " << a.proxyDx
                << ", \"proxyDy\": " << a.proxyDy
                << ", \"rawDx\": " << a.rawDx
                << ", \"rawDy\": " << a.rawDy
-               << ", \"confidence\": " << a.confidence << "}";
+               << ", \"validProxyPixels\": " << a.validProxyPixels
+               << ", \"validProxyFraction\": " << a.validProxyFraction
+               << ", \"sad\": " << a.sad
+               << ", \"meanAbsDiff\": " << a.meanAbsDiff
+               << ", \"normalizedError\": " << a.normalizedError
+               << ", \"confidence\": " << a.confidence
+               << ", \"acceptedForMerge\": " << (a.acceptedForMerge ? "true" : "false")
+               << ", \"rejectReason\": ";
+        if (a.rejectReason.empty()) output << "null";
+        else output << "\"" << a.rejectReason << "\"";
+        output << ", \"searchBoundaryHit\": " << (a.searchBoundaryHit ? "true" : "false")
+               << ", \"finalFrameWeightScale\": " << a.finalFrameWeightScale << "}";
         if (i + 1 < alignments.size()) output << ",";
         output << "\n";
     }
@@ -314,22 +406,83 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_alignAndMergeRaw16(
         }
 
         std::vector<Alignment> alignments(static_cast<size_t>(frameCount));
+        const auto proxyMinMax = std::minmax_element(
+            proxies[referenceIndex].begin(),
+            proxies[referenceIndex].end()
+        );
+        const float proxyDynamicRange = proxyMinMax.first != proxies[referenceIndex].end()
+            ? std::max(1.0f, *proxyMinMax.second - *proxyMinMax.first)
+            : 1.0f;
         for (int i = 0; i < frameCount; ++i) {
             if (i == referenceIndex) {
-                alignments[i] = Alignment{};
+                Alignment reference;
+                reference.validProxyPixels = static_cast<int64_t>(proxyW) * proxyH;
+                reference.validProxyFraction = 1.0f;
+                reference.finalFrameWeightScale = std::max(1.0f, frameWeights[i]) * 1.5f;
+                alignments[i] = reference;
             } else {
-                alignments[i] = alignProxy(proxies[referenceIndex], proxies[i], proxyW, proxyH, searchRadius, downscale);
+                alignments[i] = alignProxy(
+                    proxies[referenceIndex],
+                    proxies[i],
+                    proxyW,
+                    proxyH,
+                    searchRadius,
+                    downscale,
+                    proxyDynamicRange
+                );
+                alignments[i].finalFrameWeightScale = alignments[i].acceptedForMerge
+                    ? std::max(0.0f, frameWeights[i]) * alignments[i].confidence
+                    : 0.0f;
             }
+        }
+
+        MergeStats mergeStats;
+        mergeStats.totalOutputPixels = pixels;
+        for (const auto& alignment : alignments) {
+            if (alignment.acceptedForMerge) ++mergeStats.acceptedFrameCount;
+            else ++mergeStats.rejectedFrameCount;
+            if (alignment.confidence < 0.4f) ++mergeStats.lowConfidenceFrameCount;
+            if (alignment.searchBoundaryHit) ++mergeStats.searchBoundaryHitCount;
+        }
+        if (mergeStats.acceptedFrameCount == 1) {
+            mergeStats.mergeWarning = "REFERENCE_ONLY_MERGE";
+        }
+        proxies.clear();
+
+        const int maxOut = std::max(1, static_cast<int>(whiteLevel) - static_cast<int>(blackLevel));
+        std::vector<uint16_t> merged(pixels, 0);
+        if (!readRaw16(paths[referenceIndex], width, height, raw, error)) {
+            return env->NewStringUTF(("ERROR: " + error).c_str());
+        }
+        for (size_t p = 0; p < pixels; ++p) {
+            const int corrected = std::max(0, static_cast<int>(raw[p]) - static_cast<int>(blackLevel));
+            const int normalized = static_cast<int>(std::lround(corrected * exposureScales[referenceIndex]));
+            merged[p] = static_cast<uint16_t>(std::clamp(normalized, 0, maxOut));
         }
 
         std::vector<float> acc(pixels, 0.0f);
         std::vector<float> weightAcc(pixels, 0.0f);
+        const float referenceWeight = std::max(1.0f, alignments[referenceIndex].finalFrameWeightScale);
+        for (size_t p = 0; p < pixels; ++p) {
+            acc[p] = static_cast<float>(merged[p]) * referenceWeight;
+            weightAcc[p] = referenceWeight;
+        }
+
+        // Conservative Bayer-domain rejection constants, in black-level-subtracted RAW levels.
+        constexpr float kBaseNoise = 64.0f;
+        constexpr float kRelativeNoise = 0.12f;
+        constexpr float kHardRejectMultiplier = 2.5f;
+        constexpr float kModerateMinWeightScale = 0.15f;
+        constexpr float kHighlightStart = 0.85f;
+        constexpr float kHighlightAllowanceScale = 0.35f;
         for (int i = 0; i < frameCount; ++i) {
+            if (i == referenceIndex || !alignments[i].acceptedForMerge) continue;
             if (!readRaw16(paths[i], width, height, raw, error)) {
                 return env->NewStringUTF(("ERROR: " + error).c_str());
             }
             const auto& a = alignments[i];
-            const float weight = std::max(0.0f, frameWeights[i]) * std::max(0.05f, a.confidence);
+            const float weight = a.finalFrameWeightScale;
+            if (weight <= 0.0f) continue;
             for (int y = 0; y < height; ++y) {
                 const int sy = y + a.rawDy;
                 if (sy < 0 || sy >= height) continue;
@@ -338,20 +491,49 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_alignAndMergeRaw16(
                 for (int x = 0; x < width; ++x) {
                     const int sx = x + a.rawDx;
                     if (sx < 0 || sx >= width) continue;
-                    const int v = std::max(0, static_cast<int>(raw[inRow + sx]) - blackLevel);
-                    const float normalized = static_cast<float>(v) * exposureScales[i];
                     const size_t p = outRow + x;
-                    acc[p] += normalized * weight;
-                    weightAcc[p] += weight;
+                    const int corrected = std::max(
+                        0,
+                        static_cast<int>(raw[inRow + sx]) - static_cast<int>(blackLevel)
+                    );
+                    const float normalized = std::clamp(
+                        corrected * exposureScales[i],
+                        0.0f,
+                        static_cast<float>(maxOut)
+                    );
+                    const float reference = static_cast<float>(merged[p]);
+                    const float signal = std::max(reference, normalized);
+                    const float highlightAllowance = signal > maxOut * kHighlightStart
+                        ? (signal - maxOut * kHighlightStart) * kHighlightAllowanceScale
+                        : 0.0f;
+                    const float threshold =
+                        kBaseNoise + kRelativeNoise * signal + highlightAllowance;
+                    const float difference = std::abs(normalized - reference);
+                    ++mergeStats.totalCandidateSamples;
+                    if (difference <= threshold) {
+                        acc[p] += normalized * weight;
+                        weightAcc[p] += weight;
+                    } else if (difference <= threshold * kHardRejectMultiplier) {
+                        const float transition = (difference - threshold) /
+                            std::max(1.0f, threshold * (kHardRejectMultiplier - 1.0f));
+                        const float ghostScale = std::max(
+                            kModerateMinWeightScale,
+                            0.5f * (1.0f - transition)
+                        );
+                        acc[p] += normalized * weight * ghostScale;
+                        weightAcc[p] += weight * ghostScale;
+                        ++mergeStats.downweightedGhostSamples;
+                    } else {
+                        ++mergeStats.rejectedGhostSamples;
+                    }
                 }
             }
         }
 
-        const int maxOut = std::max(1, static_cast<int>(whiteLevel) - static_cast<int>(blackLevel));
-        std::vector<uint16_t> merged(pixels, 0);
         for (size_t p = 0; p < pixels; ++p) {
-            if (weightAcc[p] <= 0.0f) {
-                merged[p] = 0;
+            // Reference plus one surviving candidate is the minimum two-sample average.
+            if (weightAcc[p] <= referenceWeight + 0.0001f) {
+                ++mergeStats.referencePreservedPixelCount;
             } else {
                 const int v = static_cast<int>(std::lround(acc[p] / weightAcc[p]));
                 merged[p] = static_cast<uint16_t>(std::clamp(v, 0, maxOut));
@@ -361,11 +543,22 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_alignAndMergeRaw16(
         const std::string mergedPath = getString(env, outputMergedRawPath);
         const std::string alignmentPath = getString(env, outputAlignmentJsonPath);
         if (!writeRaw16(mergedPath, merged, error)) return env->NewStringUTF(("ERROR: " + error).c_str());
-        if (!writeAlignmentJson(alignmentPath, alignments, downscale, searchRadius, referenceIndex, error)) {
+        if (!writeAlignmentJson(
+                alignmentPath,
+                alignments,
+                mergeStats,
+                downscale,
+                searchRadius,
+                referenceIndex,
+                error
+            )) {
             return env->NewStringUTF(("ERROR: " + error).c_str());
         }
         std::ostringstream status;
-        status << "OK: native alignment+merge complete, frames=" << frameCount;
+        status << "OK: native RAW fusion v0.2 complete, accepted="
+               << mergeStats.acceptedFrameCount
+               << ", rejected=" << mergeStats.rejectedFrameCount;
+        if (!mergeStats.mergeWarning.empty()) status << ", warning=" << mergeStats.mergeWarning;
         return env->NewStringUTF(status.str().c_str());
     } catch (const std::bad_alloc&) {
         return env->NewStringUTF("ERROR: native out of memory");

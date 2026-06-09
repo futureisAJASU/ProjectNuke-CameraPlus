@@ -695,6 +695,30 @@ fun processRawFusionJob(
             }
             writeRaw16(merged, mergedRawFile)
         }
+        val nativeAlignmentMetadata = if (nativeMergedOk) {
+            runCatching { JSONObject(alignmentFile.readText()) }.getOrNull()
+        } else {
+            null
+        }
+        val nativeMergeWarning = nativeAlignmentMetadata
+            ?.optString("mergeWarning", "")
+            .orEmpty()
+            .takeIf { it.isNotBlank() && it != "null" }
+        val nativeAlignmentStatus = when {
+            !nativeMergedOk -> "FAILED_FALLBACK_KOTLIN_NO_ALIGNMENT"
+            nativeMergeWarning == "REFERENCE_ONLY_MERGE" -> "NATIVE_REFERENCE_ONLY_MERGE_WARNING"
+            nativeAlignmentMetadata?.optString("nativeMergeVersion") ==
+                "NATIVE_RAW_FUSION_V0_2_CONFIDENCE_GHOST" ->
+                "NATIVE_GLOBAL_SHIFT_GHOST_SUPPRESSION_COMPLETE"
+            else -> "NATIVE_GLOBAL_SHIFT_COMPLETE"
+        }
+        if (nativeMergedOk) {
+            applyNativeMergeMetadata(job, nativeAlignmentMetadata)
+                .put("alignmentStatus", nativeAlignmentStatus)
+                .put("nativeRawMerge", true)
+                .put("alignmentFile", alignmentFile.name)
+            jobFile.writeText(job.toString(2))
+        }
 
         onStatus("Processing RAW fusion: demosaicing...")
         val outputMode = CaptureResolutionMode.entries.firstOrNull { it.name == job.optString("outputResolutionMode") }
@@ -730,11 +754,15 @@ fun processRawFusionJob(
                 nativeRgbaFile.length() == expectedRgbaBytes &&
                 nativeMetadataFile.exists()
             if (!nativePostprocessUsed) {
-                val failed = JSONObject(job.toString())
+                val failed = applyNativeMergeMetadata(
+                    target = JSONObject(job.toString()),
+                    alignment = nativeAlignmentMetadata
+                )
                     .put("processStatus", "NATIVE_POSTPROCESS_FAILED_KEEPING_CACHE")
                     .put("nativePostprocessRequired", true)
                     .put("nativePostprocessUsed", false)
                     .put("nativePostprocessStatus", postprocessStatus)
+                    .put("alignmentStatus", nativeAlignmentStatus)
                     .put("processedAt", System.currentTimeMillis())
                 jobFile.writeText(failed.toString(2))
                 onStatus("RAW fusion native 24MP postprocess failed. RAW cache kept.")
@@ -755,7 +783,10 @@ fun processRawFusionJob(
             } else {
                 "Full RAW fusion used ${frameInputs.size}/$requestedFrames requested frames."
             }
-            val updated = JSONObject(job.toString())
+            val updated = applyNativeMergeMetadata(
+                target = JSONObject(job.toString()),
+                alignment = nativeAlignmentMetadata
+            )
                 .put("processStatus", "RAW_FUSION_COMPLETE")
                 .put("mergedRawFile", mergedRawFile.name)
                 .put("mergedDngFile", JSONObject.NULL)
@@ -782,7 +813,7 @@ fun processRawFusionJob(
                 .put("fullSizeKotlinDemosaicUsed", false)
                 .put("referenceFrameIndex", referenceSelection.index)
                 .put("referenceFrameReason", referenceSelection.reason)
-                .put("alignmentStatus", "NATIVE_GLOBAL_SHIFT_COMPLETE")
+                .put("alignmentStatus", nativeAlignmentStatus)
                 .put("nativeRawMerge", true)
                 .put("alignmentFile", alignmentFile.name)
                 .put("mergedRawFormat", "black_level_subtracted_aligned_compact_raw16")
@@ -850,7 +881,10 @@ fun processRawFusionJob(
             "Full RAW fusion used ${frameInputs.size}/$requestedFrames requested frames."
         }
         val notes = "RAW Fusion MVP: Bayer weighted merge, black-level correction, exposure/ISO normalization, simple bilinear demosaic, gray-world-ish tone. $partialNote Merged DNG skipped because CaptureResult metadata was not available after process restart. TODO gyro Bayer alignment, image micro-alignment, ghost suppression, RAW super-resolution/detail fusion, proper Camera2 color matrices."
-        val updated = JSONObject(job.toString())
+        val updated = applyNativeMergeMetadata(
+            target = JSONObject(job.toString()),
+            alignment = nativeAlignmentMetadata
+        )
             .put("processStatus", "RAW_FUSION_COMPLETE")
             .put("mergedRawFile", mergedRawFile.name)
             .put("mergedDngFile", JSONObject.NULL)
@@ -878,7 +912,7 @@ fun processRawFusionJob(
             .put("outputHeight", finalOutputHeight)
             .put("referenceFrameIndex", referenceSelection.index)
             .put("referenceFrameReason", referenceSelection.reason)
-            .put("alignmentStatus", if (nativeMergedOk) "NATIVE_GLOBAL_SHIFT_COMPLETE" else "FAILED_FALLBACK_KOTLIN_NO_ALIGNMENT")
+            .put("alignmentStatus", nativeAlignmentStatus)
             .put("nativeRawMerge", nativeMergedOk)
             .put("alignmentFile", if (nativeMergedOk) alignmentFile.name else JSONObject.NULL)
             .put("alignmentError", if (nativeMergedOk) JSONObject.NULL else nativeStatus)
@@ -902,6 +936,24 @@ fun processRawFusionJob(
     } catch (e: Exception) {
         RawFusionProcessResult(false, null, null, null, null, "${e.javaClass.simpleName}: ${e.message}")
     }
+}
+
+private fun applyNativeMergeMetadata(
+    target: JSONObject,
+    alignment: JSONObject?
+): JSONObject {
+    if (alignment == null || !alignment.has("nativeMergeVersion")) return target
+    return target
+        .put("nativeMergeVersion", alignment.optString("nativeMergeVersion"))
+        .put("acceptedFrameCount", alignment.optInt("acceptedFrameCount", 0))
+        .put("rejectedFrameCount", alignment.optInt("rejectedFrameCount", 0))
+        .put("ghostSuppressionEnabled", alignment.optBoolean("ghostSuppressionEnabled", false))
+        .put("ghostRejectedSampleRatio", alignment.optDouble("ghostRejectedSampleRatio", 0.0))
+        .put("referencePreservedPixelRatio", alignment.optDouble("referencePreservedPixelRatio", 0.0))
+        .put(
+            "mergeWarning",
+            alignment.opt("mergeWarning")?.takeUnless { it == JSONObject.NULL } ?: JSONObject.NULL
+        )
 }
 
 fun captureProcessExportRawNightFusion(

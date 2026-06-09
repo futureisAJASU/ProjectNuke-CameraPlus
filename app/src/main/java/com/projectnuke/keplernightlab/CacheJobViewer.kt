@@ -81,7 +81,12 @@ data class AlignmentFrameSummary(
     val proxyDy: Int,
     val rawDx: Int,
     val rawDy: Int,
-    val confidence: Double
+    val confidence: Double,
+    val normalizedError: Double,
+    val validProxyFraction: Double,
+    val acceptedForMerge: Boolean,
+    val rejectReason: String?,
+    val finalFrameWeightScale: Double
 )
 
 data class JobFileEntry(
@@ -450,7 +455,9 @@ private fun AlignmentSection(job: JSONObject?, detail: KeplerJobDetail) {
     InspectorSection("Alignment") {
         listOf(
             "alignmentStatus", "nativeRawMerge", "alignmentFile", "alignmentError",
-            "referenceFrameIndex", "referenceFrameReason"
+            "referenceFrameIndex", "referenceFrameReason", "nativeMergeVersion",
+            "acceptedFrameCount", "rejectedFrameCount", "ghostSuppressionEnabled",
+            "ghostRejectedSampleRatio", "referencePreservedPixelRatio", "mergeWarning"
         ).forEach { DetailField(it, job.value(it), it == "alignmentError" && job.value(it) != "none") }
 
         detail.alignment?.let { alignment ->
@@ -459,26 +466,41 @@ private fun AlignmentSection(job: JSONObject?, detail: KeplerJobDetail) {
             DetailField("downscale", alignment.value("downscale"))
             DetailField("searchRadius", alignment.value("searchRadius"))
             DetailField("referenceIndex", alignment.value("referenceIndex"))
+            DetailField("nativeMergeVersion", alignment.value("nativeMergeVersion"))
+            DetailField(
+                "accepted / rejected frames",
+                "${alignment.value("acceptedFrameCount")} / ${alignment.value("rejectedFrameCount")}"
+            )
+            DetailField("ghostRejectedSampleRatio", alignment.value("ghostRejectedSampleRatio"))
+            DetailField("referencePreservedPixelRatio", alignment.value("referencePreservedPixelRatio"))
+            DetailField("lowConfidenceFrameCount", alignment.value("lowConfidenceFrameCount"))
+            DetailField("searchBoundaryHitCount", alignment.value("searchBoundaryHitCount"))
+            DetailField("mergeWarning", alignment.value("mergeWarning"))
         }
         detail.alignmentFrames.forEach { frame ->
-            val lowConfidence = frame.confidence < 0.4
+            val warning = frame.confidence < 0.4 || !frame.acceptedForMerge
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(
-                        if (lowConfidence) Color(0xFF4B2527) else inspectorSurfaceAlt,
+                        if (warning) Color(0xFF4B2527) else inspectorSurfaceAlt,
                         RoundedCornerShape(10.dp)
                     )
                     .padding(9.dp)
             ) {
                 Text(
-                    "frame ${frame.index}${if (lowConfidence) " - LOW CONFIDENCE" else ""}",
-                    color = if (lowConfidence) inspectorWarning else Color.White
+                    "frame ${frame.index} - ${if (frame.acceptedForMerge) "ACCEPTED" else "REJECTED"}",
+                    color = if (warning) inspectorWarning else Color.White
                 )
                 Text(
                     "raw dx=${frame.rawDx}, dy=${frame.rawDy} | proxy dx=${frame.proxyDx}, dy=${frame.proxyDy} | confidence=${"%.3f".format(Locale.US, frame.confidence)}",
                     color = inspectorMuted
                 )
+                Text(
+                    "normalizedError=${"%.4f".format(Locale.US, frame.normalizedError)} | valid=${"%.3f".format(Locale.US, frame.validProxyFraction)} | weight=${"%.3f".format(Locale.US, frame.finalFrameWeightScale)}",
+                    color = inspectorMuted
+                )
+                frame.rejectReason?.let { Text("rejectReason=$it", color = inspectorWarning) }
             }
         }
         detail.alignmentJsonError?.let { Text(it, color = inspectorWarning) }
@@ -701,7 +723,17 @@ fun loadKeplerJobDetail(jobDir: File): KeplerJobDetail {
             proxyDy = frame.optInt("proxyDy", 0),
             rawDx = frame.optInt("rawDx", 0),
             rawDy = frame.optInt("rawDy", 0),
-            confidence = frame.optDouble("confidence", 0.0)
+            confidence = frame.optDouble("confidence", 0.0),
+            normalizedError = frame.optDouble("normalizedError", 0.0),
+            validProxyFraction = frame.optDouble("validProxyFraction", 1.0),
+            acceptedForMerge = if (frame.has("acceptedForMerge")) {
+                frame.optBoolean("acceptedForMerge", false)
+            } else {
+                true
+            },
+            rejectReason = frame.optString("rejectReason", "")
+                .takeIf { it.isNotBlank() && it != "null" },
+            finalFrameWeightScale = frame.optDouble("finalFrameWeightScale", 1.0)
         )
     }
     return KeplerJobDetail(
