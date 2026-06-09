@@ -317,15 +317,35 @@ struct WhiteBalanceGains {
     uint64_t sampleCount = 0;
 };
 
+constexpr float kPostprocessBlackLift = 0.008f;
+constexpr float kPostprocessGamma = 2.20f;
+constexpr float kPostprocessShoulderStrength = 0.16f;
+constexpr float kPostprocessExposureBiasStops = 0.0f;
+constexpr float kChromaDenoiseStrength = 0.18f;
+constexpr float kSharpenStrength = 0.22f;
+constexpr float kDarkSharpenSuppression = 0.70f;
+constexpr float kHighlightSharpenSuppression = 0.85f;
+constexpr float kWbGainMin = 0.6f;
+constexpr float kWbGainMax = 2.2f;
+
 uint8_t toneRawV02(float value, int whiteRange) {
-    constexpr float kBlackLift = 0.008f;
-    constexpr float kGamma = 2.20f;
-    constexpr float kShoulderStrength = 0.16f;
-    const float linear = std::clamp(value / std::max(1, whiteRange), 0.0f, 1.0f);
-    const float lifted = std::clamp(linear + kBlackLift * (1.0f - linear), 0.0f, 1.0f);
-    const float gammaMapped = std::pow(lifted, 1.0f / kGamma);
+    const float exposureScale = std::pow(2.0f, kPostprocessExposureBiasStops);
+    const float linear = std::clamp(
+        value * exposureScale / std::max(1, whiteRange),
+        0.0f,
+        1.0f
+    );
+    const float lifted = std::clamp(
+        linear + kPostprocessBlackLift * (1.0f - linear),
+        0.0f,
+        1.0f
+    );
+    const float gammaMapped = std::pow(lifted, 1.0f / kPostprocessGamma);
     const float shouldered = gammaMapped /
-        std::max(0.0001f, gammaMapped + kShoulderStrength * (1.0f - gammaMapped));
+        std::max(
+            0.0001f,
+            gammaMapped + kPostprocessShoulderStrength * (1.0f - gammaMapped)
+        );
     return static_cast<uint8_t>(std::clamp(std::lround(shouldered * 255.0f), 0L, 255L));
 }
 
@@ -359,16 +379,17 @@ bool writePostprocessMetadata(
            << "  \"wbSampleCount\": " << wb.sampleCount << ",\n"
            << "  \"wbFallback\": " << (wb.fallback ? "true" : "false") << ",\n"
            << "  \"toneMap\": \"filmic_shoulder_v0_2\",\n"
-           << "  \"blackLift\": 0.008,\n"
-           << "  \"gamma\": 2.20,\n"
-           << "  \"shoulderStrength\": 0.16,\n"
-           << "  \"exposureBias\": 0.0,\n"
+           << "  \"blackLift\": " << kPostprocessBlackLift << ",\n"
+           << "  \"gamma\": " << kPostprocessGamma << ",\n"
+           << "  \"shoulderStrength\": " << kPostprocessShoulderStrength << ",\n"
+           << "  \"exposureBias\": " << kPostprocessExposureBiasStops << ",\n"
            << "  \"chromaDenoise\": \"mild_chroma_v0_2\",\n"
-           << "  \"chromaDenoiseStrength\": 0.18,\n"
+           << "  \"chromaDenoiseStrength\": " << kChromaDenoiseStrength << ",\n"
            << "  \"sharpen\": \"adaptive_luma_unsharp_v0_2\",\n"
-           << "  \"sharpenStrength\": 0.22,\n"
-           << "  \"darkSharpenSuppression\": 0.70,\n"
-           << "  \"highlightSharpenSuppression\": 0.85,\n"
+           << "  \"sharpenStrength\": " << kSharpenStrength << ",\n"
+           << "  \"darkSharpenSuppression\": " << kDarkSharpenSuppression << ",\n"
+           << "  \"highlightSharpenSuppression\": "
+           << kHighlightSharpenSuppression << ",\n"
            << "  \"status\": \"OK\",\n"
            << "  \"outputPath\": \"" << outputPath << "\",\n"
            << "  \"outputName\": \"" << outputPath.substr(outputPath.find_last_of("/\\\\") + 1) << "\",\n"
@@ -753,9 +774,17 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
             const double meanR = sampleR / sampleCount;
             const double meanG = sampleG / sampleCount;
             const double meanB = sampleB / sampleCount;
-            wb.r = std::clamp(static_cast<float>(meanG / meanR), 0.6f, 2.2f);
+            wb.r = std::clamp(
+                static_cast<float>(meanG / meanR),
+                kWbGainMin,
+                kWbGainMax
+            );
             wb.g = 1.0f;
-            wb.b = std::clamp(static_cast<float>(meanG / meanB), 0.6f, 2.2f);
+            wb.b = std::clamp(
+                static_cast<float>(meanG / meanB),
+                kWbGainMin,
+                kWbGainMax
+            );
         } else {
             wb.fallback = true;
         }
@@ -779,8 +808,6 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
         std::ofstream output(rgbaOutputPath, std::ios::binary);
         if (!output) return env->NewStringUTF("ERROR: RGBA output open failed");
         std::vector<uint8_t> rgbaRow(static_cast<size_t>(outputWidth) * 4);
-        constexpr float kChromaDenoiseStrength = 0.18f;
-        constexpr float kSharpenStrength = 0.22f;
         for (int y = 0; y < outputHeight; ++y) {
             for (int x = 0; x < outputWidth; ++x) {
                 const size_t center = (static_cast<size_t>(y) * outputWidth + x) * 3;
@@ -813,8 +840,16 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
                     static_cast<float>(chromaRSum / 9.0) * kChromaDenoiseStrength;
                 const float denoisedChromaB = centerChromaB * (1.0f - kChromaDenoiseStrength) +
                     static_cast<float>(chromaBSum / 9.0) * kChromaDenoiseStrength;
-                const float darkFactor = std::clamp((centerLuma - 18.0f) / 72.0f, 0.30f, 1.0f);
-                const float highlightFactor = std::clamp((245.0f - centerLuma) / 45.0f, 0.15f, 1.0f);
+                const float darkFactor = std::clamp(
+                    (centerLuma - 18.0f) / 72.0f,
+                    1.0f - kDarkSharpenSuppression,
+                    1.0f
+                );
+                const float highlightFactor = std::clamp(
+                    (245.0f - centerLuma) / 45.0f,
+                    1.0f - kHighlightSharpenSuppression,
+                    1.0f
+                );
                 const float adaptiveStrength = kSharpenStrength * darkFactor * highlightFactor;
                 const float sharpenedLuma = std::clamp(
                     centerLuma + (centerLuma - localLuma) * adaptiveStrength,

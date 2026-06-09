@@ -234,7 +234,7 @@ private fun JobSummaryCard(job: KeplerJobSummary, onOpen: () -> Unit) {
                 "memory=${job.memoryRiskLevel} | nativePostprocess=${job.nativePostprocessUsed}",
                 color = if (job.memoryRiskLevel == "HIGH") inspectorWarning else Color.White.copy(alpha = 0.78f)
             )
-            Text("final=${job.finalOutputFileName ?: "none"}", color = inspectorMuted)
+            Text("output=${job.finalOutputFileName ?: "none"}", color = inspectorMuted)
         }
     }
 }
@@ -362,6 +362,21 @@ fun JobDetailScreen(jobDir: File, onBack: () -> Unit) {
         previewThumbnail?.let { bitmap ->
             item { ThumbnailCard("Preview", bitmap) }
         }
+        if (finalThumbnail == null && job.value("nativePostprocessRgbaFile") != "none") {
+            item {
+                InspectorSection("Primary output") {
+                    Text("24MP native output", color = Color.White)
+                    DetailField(
+                        "nativePostprocessRgbaFile",
+                        job.value("nativePostprocessRgbaFile")
+                    )
+                    Text(
+                        "Thumbnail skipped to avoid loading full native RGBA.",
+                        color = inspectorMuted
+                    )
+                }
+            }
+        }
 
         if (loaded != null) {
             item { SummarySection(jobDir, job) }
@@ -416,6 +431,7 @@ private fun SummarySection(jobDir: File, job: JSONObject?) {
         DetailField("processedAt", formatTimestamp(job.longValue("processedAt")))
         DetailField("exportedAt", formatTimestamp(job.longValue("exportedAt")))
         DetailField("finalOutputFormatSetting", job.value("finalOutputFormatSetting"))
+        DetailField("finalOutputSource", job.value("finalOutputSource"))
         DetailField("exportDisplayName", job.value("exportDisplayName"))
         DetailField("exportVerified", job.value("exportVerified"))
     }
@@ -444,7 +460,9 @@ private fun HighResolutionSection(job: JSONObject?) {
             "highResRawInputThresholdMp", "memoryRiskLevel", "estimatedRawFusionMemoryMb",
             "outputWidth", "outputHeight", "highResRawInputAvailable", "highResRawInputUsed",
             "native24RawAvailable", "native24RawUsed", "frameClampApplied", "frameClampReason",
-            "requestedFramesOriginal", "requestedFramesEffective", "highResRawFrameLimit"
+            "requestedFramesOriginal", "requestedFramesEffective", "highResRawFrameLimit",
+            "finalOutputSource", "nativeMp24DebugPngRequested", "nativeMp24DebugPngWritten",
+            "nativeMp24DebugPngSkipReason"
         ).forEach { key ->
             val warning = key == "nativePostprocessStatus" &&
                 job.value(key).contains("ERROR", ignoreCase = true)
@@ -548,7 +566,7 @@ private fun ExportSection(job: JSONObject?) {
             "exportStatus", "exportVerified", "exportUri", "exportDisplayName", "exportMimeType",
             "exportFormatRequested", "exportFormatUsed", "exportFallbackUsed", "exportFileSizeBytes",
             "exportBitmapSource", "nativeRgbaDirectExportUsed", "nativeRgbaBitmapLoadedForExport",
-            "finalPngDecodeSkippedForExport",
+            "finalPngDecodeSkippedForExport", "exportBitmapWidth", "exportBitmapHeight",
             "rawSidecarRequested", "rawSidecarExportStatus", "rawSidecarExportedFiles",
             "rawSidecarError"
         ).forEach { DetailField(it, job.value(it)) }
@@ -700,7 +718,12 @@ fun loadKeplerJobSummaries(context: Context): List<KeplerJobSummary> {
             partialCapture = job.booleanValue("partialCapture"),
             memoryRiskLevel = job.value("memoryRiskLevel"),
             nativePostprocessUsed = job.value("nativePostprocessUsed"),
-            finalOutputFileName = job.firstFileName("finalFile", "finalNightFusionFile", "averageColorFile"),
+            finalOutputFileName = job.firstFileName(
+                "finalFile",
+                "nativePostprocessRgbaFile",
+                "finalNightFusionFile",
+                "averageColorFile"
+            ),
             modifiedAt = dir.lastModified()
         )
     }.sortedByDescending { it.modifiedAt }

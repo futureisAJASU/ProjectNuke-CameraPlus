@@ -58,6 +58,7 @@ private const val MIN_RAW_FUSION_FRAMES = 2
 private const val HIGH_RES_RAW_MIN_PIXELS = 40_000_000L
 private const val HIGH_RES_RAW_FRAME_LIMIT = 4
 private const val TARGET_12MP_PIXELS = 12_000_000L
+private const val SAVE_NATIVE_MP24_DEBUG_PNG_DEFAULT = false
 
 data class RawSizeSelection(
     val size: Size,
@@ -584,6 +585,7 @@ fun captureRawBurstForFusion(
 fun processRawFusionJob(
     context: Context,
     jobDir: File,
+    saveNativeMp24DebugPng: Boolean = SAVE_NATIVE_MP24_DEBUG_PNG_DEFAULT,
     onStatus: (String) -> Unit
 ): RawFusionProcessResult {
     val jobFile = File(jobDir, "job.json")
@@ -813,12 +815,23 @@ fun processRawFusionJob(
                     "Native 24MP postprocess failed: $postprocessStatus"
                 )
             }
-            var nativeBitmap: Bitmap? = null
-            try {
-                nativeBitmap = loadRawRgbaBitmap(nativeRgbaFile, outputWidth, outputHeight)
-                saveRawFusionPng(nativeBitmap, finalFile)
-            } finally {
-                nativeBitmap?.takeUnless { it.isRecycled }?.recycle()
+            val nativeMp24DebugPngRequested = saveNativeMp24DebugPng
+            var nativeMp24DebugPngWritten = false
+            if (nativeMp24DebugPngRequested) {
+                var nativeBitmap: Bitmap? = null
+                try {
+                    onStatus("Processing RAW fusion: writing optional 24MP debug PNG...")
+                    nativeBitmap = loadRawRgbaBitmap(nativeRgbaFile, outputWidth, outputHeight)
+                    saveRawFusionPng(nativeBitmap, finalFile)
+                    nativeMp24DebugPngWritten = true
+                } finally {
+                    nativeBitmap?.takeUnless { it.isRecycled }?.recycle()
+                }
+            }
+            val nativeMp24DebugPngSkipReason = if (nativeMp24DebugPngWritten) {
+                null
+            } else {
+                "Disabled by default for high-resolution native MP24 output to avoid an extra 24MP Bitmap allocation."
             }
             val partialNote = if (partialCapture || frameInputs.size < requestedFrames) {
                 "Partial RAW fusion used ${frameInputs.size}/$requestedFrames requested frames."
@@ -836,7 +849,14 @@ fun processRawFusionJob(
                 .put("mergedRawFile", mergedRawFile.name)
                 .put("mergedDngFile", JSONObject.NULL)
                 .put("previewFile", JSONObject.NULL)
-                .put("finalFile", finalFile.name)
+                .put("finalFile", if (nativeMp24DebugPngWritten) finalFile.name else JSONObject.NULL)
+                .put("finalOutputSource", "native_rgba")
+                .put("nativeMp24DebugPngRequested", nativeMp24DebugPngRequested)
+                .put("nativeMp24DebugPngWritten", nativeMp24DebugPngWritten)
+                .put(
+                    "nativeMp24DebugPngSkipReason",
+                    nativeMp24DebugPngSkipReason ?: JSONObject.NULL
+                )
                 .put("usedFrameCount", frameInputs.size)
                 .put("requestedFrames", requestedFrames)
                 .put("savedFrames", savedFrames)
@@ -873,7 +893,7 @@ fun processRawFusionJob(
                 mergedRawFile = mergedRawFile,
                 mergedDngFile = null,
                 previewPngFile = null,
-                finalPngFile = finalFile,
+                finalPngFile = finalFile.takeIf { nativeMp24DebugPngWritten },
                 errorMessage = null,
                 nativeRgbaFile = nativeRgbaFile,
                 nativeRgbaWidth = outputWidth,
@@ -947,6 +967,7 @@ fun processRawFusionJob(
             .put("mergedDngFile", JSONObject.NULL)
             .put("previewFile", previewFile.name)
             .put("finalFile", finalFile.name)
+            .put("finalOutputSource", "final_png")
             .put("outputFallbackReason", outputFallbackReason ?: JSONObject.NULL)
             .put("fullSizeKotlinDemosaicUsed", !highResolutionRaw)
             .put("nativePostprocessRequired", false)
@@ -1027,8 +1048,16 @@ private fun applyNativePostprocessMetadata(
         "wbGainB",
         "wbSampleCount",
         "toneMap",
+        "blackLift",
+        "gamma",
+        "shoulderStrength",
+        "exposureBias",
         "chromaDenoise",
+        "chromaDenoiseStrength",
         "sharpen",
+        "sharpenStrength",
+        "darkSharpenSuppression",
+        "highlightSharpenSuppression",
         "outputFormat"
     ).forEach { key ->
         metadata.opt(key)?.takeUnless { it == JSONObject.NULL }?.let { target.put(key, it) }
@@ -1041,7 +1070,9 @@ private fun updateRawExportBitmapMetadata(
     source: String,
     nativeRgbaDirectExportUsed: Boolean,
     nativeRgbaBitmapLoadedForExport: Boolean,
-    finalPngDecodeSkippedForExport: Boolean
+    finalPngDecodeSkippedForExport: Boolean,
+    exportBitmapWidth: Int,
+    exportBitmapHeight: Int
 ) {
     val jobFile = File(jobDir, "job.json")
     val job = if (jobFile.exists()) JSONObject(jobFile.readText()) else JSONObject()
@@ -1049,7 +1080,55 @@ private fun updateRawExportBitmapMetadata(
         .put("nativeRgbaDirectExportUsed", nativeRgbaDirectExportUsed)
         .put("nativeRgbaBitmapLoadedForExport", nativeRgbaBitmapLoadedForExport)
         .put("finalPngDecodeSkippedForExport", finalPngDecodeSkippedForExport)
+        .put("exportBitmapWidth", exportBitmapWidth)
+        .put("exportBitmapHeight", exportBitmapHeight)
     jobFile.writeText(job.toString(2))
+}
+
+private data class RawFusionExportBitmap(
+    val bitmap: Bitmap,
+    val source: String,
+    val nativeRgbaDirect: Boolean
+)
+
+private fun RawFusionProcessResult.validNativeRgbaFile(): File? {
+    val file = nativeRgbaFile ?: return null
+    if (nativeRgbaWidth <= 0 || nativeRgbaHeight <= 0 || !file.exists()) return null
+    val expectedBytes = nativeRgbaWidth.toLong() * nativeRgbaHeight.toLong() * 4L
+    return file.takeIf { it.length() == expectedBytes }
+}
+
+private fun RawFusionProcessResult.hasExportableBitmapSource(): Boolean {
+    return validNativeRgbaFile() != null || finalPngFile?.let { it.exists() && it.length() > 0L } == true
+}
+
+private fun RawFusionProcessResult.loadExportBitmap(): RawFusionExportBitmap {
+    val rgbaFile = validNativeRgbaFile()
+    if (rgbaFile != null) {
+        try {
+            return RawFusionExportBitmap(
+                bitmap = loadRawRgbaBitmap(rgbaFile, nativeRgbaWidth, nativeRgbaHeight),
+                source = "native_rgba_direct",
+                nativeRgbaDirect = true
+            )
+        } catch (oom: OutOfMemoryError) {
+            throw oom
+        } catch (nativeError: Exception) {
+            val png = finalPngFile?.takeIf { it.exists() && it.length() > 0L }
+                ?: throw IllegalStateException(
+                    "Native RGBA bitmap load failed and no final PNG fallback exists",
+                    nativeError
+                )
+            val bitmap = BitmapFactory.decodeFile(png.absolutePath)
+                ?: throw IllegalStateException("Final RAW fusion PNG fallback decode failed", nativeError)
+            return RawFusionExportBitmap(bitmap, "final_png_decode", false)
+        }
+    }
+    val png = finalPngFile?.takeIf { it.exists() && it.length() > 0L }
+        ?: error("No exportable RAW fusion bitmap source")
+    val bitmap = BitmapFactory.decodeFile(png.absolutePath)
+        ?: error("Final RAW fusion PNG decode failed")
+    return RawFusionExportBitmap(bitmap, "final_png_decode", false)
 }
 
 fun captureProcessExportRawNightFusion(
@@ -1080,8 +1159,12 @@ fun captureProcessExportRawNightFusion(
             val thread = HandlerThread("KeplerRawFusionPipelineThread").apply { start() }
             Handler(thread.looper).post {
                 try {
-                    val process = processRawFusionJob(context, jobDir) { post(it) }
-                    if (!process.success || process.finalPngFile == null) {
+                    val process = processRawFusionJob(
+                        context = context,
+                        jobDir = jobDir,
+                        saveNativeMp24DebugPng = finalOutputFormat.isDebugPng
+                    ) { post(it) }
+                    if (!process.success || !process.hasExportableBitmapSource()) {
                         updateExportFailure(
                             jobDir = jobDir,
                             error = process.errorMessage ?: "RAW fusion process failed",
@@ -1097,48 +1180,22 @@ fun captureProcessExportRawNightFusion(
                     val partialCapture = processedJob.optBoolean("partialCapture", usedFrameCount < requestedFrames)
                     val requestedOutputFormat = requestedOutputFormatForSetting(finalOutputFormat)
                     post("Exporting ${requestedOutputFormat.label}...")
-                    val nativeRgbaFile = process.nativeRgbaFile
-                    val useNativeRgba = nativeRgbaFile != null &&
-                        nativeRgbaFile.exists() &&
-                        process.nativeRgbaWidth > 0 &&
-                        process.nativeRgbaHeight > 0 &&
-                        nativeRgbaFile.length() ==
-                        process.nativeRgbaWidth.toLong() * process.nativeRgbaHeight.toLong() * 4L
-                    val exportBitmapSource = if (useNativeRgba) {
-                        "native_rgba_direct"
-                    } else {
-                        "final_png_decode"
-                    }
-                    updateRawExportBitmapMetadata(
-                        jobDir = jobDir,
-                        source = exportBitmapSource,
-                        nativeRgbaDirectExportUsed = false,
-                        nativeRgbaBitmapLoadedForExport = false,
-                        finalPngDecodeSkippedForExport = false
-                    )
                     var exportBitmap: Bitmap? = null
                     val result = try {
-                        val bitmap = if (useNativeRgba) {
-                            loadRawRgbaBitmap(
-                                nativeRgbaFile!!,
-                                process.nativeRgbaWidth,
-                                process.nativeRgbaHeight
-                            )
-                        } else {
-                            BitmapFactory.decodeFile(process.finalPngFile.absolutePath)
-                                ?: error("Final RAW fusion PNG decode failed")
-                        }
-                        exportBitmap = bitmap
+                        val loaded = process.loadExportBitmap()
+                        exportBitmap = loaded.bitmap
                         updateRawExportBitmapMetadata(
                             jobDir = jobDir,
-                            source = exportBitmapSource,
-                            nativeRgbaDirectExportUsed = useNativeRgba,
-                            nativeRgbaBitmapLoadedForExport = useNativeRgba,
-                            finalPngDecodeSkippedForExport = useNativeRgba
+                            source = loaded.source,
+                            nativeRgbaDirectExportUsed = loaded.nativeRgbaDirect,
+                            nativeRgbaBitmapLoadedForExport = loaded.nativeRgbaDirect,
+                            finalPngDecodeSkippedForExport = loaded.nativeRgbaDirect,
+                            exportBitmapWidth = loaded.bitmap.width,
+                            exportBitmapHeight = loaded.bitmap.height
                         )
                         exportNightFusionBitmapToGallery(
                             context = context,
-                            bitmap = bitmap,
+                            bitmap = loaded.bitmap,
                             displayNameBase = "Kepler_RAW_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}",
                             requestedFormat = requestedOutputFormat
                         )
@@ -1202,6 +1259,13 @@ fun captureProcessExportRawNightFusion(
                     }
                     post("PIPELINE_FAILED: RAW export ran out of memory; keeping RAW cache.")
                 } catch (e: Exception) {
+                    runCatching {
+                        updateExportFailure(
+                            jobDir = jobDir,
+                            error = "${e.javaClass.simpleName}: ${e.message}",
+                            finalOutputFormat = finalOutputFormat
+                        )
+                    }
                     post("PIPELINE_FAILED: RAW Night Fusion pipeline failed; keeping RAW cache.\n${e.stackTraceToString()}")
                 } finally {
                     thread.quitSafely()
