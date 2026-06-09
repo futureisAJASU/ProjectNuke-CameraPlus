@@ -703,7 +703,21 @@ fun processRawFusionJob(
             onStatus("Processing RAW fusion: native Bayer merge complete")
         } else {
             if (highResolutionRaw) {
-                error("Native RAW merge required for 50MP-class high-resolution input; Kotlin fallback disabled for memory safety. $nativeStatus")
+                job.put("processStatus", "NATIVE_MERGE_FAILED_KEEPING_CACHE")
+                    .put("nativeRawMerge", false)
+                    .put("alignmentStatus", "NATIVE_TILE_MERGE_FAILED")
+                    .put("alignmentError", nativeStatus)
+                    .put("processedAt", System.currentTimeMillis())
+                jobFile.writeText(job.toString(2))
+                onStatus("RAW fusion native tile merge failed. RAW cache kept.")
+                return RawFusionProcessResult(
+                    success = false,
+                    mergedRawFile = null,
+                    mergedDngFile = null,
+                    previewPngFile = null,
+                    finalPngFile = null,
+                    errorMessage = "Native RAW merge required for 50MP-class high-resolution input; Kotlin fallback disabled. $nativeStatus"
+                )
             }
             onStatus("Processing RAW fusion: native failed, falling back to Kotlin merge")
             val acc = FloatArray(pixelCount)
@@ -745,7 +759,15 @@ fun processRawFusionJob(
             .takeIf { it.isNotBlank() && it != "null" }
         val nativeAlignmentStatus = when {
             !nativeMergedOk -> "FAILED_FALLBACK_KOTLIN_NO_ALIGNMENT"
-            nativeMergeWarning == "REFERENCE_ONLY_MERGE" -> "NATIVE_REFERENCE_ONLY_MERGE_WARNING"
+            nativeMergeWarning == "REFERENCE_ONLY_MERGE" &&
+                nativeAlignmentMetadata?.optString("nativeMergeVersion") ==
+                "NATIVE_RAW_FUSION_V0_3_TILE_CONFIDENCE_GHOST" ->
+                "NATIVE_TILE_REFERENCE_ONLY_MERGE_WARNING"
+            nativeMergeWarning == "REFERENCE_ONLY_MERGE" ->
+                "NATIVE_REFERENCE_ONLY_MERGE_WARNING"
+            nativeAlignmentMetadata?.optString("nativeMergeVersion") ==
+                "NATIVE_RAW_FUSION_V0_3_TILE_CONFIDENCE_GHOST" ->
+                "NATIVE_TILE_GHOST_SUPPRESSION_COMPLETE"
             nativeAlignmentMetadata?.optString("nativeMergeVersion") ==
                 "NATIVE_RAW_FUSION_V0_2_CONFIDENCE_GHOST" ->
                 "NATIVE_GLOBAL_SHIFT_GHOST_SUPPRESSION_COMPLETE"
@@ -1023,6 +1045,25 @@ private fun applyNativeMergeMetadata(
     if (alignment == null || !alignment.has("nativeMergeVersion")) return target
     return target
         .put("nativeMergeVersion", alignment.optString("nativeMergeVersion"))
+        .put("tileBasedMerge", alignment.optBoolean("tileBasedMerge", false))
+        .put("tileRows", alignment.optInt("tileRows", 0))
+        .put("tileCount", alignment.optInt("tileCount", 0))
+        .put(
+            "fullFrameAccumulatorsUsed",
+            alignment.optBoolean("fullFrameAccumulatorsUsed", true)
+        )
+        .put(
+            "fullFrameMergedBufferUsed",
+            alignment.optBoolean("fullFrameMergedBufferUsed", true)
+        )
+        .put(
+            "estimatedTileMergeWorkingSetBytes",
+            alignment.optLong("estimatedTileMergeWorkingSetBytes", 0L)
+        )
+        .put(
+            "estimatedTileMergeWorkingSetMb",
+            alignment.optDouble("estimatedTileMergeWorkingSetMb", 0.0)
+        )
         .put("acceptedFrameCount", alignment.optInt("acceptedFrameCount", 0))
         .put("rejectedFrameCount", alignment.optInt("rejectedFrameCount", 0))
         .put("ghostSuppressionEnabled", alignment.optBoolean("ghostSuppressionEnabled", false))

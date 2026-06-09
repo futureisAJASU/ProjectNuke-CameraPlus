@@ -478,7 +478,9 @@ private fun AlignmentSection(job: JSONObject?, detail: KeplerJobDetail) {
             "alignmentStatus", "nativeRawMerge", "alignmentFile", "alignmentError",
             "referenceFrameIndex", "referenceFrameReason", "nativeMergeVersion",
             "acceptedFrameCount", "rejectedFrameCount", "ghostSuppressionEnabled",
-            "ghostRejectedSampleRatio", "referencePreservedPixelRatio", "mergeWarning"
+            "ghostRejectedSampleRatio", "referencePreservedPixelRatio", "mergeWarning",
+            "tileBasedMerge", "tileRows", "tileCount", "estimatedTileMergeWorkingSetMb",
+            "fullFrameAccumulatorsUsed", "fullFrameMergedBufferUsed"
         ).forEach { DetailField(it, job.value(it), it == "alignmentError" && job.value(it) != "none") }
 
         detail.alignment?.let { alignment ->
@@ -488,6 +490,21 @@ private fun AlignmentSection(job: JSONObject?, detail: KeplerJobDetail) {
             DetailField("searchRadius", alignment.value("searchRadius"))
             DetailField("referenceIndex", alignment.value("referenceIndex"))
             DetailField("nativeMergeVersion", alignment.value("nativeMergeVersion"))
+            DetailField("tileBasedMerge", alignment.value("tileBasedMerge"))
+            DetailField("tileRows", alignment.value("tileRows"))
+            DetailField("tileCount", alignment.value("tileCount"))
+            DetailField(
+                "estimatedTileMergeWorkingSetMb",
+                alignment.value("estimatedTileMergeWorkingSetMb")
+            )
+            DetailField(
+                "fullFrameAccumulatorsUsed",
+                alignment.value("fullFrameAccumulatorsUsed")
+            )
+            DetailField(
+                "fullFrameMergedBufferUsed",
+                alignment.value("fullFrameMergedBufferUsed")
+            )
             DetailField(
                 "accepted / rejected frames",
                 "${alignment.value("acceptedFrameCount")} / ${alignment.value("rejectedFrameCount")}"

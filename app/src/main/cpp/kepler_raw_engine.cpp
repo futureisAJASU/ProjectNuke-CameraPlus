@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -40,8 +41,18 @@ struct MergeStats {
     uint64_t downweightedGhostSamples = 0;
     uint64_t referencePreservedPixelCount = 0;
     uint64_t totalOutputPixels = 0;
+    bool tileBasedMerge = true;
+    int tileRows = 0;
+    int tileCount = 0;
+    bool fullFrameAccumulatorsUsed = false;
+    bool fullFrameMergedBufferUsed = false;
+    uint64_t estimatedTileMergeWorkingSetBytes = 0;
     std::string mergeWarning;
 };
+
+constexpr int kMergeTileRows = 512;
+constexpr int kMergeTileRowsHighRes = 256;
+constexpr int64_t kHighResRawMinPixels = 40000000LL;
 
 std::string getString(JNIEnv* env, jstring value) {
     const char* chars = env->GetStringUTFChars(value, nullptr);
@@ -114,6 +125,317 @@ bool writeRaw16(const std::string& path, const std::vector<uint16_t>& raw, std::
         offset += count;
     }
     return output.good();
+}
+
+bool validateRaw16Stream(
+    std::ifstream& input,
+    const std::string& path,
+    int width,
+    int height,
+    std::string& error
+) {
+    input.open(path, std::ios::binary | std::ios::ate);
+    if (!input) {
+        error = "open failed: " + path;
+        return false;
+    }
+    const int64_t expectedBytes = static_cast<int64_t>(width) * height * 2;
+    const auto size = input.tellg();
+    if (size < expectedBytes) {
+        error = "raw16 too small: " + path;
+        return false;
+    }
+    input.seekg(0, std::ios::beg);
+    return true;
+}
+
+bool readRaw16Rows(
+    std::ifstream& input,
+    const std::string& path,
+    int width,
+    int height,
+    int startY,
+    int rowCount,
+    std::vector<uint16_t>& out,
+    std::vector<uint8_t>& ioBytes,
+    std::string& error
+) {
+    if (startY < 0 || rowCount < 0 || startY + rowCount > height) {
+        error = "invalid raw16 row range: " + path;
+        return false;
+    }
+    const size_t pixelCount = static_cast<size_t>(width) * rowCount;
+    const size_t byteCount = pixelCount * 2;
+    out.resize(pixelCount);
+    ioBytes.resize(byteCount);
+    input.clear();
+    input.seekg(static_cast<std::streamoff>(startY) * width * 2, std::ios::beg);
+    if (!input) {
+        error = "raw16 seek failed: " + path;
+        return false;
+    }
+    input.read(
+        reinterpret_cast<char*>(ioBytes.data()),
+        static_cast<std::streamsize>(byteCount)
+    );
+    if (input.gcount() != static_cast<std::streamsize>(byteCount)) {
+        error = "raw16 row short read: " + path;
+        return false;
+    }
+    for (size_t i = 0, b = 0; i < pixelCount; ++i, b += 2) {
+        out[i] = static_cast<uint16_t>(
+            static_cast<uint16_t>(ioBytes[b]) |
+            (static_cast<uint16_t>(ioBytes[b + 1]) << 8)
+        );
+    }
+    return true;
+}
+
+bool writeRaw16Tile(
+    std::ofstream& output,
+    const std::vector<uint16_t>& values,
+    std::vector<uint8_t>& ioBytes,
+    std::string& error
+) {
+    ioBytes.resize(values.size() * 2);
+    for (size_t i = 0, b = 0; i < values.size(); ++i) {
+        const uint16_t value = values[i];
+        ioBytes[b++] = static_cast<uint8_t>(value & 0xFF);
+        ioBytes[b++] = static_cast<uint8_t>((value >> 8) & 0xFF);
+    }
+    output.write(
+        reinterpret_cast<const char*>(ioBytes.data()),
+        static_cast<std::streamsize>(ioBytes.size())
+    );
+    if (!output.good()) {
+        error = "merged raw16 tile write failed";
+        return false;
+    }
+    return true;
+}
+
+bool mergeRaw16Tiles(
+    const std::vector<std::string>& paths,
+    const std::vector<float>& exposureScales,
+    const std::vector<Alignment>& alignments,
+    int width,
+    int height,
+    int blackLevel,
+    int whiteLevel,
+    int referenceIndex,
+    const std::string& mergedPath,
+    MergeStats& stats,
+    std::string& error
+) {
+    const int frameCount = static_cast<int>(paths.size());
+    std::vector<std::ifstream> streams(static_cast<size_t>(frameCount));
+    for (int i = 0; i < frameCount; ++i) {
+        if (!validateRaw16Stream(streams[i], paths[i], width, height, error)) {
+            return false;
+        }
+    }
+
+    const int64_t pixels = static_cast<int64_t>(width) * height;
+    const int tileRows = pixels >= kHighResRawMinPixels
+        ? kMergeTileRowsHighRes
+        : kMergeTileRows;
+    const int tileCount = (height + tileRows - 1) / tileRows;
+    const size_t maxTilePixels =
+        static_cast<size_t>(width) * std::min(tileRows, height);
+    // reference ushort + acc/weight floats + source ushort + little-endian I/O bytes.
+    constexpr uint64_t kBytesPerTilePixel = 2 + 4 + 4 + 2 + 2;
+    stats.tileRows = tileRows;
+    stats.tileCount = tileCount;
+    stats.estimatedTileMergeWorkingSetBytes =
+        static_cast<uint64_t>(maxTilePixels) * kBytesPerTilePixel;
+
+    const std::string tempPath = mergedPath + ".tmp";
+    std::remove(tempPath.c_str());
+    struct TempFileCleanup {
+        const std::string& path;
+        ~TempFileCleanup() {
+            std::remove(path.c_str());
+        }
+    } tempCleanup{tempPath};
+    std::ofstream output(tempPath, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        error = "temporary merged raw16 open failed: " + tempPath;
+        return false;
+    }
+    auto fail = [&](const std::string& message) {
+        error = message;
+        output.close();
+        std::remove(tempPath.c_str());
+        return false;
+    };
+
+    std::vector<uint16_t> referenceTile;
+    std::vector<uint16_t> sourceRows;
+    std::vector<float> accTile;
+    std::vector<float> weightTile;
+    std::vector<uint8_t> ioBytes;
+    referenceTile.reserve(maxTilePixels);
+    sourceRows.reserve(maxTilePixels);
+    accTile.reserve(maxTilePixels);
+    weightTile.reserve(maxTilePixels);
+    ioBytes.reserve(maxTilePixels * 2);
+
+    const int maxOut = std::max(1, whiteLevel - blackLevel);
+    const float referenceWeight =
+        std::max(1.0f, alignments[referenceIndex].finalFrameWeightScale);
+    constexpr float kBaseNoise = 64.0f;
+    constexpr float kRelativeNoise = 0.12f;
+    constexpr float kHardRejectMultiplier = 2.5f;
+    constexpr float kModerateMinWeightScale = 0.15f;
+    constexpr float kHighlightStart = 0.85f;
+    constexpr float kHighlightAllowanceScale = 0.35f;
+
+    for (int tileY0 = 0; tileY0 < height; tileY0 += tileRows) {
+        const int tileY1 = std::min(height, tileY0 + tileRows);
+        const int tileHeight = tileY1 - tileY0;
+        const size_t tilePixels = static_cast<size_t>(width) * tileHeight;
+        if (!readRaw16Rows(
+                streams[referenceIndex],
+                paths[referenceIndex],
+                width,
+                height,
+                tileY0,
+                tileHeight,
+                sourceRows,
+                ioBytes,
+                error
+            )) {
+            return fail(error);
+        }
+        referenceTile.resize(tilePixels);
+        accTile.resize(tilePixels);
+        weightTile.resize(tilePixels);
+        for (size_t p = 0; p < tilePixels; ++p) {
+            const int corrected =
+                std::max(0, static_cast<int>(sourceRows[p]) - blackLevel);
+            const int normalized = static_cast<int>(
+                std::lround(corrected * exposureScales[referenceIndex])
+            );
+            const uint16_t reference = static_cast<uint16_t>(
+                std::clamp(normalized, 0, maxOut)
+            );
+            referenceTile[p] = reference;
+            accTile[p] = static_cast<float>(reference) * referenceWeight;
+            weightTile[p] = referenceWeight;
+        }
+
+        for (int i = 0; i < frameCount; ++i) {
+            if (i == referenceIndex || !alignments[i].acceptedForMerge) continue;
+            const auto& alignment = alignments[i];
+            const float frameWeight = alignment.finalFrameWeightScale;
+            if (frameWeight <= 0.0f) continue;
+            const int sourceY0 = std::max(0, tileY0 + alignment.rawDy);
+            const int sourceY1 = std::min(height, tileY1 + alignment.rawDy);
+            if (sourceY1 <= sourceY0) continue;
+            if (!readRaw16Rows(
+                    streams[i],
+                    paths[i],
+                    width,
+                    height,
+                    sourceY0,
+                    sourceY1 - sourceY0,
+                    sourceRows,
+                    ioBytes,
+                    error
+                )) {
+                return fail(error);
+            }
+            for (int y = tileY0; y < tileY1; ++y) {
+                const int sy = y + alignment.rawDy;
+                if (sy < sourceY0 || sy >= sourceY1) continue;
+                const size_t tileRow = static_cast<size_t>(y - tileY0) * width;
+                const size_t sourceRow = static_cast<size_t>(sy - sourceY0) * width;
+                for (int x = 0; x < width; ++x) {
+                    const int sx = x + alignment.rawDx;
+                    if (sx < 0 || sx >= width) continue;
+                    const size_t p = tileRow + x;
+                    const int corrected = std::max(
+                        0,
+                        static_cast<int>(sourceRows[sourceRow + sx]) - blackLevel
+                    );
+                    const float normalized = std::clamp(
+                        corrected * exposureScales[i],
+                        0.0f,
+                        static_cast<float>(maxOut)
+                    );
+                    const float reference = static_cast<float>(referenceTile[p]);
+                    const float signal = std::max(reference, normalized);
+                    const float highlightAllowance = signal > maxOut * kHighlightStart
+                        ? (signal - maxOut * kHighlightStart) *
+                            kHighlightAllowanceScale
+                        : 0.0f;
+                    const float threshold =
+                        kBaseNoise + kRelativeNoise * signal + highlightAllowance;
+                    const float difference = std::abs(normalized - reference);
+                    ++stats.totalCandidateSamples;
+                    if (difference <= threshold) {
+                        accTile[p] += normalized * frameWeight;
+                        weightTile[p] += frameWeight;
+                    } else if (difference <= threshold * kHardRejectMultiplier) {
+                        const float transition = (difference - threshold) /
+                            std::max(
+                                1.0f,
+                                threshold * (kHardRejectMultiplier - 1.0f)
+                            );
+                        const float ghostScale = std::max(
+                            kModerateMinWeightScale,
+                            0.5f * (1.0f - transition)
+                        );
+                        accTile[p] += normalized * frameWeight * ghostScale;
+                        weightTile[p] += frameWeight * ghostScale;
+                        ++stats.downweightedGhostSamples;
+                    } else {
+                        ++stats.rejectedGhostSamples;
+                    }
+                }
+            }
+        }
+
+        for (size_t p = 0; p < tilePixels; ++p) {
+            if (weightTile[p] <= referenceWeight + 0.0001f) {
+                ++stats.referencePreservedPixelCount;
+            } else {
+                const int value = static_cast<int>(
+                    std::lround(accTile[p] / weightTile[p])
+                );
+                referenceTile[p] = static_cast<uint16_t>(
+                    std::clamp(value, 0, maxOut)
+                );
+            }
+        }
+        if (!writeRaw16Tile(output, referenceTile, ioBytes, error)) {
+            return fail(error);
+        }
+    }
+
+    output.close();
+    if (!output.good()) return fail("temporary merged raw16 close failed");
+    std::ifstream verify(tempPath, std::ios::binary | std::ios::ate);
+    const int64_t expectedBytes = pixels * 2;
+    if (!verify || verify.tellg() != expectedBytes) {
+        verify.close();
+        return fail("temporary merged raw16 size verification failed");
+    }
+    verify.close();
+    if (std::rename(tempPath.c_str(), mergedPath.c_str()) != 0) {
+        std::remove(mergedPath.c_str());
+        if (std::rename(tempPath.c_str(), mergedPath.c_str()) != 0) {
+            return fail("merged raw16 rename failed");
+        }
+    }
+    std::ifstream finalVerify(mergedPath, std::ios::binary | std::ios::ate);
+    if (!finalVerify || finalVerify.tellg() != expectedBytes) {
+        error = "merged raw16 final size verification failed";
+        finalVerify.close();
+        std::remove(mergedPath.c_str());
+        return false;
+    }
+    return true;
 }
 
 std::vector<float> buildLumaProxy(
@@ -245,10 +567,22 @@ bool writeAlignmentJson(
         ? static_cast<double>(stats.referencePreservedPixelCount) /
             stats.totalOutputPixels
         : 0.0;
-    output << "  \"type\": \"NATIVE_GLOBAL_SHIFT_V0_2\",\n";
-    output << "  \"nativeMergeVersion\": \"NATIVE_RAW_FUSION_V0_2_CONFIDENCE_GHOST\",\n";
+    output << "  \"type\": \"NATIVE_GLOBAL_SHIFT_TILE_V0_3\",\n";
+    output << "  \"nativeMergeVersion\": \"NATIVE_RAW_FUSION_V0_3_TILE_CONFIDENCE_GHOST\",\n";
     output << "  \"ghostSuppressionEnabled\": true,\n";
     output << "  \"frameRejectEnabled\": true,\n";
+    output << "  \"tileBasedMerge\": " << (stats.tileBasedMerge ? "true" : "false") << ",\n";
+    output << "  \"tileRows\": " << stats.tileRows << ",\n";
+    output << "  \"tileCount\": " << stats.tileCount << ",\n";
+    output << "  \"fullFrameAccumulatorsUsed\": "
+           << (stats.fullFrameAccumulatorsUsed ? "true" : "false") << ",\n";
+    output << "  \"fullFrameMergedBufferUsed\": "
+           << (stats.fullFrameMergedBufferUsed ? "true" : "false") << ",\n";
+    output << "  \"estimatedTileMergeWorkingSetBytes\": "
+           << stats.estimatedTileMergeWorkingSetBytes << ",\n";
+    output << "  \"estimatedTileMergeWorkingSetMb\": "
+           << static_cast<double>(stats.estimatedTileMergeWorkingSetBytes) /
+                (1024.0 * 1024.0) << ",\n";
     output << "  \"downscale\": " << downscale << ",\n";
     output << "  \"searchRadius\": " << searchRadius << ",\n";
     output << "  \"referenceIndex\": " << referenceIndex << ",\n";
@@ -500,102 +834,26 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_alignAndMergeRaw16(
         if (mergeStats.acceptedFrameCount == 1) {
             mergeStats.mergeWarning = "REFERENCE_ONLY_MERGE";
         }
-        proxies.clear();
-
-        const int maxOut = std::max(1, static_cast<int>(whiteLevel) - static_cast<int>(blackLevel));
-        std::vector<uint16_t> merged(pixels, 0);
-        if (!readRaw16(paths[referenceIndex], width, height, raw, error)) {
-            return env->NewStringUTF(("ERROR: " + error).c_str());
-        }
-        for (size_t p = 0; p < pixels; ++p) {
-            const int corrected = std::max(0, static_cast<int>(raw[p]) - static_cast<int>(blackLevel));
-            const int normalized = static_cast<int>(std::lround(corrected * exposureScales[referenceIndex]));
-            merged[p] = static_cast<uint16_t>(std::clamp(normalized, 0, maxOut));
-        }
-
-        std::vector<float> acc(pixels, 0.0f);
-        std::vector<float> weightAcc(pixels, 0.0f);
-        const float referenceWeight = std::max(1.0f, alignments[referenceIndex].finalFrameWeightScale);
-        for (size_t p = 0; p < pixels; ++p) {
-            acc[p] = static_cast<float>(merged[p]) * referenceWeight;
-            weightAcc[p] = referenceWeight;
-        }
-
-        // Conservative Bayer-domain rejection constants, in black-level-subtracted RAW levels.
-        constexpr float kBaseNoise = 64.0f;
-        constexpr float kRelativeNoise = 0.12f;
-        constexpr float kHardRejectMultiplier = 2.5f;
-        constexpr float kModerateMinWeightScale = 0.15f;
-        constexpr float kHighlightStart = 0.85f;
-        constexpr float kHighlightAllowanceScale = 0.35f;
-        for (int i = 0; i < frameCount; ++i) {
-            if (i == referenceIndex || !alignments[i].acceptedForMerge) continue;
-            if (!readRaw16(paths[i], width, height, raw, error)) {
-                return env->NewStringUTF(("ERROR: " + error).c_str());
-            }
-            const auto& a = alignments[i];
-            const float weight = a.finalFrameWeightScale;
-            if (weight <= 0.0f) continue;
-            for (int y = 0; y < height; ++y) {
-                const int sy = y + a.rawDy;
-                if (sy < 0 || sy >= height) continue;
-                const size_t outRow = static_cast<size_t>(y) * width;
-                const size_t inRow = static_cast<size_t>(sy) * width;
-                for (int x = 0; x < width; ++x) {
-                    const int sx = x + a.rawDx;
-                    if (sx < 0 || sx >= width) continue;
-                    const size_t p = outRow + x;
-                    const int corrected = std::max(
-                        0,
-                        static_cast<int>(raw[inRow + sx]) - static_cast<int>(blackLevel)
-                    );
-                    const float normalized = std::clamp(
-                        corrected * exposureScales[i],
-                        0.0f,
-                        static_cast<float>(maxOut)
-                    );
-                    const float reference = static_cast<float>(merged[p]);
-                    const float signal = std::max(reference, normalized);
-                    const float highlightAllowance = signal > maxOut * kHighlightStart
-                        ? (signal - maxOut * kHighlightStart) * kHighlightAllowanceScale
-                        : 0.0f;
-                    const float threshold =
-                        kBaseNoise + kRelativeNoise * signal + highlightAllowance;
-                    const float difference = std::abs(normalized - reference);
-                    ++mergeStats.totalCandidateSamples;
-                    if (difference <= threshold) {
-                        acc[p] += normalized * weight;
-                        weightAcc[p] += weight;
-                    } else if (difference <= threshold * kHardRejectMultiplier) {
-                        const float transition = (difference - threshold) /
-                            std::max(1.0f, threshold * (kHardRejectMultiplier - 1.0f));
-                        const float ghostScale = std::max(
-                            kModerateMinWeightScale,
-                            0.5f * (1.0f - transition)
-                        );
-                        acc[p] += normalized * weight * ghostScale;
-                        weightAcc[p] += weight * ghostScale;
-                        ++mergeStats.downweightedGhostSamples;
-                    } else {
-                        ++mergeStats.rejectedGhostSamples;
-                    }
-                }
-            }
-        }
-
-        for (size_t p = 0; p < pixels; ++p) {
-            // Reference plus one surviving candidate is the minimum two-sample average.
-            if (weightAcc[p] <= referenceWeight + 0.0001f) {
-                ++mergeStats.referencePreservedPixelCount;
-            } else {
-                const int v = static_cast<int>(std::lround(acc[p] / weightAcc[p]));
-                merged[p] = static_cast<uint16_t>(std::clamp(v, 0, maxOut));
-            }
-        }
+        std::vector<std::vector<float>>().swap(proxies);
+        std::vector<uint16_t>().swap(raw);
 
         const std::string mergedPath = getString(env, outputMergedRawPath);
         const std::string alignmentPath = getString(env, outputAlignmentJsonPath);
-        if (!writeRaw16(mergedPath, merged, error)) return env->NewStringUTF(("ERROR: " + error).c_str());
+        if (!mergeRaw16Tiles(
+                paths,
+                exposureScales,
+                alignments,
+                width,
+                height,
+                blackLevel,
+                whiteLevel,
+                referenceIndex,
+                mergedPath,
+                mergeStats,
+                error
+            )) {
+            return env->NewStringUTF(("ERROR: " + error).c_str());
+        }
         if (!writeAlignmentJson(
                 alignmentPath,
                 alignments,
@@ -608,7 +866,7 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_alignAndMergeRaw16(
             return env->NewStringUTF(("ERROR: " + error).c_str());
         }
         std::ostringstream status;
-        status << "OK: native RAW fusion v0.2 complete, accepted="
+        status << "OK: native RAW fusion v0.3 tile merge complete, accepted="
                << mergeStats.acceptedFrameCount
                << ", rejected=" << mergeStats.rejectedFrameCount;
         if (!mergeStats.mergeWarning.empty()) status << ", warning=" << mergeStats.mergeWarning;
