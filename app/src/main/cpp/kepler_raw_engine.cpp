@@ -205,6 +205,52 @@ bool writeAlignmentJson(
     return output.good();
 }
 
+char bayerColorAt(int x, int y, int cfa) {
+    const bool evenX = (x & 1) == 0;
+    const bool evenY = (y & 1) == 0;
+    switch (cfa) {
+        case 1: return evenY ? (evenX ? 'G' : 'R') : (evenX ? 'B' : 'G'); // GRBG
+        case 2: return evenY ? (evenX ? 'G' : 'B') : (evenX ? 'R' : 'G'); // GBRG
+        case 3: return evenY ? (evenX ? 'B' : 'G') : (evenX ? 'G' : 'R'); // BGGR
+        default: return evenY ? (evenX ? 'R' : 'G') : (evenX ? 'G' : 'B'); // RGGB
+    }
+}
+
+uint8_t toneRaw(int value, int whiteRange) {
+    const float linear = std::clamp(static_cast<float>(value) / std::max(1, whiteRange), 0.0f, 1.0f);
+    const float gamma = std::pow(linear, 1.0f / 2.2f);
+    const float lifted = std::clamp(gamma * 1.06f + 0.012f, 0.0f, 1.0f);
+    const float shouldered = lifted / (lifted + 0.10f);
+    return static_cast<uint8_t>(std::clamp(std::lround(shouldered * 1.10f * 255.0f), 0L, 255L));
+}
+
+bool writePostprocessMetadata(
+    const std::string& path,
+    int inputWidth,
+    int inputHeight,
+    int outputWidth,
+    int outputHeight,
+    std::string& error
+) {
+    std::ofstream output(path);
+    if (!output) {
+        error = "metadata json open failed: " + path;
+        return false;
+    }
+    output << "{\n"
+           << "  \"nativePostprocess\": true,\n"
+           << "  \"inputWidth\": " << inputWidth << ",\n"
+           << "  \"inputHeight\": " << inputHeight << ",\n"
+           << "  \"outputWidth\": " << outputWidth << ",\n"
+           << "  \"outputHeight\": " << outputHeight << ",\n"
+           << "  \"demosaic\": \"scaled_bilinear_v0\",\n"
+           << "  \"toneMap\": \"simple_v0\",\n"
+           << "  \"highResRawInput\": true,\n"
+           << "  \"outputFormat\": \"RGBA_8888_RAW\"\n"
+           << "}\n";
+    return output.good();
+}
+
 } // namespace
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -321,6 +367,131 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_alignAndMergeRaw16(
     } catch (const std::exception& e) {
         std::string message = std::string("ERROR: ") + e.what();
         return env->NewStringUTF(message.c_str());
+    } catch (...) {
+        return env->NewStringUTF("ERROR: unknown native failure");
+    }
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
+    JNIEnv* env,
+    jobject,
+    jstring mergedRawPath,
+    jint width,
+    jint height,
+    jint cfaPattern,
+    jint blackLevel,
+    jint whiteLevel,
+    jint outputWidth,
+    jint outputHeight,
+    jstring outputPath,
+    jstring outputMetadataJsonPath
+) {
+    try {
+        if (width <= 0 || height <= 0 || outputWidth <= 0 || outputHeight <= 0) {
+            return env->NewStringUTF("ERROR: invalid dimensions");
+        }
+        const int64_t inputPixels = static_cast<int64_t>(width) * height;
+        const int64_t outputPixels = static_cast<int64_t>(outputWidth) * outputHeight;
+        if (inputPixels <= 0 || inputPixels > 120000000LL || outputPixels <= 0 || outputPixels > 32000000LL) {
+            return env->NewStringUTF("ERROR: dimensions exceed native v0 limits");
+        }
+
+        std::vector<uint16_t> raw;
+        std::string error;
+        if (!readRaw16(getString(env, mergedRawPath), width, height, raw, error)) {
+            return env->NewStringUTF(("ERROR: " + error).c_str());
+        }
+        const int whiteRange = std::max(1, static_cast<int>(whiteLevel) - static_cast<int>(blackLevel));
+        auto rawAt = [&](int x, int y) {
+            x = std::clamp(x, 0, static_cast<int>(width) - 1);
+            y = std::clamp(y, 0, static_cast<int>(height) - 1);
+            return std::max(0, static_cast<int>(raw[static_cast<size_t>(y) * width + x]) - static_cast<int>(blackLevel));
+        };
+        auto average2 = [](int a, int b) { return (a + b) / 2; };
+        auto average4 = [](int a, int b, int c, int d) { return (a + b + c + d) / 4; };
+
+        std::vector<uint8_t> toned(static_cast<size_t>(outputPixels) * 3);
+        for (int oy = 0; oy < outputHeight; ++oy) {
+            int sy = static_cast<int>((static_cast<int64_t>(oy) * height) / outputHeight);
+            sy = std::clamp((sy / 2) * 2 + (oy & 1), 0, static_cast<int>(height) - 1);
+            for (int ox = 0; ox < outputWidth; ++ox) {
+                int sx = static_cast<int>((static_cast<int64_t>(ox) * width) / outputWidth);
+                sx = std::clamp((sx / 2) * 2 + (ox & 1), 0, static_cast<int>(width) - 1);
+                const int value = rawAt(sx, sy);
+                int r = 0;
+                int g = 0;
+                int b = 0;
+                switch (bayerColorAt(sx, sy, cfaPattern)) {
+                    case 'R':
+                        r = value;
+                        g = average4(rawAt(sx - 1, sy), rawAt(sx + 1, sy), rawAt(sx, sy - 1), rawAt(sx, sy + 1));
+                        b = average4(rawAt(sx - 1, sy - 1), rawAt(sx + 1, sy - 1), rawAt(sx - 1, sy + 1), rawAt(sx + 1, sy + 1));
+                        break;
+                    case 'B':
+                        b = value;
+                        g = average4(rawAt(sx - 1, sy), rawAt(sx + 1, sy), rawAt(sx, sy - 1), rawAt(sx, sy + 1));
+                        r = average4(rawAt(sx - 1, sy - 1), rawAt(sx + 1, sy - 1), rawAt(sx - 1, sy + 1), rawAt(sx + 1, sy + 1));
+                        break;
+                    default: {
+                        g = value;
+                        const bool greenOnRedRow = (cfaPattern == 2 || cfaPattern == 3) ? ((sy & 1) != 0) : ((sy & 1) == 0);
+                        if (greenOnRedRow) {
+                            r = average2(rawAt(sx - 1, sy), rawAt(sx + 1, sy));
+                            b = average2(rawAt(sx, sy - 1), rawAt(sx, sy + 1));
+                        } else {
+                            r = average2(rawAt(sx, sy - 1), rawAt(sx, sy + 1));
+                            b = average2(rawAt(sx - 1, sy), rawAt(sx + 1, sy));
+                        }
+                    }
+                }
+                const size_t p = (static_cast<size_t>(oy) * outputWidth + ox) * 3;
+                toned[p] = toneRaw(r, whiteRange);
+                toned[p + 1] = toneRaw(g, whiteRange);
+                toned[p + 2] = toneRaw(b, whiteRange);
+            }
+        }
+
+        std::ofstream output(getString(env, outputPath), std::ios::binary);
+        if (!output) return env->NewStringUTF("ERROR: RGBA output open failed");
+        std::vector<uint8_t> rgbaRow(static_cast<size_t>(outputWidth) * 4);
+        for (int y = 0; y < outputHeight; ++y) {
+            for (int x = 0; x < outputWidth; ++x) {
+                const size_t center = (static_cast<size_t>(y) * outputWidth + x) * 3;
+                const size_t out = static_cast<size_t>(x) * 4;
+                for (int channel = 0; channel < 3; ++channel) {
+                    int blur = 0;
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        const int yy = std::clamp(y + dy, 0, static_cast<int>(outputHeight) - 1);
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            const int xx = std::clamp(x + dx, 0, static_cast<int>(outputWidth) - 1);
+                            blur += toned[(static_cast<size_t>(yy) * outputWidth + xx) * 3 + channel];
+                        }
+                    }
+                    const float sharpened = toned[center + channel] * 1.20f - (blur / 9.0f) * 0.20f;
+                    rgbaRow[out + channel] = static_cast<uint8_t>(std::clamp(std::lround(sharpened), 0L, 255L));
+                }
+                rgbaRow[out + 3] = 255;
+            }
+            output.write(reinterpret_cast<const char*>(rgbaRow.data()), static_cast<std::streamsize>(rgbaRow.size()));
+        }
+        if (!output.good()) return env->NewStringUTF("ERROR: RGBA output write failed");
+
+        if (!writePostprocessMetadata(
+                getString(env, outputMetadataJsonPath),
+                width,
+                height,
+                outputWidth,
+                outputHeight,
+                error
+            )) {
+            return env->NewStringUTF(("ERROR: " + error).c_str());
+        }
+        return env->NewStringUTF("OK: native scaled demosaic+postprocess complete");
+    } catch (const std::bad_alloc&) {
+        return env->NewStringUTF("ERROR: native out of memory");
+    } catch (const std::exception& e) {
+        return env->NewStringUTF((std::string("ERROR: ") + e.what()).c_str());
     } catch (...) {
         return env->NewStringUTF("ERROR: unknown native failure");
     }

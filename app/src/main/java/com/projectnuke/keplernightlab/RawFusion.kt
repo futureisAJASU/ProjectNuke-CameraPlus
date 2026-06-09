@@ -30,6 +30,8 @@ import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -49,6 +51,10 @@ data class RawFusionProcessResult(
 )
 
 private const val MIN_RAW_FUSION_FRAMES = 2
+// 50MP-class high-resolution RAW threshold.
+private const val HIGH_RES_RAW_MIN_MP = 40_000_000L
+private const val HIGH_RES_RAW_FRAME_LIMIT = 4
+private const val TARGET_12MP_PIXELS = 12_000_000L
 
 data class RawSizeSelection(
     val size: Size,
@@ -86,7 +92,7 @@ fun captureRawBurstForFusion(
     var reader: ImageReader? = null
     var motionLogger: MotionLogger? = null
     val frameObjects = JSONArray()
-    val requestedFrames = frameCount
+    var requestedFrames = frameCount
     var attemptedFrames = 0
     var savedFrames = 0
     var receivedImages = 0
@@ -145,6 +151,21 @@ fun captureRawBurstForFusion(
             ?: error("Stream configuration map missing")
         val rawSelection = chooseRawFusionSizeV2(characteristics, resolutionMode, resolutionPlan)
         val rawSize = rawSelection.size
+        val rawPixelCount = rawSize.width.toLong() * rawSize.height.toLong()
+        val highResolutionRaw = rawPixelCount >= HIGH_RES_RAW_MIN_MP
+        val frameClampReason = if (highResolutionRaw && requestedFrames > HIGH_RES_RAW_FRAME_LIMIT) {
+            requestedFrames = HIGH_RES_RAW_FRAME_LIMIT
+            "50MP-class high-resolution RAW capture limited to $HIGH_RES_RAW_FRAME_LIMIT frames for memory safety."
+        } else {
+            null
+        }
+        if (frameClampReason != null) post(frameClampReason)
+        val saveDngSidecars = !highResolutionRaw
+        val dngSidecarSkipReason = if (saveDngSidecars) {
+            null
+        } else {
+            "v0 memory/storage policy: per-frame DNG disabled for 50MP-class high-resolution RAW; compact raw16 retained."
+        }
         val actualInputMode = resolutionPlan?.actualInputMode
             ?: if (resolutionMode == CaptureResolutionMode.MP24_FUSION) CaptureResolutionMode.MP50 else resolutionMode
         val outputMode = resolutionPlan?.outputMode ?: resolutionMode
@@ -187,6 +208,16 @@ fun captureRawBurstForFusion(
             .put("actualInputResolutionMode", actualInputMode.name)
             .put("outputResolutionMode", outputMode.name)
             .put("selectedPlanReason", resolutionPlan?.reason ?: JSONObject.NULL)
+            .put("native24RawAvailable", resolutionPlan?.native24RawAvailable ?: false)
+            .put("native24YuvAvailable", resolutionPlan?.native24YuvAvailable ?: false)
+            .put("native24JpegAvailable", resolutionPlan?.native24JpegAvailable ?: false)
+            .put("highResRawInputAvailable", resolutionPlan?.highResRawInputAvailable
+                ?: (megapixels(rawSize) >= HIGH_RES_RAW_INPUT_MIN_MP))
+            .put("samsungInternal24ModeAccessible", "UNKNOWN_NOT_PUBLIC_API")
+            .put("selected24MpStrategy", resolutionPlan?.selected24MpStrategy ?: JSONObject.NULL)
+            .put("selected24MpReason", resolutionPlan?.selected24MpReason ?: JSONObject.NULL)
+            .put("nativePostprocessRequired", resolutionMode == CaptureResolutionMode.MP24_FUSION && highResolutionRaw)
+            .put("nativePostprocessUsed", false)
             .put("planInputWidth", resolutionPlan?.inputSize?.width ?: JSONObject.NULL)
             .put("planInputHeight", resolutionPlan?.inputSize?.height ?: JSONObject.NULL)
             .put("planUsesMaximumResolution", resolutionPlan?.usesMaximumResolution ?: rawSelection.requiresMaximumResolutionPixelMode)
@@ -225,6 +256,11 @@ fun captureRawBurstForFusion(
             .put("cfaPattern", characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: JSONObject.NULL)
             .put("blackLevelPattern", blackLevelJson ?: JSONObject.NULL)
             .put("requestedFrames", requestedFrames)
+            .put("originalRequestedFrames", frameCount)
+            .put("frameCountClamped", frameClampReason != null)
+            .put("frameCountClampReason", frameClampReason ?: JSONObject.NULL)
+            .put("dngSidecarSaved", saveDngSidecars)
+            .put("dngSidecarSkipReason", dngSidecarSkipReason ?: JSONObject.NULL)
             .put("attemptedFrames", attemptedFrames)
             .put("captureCompleteness", "FAILED")
             .put("partialCapture", false)
@@ -234,7 +270,7 @@ fun captureRawBurstForFusion(
         jobFile.writeText(baseJob.toString(2))
 
         val imageReader = try {
-            ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, frameCount + 2)
+            ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, requestedFrames + 2)
         } catch (e: Exception) {
             val reason = "ImageReader failed for selected RAW plan ${rawSize.width}x${rawSize.height}: ${e.javaClass.simpleName}: ${e.message}"
             post("RAW selected resolution plan failed: $reason")
@@ -312,9 +348,11 @@ fun captureRawBurstForFusion(
                 try {
                     post("RAW saving frame ${index + 1}/$requestedFrames...")
                     writeCompactRaw16(image, File(jobDir, raw16Name))
-                    FileOutputStream(File(jobDir, dngName)).use { output ->
-                        DngCreator(characteristics, result).use { creator ->
-                            creator.writeImage(output, image)
+                    if (saveDngSidecars) {
+                        FileOutputStream(File(jobDir, dngName)).use { output ->
+                            DngCreator(characteristics, result).use { creator ->
+                                creator.writeImage(output, image)
+                            }
                         }
                     }
                     val dynamicBlackLevel = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
@@ -323,7 +361,7 @@ fun captureRawBurstForFusion(
                         JSONObject()
                             .put("index", index)
                             .put("raw16File", raw16Name)
-                            .put("dngFile", dngName)
+                            .put("dngFile", if (saveDngSidecars) dngName else JSONObject.NULL)
                             .put("timestampNs", timestamp)
                             .put("exposureTimeNs", result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: JSONObject.NULL)
                             .put("sensitivityIso", result.get(CaptureResult.SENSOR_SENSITIVITY) ?: JSONObject.NULL)
@@ -509,13 +547,33 @@ fun processRawFusionJob(
     jobDir: File,
     onStatus: (String) -> Unit
 ): RawFusionProcessResult {
+    val jobFile = File(jobDir, "job.json")
     return try {
-        val jobFile = File(jobDir, "job.json")
         val job = JSONObject(jobFile.readText())
         val frames = job.getJSONArray("frames")
         val width = job.getInt("rawWidth")
         val height = job.getInt("rawHeight")
-        val pixelCount = width * height
+        val pixelCountLong = width.toLong() * height.toLong()
+        require(pixelCountLong <= Int.MAX_VALUE) { "RAW dimensions exceed Kotlin array limits: ${width}x$height" }
+        val pixelCount = pixelCountLong.toInt()
+        val estimatedArgbBytes = pixelCountLong * 4L
+        val estimatedShortBytes = pixelCountLong * 2L
+        val estimatedNativeFallbackBytes = pixelCountLong * (4L + 4L + 2L)
+        val estimatedMemoryBytes = estimatedArgbBytes + estimatedShortBytes + estimatedNativeFallbackBytes
+        val estimatedMemoryMb = estimatedMemoryBytes.toDouble() / (1024.0 * 1024.0)
+        val memoryRiskLevel = when {
+            pixelCountLong >= HIGH_RES_RAW_MIN_MP || estimatedMemoryMb >= 512.0 -> "HIGH"
+            estimatedMemoryMb >= 256.0 -> "MEDIUM"
+            else -> "LOW"
+        }
+        job.put("estimatedRawFusionMemoryMb", (estimatedMemoryMb * 10.0).toInt() / 10.0)
+            .put("estimatedArgbBytes", estimatedArgbBytes)
+            .put("estimatedShortBytes", estimatedShortBytes)
+            .put("estimatedNativeFallbackBytes", estimatedNativeFallbackBytes)
+            .put("memoryRiskLevel", memoryRiskLevel)
+            .put("memoryEstimateUpdatedAt", System.currentTimeMillis())
+        jobFile.writeText(job.toString(2))
+        val highResolutionRaw = pixelCountLong >= HIGH_RES_RAW_MIN_MP
         val frameInputs = mutableListOf<RawFrameInput>()
         val frameMeta = mutableListOf<JSONObject>()
 
@@ -603,6 +661,9 @@ fun processRawFusionJob(
         if (nativeMergedOk) {
             onStatus("Processing RAW fusion: native Bayer merge complete")
         } else {
+            if (highResolutionRaw) {
+                error("Native RAW merge required for 50MP-class high-resolution input; Kotlin fallback disabled for memory safety. $nativeStatus")
+            }
             onStatus("Processing RAW fusion: native failed, falling back to Kotlin merge")
             val acc = FloatArray(pixelCount)
             val weights = FloatArray(pixelCount)
@@ -634,22 +695,152 @@ fun processRawFusionJob(
         }
 
         onStatus("Processing RAW fusion: demosaicing...")
-        val mergedForDemosaic = readRaw16(mergedRawFile, pixelCount)
-        val preview = demosaicBilinear(mergedForDemosaic, width, height, cfa, whiteLevel - blackLevel)
+        val outputMode = CaptureResolutionMode.entries.firstOrNull { it.name == job.optString("outputResolutionMode") }
+            ?: CaptureResolutionMode.entries.firstOrNull { it.label == job.optString("resolutionMode") }
+            ?: CaptureResolutionMode.MP12
+        val nativePostprocessRequired = outputMode == CaptureResolutionMode.MP24_FUSION && highResolutionRaw
         val previewFile = File(jobDir, "raw_fusion_preview.png")
-        saveRawFusionPng(preview, previewFile)
-        onStatus("Processing RAW fusion: tone/sharpen...")
-        val finalBitmap = resizeFinalForResolutionMode(
-            source = sharpenRawFusion(toneMapRawFusion(preview)),
-            mode = CaptureResolutionMode.entries.firstOrNull { it.name == job.optString("outputResolutionMode") }
-                ?: CaptureResolutionMode.entries.firstOrNull { it.label == job.optString("resolutionMode") }
-                ?: CaptureResolutionMode.MP12,
-            onStatus = onStatus
-        )
         val finalFile = File(jobDir, "raw_fusion_final.png")
-        saveRawFusionPng(finalBitmap, finalFile)
-        preview.recycle()
-        finalBitmap.recycle()
+        if (nativePostprocessRequired) {
+            val nativeRgbaFile = File(jobDir, "raw_fusion_24mp.rgba")
+            val nativeMetadataFile = File(jobDir, "native_postprocess.json")
+            val outputWidth = 5664
+            val outputHeight = 4248
+            onStatus("Processing RAW fusion: native 50MP detail to 24MP output...")
+            val postprocessStatus = runCatching {
+                NativeRawEngine.processRaw16ToRgbOutput(
+                    mergedRawPath = mergedRawFile.absolutePath,
+                    width = width,
+                    height = height,
+                    cfaPattern = cfa,
+                    // Native merge already writes black-level-subtracted compact raw16.
+                    blackLevel = 0,
+                    whiteLevel = whiteLevel - blackLevel,
+                    outputWidth = outputWidth,
+                    outputHeight = outputHeight,
+                    outputPath = nativeRgbaFile.absolutePath,
+                    outputMetadataJsonPath = nativeMetadataFile.absolutePath
+                )
+            }.getOrElse { "ERROR: ${it.javaClass.simpleName}: ${it.message}" }
+            val expectedRgbaBytes = outputWidth.toLong() * outputHeight.toLong() * 4L
+            val nativePostprocessUsed = postprocessStatus.startsWith("OK:") &&
+                nativeRgbaFile.exists() &&
+                nativeRgbaFile.length() == expectedRgbaBytes &&
+                nativeMetadataFile.exists()
+            if (!nativePostprocessUsed) {
+                val failed = JSONObject(job.toString())
+                    .put("processStatus", "NATIVE_POSTPROCESS_FAILED_KEEPING_CACHE")
+                    .put("nativePostprocessRequired", true)
+                    .put("nativePostprocessUsed", false)
+                    .put("nativePostprocessStatus", postprocessStatus)
+                    .put("processedAt", System.currentTimeMillis())
+                jobFile.writeText(failed.toString(2))
+                onStatus("RAW fusion native 24MP postprocess failed. RAW cache kept.")
+                return RawFusionProcessResult(
+                    false, mergedRawFile, null, null, null,
+                    "Native 24MP postprocess failed: $postprocessStatus"
+                )
+            }
+            var nativeBitmap: Bitmap? = null
+            try {
+                nativeBitmap = loadRawRgbaBitmap(nativeRgbaFile, outputWidth, outputHeight)
+                saveRawFusionPng(nativeBitmap, finalFile)
+            } finally {
+                nativeBitmap?.takeUnless { it.isRecycled }?.recycle()
+            }
+            val partialNote = if (partialCapture || frameInputs.size < requestedFrames) {
+                "Partial RAW fusion used ${frameInputs.size}/$requestedFrames requested frames."
+            } else {
+                "Full RAW fusion used ${frameInputs.size}/$requestedFrames requested frames."
+            }
+            val updated = JSONObject(job.toString())
+                .put("processStatus", "RAW_FUSION_COMPLETE")
+                .put("mergedRawFile", mergedRawFile.name)
+                .put("mergedDngFile", JSONObject.NULL)
+                .put("previewFile", JSONObject.NULL)
+                .put("finalFile", finalFile.name)
+                .put("usedFrameCount", frameInputs.size)
+                .put("requestedFrames", requestedFrames)
+                .put("savedFrames", savedFrames)
+                .put("captureCompleteness", captureCompleteness)
+                .put("partialCapture", partialCapture || frameInputs.size < requestedFrames)
+                .put("processingNotes", partialNote)
+                .put("blackLevelUsed", blackLevel)
+                .put("whiteLevelUsed", whiteLevel)
+                .put("outputWidth", outputWidth)
+                .put("outputHeight", outputHeight)
+                .put("selected24MpStrategy", "50MP_DETAIL_TO_24MP_FUSION_V0")
+                .put("actualInputResolutionMode", CaptureResolutionMode.MP50.name)
+                .put("outputResolutionMode", CaptureResolutionMode.MP24_FUSION.name)
+                .put("nativePostprocessRequired", true)
+                .put("nativePostprocessUsed", true)
+                .put("nativePostprocessStatus", postprocessStatus)
+                .put("nativePostprocessMetadataFile", nativeMetadataFile.name)
+                .put("nativePostprocessRgbaFile", nativeRgbaFile.name)
+                .put("fullSizeKotlinDemosaicUsed", false)
+                .put("referenceFrameIndex", referenceSelection.index)
+                .put("referenceFrameReason", referenceSelection.reason)
+                .put("alignmentStatus", "NATIVE_GLOBAL_SHIFT_COMPLETE")
+                .put("nativeRawMerge", true)
+                .put("alignmentFile", alignmentFile.name)
+                .put("mergedRawFormat", "black_level_subtracted_aligned_compact_raw16")
+                .put("sensorOrientation", job.opt("sensorOrientation") ?: JSONObject.NULL)
+                .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
+                .put("processedAt", System.currentTimeMillis())
+            jobFile.writeText(updated.toString(2))
+            return RawFusionProcessResult(true, mergedRawFile, null, null, finalFile, null)
+        }
+        val targetSize = chooseRawDemosaicTarget(width, height, highResolutionRaw)
+        val mergedForDemosaic = readRaw16(mergedRawFile, pixelCount)
+        var preview: Bitmap? = null
+        var toned: Bitmap? = null
+        var sharpened: Bitmap? = null
+        var finalBitmap: Bitmap? = null
+        var finalOutputWidth = targetSize.first
+        var finalOutputHeight = targetSize.second
+        val outputFallbackReason = when {
+            outputMode == CaptureResolutionMode.MP50 ->
+                "MP50 Kotlin ARGB output unsupported until native demosaic/postprocess exists; wrote downscaled preview."
+            outputMode == CaptureResolutionMode.MP24_FUSION && highResolutionRaw ->
+                "MP24_FUSION fell back to ~12MP because full 24MP Kotlin bitmap chain is unsafe for 50MP-class high-resolution RAW input."
+            else -> null
+        }
+        try {
+            preview = if (highResolutionRaw) {
+                onStatus("Processing RAW fusion: memory-safe downscaled demosaic ${targetSize.first}x${targetSize.second}...")
+                demosaicBilinearDownscaled(
+                    mergedForDemosaic, width, height, cfa, whiteLevel - blackLevel,
+                    targetSize.first, targetSize.second
+                )
+            } else {
+                demosaicBilinear(mergedForDemosaic, width, height, cfa, whiteLevel - blackLevel)
+            }
+            saveRawFusionPng(preview, previewFile)
+            onStatus("Processing RAW fusion: tone/sharpen...")
+            toned = toneMapRawFusion(preview)
+            preview.recycle()
+            preview = null
+            sharpened = sharpenRawFusion(toned)
+            toned.recycle()
+            toned = null
+            finalBitmap = resizeFinalForResolutionMode(
+                source = sharpened,
+                mode = if (outputFallbackReason == null) outputMode else CaptureResolutionMode.MP12,
+                onStatus = onStatus
+            )
+            if (finalBitmap !== sharpened) {
+                sharpened.recycle()
+                sharpened = null
+            }
+            finalOutputWidth = finalBitmap.width
+            finalOutputHeight = finalBitmap.height
+            saveRawFusionPng(finalBitmap, finalFile)
+        } finally {
+            preview?.takeUnless { it.isRecycled }?.recycle()
+            toned?.takeUnless { it.isRecycled }?.recycle()
+            sharpened?.takeUnless { it.isRecycled }?.recycle()
+            finalBitmap?.takeUnless { it.isRecycled }?.recycle()
+        }
 
         val partialNote = if (partialCapture || frameInputs.size < requestedFrames) {
             "Partial RAW fusion used ${frameInputs.size}/$requestedFrames requested frames."
@@ -663,6 +854,10 @@ fun processRawFusionJob(
             .put("mergedDngFile", JSONObject.NULL)
             .put("previewFile", previewFile.name)
             .put("finalFile", finalFile.name)
+            .put("outputFallbackReason", outputFallbackReason ?: JSONObject.NULL)
+            .put("fullSizeKotlinDemosaicUsed", !highResolutionRaw)
+            .put("nativePostprocessRequired", false)
+            .put("nativePostprocessUsed", false)
             .put("usedFrameCount", frameInputs.size)
             .put("requestedFrames", requestedFrames)
             .put("savedFrames", savedFrames)
@@ -675,8 +870,8 @@ fun processRawFusionJob(
             .put("blackLevelMode", blackLevelEstimate.mode)
             .put("whiteLevelUsed", whiteLevel)
             .put("whiteLevelSource", whiteLevelEstimate.source)
-            .put("outputWidth", BitmapFactory.decodeFile(finalFile.absolutePath)?.width ?: JSONObject.NULL)
-            .put("outputHeight", BitmapFactory.decodeFile(finalFile.absolutePath)?.height ?: JSONObject.NULL)
+            .put("outputWidth", finalOutputWidth)
+            .put("outputHeight", finalOutputHeight)
             .put("referenceFrameIndex", referenceSelection.index)
             .put("referenceFrameReason", referenceSelection.reason)
             .put("alignmentStatus", if (nativeMergedOk) "NATIVE_GLOBAL_SHIFT_COMPLETE" else "FAILED_FALLBACK_KOTLIN_NO_ALIGNMENT")
@@ -690,6 +885,16 @@ fun processRawFusionJob(
         jobFile.writeText(updated.toString(2))
 
         RawFusionProcessResult(true, mergedRawFile, null, previewFile, finalFile, null)
+    } catch (oom: OutOfMemoryError) {
+        runCatching {
+            val job = if (jobFile.exists()) JSONObject(jobFile.readText()) else JSONObject()
+            job.put("processStatus", "OOM_FAILED_KEEPING_CACHE")
+                .put("processError", "OutOfMemoryError")
+                .put("processedAt", System.currentTimeMillis())
+            jobFile.writeText(job.toString(2))
+        }
+        onStatus("RAW fusion stopped: insufficient memory. RAW cache kept.")
+        RawFusionProcessResult(false, null, null, null, null, "OutOfMemoryError: RAW cache kept")
     } catch (e: Exception) {
         RawFusionProcessResult(false, null, null, null, null, "${e.javaClass.simpleName}: ${e.message}")
     }
@@ -1109,6 +1314,73 @@ private fun demosaicBilinear(raw: ShortArray, width: Int, height: Int, cfa: Int,
     return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
 }
 
+private fun chooseRawDemosaicTarget(width: Int, height: Int, forceDownscale: Boolean): Pair<Int, Int> {
+    if (!forceDownscale) return width to height
+    val scale = kotlin.math.sqrt(TARGET_12MP_PIXELS.toDouble() / (width.toLong() * height.toLong()))
+        .coerceAtMost(1.0)
+    val targetWidth = ((width * scale).toInt().coerceAtLeast(2) / 2) * 2
+    val targetHeight = ((height * scale).toInt().coerceAtLeast(2) / 2) * 2
+    return targetWidth to targetHeight
+}
+
+private fun demosaicBilinearDownscaled(
+    raw: ShortArray,
+    width: Int,
+    height: Int,
+    cfa: Int,
+    whiteLevel: Int,
+    targetWidth: Int,
+    targetHeight: Int
+): Bitmap {
+    val pixels = IntArray(targetWidth * targetHeight)
+    fun sourceX(x: Int): Int {
+        val evenBase = ((x.toLong() * width) / targetWidth).toInt() / 2 * 2
+        return (evenBase + x % 2).coerceIn(0, width - 1)
+    }
+    fun sourceY(y: Int): Int {
+        val evenBase = ((y.toLong() * height) / targetHeight).toInt() / 2 * 2
+        return (evenBase + y % 2).coerceIn(0, height - 1)
+    }
+    fun rawAt(x: Int, y: Int): Int =
+        raw[y.coerceIn(0, height - 1) * width + x.coerceIn(0, width - 1)].toInt() and 0xFFFF
+    fun avg2(a: Int, b: Int) = (a + b) / 2
+    fun avg4(a: Int, b: Int, c: Int, d: Int) = (a + b + c + d) / 4
+    fun colorAt(x: Int, y: Int): Char = when (cfa) {
+        1 -> if (y % 2 == 0) if (x % 2 == 0) 'G' else 'R' else if (x % 2 == 0) 'B' else 'G'
+        2 -> if (y % 2 == 0) if (x % 2 == 0) 'G' else 'B' else if (x % 2 == 0) 'R' else 'G'
+        3 -> if (y % 2 == 0) if (x % 2 == 0) 'B' else 'G' else if (x % 2 == 0) 'G' else 'R'
+        else -> if (y % 2 == 0) if (x % 2 == 0) 'R' else 'G' else if (x % 2 == 0) 'G' else 'B'
+    }
+    fun greenOnRedRow(y: Int) = if (cfa == 2 || cfa == 3) y % 2 != 0 else y % 2 == 0
+    for (targetY in 0 until targetHeight) {
+        val y = sourceY(targetY)
+        for (targetX in 0 until targetWidth) {
+            val x = sourceX(targetX)
+            val value = rawAt(x, y)
+            val (r, g, b) = when (colorAt(x, y)) {
+                'R' -> Triple(
+                    value,
+                    avg4(rawAt(x - 1, y), rawAt(x + 1, y), rawAt(x, y - 1), rawAt(x, y + 1)),
+                    avg4(rawAt(x - 1, y - 1), rawAt(x + 1, y - 1), rawAt(x - 1, y + 1), rawAt(x + 1, y + 1))
+                )
+                'B' -> Triple(
+                    avg4(rawAt(x - 1, y - 1), rawAt(x + 1, y - 1), rawAt(x - 1, y + 1), rawAt(x + 1, y + 1)),
+                    avg4(rawAt(x - 1, y), rawAt(x + 1, y), rawAt(x, y - 1), rawAt(x, y + 1)),
+                    value
+                )
+                else -> if (greenOnRedRow(y)) {
+                    Triple(avg2(rawAt(x - 1, y), rawAt(x + 1, y)), value, avg2(rawAt(x, y - 1), rawAt(x, y + 1)))
+                } else {
+                    Triple(avg2(rawAt(x, y - 1), rawAt(x, y + 1)), value, avg2(rawAt(x - 1, y), rawAt(x + 1, y)))
+                }
+            }
+            pixels[targetY * targetWidth + targetX] =
+                Color.rgb(curveRaw(r, whiteLevel), curveRaw(g, whiteLevel), curveRaw(b, whiteLevel))
+        }
+    }
+    return Bitmap.createBitmap(pixels, targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+}
+
 private fun curveRaw(value: Int, whiteLevel: Int): Int {
     val x = (value.toDouble() / max(1, whiteLevel)).coerceIn(0.0, 1.0)
     return (x.pow(1.0 / 2.2) * 255.0).toInt().coerceIn(0, 255)
@@ -1146,10 +1418,8 @@ private fun resizeFinalForResolutionMode(
     val targetHeight = 3672
     return try {
         onStatus("24M Fusion v0: resizing final output to ${targetWidth}x$targetHeight")
-        val resized = Bitmap.createScaledBitmap(source, targetWidth, targetHeight, true)
-        if (resized !== source) source.recycle()
-        resized
-    } catch (e: OutOfMemoryError) {
+        Bitmap.createScaledBitmap(source, targetWidth, targetHeight, true)
+    } catch (e: Exception) {
         onStatus("24M Fusion resize failed; keeping source output. ${e.javaClass.simpleName}")
         source
     }
@@ -1193,6 +1463,43 @@ private fun saveRawFusionPng(bitmap: Bitmap, file: File) {
     if (!file.exists() || file.length() < 1024L) {
         error("PNG output invalid or too small: ${file.absolutePath}, size=${file.length()}")
     }
+}
+
+private fun loadRawRgbaBitmap(file: File, width: Int, height: Int): Bitmap {
+    val expectedBytes = width.toLong() * height.toLong() * 4L
+    require(file.length() == expectedBytes) {
+        "Native RGBA size mismatch: expected=$expectedBytes actual=${file.length()}"
+    }
+    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    val rowsPerChunk = 16
+    val byteBuffer = ByteBuffer.allocate(width * rowsPerChunk * 4).order(ByteOrder.LITTLE_ENDIAN)
+    val pixels = IntArray(width * rowsPerChunk)
+    FileInputStream(file).use { input ->
+        var y = 0
+        while (y < height) {
+            val rows = min(rowsPerChunk, height - y)
+            val bytesNeeded = width * rows * 4
+            byteBuffer.clear()
+            var offset = 0
+            while (offset < bytesNeeded) {
+                val read = input.read(byteBuffer.array(), offset, bytesNeeded - offset)
+                if (read < 0) error("Unexpected EOF in native RGBA output")
+                offset += read
+            }
+            var p = 0
+            var b = 0
+            while (p < width * rows) {
+                val r = byteBuffer.array()[b++].toInt() and 0xFF
+                val g = byteBuffer.array()[b++].toInt() and 0xFF
+                val blue = byteBuffer.array()[b++].toInt() and 0xFF
+                val a = byteBuffer.array()[b++].toInt() and 0xFF
+                pixels[p++] = Color.argb(a, r, g, blue)
+            }
+            bitmap.setPixels(pixels, 0, width, 0, y, width, rows)
+            y += rows
+        }
+    }
+    return bitmap
 }
 
 private data class RawGyro(val timestamp: Long, val magnitude: Double)

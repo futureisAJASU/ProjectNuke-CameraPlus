@@ -22,6 +22,19 @@ object NativeRawEngine {
         outputMergedRawPath: String,
         outputAlignmentJsonPath: String
     ): String
+
+    external fun processRaw16ToRgbOutput(
+        mergedRawPath: String,
+        width: Int,
+        height: Int,
+        cfaPattern: Int,
+        blackLevel: Int,
+        whiteLevel: Int,
+        outputWidth: Int,
+        outputHeight: Int,
+        outputPath: String,
+        outputMetadataJsonPath: String
+    ): String
 }
 
 fun isNativeRawEngineAvailable(): Boolean = NativeRawEngine.isAvailable()
