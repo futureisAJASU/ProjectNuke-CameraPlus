@@ -474,16 +474,39 @@ private class CameraPreviewController(
         val centerY = viewHeight / 2f
         val viewRect = RectF(0f, 0f, viewWidth, viewHeight)
         val characteristics = cameraCharacteristics
-        val sensorOrientation = characteristics?.get(CameraCharacteristics.SENSOR_ORIENTATION)
+        val sensorOrientation = characteristics
+            ?.get(CameraCharacteristics.SENSOR_ORIENTATION)
+            ?: 0
         val displayRotation = textureView.display?.rotation ?: Surface.ROTATION_0
+        val displayDegrees = when (displayRotation) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+        val relativeRotation = (sensorOrientation - displayDegrees + 360) % 360
+        val swapDimensions = relativeRotation == 90 || relativeRotation == 270
+        val rotatedBufferWidth = if (swapDimensions) {
+            previewSize.height.toFloat()
+        } else {
+            previewSize.width.toFloat()
+        }
+        val rotatedBufferHeight = if (swapDimensions) {
+            previewSize.width.toFloat()
+        } else {
+            previewSize.height.toFloat()
+        }
+        val scaleX = viewWidth / rotatedBufferWidth
+        val scaleY = viewHeight / rotatedBufferHeight
+        val finalScale = kotlin.math.max(scaleX, scaleY)
         Log.d(
             TAG,
             "configureTransform view=${viewWidth}x$viewHeight previewSize=${previewSize.width}x${previewSize.height} " +
-                "sensorOrientation=$sensorOrientation displayRotation=$displayRotation rotationFix=$PREVIEW_ROTATION_FIX_DEGREES"
+                "sensorOrientation=$sensorOrientation displayRotation=$displayRotation relativeRotation=$relativeRotation " +
+                "swapDimensions=$swapDimensions scaleX=$scaleX scaleY=$scaleY finalScale=$finalScale " +
+                "rotationFix=$PREVIEW_ROTATION_FIX_DEGREES"
         )
 
-        val rotatedBufferWidth = previewSize.height.toFloat()
-        val rotatedBufferHeight = previewSize.width.toFloat()
         val bufferRect = RectF(
             0f,
             0f,
@@ -494,13 +517,15 @@ private class CameraPreviewController(
         }
 
         val matrix = Matrix().apply {
-            setRectToRect(bufferRect, viewRect, Matrix.ScaleToFit.CENTER)
-            val scale = kotlin.math.max(
-                viewWidth / rotatedBufferWidth,
-                viewHeight / rotatedBufferHeight
-            )
-            postScale(scale, scale, centerX, centerY)
-            // TODO: replace manual preview rotation fix with verified sensor/display mapping table.
+            setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
+            postScale(finalScale, finalScale, centerX, centerY)
+            val displayCorrection = when (displayRotation) {
+                Surface.ROTATION_90 -> -90f
+                Surface.ROTATION_180 -> 180f
+                Surface.ROTATION_270 -> 90f
+                else -> 0f
+            }
+            postRotate(displayCorrection, centerX, centerY)
             postRotate(PREVIEW_ROTATION_FIX_DEGREES, centerX, centerY)
         }
 

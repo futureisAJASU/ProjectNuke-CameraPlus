@@ -7,6 +7,13 @@ object CameraCapabilityCache {
     private var backCameraCandidates: List<CameraCandidate>? = null
     private val resolutionCapabilities = mutableMapOf<String, CameraResolutionCapability>()
 
+    fun clear() {
+        synchronized(lock) {
+            backCameraCandidates = null
+            resolutionCapabilities.clear()
+        }
+    }
+
     fun getBackCameraCandidates(context: Context): List<CameraCandidate> {
         synchronized(lock) {
             backCameraCandidates?.let { return it }

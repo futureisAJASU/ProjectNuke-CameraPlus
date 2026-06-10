@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -22,7 +23,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -344,6 +344,7 @@ fun MainCameraScreen(
     var manualFrames by remember { mutableStateOf(4) }
     var latestSceneLuma by remember { mutableStateOf<Double?>(null) }
     var latestMotionScore by remember { mutableStateOf<Double?>(null) }
+    var capabilityRefreshNonce by remember { mutableStateOf(0) }
     var latestFramePlan by remember {
         mutableStateOf(
             FramePlan(
@@ -359,7 +360,7 @@ fun MainCameraScreen(
         resolutionMode = selectedResolution,
         threeXSourceMode = selectedThreeXSource
     )
-    val cameraSelection = remember(selectedLensSlot, selectedThreeXSource) {
+    val cameraSelection = remember(selectedLensSlot, selectedThreeXSource, capabilityRefreshNonce) {
         selectCameraForOptions(
             context,
             SelectedCaptureOptions(
@@ -369,7 +370,7 @@ fun MainCameraScreen(
             )
         )
     }
-    val resolutionCapability = remember(cameraSelection.cameraId, selectedLensSlot, selectedThreeXSource) {
+    val resolutionCapability = remember(cameraSelection.cameraId, selectedLensSlot, selectedThreeXSource, capabilityRefreshNonce) {
         runCatching {
             queryCameraResolutionCapability(context, cameraSelection.cameraId, selectedLensSlot)
         }.getOrNull()
@@ -479,6 +480,22 @@ fun MainCameraScreen(
         status = "Zoom ${"%.1f".format(displayZoom)}x"
     }
 
+    fun cameraSelectionStatus(selection: CameraSelection): String {
+        val source = when (selection.actualLensSource) {
+            ActualLensSource.OPTICAL_TELE_LOGICAL -> "3x optical tele"
+            ActualLensSource.OPTICAL_TELE_PHYSICAL -> "3x physical optical tele"
+            ActualLensSource.OPTICAL_TELE_UNAVAILABLE_FALLBACK_CROP -> "3x crop fallback"
+            ActualLensSource.MAIN_CROP_3X -> "3x main crop"
+            ActualLensSource.MAIN_CROP_2X -> "2x main crop"
+            ActualLensSource.ULTRAWIDE -> "ultrawide"
+            ActualLensSource.MAIN_1X -> "main 1x"
+        }
+        return "$source: cameraId=${selection.cameraId}" +
+            (selection.physicalCameraId?.let { ", physicalCameraId=$it" } ?: "") +
+            ", zoom=${selection.effectiveZoomRatio}, crop=${selection.useCrop}. " +
+            selection.diagnosticReason
+    }
+
     fun runCameraJob(
         startMessage: String,
         requestedFrames: Int = 0,
@@ -547,11 +564,14 @@ fun MainCameraScreen(
                 onResolutionClick = {
                     val modes = allowedResolutionModes.ifEmpty { listOf(CaptureResolutionMode.MP12) }
                     val capabilityText = resolutionCapability?.let {
-                        "${selectedLensSlot.label} cameraId=${it.cameraId} ultra=${it.supportsUltraHighResolution} maxRAW=${"%.1f".format(it.maxAvailableRawMp)}MP maxYUV=${"%.1f".format(it.maxAvailableYuvMp)}MP maxJPEG=${"%.1f".format(it.maxAvailableJpegMp)}MP modes=${modes.joinToString { mode -> mode.label }}"
+                        "${selectedLensSlot.label} cameraId=${it.cameraId} raw50=${it.raw50Available} yuv50=${it.yuv50Available} jpeg50=${it.jpeg50Available} maxRAW=${"%.1f".format(it.maxAvailableRawMp)}MP modes=${modes.joinToString { mode -> mode.label }}"
                     } ?: "Resolution capability unavailable."
                     if (modes.size <= 1) {
                         val reason = resolutionPlans
-                            .firstOrNull { it.requestedMode != CaptureResolutionMode.MP12 && !it.isAvailable }
+                            .firstOrNull { it.requestedMode == CaptureResolutionMode.MP50 && !it.isAvailable }
+                            ?.reason
+                            ?: resolutionPlans
+                                .firstOrNull { it.requestedMode != CaptureResolutionMode.MP12 && !it.isAvailable }
                             ?.reason
                             ?: "no 50MP RAW/YUV/JPEG stream exposed for selected main camera."
                         status = "Only 12M: $reason $capabilityText"
@@ -568,8 +588,8 @@ fun MainCameraScreen(
             )
             Box(
                 modifier = Modifier
+                    .weight(1f)
                     .fillMaxWidth()
-                    .aspectRatio(3f / 4f)
                     .background(Color.Black)
                     .pointerInput(Unit) {
                         detectTapGestures { offset ->
@@ -676,7 +696,7 @@ fun MainCameraScreen(
                         context,
                         options.copy(lensSlot = lensSlot)
                     )
-                    status = "${lensSlot.label} selected: cameraId=${updatedSelection.cameraId}, zoom=${updatedSelection.effectiveZoomRatio}, crop=${updatedSelection.useCrop}. ${updatedSelection.note}\n${buildCameraSelectionDebugReport(context)}"
+                    status = cameraSelectionStatus(updatedSelection)
                 },
                 selectedThreeXSource = selectedThreeXSource,
                 onThreeXSourceChange = { source ->
@@ -690,7 +710,7 @@ fun MainCameraScreen(
                         threeXSourceMode = source
                     )
                     val updatedSelection = selectCameraForOptions(context, updatedOptions)
-                    status = "3x ${source.label}: cameraId=${updatedSelection.cameraId}, zoom=${updatedSelection.effectiveZoomRatio}, crop=${updatedSelection.useCrop}, ${updatedSelection.note}\n${buildCameraSelectionDebugReport(context)}"
+                    status = cameraSelectionStatus(updatedSelection)
                 },
                 frameCountMode = frameCountMode,
                 latestFramePlan = latestFramePlan,
@@ -737,7 +757,7 @@ fun MainCameraScreen(
                         zoomUiState.zoomRatio.coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
                     }
                     runCameraJob(
-                        startMessage = "Night Fusion ${selectedLensSlot.label} ${selectedResolution.label} cameraId=${selection.cameraId}, zoom=${captureZoomRatio}x. ${selectedResolutionPlan?.reason.orEmpty()} Frame mode: ${settings.mode.label}, capture frames: ${plan.framesToCapture}, auto max: ${plan.maxFrames}. ${plan.reason}. ${selection.note}",
+                        startMessage = "Night Fusion ${selectedResolution.label}. ${cameraSelectionStatus(selection)} ${selectedResolutionPlan?.reason.orEmpty()} Frame mode: ${settings.mode.label}, capture frames: ${plan.framesToCapture}, auto max: ${plan.maxFrames}. ${plan.reason}.",
                         requestedFrames = plan.framesToCapture,
                         timeoutMillis = if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) 120_000L else 60_000L
                     ) { callback ->
@@ -880,12 +900,23 @@ fun MainCameraScreen(
                         )
                     }
                 },
-                onTest50MRaw = {
+                onTest50MRaw = test50@{
                     currentScreen = MainScreen.CAMERA
                     val mainSelection = selectCameraForOptions(
                         context,
                         SelectedCaptureOptions(LensSlot.MAIN_1X, CaptureResolutionMode.MP50, ThreeXSourceMode.MAIN_CROP)
                     )
+                    CameraCapabilityCache.clear()
+                    val mainCapability = queryCameraResolutionCapability(
+                        context,
+                        mainSelection.cameraId,
+                        LensSlot.MAIN_1X
+                    )
+                    capabilityRefreshNonce++
+                    if (!mainCapability.raw50Available) {
+                        status = mainCapability.raw50Reason
+                        return@test50
+                    }
                     runCameraJob("Test 50M RAW Capture: cameraId=${mainSelection.cameraId}", requestedFrames = 1) { callback ->
                         captureRawBurstForFusion(
                             context = context,
@@ -906,7 +937,16 @@ fun MainCameraScreen(
                     }
                 },
                 onPrintResolutionReport = {
-                    status = buildResolutionCapabilityReport(context)
+                    val report = buildResolutionCapabilityReport(context)
+                    Log.i("KeplerCameraCapabilities", report)
+                    status = report
+                    capabilityRefreshNonce++
+                    currentScreen = MainScreen.CAMERA
+                },
+                onRefreshCameraCapabilities = {
+                    CameraCapabilityCache.clear()
+                    capabilityRefreshNonce++
+                    status = "Camera capabilities refreshed."
                     currentScreen = MainScreen.CAMERA
                 },
                 onBack = {
@@ -1133,8 +1173,8 @@ fun CameraBottomPanel(
             .fillMaxWidth()
             .background(Color.Black)
             .navigationBarsPadding()
-            .padding(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 18.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+            .padding(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(7.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1174,21 +1214,6 @@ fun CameraBottomPanel(
             )
         }
 
-        Text(
-            text = if (frameCountMode == FrameCountMode.AUTO) {
-                "${pipelineMode.label}  |  Auto: ${latestFramePlan.framesToCapture} / ${latestFramePlan.maxFrames} frames"
-            } else {
-                "${pipelineMode.label}  |  Manual: ${latestFramePlan.framesToCapture} frames"
-            },
-            color = Color.White.copy(alpha = 0.58f),
-            style = MaterialTheme.typography.labelMedium,
-            modifier = Modifier.align(Alignment.CenterHorizontally)
-        )
-
-        if (isCapturing) {
-            CaptureProgressRow(captureProgress = captureProgress)
-        }
-
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
@@ -1221,6 +1246,21 @@ fun CameraBottomPanel(
                 enabled = !isCapturing,
                 onClick = onAverage
             )
+        }
+
+        Text(
+            text = if (frameCountMode == FrameCountMode.AUTO) {
+                "${pipelineMode.label}  |  Auto: ${latestFramePlan.framesToCapture} / ${latestFramePlan.maxFrames} frames"
+            } else {
+                "${pipelineMode.label}  |  Manual: ${latestFramePlan.framesToCapture} frames"
+            },
+            color = Color.White.copy(alpha = 0.58f),
+            style = MaterialTheme.typography.labelMedium,
+            modifier = Modifier.align(Alignment.CenterHorizontally)
+        )
+
+        if (isCapturing) {
+            CaptureProgressRow(captureProgress = captureProgress)
         }
 
         ModeTabs(
@@ -1589,6 +1629,7 @@ fun SettingsScreen(
     onRawBurst: () -> Unit,
     onTest50MRaw: () -> Unit,
     onPrintResolutionReport: () -> Unit,
+    onRefreshCameraCapabilities: () -> Unit,
     onBack: () -> Unit,
     onOpenDebug: () -> Unit,
     onOpenCacheJobs: () -> Unit,
@@ -1700,6 +1741,11 @@ fun SettingsScreen(
                 MiniSettingsButton(
                     text = "Print Resolution Capability Report",
                     onClick = onPrintResolutionReport
+                )
+
+                MiniSettingsButton(
+                    text = "Refresh camera capabilities",
+                    onClick = onRefreshCameraCapabilities
                 )
 
                 MiniSettingsButton(

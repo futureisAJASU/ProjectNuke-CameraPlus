@@ -11,22 +11,52 @@ import android.util.Size
 import kotlin.math.abs
 import kotlin.math.max
 
+data class PhysicalCameraCandidate(
+    val physicalCameraId: String,
+    val lensFacing: Int?,
+    val focalLengths: List<Float>,
+    val maxYuvMegapixels: Double,
+    val maxJpegMegapixels: Double,
+    val maxRawMegapixels: Double
+)
+
 data class CameraCandidate(
     val cameraId: String,
     val lensFacing: Int?,
     val focalLengths: List<Float>,
     val maxYuvMegapixels: Double,
+    val maxJpegMegapixels: Double,
     val maxRawMegapixels: Double,
     val maxHighResMegapixels: Double,
     val supportsUltraHighResolution: Boolean,
-    val supportsRaw: Boolean
+    val supportsRaw: Boolean,
+    val isLogicalMultiCamera: Boolean,
+    val capabilities: List<Int>,
+    val physicalCameras: List<PhysicalCameraCandidate>
 )
+
+enum class ActualLensSource {
+    MAIN_1X,
+    ULTRAWIDE,
+    MAIN_CROP_2X,
+    MAIN_CROP_3X,
+    OPTICAL_TELE_LOGICAL,
+    OPTICAL_TELE_PHYSICAL,
+    OPTICAL_TELE_UNAVAILABLE_FALLBACK_CROP
+}
 
 data class CameraSelection(
     val cameraId: String,
     val effectiveZoomRatio: Float,
     val useCrop: Boolean,
-    val note: String
+    val note: String,
+    val requestedLensSlot: LensSlot,
+    val requestedThreeXSourceMode: ThreeXSourceMode,
+    val actualLensSource: ActualLensSource,
+    val physicalCameraId: String? = null,
+    val isOpticalTeleActuallyUsed: Boolean = false,
+    val isFallback: Boolean = false,
+    val diagnosticReason: String = note
 )
 
 fun findBackCameraCandidates(context: Context): List<CameraCandidate> {
@@ -49,10 +79,34 @@ fun loadBackCameraCandidates(context: Context): List<CameraCandidate> {
             val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
                 ?: intArrayOf()
             val supportsRaw = capabilities.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW)
+            val isLogicalMultiCamera = capabilities.contains(
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA
+            )
             val supportsUltraHighResolution = capabilities.contains(
                 CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_ULTRA_HIGH_RESOLUTION_SENSOR
             )
             val capability = queryCameraResolutionCapability(context, cameraId, LensSlot.MAIN_1X)
+            val physicalCameras = if (Build.VERSION.SDK_INT >= 28) {
+                characteristics.physicalCameraIds.mapNotNull { physicalCameraId ->
+                    runCatching {
+                        val physical = cameraManager.getCameraCharacteristics(physicalCameraId)
+                        val physicalMap = physical.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                        PhysicalCameraCandidate(
+                            physicalCameraId = physicalCameraId,
+                            lensFacing = physical.get(CameraCharacteristics.LENS_FACING),
+                            focalLengths = physical
+                                .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                                ?.toList()
+                                .orEmpty(),
+                            maxYuvMegapixels = maxMegapixels(physicalMap?.getOutputSizes(ImageFormat.YUV_420_888)),
+                            maxJpegMegapixels = maxMegapixels(physicalMap?.getOutputSizes(ImageFormat.JPEG)),
+                            maxRawMegapixels = maxMegapixels(physicalMap?.getOutputSizes(ImageFormat.RAW_SENSOR))
+                        )
+                    }.getOrNull()
+                }
+            } else {
+                emptyList()
+            }
 
             CameraCandidate(
                 cameraId = cameraId,
@@ -62,13 +116,17 @@ fun loadBackCameraCandidates(context: Context): List<CameraCandidate> {
                     ?.toList()
                     .orEmpty(),
                 maxYuvMegapixels = maxMegapixels(map?.getOutputSizes(ImageFormat.YUV_420_888)),
+                maxJpegMegapixels = maxMegapixels(map?.getOutputSizes(ImageFormat.JPEG)),
                 maxRawMegapixels = maxMegapixels(map?.getOutputSizes(ImageFormat.RAW_SENSOR)),
                 maxHighResMegapixels = max(
                     capability.maxAvailableRawMp,
                     max(capability.maxAvailableYuvMp, capability.maxAvailableJpegMp)
                 ),
                 supportsUltraHighResolution = supportsUltraHighResolution,
-                supportsRaw = supportsRaw
+                supportsRaw = supportsRaw,
+                isLogicalMultiCamera = isLogicalMultiCamera,
+                capabilities = capabilities.toList(),
+                physicalCameras = physicalCameras
             )
         }.getOrNull()
     }
@@ -85,7 +143,11 @@ fun selectCameraForOptions(
             cameraId = "0",
             effectiveZoomRatio = 1.0f,
             useCrop = false,
-            note = "No back camera candidate found; using cameraId=0 fallback."
+            note = "No back camera candidate found; using cameraId=0 fallback.",
+            requestedLensSlot = options.lensSlot,
+            requestedThreeXSourceMode = options.threeXSourceMode,
+            actualLensSource = ActualLensSource.MAIN_1X,
+            isFallback = true
         )
     }
 
@@ -98,7 +160,16 @@ fun selectCameraForOptions(
                 cameraId = camera.cameraId,
                 effectiveZoomRatio = 1.0f,
                 useCrop = false,
-                note = "Ultrawide candidate cameraId=${camera.cameraId}."
+                note = "Ultrawide candidate cameraId=${camera.cameraId}.",
+                requestedLensSlot = options.lensSlot,
+                requestedThreeXSourceMode = options.threeXSourceMode,
+                actualLensSource = ActualLensSource.ULTRAWIDE,
+                isFallback = camera.cameraId == main.cameraId,
+                diagnosticReason = if (camera.cameraId == main.cameraId) {
+                    "Separate public ultrawide camera was not found; main logical camera selected."
+                } else {
+                    "Separate public ultrawide logical camera selected."
+                }
             )
         }
 
@@ -107,7 +178,10 @@ fun selectCameraForOptions(
                 cameraId = main.cameraId,
                 effectiveZoomRatio = 1.0f,
                 useCrop = false,
-                note = "Main selected by max high-res capability: cameraId=${main.cameraId}."
+                note = "Main selected by max high-res capability: cameraId=${main.cameraId}.",
+                requestedLensSlot = options.lensSlot,
+                requestedThreeXSourceMode = options.threeXSourceMode,
+                actualLensSource = ActualLensSource.MAIN_1X
             )
         }
 
@@ -117,7 +191,10 @@ fun selectCameraForOptions(
                 cameraId = main.cameraId,
                 effectiveZoomRatio = 2.0f,
                 useCrop = true,
-                note = "2x uses main high-res camera crop on cameraId=${main.cameraId}. 2x 24M is fusion/SR, not native crop."
+                note = "2x uses main high-res camera crop on cameraId=${main.cameraId}. 2x 24M is fusion/SR, not native crop.",
+                requestedLensSlot = options.lensSlot,
+                requestedThreeXSourceMode = options.threeXSourceMode,
+                actualLensSource = ActualLensSource.MAIN_CROP_2X
             )
         }
 
@@ -132,14 +209,35 @@ fun selectCameraForOptions(
                             cameraId = tele.cameraId,
                             effectiveZoomRatio = 1.0f,
                             useCrop = false,
-                            note = "Optical 3x candidate cameraId=${tele.cameraId}."
+                            note = "Optical tele logical camera selected: cameraId=${tele.cameraId}.",
+                            requestedLensSlot = options.lensSlot,
+                            requestedThreeXSourceMode = options.threeXSourceMode,
+                            actualLensSource = ActualLensSource.OPTICAL_TELE_LOGICAL,
+                            isOpticalTeleActuallyUsed = true,
+                            diagnosticReason = "Separate public logical tele camera has focal length significantly longer than main."
                         )
                     } else {
+                        val physicalTele = selectPhysicalTeleCamera(main)
                         CameraSelection(
                             cameraId = main.cameraId,
                             effectiveZoomRatio = 3.0f,
                             useCrop = true,
-                            note = "Tele camera not found; falling back to main 3x crop. cameraId=${main.cameraId}."
+                            note = if (physicalTele != null) {
+                                "3x crop fallback. Physical tele candidate ${physicalTele.physicalCameraId} exists, but explicit physical routing is not enabled."
+                            } else {
+                                "Optical tele unavailable; using main 3x crop."
+                            },
+                            requestedLensSlot = options.lensSlot,
+                            requestedThreeXSourceMode = options.threeXSourceMode,
+                            actualLensSource = ActualLensSource.OPTICAL_TELE_UNAVAILABLE_FALLBACK_CROP,
+                            physicalCameraId = physicalTele?.physicalCameraId,
+                            isOpticalTeleActuallyUsed = false,
+                            isFallback = true,
+                            diagnosticReason = if (physicalTele != null) {
+                                "Physical tele candidate detected inside logical cameraId=${main.cameraId}; preview/capture remains on main crop until physical OutputConfiguration routing is implemented."
+                            } else {
+                                "No separate public logical tele camera or usable physical tele metadata was exposed."
+                            }
                         )
                     }
                 }
@@ -149,7 +247,10 @@ fun selectCameraForOptions(
                         cameraId = main.cameraId,
                         effectiveZoomRatio = 3.0f,
                         useCrop = true,
-                        note = "3x uses main high-res camera crop on cameraId=${main.cameraId}."
+                        note = "3x uses main high-res camera crop on cameraId=${main.cameraId}.",
+                        requestedLensSlot = options.lensSlot,
+                        requestedThreeXSourceMode = options.threeXSourceMode,
+                        actualLensSource = ActualLensSource.MAIN_CROP_3X
                     )
                 }
             }
@@ -171,11 +272,24 @@ fun buildCameraSelectionDebugReport(context: Context): String {
                 "cameraId=${camera.cameraId}, " +
                     "focalLengths=${camera.focalLengths}, " +
                     "maxYuvMp=${"%.1f".format(camera.maxYuvMegapixels)}, " +
+                    "maxJpegMp=${"%.1f".format(camera.maxJpegMegapixels)}, " +
                     "maxRawMp=${"%.1f".format(camera.maxRawMegapixels)}, " +
                     "maxHighResMp=${"%.1f".format(camera.maxHighResMegapixels)}, " +
                     "ultraHighRes=${camera.supportsUltraHighResolution}, " +
-                    "supportsRaw=${camera.supportsRaw}"
+                    "supportsRaw=${camera.supportsRaw}, " +
+                    "logicalMultiCamera=${camera.isLogicalMultiCamera}, " +
+                    "capabilities=${camera.capabilities}, " +
+                    "physicalCameraIds=${camera.physicalCameras.map { it.physicalCameraId }}"
             )
+            camera.physicalCameras.forEach { physical ->
+                appendLine(
+                    "  physicalId=${physical.physicalCameraId}, facing=${physical.lensFacing}, " +
+                        "focalLengths=${physical.focalLengths}, " +
+                        "maxRAW/YUV/JPEG=${"%.1f".format(physical.maxRawMegapixels)}/" +
+                        "${"%.1f".format(physical.maxYuvMegapixels)}/" +
+                        "${"%.1f".format(physical.maxJpegMegapixels)}MP"
+                )
+            }
         }
     }.trim()
 }
@@ -251,8 +365,19 @@ private fun selectTeleCamera(
     }
 }
 
+private fun selectPhysicalTeleCamera(main: CameraCandidate): PhysicalCameraCandidate? {
+    val mainFocal = main.primaryFocalLength()
+    return main.physicalCameras
+        .filter { it.primaryFocalLength() >= mainFocal * 1.4f }
+        .maxByOrNull { it.primaryFocalLength() }
+}
+
 private fun CameraCandidate.primaryFocalLength(): Float {
     return focalLengths.minOrNull() ?: 0f
+}
+
+private fun PhysicalCameraCandidate.primaryFocalLength(): Float {
+    return focalLengths.maxOrNull() ?: 0f
 }
 
 private fun maxMegapixels(sizes: Array<Size>?): Double {
