@@ -56,10 +56,6 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.max
 
-private const val JOB_JSON_FILE_NAME = "job.json"
-private const val ALIGNMENT_JSON_FILE_NAME = "alignment.json"
-private const val NATIVE_POSTPROCESS_JSON_FILE_NAME = "native_postprocess.json"
-
 data class KeplerJobSummary(
     val jobDir: File,
     val group: String,
