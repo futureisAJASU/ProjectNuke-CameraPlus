@@ -35,6 +35,10 @@ internal val SideButtonSize: Dp = 56.dp
 internal val ShutterOuterSize: Dp = 84.dp
 internal val ShutterInnerSize: Dp = 64.dp
 private val ModeTabsSpacing: Dp = 1.dp
+private val TopOverlayHeight: Dp = 58.dp
+private val TopOverlayHorizontalPadding: Dp = 14.dp
+private val TopOverlayVerticalPadding: Dp = 4.dp
+private val TopMiniButtonSize: Dp = 46.dp
 
 @Composable
 fun CameraTopOverlay(
@@ -42,19 +46,23 @@ fun CameraTopOverlay(
     selectedResolution: CaptureResolutionMode,
     onHideFocusAeControls: () -> Unit,
     onResolutionClick: () -> Unit,
-    onSettings: () -> Unit
+    onSettings: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .statusBarsPadding()
-            .height(86.dp)
-            .background(Color.Black)
-            .padding(horizontal = 18.dp, vertical = 8.dp),
+            .padding(
+                horizontal = TopOverlayHorizontalPadding,
+                vertical = TopOverlayVerticalPadding
+            ),
         verticalArrangement = Arrangement.SpaceBetween
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(TopOverlayHeight),
             verticalAlignment = Alignment.CenterVertically
         ) {
             CircleMiniButton(label = "⚙", onClick = onSettings)
@@ -73,8 +81,8 @@ fun CameraTopOverlay(
         }
         Text(
             text = status,
-            color = Color.White.copy(alpha = 0.55f),
-            style = MaterialTheme.typography.labelMedium,
+            color = Color.White.copy(alpha = 0.42f),
+            style = MaterialTheme.typography.labelSmall,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.fillMaxWidth()
@@ -86,9 +94,9 @@ fun CameraTopOverlay(
 fun CircleMiniButton(label: String, onClick: () -> Unit) {
     Box(
         modifier = Modifier
-            .size(52.dp)
+            .size(TopMiniButtonSize)
             .clip(CircleShape)
-            .background(Color(0xFF1C1D24))
+            .background(Color(0x80202229))
             .border(
                 width = 1.dp,
                 color = Color.White.copy(alpha = 0.14f),
@@ -100,7 +108,7 @@ fun CircleMiniButton(label: String, onClick: () -> Unit) {
         Text(
             text = label,
             color = Color.White,
-            style = MaterialTheme.typography.titleMedium
+            style = MaterialTheme.typography.titleSmall
         )
     }
 }
@@ -110,7 +118,7 @@ fun TopText(text: String, onClick: () -> Unit) {
     Text(
         text = text,
         color = Color.White,
-        style = MaterialTheme.typography.titleMedium,
+        style = MaterialTheme.typography.titleSmall,
         modifier = Modifier.clickable(onClick = onClick)
     )
 }
