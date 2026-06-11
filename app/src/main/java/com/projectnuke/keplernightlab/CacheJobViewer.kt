@@ -193,7 +193,7 @@ fun CacheJobsScreen(onBack: () -> Unit) {
             item {
                 InspectorSection("No jobs") {
                     Text(
-                        "No job folders found under KeplerRawFusion, KeplerColorBurst, or KeplerYuvBurst.",
+                        "No job folders found under KeplerRawFusion, KeplerColorBurst, KeplerSuperRes, or KeplerYuvBurst.",
                         color = inspectorMuted
                     )
                 }
@@ -706,6 +706,7 @@ fun findKeplerJobDirectories(context: Context): List<File> {
     val roots = listOf(
         "KeplerRawFusion",
         "KeplerColorBurst",
+        "KeplerSuperRes",
         "KeplerYuvBurst",
         "KeplerRaw",
         "KeplerRawBurst"

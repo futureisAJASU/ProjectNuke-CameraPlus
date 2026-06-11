@@ -1858,7 +1858,8 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
 
         val latestJobDir = listOf(
             File(picturesDir, "KeplerColorBurst"),
-            File(picturesDir, "KeplerRawFusion")
+            File(picturesDir, "KeplerRawFusion"),
+            File(picturesDir, "KeplerSuperRes")
         )
             .flatMap { root ->
                 root.listFiles()
@@ -1882,7 +1883,7 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
         val bitmap = previewName.takeIf { it.isNotBlank() }
             ?.let { File(latestJobDir, it) }
             ?.takeIf { it.exists() }
-            ?.let { BitmapFactory.decodeFile(it.absolutePath) }
+            ?.let { decodeLatestResultPreview(it) }
 
         val summary = buildString {
             append("status=")
@@ -1910,4 +1911,22 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
     } catch (e: Exception) {
         LatestKeplerResult(null, "Latest result load failed: ${e.javaClass.simpleName}")
     }
+}
+
+private fun decodeLatestResultPreview(file: File, maxDimension: Int = 1280): Bitmap? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(file.absolutePath, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+    var sampleSize = 1
+    while (
+        bounds.outWidth / (sampleSize * 2) >= maxDimension ||
+        bounds.outHeight / (sampleSize * 2) >= maxDimension
+    ) {
+        sampleSize *= 2
+    }
+    return BitmapFactory.decodeFile(
+        file.absolutePath,
+        BitmapFactory.Options().apply { inSampleSize = sampleSize }
+    )
 }

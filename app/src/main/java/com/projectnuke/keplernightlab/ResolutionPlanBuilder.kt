@@ -10,6 +10,7 @@ private data class ResolutionPlanInputs(
     val capability: CameraResolutionCapability,
     val pipelineMode: PipelineMode,
     val normal12: Size?,
+    val yuv12: Size?,
     val native24Raw: Size?,
     val native24Yuv: Size?,
     val native24Jpeg: Size?,
@@ -62,10 +63,10 @@ private class ResolutionPlanFactory(private val inputs: ResolutionPlanInputs) {
         isFusion: Boolean
     ) = ResolutionCapturePlan(
         requestedMode = CaptureResolutionMode.MP24_FUSION,
-        actualInputMode = if (strategy == "50MP_DETAIL_TO_24MP_FUSION_V0") {
-            CaptureResolutionMode.MP50
-        } else {
-            CaptureResolutionMode.MP24_FUSION
+        actualInputMode = when (strategy) {
+            "50MP_DETAIL_TO_24MP_FUSION_V0" -> CaptureResolutionMode.MP50
+            "12MP_BINNED_BURST_SUPER_RES_V1" -> CaptureResolutionMode.MP12
+            else -> CaptureResolutionMode.MP24_FUSION
         },
         outputMode = CaptureResolutionMode.MP24_FUSION,
         cameraId = capability.cameraId,
@@ -97,6 +98,7 @@ fun allowedResolutionModesForLens(
             capability.maxAvailableRawMp > 0.0 ||
             capability.maxAvailableYuvMp > 0.0
     val has50 = capability.highResRawInputAvailable
+    val has12Yuv = capability.normalYuvSizes.any { megapixels(it) in 8.0..14.5 }
     val mp12 = ResolutionModeAvailability(
         CaptureResolutionMode.MP12,
         if (has12) {
@@ -129,23 +131,15 @@ fun allowedResolutionModesForLens(
             mp12,
             ResolutionModeAvailability(
                 CaptureResolutionMode.MP24_FUSION,
-                if (capability.native24RawAvailable || has50) {
+                if (has12Yuv) {
                     ResolutionAvailability.FUSION_AVAILABLE
                 } else {
                     ResolutionAvailability.UNAVAILABLE
                 },
-                when {
-                    capability.native24RawAvailable ->
-                        "Native 24MP RAW stream exposed. $PUBLIC_CAMERA2_24MP_NOTICE"
-                    has50 ->
-                        "24MP Fusion uses 50MP-class RAW detail input. " +
-                            PUBLIC_CAMERA2_24MP_NOTICE
-                    capability.native24YuvAvailable || capability.native24JpegAvailable ->
-                        "Processed 24MP stream exists, but RAW Fusion 24MP is unavailable. " +
-                            PUBLIC_CAMERA2_24MP_NOTICE
-                    else ->
-                        "24MP unavailable through public Camera2. " +
-                            PUBLIC_CAMERA2_24MP_NOTICE
+                if (has12Yuv) {
+                    "24M Fusion uses a multi-frame 12MP binned YUV burst."
+                } else {
+                    "24M Fusion unavailable: no 8-14.5MP YUV burst stream exposed."
                 }
             ),
             ResolutionModeAvailability(
@@ -166,15 +160,15 @@ fun allowedResolutionModesForLens(
             mp12,
             ResolutionModeAvailability(
                 CaptureResolutionMode.MP24_FUSION,
-                if (has50) {
+                if (has12Yuv) {
                     ResolutionAvailability.FUSION_AVAILABLE
                 } else {
                     ResolutionAvailability.UNAVAILABLE
                 },
-                if (has50) {
-                    "2x 24M uses 50M detail crop + fusion/SR; native 2x crop is about 12.5MP."
+                if (has12Yuv) {
+                    "2x 24M uses a cropped multi-frame 12MP binned YUV burst."
                 } else {
-                    "2x 24M Fusion needs 50M main stream."
+                    "2x 24M Fusion needs a 12MP YUV burst stream."
                 }
             ),
             ResolutionModeAvailability(
@@ -202,15 +196,15 @@ fun allowedResolutionModesForLens(
                 mp12,
                 ResolutionModeAvailability(
                     CaptureResolutionMode.MP24_FUSION,
-                    if (has50) {
+                    if (has12Yuv) {
                         ResolutionAvailability.FUSION_AVAILABLE
                     } else {
                         ResolutionAvailability.UNAVAILABLE
                     },
-                    if (has50) {
-                        "3x 24M uses main 50M crop + fusion/SR."
+                    if (has12Yuv) {
+                        "3x 24M uses a main-camera cropped multi-frame 12MP YUV burst."
                     } else {
-                        "3x crop 24M Fusion needs 50M main stream."
+                        "3x crop 24M Fusion needs a 12MP YUV burst stream."
                     }
                 ),
                 ResolutionModeAvailability(
@@ -257,6 +251,7 @@ private fun buildResolutionPlanInputs(
         capability = capability,
         pipelineMode = pipelineMode,
         normal12 = normal12,
+        yuv12 = yuv12,
         native24Raw = native24(
             capability.normalRawSizes + capability.maxRawSizes + capability.highResRawSizes
         ),
@@ -284,35 +279,6 @@ private fun buildResolutionPlanInputs(
     )
 }
 
-private fun build24MpRawPlan(
-    factory: ResolutionPlanFactory,
-    inputs: ResolutionPlanInputs,
-    detailReason: String,
-    unavailableReason: String = "24MP RAW Fusion unavailable."
-): ResolutionCapturePlan {
-    return when {
-        inputs.raw50 != null -> factory.plan24(
-            inputs.raw50,
-            "50MP_DETAIL_TO_24MP_FUSION_V0",
-            "$detailReason $PUBLIC_CAMERA2_24MP_NOTICE",
-            true
-        )
-        inputs.native24Raw != null -> factory.plan24(
-            inputs.native24Raw,
-            "native_24mp_raw_fallback",
-            "No 50MP-class RAW stream is exposed; using native 20-30MP public " +
-                "Camera2 RAW fallback. $PUBLIC_CAMERA2_24MP_NOTICE",
-            false
-        )
-        else -> factory.plan24(
-            null,
-            null,
-            "$unavailableReason $PUBLIC_CAMERA2_24MP_NOTICE",
-            false
-        )
-    }
-}
-
 private fun buildMain1xPlans(
     factory: ResolutionPlanFactory,
     inputs: ResolutionPlanInputs
@@ -329,15 +295,10 @@ private fun buildMain1xPlans(
                     inputs.capability.raw50Reason
                 }
             ),
-            build24MpRawPlan(
-                factory,
-                inputs,
-                "50MP-class RAW detail input selected for 24MP Fusion v0."
-            )
+            build24MpSuperResolutionPlan(factory, inputs, "Main 1x")
         )
     }
     val yuv50Available = inputs.yuv50 != null
-    val processed24 = inputs.native24Yuv ?: inputs.native24Jpeg
     return listOf(
         factory.plan50(
             yuv50Available,
@@ -349,22 +310,7 @@ private fun buildMain1xPlans(
                 else -> "50M unavailable: no >=40MP YUV stream exposed."
             }
         ),
-        factory.plan24(
-            processed24,
-            when {
-                inputs.native24Yuv != null -> "native_24mp_yuv_processed"
-                inputs.native24Jpeg != null -> "native_24mp_jpeg_processed"
-                else -> null
-            },
-            if (processed24 != null) {
-                "Processed 24MP public Camera2 stream selected. " +
-                    PUBLIC_CAMERA2_24MP_NOTICE
-            } else {
-                "Processed 24MP unavailable through public Camera2. " +
-                    PUBLIC_CAMERA2_24MP_NOTICE
-            },
-            false
-        )
+        build24MpSuperResolutionPlan(factory, inputs, "Main 1x")
     )
 }
 
@@ -372,24 +318,7 @@ private fun buildMain2xPlans(
     factory: ResolutionPlanFactory,
     inputs: ResolutionPlanInputs
 ): List<ResolutionCapturePlan> {
-    if (inputs.pipelineMode != PipelineMode.RAW_NIGHT_FUSION) return emptyList()
-    val plan = if (inputs.raw50 != null) {
-        factory.plan24(
-            inputs.raw50,
-            "50MP_DETAIL_TO_24MP_FUSION_V0",
-            "2x 24MP Fusion uses 50MP-class public Camera2 RAW detail input. " +
-                PUBLIC_CAMERA2_24MP_NOTICE,
-            true
-        )
-    } else {
-        build24MpRawPlan(
-            factory,
-            inputs,
-            "2x 24MP Fusion uses 50MP-class public Camera2 RAW detail input.",
-            "24MP unavailable through public Camera2."
-        )
-    }
-    return listOf(plan)
+    return listOf(build24MpSuperResolutionPlan(factory, inputs, "Main 2x crop"))
 }
 
 private fun buildThreeXPlans(
@@ -398,28 +327,29 @@ private fun buildThreeXPlans(
     threeXSourceMode: ThreeXSourceMode
 ): List<ResolutionCapturePlan> {
     if (
-        threeXSourceMode != ThreeXSourceMode.MAIN_CROP ||
-        inputs.pipelineMode != PipelineMode.RAW_NIGHT_FUSION
+        threeXSourceMode != ThreeXSourceMode.MAIN_CROP
     ) {
         return emptyList()
     }
-    val plan = if (inputs.raw50 != null) {
-        factory.plan24(
-            inputs.raw50,
-            "50MP_DETAIL_TO_24MP_FUSION_V0",
-            "3x 24MP Fusion uses 50MP-class public Camera2 RAW detail input. " +
-                PUBLIC_CAMERA2_24MP_NOTICE,
-            true
-        )
-    } else {
-        build24MpRawPlan(
-            factory,
-            inputs,
-            "3x 24MP Fusion uses 50MP-class public Camera2 RAW detail input.",
-            "24MP unavailable through public Camera2."
-        )
-    }
-    return listOf(plan)
+    return listOf(build24MpSuperResolutionPlan(factory, inputs, "Main 3x crop"))
+}
+
+private fun build24MpSuperResolutionPlan(
+    factory: ResolutionPlanFactory,
+    inputs: ResolutionPlanInputs,
+    lensDescription: String
+): ResolutionCapturePlan {
+    val input = inputs.yuv12
+    return factory.plan24(
+        inputSize = input,
+        strategy = "12MP_BINNED_BURST_SUPER_RES_V1",
+        reason = if (input != null) {
+            "$lensDescription 24M Fusion uses aligned multi-frame 12MP binned YUV input."
+        } else {
+            "$lensDescription 24M Fusion unavailable: no 8-14.5MP YUV stream exposed."
+        },
+        isFusion = true
+    )
 }
 
 fun buildResolutionCapturePlans(

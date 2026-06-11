@@ -214,7 +214,22 @@ internal fun startCapturePipeline(
     request: CapturePipelineRequest,
     onStatus: (String) -> Unit
 ) {
-    if (request.pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
+    if (request.selectedResolution == CaptureResolutionMode.MP24_FUSION) {
+        captureProcessExportSuperResolutionFusion(
+            context = request.context,
+            cameraId = request.prepared.selection.cameraId,
+            frameCount = request.prepared.framePlan.framesToCapture,
+            finalOutputFormat = request.finalOutputFormat,
+            zoomRatio = request.prepared.captureZoomRatio,
+            focusAeState = request.focusAeState,
+            frameCountMode = request.prepared.settings.mode,
+            autoMinFrames = request.prepared.settings.autoMinFrames,
+            autoMaxFrames = request.prepared.settings.autoMaxFrames,
+            manualFrames = request.prepared.settings.manualFrames,
+            framePlanReason = request.prepared.framePlan.reason,
+            onStatus = onStatus
+        )
+    } else if (request.pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
         captureProcessExportRawNightFusion(
             context = request.context,
             cameraId = request.prepared.selection.cameraId,
