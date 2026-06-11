@@ -1,4 +1,4 @@
-package com.projectnuke.keplernightlab
+﻿package com.projectnuke.keplernightlab
 
 import android.Manifest
 import android.content.Context
@@ -140,22 +140,22 @@ fun parseCaptureProgress(
     val lower = text.lowercase()
     val stage = when {
         text.contains("CAPTURE_TIMEOUT", ignoreCase = true) ||
-            text.contains("PROCESS_TIMEOUT", ignoreCase = true) ||
-            text.contains("EXPORT_TIMEOUT", ignoreCase = true) ||
-            lower.contains("timeout") -> CaptureStage.TIMEOUT
+                text.contains("PROCESS_TIMEOUT", ignoreCase = true) ||
+                text.contains("EXPORT_TIMEOUT", ignoreCase = true) ||
+                lower.contains("timeout") -> CaptureStage.TIMEOUT
         text.contains("PIPELINE_FAILED", ignoreCase = true) ||
-            lower.contains("failed") ||
-            text.contains("실패") ||
-            text.contains("오류") -> CaptureStage.FAILED
+                lower.contains("failed") ||
+                text.contains("실패") ||
+                text.contains("오류") -> CaptureStage.FAILED
         text.contains("PIPELINE_COMPLETE", ignoreCase = true) ||
-            text.contains("완료") ||
-            lower.contains("saved to gallery") -> CaptureStage.COMPLETE
+                text.contains("완료") ||
+                lower.contains("saved to gallery") -> CaptureStage.COMPLETE
         lower.contains("cleanup") || lower.contains("cleaning") -> CaptureStage.CLEANING
         lower.contains("verifying") || lower.contains("verification") -> CaptureStage.VERIFYING
         lower.contains("exporting") || lower.contains("export ") -> CaptureStage.EXPORTING
         lower.contains("demosaic") -> CaptureStage.DEMOSAICING
         text.contains("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true) ||
-            lower.contains("processing") || lower.contains("merging") || lower.contains("loading frames") -> CaptureStage.PROCESSING
+                lower.contains("processing") || lower.contains("merging") || lower.contains("loading frames") -> CaptureStage.PROCESSING
         lower.contains("capture") || lower.contains("capturing") || lower.contains("frame saved") -> CaptureStage.CAPTURING
         lower.contains("prepar") || text.contains("준비") || text.contains("초기화") -> CaptureStage.PREPARING
         else -> fallback.stage
@@ -939,31 +939,31 @@ fun CameraBottomPanel(
         ModeTabs()
 
         if (SHOW_LEGACY_RAW_ACTIONS) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            MiniActionButton(
-                modifier = Modifier.weight(1f),
-                text = "RAW",
-                enabled = !isCapturing,
-                onClick = onRaw
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                MiniActionButton(
+                    modifier = Modifier.weight(1f),
+                    text = "RAW",
+                    enabled = !isCapturing,
+                    onClick = onRaw
+                )
 
-            MiniActionButton(
-                modifier = Modifier.weight(1f),
-                text = "RAW 4장",
-                enabled = !isCapturing,
-                onClick = onRawBurst
-            )
+                MiniActionButton(
+                    modifier = Modifier.weight(1f),
+                    text = "RAW 4장",
+                    enabled = !isCapturing,
+                    onClick = onRawBurst
+                )
 
-            MiniActionButton(
-                modifier = Modifier.weight(1f),
-                text = "삭제",
-                enabled = !isCapturing,
-                onClick = onClear
-            )
-        }
+                MiniActionButton(
+                    modifier = Modifier.weight(1f),
+                    text = "삭제",
+                    enabled = !isCapturing,
+                    onClick = onClear
+                )
+            }
         }
     }
 }
