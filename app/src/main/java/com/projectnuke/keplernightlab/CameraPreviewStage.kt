@@ -4,7 +4,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -18,13 +17,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 
 @Composable
-internal fun ColumnScope.PreviewStage(
+internal fun PreviewStage(
     state: CameraPreviewPaneState,
-    callbacks: CameraPreviewPaneCallbacks
+    callbacks: CameraPreviewPaneCallbacks,
+    modifier: Modifier = Modifier
 ) {
     BoxWithConstraints(
-        modifier = Modifier
-            .weight(1f)
+        modifier = modifier
+            .fillMaxSize()
             .fillMaxWidth()
             .background(Color.Black),
         contentAlignment = Alignment.Center

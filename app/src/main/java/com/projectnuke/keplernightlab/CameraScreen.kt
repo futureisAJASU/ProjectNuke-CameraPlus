@@ -11,6 +11,11 @@ import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -21,7 +26,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -99,10 +103,6 @@ internal val KeplerDarkScheme = darkColorScheme(
 )
 
 private const val SHOW_LEGACY_RAW_ACTIONS = false
-private val BottomPanelHorizontalPadding: Dp = 16.dp
-private val BottomPanelTopPadding: Dp = 4.dp
-private val BottomPanelBottomPadding: Dp = 4.dp
-private val BottomPanelSpacing: Dp = 4.dp
 private val ZoomSelectorHorizontalPadding: Dp = 7.dp
 private val ZoomSelectorVerticalPadding: Dp = 4.dp
 private val ZoomSelectorItemWidth: Dp = 44.dp
@@ -111,6 +111,12 @@ private val ZoomSelectorItemCornerRadius: Dp = 15.dp
 private val CompactSliderHeight: Dp = 26.dp
 private val CompactSliderTrackHeight: Dp = 4.dp
 private val CompactSliderThumbSize: Dp = 12.dp
+private val BottomOverlayHorizontalPadding: Dp = 16.dp
+private val BottomOverlayBottomPadding: Dp = 8.dp
+private val BottomOverlaySpacing: Dp = 4.dp
+private val FloatingClusterHorizontalPadding: Dp = 10.dp
+private val FloatingClusterVerticalPadding: Dp = 8.dp
+private const val ZoomSliderAutoHideDelayMillis = 2500L
 
 private fun mapSliderPositionToValue(
     x: Float,
@@ -236,6 +242,7 @@ fun MainCameraScreen(
     var finalOutputFormat by remember { mutableStateOf(OutputSettingsStore.load(context)) }
     var focusAeState by remember { mutableStateOf(FocusAeState()) }
     var showFocusAeControls by remember { mutableStateOf(false) }
+    var showZoomSlider by remember { mutableStateOf(false) }
     var focusAeUiNonce by remember { mutableStateOf(0) }
     var overlaySettings by remember {
         mutableStateOf(UiOverlaySettingsStore.load(context))
@@ -296,6 +303,13 @@ fun MainCameraScreen(
         if (showFocusAeControls) {
             delay(2_000L)
             showFocusAeControls = false
+        }
+    }
+
+    LaunchedEffect(showZoomSlider, zoomUiState.zoomRatio) {
+        if (showZoomSlider) {
+            delay(ZoomSliderAutoHideDelayMillis)
+            showZoomSlider = false
         }
     }
 
@@ -394,86 +408,91 @@ fun MainCameraScreen(
             .fillMaxSize()
             .background(Color.Black)
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Color.Black)
-        ) {
-            CameraTopOverlay(
-                status = shortStatus(status),
-                selectedResolution = selectedResolution,
-                onHideFocusAeControls = { showFocusAeControls = false },
-                onResolutionClick = {
-                    val result = handleResolutionClick(
-                        selectedResolution = selectedResolution,
-                        allowedResolutionModes = resolutionState.allowedModes,
-                        resolutionCapability = resolutionState.capability,
-                        resolutionPlans = resolutionState.plans,
-                        selectedLensSlot = selectedLensSlot
-                    )
-                    selectedResolution = result.selectedResolution
-                    status = result.status
+        PreviewStage(
+            modifier = Modifier.fillMaxSize(),
+            state = CameraPreviewPaneState(
+                cameraSelection = cameraState.selection,
+                previewZoomRatio = cameraState.previewZoomRatio,
+                focusAeState = focusAeState,
+                previewEnabled = previewEnabled,
+                isCapturing = isCapturing,
+                showFocusAeControls = showFocusAeControls,
+                overlaySettings = overlaySettings,
+                levelState = levelState
+            ),
+            callbacks = CameraPreviewPaneCallbacks(
+                onFocusPoint = { point ->
+                    focusAeState = focusAeState.copy(point = point, locked = false)
+                    showFocusAeControls = true
+                    focusAeUiNonce++
+                    showZoomSlider = false
+                    status = "AF/AE point set"
                 },
-                onSettings = {
-                    currentScreen = MainScreen.SETTINGS
+                onAeCapabilitiesChanged = { minIndex, maxIndex, stepEv ->
+                    if (
+                        focusAeState.supportedMinIndex != minIndex ||
+                        focusAeState.supportedMaxIndex != maxIndex ||
+                        focusAeState.exposureStepEv != stepEv
+                    ) {
+                        val index = focusAeState.exposureCompensationIndex.coerceIn(minIndex, maxIndex)
+                        focusAeState = focusAeState.copy(
+                            supportedMinIndex = minIndex,
+                            supportedMaxIndex = maxIndex,
+                            exposureStepEv = stepEv,
+                            exposureCompensationIndex = index,
+                            exposureCompensationEv = index * stepEv
+                        )
+                    }
+                },
+                onToggleFocusLock = {
+                    val locked = !focusAeState.locked
+                    focusAeState = focusAeState.copy(locked = locked)
+                    showFocusAeControls = true
+                    focusAeUiNonce++
+                    showZoomSlider = false
+                    status = if (locked) "AF/AE locked" else "AF/AE unlocked"
+                },
+                onExposureStep = { delta ->
+                    val index = (focusAeState.exposureCompensationIndex + delta)
+                        .coerceIn(focusAeState.supportedMinIndex, focusAeState.supportedMaxIndex)
+                    focusAeState = focusAeState.copy(
+                        exposureCompensationIndex = index,
+                        exposureCompensationEv = index * focusAeState.exposureStepEv
+                    )
+                    showFocusAeControls = true
+                    focusAeUiNonce++
+                    showZoomSlider = false
+                    status = "EV ${"%.1f".format(index * focusAeState.exposureStepEv)}"
                 }
             )
-            PreviewStage(
-                state = CameraPreviewPaneState(
-                    cameraSelection = cameraState.selection,
-                    previewZoomRatio = cameraState.previewZoomRatio,
-                    focusAeState = focusAeState,
-                    previewEnabled = previewEnabled,
-                    isCapturing = isCapturing,
-                    showFocusAeControls = showFocusAeControls,
-                    overlaySettings = overlaySettings,
-                    levelState = levelState
-                ),
-                callbacks = CameraPreviewPaneCallbacks(
-                    onFocusPoint = { point ->
-                        focusAeState = focusAeState.copy(point = point, locked = false)
-                        showFocusAeControls = true
-                        focusAeUiNonce++
-                        status = "AF/AE point set"
-                    },
-                    onAeCapabilitiesChanged = { minIndex, maxIndex, stepEv ->
-                        if (
-                            focusAeState.supportedMinIndex != minIndex ||
-                            focusAeState.supportedMaxIndex != maxIndex ||
-                            focusAeState.exposureStepEv != stepEv
-                        ) {
-                            val index = focusAeState.exposureCompensationIndex.coerceIn(minIndex, maxIndex)
-                            focusAeState = focusAeState.copy(
-                                supportedMinIndex = minIndex,
-                                supportedMaxIndex = maxIndex,
-                                exposureStepEv = stepEv,
-                                exposureCompensationIndex = index,
-                                exposureCompensationEv = index * stepEv
-                            )
-                        }
-                    },
-                    onToggleFocusLock = {
-                        val locked = !focusAeState.locked
-                        focusAeState = focusAeState.copy(locked = locked)
-                        showFocusAeControls = true
-                        focusAeUiNonce++
-                        status = if (locked) "AF/AE locked" else "AF/AE unlocked"
-                    },
-                    onExposureStep = { delta ->
-                        val index = (focusAeState.exposureCompensationIndex + delta)
-                            .coerceIn(focusAeState.supportedMinIndex, focusAeState.supportedMaxIndex)
-                        focusAeState = focusAeState.copy(
-                            exposureCompensationIndex = index,
-                            exposureCompensationEv = index * focusAeState.exposureStepEv
-                        )
-                        showFocusAeControls = true
-                        focusAeUiNonce++
-                        status = "EV ${"%.1f".format(index * focusAeState.exposureStepEv)}"
-                    }
-                )
-            )
+        )
 
-            CameraBottomPanel(
+        CameraTopOverlay(
+            modifier = Modifier.align(Alignment.TopCenter),
+            status = shortStatus(status),
+            selectedResolution = selectedResolution,
+            onHideFocusAeControls = {
+                showFocusAeControls = false
+                showZoomSlider = false
+            },
+            onResolutionClick = {
+                val result = handleResolutionClick(
+                    selectedResolution = selectedResolution,
+                    allowedResolutionModes = resolutionState.allowedModes,
+                    resolutionCapability = resolutionState.capability,
+                    resolutionPlans = resolutionState.plans,
+                    selectedLensSlot = selectedLensSlot
+                )
+                selectedResolution = result.selectedResolution
+                status = result.status
+            },
+            onSettings = {
+                currentScreen = MainScreen.SETTINGS
+            }
+        )
+
+        CameraBottomPanel(
+                modifier = Modifier.align(Alignment.BottomCenter),
                 latestBitmap = latestBitmap,
                 selectedLensSlot = selectedLensSlot,
                 onLensSlotChange = { lensSlot ->
@@ -486,6 +505,7 @@ fun MainCameraScreen(
                     )
                     selectedLensSlot = lensSlot
                     zoomUiState = result.zoomUiState
+                    showZoomSlider = false
                     result.forcedResolution?.let { selectedResolution = it }
                     status = result.status
                 },
@@ -499,6 +519,7 @@ fun MainCameraScreen(
                     )
                     selectedThreeXSource = source
                     zoomUiState = result.zoomUiState
+                    showZoomSlider = false
                     result.forcedResolution?.let { selectedResolution = it }
                     status = result.status
                 },
@@ -506,10 +527,21 @@ fun MainCameraScreen(
                 latestFramePlan = latestFramePlan,
                 pipelineMode = pipelineMode,
                 zoomUiState = zoomUiState,
-                onZoomRatioChange = { applyZoomRatio(it) },
+                showZoomSlider = showZoomSlider,
+                onToggleZoomSlider = {
+                    showFocusAeControls = false
+                    showZoomSlider = !showZoomSlider
+                },
+                onZoomRatioChange = {
+                    showZoomSlider = true
+                    applyZoomRatio(it)
+                },
                 isCapturing = isCapturing,
                 captureProgress = captureProgress,
-                onHideFocusAeControls = { showFocusAeControls = false },
+                onHideFocusAeControls = {
+                    showFocusAeControls = false
+                    showZoomSlider = false
+                },
                 onCapture = captureClick@{
                     val clickResult = handleCaptureClick(
                         CaptureClickInput(
@@ -611,7 +643,6 @@ fun MainCameraScreen(
                     status = shortStatus(latestSummary)
                 }
             )
-        }
 
         if (currentScreen == MainScreen.SETTINGS) {
             SettingsScreen(
@@ -817,6 +848,7 @@ fun FocusAeOverlay(
 
 @Composable
 fun CameraBottomPanel(
+    modifier: Modifier = Modifier,
     latestBitmap: Bitmap?,
     selectedLensSlot: LensSlot,
     onLensSlotChange: (LensSlot) -> Unit,
@@ -826,6 +858,8 @@ fun CameraBottomPanel(
     latestFramePlan: FramePlan,
     pipelineMode: PipelineMode,
     zoomUiState: ZoomUiState,
+    showZoomSlider: Boolean,
+    onToggleZoomSlider: () -> Unit,
     onZoomRatioChange: (Float) -> Unit,
     isCapturing: Boolean,
     captureProgress: CaptureProgressState,
@@ -838,105 +872,133 @@ fun CameraBottomPanel(
     onThumbnail: () -> Unit
 ) {
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
-            .background(Color.Black)
             .navigationBarsPadding()
             .padding(
-                start = BottomPanelHorizontalPadding,
-                end = BottomPanelHorizontalPadding,
-                top = BottomPanelTopPadding,
-                bottom = BottomPanelBottomPadding
+                start = BottomOverlayHorizontalPadding,
+                end = BottomOverlayHorizontalPadding,
+                top = 0.dp,
+                bottom = BottomOverlayBottomPadding
             ),
-        verticalArrangement = Arrangement.spacedBy(BottomPanelSpacing)
+        verticalArrangement = Arrangement.spacedBy(BottomOverlaySpacing)
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.Center,
-            verticalAlignment = Alignment.CenterVertically
+        AnimatedVisibility(
+            visible = showZoomSlider,
+            enter = fadeIn() + expandVertically(),
+            exit = fadeOut() + shrinkVertically()
         ) {
-            ZoomSelector(
-                selected = selectedLensSlot,
-                onSelect = onLensSlotChange
-            )
-
-            if (selectedLensSlot == LensSlot.THREE_X) {
-                Spacer(modifier = Modifier.size(12.dp))
-
-                ThreeXSourceDots(
-                    selected = selectedThreeXSource,
-                    onSelect = onThreeXSourceChange
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(Color(0xAA111218))
+                    .padding(
+                        horizontal = FloatingClusterHorizontalPadding,
+                        vertical = FloatingClusterVerticalPadding
+                    ),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                Text(
+                    text = "${"%.1f".format(zoomUiState.zoomRatio)}x",
+                    color = Color.White.copy(alpha = 0.72f),
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier
+                        .align(Alignment.CenterHorizontally)
+                        .clickable(onClick = onToggleZoomSlider)
+                )
+                CompactZoomSlider(
+                    value = zoomUiState.zoomRatio,
+                    onZoomRatioChange = onZoomRatioChange,
+                    valueRange = zoomUiState.minZoom..zoomUiState.maxZoom,
+                    modifier = Modifier.fillMaxWidth()
                 )
             }
         }
 
         Column(
-            modifier = Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(2.dp)
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(22.dp))
+                .background(Color(0x54111218))
+                .padding(
+                    horizontal = FloatingClusterHorizontalPadding,
+                    vertical = FloatingClusterVerticalPadding
+                ),
+            verticalArrangement = Arrangement.spacedBy(BottomOverlaySpacing)
         ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onToggleZoomSlider),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                ZoomSelector(
+                    selected = selectedLensSlot,
+                    onSelect = onLensSlotChange
+                )
+
+                if (selectedLensSlot == LensSlot.THREE_X) {
+                    Spacer(modifier = Modifier.size(12.dp))
+
+                    ThreeXSourceDots(
+                        selected = selectedThreeXSource,
+                        onSelect = onThreeXSourceChange
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                ResultThumbnail(
+                    bitmap = latestBitmap,
+                    onClick = onThumbnail
+                )
+
+                Spacer(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable(onClick = onHideFocusAeControls)
+                )
+
+                ShutterButton(
+                    enabled = !isCapturing,
+                    isCapturing = isCapturing,
+                    onClick = onCapture
+                )
+
+                Spacer(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable(onClick = onHideFocusAeControls)
+                )
+
+                CameraSwitchButton(
+                    enabled = !isCapturing,
+                    onClick = onAverage
+                )
+            }
+
             Text(
-                text = "${"%.1f".format(zoomUiState.zoomRatio)}x",
-                color = Color.White.copy(alpha = 0.72f),
+                text = if (frameCountMode == FrameCountMode.AUTO) {
+                    "${pipelineMode.label}  |  Auto: ${latestFramePlan.framesToCapture} / ${latestFramePlan.maxFrames} frames"
+                } else {
+                    "${pipelineMode.label}  |  Manual: ${latestFramePlan.framesToCapture} frames"
+                },
+                color = Color.White.copy(alpha = 0.58f),
                 style = MaterialTheme.typography.labelMedium,
                 modifier = Modifier.align(Alignment.CenterHorizontally)
             )
-            CompactZoomSlider(
-                value = zoomUiState.zoomRatio,
-                onZoomRatioChange = onZoomRatioChange,
-                valueRange = zoomUiState.minZoom..zoomUiState.maxZoom,
-                modifier = Modifier.fillMaxWidth()
-            )
+
+            if (isCapturing) {
+                CaptureProgressRow(captureProgress = captureProgress)
+            }
+
+            ModeTabs()
         }
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            ResultThumbnail(
-                bitmap = latestBitmap,
-                onClick = onThumbnail
-            )
-
-            Spacer(
-                modifier = Modifier
-                    .weight(1f)
-                    .clickable(onClick = onHideFocusAeControls)
-            )
-
-            ShutterButton(
-                enabled = !isCapturing,
-                isCapturing = isCapturing,
-                onClick = onCapture
-            )
-
-            Spacer(
-                modifier = Modifier
-                    .weight(1f)
-                    .clickable(onClick = onHideFocusAeControls)
-            )
-
-            CameraSwitchButton(
-                enabled = !isCapturing,
-                onClick = onAverage
-            )
-        }
-
-        Text(
-            text = if (frameCountMode == FrameCountMode.AUTO) {
-                "${pipelineMode.label}  |  Auto: ${latestFramePlan.framesToCapture} / ${latestFramePlan.maxFrames} frames"
-            } else {
-                "${pipelineMode.label}  |  Manual: ${latestFramePlan.framesToCapture} frames"
-            },
-            color = Color.White.copy(alpha = 0.58f),
-            style = MaterialTheme.typography.labelMedium,
-            modifier = Modifier.align(Alignment.CenterHorizontally)
-        )
-
-        if (isCapturing) {
-            CaptureProgressRow(captureProgress = captureProgress)
-        }
-
-        ModeTabs()
 
         if (SHOW_LEGACY_RAW_ACTIONS) {
             Row(
