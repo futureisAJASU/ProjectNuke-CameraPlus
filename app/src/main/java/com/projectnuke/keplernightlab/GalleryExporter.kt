@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.MediaStore
+import android.util.Log
 import androidx.heifwriter.HeifWriter
 import org.json.JSONArray
 import org.json.JSONObject
@@ -312,8 +313,9 @@ private fun writeHeifViaTempFile(
     output: OutputStream
 ): Boolean {
     val tempFile = File.createTempFile("kepler_export_", ".heic", context.cacheDir)
+    var writer: HeifWriter? = null
     return try {
-        val writer = HeifWriter.Builder(
+        val createdWriter = HeifWriter.Builder(
             tempFile.absolutePath,
             bitmap.width,
             bitmap.height,
@@ -321,13 +323,17 @@ private fun writeHeifViaTempFile(
         )
             .setQuality(quality)
             .build()
-        writer.start()
-        writer.addBitmap(bitmap)
-        writer.stop(5_000)
-        writer.close()
+        writer = createdWriter
+        createdWriter.start()
+        createdWriter.addBitmap(bitmap)
+        createdWriter.stop(5_000)
         FileInputStream(tempFile).use { input -> input.copyTo(output) }
         true
     } finally {
-        tempFile.delete()
+        runCatching { writer?.close() }
+            .onFailure { Log.w("KeplerGalleryExporter", "Failed to close HEIF writer.", it) }
+        if (tempFile.exists() && !tempFile.delete()) {
+            Log.w("KeplerGalleryExporter", "Failed to delete temporary HEIF file: ${tempFile.absolutePath}")
+        }
     }
 }

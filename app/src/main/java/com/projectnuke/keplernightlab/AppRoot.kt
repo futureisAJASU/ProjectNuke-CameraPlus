@@ -20,10 +20,13 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBars
@@ -33,6 +36,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -120,9 +124,492 @@ private val KeplerDarkScheme = darkColorScheme(
     onSurface = Color.White
 )
 
+private const val SHOW_LEGACY_RAW_ACTIONS = false
+
 private enum class MainScreen {
     CAMERA,
     SETTINGS
+}
+
+private data class ResolutionClickResult(
+    val selectedResolution: CaptureResolutionMode,
+    val status: String
+)
+
+private data class LensChangeResult(
+    val zoomUiState: ZoomUiState,
+    val forcedResolution: CaptureResolutionMode?,
+    val status: String
+)
+
+private data class CapturePreparationInput(
+    val options: SelectedCaptureOptions,
+    val resolutionPlan: ResolutionCapturePlan,
+    val selectedResolution: CaptureResolutionMode,
+    val selectedLensSlot: LensSlot,
+    val selectedThreeXSource: ThreeXSourceMode,
+    val zoomUiState: ZoomUiState,
+    val frameCountMode: FrameCountMode,
+    val autoMinFrames: Int,
+    val autoMaxFrames: Int,
+    val manualFrames: Int,
+    val selectedMode: String,
+    val latestSceneLuma: Double?,
+    val latestMotionScore: Double?
+)
+
+private data class PreparedCaptureAttempt(
+    val settings: FrameCountSettings,
+    val framePlan: FramePlan,
+    val selection: CameraSelection,
+    val captureZoomRatio: Float,
+    val startMessage: String
+)
+
+private data class CameraSelectionUiState(
+    val options: SelectedCaptureOptions,
+    val selection: CameraSelection,
+    val previewZoomRatio: Float
+)
+
+private data class ResolutionUiState(
+    val capability: CameraResolutionCapability?,
+    val plans: List<ResolutionCapturePlan>,
+    val allowedModes: List<CaptureResolutionMode>,
+    val selectedPlan: ResolutionCapturePlan?
+)
+
+private data class CaptureClickInput(
+    val context: Context,
+    val selectedResolution: CaptureResolutionMode,
+    val resolutionPlans: List<ResolutionCapturePlan>,
+    val selectedResolutionPlan: ResolutionCapturePlan?,
+    val buildPreparationInput: (ResolutionCapturePlan) -> CapturePreparationInput
+)
+
+private sealed interface CaptureClickResult {
+    data class InvalidResolution(val status: String) : CaptureClickResult
+
+    data class Ready(
+        val resolutionPlan: ResolutionCapturePlan,
+        val prepared: PreparedCaptureAttempt
+    ) : CaptureClickResult
+}
+
+private data class CapturePipelineRequest(
+    val context: Context,
+    val pipelineMode: PipelineMode,
+    val prepared: PreparedCaptureAttempt,
+    val selectedResolution: CaptureResolutionMode,
+    val resolutionPlan: ResolutionCapturePlan,
+    val finalOutputFormat: FinalOutputFormat,
+    val focusAeState: FocusAeState
+)
+
+private data class CameraPreviewPaneState(
+    val cameraSelection: CameraSelection,
+    val previewZoomRatio: Float,
+    val focusAeState: FocusAeState,
+    val previewEnabled: Boolean,
+    val isCapturing: Boolean,
+    val showFocusAeControls: Boolean,
+    val overlaySettings: UiOverlaySettings,
+    val levelState: DeviceLevelState
+)
+
+private data class CameraPreviewPaneCallbacks(
+    val onFocusPoint: (NormalizedPoint) -> Unit,
+    val onAeCapabilitiesChanged: (Int, Int, Float) -> Unit,
+    val onToggleFocusLock: () -> Unit,
+    val onExposureStep: (Int) -> Unit
+)
+
+private fun cameraSelectionStatus(selection: CameraSelection): String {
+    val source = when (selection.actualLensSource) {
+        ActualLensSource.OPTICAL_TELE_LOGICAL -> "3x optical tele"
+        ActualLensSource.OPTICAL_TELE_PHYSICAL -> "3x physical optical tele"
+        ActualLensSource.OPTICAL_TELE_UNAVAILABLE_FALLBACK_CROP -> "3x crop fallback"
+        ActualLensSource.MAIN_CROP_3X -> "3x main crop"
+        ActualLensSource.MAIN_CROP_2X -> "2x main crop"
+        ActualLensSource.ULTRAWIDE -> "ultrawide"
+        ActualLensSource.MAIN_1X -> "main 1x"
+    }
+    return "$source: cameraId=${selection.cameraId}" +
+        (selection.physicalCameraId?.let { ", physicalCameraId=$it" } ?: "") +
+        ", zoom=${selection.effectiveZoomRatio}, crop=${selection.useCrop}. " +
+        selection.diagnosticReason
+}
+
+private fun handleResolutionClick(
+    selectedResolution: CaptureResolutionMode,
+    allowedResolutionModes: List<CaptureResolutionMode>,
+    resolutionCapability: CameraResolutionCapability?,
+    resolutionPlans: List<ResolutionCapturePlan>,
+    selectedLensSlot: LensSlot
+): ResolutionClickResult {
+    val modes = allowedResolutionModes.ifEmpty { listOf(CaptureResolutionMode.MP12) }
+    val capabilityText = resolutionCapability?.let {
+        "${selectedLensSlot.label} cameraId=${it.cameraId} raw50=${it.raw50Available} " +
+            "yuv50=${it.yuv50Available} jpeg50=${it.jpeg50Available} " +
+            "maxRAW=${"%.1f".format(it.maxAvailableRawMp)}MP " +
+            "modes=${modes.joinToString { mode -> mode.label }}"
+    } ?: "Resolution capability unavailable."
+    if (modes.size <= 1) {
+        val reason = resolutionPlans
+            .firstOrNull { it.requestedMode == CaptureResolutionMode.MP50 && !it.isAvailable }
+            ?.reason
+            ?: resolutionPlans
+                .firstOrNull { it.requestedMode != CaptureResolutionMode.MP12 && !it.isAvailable }
+                ?.reason
+            ?: "no 50MP RAW/YUV/JPEG stream exposed for selected main camera."
+        return ResolutionClickResult(
+            CaptureResolutionMode.MP12,
+            "Only 12M: $reason $capabilityText"
+        )
+    }
+    val index = modes.indexOf(selectedResolution).coerceAtLeast(0)
+    val next = modes[(index + 1) % modes.size]
+    return ResolutionClickResult(next, "Resolution: ${next.label}. $capabilityText")
+}
+
+private fun handleLensSlotChange(
+    context: Context,
+    options: SelectedCaptureOptions,
+    lensSlot: LensSlot,
+    selectedThreeXSource: ThreeXSourceMode,
+    zoomUiState: ZoomUiState
+): LensChangeResult {
+    val clampedZoom =
+        lensSlot.targetZoomRatio.coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
+    val updatedZoomState = zoomUiState.copy(
+        zoomRatio = clampedZoom,
+        lensSlot = lensSlot,
+        useOpticalTeleAt3x = selectedThreeXSource == ThreeXSourceMode.OPTICAL
+    )
+    val forcedResolution = if (
+        lensSlot == LensSlot.ULTRAWIDE ||
+        (lensSlot == LensSlot.THREE_X && selectedThreeXSource == ThreeXSourceMode.OPTICAL)
+    ) {
+        CaptureResolutionMode.MP12
+    } else {
+        null
+    }
+    val selection = selectCameraForOptions(context, options.copy(lensSlot = lensSlot))
+    return LensChangeResult(
+        updatedZoomState,
+        forcedResolution,
+        cameraSelectionStatus(selection)
+    )
+}
+
+private fun handleThreeXSourceChange(
+    context: Context,
+    options: SelectedCaptureOptions,
+    source: ThreeXSourceMode,
+    zoomUiState: ZoomUiState
+): LensChangeResult {
+    val updatedZoomState =
+        zoomUiState.copy(useOpticalTeleAt3x = source == ThreeXSourceMode.OPTICAL)
+    val selection = selectCameraForOptions(
+        context,
+        options.copy(
+            lensSlot = LensSlot.THREE_X,
+            threeXSourceMode = source
+        )
+    )
+    return LensChangeResult(
+        updatedZoomState,
+        CaptureResolutionMode.MP12.takeIf { source == ThreeXSourceMode.OPTICAL },
+        cameraSelectionStatus(selection)
+    )
+}
+
+private fun calculateCaptureZoomRatio(
+    selection: CameraSelection,
+    selectedLensSlot: LensSlot,
+    selectedThreeXSource: ThreeXSourceMode,
+    zoomUiState: ZoomUiState
+): Float {
+    return if (
+        selectedLensSlot == LensSlot.THREE_X &&
+        selectedThreeXSource == ThreeXSourceMode.OPTICAL &&
+        !selection.useCrop
+    ) {
+        1.0f
+    } else {
+        zoomUiState.zoomRatio.coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
+    }
+}
+
+private fun buildCaptureStartMessage(
+    selectedResolution: CaptureResolutionMode,
+    selection: CameraSelection,
+    resolutionPlan: ResolutionCapturePlan,
+    settings: FrameCountSettings,
+    framePlan: FramePlan
+): String {
+    return "Night Fusion ${selectedResolution.label}. ${cameraSelectionStatus(selection)} " +
+        "${resolutionPlan.reason} Frame mode: ${settings.mode.label}, " +
+        "capture frames: ${framePlan.framesToCapture}, auto max: ${framePlan.maxFrames}. " +
+        "${framePlan.reason}."
+}
+
+private fun prepareCaptureAttempt(
+    context: Context,
+    input: CapturePreparationInput
+): PreparedCaptureAttempt {
+    val settings = currentFrameCountSettings(
+        mode = input.frameCountMode,
+        autoMinFrames = input.autoMinFrames,
+        autoMaxFrames = input.autoMaxFrames,
+        manualFrames = input.manualFrames
+    )
+    val framePlan = estimateFramePlan(
+        settings = settings,
+        selectedModeLabel = input.selectedMode,
+        latestSceneLuma = input.latestSceneLuma,
+        latestMotionScore = input.latestMotionScore
+    )
+    val selection = selectCameraForOptions(context, input.options)
+    val captureZoomRatio = calculateCaptureZoomRatio(
+        selection,
+        input.selectedLensSlot,
+        input.selectedThreeXSource,
+        input.zoomUiState
+    )
+    return PreparedCaptureAttempt(
+        settings = settings,
+        framePlan = framePlan,
+        selection = selection,
+        captureZoomRatio = captureZoomRatio,
+        startMessage = buildCaptureStartMessage(
+            input.selectedResolution,
+            selection,
+            input.resolutionPlan,
+            settings,
+            framePlan
+        )
+    )
+}
+
+@Composable
+private fun rememberCameraSelectionState(
+    context: Context,
+    selectedResolution: CaptureResolutionMode,
+    selectedLensSlot: LensSlot,
+    selectedThreeXSource: ThreeXSourceMode,
+    zoomUiState: ZoomUiState,
+    capabilityRefreshNonce: Int
+): CameraSelectionUiState {
+    val options = SelectedCaptureOptions(
+        lensSlot = selectedLensSlot,
+        resolutionMode = selectedResolution,
+        threeXSourceMode = selectedThreeXSource
+    )
+    val selection = remember(
+        selectedLensSlot,
+        selectedThreeXSource,
+        capabilityRefreshNonce
+    ) {
+        selectCameraForOptions(
+            context,
+            options.copy(resolutionMode = CaptureResolutionMode.MP12)
+        )
+    }
+    val previewZoomRatio = when {
+        selection.useCrop -> zoomUiState.zoomRatio.coerceIn(1.0f, zoomUiState.maxZoom)
+        selectedLensSlot == LensSlot.THREE_X &&
+            selectedThreeXSource == ThreeXSourceMode.OPTICAL -> 1.0f
+        else -> zoomUiState.zoomRatio
+    }
+    return CameraSelectionUiState(options, selection, previewZoomRatio)
+}
+
+@Composable
+private fun rememberResolutionState(
+    context: Context,
+    cameraSelection: CameraSelection,
+    selectedResolution: CaptureResolutionMode,
+    selectedLensSlot: LensSlot,
+    selectedThreeXSource: ThreeXSourceMode,
+    pipelineMode: PipelineMode,
+    capabilityRefreshNonce: Int
+): ResolutionUiState {
+    val capability = remember(
+        cameraSelection.cameraId,
+        selectedLensSlot,
+        selectedThreeXSource,
+        capabilityRefreshNonce
+    ) {
+        runCatching {
+            queryCameraResolutionCapability(context, cameraSelection.cameraId, selectedLensSlot)
+        }.getOrNull()
+    }
+    val plans = remember(selectedLensSlot, selectedThreeXSource, pipelineMode, capability) {
+        capability
+            ?.let { buildResolutionCapturePlans(selectedLensSlot, selectedThreeXSource, pipelineMode, it) }
+            .orEmpty()
+    }
+    val allowedModes = remember(plans) {
+        plans
+            .filter { it.isAvailable }
+            .map { it.requestedMode }
+            .ifEmpty { listOf(CaptureResolutionMode.MP12) }
+    }
+    val selectedPlan = remember(selectedResolution, plans) {
+        plans.firstOrNull { it.requestedMode == selectedResolution && it.isAvailable }
+    }
+    return ResolutionUiState(capability, plans, allowedModes, selectedPlan)
+}
+
+private fun handleCaptureClick(input: CaptureClickInput): CaptureClickResult {
+    val activePlan = input.selectedResolutionPlan
+    if (activePlan == null) {
+        val reason = input.resolutionPlans
+            .firstOrNull { it.requestedMode == input.selectedResolution }
+            ?.reason
+            ?: "Selected resolution has no valid capture plan."
+        return CaptureClickResult.InvalidResolution("Resolution changed to 12M: $reason")
+    }
+    return CaptureClickResult.Ready(
+        resolutionPlan = activePlan,
+        prepared = prepareCaptureAttempt(input.context, input.buildPreparationInput(activePlan))
+    )
+}
+
+private fun startCapturePipeline(
+    request: CapturePipelineRequest,
+    onStatus: (String) -> Unit
+) {
+    if (request.pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
+        captureProcessExportRawNightFusion(
+            context = request.context,
+            cameraId = request.prepared.selection.cameraId,
+            frameCount = request.prepared.framePlan.framesToCapture,
+            resolutionMode = request.selectedResolution,
+            resolutionPlan = request.resolutionPlan,
+            finalOutputFormat = request.finalOutputFormat,
+            zoomRatio = request.prepared.captureZoomRatio,
+            focusAeState = request.focusAeState,
+            cleanupPolicy = CacheCleanupPolicy.KEEP_ALL,
+            onStatus = onStatus
+        )
+    } else {
+        captureProcessExportNightFusion(
+            context = request.context,
+            cameraId = request.prepared.selection.cameraId,
+            frameCount = request.prepared.framePlan.framesToCapture,
+            resolutionMode = request.selectedResolution,
+            finalOutputFormat = request.finalOutputFormat,
+            zoomRatio = request.prepared.captureZoomRatio,
+            focusAeState = request.focusAeState,
+            cleanupPolicy = CacheCleanupPolicy.DELETE_SOURCE_FRAMES_AFTER_VERIFIED_EXPORT,
+            frameCountMode = request.prepared.settings.mode,
+            autoMinFrames = request.prepared.settings.autoMinFrames,
+            autoMaxFrames = request.prepared.settings.autoMaxFrames,
+            manualFrames = request.prepared.settings.manualFrames,
+            framePlanReason = request.prepared.framePlan.reason,
+            onStatus = onStatus
+        )
+    }
+}
+
+private fun isTerminalStatus(text: String): Boolean {
+    return text.contains("PIPELINE_COMPLETE", ignoreCase = true) ||
+        text.contains("PIPELINE_FAILED", ignoreCase = true) ||
+        text.contains("CAPTURE_TIMEOUT", ignoreCase = true) ||
+        text.contains("PROCESS_TIMEOUT", ignoreCase = true) ||
+        text.contains("EXPORT_TIMEOUT", ignoreCase = true) ||
+        text.contains("timeout", ignoreCase = true) ||
+        text.contains("failed", ignoreCase = true) ||
+        text.contains("완료") ||
+        text.contains("실패") ||
+        text.contains("오류") ||
+        text.contains("연결 해제")
+}
+
+private fun shortStatus(text: String): String =
+    text.lineSequence().firstOrNull()?.trim()?.take(42) ?: "대기 중"
+
+@Composable
+private fun ColumnScope.PreviewStage(
+    state: CameraPreviewPaneState,
+    callbacks: CameraPreviewPaneCallbacks
+) {
+    BoxWithConstraints(
+        modifier = Modifier
+            .weight(1f)
+            .fillMaxWidth()
+            .background(Color.Black),
+        contentAlignment = Alignment.Center
+    ) {
+        val portraitPhotoAspectRatio = 3f / 4f
+        val previewModifier = if (maxWidth / portraitPhotoAspectRatio <= maxHeight) {
+            Modifier
+                .fillMaxWidth()
+                .aspectRatio(portraitPhotoAspectRatio)
+        } else {
+            Modifier
+                .fillMaxHeight()
+                .aspectRatio(portraitPhotoAspectRatio)
+        }
+
+        Box(
+            modifier = previewModifier
+                .background(Color.Black)
+                .pointerInput(Unit) {
+                    detectTapGestures { offset ->
+                        callbacks.onFocusPoint(
+                            NormalizedPoint(
+                                (offset.x / size.width).coerceIn(0f, 1f),
+                                (offset.y / size.height).coerceIn(0f, 1f)
+                            )
+                        )
+                    }
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            Camera2Preview(
+                modifier = Modifier.fillMaxSize(),
+                cameraId = state.cameraSelection.cameraId,
+                zoomRatio = state.previewZoomRatio,
+                focusAeState = state.focusAeState,
+                enabled = state.previewEnabled,
+                onAeCapabilitiesChanged = callbacks.onAeCapabilitiesChanged
+            )
+
+            if (state.overlaySettings.showGrid) {
+                RuleOfThirdsGridOverlay(Modifier.fillMaxSize())
+            }
+            if (state.overlaySettings.showLevel) {
+                LevelIndicatorOverlay(
+                    levelState = state.levelState,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+            if (state.focusAeState.point != null && state.showFocusAeControls) {
+                FocusAeOverlay(
+                    focusAeState = state.focusAeState,
+                    onToggleLock = callbacks.onToggleFocusLock,
+                    onExposureStep = callbacks.onExposureStep
+                )
+            }
+            if (!state.previewEnabled) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color(0x66000000)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = if (state.isCapturing) "Capturing..." else "Preview paused",
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleLarge
+                    )
+                }
+            }
+        }
+    }
 }
 
 private val progressPairRegex = Regex("(saved|images|results)\\s+(\\d+)\\s*/\\s*(\\d+)", RegexOption.IGNORE_CASE)
@@ -325,7 +812,7 @@ fun MainCameraScreen(
     var currentScreen by remember { mutableStateOf(MainScreen.CAMERA) }
     var captureProgress by remember { mutableStateOf(CaptureProgressState()) }
 
-    var selectedMode by remember { mutableStateOf("사진") }
+    val selectedMode = "사진"
     var selectedResolution by remember { mutableStateOf(CaptureResolutionMode.MP12) }
     var selectedLensSlot by remember { mutableStateOf(LensSlot.MAIN_1X) }
     var selectedThreeXSource by remember { mutableStateOf(ThreeXSourceMode.OPTICAL) }
@@ -355,47 +842,23 @@ fun MainCameraScreen(
         )
     }
 
-    val options = SelectedCaptureOptions(
-        lensSlot = selectedLensSlot,
-        resolutionMode = selectedResolution,
-        threeXSourceMode = selectedThreeXSource
+    val cameraState = rememberCameraSelectionState(
+        context = context,
+        selectedResolution = selectedResolution,
+        selectedLensSlot = selectedLensSlot,
+        selectedThreeXSource = selectedThreeXSource,
+        zoomUiState = zoomUiState,
+        capabilityRefreshNonce = capabilityRefreshNonce
     )
-    val cameraSelection = remember(selectedLensSlot, selectedThreeXSource, capabilityRefreshNonce) {
-        selectCameraForOptions(
-            context,
-            SelectedCaptureOptions(
-                lensSlot = selectedLensSlot,
-                resolutionMode = CaptureResolutionMode.MP12,
-                threeXSourceMode = selectedThreeXSource
-            )
-        )
-    }
-    val resolutionCapability = remember(cameraSelection.cameraId, selectedLensSlot, selectedThreeXSource, capabilityRefreshNonce) {
-        runCatching {
-            queryCameraResolutionCapability(context, cameraSelection.cameraId, selectedLensSlot)
-        }.getOrNull()
-    }
-    val resolutionPlans = remember(selectedLensSlot, selectedThreeXSource, pipelineMode, resolutionCapability) {
-        resolutionCapability
-            ?.let { buildResolutionCapturePlans(selectedLensSlot, selectedThreeXSource, pipelineMode, it) }
-            .orEmpty()
-    }
-    val allowedResolutionModes = remember(resolutionPlans) {
-        resolutionPlans
-            .filter { it.isAvailable }
-            .map { it.requestedMode }
-            .ifEmpty { listOf(CaptureResolutionMode.MP12) }
-    }
-    val selectedResolutionPlan = remember(selectedResolution, resolutionPlans) {
-        resolutionPlans.firstOrNull { it.requestedMode == selectedResolution && it.isAvailable }
-    }
-    val previewZoomRatio = if (cameraSelection.useCrop) {
-        zoomUiState.zoomRatio.coerceIn(1.0f, zoomUiState.maxZoom)
-    } else if (selectedLensSlot == LensSlot.THREE_X && selectedThreeXSource == ThreeXSourceMode.OPTICAL) {
-        1.0f
-    } else {
-        zoomUiState.zoomRatio
-    }
+    val resolutionState = rememberResolutionState(
+        context = context,
+        cameraSelection = cameraState.selection,
+        selectedResolution = selectedResolution,
+        selectedLensSlot = selectedLensSlot,
+        selectedThreeXSource = selectedThreeXSource,
+        pipelineMode = pipelineMode,
+        capabilityRefreshNonce = capabilityRefreshNonce
+    )
     val levelState = rememberDeviceLevelState(enabled = overlaySettings.showLevel)
 
     var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
@@ -421,8 +884,8 @@ fun MainCameraScreen(
         }
     }
 
-    LaunchedEffect(selectedLensSlot, selectedThreeXSource, allowedResolutionModes) {
-        if (selectedResolution !in allowedResolutionModes) {
+    LaunchedEffect(selectedLensSlot, selectedThreeXSource, resolutionState.allowedModes) {
+        if (selectedResolution !in resolutionState.allowedModes) {
             selectedResolution = CaptureResolutionMode.MP12
             status = "Resolution changed to 12M: selected lens does not support current mode."
         }
@@ -443,24 +906,6 @@ fun MainCameraScreen(
         )
     }
 
-    fun isTerminalStatus(text: String): Boolean {
-        return text.contains("PIPELINE_COMPLETE", ignoreCase = true) ||
-                text.contains("PIPELINE_FAILED", ignoreCase = true) ||
-                text.contains("CAPTURE_TIMEOUT", ignoreCase = true) ||
-                text.contains("PROCESS_TIMEOUT", ignoreCase = true) ||
-                text.contains("EXPORT_TIMEOUT", ignoreCase = true) ||
-                text.contains("timeout", ignoreCase = true) ||
-                text.contains("failed", ignoreCase = true) ||
-                text.contains("완료") ||
-                text.contains("실패") ||
-                text.contains("오류") ||
-                text.contains("연결 해제")
-    }
-
-    fun shortStatus(text: String): String {
-        return text.lineSequence().firstOrNull()?.trim()?.take(42) ?: "대기 중"
-    }
-
     fun applyZoomRatio(newZoom: Float, explicitLensSlot: LensSlot? = null) {
         val clamped = newZoom.coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
         val nextSlot = explicitLensSlot ?: lensSlotForZoomRatioHysteresis(
@@ -478,22 +923,6 @@ fun MainCameraScreen(
             selectedLensSlot = nextSlot
         }
         status = "Zoom ${"%.1f".format(displayZoom)}x"
-    }
-
-    fun cameraSelectionStatus(selection: CameraSelection): String {
-        val source = when (selection.actualLensSource) {
-            ActualLensSource.OPTICAL_TELE_LOGICAL -> "3x optical tele"
-            ActualLensSource.OPTICAL_TELE_PHYSICAL -> "3x physical optical tele"
-            ActualLensSource.OPTICAL_TELE_UNAVAILABLE_FALLBACK_CROP -> "3x crop fallback"
-            ActualLensSource.MAIN_CROP_3X -> "3x main crop"
-            ActualLensSource.MAIN_CROP_2X -> "2x main crop"
-            ActualLensSource.ULTRAWIDE -> "ultrawide"
-            ActualLensSource.MAIN_1X -> "main 1x"
-        }
-        return "$source: cameraId=${selection.cameraId}" +
-            (selection.physicalCameraId?.let { ", physicalCameraId=$it" } ?: "") +
-            ", zoom=${selection.effectiveZoomRatio}, crop=${selection.useCrop}. " +
-            selection.diagnosticReason
     }
 
     fun runCameraJob(
@@ -554,64 +983,45 @@ fun MainCameraScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color.Black)
-                .windowInsetsPadding(WindowInsets.safeDrawing)
         ) {
-            CameraTopBar(
+            CameraTopOverlay(
                 status = shortStatus(status),
                 selectedResolution = selectedResolution,
-                allowedResolutionModes = allowedResolutionModes,
+                allowedResolutionModes = resolutionState.allowedModes,
                 onHideFocusAeControls = { showFocusAeControls = false },
                 onResolutionClick = {
-                    val modes = allowedResolutionModes.ifEmpty { listOf(CaptureResolutionMode.MP12) }
-                    val capabilityText = resolutionCapability?.let {
-                        "${selectedLensSlot.label} cameraId=${it.cameraId} raw50=${it.raw50Available} yuv50=${it.yuv50Available} jpeg50=${it.jpeg50Available} maxRAW=${"%.1f".format(it.maxAvailableRawMp)}MP modes=${modes.joinToString { mode -> mode.label }}"
-                    } ?: "Resolution capability unavailable."
-                    if (modes.size <= 1) {
-                        val reason = resolutionPlans
-                            .firstOrNull { it.requestedMode == CaptureResolutionMode.MP50 && !it.isAvailable }
-                            ?.reason
-                            ?: resolutionPlans
-                                .firstOrNull { it.requestedMode != CaptureResolutionMode.MP12 && !it.isAvailable }
-                            ?.reason
-                            ?: "no 50MP RAW/YUV/JPEG stream exposed for selected main camera."
-                        status = "Only 12M: $reason $capabilityText"
-                    } else {
-                        val index = modes.indexOf(selectedResolution).coerceAtLeast(0)
-                        val next = modes[(index + 1) % modes.size]
-                        selectedResolution = next
-                        status = "Resolution: ${next.label}. $capabilityText"
-                    }
+                    val result = handleResolutionClick(
+                        selectedResolution = selectedResolution,
+                        allowedResolutionModes = resolutionState.allowedModes,
+                        resolutionCapability = resolutionState.capability,
+                        resolutionPlans = resolutionState.plans,
+                        selectedLensSlot = selectedLensSlot
+                    )
+                    selectedResolution = result.selectedResolution
+                    status = result.status
                 },
                 onSettings = {
                     currentScreen = MainScreen.SETTINGS
                 }
             )
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .background(Color.Black)
-                    .pointerInput(Unit) {
-                        detectTapGestures { offset ->
-                            val x = (offset.x / size.width).coerceIn(0f, 1f)
-                            val y = (offset.y / size.height).coerceIn(0f, 1f)
-                            focusAeState = focusAeState.copy(
-                                point = NormalizedPoint(x, y),
-                                locked = false
-                            )
-                            showFocusAeControls = true
-                            focusAeUiNonce++
-                            status = "AF/AE point set"
-                        }
-                    },
-                contentAlignment = Alignment.Center
-            ) {
-                Camera2Preview(
-                    modifier = Modifier.fillMaxSize(),
-                    cameraId = cameraSelection.cameraId,
-                    zoomRatio = previewZoomRatio,
+            PreviewStage(
+                state = CameraPreviewPaneState(
+                    cameraSelection = cameraState.selection,
+                    previewZoomRatio = cameraState.previewZoomRatio,
                     focusAeState = focusAeState,
-                    enabled = previewEnabled,
+                    previewEnabled = previewEnabled,
+                    isCapturing = isCapturing,
+                    showFocusAeControls = showFocusAeControls,
+                    overlaySettings = overlaySettings,
+                    levelState = levelState
+                ),
+                callbacks = CameraPreviewPaneCallbacks(
+                    onFocusPoint = { point ->
+                        focusAeState = focusAeState.copy(point = point, locked = false)
+                        showFocusAeControls = true
+                        focusAeUiNonce++
+                        status = "AF/AE point set"
+                    },
                     onAeCapabilitiesChanged = { minIndex, maxIndex, stepEv ->
                         if (
                             focusAeState.supportedMinIndex != minIndex ||
@@ -627,170 +1037,120 @@ fun MainCameraScreen(
                                 exposureCompensationEv = index * stepEv
                             )
                         }
+                    },
+                    onToggleFocusLock = {
+                        val locked = !focusAeState.locked
+                        focusAeState = focusAeState.copy(locked = locked)
+                        showFocusAeControls = true
+                        focusAeUiNonce++
+                        status = if (locked) "AF/AE locked" else "AF/AE unlocked"
+                    },
+                    onExposureStep = { delta ->
+                        val index = (focusAeState.exposureCompensationIndex + delta)
+                            .coerceIn(focusAeState.supportedMinIndex, focusAeState.supportedMaxIndex)
+                        focusAeState = focusAeState.copy(
+                            exposureCompensationIndex = index,
+                            exposureCompensationEv = index * focusAeState.exposureStepEv
+                        )
+                        showFocusAeControls = true
+                        focusAeUiNonce++
+                        status = "EV ${"%.1f".format(index * focusAeState.exposureStepEv)}"
                     }
                 )
-
-                if (overlaySettings.showGrid) {
-                    RuleOfThirdsGridOverlay(Modifier.fillMaxSize())
-                }
-
-                if (overlaySettings.showLevel) {
-                    LevelIndicatorOverlay(
-                        levelState = levelState,
-                        modifier = Modifier.fillMaxSize()
-                    )
-                }
-
-                if (focusAeState.point != null && showFocusAeControls) {
-                    FocusAeOverlay(
-                        focusAeState = focusAeState,
-                        onToggleLock = {
-                            val locked = !focusAeState.locked
-                            focusAeState = focusAeState.copy(locked = locked)
-                            showFocusAeControls = true
-                            focusAeUiNonce++
-                            status = if (locked) "AF/AE locked" else "AF/AE unlocked"
-                        },
-                        onExposureStep = { delta ->
-                            val index = (focusAeState.exposureCompensationIndex + delta)
-                                .coerceIn(focusAeState.supportedMinIndex, focusAeState.supportedMaxIndex)
-                            focusAeState = focusAeState.copy(
-                                exposureCompensationIndex = index,
-                                exposureCompensationEv = index * focusAeState.exposureStepEv
-                            )
-                            showFocusAeControls = true
-                            focusAeUiNonce++
-                            status = "EV ${"%.1f".format(index * focusAeState.exposureStepEv)}"
-                        }
-                    )
-                }
-
-                if (!previewEnabled) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(Color(0x66000000)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = if (isCapturing) "Capturing..." else "Preview paused",
-                            color = Color.White,
-                            style = MaterialTheme.typography.titleLarge
-                        )
-                    }
-                }
-            }
+            )
 
             CameraBottomPanel(
                 latestBitmap = latestBitmap,
                 selectedLensSlot = selectedLensSlot,
                 onLensSlotChange = { lensSlot ->
-                    applyZoomRatio(
-                        newZoom = lensSlot.targetZoomRatio.coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom),
-                        explicitLensSlot = lensSlot
+                    val result = handleLensSlotChange(
+                        context = context,
+                        options = cameraState.options,
+                        lensSlot = lensSlot,
+                        selectedThreeXSource = selectedThreeXSource,
+                        zoomUiState = zoomUiState
                     )
-                    if (lensSlot == LensSlot.ULTRAWIDE || (lensSlot == LensSlot.THREE_X && selectedThreeXSource == ThreeXSourceMode.OPTICAL)) {
-                        selectedResolution = CaptureResolutionMode.MP12
-                    }
-                    val updatedSelection = selectCameraForOptions(
-                        context,
-                        options.copy(lensSlot = lensSlot)
-                    )
-                    status = cameraSelectionStatus(updatedSelection)
+                    selectedLensSlot = lensSlot
+                    zoomUiState = result.zoomUiState
+                    result.forcedResolution?.let { selectedResolution = it }
+                    status = result.status
                 },
                 selectedThreeXSource = selectedThreeXSource,
                 onThreeXSourceChange = { source ->
-                    selectedThreeXSource = source
-                    zoomUiState = zoomUiState.copy(useOpticalTeleAt3x = source == ThreeXSourceMode.OPTICAL)
-                    if (source == ThreeXSourceMode.OPTICAL) {
-                        selectedResolution = CaptureResolutionMode.MP12
-                    }
-                    val updatedOptions = options.copy(
-                        lensSlot = LensSlot.THREE_X,
-                        threeXSourceMode = source
+                    val result = handleThreeXSourceChange(
+                        context = context,
+                        options = cameraState.options,
+                        source = source,
+                        zoomUiState = zoomUiState
                     )
-                    val updatedSelection = selectCameraForOptions(context, updatedOptions)
-                    status = cameraSelectionStatus(updatedSelection)
+                    selectedThreeXSource = source
+                    zoomUiState = result.zoomUiState
+                    result.forcedResolution?.let { selectedResolution = it }
+                    status = result.status
                 },
                 frameCountMode = frameCountMode,
                 latestFramePlan = latestFramePlan,
                 pipelineMode = pipelineMode,
                 zoomUiState = zoomUiState,
                 onZoomRatioChange = { applyZoomRatio(it) },
-                selectedMode = selectedMode,
-                onModeChange = { selectedMode = it },
                 isCapturing = isCapturing,
                 captureProgress = captureProgress,
                 onHideFocusAeControls = { showFocusAeControls = false },
                 onCapture = captureClick@{
-                    val activeResolutionPlan = selectedResolutionPlan
-                    if (activeResolutionPlan == null) {
-                        val reason = resolutionPlans
-                            .firstOrNull { it.requestedMode == selectedResolution }
-                            ?.reason
-                            ?: "Selected resolution has no valid capture plan."
-                        selectedResolution = CaptureResolutionMode.MP12
-                        status = "Resolution changed to 12M: $reason"
-                        return@captureClick
-                    }
-                    val settings = currentFrameCountSettings(
-                        mode = frameCountMode,
-                        autoMinFrames = autoMinFrames,
-                        autoMaxFrames = autoMaxFrames,
-                        manualFrames = manualFrames
+                    val clickResult = handleCaptureClick(
+                        CaptureClickInput(
+                            context = context,
+                            selectedResolution = selectedResolution,
+                            resolutionPlans = resolutionState.plans,
+                            selectedResolutionPlan = resolutionState.selectedPlan,
+                            buildPreparationInput = { activePlan ->
+                                CapturePreparationInput(
+                                    options = cameraState.options,
+                                    resolutionPlan = activePlan,
+                                    selectedResolution = selectedResolution,
+                                    selectedLensSlot = selectedLensSlot,
+                                    selectedThreeXSource = selectedThreeXSource,
+                                    zoomUiState = zoomUiState,
+                                    frameCountMode = frameCountMode,
+                                    autoMinFrames = autoMinFrames,
+                                    autoMaxFrames = autoMaxFrames,
+                                    manualFrames = manualFrames,
+                                    selectedMode = selectedMode,
+                                    latestSceneLuma = latestSceneLuma,
+                                    latestMotionScore = latestMotionScore
+                                )
+                            }
+                        )
                     )
-                    val plan = estimateFramePlan(
-                        settings = settings,
-                        selectedModeLabel = selectedMode,
-                        latestSceneLuma = latestSceneLuma,
-                        latestMotionScore = latestMotionScore
-                    )
-                    latestFramePlan = plan
-                    val selection = selectCameraForOptions(context, options)
-                    val captureZoomRatio = if (
-                        selectedLensSlot == LensSlot.THREE_X &&
-                        selectedThreeXSource == ThreeXSourceMode.OPTICAL &&
-                        !selection.useCrop
-                    ) {
-                        1.0f
-                    } else {
-                        zoomUiState.zoomRatio.coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
-                    }
-                    runCameraJob(
-                        startMessage = "Night Fusion ${selectedResolution.label}. ${cameraSelectionStatus(selection)} ${selectedResolutionPlan?.reason.orEmpty()} Frame mode: ${settings.mode.label}, capture frames: ${plan.framesToCapture}, auto max: ${plan.maxFrames}. ${plan.reason}.",
-                        requestedFrames = plan.framesToCapture,
-                        timeoutMillis = if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) 120_000L else 60_000L
-                    ) { callback ->
-                        if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
-                            captureProcessExportRawNightFusion(
-                                context = context,
-                                cameraId = selection.cameraId,
-                                frameCount = plan.framesToCapture,
-                                resolutionMode = selectedResolution,
-                                resolutionPlan = activeResolutionPlan,
-                                finalOutputFormat = finalOutputFormat,
-                                zoomRatio = captureZoomRatio,
-                                focusAeState = focusAeState,
-                                cleanupPolicy = CacheCleanupPolicy.KEEP_ALL,
-                                onStatus = callback
-                            )
-                        } else {
-                            captureProcessExportNightFusion(
-                                context = context,
-                                cameraId = selection.cameraId,
-                                frameCount = plan.framesToCapture,
-                                resolutionMode = selectedResolution,
-                                finalOutputFormat = finalOutputFormat,
-                                zoomRatio = captureZoomRatio,
-                                focusAeState = focusAeState,
-                                cleanupPolicy = CacheCleanupPolicy.DELETE_SOURCE_FRAMES_AFTER_VERIFIED_EXPORT,
-                                frameCountMode = settings.mode,
-                                autoMinFrames = settings.autoMinFrames,
-                                autoMaxFrames = settings.autoMaxFrames,
-                                manualFrames = settings.manualFrames,
-                                framePlanReason = plan.reason,
-                                onStatus = callback
-                            )
+                    when (clickResult) {
+                        is CaptureClickResult.InvalidResolution -> {
+                            selectedResolution = CaptureResolutionMode.MP12
+                            status = clickResult.status
+                        }
+                        is CaptureClickResult.Ready -> {
+                            latestFramePlan = clickResult.prepared.framePlan
+                            runCameraJob(
+                                startMessage = clickResult.prepared.startMessage,
+                                requestedFrames = clickResult.prepared.framePlan.framesToCapture,
+                                timeoutMillis = if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
+                                    120_000L
+                                } else {
+                                    60_000L
+                                }
+                            ) { callback ->
+                                startCapturePipeline(
+                                    CapturePipelineRequest(
+                                        context = context,
+                                        pipelineMode = pipelineMode,
+                                        prepared = clickResult.prepared,
+                                        selectedResolution = selectedResolution,
+                                        resolutionPlan = clickResult.resolutionPlan,
+                                        finalOutputFormat = finalOutputFormat,
+                                        focusAeState = focusAeState
+                                    ),
+                                    onStatus = callback
+                                )
+                            }
                         }
                     }
                 },
@@ -811,7 +1171,7 @@ fun MainCameraScreen(
                     runCameraJob("RAW DNG 촬영 준비 중...", requestedFrames = 1) { callback ->
                         captureSingleRawDng(
                             context = context,
-                            cameraId = "0",
+                            cameraId = LEGACY_DEBUG_CAMERA_ID,
                             onStatus = callback
                         )
                     }
@@ -820,7 +1180,7 @@ fun MainCameraScreen(
                     runCameraJob("RAW Burst 촬영 준비 중...", requestedFrames = 4) { callback ->
                         captureRawBurstDng(
                             context = context,
-                            cameraId = "0",
+                            cameraId = LEGACY_DEBUG_CAMERA_ID,
                             frameCount = 4,
                             onStatus = callback
                         )
@@ -884,7 +1244,7 @@ fun MainCameraScreen(
                     runCameraJob("RAW DNG capture preparing...") { callback ->
                         captureSingleRawDng(
                             context = context,
-                            cameraId = "0",
+                            cameraId = LEGACY_DEBUG_CAMERA_ID,
                             onStatus = callback
                         )
                     }
@@ -894,7 +1254,7 @@ fun MainCameraScreen(
                     runCameraJob("RAW Burst capture preparing...") { callback ->
                         captureRawBurstDng(
                             context = context,
-                            cameraId = "0",
+                            cameraId = LEGACY_DEBUG_CAMERA_ID,
                             frameCount = 4,
                             onStatus = callback
                         )
@@ -973,7 +1333,7 @@ fun MainCameraScreen(
 }
 
 @Composable
-fun CameraTopBar(
+fun CameraTopOverlay(
     status: String,
     selectedResolution: CaptureResolutionMode,
     allowedResolutionModes: List<CaptureResolutionMode>,
@@ -984,6 +1344,7 @@ fun CameraTopBar(
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .statusBarsPadding()
             .height(86.dp)
             .background(Color.Black)
             .padding(horizontal = 18.dp, vertical = 8.dp),
@@ -1156,8 +1517,6 @@ fun CameraBottomPanel(
     pipelineMode: PipelineMode,
     zoomUiState: ZoomUiState,
     onZoomRatioChange: (Float) -> Unit,
-    selectedMode: String,
-    onModeChange: (String) -> Unit,
     isCapturing: Boolean,
     captureProgress: CaptureProgressState,
     onHideFocusAeControls: () -> Unit,
@@ -1263,12 +1622,9 @@ fun CameraBottomPanel(
             CaptureProgressRow(captureProgress = captureProgress)
         }
 
-        ModeTabs(
-            selected = selectedMode,
-            onSelect = onModeChange
-        )
+        ModeTabs()
 
-        if (false) {
+        if (SHOW_LEGACY_RAW_ACTIONS) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1458,27 +1814,36 @@ fun ThreeXSourceDot(
 
 @Composable
 fun ModeTabs(
-    selected: String,
-    onSelect: (String) -> Unit
 ) {
     val modes = listOf("인물 사진", "야간", "사진", "동영상", "더보기")
 
-    Row(
+    Column(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceAround
+        verticalArrangement = Arrangement.spacedBy(2.dp)
     ) {
-        modes.forEach { mode ->
-            Text(
-                text = mode,
-                color = if (selected == mode) Color.White else Color.White.copy(alpha = 0.38f),
-                style = if (selected == mode) {
-                    MaterialTheme.typography.titleMedium
-                } else {
-                    MaterialTheme.typography.bodyMedium
-                },
-                modifier = Modifier.clickable { onSelect(mode) }
-            )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceAround
+        ) {
+            modes.forEach { mode ->
+                val isPhoto = mode == "사진"
+                Text(
+                    text = mode,
+                    color = if (isPhoto) Color.White else Color.White.copy(alpha = 0.28f),
+                    style = if (isPhoto) {
+                        MaterialTheme.typography.titleMedium
+                    } else {
+                        MaterialTheme.typography.bodyMedium
+                    }
+                )
+            }
         }
+        Text(
+            text = "사진 외 모드는 준비 중",
+            color = Color.White.copy(alpha = 0.38f),
+            style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier.align(Alignment.CenterHorizontally)
+        )
     }
 }
 

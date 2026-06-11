@@ -56,6 +56,10 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.max
 
+private const val JOB_JSON_FILE_NAME = "job.json"
+private const val ALIGNMENT_JSON_FILE_NAME = "alignment.json"
+private const val NATIVE_POSTPROCESS_JSON_FILE_NAME = "native_postprocess.json"
+
 data class KeplerJobSummary(
     val jobDir: File,
     val group: String,
@@ -312,22 +316,22 @@ fun JobDetailScreen(jobDir: File, onBack: () -> Unit) {
                 Button(
                     enabled = loaded != null,
                     onClick = {
-                        copyText(clipboard, "job.json", loaded?.jobJsonPretty.orEmpty())
-                        message = "Copied job.json"
+                        copyText(clipboard, JOB_JSON_FILE_NAME, loaded?.jobJsonPretty.orEmpty())
+                        message = "Copied $JOB_JSON_FILE_NAME"
                     }
-                ) { Text("Copy job.json") }
+                ) { Text("Copy $JOB_JSON_FILE_NAME") }
                 Button(
                     enabled = !loaded?.alignmentJsonPretty.isNullOrBlank(),
                     onClick = {
-                        copyText(clipboard, "alignment.json", loaded?.alignmentJsonPretty.orEmpty())
-                        message = "Copied alignment.json"
+                        copyText(clipboard, ALIGNMENT_JSON_FILE_NAME, loaded?.alignmentJsonPretty.orEmpty())
+                        message = "Copied $ALIGNMENT_JSON_FILE_NAME"
                     }
-                ) { Text("Copy alignment.json") }
+                ) { Text("Copy $ALIGNMENT_JSON_FILE_NAME") }
                 Button(
                     enabled = !loaded?.nativePostprocessJsonPretty.isNullOrBlank(),
                     onClick = {
-                        copyText(clipboard, "native_postprocess.json", loaded?.nativePostprocessJsonPretty.orEmpty())
-                        message = "Copied native_postprocess.json"
+                        copyText(clipboard, NATIVE_POSTPROCESS_JSON_FILE_NAME, loaded?.nativePostprocessJsonPretty.orEmpty())
+                        message = "Copied $NATIVE_POSTPROCESS_JSON_FILE_NAME"
                     }
                 ) { Text("Copy native JSON") }
                 Button(onClick = {
@@ -563,9 +567,9 @@ private fun NativePostprocessSection(job: JSONObject?, detail: KeplerJobDetail) 
         } else {
             Text(
                 if (required) {
-                    "WARNING: native postprocess was required, but native_postprocess.json is missing or unreadable."
+                    "WARNING: native postprocess was required, but $NATIVE_POSTPROCESS_JSON_FILE_NAME is missing or unreadable."
                 } else {
-                    "native_postprocess.json not present."
+                    "$NATIVE_POSTPROCESS_JSON_FILE_NAME not present."
                 },
                 color = if (required) inspectorWarning else inspectorMuted
             )
@@ -625,10 +629,10 @@ private fun RawJsonSection(
     onToggleNative: () -> Unit
 ) {
     InspectorSection("Raw JSON") {
-        JsonDisclosure("job.json", showJobJson, onToggleJob, detail.jobJsonPretty, detail.jobJsonError)
+        JsonDisclosure(JOB_JSON_FILE_NAME, showJobJson, onToggleJob, detail.jobJsonPretty, detail.jobJsonError)
         if (detail.alignmentJsonPretty != null || detail.alignmentJsonError != null) {
             JsonDisclosure(
-                "alignment.json",
+                ALIGNMENT_JSON_FILE_NAME,
                 showAlignmentJson,
                 onToggleAlignment,
                 detail.alignmentJsonPretty.orEmpty(),
@@ -637,7 +641,7 @@ private fun RawJsonSection(
         }
         if (detail.nativePostprocessJsonPretty != null || detail.nativePostprocessJsonError != null) {
             JsonDisclosure(
-                "native_postprocess.json",
+                NATIVE_POSTPROCESS_JSON_FILE_NAME,
                 showNativeJson,
                 onToggleNative,
                 detail.nativePostprocessJsonPretty.orEmpty(),
@@ -712,14 +716,14 @@ fun findKeplerJobDirectories(context: Context): List<File> {
     )
     return roots.flatMap { root ->
         File(picturesDir, root).listFiles()
-            ?.filter { it.isDirectory && File(it, "job.json").exists() }
+            ?.filter { it.isDirectory && File(it, JOB_JSON_FILE_NAME).exists() }
             .orEmpty()
     }.sortedByDescending { it.lastModified() }
 }
 
 fun loadKeplerJobSummaries(context: Context): List<KeplerJobSummary> {
     return findKeplerJobDirectories(context).map { dir ->
-        val job = parseJsonFile(File(dir, "job.json")).first
+        val job = parseJsonFile(File(dir, JOB_JSON_FILE_NAME)).first
         KeplerJobSummary(
             jobDir = dir,
             group = dir.parentFile?.name ?: "unknown",
@@ -747,9 +751,9 @@ fun loadKeplerJobSummaries(context: Context): List<KeplerJobSummary> {
 }
 
 fun loadKeplerJobDetail(jobDir: File): KeplerJobDetail {
-    val jobFile = File(jobDir, "job.json")
-    val alignmentFile = File(jobDir, "alignment.json")
-    val nativeFile = File(jobDir, "native_postprocess.json")
+    val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
+    val alignmentFile = File(jobDir, ALIGNMENT_JSON_FILE_NAME)
+    val nativeFile = File(jobDir, NATIVE_POSTPROCESS_JSON_FILE_NAME)
     val (job, jobError) = parseJsonFile(jobFile)
     val (alignment, alignmentError) = parseJsonFile(alignmentFile)
     val (nativePostprocess, nativeError) = parseJsonFile(nativeFile)

@@ -92,7 +92,173 @@ enum class Fusion24Strategy {
     UNAVAILABLE
 }
 
+private data class CameraStreamSizes(
+    val normalRaw: List<Size>,
+    val normalYuv: List<Size>,
+    val normalJpeg: List<Size>,
+    val maximumRaw: List<Size>,
+    val maximumYuv: List<Size>,
+    val maximumJpeg: List<Size>,
+    val highResolutionRaw: List<Size>,
+    val highResolutionYuv: List<Size>,
+    val highResolutionJpeg: List<Size>
+) {
+    val allRaw = normalRaw + maximumRaw + highResolutionRaw
+    val allYuv = normalYuv + maximumYuv + highResolutionYuv
+    val allJpeg = normalJpeg + maximumJpeg + highResolutionJpeg
+}
+
+private data class Raw50Status(
+    val rawAvailable: Boolean,
+    val yuvAvailable: Boolean,
+    val jpegAvailable: Boolean,
+    val maxRawMp: Double,
+    val maxYuvMp: Double,
+    val maxJpegMp: Double,
+    val reason: String
+)
+
+private data class ResolutionPlanInputs(
+    val capability: CameraResolutionCapability,
+    val pipelineMode: PipelineMode,
+    val normal12: Size?,
+    val native24Raw: Size?,
+    val native24Yuv: Size?,
+    val native24Jpeg: Size?,
+    val raw50: Size?,
+    val yuv50: Size?,
+    val jpeg50: Size?
+)
+
+private class ResolutionPlanFactory(private val inputs: ResolutionPlanInputs) {
+    private val capability = inputs.capability
+    private val maximumSizes =
+        capability.maxRawSizes + capability.maxYuvSizes + capability.maxJpegSizes
+    private val highResolutionSizes =
+        capability.highResRawSizes + capability.highResYuvSizes + capability.highResJpegSizes
+
+    fun plan12(reason: String) = ResolutionCapturePlan(
+        requestedMode = CaptureResolutionMode.MP12,
+        actualInputMode = CaptureResolutionMode.MP12,
+        outputMode = CaptureResolutionMode.MP12,
+        cameraId = capability.cameraId,
+        inputSize = inputs.normal12,
+        outputWidth = null,
+        outputHeight = null,
+        usesMaximumResolution = false,
+        usesHighResolutionSlowPath = false,
+        isFusionOrUpscale = false,
+        isAvailable = inputs.normal12 != null,
+        reason = reason
+    )
+
+    fun plan50(isAvailable: Boolean, size: Size?, reason: String) = ResolutionCapturePlan(
+        requestedMode = CaptureResolutionMode.MP50,
+        actualInputMode = CaptureResolutionMode.MP50,
+        outputMode = CaptureResolutionMode.MP50,
+        cameraId = capability.cameraId,
+        inputSize = size,
+        outputWidth = size?.width,
+        outputHeight = size?.height,
+        usesMaximumResolution = size != null && size in maximumSizes,
+        usesHighResolutionSlowPath = size != null && size in highResolutionSizes,
+        isFusionOrUpscale = false,
+        isAvailable = isAvailable,
+        reason = reason
+    )
+
+    fun plan24(
+        inputSize: Size?,
+        strategy: String?,
+        reason: String,
+        isFusion: Boolean
+    ) = ResolutionCapturePlan(
+        requestedMode = CaptureResolutionMode.MP24_FUSION,
+        actualInputMode = if (strategy == "50MP_DETAIL_TO_24MP_FUSION_V0") {
+            CaptureResolutionMode.MP50
+        } else {
+            CaptureResolutionMode.MP24_FUSION
+        },
+        outputMode = CaptureResolutionMode.MP24_FUSION,
+        cameraId = capability.cameraId,
+        inputSize = inputSize,
+        outputWidth = 5664,
+        outputHeight = 4248,
+        usesMaximumResolution = inputSize != null && inputSize in maximumSizes,
+        usesHighResolutionSlowPath = inputSize != null && inputSize in highResolutionSizes,
+        isFusionOrUpscale = isFusion,
+        isAvailable = inputSize != null,
+        native24RawAvailable = capability.native24RawAvailable,
+        native24YuvAvailable = capability.native24YuvAvailable,
+        native24JpegAvailable = capability.native24JpegAvailable,
+        highResRawInputAvailable = capability.highResRawInputAvailable,
+        selected24MpStrategy = strategy,
+        selected24MpReason = reason,
+        reason = reason
+    )
+}
+
 fun megapixels(size: Size): Double = size.width.toDouble() * size.height.toDouble() / 1_000_000.0
+
+private fun collectStreamSizes(characteristics: CameraCharacteristics): CameraStreamSizes {
+    val normalMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+    val maximumMap = if (Build.VERSION.SDK_INT >= 31) {
+        characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
+    } else {
+        null
+    }
+    fun normal(format: Int) = normalMap?.getOutputSizes(format)?.toList().orEmpty()
+    fun maximum(format: Int) = maximumMap?.getOutputSizes(format)?.toList().orEmpty()
+    fun highResolution(format: Int) = runCatching {
+        normalMap?.getHighResolutionOutputSizes(format)?.toList().orEmpty()
+    }.getOrDefault(emptyList())
+    return CameraStreamSizes(
+        normalRaw = normal(ImageFormat.RAW_SENSOR),
+        normalYuv = normal(ImageFormat.YUV_420_888),
+        normalJpeg = normal(ImageFormat.JPEG),
+        maximumRaw = maximum(ImageFormat.RAW_SENSOR),
+        maximumYuv = maximum(ImageFormat.YUV_420_888),
+        maximumJpeg = maximum(ImageFormat.JPEG),
+        highResolutionRaw = highResolution(ImageFormat.RAW_SENSOR),
+        highResolutionYuv = highResolution(ImageFormat.YUV_420_888),
+        highResolutionJpeg = highResolution(ImageFormat.JPEG)
+    )
+}
+
+private fun buildRaw50Status(streams: CameraStreamSizes): Raw50Status {
+    fun maxMp(sizes: List<Size>) = sizes.maxOfOrNull(::megapixels) ?: 0.0
+    val maxRawMp = maxMp(streams.allRaw)
+    val maxYuvMp = maxMp(streams.allYuv)
+    val maxJpegMp = maxMp(streams.allJpeg)
+    val rawAvailable = streams.allRaw.any { megapixels(it) >= HIGH_RES_RAW_INPUT_MIN_MP }
+    val yuvAvailable = streams.allYuv.any { megapixels(it) >= HIGH_RES_RAW_INPUT_MIN_MP }
+    val jpegAvailable = streams.allJpeg.any { megapixels(it) >= HIGH_RES_RAW_INPUT_MIN_MP }
+    val reason = if (rawAvailable) {
+        "Public Camera2 exposes RAW_SENSOR >=40MP."
+    } else {
+        buildString {
+            append("50M RAW unavailable: max public RAW is ${"%.1f".format(maxRawMp)} MP.")
+            when {
+                yuvAvailable && jpegAvailable ->
+                    append(" Public >=40MP YUV and JPEG exist, but they are processed streams, not RAW Fusion input.")
+                yuvAvailable ->
+                    append(" Public >=40MP YUV exists, but it is processed, not RAW Fusion input.")
+                jpegAvailable ->
+                    append(" Public >=40MP JPEG exists, but it is processed, not RAW Fusion input.")
+                else -> append(" No >=40MP public RAW/YUV/JPEG stream is exposed.")
+            }
+        }
+    }
+    return Raw50Status(
+        rawAvailable,
+        yuvAvailable,
+        jpegAvailable,
+        maxRawMp,
+        maxYuvMp,
+        maxJpegMp,
+        reason
+    )
+}
 
 fun queryCameraResolutionCapability(
     context: Context,
@@ -111,81 +277,38 @@ fun loadCameraResolutionCapability(
     val supportsUltraHighResolution = capabilities.contains(
         CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_ULTRA_HIGH_RESOLUTION_SENSOR
     )
-    val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-    val maxMap = if (Build.VERSION.SDK_INT >= 31) {
-        c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
-    } else {
-        null
-    }
-
-    fun normal(format: Int) = map?.getOutputSizes(format)?.toList().orEmpty()
-    fun maxRes(format: Int) = maxMap?.getOutputSizes(format)?.toList().orEmpty()
-    fun highRes(format: Int) = runCatching {
-        map?.getHighResolutionOutputSizes(format)?.toList().orEmpty()
-    }.getOrDefault(emptyList())
-    fun maxMp(sizes: List<Size>) = sizes.maxOfOrNull(::megapixels) ?: 0.0
-
-    val normalRaw = normal(ImageFormat.RAW_SENSOR)
-    val normalYuv = normal(ImageFormat.YUV_420_888)
-    val normalJpeg = normal(ImageFormat.JPEG)
-    val maxRaw = maxRes(ImageFormat.RAW_SENSOR)
-    val maxYuv = maxRes(ImageFormat.YUV_420_888)
-    val maxJpeg = maxRes(ImageFormat.JPEG)
-    val highRaw = highRes(ImageFormat.RAW_SENSOR)
-    val highYuv = highRes(ImageFormat.YUV_420_888)
-    val highJpeg = highRes(ImageFormat.JPEG)
-    val allRaw = normalRaw + maxRaw + highRaw
-    val allYuv = normalYuv + maxYuv + highYuv
-    val allJpeg = normalJpeg + maxJpeg + highJpeg
-    val maxRawMp = maxMp(allRaw)
-    val maxYuvMp = maxMp(allYuv)
-    val maxJpegMp = maxMp(allJpeg)
-    val raw50Available = allRaw.any { megapixels(it) >= HIGH_RES_RAW_INPUT_MIN_MP }
-    val yuv50Available = allYuv.any { megapixels(it) >= HIGH_RES_RAW_INPUT_MIN_MP }
-    val jpeg50Available = allJpeg.any { megapixels(it) >= HIGH_RES_RAW_INPUT_MIN_MP }
-    val raw50Reason = if (raw50Available) {
-        "Public Camera2 exposes RAW_SENSOR >=40MP."
-    } else {
-        buildString {
-            append("50M RAW unavailable: max public RAW is ${"%.1f".format(maxRawMp)} MP.")
-            when {
-                yuv50Available && jpeg50Available -> append(" Public >=40MP YUV and JPEG exist, but they are processed streams, not RAW Fusion input.")
-                yuv50Available -> append(" Public >=40MP YUV exists, but it is processed, not RAW Fusion input.")
-                jpeg50Available -> append(" Public >=40MP JPEG exists, but it is processed, not RAW Fusion input.")
-                else -> append(" No >=40MP public RAW/YUV/JPEG stream is exposed.")
-            }
-        }
-    }
+    val streams = collectStreamSizes(c)
+    val raw50Status = buildRaw50Status(streams)
 
     return CameraResolutionCapability(
         cameraId = cameraId,
         lensSlot = lensSlot,
         supportsUltraHighResolution = supportsUltraHighResolution,
-        normalRawSizes = normalRaw,
-        normalYuvSizes = normalYuv,
-        normalJpegSizes = normalJpeg,
-        maxRawSizes = maxRaw,
-        maxYuvSizes = maxYuv,
-        maxJpegSizes = maxJpeg,
-        highResRawSizes = highRaw,
-        highResYuvSizes = highYuv,
-        highResJpegSizes = highJpeg,
+        normalRawSizes = streams.normalRaw,
+        normalYuvSizes = streams.normalYuv,
+        normalJpegSizes = streams.normalJpeg,
+        maxRawSizes = streams.maximumRaw,
+        maxYuvSizes = streams.maximumYuv,
+        maxJpegSizes = streams.maximumJpeg,
+        highResRawSizes = streams.highResolutionRaw,
+        highResYuvSizes = streams.highResolutionYuv,
+        highResJpegSizes = streams.highResolutionJpeg,
         capabilities = capabilities.toList(),
         sensorPixelModeRequestKeySupported = c
             .getAvailableCaptureRequestKeys()
             ?.contains(CaptureRequest.SENSOR_PIXEL_MODE) == true,
         physicalCameraIds = if (Build.VERSION.SDK_INT >= 28) c.physicalCameraIds.toList() else emptyList(),
-        native24RawAvailable = allRaw.any { megapixels(it) in 20.0..30.0 },
-        native24YuvAvailable = allYuv.any { megapixels(it) in 20.0..30.0 },
-        native24JpegAvailable = allJpeg.any { megapixels(it) in 20.0..30.0 },
-        highResRawInputAvailable = raw50Available,
-        raw50Available = raw50Available,
-        yuv50Available = yuv50Available,
-        jpeg50Available = jpeg50Available,
-        raw50Reason = raw50Reason,
-        maxAvailableRawMp = maxRawMp,
-        maxAvailableYuvMp = maxYuvMp,
-        maxAvailableJpegMp = maxJpegMp
+        native24RawAvailable = streams.allRaw.any { megapixels(it) in 20.0..30.0 },
+        native24YuvAvailable = streams.allYuv.any { megapixels(it) in 20.0..30.0 },
+        native24JpegAvailable = streams.allJpeg.any { megapixels(it) in 20.0..30.0 },
+        highResRawInputAvailable = raw50Status.rawAvailable,
+        raw50Available = raw50Status.rawAvailable,
+        yuv50Available = raw50Status.yuvAvailable,
+        jpeg50Available = raw50Status.jpegAvailable,
+        raw50Reason = raw50Status.reason,
+        maxAvailableRawMp = raw50Status.maxRawMp,
+        maxAvailableYuvMp = raw50Status.maxYuvMp,
+        maxAvailableJpegMp = raw50Status.maxJpegMp
     )
 }
 
@@ -257,173 +380,198 @@ fun allowedResolutionModesForLens(
     }
 }
 
+private fun largestSize(sizes: List<Size>): Size? =
+    sizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
+
+private fun buildResolutionPlanInputs(
+    capability: CameraResolutionCapability,
+    pipelineMode: PipelineMode
+): ResolutionPlanInputs {
+    fun native24(sizes: List<Size>) =
+        largestSize(sizes.filter { megapixels(it) in 20.0..30.0 })
+    fun fifty(
+        maximum: List<Size>,
+        highResolution: List<Size>,
+        normal: List<Size>
+    ) = largestSize(maximum.filter { megapixels(it) >= HIGH_RES_RAW_INPUT_MIN_MP })
+        ?: largestSize(highResolution.filter { megapixels(it) >= HIGH_RES_RAW_INPUT_MIN_MP })
+        ?: largestSize(normal.filter { megapixels(it) >= HIGH_RES_RAW_INPUT_MIN_MP })
+
+    val raw12 = largestSize(capability.normalRawSizes.filter { megapixels(it) in 8.0..14.5 })
+    val yuv12 = largestSize(capability.normalYuvSizes.filter { megapixels(it) in 8.0..14.5 })
+    val jpeg12 = largestSize(capability.normalJpegSizes.filter { megapixels(it) in 8.0..14.5 })
+    val normal12 = if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
+        raw12 ?: largestSize(capability.normalRawSizes)
+    } else {
+        yuv12 ?: jpeg12
+    }
+    return ResolutionPlanInputs(
+        capability = capability,
+        pipelineMode = pipelineMode,
+        normal12 = normal12,
+        native24Raw = native24(
+            capability.normalRawSizes + capability.maxRawSizes + capability.highResRawSizes
+        ),
+        native24Yuv = native24(
+            capability.normalYuvSizes + capability.maxYuvSizes + capability.highResYuvSizes
+        ),
+        native24Jpeg = native24(
+            capability.normalJpegSizes + capability.maxJpegSizes + capability.highResJpegSizes
+        ),
+        raw50 = fifty(capability.maxRawSizes, capability.highResRawSizes, capability.normalRawSizes),
+        yuv50 = fifty(capability.maxYuvSizes, capability.highResYuvSizes, capability.normalYuvSizes),
+        jpeg50 = fifty(capability.maxJpegSizes, capability.highResJpegSizes, capability.normalJpegSizes)
+    )
+}
+
+private fun build24MpRawPlan(
+    factory: ResolutionPlanFactory,
+    inputs: ResolutionPlanInputs,
+    detailReason: String,
+    unavailableReason: String = "24MP RAW Fusion unavailable."
+): ResolutionCapturePlan {
+    return when {
+        inputs.raw50 != null -> factory.plan24(
+            inputs.raw50,
+            "50MP_DETAIL_TO_24MP_FUSION_V0",
+            "$detailReason $PUBLIC_CAMERA2_24MP_NOTICE",
+            true
+        )
+        inputs.native24Raw != null -> factory.plan24(
+            inputs.native24Raw,
+            "native_24mp_raw_fallback",
+            "No 50MP-class RAW stream is exposed; using native 20-30MP public Camera2 RAW fallback. $PUBLIC_CAMERA2_24MP_NOTICE",
+            false
+        )
+        else -> factory.plan24(
+            null,
+            null,
+            "$unavailableReason $PUBLIC_CAMERA2_24MP_NOTICE",
+            false
+        )
+    }
+}
+
+private fun buildMain1xPlans(
+    factory: ResolutionPlanFactory,
+    inputs: ResolutionPlanInputs
+): List<ResolutionCapturePlan> {
+    if (inputs.pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
+        val raw50Available = inputs.raw50 != null
+        return listOf(
+            factory.plan50(
+                raw50Available,
+                inputs.raw50,
+                if (raw50Available) "50M RAW input available." else inputs.capability.raw50Reason
+            ),
+            build24MpRawPlan(
+                factory,
+                inputs,
+                "50MP-class RAW detail input selected for 24MP Fusion v0."
+            )
+        )
+    }
+    val yuv50Available = inputs.yuv50 != null
+    val processed24 = inputs.native24Yuv ?: inputs.native24Jpeg
+    return listOf(
+        factory.plan50(
+            yuv50Available,
+            inputs.yuv50,
+            when {
+                yuv50Available -> "50M YUV input available."
+                inputs.jpeg50 != null -> "50M is available only as JPEG/high-res still, not YUV burst."
+                else -> "50M unavailable: no >=40MP YUV stream exposed."
+            }
+        ),
+        factory.plan24(
+            processed24,
+            when {
+                inputs.native24Yuv != null -> "native_24mp_yuv_processed"
+                inputs.native24Jpeg != null -> "native_24mp_jpeg_processed"
+                else -> null
+            },
+            if (processed24 != null) {
+                "Processed 24MP public Camera2 stream selected. $PUBLIC_CAMERA2_24MP_NOTICE"
+            } else {
+                "Processed 24MP unavailable through public Camera2. $PUBLIC_CAMERA2_24MP_NOTICE"
+            },
+            false
+        )
+    )
+}
+
+private fun buildMain2xPlans(
+    factory: ResolutionPlanFactory,
+    inputs: ResolutionPlanInputs
+): List<ResolutionCapturePlan> {
+    if (inputs.pipelineMode != PipelineMode.RAW_NIGHT_FUSION) return emptyList()
+    val plan = if (inputs.raw50 != null) {
+        factory.plan24(
+            inputs.raw50,
+            "50MP_DETAIL_TO_24MP_FUSION_V0",
+            "2x 24MP Fusion uses 50MP-class public Camera2 RAW detail input. $PUBLIC_CAMERA2_24MP_NOTICE",
+            true
+        )
+    } else {
+        build24MpRawPlan(
+            factory,
+            inputs,
+            "2x 24MP Fusion uses 50MP-class public Camera2 RAW detail input.",
+            "24MP unavailable through public Camera2."
+        )
+    }
+    return listOf(plan)
+}
+
+private fun buildThreeXPlans(
+    factory: ResolutionPlanFactory,
+    inputs: ResolutionPlanInputs,
+    threeXSourceMode: ThreeXSourceMode
+): List<ResolutionCapturePlan> {
+    if (
+        threeXSourceMode != ThreeXSourceMode.MAIN_CROP ||
+        inputs.pipelineMode != PipelineMode.RAW_NIGHT_FUSION
+    ) {
+        return emptyList()
+    }
+    val plan = if (inputs.raw50 != null) {
+        factory.plan24(
+            inputs.raw50,
+            "50MP_DETAIL_TO_24MP_FUSION_V0",
+            "3x 24MP Fusion uses 50MP-class public Camera2 RAW detail input. $PUBLIC_CAMERA2_24MP_NOTICE",
+            true
+        )
+    } else {
+        build24MpRawPlan(
+            factory,
+            inputs,
+            "3x 24MP Fusion uses 50MP-class public Camera2 RAW detail input.",
+            "24MP unavailable through public Camera2."
+        )
+    }
+    return listOf(plan)
+}
+
 fun buildResolutionCapturePlans(
     lensSlot: LensSlot,
     threeXSourceMode: ThreeXSourceMode,
     pipelineMode: PipelineMode,
     capability: CameraResolutionCapability
 ): List<ResolutionCapturePlan> {
-    fun largest(sizes: List<Size>) = sizes.maxByOrNull { it.width * it.height }
-    val allRawSizes = capability.normalRawSizes + capability.maxRawSizes + capability.highResRawSizes
-    val allYuvSizes = capability.normalYuvSizes + capability.maxYuvSizes + capability.highResYuvSizes
-    val allJpegSizes = capability.normalJpegSizes + capability.maxJpegSizes + capability.highResJpegSizes
-    val native24Raw = largest(allRawSizes.filter { megapixels(it) in 20.0..30.0 })
-    val native24Yuv = largest(allYuvSizes.filter { megapixels(it) in 20.0..30.0 })
-    val native24Jpeg = largest(allJpegSizes.filter { megapixels(it) in 20.0..30.0 })
-    val raw50 = largest(capability.maxRawSizes.filter { megapixels(it) >= HIGH_RES_RAW_INPUT_MIN_MP })
-        ?: largest(capability.highResRawSizes.filter { megapixels(it) >= HIGH_RES_RAW_INPUT_MIN_MP })
-        ?: largest(capability.normalRawSizes.filter { megapixels(it) >= HIGH_RES_RAW_INPUT_MIN_MP })
-    val yuv50 = largest(capability.maxYuvSizes.filter { megapixels(it) >= 40.0 })
-        ?: largest(capability.highResYuvSizes.filter { megapixels(it) >= 40.0 })
-        ?: largest(capability.normalYuvSizes.filter { megapixels(it) >= 40.0 })
-    val jpeg50 = largest(capability.maxJpegSizes.filter { megapixels(it) >= 40.0 })
-        ?: largest(capability.highResJpegSizes.filter { megapixels(it) >= 40.0 })
-        ?: largest(capability.normalJpegSizes.filter { megapixels(it) >= 40.0 })
-    val raw12 = largest(capability.normalRawSizes.filter { megapixels(it) in 8.0..14.5 })
-    val yuv12 = largest(capability.normalYuvSizes.filter { megapixels(it) in 8.0..14.5 })
-    val jpeg12 = largest(capability.normalJpegSizes.filter { megapixels(it) in 8.0..14.5 })
-    val normal12 = if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
-        raw12 ?: largest(capability.normalRawSizes)
-    } else {
-        yuv12 ?: jpeg12
-    } ?: if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
-        null
-    } else {
-        yuv12 ?: jpeg12
-    }
-    val has50DetailForRaw = raw50 != null
-    val has50ForYuv = yuv50 != null
-
-    fun target24() = 5664 to 4248
-    fun plan12(reason: String) = ResolutionCapturePlan(
-        requestedMode = CaptureResolutionMode.MP12,
-        actualInputMode = CaptureResolutionMode.MP12,
-        outputMode = CaptureResolutionMode.MP12,
-        cameraId = capability.cameraId,
-        inputSize = normal12,
-        outputWidth = null,
-        outputHeight = null,
-        usesMaximumResolution = false,
-        usesHighResolutionSlowPath = false,
-        isFusionOrUpscale = false,
-        isAvailable = normal12 != null,
-        reason = reason
-    )
-    fun plan50(isAvailable: Boolean, size: Size?, reason: String) = ResolutionCapturePlan(
-        requestedMode = CaptureResolutionMode.MP50,
-        actualInputMode = CaptureResolutionMode.MP50,
-        outputMode = CaptureResolutionMode.MP50,
-        cameraId = capability.cameraId,
-        inputSize = size,
-        outputWidth = size?.width,
-        outputHeight = size?.height,
-        usesMaximumResolution = size != null && size in capability.maxRawSizes + capability.maxYuvSizes + capability.maxJpegSizes,
-        usesHighResolutionSlowPath = size != null && size in capability.highResRawSizes + capability.highResYuvSizes + capability.highResJpegSizes,
-        isFusionOrUpscale = false,
-        isAvailable = isAvailable,
-        reason = reason
-    )
-    fun plan24(inputSize: Size?, strategy: String?, reason: String, isFusion: Boolean) = target24().let { (w, h) ->
-        ResolutionCapturePlan(
-            requestedMode = CaptureResolutionMode.MP24_FUSION,
-            actualInputMode = if (strategy == "50MP_DETAIL_TO_24MP_FUSION_V0") CaptureResolutionMode.MP50 else CaptureResolutionMode.MP24_FUSION,
-            outputMode = CaptureResolutionMode.MP24_FUSION,
-            cameraId = capability.cameraId,
-            inputSize = inputSize,
-            outputWidth = w,
-            outputHeight = h,
-            usesMaximumResolution = inputSize != null && inputSize in capability.maxRawSizes + capability.maxYuvSizes + capability.maxJpegSizes,
-            usesHighResolutionSlowPath = inputSize != null && inputSize in capability.highResRawSizes + capability.highResYuvSizes + capability.highResJpegSizes,
-            isFusionOrUpscale = isFusion,
-            isAvailable = inputSize != null,
-            native24RawAvailable = capability.native24RawAvailable,
-            native24YuvAvailable = capability.native24YuvAvailable,
-            native24JpegAvailable = capability.native24JpegAvailable,
-            highResRawInputAvailable = capability.highResRawInputAvailable,
-            selected24MpStrategy = strategy,
-            selected24MpReason = reason,
-            reason = reason
-        )
-    }
-
+    val inputs = buildResolutionPlanInputs(capability, pipelineMode)
+    val factory = ResolutionPlanFactory(inputs)
     val only12Reason = when {
         lensSlot == LensSlot.ULTRAWIDE -> "Ultrawide is locked to 12M in this app."
         lensSlot == LensSlot.THREE_X && threeXSourceMode == ThreeXSourceMode.OPTICAL -> "Optical tele is locked to 12M in this app."
         else -> "12M burst capture available."
     }
-    val plans = mutableListOf(plan12(only12Reason))
-    when (lensSlot) {
-        LensSlot.ULTRAWIDE -> Unit
-        LensSlot.MAIN_1X -> {
-            if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
-                plans += plan50(has50DetailForRaw, raw50, if (has50DetailForRaw) "50M RAW input available." else capability.raw50Reason)
-                plans += when {
-                    raw50 != null -> plan24(
-                        raw50,
-                        "50MP_DETAIL_TO_24MP_FUSION_V0",
-                        "50MP-class RAW detail input selected for 24MP Fusion v0. $PUBLIC_CAMERA2_24MP_NOTICE",
-                        true
-                    )
-                    native24Raw != null -> plan24(
-                        native24Raw,
-                        "native_24mp_raw_fallback",
-                        "No 50MP-class RAW stream is exposed; using native 20-30MP public Camera2 RAW fallback. $PUBLIC_CAMERA2_24MP_NOTICE",
-                        false
-                    )
-                    else -> plan24(
-                        null,
-                        null,
-                        "24MP RAW Fusion unavailable. $PUBLIC_CAMERA2_24MP_NOTICE",
-                        false
-                    )
-                }
-            } else {
-                plans += plan50(has50ForYuv, yuv50, if (has50ForYuv) "50M YUV input available." else if (jpeg50 != null) "50M is available only as JPEG/high-res still, not YUV burst." else "50M unavailable: no >=40MP YUV stream exposed.")
-                val processed24 = native24Yuv ?: native24Jpeg
-                plans += plan24(
-                    processed24,
-                    if (native24Yuv != null) "native_24mp_yuv_processed" else if (native24Jpeg != null) "native_24mp_jpeg_processed" else null,
-                    if (processed24 != null) {
-                        "Processed 24MP public Camera2 stream selected. $PUBLIC_CAMERA2_24MP_NOTICE"
-                    } else {
-                        "Processed 24MP unavailable through public Camera2. $PUBLIC_CAMERA2_24MP_NOTICE"
-                    },
-                    false
-                )
-            }
-        }
-        LensSlot.MAIN_2X -> {
-            if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
-                val input = raw50 ?: native24Raw
-                val strategy = when {
-                    raw50 != null -> "50MP_DETAIL_TO_24MP_FUSION_V0"
-                    native24Raw != null -> "native_24mp_raw_fallback"
-                    else -> null
-                }
-                val reason = when {
-                    raw50 != null -> "2x 24MP Fusion uses 50MP-class public Camera2 RAW detail input. $PUBLIC_CAMERA2_24MP_NOTICE"
-                    native24Raw != null -> "No 50MP-class RAW stream is exposed; using native 20-30MP public Camera2 RAW fallback. $PUBLIC_CAMERA2_24MP_NOTICE"
-                    else -> "24MP unavailable through public Camera2. $PUBLIC_CAMERA2_24MP_NOTICE"
-                }
-                plans += plan24(input, strategy, reason, raw50 != null)
-            }
-        }
-        LensSlot.THREE_X -> if (threeXSourceMode == ThreeXSourceMode.MAIN_CROP && pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
-            val input = raw50 ?: native24Raw
-            val strategy = when {
-                raw50 != null -> "50MP_DETAIL_TO_24MP_FUSION_V0"
-                native24Raw != null -> "native_24mp_raw_fallback"
-                else -> null
-            }
-            val reason = when {
-                raw50 != null -> "3x 24MP Fusion uses 50MP-class public Camera2 RAW detail input. $PUBLIC_CAMERA2_24MP_NOTICE"
-                native24Raw != null -> "No 50MP-class RAW stream is exposed; using native 20-30MP public Camera2 RAW fallback. $PUBLIC_CAMERA2_24MP_NOTICE"
-                else -> "24MP unavailable through public Camera2. $PUBLIC_CAMERA2_24MP_NOTICE"
-            }
-            plans += plan24(input, strategy, reason, raw50 != null)
-        }
+    val additionalPlans = when (lensSlot) {
+        LensSlot.ULTRAWIDE -> emptyList()
+        LensSlot.MAIN_1X -> buildMain1xPlans(factory, inputs)
+        LensSlot.MAIN_2X -> buildMain2xPlans(factory, inputs)
+        LensSlot.THREE_X -> buildThreeXPlans(factory, inputs, threeXSourceMode)
     }
-    return plans
+    return listOf(factory.plan12(only12Reason)) + additionalPlans
 }
 
 fun planCropOutput(inputSize: Size, zoomRatio: Float, targetMode: CaptureResolutionMode): CropOutputPlan {
@@ -461,73 +609,99 @@ fun choose24MpFusionStrategy(
     }
 }
 
+private fun List<Size>.describeSizes(): String =
+    if (isEmpty()) {
+        "none"
+    } else {
+        joinToString { "${it.width}x${it.height} ${"%.1f".format(megapixels(it))}MP" }
+    }
+
+private fun describeCapabilityReportForCamera(
+    manager: CameraManager,
+    cameraId: String,
+    capability: CameraResolutionCapability
+): String {
+    val characteristics = manager.getCameraCharacteristics(cameraId)
+    val activeArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+    val maxActiveArray = if (Build.VERSION.SDK_INT >= 31) {
+        characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE_MAXIMUM_RESOLUTION)
+    } else {
+        null
+    }
+    val hasMaximumResolutionMap = Build.VERSION.SDK_INT >= 31 &&
+        characteristics.get(
+            CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION
+        ) != null
+    return buildString {
+        appendLine("cameraId=$cameraId")
+        appendLine(
+            "focalLengths: " +
+                characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                    ?.toList()
+                    .orEmpty()
+        )
+        appendLine("capabilities: ${capability.capabilities}")
+        appendLine("physicalCameraIds: ${capability.physicalCameraIds}")
+        appendLine("Ultra high resolution: ${if (capability.supportsUltraHighResolution) "YES" else "NO"}")
+        appendLine("activeArray: ${activeArray ?: "none"}")
+        appendLine("maximumResolutionActiveArray: ${maxActiveArray ?: "none"}")
+        appendLine(
+            "SENSOR_PIXEL_MODE request key: " +
+                if (capability.sensorPixelModeRequestKeySupported) "YES" else "NO"
+        )
+        appendLine("maximum-resolution stream map: ${if (hasMaximumResolutionMap) "YES" else "NO"}")
+        appendLine("normal RAW: ${capability.normalRawSizes.describeSizes()}")
+        appendLine("normal YUV: ${capability.normalYuvSizes.describeSizes()}")
+        appendLine("normal JPEG: ${capability.normalJpegSizes.describeSizes()}")
+        appendLine("maximum RAW: ${capability.maxRawSizes.describeSizes()}")
+        appendLine("maximum YUV: ${capability.maxYuvSizes.describeSizes()}")
+        appendLine("maximum JPEG: ${capability.maxJpegSizes.describeSizes()}")
+        appendLine("highRes RAW: ${capability.highResRawSizes.describeSizes()}")
+        appendLine("highRes YUV: ${capability.highResYuvSizes.describeSizes()}")
+        appendLine("highRes JPEG: ${capability.highResJpegSizes.describeSizes()}")
+        appendLine(
+            "max MP RAW/YUV/JPEG: ${"%.1f".format(capability.maxAvailableRawMp)} / " +
+                "${"%.1f".format(capability.maxAvailableYuvMp)} / " +
+                "${"%.1f".format(capability.maxAvailableJpegMp)}"
+        )
+        appendLine("raw50Available: ${capability.raw50Available}")
+        appendLine("yuv50Available: ${capability.yuv50Available}")
+        appendLine("jpeg50Available: ${capability.jpeg50Available}")
+        appendLine("raw50Reason: ${capability.raw50Reason}")
+        if (Build.VERSION.SDK_INT >= 28) {
+            capability.physicalCameraIds.forEach { physicalId ->
+                appendLine(describePhysicalCamera(manager, physicalId))
+            }
+        }
+    }.trimEnd()
+}
+
+private fun describePhysicalCamera(manager: CameraManager, physicalId: String): String {
+    val physical = runCatching { manager.getCameraCharacteristics(physicalId) }.getOrNull()
+    val physicalMap = physical?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+    val raw = physicalMap?.getOutputSizes(ImageFormat.RAW_SENSOR)?.toList().orEmpty()
+    val yuv = physicalMap?.getOutputSizes(ImageFormat.YUV_420_888)?.toList().orEmpty()
+    val jpeg = physicalMap?.getOutputSizes(ImageFormat.JPEG)?.toList().orEmpty()
+    return "physicalCameraId=$physicalId focalLengths=" +
+        "${physical?.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.toList().orEmpty()} " +
+        "lensFacing=${physical?.get(CameraCharacteristics.LENS_FACING) ?: "unknown"} " +
+        "maxRAW/YUV/JPEG=" +
+        "${"%.1f".format(raw.maxOfOrNull(::megapixels) ?: 0.0)}/" +
+        "${"%.1f".format(yuv.maxOfOrNull(::megapixels) ?: 0.0)}/" +
+        "${"%.1f".format(jpeg.maxOfOrNull(::megapixels) ?: 0.0)}MP"
+}
+
 fun buildResolutionCapabilityReport(context: Context): String {
     CameraCapabilityCache.clear()
     val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-    fun List<Size>.describe() = if (isEmpty()) "none" else joinToString { "${it.width}x${it.height} ${"%.1f".format(megapixels(it))}MP" }
     return buildString {
         manager.cameraIdList.forEach { id ->
             val characteristics = manager.getCameraCharacteristics(id)
             if (characteristics.get(CameraCharacteristics.LENS_FACING) != CameraCharacteristics.LENS_FACING_BACK) {
                 return@forEach
             }
-            val lensSlot = LensSlot.MAIN_1X
-            val cap = queryCameraResolutionCapability(context, id, lensSlot)
-            val activeArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-            val maxActiveArray = if (Build.VERSION.SDK_INT >= 31) {
-                characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE_MAXIMUM_RESOLUTION)
-            } else {
-                null
-            }
-            val hasSensorPixelModeRequestKey = characteristics
-                .getAvailableCaptureRequestKeys()
-                ?.contains(CaptureRequest.SENSOR_PIXEL_MODE) == true
-            val hasMaximumResolutionMap = if (Build.VERSION.SDK_INT >= 31) {
-                characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION) != null
-            } else {
-                false
-            }
-            appendLine("cameraId=$id")
-            appendLine("focalLengths: ${characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.toList().orEmpty()}")
-            appendLine("capabilities: ${cap.capabilities}")
-            appendLine("physicalCameraIds: ${cap.physicalCameraIds}")
-            appendLine("Ultra high resolution: ${if (cap.supportsUltraHighResolution) "YES" else "NO"}")
-            appendLine("activeArray: ${activeArray ?: "none"}")
-            appendLine("maximumResolutionActiveArray: ${maxActiveArray ?: "none"}")
-            appendLine("SENSOR_PIXEL_MODE request key: ${if (hasSensorPixelModeRequestKey) "YES" else "NO"}")
-            appendLine("maximum-resolution stream map: ${if (hasMaximumResolutionMap) "YES" else "NO"}")
-            appendLine("normal RAW: ${cap.normalRawSizes.describe()}")
-            appendLine("normal YUV: ${cap.normalYuvSizes.describe()}")
-            appendLine("normal JPEG: ${cap.normalJpegSizes.describe()}")
-            appendLine("maximum RAW: ${cap.maxRawSizes.describe()}")
-            appendLine("maximum YUV: ${cap.maxYuvSizes.describe()}")
-            appendLine("maximum JPEG: ${cap.maxJpegSizes.describe()}")
-            appendLine("highRes RAW: ${cap.highResRawSizes.describe()}")
-            appendLine("highRes YUV: ${cap.highResYuvSizes.describe()}")
-            appendLine("highRes JPEG: ${cap.highResJpegSizes.describe()}")
-            appendLine("max MP RAW/YUV/JPEG: ${"%.1f".format(cap.maxAvailableRawMp)} / ${"%.1f".format(cap.maxAvailableYuvMp)} / ${"%.1f".format(cap.maxAvailableJpegMp)}")
-            appendLine("raw50Available: ${cap.raw50Available}")
-            appendLine("yuv50Available: ${cap.yuv50Available}")
-            appendLine("jpeg50Available: ${cap.jpeg50Available}")
-            appendLine("raw50Reason: ${cap.raw50Reason}")
-            if (Build.VERSION.SDK_INT >= 28) {
-                cap.physicalCameraIds.forEach { physicalId ->
-                    val physical = runCatching { manager.getCameraCharacteristics(physicalId) }.getOrNull()
-                    val physicalMap = physical?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                    val physicalRaw = physicalMap?.getOutputSizes(ImageFormat.RAW_SENSOR)?.toList().orEmpty()
-                    val physicalYuv = physicalMap?.getOutputSizes(ImageFormat.YUV_420_888)?.toList().orEmpty()
-                    val physicalJpeg = physicalMap?.getOutputSizes(ImageFormat.JPEG)?.toList().orEmpty()
-                    appendLine(
-                        "physicalCameraId=$physicalId focalLengths=" +
-                            "${physical?.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.toList().orEmpty()} " +
-                            "lensFacing=${physical?.get(CameraCharacteristics.LENS_FACING) ?: "unknown"} " +
-                            "maxRAW/YUV/JPEG=" +
-                            "${"%.1f".format(physicalRaw.maxOfOrNull(::megapixels) ?: 0.0)}/" +
-                            "${"%.1f".format(physicalYuv.maxOfOrNull(::megapixels) ?: 0.0)}/" +
-                            "${"%.1f".format(physicalJpeg.maxOfOrNull(::megapixels) ?: 0.0)}MP"
-                    )
-                }
-            }
+            val capability = queryCameraResolutionCapability(context, id, LensSlot.MAIN_1X)
+            appendLine(describeCapabilityReportForCamera(manager, id, capability))
             appendLine()
         }
     }.trim()
