@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -45,12 +44,12 @@ private val TopMiniButtonSize: Dp = 40.dp
 fun CameraTopOverlay(
     status: String,
     selectedResolution: CaptureResolutionMode,
-    meteringMode: MeteringMode,
     onHideFocusAeControls: () -> Unit,
     onResolutionClick: () -> Unit,
-    onMeteringModeClick: () -> Unit,
     onSettings: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    meteringMode: MeteringMode = MeteringMode.CENTER,
+    onMeteringModeClick: () -> Unit = {}
 ) {
     val levelState = rememberDeviceLevelState(enabled = true)
     val levelText = if (levelState.available) {
