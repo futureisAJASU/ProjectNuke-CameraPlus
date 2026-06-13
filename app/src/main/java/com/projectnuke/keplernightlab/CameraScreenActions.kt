@@ -82,16 +82,22 @@ internal fun handleLensSlotChange(
     selectedThreeXSource: ThreeXSourceMode,
     zoomUiState: ZoomUiState
 ): LensChangeResult {
+    val enteringThreeXFromOtherSlot = lensSlot == LensSlot.THREE_X && zoomUiState.lensSlot != LensSlot.THREE_X
+    val effectiveThreeXSource = if (enteringThreeXFromOtherSlot) {
+        ThreeXSourceMode.OPTICAL
+    } else {
+        selectedThreeXSource
+    }
     val clampedZoom =
         lensSlot.targetZoomRatio.coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
     val updatedZoomState = zoomUiState.copy(
         zoomRatio = clampedZoom,
         lensSlot = lensSlot,
-        useOpticalTeleAt3x = selectedThreeXSource == ThreeXSourceMode.OPTICAL
+        useOpticalTeleAt3x = effectiveThreeXSource == ThreeXSourceMode.OPTICAL
     )
     val forcedResolution = if (
         lensSlot == LensSlot.ULTRAWIDE ||
-        (lensSlot == LensSlot.THREE_X && selectedThreeXSource == ThreeXSourceMode.OPTICAL)
+        (lensSlot == LensSlot.THREE_X && effectiveThreeXSource == ThreeXSourceMode.OPTICAL)
     ) {
         CaptureResolutionMode.MP12
     } else {
@@ -101,7 +107,7 @@ internal fun handleLensSlotChange(
         context,
         options.copy(
             lensSlot = lensSlot,
-            threeXSourceMode = selectedThreeXSource
+            threeXSourceMode = effectiveThreeXSource
         )
     )
     return LensChangeResult(
