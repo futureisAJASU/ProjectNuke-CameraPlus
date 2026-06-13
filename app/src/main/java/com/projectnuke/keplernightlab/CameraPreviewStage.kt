@@ -82,7 +82,10 @@ internal fun PreviewStage(
                     modifier = Modifier.fillMaxSize()
                 )
             }
-            if (state.focusAeState.point != null && state.showFocusAeControls) {
+            if (
+                state.focusAeState.point != null &&
+                (state.showFocusAeControls || state.focusAeState.locked)
+            ) {
                 FocusAeOverlay(
                     focusAeState = state.focusAeState,
                     onToggleLock = callbacks.onToggleFocusLock,
