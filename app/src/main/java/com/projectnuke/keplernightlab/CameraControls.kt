@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -44,8 +45,10 @@ private val TopMiniButtonSize: Dp = 40.dp
 fun CameraTopOverlay(
     status: String,
     selectedResolution: CaptureResolutionMode,
+    meteringMode: MeteringMode,
     onHideFocusAeControls: () -> Unit,
     onResolutionClick: () -> Unit,
+    onMeteringModeClick: () -> Unit,
     onSettings: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -72,7 +75,7 @@ fun CameraTopOverlay(
         Column(
             modifier = Modifier
                 .weight(1f)
-                .padding(horizontal = 10.dp)
+                .padding(horizontal = 8.dp)
                 .clickable(onClick = onHideFocusAeControls),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
@@ -93,6 +96,11 @@ fun CameraTopOverlay(
             )
         }
 
+        TopText(
+            text = meteringMode.shortLabel,
+            onClick = onMeteringModeClick
+        )
+        Spacer(modifier = Modifier.size(10.dp))
         TopText(
             text = when (selectedResolution) {
                 CaptureResolutionMode.MP24_FUSION -> "24M Fusion"
