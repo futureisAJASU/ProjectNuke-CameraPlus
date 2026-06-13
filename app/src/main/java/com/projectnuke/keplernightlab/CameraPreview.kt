@@ -12,6 +12,7 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.params.MeteringRectangle
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
@@ -41,6 +42,7 @@ fun Camera2Preview(
     cameraId: String,
     zoomRatio: Float = 1.0f,
     focusAeState: FocusAeState = FocusAeState(),
+    meteringMode: MeteringMode = MeteringMode.CENTER,
     enabled: Boolean = true,
     onAeCapabilitiesChanged: (minIndex: Int, maxIndex: Int, stepEv: Float) -> Unit = { _, _, _ -> }
 ) {
@@ -62,6 +64,10 @@ fun Camera2Preview(
 
     LaunchedEffect(focusAeState) {
         controller.updateFocusAeState(focusAeState)
+    }
+
+    LaunchedEffect(meteringMode) {
+        controller.updateMeteringMode(meteringMode)
     }
 
     AndroidView(
@@ -109,6 +115,7 @@ private class CameraPreviewController(
     private var currentPreviewSize: Size? = null
     @Volatile private var latestZoomRatio: Float = 1.0f
     @Volatile private var latestFocusAeState: FocusAeState = FocusAeState()
+    @Volatile private var latestMeteringMode: MeteringMode = MeteringMode.CENTER
     @Volatile private var started = false
 
     fun start(textureView: TextureView) {
@@ -179,7 +186,6 @@ private class CameraPreviewController(
         }
 
         runCatching { refs.session?.stopRepeating() }
-        runCatching { refs.session?.close() }
         runCatching { refs.device?.close() }
         runCatching { refs.surface?.release() }
         runCatching { refs.thread?.quitSafely() }
@@ -196,6 +202,25 @@ private class CameraPreviewController(
                 previousState = previous,
                 localGeneration = localGeneration
             )
+        }
+    }
+
+    fun updateMeteringMode(newMode: MeteringMode) {
+        val previous = latestMeteringMode
+        latestMeteringMode = newMode
+        val handler = backgroundHandler ?: return
+        val localGeneration = synchronized(lock) { generation }
+        handler.post {
+            if (!isActive(localGeneration)) return@post
+            applyFocusAeStateOnCameraThread(
+                newState = latestFocusAeState,
+                previousState = latestFocusAeState,
+                localGeneration = localGeneration,
+                forceTrigger = false
+            )
+            if (previous != newMode) {
+                Log.d(TAG, "metering changed mode=$newMode")
+            }
         }
     }
 
@@ -380,10 +405,22 @@ private class CameraPreviewController(
         val characteristics = cameraCharacteristics ?: return
         val handler = backgroundHandler ?: return
         val zoom = latestZoomRatio
+        val meteringMode = latestMeteringMode
+        val centerPoint = NormalizedPoint(0.5f, 0.5f)
+        val afState = when {
+            newState.point != null -> newState
+            meteringMode == MeteringMode.CENTER || meteringMode == MeteringMode.SPOT -> newState.copy(point = centerPoint)
+            else -> newState
+        }
         val pointChanged = previousState.point != newState.point
         val lockChanged = previousState.locked != newState.locked
         val evChanged = previousState.exposureCompensationIndex != newState.exposureCompensationIndex
-        val meteringRegion = buildFocusAeMeteringRectangle(characteristics, zoom, newState.point)
+        val aeMeteringPoint = when (meteringMode) {
+            MeteringMode.MATRIX -> null
+            MeteringMode.CENTER -> centerPoint
+            MeteringMode.SPOT -> newState.point ?: centerPoint
+        }
+        val aeMeteringRegion = buildFocusAeMeteringRectangle(characteristics, zoom, aeMeteringPoint)
         val cropRegion = buildCenterCropRegion(characteristics, zoom)
 
         runCatching {
@@ -394,15 +431,17 @@ private class CameraPreviewController(
                         camera = camera,
                         surface = surface,
                         characteristics = characteristics,
-                        state = newState,
+                        state = afState,
                         zoomRatio = zoom,
+                        meteringMode = meteringMode,
+                        aeMeteringPoint = aeMeteringPoint,
                         afMode = CaptureRequest.CONTROL_AF_MODE_AUTO,
                         afTrigger = CaptureRequest.CONTROL_AF_TRIGGER_START
                     ),
                     null,
                     handler
                 )
-                Log.d(TAG, "AF trigger sent point=${newState.point}")
+                Log.d(TAG, "AF trigger sent point=${newState.point} metering=$meteringMode")
             }
 
             session.setRepeatingRequest(
@@ -410,8 +449,10 @@ private class CameraPreviewController(
                     camera = camera,
                     surface = surface,
                     characteristics = characteristics,
-                    state = newState,
+                    state = afState,
                     zoomRatio = zoom,
+                    meteringMode = meteringMode,
+                    aeMeteringPoint = aeMeteringPoint,
                     afMode = if (newState.point != null) {
                         CaptureRequest.CONTROL_AF_MODE_AUTO
                     } else {
@@ -425,7 +466,7 @@ private class CameraPreviewController(
             Log.d(
                 TAG,
                 "AF/AE apply pointChanged=$pointChanged lockChanged=$lockChanged evChanged=$evChanged " +
-                    "afRegions=${if (meteringRegion != null) 1 else 0} aeRegions=${if (meteringRegion != null) 1 else 0} " +
+                    "mode=$meteringMode aeRegions=${if (aeMeteringRegion != null) 1 else 0} " +
                     "zoomRatio=$zoom cropRegion=$cropRegion"
             )
             if (pointChanged) Log.d(TAG, "AF/AE point applied point=${newState.point}")
@@ -442,6 +483,8 @@ private class CameraPreviewController(
         characteristics: CameraCharacteristics,
         state: FocusAeState,
         zoomRatio: Float,
+        meteringMode: MeteringMode,
+        aeMeteringPoint: NormalizedPoint?,
         afMode: Int,
         afTrigger: Int
     ) = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
@@ -451,7 +494,31 @@ private class CameraPreviewController(
         set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
         set(CaptureRequest.CONTROL_AF_TRIGGER, afTrigger)
         applyZoomAndFocusAe(characteristics, zoomRatio, state)
+        applyPreviewAeMetering(characteristics, zoomRatio, meteringMode, aeMeteringPoint)
     }.build()
+
+    private fun CaptureRequest.Builder.applyPreviewAeMetering(
+        characteristics: CameraCharacteristics,
+        zoomRatio: Float,
+        meteringMode: MeteringMode,
+        aeMeteringPoint: NormalizedPoint?
+    ) {
+        val maxAeRegions = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+        if (maxAeRegions <= 0) return
+        when (meteringMode) {
+            MeteringMode.MATRIX -> {
+                val cropRegion = buildCenterCropRegion(characteristics, zoomRatio)
+                set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(MeteringRectangle(cropRegion, 0)))
+            }
+            MeteringMode.CENTER,
+            MeteringMode.SPOT -> {
+                val region = buildFocusAeMeteringRectangle(characteristics, zoomRatio, aeMeteringPoint)
+                if (region != null) {
+                    set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
+                }
+            }
+        }
+    }
 
     private fun isActive(localGeneration: Int): Boolean = synchronized(lock) {
         isActiveLocked(localGeneration)
