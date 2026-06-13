@@ -25,7 +25,8 @@ private val PreviewTopInset: Dp = 88.dp
 internal fun PreviewStage(
     state: CameraPreviewPaneState,
     callbacks: CameraPreviewPaneCallbacks,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    meteringMode: MeteringMode = MeteringMode.CENTER
 ) {
     BoxWithConstraints(
         modifier = modifier
@@ -67,6 +68,7 @@ internal fun PreviewStage(
                 cameraId = state.cameraSelection.cameraId,
                 zoomRatio = state.previewZoomRatio,
                 focusAeState = state.focusAeState,
+                meteringMode = meteringMode,
                 enabled = state.previewEnabled,
                 onAeCapabilitiesChanged = callbacks.onAeCapabilitiesChanged
             )
