@@ -79,6 +79,7 @@ fun captureRawBurstForFusion(
     val savedTimestamps = mutableSetOf<Long>()
     var failedCaptures = 0
     var maxResolutionPixelModeFailure: String? = null
+    var sensorPixelModeUsed = false
     var timeoutRunnable: Runnable? = null
     fun postCaptureProgress() {
         post("RAW capture: saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames, failed $failedCaptures")
@@ -108,6 +109,7 @@ fun captureRawBurstForFusion(
                 .put("receivedImages", receivedImages)
                 .put("completedResults", completedResults)
                 .put("failedCaptures", failedCaptures)
+                .put("sensorPixelModeUsed", sensorPixelModeUsed)
                 .put("captureCompleteness", if (savedFrames >= requestedFrames) "FULL" else if (savedFrames >= MIN_RAW_FUSION_FRAMES) "PARTIAL" else "FAILED")
                 .put("partialCapture", savedFrames in MIN_RAW_FUSION_FRAMES until requestedFrames)
                 .put("frames", frameObjects)
@@ -117,6 +119,7 @@ fun captureRawBurstForFusion(
                 job.put("resolutionFallbackReason", maxResolutionPixelModeFailure)
                 job.put("maxResolutionPixelModeFailure", maxResolutionPixelModeFailure)
             }
+            if (error != null) job.put("failureReason", error)
             jobFile.writeText(job.toString(2))
         }
     }
@@ -206,6 +209,7 @@ fun captureRawBurstForFusion(
             .put("status", "CAPTURING")
             .put("processStatus", "NOT_PROCESSED")
             .put("cameraId", cameraId)
+            .put("physicalCameraId", JSONObject.NULL)
             .put("resolutionMode", resolutionMode.label)
             .put("requestedResolutionMode", resolutionMode.name)
             .put("actualInputResolutionMode", actualInputMode.name)
@@ -245,6 +249,7 @@ fun captureRawBurstForFusion(
             .put("outputIsUpscaled", resolutionMode == CaptureResolutionMode.MP24_FUSION && zoomRatio >= 1.9f)
             .put("rawSizeSource", rawSelection.source)
             .put("requiresMaximumResolutionPixelMode", rawSelection.requiresMaximumResolutionPixelMode)
+            .put("sensorPixelModeUsed", false)
             .put("isHighResolutionSlowPath", rawSelection.isHighResolutionSlowPath)
             .put("rawSizeFallbackReason", rawSelection.fallbackReason ?: JSONObject.NULL)
             .put("sensorOrientation", characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: JSONObject.NULL)
@@ -280,6 +285,19 @@ fun captureRawBurstForFusion(
             .put("createdAt", System.currentTimeMillis())
             .put("notes", "True RAW fusion input. Stores RAW_SENSOR DNG backup plus compact raw16 per frame. TODO retry budget: targetFrames=8, maxAttempts=9 or 10, continue until target saved or maxAttempts/timeout.")
         jobFile.writeText(baseJob.toString(2))
+
+        if (
+            rawSelection.requiresMaximumResolutionPixelMode &&
+            characteristics.getAvailableCaptureRequestKeys()
+                ?.contains(CaptureRequest.SENSOR_PIXEL_MODE) != true
+        ) {
+            val reason =
+                "50MP RAW exists only in maximum-resolution map, but SENSOR_PIXEL_MODE request key is unavailable."
+            writeJobStatus(jobFile, baseJob, "CAPTURE_FAILED", reason)
+            fail("PIPELINE_FAILED: $reason")
+            cleanup()
+            return
+        }
 
         val imageReader = try {
             ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, requestedFrames + 2)
@@ -453,15 +471,21 @@ fun captureRawBurstForFusion(
                                         addTarget(imageReader.surface)
                                         set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                                         if (rawSelection.requiresMaximumResolutionPixelMode) {
-                                            runCatching {
+                                            try {
                                                 set(
                                                     CaptureRequest.SENSOR_PIXEL_MODE,
                                                     CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION
                                                 )
-                                            }.onFailure {
-                                                maxResolutionPixelModeFailure = "SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION failed: ${it.javaClass.simpleName}: ${it.message}"
-                                                writeJobStatus(jobFile, baseJob, "CAPTURING")
-                                                post("RAW max-resolution pixel mode not accepted; continuing safely.")
+                                                sensorPixelModeUsed = true
+                                                baseJob.put("sensorPixelModeUsed", true)
+                                            } catch (error: Exception) {
+                                                maxResolutionPixelModeFailure =
+                                                    "SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION failed: " +
+                                                        "${error.javaClass.simpleName}: ${error.message}"
+                                                throw IllegalStateException(
+                                                    maxResolutionPixelModeFailure,
+                                                    error
+                                                )
                                             }
                                         }
                                         applyZoomAndFocusAe(
@@ -1048,7 +1072,6 @@ fun chooseRawFusionSizeV2(
     val normalMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         ?: error("Stream configuration map missing")
     val normalRaw = normalMap.getOutputSizes(ImageFormat.RAW_SENSOR)?.toList().orEmpty()
-    if (normalRaw.isEmpty()) error("RAW_SENSOR not exposed")
     val maxRaw = if (Build.VERSION.SDK_INT >= 31) {
         characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
             ?.getOutputSizes(ImageFormat.RAW_SENSOR)
@@ -1060,6 +1083,9 @@ fun chooseRawFusionSizeV2(
     val highRaw = runCatching {
         normalMap.getHighResolutionOutputSizes(ImageFormat.RAW_SENSOR)?.toList().orEmpty()
     }.getOrDefault(emptyList())
+    if (normalRaw.isEmpty() && maxRaw.isEmpty() && highRaw.isEmpty()) {
+        error("RAW_SENSOR not exposed in normal, maximum-resolution, or high-resolution maps")
+    }
     val highDetailRawAvailable = (maxRaw + highRaw + normalRaw).any {
         it.width.toLong() * it.height.toLong() >= HIGH_RES_RAW_MIN_PIXELS
     }
@@ -1083,9 +1109,9 @@ fun chooseRawFusionSizeV2(
                     resolutionMode == CaptureResolutionMode.MP24_FUSION &&
                         resolutionPlan.selected24MpStrategy == "native_24mp_raw_fallback" ->
                         "native_24mp_raw_fallback"
-                    inMax -> "selected_plan_maximum_resolution_raw"
-                    inHigh -> "selected_plan_high_resolution_raw"
-                    else -> "selected_plan_normal_raw"
+                    inMax -> "MAXIMUM_RESOLUTION_MAP"
+                    inHigh -> "HIGH_RESOLUTION_OUTPUT"
+                    else -> "NORMAL_MAP"
                 },
                 requiresMaximumResolutionPixelMode = resolutionPlan.usesMaximumResolution || inMax,
                 isHighResolutionSlowPath = resolutionPlan.usesHighResolutionSlowPath || inHigh,
@@ -1098,22 +1124,22 @@ fun chooseRawFusionSizeV2(
     fun List<Size>.native24() = filter { megapixels(it) in 20.0..30.0 }.minByOrNull { abs(megapixels(it) - 24.0) }
     fun mp12() = normalRaw.filter { megapixels(it) <= 14.5 }.maxByOrNull { it.width * it.height }
         ?: normalRaw.maxByOrNull { it.width * it.height }
-        ?: error("RAW_SENSOR not exposed")
+        ?: error("12MP RAW unavailable in normal stream map")
     fun mp50(): RawSizeSelection? {
         maxRaw.largestAtLeast(40.0)?.let {
-            return RawSizeSelection(it, "maximum_resolution_raw", true, false, null)
+            return RawSizeSelection(it, "MAXIMUM_RESOLUTION_MAP", true, false, null)
         }
         highRaw.largestAtLeast(40.0)?.let {
-            return RawSizeSelection(it, "high_resolution_raw", false, true, null)
+            return RawSizeSelection(it, "HIGH_RESOLUTION_OUTPUT", false, true, null)
         }
         normalRaw.largestAtLeast(40.0)?.let {
-            return RawSizeSelection(it, "normal_raw", false, false, null)
+            return RawSizeSelection(it, "NORMAL_MAP", false, false, null)
         }
         return null
     }
 
     return when (resolutionMode) {
-        CaptureResolutionMode.MP12 -> RawSizeSelection(mp12(), "normal_raw_12mp", false, false, null)
+        CaptureResolutionMode.MP12 -> RawSizeSelection(mp12(), "NORMAL_MAP", false, false, null)
         CaptureResolutionMode.MP50 -> mp50()
             ?: error("50M RAW unavailable; no >=40MP RAW stream exposed through public Camera2.")
         CaptureResolutionMode.MP24_FUSION -> {

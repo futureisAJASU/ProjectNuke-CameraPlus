@@ -193,7 +193,7 @@ fun CacheJobsScreen(onBack: () -> Unit) {
             item {
                 InspectorSection("No jobs") {
                     Text(
-                        "No job folders found under KeplerRawFusion, KeplerColorBurst, KeplerSuperRes, or KeplerYuvBurst.",
+                        "No Kepler capture jobs found.",
                         color = inspectorMuted
                     )
                 }
@@ -707,6 +707,7 @@ fun findKeplerJobDirectories(context: Context): List<File> {
         "KeplerRawFusion",
         "KeplerColorBurst",
         "KeplerSuperRes",
+        "Kepler50MpTest",
         "KeplerYuvBurst",
         "KeplerRaw",
         "KeplerRawBurst"
@@ -738,6 +739,7 @@ fun loadKeplerJobSummaries(context: Context): List<KeplerJobSummary> {
             nativePostprocessUsed = job.value("nativePostprocessUsed"),
             finalOutputFileName = job.firstFileName(
                 "finalFile",
+                "outputFile",
                 "nativePostprocessRgbaFile",
                 "finalNightFusionFile",
                 "averageColorFile"

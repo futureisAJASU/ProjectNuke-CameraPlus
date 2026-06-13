@@ -37,6 +37,13 @@ internal data class Raw50Status(
     val maxRawMp: Double,
     val maxYuvMp: Double,
     val maxJpegMp: Double,
+    val normalRawAvailable: Boolean,
+    val normalYuvAvailable: Boolean,
+    val normalJpegAvailable: Boolean,
+    val maximumRawAvailable: Boolean,
+    val maximumYuvAvailable: Boolean,
+    val maximumJpegAvailable: Boolean,
+    val maximumResolutionPixelModeRequired: Boolean,
     val reason: String
 )
 
@@ -133,6 +140,16 @@ internal fun buildRaw50Status(streams: CameraStreamSizes): Raw50Status {
     val jpegAvailable = streams.allJpeg.any {
         megapixels(it) >= HIGH_RES_RAW_INPUT_MIN_MP
     }
+    val normalRawAvailable = streams.normalRaw.has50Mp()
+    val normalYuvAvailable = streams.normalYuv.has50Mp()
+    val normalJpegAvailable = streams.normalJpeg.has50Mp()
+    val maximumRawAvailable = streams.maximumRaw.has50Mp()
+    val maximumYuvAvailable = streams.maximumYuv.has50Mp()
+    val maximumJpegAvailable = streams.maximumJpeg.has50Mp()
+    val maximumResolutionPixelModeRequired =
+        (maximumRawAvailable && !normalRawAvailable) ||
+            (maximumYuvAvailable && !normalYuvAvailable) ||
+            (maximumJpegAvailable && !normalJpegAvailable)
     val reason = if (rawAvailable) {
         "Public Camera2 exposes RAW_SENSOR >=40MP."
     } else {
@@ -159,9 +176,22 @@ internal fun buildRaw50Status(streams: CameraStreamSizes): Raw50Status {
         maxRawMp,
         maxYuvMp,
         maxJpegMp,
+        normalRawAvailable,
+        normalYuvAvailable,
+        normalJpegAvailable,
+        maximumRawAvailable,
+        maximumYuvAvailable,
+        maximumJpegAvailable,
+        maximumResolutionPixelModeRequired,
         reason
     )
 }
+
+private fun List<Size>.has50Mp(): Boolean =
+    any { megapixels(it) >= HIGH_RES_RAW_INPUT_MIN_MP }
+
+private fun List<Size>.has12Mp(): Boolean =
+    any { megapixels(it) in 8.0..14.5 }
 
 fun queryCameraResolutionCapability(
     context: Context,
@@ -186,6 +216,28 @@ fun loadCameraResolutionCapability(
     val streams = collectStreamSizes(characteristics)
     val raw50Status = buildRaw50Status(streams)
     val native24Status = buildNative24Status(streams)
+    val pixelModeKeySupported = characteristics
+        .getAvailableCaptureRequestKeys()
+        ?.contains(CaptureRequest.SENSOR_PIXEL_MODE) == true
+    val maximumResolutionPixelModeSettable =
+        Build.VERSION.SDK_INT >= 31 &&
+            supportsUltraHighResolution &&
+            pixelModeKeySupported
+    val processed50Reason = when {
+        !raw50Status.rawAvailable && raw50Status.yuvAvailable && raw50Status.jpegAvailable ->
+            "50MP RAW unavailable, 50MP YUV/JPEG available."
+        !raw50Status.rawAvailable && raw50Status.yuvAvailable ->
+            "50MP RAW unavailable, 50MP YUV available, 50MP JPEG unavailable."
+        !raw50Status.rawAvailable && raw50Status.jpegAvailable ->
+            "50MP RAW unavailable, 50MP JPEG available, 50MP YUV unavailable."
+        raw50Status.yuvAvailable && raw50Status.jpegAvailable ->
+            "50MP RAW and 50MP YUV/JPEG available."
+        raw50Status.yuvAvailable ->
+            "50MP RAW and 50MP YUV available; 50MP JPEG unavailable."
+        raw50Status.jpegAvailable ->
+            "50MP RAW and 50MP JPEG available; 50MP YUV unavailable."
+        else -> "No >=40MP public YUV/JPEG stream is exposed."
+    }
 
     return CameraResolutionCapability(
         cameraId = cameraId,
@@ -201,9 +253,7 @@ fun loadCameraResolutionCapability(
         highResYuvSizes = streams.highResolutionYuv,
         highResJpegSizes = streams.highResolutionJpeg,
         capabilities = capabilities.toList(),
-        sensorPixelModeRequestKeySupported = characteristics
-            .getAvailableCaptureRequestKeys()
-            ?.contains(CaptureRequest.SENSOR_PIXEL_MODE) == true,
+        sensorPixelModeRequestKeySupported = pixelModeKeySupported,
         physicalCameraIds = if (Build.VERSION.SDK_INT >= 28) {
             characteristics.physicalCameraIds.toList()
         } else {
@@ -216,7 +266,18 @@ fun loadCameraResolutionCapability(
         raw50Available = raw50Status.rawAvailable,
         yuv50Available = raw50Status.yuvAvailable,
         jpeg50Available = raw50Status.jpegAvailable,
+        raw12Available = streams.normalRaw.has12Mp(),
+        yuv12Available = streams.normalYuv.has12Mp(),
+        normalRaw50Available = raw50Status.normalRawAvailable,
+        normalYuv50Available = raw50Status.normalYuvAvailable,
+        normalJpeg50Available = raw50Status.normalJpegAvailable,
+        maxResolutionRaw50Available = raw50Status.maximumRawAvailable,
+        maxResolutionYuv50Available = raw50Status.maximumYuvAvailable,
+        maxResolutionJpeg50Available = raw50Status.maximumJpegAvailable,
+        maxResolutionPixelModeRequired = raw50Status.maximumResolutionPixelModeRequired,
+        maximumResolutionPixelModeSettable = maximumResolutionPixelModeSettable,
         raw50Reason = raw50Status.reason,
+        processed50Reason = processed50Reason,
         maxAvailableRawMp = raw50Status.maxRawMp,
         maxAvailableYuvMp = raw50Status.maxYuvMp,
         maxAvailableJpegMp = raw50Status.maxJpegMp

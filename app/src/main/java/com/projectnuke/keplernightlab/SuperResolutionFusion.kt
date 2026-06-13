@@ -27,7 +27,9 @@ private const val SUPER_RES_PIPELINE = "SUPER_RESOLUTION_FUSION"
 private const val SUPER_RES_JOB_FILE = "job.json"
 private const val ALIGNMENT_PROXY_MAX_WIDTH = 512
 private const val ALIGNMENT_SEARCH_RADIUS = 24
-private const val FUSION_TILE_HEIGHT = 256
+private const val FUSION_TILE_WIDTH = 512
+private const val FUSION_TILE_HEIGHT = 512
+private const val BILINEAR_HALO_RADIUS = 2
 private const val OUTLIER_LUMA_THRESHOLD = 35f
 private const val ALIGNMENT_SCORE_LIMIT = 0.16f
 private const val MIN_FUSION_FRAMES = 2
@@ -78,6 +80,7 @@ data class SuperResolutionFusionRequest(
     val targetPolicy: SuperResolutionTargetPolicy = superResolutionTargetPolicy(sourceMode),
     val targetMegapixels: Double = targetPolicy.defaultTargetMegapixels,
     val maxFrames: Int = 6,
+    val tileSinkFactory: ((File) -> SuperResolutionTileSink)? = null,
     val status: (String) -> Unit
 )
 
@@ -105,6 +108,46 @@ data class FrameShift(
     val accepted: Boolean
 )
 
+interface SuperResolutionTileSink {
+    fun begin(width: Int, height: Int)
+    fun writeTile(x: Int, y: Int, width: Int, height: Int, pixels: IntArray)
+    fun finish(): File
+}
+
+class BitmapTileSink(
+    private val outputFile: File,
+    private val quality: Int = JPEG_QUALITY
+) : SuperResolutionTileSink {
+    private var bitmap: Bitmap? = null
+
+    override fun begin(width: Int, height: Int) {
+        check(bitmap == null) { "Tile sink already started." }
+        bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    }
+
+    override fun writeTile(x: Int, y: Int, width: Int, height: Int, pixels: IntArray) {
+        require(pixels.size >= width * height) { "Tile pixel buffer is too small." }
+        bitmap?.setPixels(pixels, 0, width, x, y, width, height)
+            ?: error("Tile sink not started.")
+    }
+
+    override fun finish(): File {
+        val output = bitmap ?: error("Tile sink not started.")
+        return try {
+            saveJpeg(output, outputFile, quality)
+            outputFile
+        } finally {
+            output.recycle()
+            bitmap = null
+        }
+    }
+
+    internal fun abort() {
+        bitmap?.recycle()
+        bitmap = null
+    }
+}
+
 private data class LumaFrame(
     val index: Int,
     val file: File,
@@ -122,7 +165,8 @@ private data class AlignmentEstimate(
     val score: Float
 )
 
-private data class DecodedStrip(
+private data class DecodedRegion(
+    val left: Int,
     val top: Int,
     val width: Int,
     val height: Int,
@@ -183,11 +227,18 @@ fun runSuperResolutionFusion(
             resolvedTargetMegapixels,
             request.targetPolicy
         )
-        if (!canAllocateOutputBitmap(dimensions.first, dimensions.second)) {
+        val usesBitmapSink = request.tileSinkFactory == null
+        if (
+            usesBitmapSink &&
+            (
+                resolvedTargetMegapixels > request.targetPolicy.maxSafeTargetMegapixels ||
+                    !canAllocateOutputBitmap(dimensions.first, dimensions.second)
+                )
+        ) {
             return failedSuperResolutionResult(
                 request = request,
                 inputFrameCount = inputFiles.size,
-                message = "Target requires a future streaming tile encoder; full output bitmap is unsafe.",
+                message = "Target requires a streaming tile sink; BitmapTileSink is limited to safe targets.",
                 shifts = shifts
             )
         }
@@ -207,7 +258,8 @@ fun runSuperResolutionFusion(
 
         val requiredBytes = estimateFusionWorkingBytes(
             outputWidth = dimensions.first,
-            outputHeight = dimensions.second
+            outputHeight = dimensions.second,
+            includesOutputBitmap = usesBitmapSink
         )
         if (availableHeapBytes() < requiredBytes) {
             return runSingleFrameFallback(
@@ -223,85 +275,46 @@ fun runSuperResolutionFusion(
         }
 
         request.status("$statusLabel: accumulating detail...")
-        val outputBitmap = fuseFramesTiled(
+        val outputFile = File(
+            request.outputDir,
+            superResolutionOutputFileName(resolvedTargetMegapixels)
+        )
+        val tileSink = request.tileSinkFactory?.invoke(outputFile) ?: BitmapTileSink(outputFile)
+        request.status("$statusLabel: writing output...")
+        val writtenFile = fuseFramesTiled(
             frames = acceptedFrames,
             shifts = shifts,
             reference = reference,
             outputWidth = dimensions.first,
-            outputHeight = dimensions.second
+            outputHeight = dimensions.second,
+            sink = tileSink
         )
-        try {
-            applyMildUnsharpInPlace(outputBitmap)
-            request.status("$statusLabel: writing output...")
-            val outputFile = File(
-                request.outputDir,
-                superResolutionOutputFileName(resolvedTargetMegapixels)
-            )
-            saveJpeg(outputBitmap, outputFile)
-            val actualOutputMegapixels = megapixels(outputBitmap.width, outputBitmap.height)
-            val result = SuperResolutionFusionResult(
-                outputFile = outputFile,
-                outputWidth = outputBitmap.width,
-                outputHeight = outputBitmap.height,
-                inputFrameCount = inputFiles.size,
-                usedFrameCount = acceptedFrames.size,
-                fallbackUsed = false,
-                estimatedShifts = shifts,
-                sourceMegapixels = sourceMegapixels,
-                targetMegapixels = resolvedTargetMegapixels,
-                actualOutputMegapixels = actualOutputMegapixels,
-                experimentalTarget =
-                    resolvedTargetMegapixels > request.targetPolicy.maxSafeTargetMegapixels,
-                rawInputUsed = request.sourceMode == SuperResolutionSourceMode.FULLRES_50MP_RAW,
-                message = "Multi-frame super-resolution completed."
-            )
-            writeSuperResolutionJob(request, result, "COMPLETE", null)
-            result
-        } finally {
-            outputBitmap.recycle()
-        }
+        val actualOutputMegapixels = megapixels(dimensions.first, dimensions.second)
+        val result = SuperResolutionFusionResult(
+            outputFile = writtenFile,
+            outputWidth = dimensions.first,
+            outputHeight = dimensions.second,
+            inputFrameCount = inputFiles.size,
+            usedFrameCount = acceptedFrames.size,
+            fallbackUsed = false,
+            estimatedShifts = shifts,
+            sourceMegapixels = sourceMegapixels,
+            targetMegapixels = resolvedTargetMegapixels,
+            actualOutputMegapixels = actualOutputMegapixels,
+            experimentalTarget =
+                resolvedTargetMegapixels > request.targetPolicy.maxSafeTargetMegapixels,
+            rawInputUsed = request.sourceMode == SuperResolutionSourceMode.FULLRES_50MP_RAW,
+            message = "Multi-frame tiled super-resolution completed."
+        )
+        writeSuperResolutionJob(request, result, "COMPLETE", null)
+        result
     } catch (oom: OutOfMemoryError) {
-        System.gc()
-        val reference = runCatching { analyzeFrames(inputFiles.take(1)).firstOrNull() }.getOrNull()
-        if (reference != null) {
-            val dimensions = calculateTargetDimensions(
-                reference.sourceWidth,
-                reference.sourceHeight,
-                resolveTargetMegapixels(
-                    request,
-                    megapixels(reference.sourceWidth, reference.sourceHeight)
-                ),
-                request.targetPolicy
-            )
-            val sourceMegapixels = megapixels(reference.sourceWidth, reference.sourceHeight)
-            val resolvedTargetMegapixels = resolveTargetMegapixels(request, sourceMegapixels)
-            runCatching {
-                runSingleFrameFallback(
-                    request = request,
-                    reference = reference,
-                    targetWidth = dimensions.first,
-                    targetHeight = dimensions.second,
-                    shifts = shifts,
-                    sourceMegapixels = sourceMegapixels,
-                    targetMegapixels = resolvedTargetMegapixels,
-                    reason = "Fusion ran out of memory."
-                )
-            }.getOrElse {
-                failedSuperResolutionResult(
-                    request,
-                    inputFiles.size,
-                    "Out of memory; fallback also failed.",
-                    shifts
-                )
-            }
-        } else {
-            failedSuperResolutionResult(
-                request,
-                inputFiles.size,
-                "Out of memory before reference decode.",
-                shifts
-            )
-        }
+        failedSuperResolutionResult(
+            request = request,
+            inputFrameCount = inputFiles.size,
+            message = "Out of memory; fusion stopped without attempting recovery.",
+            shifts = shifts
+        )
     } catch (error: Exception) {
         failedSuperResolutionResult(
             request = request,
@@ -656,111 +669,135 @@ private fun fuseFramesTiled(
     shifts: List<FrameShift>,
     reference: LumaFrame,
     outputWidth: Int,
-    outputHeight: Int
-): Bitmap {
+    outputHeight: Int,
+    sink: SuperResolutionTileSink
+): File {
     val scaleX = outputWidth.toFloat() / reference.sourceWidth
     val scaleY = outputHeight.toFloat() / reference.sourceHeight
     val shiftByIndex = shifts.associateBy { it.index }
-    val output = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
+    val maximumAcceptedShift = shifts
+        .asSequence()
+        .filter { it.accepted }
+        .maxOfOrNull { max(abs(it.dx), abs(it.dy)) }
+        ?: 0f
+    val sourceHalo = ceil(maximumAcceptedShift).toInt() + BILINEAR_HALO_RADIUS
     val decoders = frames.associate { frame ->
         frame.index to BitmapRegionDecoder.newInstance(frame.file.absolutePath, false)
     }
 
+    var finished = false
+    sink.begin(outputWidth, outputHeight)
     try {
-        var tileTop = 0
-        while (tileTop < outputHeight) {
-            val tileHeight = minOf(FUSION_TILE_HEIGHT, outputHeight - tileTop)
-            val pixelCount = outputWidth * tileHeight
-            val accumR = FloatArray(pixelCount)
-            val accumG = FloatArray(pixelCount)
-            val accumB = FloatArray(pixelCount)
-            val weights = FloatArray(pixelCount)
-            val referenceLuma = FloatArray(pixelCount)
+        val orderedFrames = frames.sortedBy { if (it.index == reference.index) 0 else 1 }
+        var tileY = 0
+        while (tileY < outputHeight) {
+            val tileHeight = minOf(FUSION_TILE_HEIGHT, outputHeight - tileY)
+            var tileX = 0
+            while (tileX < outputWidth) {
+                val tileWidth = minOf(FUSION_TILE_WIDTH, outputWidth - tileX)
+                val pixelCount = tileWidth * tileHeight
+                val accumR = FloatArray(pixelCount)
+                val accumG = FloatArray(pixelCount)
+                val accumB = FloatArray(pixelCount)
+                val weights = FloatArray(pixelCount)
+                val referenceLuma = FloatArray(pixelCount)
 
-            val orderedFrames = frames.sortedBy { if (it.index == reference.index) 0 else 1 }
-            orderedFrames.forEach { frame ->
-                val shift = shiftByIndex.getValue(frame.index)
-                val decoder = decoders.getValue(frame.index)
-                val strip = decodeStrip(
-                    decoder = decoder,
-                    sourceWidth = reference.sourceWidth,
-                    sourceHeight = reference.sourceHeight,
-                    outputTileTop = tileTop,
-                    outputTileHeight = tileHeight,
-                    scaleY = scaleY,
-                    shiftY = shift.dy
-                )
-                accumulateStrip(
-                    strip = strip,
-                    outputWidth = outputWidth,
-                    tileTop = tileTop,
-                    tileHeight = tileHeight,
-                    scaleX = scaleX,
-                    scaleY = scaleY,
-                    shift = shift,
-                    isReference = frame.index == reference.index,
-                    referenceLuma = referenceLuma,
+                orderedFrames.forEach { frame ->
+                    val shift = shiftByIndex.getValue(frame.index)
+                    val region = decodeTileRegion(
+                        decoder = decoders.getValue(frame.index),
+                        sourceWidth = reference.sourceWidth,
+                        sourceHeight = reference.sourceHeight,
+                        outputTileX = tileX,
+                        outputTileY = tileY,
+                        outputTileWidth = tileWidth,
+                        outputTileHeight = tileHeight,
+                        scaleX = scaleX,
+                        scaleY = scaleY,
+                        shift = shift,
+                        sourceHalo = sourceHalo
+                    )
+                    accumulateTile(
+                        region = region,
+                        tileX = tileX,
+                        tileY = tileY,
+                        tileWidth = tileWidth,
+                        tileHeight = tileHeight,
+                        scaleX = scaleX,
+                        scaleY = scaleY,
+                        shift = shift,
+                        isReference = frame.index == reference.index,
+                        referenceLuma = referenceLuma,
+                        accumR = accumR,
+                        accumG = accumG,
+                        accumB = accumB,
+                        weights = weights
+                    )
+                }
+
+                val outputPixels = normalizeTile(
                     accumR = accumR,
                     accumG = accumG,
                     accumB = accumB,
                     weights = weights
                 )
+                sink.writeTile(tileX, tileY, tileWidth, tileHeight, outputPixels)
+                tileX += tileWidth
             }
-
-            val outputPixels = IntArray(pixelCount)
-            for (index in 0 until pixelCount) {
-                val weight = weights[index]
-                outputPixels[index] = if (weight > 0f) {
-                    val red = (accumR[index] / weight).roundToInt().coerceIn(0, 255)
-                    val green = (accumG[index] / weight).roundToInt().coerceIn(0, 255)
-                    val blue = (accumB[index] / weight).roundToInt().coerceIn(0, 255)
-                    0xff000000.toInt() or (red shl 16) or (green shl 8) or blue
-                } else {
-                    0xff000000.toInt()
-                }
-            }
-            output.setPixels(outputPixels, 0, outputWidth, 0, tileTop, outputWidth, tileHeight)
-            tileTop += tileHeight
+            tileY += tileHeight
         }
+        return sink.finish().also { finished = true }
     } finally {
         decoders.values.forEach { decoder -> runCatching { decoder.recycle() } }
+        if (!finished && sink is BitmapTileSink) sink.abort()
     }
-    return output
 }
 
-private fun decodeStrip(
+private fun decodeTileRegion(
     decoder: BitmapRegionDecoder,
     sourceWidth: Int,
     sourceHeight: Int,
-    outputTileTop: Int,
+    outputTileX: Int,
+    outputTileY: Int,
+    outputTileWidth: Int,
     outputTileHeight: Int,
+    scaleX: Float,
     scaleY: Float,
-    shiftY: Float
-): DecodedStrip {
-    val firstSourceY = (outputTileTop + 0.5f) / scaleY - 0.5f + shiftY
+    shift: FrameShift,
+    sourceHalo: Int
+): DecodedRegion {
+    val firstSourceX = (outputTileX + 0.5f) / scaleX - 0.5f + shift.dx
+    val lastSourceX =
+        (outputTileX + outputTileWidth - 0.5f) / scaleX - 0.5f + shift.dx
+    val firstSourceY = (outputTileY + 0.5f) / scaleY - 0.5f + shift.dy
     val lastSourceY =
-        (outputTileTop + outputTileHeight - 0.5f) / scaleY - 0.5f + shiftY
-    val top = floor(minOf(firstSourceY, lastSourceY)).toInt().minus(2)
+        (outputTileY + outputTileHeight - 0.5f) / scaleY - 0.5f + shift.dy
+    val left = floor(minOf(firstSourceX, lastSourceX)).toInt().minus(sourceHalo)
+        .coerceIn(0, sourceWidth - 1)
+    val right = ceil(max(firstSourceX, lastSourceX)).toInt().plus(sourceHalo + 1)
+        .coerceIn(left + 1, sourceWidth)
+    val top = floor(minOf(firstSourceY, lastSourceY)).toInt().minus(sourceHalo)
         .coerceIn(0, sourceHeight - 1)
-    val bottom = ceil(max(firstSourceY, lastSourceY)).toInt().plus(3)
+    val bottom = ceil(max(firstSourceY, lastSourceY)).toInt().plus(sourceHalo + 1)
         .coerceIn(top + 1, sourceHeight)
     val bitmap = decoder.decodeRegion(
-        Rect(0, top, sourceWidth, bottom),
+        Rect(left, top, right, bottom),
         BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
     ) ?: error("Could not decode source strip.")
     return try {
         val pixels = IntArray(bitmap.width * bitmap.height)
         bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
-        DecodedStrip(top, bitmap.width, bitmap.height, pixels)
+        DecodedRegion(left, top, bitmap.width, bitmap.height, pixels)
     } finally {
         bitmap.recycle()
     }
 }
 
-private fun accumulateStrip(
-    strip: DecodedStrip,
-    outputWidth: Int,
-    tileTop: Int,
+private fun accumulateTile(
+    region: DecodedRegion,
+    tileX: Int,
+    tileY: Int,
+    tileWidth: Int,
     tileHeight: Int,
     scaleX: Float,
     scaleY: Float,
@@ -778,19 +815,20 @@ private fun accumulateStrip(
         (1f - shift.score * 3f).coerceIn(0.35f, 1f)
     }
     for (localY in 0 until tileHeight) {
-        val outputY = tileTop + localY
+        val outputY = tileY + localY
         val sourceY = (outputY + 0.5f) / scaleY - 0.5f + shift.dy
-        if (sourceY < strip.top || sourceY > strip.top + strip.height - 1) continue
-        val rowOffset = localY * outputWidth
-        for (outputX in 0 until outputWidth) {
+        if (sourceY < region.top || sourceY > region.top + region.height - 1) continue
+        val rowOffset = localY * tileWidth
+        for (localX in 0 until tileWidth) {
+            val outputX = tileX + localX
             val sourceX = (outputX + 0.5f) / scaleX - 0.5f + shift.dx
-            if (sourceX < 0f || sourceX > strip.width - 1f) continue
-            val color = bilinearArgb(strip, sourceX, sourceY)
+            if (sourceX < region.left || sourceX > region.left + region.width - 1) continue
+            val color = bilinearArgb(region, sourceX, sourceY)
             val red = color shr 16 and 0xff
             val green = color shr 8 and 0xff
             val blue = color and 0xff
             val luma = rgbLuma(red, green, blue)
-            val index = rowOffset + outputX
+            val index = rowOffset + localX
             val weight = if (isReference) {
                 referenceLuma[index] = luma
                 1f
@@ -813,18 +851,36 @@ private fun accumulateStrip(
     }
 }
 
-private fun bilinearArgb(strip: DecodedStrip, sourceX: Float, sourceY: Float): Int {
-    val x0 = floor(sourceX).toInt().coerceIn(0, strip.width - 1)
-    val x1 = minOf(x0 + 1, strip.width - 1)
-    val localY = sourceY - strip.top
-    val y0 = floor(localY).toInt().coerceIn(0, strip.height - 1)
-    val y1 = minOf(y0 + 1, strip.height - 1)
-    val fx = (sourceX - x0).coerceIn(0f, 1f)
+private fun normalizeTile(
+    accumR: FloatArray,
+    accumG: FloatArray,
+    accumB: FloatArray,
+    weights: FloatArray
+): IntArray = IntArray(weights.size) { index ->
+    val weight = weights[index]
+    if (weight > 0f) {
+        val red = (accumR[index] / weight).roundToInt().coerceIn(0, 255)
+        val green = (accumG[index] / weight).roundToInt().coerceIn(0, 255)
+        val blue = (accumB[index] / weight).roundToInt().coerceIn(0, 255)
+        0xff000000.toInt() or (red shl 16) or (green shl 8) or blue
+    } else {
+        0xff000000.toInt()
+    }
+}
+
+private fun bilinearArgb(region: DecodedRegion, sourceX: Float, sourceY: Float): Int {
+    val localX = sourceX - region.left
+    val localY = sourceY - region.top
+    val x0 = floor(localX).toInt().coerceIn(0, region.width - 1)
+    val x1 = minOf(x0 + 1, region.width - 1)
+    val y0 = floor(localY).toInt().coerceIn(0, region.height - 1)
+    val y1 = minOf(y0 + 1, region.height - 1)
+    val fx = (localX - x0).coerceIn(0f, 1f)
     val fy = (localY - y0).coerceIn(0f, 1f)
-    val c00 = strip.pixels[y0 * strip.width + x0]
-    val c10 = strip.pixels[y0 * strip.width + x1]
-    val c01 = strip.pixels[y1 * strip.width + x0]
-    val c11 = strip.pixels[y1 * strip.width + x1]
+    val c00 = region.pixels[y0 * region.width + x0]
+    val c10 = region.pixels[y0 * region.width + x1]
+    val c01 = region.pixels[y1 * region.width + x0]
+    val c11 = region.pixels[y1 * region.width + x1]
     val red = bilinearChannel(c00, c10, c01, c11, 16, fx, fy)
     val green = bilinearChannel(c00, c10, c01, c11, 8, fx, fy)
     val blue = bilinearChannel(c00, c10, c01, c11, 0, fx, fy)
@@ -906,6 +962,14 @@ private fun runSingleFrameFallback(
     targetMegapixels: Double,
     reason: String
 ): SuperResolutionFusionResult {
+    if (targetMegapixels > request.targetPolicy.maxSafeTargetMegapixels) {
+        return failedSuperResolutionResult(
+            request = request,
+            inputFrameCount = request.inputFrameFiles.size,
+            message = "$reason Streaming single-frame fallback is not implemented.",
+            shifts = shifts
+        )
+    }
     request.status("${superResolutionStatusLabel(request)}: writing output...")
     val source = BitmapFactory.decodeFile(reference.file.absolutePath)
         ?: return failedSuperResolutionResult(
@@ -1063,17 +1127,27 @@ private fun createSuperResolutionJobDirectory(context: Context): File {
     }
 }
 
-private fun saveJpeg(bitmap: Bitmap, outputFile: File) {
+private fun saveJpeg(bitmap: Bitmap, outputFile: File, quality: Int = JPEG_QUALITY) {
     FileOutputStream(outputFile).use { output ->
-        check(bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, output)) {
+        check(bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
             "JPEG encode failed."
         }
     }
 }
 
-private fun estimateFusionWorkingBytes(outputWidth: Int, outputHeight: Int): Long {
-    val outputBytes = outputWidth.toLong() * outputHeight * 4L
-    val tilePixels = outputWidth.toLong() * minOf(FUSION_TILE_HEIGHT, outputHeight)
+private fun estimateFusionWorkingBytes(
+    outputWidth: Int,
+    outputHeight: Int,
+    includesOutputBitmap: Boolean
+): Long {
+    val outputBytes = if (includesOutputBitmap) {
+        outputWidth.toLong() * outputHeight * 4L
+    } else {
+        0L
+    }
+    val tilePixels =
+        minOf(FUSION_TILE_WIDTH, outputWidth).toLong() *
+            minOf(FUSION_TILE_HEIGHT, outputHeight)
     val tileBytes = tilePixels * 29L
     return outputBytes + tileBytes + 64L * 1024L * 1024L
 }

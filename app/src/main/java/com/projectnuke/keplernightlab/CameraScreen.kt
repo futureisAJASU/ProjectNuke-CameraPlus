@@ -741,6 +741,39 @@ fun MainCameraScreen(
                         )
                     }
                 },
+                onTest50MProcessed = test50Processed@{
+                    currentScreen = MainScreen.CAMERA
+                    val mainSelection = selectCameraForOptions(
+                        context,
+                        SelectedCaptureOptions(
+                            LensSlot.MAIN_1X,
+                            CaptureResolutionMode.MP50,
+                            ThreeXSourceMode.MAIN_CROP
+                        )
+                    )
+                    CameraCapabilityCache.clear()
+                    val capability = queryCameraResolutionCapability(
+                        context,
+                        mainSelection.cameraId,
+                        LensSlot.MAIN_1X
+                    )
+                    if (!capability.yuv50Available && !capability.jpeg50Available) {
+                        status = "50MP processed capture unavailable. ${capability.processed50Reason}"
+                        return@test50Processed
+                    }
+                    runCameraJob(
+                        "Test 50M YUV/JPEG Capture: cameraId=${mainSelection.cameraId}",
+                        requestedFrames = 1
+                    ) { callback ->
+                        capture50MpProcessedTest(
+                            context = context,
+                            cameraId = mainSelection.cameraId,
+                            onStatus = callback,
+                            onComplete = {},
+                            onError = {}
+                        )
+                    }
+                },
                 onPrintResolutionReport = {
                     val report = buildResolutionCapabilityReport(context)
                     Log.i("KeplerCameraCapabilities", report)
@@ -1324,6 +1357,7 @@ fun SettingsScreen(
     onRaw: () -> Unit,
     onRawBurst: () -> Unit,
     onTest50MRaw: () -> Unit,
+    onTest50MProcessed: () -> Unit,
     onPrintResolutionReport: () -> Unit,
     onRefreshCameraCapabilities: () -> Unit,
     onBack: () -> Unit,
@@ -1432,6 +1466,11 @@ fun SettingsScreen(
                 MiniSettingsButton(
                     text = "Test 50M RAW Capture",
                     onClick = onTest50MRaw
+                )
+
+                MiniSettingsButton(
+                    text = "Test 50M YUV/JPEG Capture",
+                    onClick = onTest50MProcessed
                 )
 
                 MiniSettingsButton(
