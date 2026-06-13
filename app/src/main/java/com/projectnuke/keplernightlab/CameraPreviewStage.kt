@@ -19,7 +19,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
-private val PreviewTopInset: Dp = 108.dp
+private val PreviewTopInset: Dp = 88.dp
 
 @Composable
 internal fun PreviewStage(
