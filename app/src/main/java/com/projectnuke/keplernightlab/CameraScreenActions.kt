@@ -17,7 +17,7 @@ internal fun lensSlotForZoomRatioHysteresis(
         }
         LensSlot.MAIN_2X -> when {
             zoomRatio < 1.35f -> LensSlot.MAIN_1X
-            zoomRatio >= 2.9f && useOpticalTeleAt3x -> LensSlot.THREE_X
+            zoomRatio >= 2.9f -> LensSlot.THREE_X
             else -> LensSlot.MAIN_2X
         }
         LensSlot.THREE_X ->
@@ -97,7 +97,13 @@ internal fun handleLensSlotChange(
     } else {
         null
     }
-    val selection = selectCameraForOptions(context, options.copy(lensSlot = lensSlot))
+    val selection = selectCameraForOptions(
+        context,
+        options.copy(
+            lensSlot = lensSlot,
+            threeXSourceMode = selectedThreeXSource
+        )
+    )
     return LensChangeResult(
         updatedZoomState,
         forcedResolution,
@@ -111,8 +117,13 @@ internal fun handleThreeXSourceChange(
     source: ThreeXSourceMode,
     zoomUiState: ZoomUiState
 ): LensChangeResult {
-    val updatedZoomState =
-        zoomUiState.copy(useOpticalTeleAt3x = source == ThreeXSourceMode.OPTICAL)
+    val targetZoom = LensSlot.THREE_X.targetZoomRatio
+        .coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
+    val updatedZoomState = zoomUiState.copy(
+        zoomRatio = targetZoom,
+        lensSlot = LensSlot.THREE_X,
+        useOpticalTeleAt3x = source == ThreeXSourceMode.OPTICAL
+    )
     val selection = selectCameraForOptions(
         context,
         options.copy(
@@ -260,20 +271,3 @@ internal fun startCapturePipeline(
         )
     }
 }
-
-internal fun isTerminalStatus(text: String): Boolean {
-    return text.contains("PIPELINE_COMPLETE", ignoreCase = true) ||
-        text.contains("PIPELINE_FAILED", ignoreCase = true) ||
-        text.contains("CAPTURE_TIMEOUT", ignoreCase = true) ||
-        text.contains("PROCESS_TIMEOUT", ignoreCase = true) ||
-        text.contains("EXPORT_TIMEOUT", ignoreCase = true) ||
-        text.contains("timeout", ignoreCase = true) ||
-        text.contains("failed", ignoreCase = true) ||
-        text.contains("완료") ||
-        text.contains("실패") ||
-        text.contains("오류") ||
-        text.contains("연결 해제")
-}
-
-internal fun shortStatus(text: String): String =
-    text.lineSequence().firstOrNull()?.trim()?.take(42) ?: "대기 중"
