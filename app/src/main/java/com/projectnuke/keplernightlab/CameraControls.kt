@@ -48,8 +48,8 @@ fun CameraTopOverlay(
     onResolutionClick: () -> Unit,
     onSettings: () -> Unit,
     modifier: Modifier = Modifier,
-    meteringMode: MeteringMode = MeteringMode.CENTER,
-    onMeteringModeClick: () -> Unit = {}
+    meteringMode: MeteringMode = MeteringModeState.mode,
+    onMeteringModeClick: () -> Unit = { MeteringModeState.cycle() }
 ) {
     val levelState = rememberDeviceLevelState(enabled = true)
     val levelText = if (levelState.available) {
