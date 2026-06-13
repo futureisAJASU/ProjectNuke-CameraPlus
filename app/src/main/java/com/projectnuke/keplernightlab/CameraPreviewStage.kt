@@ -26,7 +26,7 @@ internal fun PreviewStage(
     state: CameraPreviewPaneState,
     callbacks: CameraPreviewPaneCallbacks,
     modifier: Modifier = Modifier,
-    meteringMode: MeteringMode = MeteringMode.CENTER
+    meteringMode: MeteringMode = MeteringModeState.mode
 ) {
     BoxWithConstraints(
         modifier = modifier
