@@ -35,10 +35,10 @@ internal val SideButtonSize: Dp = 56.dp
 internal val ShutterOuterSize: Dp = 84.dp
 internal val ShutterInnerSize: Dp = 64.dp
 private val ModeTabsSpacing: Dp = 1.dp
-private val TopOverlayHeight: Dp = 58.dp
-private val TopOverlayHorizontalPadding: Dp = 14.dp
-private val TopOverlayVerticalPadding: Dp = 4.dp
-private val TopMiniButtonSize: Dp = 46.dp
+private val TopOverlayHeight: Dp = 46.dp
+private val TopOverlayHorizontalPadding: Dp = 12.dp
+private val TopOverlayVerticalPadding: Dp = 2.dp
+private val TopMiniButtonSize: Dp = 40.dp
 
 @Composable
 fun CameraTopOverlay(
@@ -49,43 +49,56 @@ fun CameraTopOverlay(
     onSettings: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Column(
+    val levelState = rememberDeviceLevelState(enabled = true)
+    val levelText = if (levelState.available) {
+        "PITCH ${levelState.pitchDegrees.toInt()}°  ROLL ${levelState.rollDegrees.toInt()}°"
+    } else {
+        "LEVEL --"
+    }
+
+    Row(
         modifier = modifier
             .fillMaxWidth()
             .statusBarsPadding()
             .padding(
                 horizontal = TopOverlayHorizontalPadding,
                 vertical = TopOverlayVerticalPadding
-            ),
-        verticalArrangement = Arrangement.SpaceBetween
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(TopOverlayHeight),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            CircleMiniButton(label = "⚙", onClick = onSettings)
-            Spacer(
-                modifier = Modifier
-                    .weight(1f)
-                    .clickable(onClick = onHideFocusAeControls)
             )
-            TopText(
-                text = when (selectedResolution) {
-                    CaptureResolutionMode.MP24_FUSION -> "24M Fusion"
-                    else -> selectedResolution.label
-                },
-                onClick = onResolutionClick
+            .height(TopOverlayHeight),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        CircleMiniButton(label = "⚙", onClick = onSettings)
+
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 10.dp)
+                .clickable(onClick = onHideFocusAeControls),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = status,
+                color = Color.White.copy(alpha = 0.68f),
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = levelText,
+                color = Color.White.copy(alpha = 0.48f),
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
-        Text(
-            text = status,
-            color = Color.White.copy(alpha = 0.42f),
-            style = MaterialTheme.typography.labelSmall,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.fillMaxWidth()
+
+        TopText(
+            text = when (selectedResolution) {
+                CaptureResolutionMode.MP24_FUSION -> "24M Fusion"
+                else -> selectedResolution.label
+            },
+            onClick = onResolutionClick
         )
     }
 }
