@@ -21,7 +21,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
-import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.LocalContext
 import kotlin.math.PI
 
@@ -146,15 +145,5 @@ fun LevelIndicatorOverlay(
             end = Offset(center.x, center.y + 8f),
             strokeWidth = 2f
         )
-
-        drawContext.canvas.nativeCanvas.apply {
-            val paint = android.graphics.Paint().apply {
-                color = android.graphics.Color.argb(170, 255, 255, 255)
-                textSize = 28f
-                isAntiAlias = true
-            }
-            drawText("ROLL ${levelState.rollDegrees.toInt()}°", 24f, 42f, paint)
-            drawText("PITCH ${levelState.pitchDegrees.toInt()}°", 24f, 76f, paint)
-        }
     }
 }
