@@ -27,7 +27,7 @@ internal fun PreviewStage(
             .fillMaxSize()
             .fillMaxWidth()
             .background(Color.Black),
-        contentAlignment = Alignment.Center
+        contentAlignment = Alignment.TopCenter
     ) {
         val portraitPhotoAspectRatio = 3f / 4f
         val previewModifier = if (maxWidth / portraitPhotoAspectRatio <= maxHeight) {
