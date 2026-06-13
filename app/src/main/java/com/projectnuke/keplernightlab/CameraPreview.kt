@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Matrix
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
@@ -32,6 +33,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.roundToInt
 
 // Galaxy S24 temporary preview rotation override. Try 0/90/180/270 only while sensor/display transform is being verified.
 private const val PREVIEW_ROTATION_FIX_DEGREES = 0f
@@ -42,7 +45,7 @@ fun Camera2Preview(
     cameraId: String,
     zoomRatio: Float = 1.0f,
     focusAeState: FocusAeState = FocusAeState(),
-    meteringMode: MeteringMode = MeteringMode.CENTER,
+    meteringMode: MeteringMode = MeteringModeState.mode,
     enabled: Boolean = true,
     onAeCapabilitiesChanged: (minIndex: Int, maxIndex: Int, stepEv: Float) -> Unit = { _, _, _ -> }
 ) {
@@ -115,7 +118,7 @@ private class CameraPreviewController(
     private var currentPreviewSize: Size? = null
     @Volatile private var latestZoomRatio: Float = 1.0f
     @Volatile private var latestFocusAeState: FocusAeState = FocusAeState()
-    @Volatile private var latestMeteringMode: MeteringMode = MeteringMode.CENTER
+    @Volatile private var latestMeteringMode: MeteringMode = MeteringModeState.mode
     @Volatile private var started = false
 
     fun start(textureView: TextureView) {
@@ -134,7 +137,7 @@ private class CameraPreviewController(
             started = true
             generation
         }
-        Log.d(TAG, "start generation=$localGeneration cameraId=$cameraId zoom=$latestZoomRatio")
+        Log.d(TAG, "start generation=$localGeneration cameraId=$cameraId zoom=$latestZoomRatio metering=$latestMeteringMode")
 
         textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(
@@ -186,6 +189,7 @@ private class CameraPreviewController(
         }
 
         runCatching { refs.session?.stopRepeating() }
+        runCatching { refs.session?.close() }
         runCatching { refs.device?.close() }
         runCatching { refs.surface?.release() }
         runCatching { refs.thread?.quitSafely() }
@@ -215,8 +219,7 @@ private class CameraPreviewController(
             applyFocusAeStateOnCameraThread(
                 newState = latestFocusAeState,
                 previousState = latestFocusAeState,
-                localGeneration = localGeneration,
-                forceTrigger = false
+                localGeneration = localGeneration
             )
             if (previous != newMode) {
                 Log.d(TAG, "metering changed mode=$newMode")
@@ -236,7 +239,7 @@ private class CameraPreviewController(
                 previousState = latestFocusAeState,
                 localGeneration = localGeneration
             )
-            if (kotlin.math.abs(previous - latestZoomRatio) >= 0.02f) {
+            if (abs(previous - latestZoomRatio) >= 0.02f) {
                 Log.d(TAG, "zoom changed ratio=$latestZoomRatio")
             }
         }
@@ -406,35 +409,23 @@ private class CameraPreviewController(
         val handler = backgroundHandler ?: return
         val zoom = latestZoomRatio
         val meteringMode = latestMeteringMode
-        val centerPoint = NormalizedPoint(0.5f, 0.5f)
-        val afState = when {
-            newState.point != null -> newState
-            meteringMode == MeteringMode.CENTER || meteringMode == MeteringMode.SPOT -> newState.copy(point = centerPoint)
-            else -> newState
-        }
         val pointChanged = previousState.point != newState.point
         val lockChanged = previousState.locked != newState.locked
         val evChanged = previousState.exposureCompensationIndex != newState.exposureCompensationIndex
-        val aeMeteringPoint = when (meteringMode) {
-            MeteringMode.MATRIX -> null
-            MeteringMode.CENTER -> centerPoint
-            MeteringMode.SPOT -> newState.point ?: centerPoint
-        }
-        val aeMeteringRegion = buildFocusAeMeteringRectangle(characteristics, zoom, aeMeteringPoint)
+        val aeRegions = buildAeMeteringRegions(characteristics, zoom, meteringMode, newState.point)
         val cropRegion = buildCenterCropRegion(characteristics, zoom)
 
         runCatching {
             if ((pointChanged || forceTrigger) && newState.point != null) {
-                // Tap is focus trigger. LOCK only holds current AE/AF behavior.
                 session.capture(
                     buildPreviewRequest(
                         camera = camera,
                         surface = surface,
                         characteristics = characteristics,
-                        state = afState,
+                        state = newState,
                         zoomRatio = zoom,
                         meteringMode = meteringMode,
-                        aeMeteringPoint = aeMeteringPoint,
+                        aeRegions = aeRegions,
                         afMode = CaptureRequest.CONTROL_AF_MODE_AUTO,
                         afTrigger = CaptureRequest.CONTROL_AF_TRIGGER_START
                     ),
@@ -449,10 +440,10 @@ private class CameraPreviewController(
                     camera = camera,
                     surface = surface,
                     characteristics = characteristics,
-                    state = afState,
+                    state = newState,
                     zoomRatio = zoom,
                     meteringMode = meteringMode,
-                    aeMeteringPoint = aeMeteringPoint,
+                    aeRegions = aeRegions,
                     afMode = if (newState.point != null) {
                         CaptureRequest.CONTROL_AF_MODE_AUTO
                     } else {
@@ -466,8 +457,7 @@ private class CameraPreviewController(
             Log.d(
                 TAG,
                 "AF/AE apply pointChanged=$pointChanged lockChanged=$lockChanged evChanged=$evChanged " +
-                    "mode=$meteringMode aeRegions=${if (aeMeteringRegion != null) 1 else 0} " +
-                    "zoomRatio=$zoom cropRegion=$cropRegion"
+                    "mode=$meteringMode aeRegions=${aeRegions.size} zoomRatio=$zoom cropRegion=$cropRegion"
             )
             if (pointChanged) Log.d(TAG, "AF/AE point applied point=${newState.point}")
             if (lockChanged) Log.d(TAG, "AE lock changed locked=${newState.locked}")
@@ -484,7 +474,7 @@ private class CameraPreviewController(
         state: FocusAeState,
         zoomRatio: Float,
         meteringMode: MeteringMode,
-        aeMeteringPoint: NormalizedPoint?,
+        aeRegions: Array<MeteringRectangle>,
         afMode: Int,
         afTrigger: Int
     ) = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
@@ -493,31 +483,129 @@ private class CameraPreviewController(
         set(CaptureRequest.CONTROL_AF_MODE, afMode)
         set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
         set(CaptureRequest.CONTROL_AF_TRIGGER, afTrigger)
-        applyZoomAndFocusAe(characteristics, zoomRatio, state)
-        applyPreviewAeMetering(characteristics, zoomRatio, meteringMode, aeMeteringPoint)
+        applyZoomAndFocusAf(characteristics, zoomRatio, state)
+        applyPreviewAeMetering(characteristics, meteringMode, aeRegions)
     }.build()
+
+    private fun CaptureRequest.Builder.applyZoomAndFocusAf(
+        characteristics: CameraCharacteristics,
+        zoomRatio: Float,
+        state: FocusAeState
+    ) {
+        val cropRegion = buildCenterCropRegion(characteristics, zoomRatio)
+        set(CaptureRequest.SCALER_CROP_REGION, cropRegion)
+
+        val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+        val compensation = if (aeRange != null) {
+            state.exposureCompensationIndex.coerceIn(aeRange.lower, aeRange.upper)
+        } else {
+            state.exposureCompensationIndex
+        }
+        set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, compensation)
+        set(CaptureRequest.CONTROL_AE_LOCK, state.locked)
+
+        val maxAfRegions = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
+        if (maxAfRegions > 0 && state.point != null) {
+            buildMeteringRectangle(
+                characteristics = characteristics,
+                zoomRatio = zoomRatio,
+                point = state.point,
+                fraction = 0.18f,
+                weight = MeteringRectangle.METERING_WEIGHT_MAX
+            )?.let { region ->
+                set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
+            }
+        }
+    }
 
     private fun CaptureRequest.Builder.applyPreviewAeMetering(
         characteristics: CameraCharacteristics,
-        zoomRatio: Float,
         meteringMode: MeteringMode,
-        aeMeteringPoint: NormalizedPoint?
+        aeRegions: Array<MeteringRectangle>
     ) {
         val maxAeRegions = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
         if (maxAeRegions <= 0) return
-        when (meteringMode) {
-            MeteringMode.MATRIX -> {
-                val cropRegion = buildCenterCropRegion(characteristics, zoomRatio)
-                set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(MeteringRectangle(cropRegion, 0)))
+        if (meteringMode == MeteringMode.AVERAGE || aeRegions.isEmpty()) return
+        set(CaptureRequest.CONTROL_AE_REGIONS, aeRegions.take(maxAeRegions).toTypedArray())
+    }
+
+    private fun buildAeMeteringRegions(
+        characteristics: CameraCharacteristics,
+        zoomRatio: Float,
+        meteringMode: MeteringMode,
+        touchPoint: NormalizedPoint?
+    ): Array<MeteringRectangle> {
+        val cropRegion = buildCenterCropRegion(characteristics, zoomRatio)
+        return when (meteringMode) {
+            MeteringMode.AVERAGE -> emptyArray()
+            MeteringMode.CENTER_WEIGHTED -> {
+                val full = MeteringRectangle(cropRegion, 120)
+                val center = buildMeteringRectangle(
+                    characteristics = characteristics,
+                    zoomRatio = zoomRatio,
+                    point = NormalizedPoint(0.5f, 0.5f),
+                    fraction = 0.72f,
+                    weight = MeteringRectangle.METERING_WEIGHT_MAX
+                )
+                listOfNotNull(full, center).toTypedArray()
             }
-            MeteringMode.CENTER,
+            MeteringMode.CENTER -> {
+                buildMeteringRectangle(
+                    characteristics = characteristics,
+                    zoomRatio = zoomRatio,
+                    point = NormalizedPoint(0.5f, 0.5f),
+                    fraction = 0.34f,
+                    weight = MeteringRectangle.METERING_WEIGHT_MAX
+                )?.let { arrayOf(it) } ?: emptyArray()
+            }
             MeteringMode.SPOT -> {
-                val region = buildFocusAeMeteringRectangle(characteristics, zoomRatio, aeMeteringPoint)
-                if (region != null) {
-                    set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
-                }
+                buildMeteringRectangle(
+                    characteristics = characteristics,
+                    zoomRatio = zoomRatio,
+                    point = touchPoint ?: NormalizedPoint(0.5f, 0.5f),
+                    fraction = 0.13f,
+                    weight = MeteringRectangle.METERING_WEIGHT_MAX
+                )?.let { arrayOf(it) } ?: emptyArray()
             }
         }
+    }
+
+    private fun buildMeteringRectangle(
+        characteristics: CameraCharacteristics,
+        zoomRatio: Float,
+        point: NormalizedPoint?,
+        fraction: Float,
+        weight: Int
+    ): MeteringRectangle? {
+        val safePoint = point ?: return null
+        val cropRegion = buildCenterCropRegion(characteristics, zoomRatio)
+        val regionWidth = max(48, (cropRegion.width() * fraction).roundToInt())
+        val regionHeight = max(48, (cropRegion.height() * fraction).roundToInt())
+        val centerX = cropRegion.left + (cropRegion.width() * safePoint.x.coerceIn(0f, 1f)).roundToInt()
+        val centerY = cropRegion.top + (cropRegion.height() * safePoint.y.coerceIn(0f, 1f)).roundToInt()
+        val left = (centerX - regionWidth / 2).coerceIn(cropRegion.left, cropRegion.right - regionWidth)
+        val top = (centerY - regionHeight / 2).coerceIn(cropRegion.top, cropRegion.bottom - regionHeight)
+        val rect = Rect(
+            left,
+            top,
+            left + regionWidth,
+            top + regionHeight
+        )
+        return MeteringRectangle(rect, weight.coerceIn(0, MeteringRectangle.METERING_WEIGHT_MAX))
+    }
+
+    private fun buildCenterCropRegion(
+        characteristics: CameraCharacteristics,
+        zoomRatio: Float
+    ): Rect {
+        val activeArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            ?: return Rect(0, 0, 1, 1)
+        val safeZoom = max(1f, zoomRatio)
+        val cropWidth = max(1, (activeArray.width() / safeZoom).roundToInt())
+        val cropHeight = max(1, (activeArray.height() / safeZoom).roundToInt())
+        val left = activeArray.left + (activeArray.width() - cropWidth) / 2
+        val top = activeArray.top + (activeArray.height() - cropHeight) / 2
+        return Rect(left, top, left + cropWidth, top + cropHeight)
     }
 
     private fun isActive(localGeneration: Int): Boolean = synchronized(lock) {
@@ -565,7 +653,7 @@ private class CameraPreviewController(
         }
         val scaleX = viewWidth / rotatedBufferWidth
         val scaleY = viewHeight / rotatedBufferHeight
-        val finalScale = kotlin.math.max(scaleX, scaleY)
+        val finalScale = max(scaleX, scaleY)
         Log.d(
             TAG,
             "configureTransform view=${viewWidth}x$viewHeight previewSize=${previewSize.width}x${previewSize.height} " +
