@@ -11,6 +11,17 @@ enum class ResolutionAvailability {
 
 const val HIGH_RES_RAW_INPUT_MIN_MP = 40.0
 
+enum class Raw50ReasonCode {
+    RAW50_NORMAL_MAP_AVAILABLE,
+    RAW50_MAXIMUM_RESOLUTION_MAP_AVAILABLE,
+    RAW50_MAX_MAP_AVAILABLE_BUT_SENSOR_PIXEL_MODE_KEY_MISSING,
+    RAW50_NOT_EXPOSED_BUT_YUV50_AVAILABLE,
+    RAW50_NOT_EXPOSED_BUT_JPEG50_AVAILABLE,
+    RAW50_NOT_EXPOSED_ANYWHERE,
+    WRONG_CAMERA_ID_SUSPECTED,
+    PHYSICAL_CAMERA_CHECK_NEEDED
+}
+
 data class ResolutionModeAvailability(
     val mode: CaptureResolutionMode,
     val availability: ResolutionAvailability,
@@ -50,6 +61,7 @@ data class CameraResolutionCapability(
     val maxResolutionJpeg50Available: Boolean,
     val maxResolutionPixelModeRequired: Boolean,
     val maximumResolutionPixelModeSettable: Boolean,
+    val raw50ReasonCode: Raw50ReasonCode,
     val raw50Reason: String,
     val processed50Reason: String,
     val maxAvailableRawMp: Double,

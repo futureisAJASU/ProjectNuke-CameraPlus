@@ -117,7 +117,12 @@ private fun describeCameraCapabilityForReport(
         appendLine("maxResolutionRaw50Available: ${capability.maxResolutionRaw50Available}")
         appendLine("maxResolutionYuv50Available: ${capability.maxResolutionYuv50Available}")
         appendLine("maxResolutionJpeg50Available: ${capability.maxResolutionJpeg50Available}")
+        appendLine(
+            "maxResolutionRawHas4By3Above40MP: " +
+                capability.maxRawSizes.hasFourByThreeAbove40Mp()
+        )
         appendLine("maxResolutionPixelModeRequired: ${capability.maxResolutionPixelModeRequired}")
+        appendLine("raw50ReasonCode: ${capability.raw50ReasonCode.name}")
         appendLine("raw50Reason: ${capability.raw50Reason}")
         appendLine("processed50Reason: ${capability.processed50Reason}")
         appendLine(
@@ -179,6 +184,16 @@ private fun describePhysicalCamera(manager: CameraManager, physicalId: String): 
     val sensorPixelModeAvailable = physical
         ?.getAvailableCaptureRequestKeys()
         ?.contains(android.hardware.camera2.CaptureRequest.SENSOR_PIXEL_MODE) == true
+    val normalRaw50 = raw.hasFourByThreeAbove40Mp()
+    val maximumRaw50 =
+        maximumMap.sizes(ImageFormat.RAW_SENSOR).hasFourByThreeAbove40Mp()
+    val physicalRaw50Reason = when {
+        normalRaw50 -> Raw50ReasonCode.RAW50_NORMAL_MAP_AVAILABLE
+        maximumRaw50 && !sensorPixelModeAvailable ->
+            Raw50ReasonCode.RAW50_MAX_MAP_AVAILABLE_BUT_SENSOR_PIXEL_MODE_KEY_MISSING
+        maximumRaw50 -> Raw50ReasonCode.RAW50_MAXIMUM_RESOLUTION_MAP_AVAILABLE
+        else -> Raw50ReasonCode.RAW50_NOT_EXPOSED_ANYWHERE
+    }
     return buildString {
         appendLine("physicalCameraId=$physicalId")
         appendLine("  lensFacing=${physical?.get(CameraCharacteristics.LENS_FACING) ?: "unknown"}")
@@ -202,6 +217,8 @@ private fun describePhysicalCamera(manager: CameraManager, physicalId: String): 
         appendLine("  maximum RAW=${maximumMap.sizes(ImageFormat.RAW_SENSOR).describeSizes()}")
         appendLine("  maximum YUV=${maximumMap.sizes(ImageFormat.YUV_420_888).describeSizes()}")
         appendLine("  maximum JPEG=${maximumMap.sizes(ImageFormat.JPEG).describeSizes()}")
+        appendLine("  maxResolutionRawHas4By3Above40MP=$maximumRaw50")
+        appendLine("  raw50ReasonCode=${physicalRaw50Reason.name}")
         append("  maximum PRIVATE=${maximumMap.sizes(ImageFormat.PRIVATE).describeSizes()}")
     }
 }
@@ -209,7 +226,18 @@ private fun describePhysicalCamera(manager: CameraManager, physicalId: String): 
 fun buildResolutionCapabilityReport(context: Context): String {
     CameraCapabilityCache.clear()
     val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    val selectedMain50 = selectCameraForOptions(
+        context,
+        SelectedCaptureOptions(
+            LensSlot.MAIN_1X,
+            CaptureResolutionMode.MP50,
+            ThreeXSourceMode.MAIN_CROP
+        )
+    )
     return buildString {
+        appendLine("selected MAIN_1X MP50 cameraId=${selectedMain50.cameraId}")
+        appendLine("selectionReason=${selectedMain50.diagnosticReason}")
+        appendLine()
         manager.cameraIdList.forEach { id ->
             val characteristics = manager.getCameraCharacteristics(id)
             if (

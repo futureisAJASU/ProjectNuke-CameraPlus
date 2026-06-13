@@ -719,7 +719,12 @@ fun MainCameraScreen(
                     )
                     capabilityRefreshNonce++
                     if (!mainCapability.raw50Available) {
-                        status = mainCapability.raw50Reason
+                        status =
+                            "50MP RAW unavailable: ${mainCapability.raw50ReasonCode.name}. " +
+                                "cameraId=${mainSelection.cameraId}, checked normal/max maps, " +
+                                "YUV50=${mainCapability.yuv50Available}, " +
+                                "JPEG50=${mainCapability.jpeg50Available}. " +
+                                mainCapability.raw50Reason
                         return@test50
                     }
                     runCameraJob("Test 50M RAW Capture: cameraId=${mainSelection.cameraId}", requestedFrames = 1) { callback ->
