@@ -416,7 +416,12 @@ fun captureYuvBurstColorWithMotion(
                                                     CaptureRequest.EDGE_MODE_FAST
                                                 )
 
-                                                applyZoomAndFocusAe(characteristics, zoomRatio, focusAeState)
+                                                applyZoomAndFocusAe(
+                                                    characteristics = characteristics,
+                                                    zoomRatio = zoomRatio,
+                                                    focusAeState = focusAeState,
+                                                    cameraId = cameraId
+                                                )
                                             }.build()
                                         }
 

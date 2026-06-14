@@ -492,8 +492,15 @@ private class CameraPreviewController(
         zoomRatio: Float,
         state: FocusAeState
     ) {
-        val cropRegion = buildCenterCropRegion(characteristics, zoomRatio)
-        set(CaptureRequest.SCALER_CROP_REGION, cropRegion)
+        val zoomApplication = applyCamera2Zoom(characteristics, zoomRatio)
+        Log.d(
+            "KeplerPreview",
+            "previewZoom cameraId=$cameraId requested=$zoomRatio " +
+                "mode=${if (zoomApplication.usedControlZoomRatio) "CONTROL_ZOOM_RATIO" else "SCALER_CROP_REGION"} " +
+                "applied=${zoomApplication.appliedZoomRatio} " +
+                "range=${zoomApplication.zoomRatioRange} " +
+                "cropFallback=${zoomApplication.cropRegion != null}"
+        )
 
         val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
         val compensation = if (aeRange != null) {

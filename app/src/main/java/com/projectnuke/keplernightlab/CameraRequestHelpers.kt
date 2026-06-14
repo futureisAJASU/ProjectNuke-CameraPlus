@@ -5,28 +5,75 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.MeteringRectangle
 import android.os.Build
+import android.util.Log
 import kotlin.math.roundToInt
 
-fun CaptureRequest.Builder.applyZoomAndFocusAe(
+data class Camera2ZoomApplication(
+    val requestedZoomRatio: Float,
+    val appliedZoomRatio: Float,
+    val usedControlZoomRatio: Boolean,
+    val cropRegion: Rect?,
+    val zoomRatioRange: String
+)
+
+fun CaptureRequest.Builder.applyCamera2Zoom(
     characteristics: CameraCharacteristics,
     zoomRatio: Float,
-    focusAeState: FocusAeState,
     useMaximumResolutionActiveArray: Boolean = false
-) {
+): Camera2ZoomApplication {
+    val zoomRange = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+    } else {
+        null
+    }
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && zoomRange != null) {
+        val appliedZoom = zoomRatio.coerceIn(zoomRange.lower, zoomRange.upper)
+        set(CaptureRequest.CONTROL_ZOOM_RATIO, appliedZoom)
+        return Camera2ZoomApplication(
+            requestedZoomRatio = zoomRatio,
+            appliedZoomRatio = appliedZoom,
+            usedControlZoomRatio = true,
+            cropRegion = null,
+            zoomRatioRange = "${zoomRange.lower}..${zoomRange.upper}"
+        )
+    }
+
     val crop = buildCenterCropRegionForPixelMode(
         characteristics = characteristics,
         zoomRatio = zoomRatio,
         useMaximumResolutionActiveArray = useMaximumResolutionActiveArray
     ).region
     crop?.let { set(CaptureRequest.SCALER_CROP_REGION, it) }
+    return Camera2ZoomApplication(
+        requestedZoomRatio = zoomRatio,
+        appliedZoomRatio = zoomRatio,
+        usedControlZoomRatio = false,
+        cropRegion = crop,
+        zoomRatioRange = "unavailable"
+    )
+}
 
-    if (zoomRatio > 1f && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        runCatching {
-            val zoomRange = characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
-            if (zoomRange == null || zoomRange.contains(zoomRatio)) {
-                set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio)
-            }
-        }
+fun CaptureRequest.Builder.applyZoomAndFocusAe(
+    characteristics: CameraCharacteristics,
+    zoomRatio: Float,
+    focusAeState: FocusAeState,
+    useMaximumResolutionActiveArray: Boolean = false,
+    cameraId: String? = null
+) {
+    val zoomApplication = applyCamera2Zoom(
+        characteristics = characteristics,
+        zoomRatio = zoomRatio,
+        useMaximumResolutionActiveArray = useMaximumResolutionActiveArray
+    )
+    if (zoomRatio >= 2.9f) {
+        Log.d(
+            "Kepler3xSelection",
+            "captureZoom cameraId=${cameraId ?: "unknown"} requested=$zoomRatio " +
+                "mode=${if (zoomApplication.usedControlZoomRatio) "CONTROL_ZOOM_RATIO" else "SCALER_CROP_REGION"} " +
+                "applied=${zoomApplication.appliedZoomRatio} " +
+                "range=${zoomApplication.zoomRatioRange} crop=${zoomApplication.cropRegion}"
+        )
     }
 
     val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)

@@ -492,7 +492,8 @@ fun captureRawBurstForFusion(
                                             characteristics = characteristics,
                                             zoomRatio = zoomRatio,
                                             focusAeState = focusAeState,
-                                            useMaximumResolutionActiveArray = rawSelection.requiresMaximumResolutionPixelMode
+                                            useMaximumResolutionActiveArray = rawSelection.requiresMaximumResolutionPixelMode,
+                                            cameraId = cameraId
                                         )
                                     }.build()
                                 }
