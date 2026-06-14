@@ -103,13 +103,19 @@ internal fun handleLensSlotChange(
     } else {
         null
     }
-    val selection = selectCameraForOptions(
-        context,
+    val selectionOptions = if (lensSlot == LensSlot.THREE_X && effectiveThreeXSource == ThreeXSourceMode.OPTICAL) {
+        SelectedCaptureOptions(
+            LensSlot.THREE_X,
+            CaptureResolutionMode.MP12,
+            ThreeXSourceMode.OPTICAL
+        )
+    } else {
         options.copy(
             lensSlot = lensSlot,
             threeXSourceMode = effectiveThreeXSource
         )
-    )
+    }
+    val selection = selectCameraForOptions(context, selectionOptions)
     return LensChangeResult(
         updatedZoomState,
         forcedResolution,
@@ -130,13 +136,19 @@ internal fun handleThreeXSourceChange(
         lensSlot = LensSlot.THREE_X,
         useOpticalTeleAt3x = source == ThreeXSourceMode.OPTICAL
     )
-    val selection = selectCameraForOptions(
-        context,
+    val selectionOptions = if (source == ThreeXSourceMode.OPTICAL) {
+        SelectedCaptureOptions(
+            LensSlot.THREE_X,
+            CaptureResolutionMode.MP12,
+            ThreeXSourceMode.OPTICAL
+        )
+    } else {
         options.copy(
             lensSlot = LensSlot.THREE_X,
-            threeXSourceMode = source
+            threeXSourceMode = ThreeXSourceMode.MAIN_CROP
         )
-    )
+    }
+    val selection = selectCameraForOptions(context, selectionOptions)
     return LensChangeResult(
         updatedZoomState,
         CaptureResolutionMode.MP12.takeIf { source == ThreeXSourceMode.OPTICAL },
