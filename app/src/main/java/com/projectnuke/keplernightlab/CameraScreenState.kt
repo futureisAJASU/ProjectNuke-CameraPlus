@@ -28,12 +28,10 @@ internal data class LensChangeResult(
 )
 
 internal data class CapturePreparationInput(
-    val options: SelectedCaptureOptions,
+    val cameraSelection: CameraSelection,
+    val captureZoomRatio: Float,
     val resolutionPlan: ResolutionCapturePlan,
     val selectedResolution: CaptureResolutionMode,
-    val selectedLensSlot: LensSlot,
-    val selectedThreeXSource: ThreeXSourceMode,
-    val zoomUiState: ZoomUiState,
     val frameCountMode: FrameCountMode,
     val autoMinFrames: Int,
     val autoMaxFrames: Int,
@@ -54,7 +52,8 @@ internal data class PreparedCaptureAttempt(
 internal data class CameraSelectionUiState(
     val options: SelectedCaptureOptions,
     val selection: CameraSelection,
-    val previewZoomRatio: Float
+    val previewZoomRatio: Float,
+    val captureZoomRatio: Float
 )
 
 internal data class ResolutionUiState(
@@ -132,12 +131,8 @@ internal fun rememberCameraSelectionState(
     ) {
         selectCameraForOptions(context, options)
     }
-    val previewZoomRatio = when {
-        selection.useCrop -> zoomUiState.zoomRatio.coerceIn(1.0f, zoomUiState.maxZoom)
-        selectedLensSlot == LensSlot.THREE_X &&
-            selectedThreeXSource == ThreeXSourceMode.OPTICAL -> 1.0f
-        else -> zoomUiState.zoomRatio
-    }
+    val resolvedZoomRatio = selection.effectiveZoomRatio
+        .coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
 
     LaunchedEffect(
         selectedResolution,
@@ -152,12 +147,20 @@ internal fun rememberCameraSelectionState(
                 "lens=$selectedLensSlot source=$selectedThreeXSource " +
                     "zoom=${zoomUiState.zoomRatio} " +
                     "optical=${zoomUiState.useOpticalTeleAt3x} " +
-                    "cameraId=${selection.cameraId} actual=${selection.actualLensSource}"
+                    "cameraId=${selection.cameraId} previewZoom=$resolvedZoomRatio " +
+                    "captureZoom=$resolvedZoomRatio actual=${selection.actualLensSource} " +
+                    "physicalTele=${selection.isOpticalTeleActuallyUsed && !selection.useCrop} " +
+                    "mainCrop=${selection.actualLensSource == ActualLensSource.MAIN_CROP_3X}"
             )
         }
     }
 
-    return CameraSelectionUiState(options, selection, previewZoomRatio)
+    return CameraSelectionUiState(
+        options = options,
+        selection = selection,
+        previewZoomRatio = resolvedZoomRatio,
+        captureZoomRatio = resolvedZoomRatio
+    )
 }
 
 @Composable

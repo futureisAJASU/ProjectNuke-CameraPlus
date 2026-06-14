@@ -1,6 +1,7 @@
 package com.projectnuke.keplernightlab
 
 import android.content.Context
+import android.util.Log
 
 internal fun lensSlotForZoomRatioHysteresis(
     zoomRatio: Float,
@@ -109,6 +110,7 @@ internal fun handleLensSlotChange(
         threeXSourceMode = effectiveThreeXSource
     )
     val selection = selectCameraForOptions(context, selectionOptions)
+    logThreeXTransition("lens", lensSlot, effectiveThreeXSource, updatedZoomState, selection)
     return LensChangeResult(
         lensSlot = lensSlot,
         threeXSource = effectiveThreeXSource,
@@ -139,6 +141,7 @@ internal fun handleThreeXSourceChange(
         threeXSourceMode = source
     )
     val selection = selectCameraForOptions(context, selectionOptions)
+    logThreeXTransition("source", LensSlot.THREE_X, source, updatedZoomState, selection)
     return LensChangeResult(
         lensSlot = LensSlot.THREE_X,
         threeXSource = source,
@@ -146,23 +149,6 @@ internal fun handleThreeXSourceChange(
         forcedResolution = forcedResolution,
         status = cameraSelectionStatus(selection)
     )
-}
-
-internal fun calculateCaptureZoomRatio(
-    selection: CameraSelection,
-    selectedLensSlot: LensSlot,
-    selectedThreeXSource: ThreeXSourceMode,
-    zoomUiState: ZoomUiState
-): Float {
-    return if (
-        selectedLensSlot == LensSlot.THREE_X &&
-        selectedThreeXSource == ThreeXSourceMode.OPTICAL &&
-        !selection.useCrop
-    ) {
-        1.0f
-    } else {
-        zoomUiState.zoomRatio.coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
-    }
 }
 
 internal fun buildCaptureStartMessage(
@@ -194,13 +180,19 @@ internal fun prepareCaptureAttempt(
         latestSceneLuma = input.latestSceneLuma,
         latestMotionScore = input.latestMotionScore
     )
-    val selection = selectCameraForOptions(context, input.options)
-    val captureZoomRatio = calculateCaptureZoomRatio(
-        selection,
-        input.selectedLensSlot,
-        input.selectedThreeXSource,
-        input.zoomUiState
-    )
+    val selection = input.cameraSelection
+    val captureZoomRatio = input.captureZoomRatio
+    if (selection.requestedLensSlot == LensSlot.THREE_X) {
+        Log.d(
+            "Kepler3xSelection",
+            "phase=capture lens=${selection.requestedLensSlot} " +
+                "source=${selection.requestedThreeXSourceMode} " +
+                "cameraId=${selection.cameraId} captureZoom=$captureZoomRatio " +
+                "actual=${selection.actualLensSource} " +
+                "physicalTele=${selection.isOpticalTeleActuallyUsed && !selection.useCrop} " +
+                "mainCrop=${selection.actualLensSource == ActualLensSource.MAIN_CROP_3X}"
+        )
+    }
     return PreparedCaptureAttempt(
         settings = settings,
         framePlan = framePlan,
@@ -213,6 +205,25 @@ internal fun prepareCaptureAttempt(
             settings,
             framePlan
         )
+    )
+}
+
+private fun logThreeXTransition(
+    phase: String,
+    lensSlot: LensSlot,
+    source: ThreeXSourceMode,
+    zoomUiState: ZoomUiState,
+    selection: CameraSelection
+) {
+    if (lensSlot != LensSlot.THREE_X) return
+    Log.d(
+        "Kepler3xSelection",
+        "phase=$phase lens=$lensSlot source=$source " +
+            "zoom=${zoomUiState.zoomRatio} optical=${zoomUiState.useOpticalTeleAt3x} " +
+            "cameraId=${selection.cameraId} previewZoom=${selection.effectiveZoomRatio} " +
+            "captureZoom=${selection.effectiveZoomRatio} actual=${selection.actualLensSource} " +
+            "physicalTele=${selection.isOpticalTeleActuallyUsed && !selection.useCrop} " +
+            "mainCrop=${selection.actualLensSource == ActualLensSource.MAIN_CROP_3X}"
     )
 }
 

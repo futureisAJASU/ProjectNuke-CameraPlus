@@ -570,12 +570,10 @@ fun MainCameraScreen(
                             selectedResolutionPlan = resolutionState.selectedPlan,
                             buildPreparationInput = { activePlan ->
                                 CapturePreparationInput(
-                                    options = cameraState.options,
+                                    cameraSelection = cameraState.selection,
+                                    captureZoomRatio = cameraState.captureZoomRatio,
                                     resolutionPlan = activePlan,
                                     selectedResolution = selectedResolution,
-                                    selectedLensSlot = selectedLensSlot,
-                                    selectedThreeXSource = selectedThreeXSource,
-                                    zoomUiState = zoomUiState,
                                     frameCountMode = frameCountMode,
                                     autoMinFrames = autoMinFrames,
                                     autoMaxFrames = autoMaxFrames,
