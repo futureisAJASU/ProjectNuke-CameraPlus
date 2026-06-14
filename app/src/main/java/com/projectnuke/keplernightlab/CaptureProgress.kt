@@ -25,18 +25,20 @@ data class CaptureProgressState(
 )
 
 fun isTerminalStatus(status: String): Boolean {
+    if (status.contains("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true)) {
+        return false
+    }
+
     val lower = status.lowercase()
     return status.contains("PIPELINE_COMPLETE", ignoreCase = true) ||
             status.contains("CAPTURE_COMPLETE", ignoreCase = true) ||
-            status.contains("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true) ||
             status.contains("PIPELINE_FAILED", ignoreCase = true) ||
             status.contains("CAPTURE_TIMEOUT", ignoreCase = true) ||
             status.contains("PROCESS_TIMEOUT", ignoreCase = true) ||
             status.contains("EXPORT_TIMEOUT", ignoreCase = true) ||
-            lower.contains("complete") ||
+            lower.contains("saved to gallery") ||
             lower.contains("failed") ||
             lower.contains("timeout") ||
-            lower.contains("saved to gallery") ||
             status.contains("완료") ||
             status.contains("실패") ||
             status.contains("오류") ||
