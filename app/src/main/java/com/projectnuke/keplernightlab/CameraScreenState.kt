@@ -1,7 +1,9 @@
 package com.projectnuke.keplernightlab
 
 import android.content.Context
+import android.util.Log
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 
 data class ZoomUiState(
@@ -18,6 +20,8 @@ internal data class ResolutionClickResult(
 )
 
 internal data class LensChangeResult(
+    val lensSlot: LensSlot,
+    val threeXSource: ThreeXSourceMode,
     val zoomUiState: ZoomUiState,
     val forcedResolution: CaptureResolutionMode?,
     val status: String
@@ -120,14 +124,13 @@ internal fun rememberCameraSelectionState(
         threeXSourceMode = selectedThreeXSource
     )
     val selection = remember(
+        selectedResolution,
         selectedLensSlot,
         selectedThreeXSource,
+        zoomUiState,
         capabilityRefreshNonce
     ) {
-        selectCameraForOptions(
-            context,
-            options.copy(resolutionMode = CaptureResolutionMode.MP12)
-        )
+        selectCameraForOptions(context, options)
     }
     val previewZoomRatio = when {
         selection.useCrop -> zoomUiState.zoomRatio.coerceIn(1.0f, zoomUiState.maxZoom)
@@ -135,6 +138,25 @@ internal fun rememberCameraSelectionState(
             selectedThreeXSource == ThreeXSourceMode.OPTICAL -> 1.0f
         else -> zoomUiState.zoomRatio
     }
+
+    LaunchedEffect(
+        selectedResolution,
+        selectedLensSlot,
+        selectedThreeXSource,
+        zoomUiState,
+        selection
+    ) {
+        if (selectedLensSlot == LensSlot.THREE_X) {
+            Log.d(
+                "Kepler3xSelection",
+                "lens=$selectedLensSlot source=$selectedThreeXSource " +
+                    "zoom=${zoomUiState.zoomRatio} " +
+                    "optical=${zoomUiState.useOpticalTeleAt3x} " +
+                    "cameraId=${selection.cameraId} actual=${selection.actualLensSource}"
+            )
+        }
+    }
+
     return CameraSelectionUiState(options, selection, previewZoomRatio)
 }
 

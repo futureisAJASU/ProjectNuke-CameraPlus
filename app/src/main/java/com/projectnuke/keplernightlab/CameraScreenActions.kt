@@ -77,8 +77,8 @@ internal fun handleResolutionClick(
 
 internal fun handleLensSlotChange(
     context: Context,
-    options: SelectedCaptureOptions,
     lensSlot: LensSlot,
+    selectedResolution: CaptureResolutionMode,
     selectedThreeXSource: ThreeXSourceMode,
     zoomUiState: ZoomUiState
 ): LensChangeResult {
@@ -103,30 +103,25 @@ internal fun handleLensSlotChange(
     } else {
         null
     }
-    val selectionOptions = if (lensSlot == LensSlot.THREE_X && effectiveThreeXSource == ThreeXSourceMode.OPTICAL) {
-        SelectedCaptureOptions(
-            LensSlot.THREE_X,
-            CaptureResolutionMode.MP12,
-            ThreeXSourceMode.OPTICAL
-        )
-    } else {
-        options.copy(
-            lensSlot = lensSlot,
-            threeXSourceMode = effectiveThreeXSource
-        )
-    }
+    val selectionOptions = SelectedCaptureOptions(
+        lensSlot = lensSlot,
+        resolutionMode = forcedResolution ?: selectedResolution,
+        threeXSourceMode = effectiveThreeXSource
+    )
     val selection = selectCameraForOptions(context, selectionOptions)
     return LensChangeResult(
-        updatedZoomState,
-        forcedResolution,
-        cameraSelectionStatus(selection)
+        lensSlot = lensSlot,
+        threeXSource = effectiveThreeXSource,
+        zoomUiState = updatedZoomState,
+        forcedResolution = forcedResolution,
+        status = cameraSelectionStatus(selection)
     )
 }
 
 internal fun handleThreeXSourceChange(
     context: Context,
-    options: SelectedCaptureOptions,
     source: ThreeXSourceMode,
+    selectedResolution: CaptureResolutionMode,
     zoomUiState: ZoomUiState
 ): LensChangeResult {
     val targetZoom = LensSlot.THREE_X.targetZoomRatio
@@ -136,23 +131,20 @@ internal fun handleThreeXSourceChange(
         lensSlot = LensSlot.THREE_X,
         useOpticalTeleAt3x = source == ThreeXSourceMode.OPTICAL
     )
-    val selectionOptions = if (source == ThreeXSourceMode.OPTICAL) {
-        SelectedCaptureOptions(
-            LensSlot.THREE_X,
-            CaptureResolutionMode.MP12,
-            ThreeXSourceMode.OPTICAL
-        )
-    } else {
-        options.copy(
-            lensSlot = LensSlot.THREE_X,
-            threeXSourceMode = ThreeXSourceMode.MAIN_CROP
-        )
-    }
+    val forcedResolution = CaptureResolutionMode.MP12
+        .takeIf { source == ThreeXSourceMode.OPTICAL }
+    val selectionOptions = SelectedCaptureOptions(
+        lensSlot = LensSlot.THREE_X,
+        resolutionMode = forcedResolution ?: selectedResolution,
+        threeXSourceMode = source
+    )
     val selection = selectCameraForOptions(context, selectionOptions)
     return LensChangeResult(
-        updatedZoomState,
-        CaptureResolutionMode.MP12.takeIf { source == ThreeXSourceMode.OPTICAL },
-        cameraSelectionStatus(selection)
+        lensSlot = LensSlot.THREE_X,
+        threeXSource = source,
+        zoomUiState = updatedZoomState,
+        forcedResolution = forcedResolution,
+        status = cameraSelectionStatus(selection)
     )
 }
 

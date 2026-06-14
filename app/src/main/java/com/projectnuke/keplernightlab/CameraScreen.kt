@@ -84,6 +84,12 @@ data class LatestKeplerResult(
     val summary: String
 )
 
+private fun logLongReport(tag: String, report: String) {
+    report.chunked(3000).forEachIndexed { index, chunk ->
+        Log.i(tag, "part ${index + 1}:\n$chunk")
+    }
+}
+
 fun lensSlotForZoomRatio(zoomRatio: Float): LensSlot {
     return when {
         zoomRatio < 0.85f -> LensSlot.ULTRAWIDE
@@ -300,7 +306,7 @@ fun MainCameraScreen(
     }
 
     LaunchedEffect(focusAeUiNonce, focusAeState.locked) {
-        if (showFocusAeControls) {
+        if (showFocusAeControls && !focusAeState.locked) {
             delay(2_000L)
             showFocusAeControls = false
         }
@@ -342,12 +348,23 @@ fun MainCameraScreen(
             current = selectedLensSlot,
             useOpticalTeleAt3x = selectedThreeXSource == ThreeXSourceMode.OPTICAL
         )
+        val enteringThreeX =
+            nextSlot == LensSlot.THREE_X && selectedLensSlot != LensSlot.THREE_X
+        val effectiveThreeXSource = if (enteringThreeX) {
+            ThreeXSourceMode.OPTICAL
+        } else {
+            selectedThreeXSource
+        }
         val displayZoom = (clamped * 10f).roundToInt() / 10f
         zoomUiState = zoomUiState.copy(
             zoomRatio = clamped,
             lensSlot = nextSlot,
-            useOpticalTeleAt3x = selectedThreeXSource == ThreeXSourceMode.OPTICAL
+            useOpticalTeleAt3x = effectiveThreeXSource == ThreeXSourceMode.OPTICAL
         )
+        if (enteringThreeX) {
+            selectedThreeXSource = ThreeXSourceMode.OPTICAL
+            selectedResolution = CaptureResolutionMode.MP12
+        }
         if (nextSlot != selectedLensSlot) {
             selectedLensSlot = nextSlot
         }
@@ -498,12 +515,13 @@ fun MainCameraScreen(
                 onLensSlotChange = { lensSlot ->
                     val result = handleLensSlotChange(
                         context = context,
-                        options = cameraState.options,
                         lensSlot = lensSlot,
+                        selectedResolution = selectedResolution,
                         selectedThreeXSource = selectedThreeXSource,
                         zoomUiState = zoomUiState
                     )
-                    selectedLensSlot = lensSlot
+                    selectedLensSlot = result.lensSlot
+                    selectedThreeXSource = result.threeXSource
                     zoomUiState = result.zoomUiState
                     showZoomSlider = false
                     result.forcedResolution?.let { selectedResolution = it }
@@ -513,11 +531,12 @@ fun MainCameraScreen(
                 onThreeXSourceChange = { source ->
                     val result = handleThreeXSourceChange(
                         context = context,
-                        options = cameraState.options,
                         source = source,
+                        selectedResolution = selectedResolution,
                         zoomUiState = zoomUiState
                     )
-                    selectedThreeXSource = source
+                    selectedLensSlot = result.lensSlot
+                    selectedThreeXSource = result.threeXSource
                     zoomUiState = result.zoomUiState
                     showZoomSlider = false
                     result.forcedResolution?.let { selectedResolution = it }
@@ -781,8 +800,8 @@ fun MainCameraScreen(
                 },
                 onPrintResolutionReport = {
                     val report = buildResolutionCapabilityReport(context)
-                    Log.i("KeplerCameraCapabilities", report)
-                    status = report
+                    logLongReport("KeplerCaps", report)
+                    status = "Capability report printed to logcat: KeplerCaps"
                     capabilityRefreshNonce++
                     currentScreen = MainScreen.CAMERA
                 },
