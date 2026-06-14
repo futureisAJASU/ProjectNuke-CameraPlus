@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.key
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -63,15 +64,23 @@ internal fun PreviewStage(
                 },
             contentAlignment = Alignment.Center
         ) {
-            Camera2Preview(
-                modifier = Modifier.fillMaxSize(),
-                cameraId = state.cameraSelection.cameraId,
-                zoomRatio = state.previewZoomRatio,
-                focusAeState = state.focusAeState,
-                meteringMode = meteringMode,
-                enabled = state.previewEnabled,
-                onAeCapabilitiesChanged = callbacks.onAeCapabilitiesChanged
-            )
+            key(
+                state.cameraSelection.cameraId,
+                state.cameraSelection.actualLensSource,
+                state.cameraSelection.requestedThreeXSourceMode,
+                state.previewZoomRatio,
+                state.previewEnabled
+            ) {
+                Camera2Preview(
+                    modifier = Modifier.fillMaxSize(),
+                    cameraId = state.cameraSelection.cameraId,
+                    zoomRatio = state.previewZoomRatio,
+                    focusAeState = state.focusAeState,
+                    meteringMode = meteringMode,
+                    enabled = state.previewEnabled,
+                    onAeCapabilitiesChanged = callbacks.onAeCapabilitiesChanged
+                )
+            }
 
             if (state.overlaySettings.showGrid) {
                 RuleOfThirdsGridOverlay(Modifier.fillMaxSize())
