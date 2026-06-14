@@ -11,6 +11,9 @@ import android.util.Size
 import kotlin.math.abs
 import kotlin.math.max
 
+private const val TELE_FOCAL_RATIO_THRESHOLD = 1.18f
+private const val TELE_MIN_OUTPUT_MEGAPIXELS = 6.0
+
 data class PhysicalCameraCandidate(
     val physicalCameraId: String,
     val lensFacing: Int?,
@@ -201,7 +204,6 @@ fun selectCameraForOptions(
         LensSlot.THREE_X -> {
             when (options.threeXSourceMode) {
                 ThreeXSourceMode.OPTICAL -> {
-                    // TODO: 3x optical selection is heuristic until physical camera mapping is verified.
                     val tele = selectTeleCamera(candidates, main)
 
                     if (tele != null) {
@@ -214,7 +216,7 @@ fun selectCameraForOptions(
                             requestedThreeXSourceMode = options.threeXSourceMode,
                             actualLensSource = ActualLensSource.OPTICAL_TELE_LOGICAL,
                             isOpticalTeleActuallyUsed = true,
-                            diagnosticReason = "Separate public logical tele camera has focal length significantly longer than main."
+                            diagnosticReason = "Separate public logical tele camera selected by relaxed focal heuristic."
                         )
                     } else {
                         val physicalTele = selectPhysicalTeleCamera(main)
@@ -356,28 +358,52 @@ private fun selectTeleCamera(
     main: CameraCandidate
 ): CameraCandidate? {
     val mainFocal = main.primaryFocalLength()
-    val longest = candidates.maxByOrNull { it.primaryFocalLength() } ?: return null
+    val minTeleFocal = mainFocal * TELE_FOCAL_RATIO_THRESHOLD
 
-    return if (longest.cameraId != main.cameraId && longest.primaryFocalLength() >= mainFocal * 1.4f) {
-        longest
-    } else {
-        null
-    }
+    return candidates
+        .asSequence()
+        .filter { it.cameraId != main.cameraId }
+        .filter { it.teleFocalLength() >= minTeleFocal }
+        .filter { it.maxPreviewMegapixels() >= TELE_MIN_OUTPUT_MEGAPIXELS || it.supportsRaw }
+        .maxWithOrNull(
+            compareBy<CameraCandidate> { it.teleFocalLength() }
+                .thenBy { it.maxPreviewMegapixels() }
+                .thenBy { it.maxRawMegapixels }
+        )
 }
 
 private fun selectPhysicalTeleCamera(main: CameraCandidate): PhysicalCameraCandidate? {
     val mainFocal = main.primaryFocalLength()
+    val minTeleFocal = mainFocal * TELE_FOCAL_RATIO_THRESHOLD
+
     return main.physicalCameras
-        .filter { it.primaryFocalLength() >= mainFocal * 1.4f }
-        .maxByOrNull { it.primaryFocalLength() }
+        .filter { it.teleFocalLength() >= minTeleFocal }
+        .filter { it.maxPreviewMegapixels() >= TELE_MIN_OUTPUT_MEGAPIXELS || it.maxRawMegapixels > 0.0 }
+        .maxWithOrNull(
+            compareBy<PhysicalCameraCandidate> { it.teleFocalLength() }
+                .thenBy { it.maxPreviewMegapixels() }
+                .thenBy { it.maxRawMegapixels }
+        )
 }
 
 private fun CameraCandidate.primaryFocalLength(): Float {
-    return focalLengths.minOrNull() ?: 0f
+    return focalLengths.filter { it > 0f }.minOrNull() ?: 0f
 }
 
-private fun PhysicalCameraCandidate.primaryFocalLength(): Float {
-    return focalLengths.maxOrNull() ?: 0f
+private fun CameraCandidate.teleFocalLength(): Float {
+    return focalLengths.filter { it > 0f }.maxOrNull() ?: 0f
+}
+
+private fun PhysicalCameraCandidate.teleFocalLength(): Float {
+    return focalLengths.filter { it > 0f }.maxOrNull() ?: 0f
+}
+
+private fun CameraCandidate.maxPreviewMegapixels(): Double {
+    return max(maxYuvMegapixels, maxJpegMegapixels)
+}
+
+private fun PhysicalCameraCandidate.maxPreviewMegapixels(): Double {
+    return max(maxYuvMegapixels, maxJpegMegapixels)
 }
 
 private fun maxMegapixels(sizes: Array<Size>?): Double {
