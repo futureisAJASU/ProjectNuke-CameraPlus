@@ -21,10 +21,8 @@ internal fun lensSlotForZoomRatioHysteresis(
             zoomRatio >= 2.9f -> LensSlot.THREE_X
             else -> LensSlot.MAIN_2X
         }
-        LensSlot.THREE_X -> {
-            val exitThreshold = if (useOpticalTeleAt3x) 2.65f else 2.7f
-            if (zoomRatio < exitThreshold) LensSlot.MAIN_2X else LensSlot.THREE_X
-        }
+        LensSlot.THREE_X ->
+            if (zoomRatio < 2.7f) LensSlot.MAIN_2X else LensSlot.THREE_X
     }
 }
 
@@ -128,8 +126,6 @@ internal fun handleThreeXSourceChange(
     selectedResolution: CaptureResolutionMode,
     zoomUiState: ZoomUiState
 ): LensChangeResult {
-    CameraCapabilityCache.clear()
-
     val targetZoom = LensSlot.THREE_X.targetZoomRatio
         .coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
     val updatedZoomState = zoomUiState.copy(
@@ -146,19 +142,12 @@ internal fun handleThreeXSourceChange(
     )
     val selection = selectCameraForOptions(context, selectionOptions)
     logThreeXTransition("source", LensSlot.THREE_X, source, updatedZoomState, selection)
-
-    val status = if (source == ThreeXSourceMode.OPTICAL && !selection.isOpticalTeleActuallyUsed) {
-        "3x optical requested but optical tele is not active. ${cameraSelectionStatus(selection)}"
-    } else {
-        cameraSelectionStatus(selection)
-    }
-
     return LensChangeResult(
         lensSlot = LensSlot.THREE_X,
         threeXSource = source,
         zoomUiState = updatedZoomState,
         forcedResolution = forcedResolution,
-        status = status
+        status = cameraSelectionStatus(selection)
     )
 }
 
