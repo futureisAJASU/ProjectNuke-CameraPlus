@@ -5,6 +5,7 @@ import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
 import android.graphics.Color
 import android.graphics.Rect
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -14,15 +15,11 @@ import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToInt
 
-private const val CLASSIC_FUSION_VERSION = "1.0"
+private const val CLASSIC_FUSION_VERSION = "1.1"
 private const val CLASSIC_FUSION_ALIGNMENT_MAX_DIMENSION = 512
 private const val CLASSIC_FUSION_ALIGNMENT_SEARCH_RADIUS = 24
-private const val CLASSIC_FUSION_ALIGNMENT_BAD_SCORE = 0.20f
 private const val CLASSIC_FUSION_TILE_ROWS = 256
-private const val CLASSIC_FUSION_REFERENCE_WEIGHT = 1.5f
-private const val CLASSIC_FUSION_SHARPEN_AMOUNT = 0.28f
-private const val CLASSIC_FUSION_DENOISE_STRENGTH = 0.24f
-private const val CLASSIC_FUSION_GHOST_THRESHOLD = 34f
+private const val CLASSIC_FUSION_DEBUG_MAX_DIMENSION = 1024
 
 private data class ClassicFrame(
     val jsonIndex: Int,
@@ -33,7 +30,8 @@ private data class ClassicFrame(
     var alignDx: Int = 0,
     var alignDy: Int = 0,
     var alignmentScore: Float = 0f,
-    var alignmentUsed: Boolean = true
+    var alignmentUsed: Boolean = true,
+    var isReference: Boolean = false
 )
 
 private data class LumaThumbnail(
@@ -58,10 +56,13 @@ private data class MergeResult(
 
 internal fun processClassicYuvFusionJob(
     jobDir: File,
+    requestedParams: ClassicYuvFusionParams? = null,
     onStatus: (String) -> Unit
 ): File {
+    val processingStartedAt = System.currentTimeMillis()
     val jobFile = File(jobDir, "job.json")
     val job = JSONObject(jobFile.readText())
+    val params = (requestedParams ?: loadClassicYuvFusionParams(job)).clamped()
     var merged: Bitmap? = null
     var finalBitmap: Bitmap? = null
     try {
@@ -100,21 +101,31 @@ internal fun processClassicYuvFusionJob(
                 frame.alignmentScore = alignment.score
                 frame.alignmentUsed =
                     alignment.score.isFinite() &&
-                        alignment.score <= CLASSIC_FUSION_ALIGNMENT_BAD_SCORE
+                        alignment.score <= params.alignmentRejectThreshold
             }
-            updateAlignmentMetadata(job, frame)
+            updateAlignmentMetadata(job, frame, params)
         }
 
         val dimensions = decodeImageDimensions(reference.file)
         val compatibleFrames = frames.filter { decodeImageDimensions(it.file) == dimensions }
         if (compatibleFrames.size < 2) error("Not enough same-size YUV frames to fuse")
         val activeReference = compatibleFrames.find { it === reference } ?: compatibleFrames.first()
+        activeReference.isReference = true
+        compatibleFrames.forEach { frame ->
+            updateAlignmentMetadata(job, frame, params, used = true, skipReason = null)
+        }
+        frames.filterNot { it in compatibleFrames }.forEach { frame ->
+            updateAlignmentMetadata(
+                job, frame, params, used = false, skipReason = "DIMENSION_MISMATCH"
+            )
+        }
 
         val mergeResult = mergeClassicFrames(
             frames = compatibleFrames,
             reference = activeReference,
             width = dimensions.first,
             height = dimensions.second,
+            params = params,
             onStatus = onStatus
         )
         merged = mergeResult.bitmap
@@ -122,9 +133,13 @@ internal fun processClassicYuvFusionJob(
         saveClassicBitmap(merged, averageFile)
 
         onStatus("Classic YUV fusion: tone/sharpen...")
-        finalBitmap = finishClassicFusion(merged)
+        finalBitmap = finishClassicFusion(merged, params)
         val finalFile = File(jobDir, "sharpened_night_fusion.png")
         saveClassicBitmap(finalBitmap, finalFile)
+        val processingTimeMs = System.currentTimeMillis() - processingStartedAt
+        val excludedFrameCount = countExcludedFrames(job)
+        val skippedFrameCount =
+            (totalFrames - excludedFrameCount - compatibleFrames.size).coerceAtLeast(0)
 
         val rejectedRatio = if (mergeResult.comparedPixels > 0L) {
             mergeResult.rejectedPixels.toDouble() / mergeResult.comparedPixels
@@ -135,20 +150,54 @@ internal fun processClassicYuvFusionJob(
             .put("processStatus", "CLASSIC_YUV_FUSION_V1_COMPLETE")
             .put("fusionEngine", "classic_yuv_v1")
             .put("fusionVersion", CLASSIC_FUSION_VERSION)
+            .put("fusionParamsVersion", CLASSIC_YUV_FUSION_PARAMS_VERSION)
+            .put("fusionPresetName", params.presetName)
+            .put("fusionParams", params.toJson())
             .put("usedFrameCount", compatibleFrames.size)
-            .put("excludedFrameCount", totalFrames - compatibleFrames.size)
+            .put("excludedFrameCount", excludedFrameCount)
+            .put("skippedFrameCount", skippedFrameCount)
             .put("referenceFrameIndex", activeReference.jsonIndex)
             .put("ghostSuppressionUsed", true)
             .put("ghostRejectedPixelRatio", rejectedRatio)
             .put("averageColorFile", averageFile.name)
             .put("finalNightFusionFile", finalFile.name)
             .put("finalFile", finalFile.name)
+            .put("processingTimeMs", processingTimeMs)
+            .put("outputWidth", dimensions.first)
+            .put("outputHeight", dimensions.second)
             .put("processedAt", System.currentTimeMillis())
             .put(
                 "processingNotes",
                 "Classic YUV Fusion v1: integer translation alignment, robust local weights, " +
                     "ghost suppression, mild chroma denoise, tone, and sharpen."
             )
+        val debugMetadataFailure = runCatching {
+            writeFusionDebugMetadata(
+                jobDir = jobDir,
+                job = job,
+                frames = compatibleFrames,
+                totalFrameCount = totalFrames,
+                ghostRejectedPixelRatio = rejectedRatio,
+                processingTimeMs = processingTimeMs,
+                outputWidth = dimensions.first,
+                outputHeight = dimensions.second,
+                params = params
+            )
+        }.exceptionOrNull()
+        generateFusionDebugArtifacts(
+            jobDir = jobDir,
+            job = job,
+            referenceFile = activeReference.file,
+            fusedBitmap = finalBitmap,
+            params = params
+        )
+        if (debugMetadataFailure != null) {
+            job.put("debugArtifactStatus", "FAILED")
+                .put(
+                    "debugArtifactError",
+                    "${debugMetadataFailure.javaClass.simpleName}: ${debugMetadataFailure.message}".take(240)
+                )
+        }
         jobFile.writeText(job.toString(2))
         onStatus("Classic YUV fusion complete")
         return finalFile
@@ -312,6 +361,7 @@ private fun mergeClassicFrames(
     reference: ClassicFrame,
     width: Int,
     height: Int,
+    params: ClassicYuvFusionParams,
     onStatus: (String) -> Unit
 ): MergeResult {
     val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
@@ -341,10 +391,10 @@ private fun mergeClassicFrames(
             val sumW = FloatArray(pixelCount)
             for (pixel in 0 until pixelCount) {
                 val color = referencePixels[pixel]
-                sumR[pixel] = Color.red(color) * CLASSIC_FUSION_REFERENCE_WEIGHT
-                sumG[pixel] = Color.green(color) * CLASSIC_FUSION_REFERENCE_WEIGHT
-                sumB[pixel] = Color.blue(color) * CLASSIC_FUSION_REFERENCE_WEIGHT
-                sumW[pixel] = CLASSIC_FUSION_REFERENCE_WEIGHT
+                sumR[pixel] = Color.red(color) * params.referenceWeight
+                sumG[pixel] = Color.green(color) * params.referenceWeight
+                sumB[pixel] = Color.blue(color) * params.referenceWeight
+                sumW[pixel] = params.referenceWeight
             }
 
             frames.forEachIndexed { frameIndex, frame ->
@@ -368,7 +418,10 @@ private fun mergeClassicFrames(
                 )
                 frameBitmap.recycle()
 
-                val alignmentWeight = alignmentWeight(frame.alignmentScore)
+                val alignmentWeight = alignmentWeight(
+                    frame.alignmentScore,
+                    params.alignmentRejectThreshold
+                )
                 val gain = (
                     requireNotNull(reference.thumbnail).mean /
                         requireNotNull(frame.thumbnail).mean.coerceAtLeast(1f)
@@ -387,7 +440,7 @@ private fun mergeClassicFrames(
                         val refColor = referencePixels[outputIndex]
                         val adjustedLuma = luma(color) * gain
                         val difference = abs(adjustedLuma - luma(refColor))
-                        val localWeight = ghostWeight(difference) * alignmentWeight
+                        val localWeight = ghostWeight(difference, params) * alignmentWeight
                         comparedPixels++
                         if (localWeight < alignmentWeight * 0.25f) rejectedPixels++
                         sumR[outputIndex] += Color.red(color) * gain * localWeight
@@ -416,28 +469,30 @@ private fun mergeClassicFrames(
     return MergeResult(output, rejectedPixels, comparedPixels)
 }
 
-private fun alignmentWeight(score: Float): Float {
+private fun alignmentWeight(score: Float, rejectThreshold: Float): Float {
     if (!score.isFinite()) return 0.10f
-    return (1f - score / CLASSIC_FUSION_ALIGNMENT_BAD_SCORE).coerceIn(0.12f, 1f)
+    return (1f - score / rejectThreshold).coerceIn(0.12f, 1f)
 }
 
-private fun ghostWeight(lumaDifference: Float): Float {
-    if (lumaDifference <= CLASSIC_FUSION_GHOST_THRESHOLD) return 1f
+private fun ghostWeight(lumaDifference: Float, params: ClassicYuvFusionParams): Float {
+    if (lumaDifference <= params.ghostThreshold) return 1f
     val normalized = (
-        (lumaDifference - CLASSIC_FUSION_GHOST_THRESHOLD) /
-            (255f - CLASSIC_FUSION_GHOST_THRESHOLD)
+        (lumaDifference - params.ghostThreshold) /
+            (255f - params.ghostThreshold)
         ).coerceIn(0f, 1f)
-    return (1f - normalized).pow(3).coerceAtLeast(0.03f)
+    return (1f - normalized).pow(3).coerceAtLeast(params.ghostWeight)
 }
 
-private fun finishClassicFusion(source: Bitmap): Bitmap {
+private fun finishClassicFusion(source: Bitmap, params: ClassicYuvFusionParams): Bitmap {
     val width = source.width
     val height = source.height
     val outputBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
     fun tone(value: Float): Int {
         val normalized = (value / 255f).coerceIn(0f, 1f)
-        val curved = normalized.pow(0.94f)
-        return (((curved - 0.5f) * 1.025f + 0.5f) * 255f).roundToInt().coerceIn(0, 255)
+        val lifted = normalized + params.shadowLift * (1f - normalized).pow(2)
+        val rolled = lifted -
+            params.highlightRollOff * lifted.pow(2) * (1f - lifted)
+        return (rolled.coerceIn(0f, 1f) * 255f).roundToInt().coerceIn(0, 255)
     }
     var tileTop = 0
     while (tileTop < height) {
@@ -470,14 +525,20 @@ private fun finishClassicFusion(source: Bitmap): Bitmap {
                 }
                 val centerLuma = luma(center).toFloat()
                 val localLuma = lumaSum / 9f
-                val sharpenedLuma =
-                    centerLuma + (centerLuma - localLuma) * CLASSIC_FUSION_SHARPEN_AMOUNT
+                val detail = centerLuma - localLuma
+                val sharpenedLuma = centerLuma +
+                    detail * params.localContrastAmount +
+                    detail * params.sharpenAmount
                 val centerChromaR = Color.red(center) - centerLuma
                 val centerChromaB = Color.blue(center) - centerLuma
-                val chromaR = centerChromaR * (1f - CLASSIC_FUSION_DENOISE_STRENGTH) +
-                    chromaRSum / 9f * CLASSIC_FUSION_DENOISE_STRENGTH
-                val chromaB = centerChromaB * (1f - CLASSIC_FUSION_DENOISE_STRENGTH) +
-                    chromaBSum / 9f * CLASSIC_FUSION_DENOISE_STRENGTH
+                val chromaR = (
+                    centerChromaR * (1f - params.denoiseStrength) +
+                        chromaRSum / 9f * params.denoiseStrength
+                    ) * params.saturationBoost
+                val chromaB = (
+                    centerChromaB * (1f - params.denoiseStrength) +
+                        chromaBSum / 9f * params.denoiseStrength
+                    ) * params.saturationBoost
                 val tonedLuma = tone(sharpenedLuma).toFloat()
                 outputPixels[(y - tileTop) * width + x] = Color.rgb(
                     (tonedLuma + chromaR).roundToInt().coerceIn(0, 255),
@@ -494,13 +555,192 @@ private fun finishClassicFusion(source: Bitmap): Bitmap {
     return outputBitmap
 }
 
-private fun updateAlignmentMetadata(job: JSONObject, frame: ClassicFrame) {
+private fun updateAlignmentMetadata(
+    job: JSONObject,
+    frame: ClassicFrame,
+    params: ClassicYuvFusionParams,
+    used: Boolean = frame.alignmentUsed,
+    skipReason: String? = null
+) {
     val frameJson = job.optJSONArray("frames")?.optJSONObject(frame.jsonIndex) ?: return
+    val globalWeight = globalWeightFor(frame, params)
     frameJson.put("alignDx", frame.alignDx)
         .put("alignDy", frame.alignDy)
         .put("alignmentScore", frame.alignmentScore.toDouble())
         .put("alignmentUsed", frame.alignmentUsed)
+        .put("globalWeight", globalWeight.toDouble())
+        .put("fusionUsed", used)
+        .put("fusionSkipReason", skipReason ?: JSONObject.NULL)
 }
+
+private fun writeFusionDebugMetadata(
+    jobDir: File,
+    job: JSONObject,
+    frames: List<ClassicFrame>,
+    totalFrameCount: Int,
+    ghostRejectedPixelRatio: Double,
+    processingTimeMs: Long,
+    outputWidth: Int,
+    outputHeight: Int,
+    params: ClassicYuvFusionParams
+) {
+    val frameMap = frames.associateBy { it.jsonIndex }
+    val sourceFrames = job.optJSONArray("frames") ?: JSONArray()
+    val alignments = JSONArray()
+    repeat(sourceFrames.length()) { index ->
+        val source = sourceFrames.optJSONObject(index) ?: return@repeat
+        val frame = frameMap[index]
+        val enabled = source.optBoolean("enabled", true)
+        val excluded = source.optBoolean("excludedByUser", false)
+        val fileName = source.optString("file")
+        val skipReason = when {
+            frame != null -> null
+            !enabled || excluded -> "USER_EXCLUDED"
+            fileName.isBlank() || !File(jobDir, fileName).isFile -> "MISSING_FILE"
+            source.optString("alignmentFailureReason").isNotBlank() ->
+                source.optString("alignmentFailureReason")
+            else -> source.optString("fusionSkipReason").ifBlank { "SKIPPED" }
+        }
+        alignments.put(
+            JSONObject()
+                .put("frameIndex", source.optInt("index", index))
+                .put("file", fileName)
+                .put("alignDx", frame?.alignDx ?: source.optInt("alignDx", 0))
+                .put("alignDy", frame?.alignDy ?: source.optInt("alignDy", 0))
+                .put(
+                    "alignmentScore",
+                    frame?.alignmentScore?.toDouble()
+                        ?: source.optDouble("alignmentScore", Double.NaN)
+                )
+                .put(
+                    "globalWeight",
+                    frame?.let { globalWeightFor(it, params).toDouble() }
+                        ?: source.optDouble("globalWeight", 0.0)
+                )
+                .put("used", frame != null)
+                .put("skipReason", skipReason ?: JSONObject.NULL)
+        )
+    }
+    val debug = JSONObject()
+        .put("fusionEngine", "classic_yuv_v1")
+        .put("fusionVersion", CLASSIC_FUSION_VERSION)
+        .put("fusionParamsVersion", CLASSIC_YUV_FUSION_PARAMS_VERSION)
+        .put("fusionPresetName", params.presetName)
+        .put("fusionParams", params.toJson())
+        .put("referenceFrameIndex", job.optInt("referenceFrameIndex"))
+        .put("usedFrameCount", frames.size)
+        .put("excludedFrameCount", countExcludedFrames(job))
+        .put(
+            "skippedFrameCount",
+            (totalFrameCount - countExcludedFrames(job) - frames.size).coerceAtLeast(0)
+        )
+        .put("alignments", alignments)
+        .put("ghostSuppressionUsed", true)
+        .put("ghostRejectedPixelRatio", ghostRejectedPixelRatio)
+        .put("processingTimeMs", processingTimeMs)
+        .put("outputWidth", outputWidth)
+        .put("outputHeight", outputHeight)
+    File(jobDir, "fusion_debug.json").writeText(debug.toString(2))
+    job.put("fusionDebugFile", "fusion_debug.json")
+        .put("fusionAlignmentSummary", alignments)
+}
+
+private fun generateFusionDebugArtifacts(
+    jobDir: File,
+    job: JSONObject,
+    referenceFile: File,
+    fusedBitmap: Bitmap,
+    params: ClassicYuvFusionParams
+) {
+    try {
+        val referenceOutput = File(jobDir, "reference_frame.png")
+        referenceFile.copyTo(referenceOutput, overwrite = true)
+        val fusedOutput = File(jobDir, "fused_classic_yuv_v1.png")
+        saveClassicBitmap(fusedBitmap, fusedOutput)
+        val presetOutput = File(
+            jobDir,
+            "fused_classic_yuv_v1_${params.presetName.lowercase()}.png"
+        )
+        saveClassicBitmap(fusedBitmap, presetOutput)
+
+        val referencePreview = decodeDebugPreview(referenceFile)
+        var fusedPreview: Bitmap? = null
+        var comparison: Bitmap? = null
+        try {
+            fusedPreview = Bitmap.createScaledBitmap(
+                fusedBitmap,
+                referencePreview.width,
+                referencePreview.height,
+                true
+            )
+            comparison = Bitmap.createBitmap(
+                referencePreview.width * 2,
+                referencePreview.height,
+                Bitmap.Config.ARGB_8888
+            )
+            val canvas = android.graphics.Canvas(comparison)
+            canvas.drawBitmap(referencePreview, 0f, 0f, null)
+            canvas.drawBitmap(fusedPreview, referencePreview.width.toFloat(), 0f, null)
+            saveClassicBitmap(comparison, File(jobDir, "compare_reference_vs_fused.png"))
+        } finally {
+            comparison?.recycle()
+            if (fusedPreview != null && fusedPreview !== fusedBitmap) fusedPreview.recycle()
+            referencePreview.recycle()
+        }
+        job.put("referenceFrameDebugFile", referenceOutput.name)
+            .put("fusedClassicDebugFile", fusedOutput.name)
+            .put("fusedClassicPresetFile", presetOutput.name)
+            .put("comparisonDebugFile", "compare_reference_vs_fused.png")
+            .put("debugArtifactStatus", "COMPLETE")
+            .remove("debugArtifactError")
+    } catch (oom: OutOfMemoryError) {
+        job.put("debugArtifactStatus", "FAILED")
+            .put("debugArtifactError", "OutOfMemoryError")
+    } catch (e: Exception) {
+        job.put("debugArtifactStatus", "FAILED")
+            .put("debugArtifactError", "${e.javaClass.simpleName}: ${e.message}".take(240))
+    }
+}
+
+private fun decodeDebugPreview(file: File): Bitmap {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(file.absolutePath, bounds)
+    require(bounds.outWidth > 0 && bounds.outHeight > 0) { "Unreadable debug image" }
+    var sampleSize = 1
+    while (
+        max(bounds.outWidth / sampleSize, bounds.outHeight / sampleSize) >
+        CLASSIC_FUSION_DEBUG_MAX_DIMENSION
+    ) {
+        sampleSize *= 2
+    }
+    return BitmapFactory.decodeFile(
+        file.absolutePath,
+        BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+    ) ?: error("Could not decode debug preview")
+}
+
+private fun countExcludedFrames(job: JSONObject): Int {
+    val frames = job.optJSONArray("frames") ?: return 0
+    var count = 0
+    repeat(frames.length()) { index ->
+        val frame = frames.optJSONObject(index) ?: return@repeat
+        if (!frame.optBoolean("enabled", true) || frame.optBoolean("excludedByUser", false)) count++
+    }
+    return count
+}
+
+private fun globalWeightFor(
+    frame: ClassicFrame,
+    params: ClassicYuvFusionParams
+): Float =
+    if (frame.isReference) {
+        params.referenceWeight
+    } else {
+        alignmentWeight(frame.alignmentScore, params.alignmentRejectThreshold)
+    }
 
 private fun decodeImageDimensions(file: File): Pair<Int, Int> {
     val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }

@@ -79,7 +79,7 @@ fun estimateLatestColorBurstScene(context: Context): LatestSceneEstimate {
 fun processNightFusionJobV02Sync(
     jobDir: File,
     onStatus: (String) -> Unit
-): File = processClassicYuvFusionJob(jobDir, onStatus)
+): File = processClassicYuvFusionJob(jobDir, onStatus = onStatus)
 
 fun findLatestColorBurstJobDir(context: Context): File? {
     val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return null

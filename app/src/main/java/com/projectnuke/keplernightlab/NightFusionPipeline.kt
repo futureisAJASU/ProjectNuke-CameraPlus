@@ -134,6 +134,7 @@ fun reprocessYuvJob(
     context: Context,
     jobDir: File,
     finalOutputFormat: FinalOutputFormat,
+    fusionParams: ClassicYuvFusionParams? = null,
     onStatus: (String) -> Unit
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
@@ -170,7 +171,11 @@ fun reprocessYuvJob(
 
             post("YUV reprocess: loading enabled frames...")
             post("YUV reprocess: using $enabledFrames/$totalFrames frames...")
-            val finalFile = processNightFusionJobV02Sync(jobDir) { post(it) }
+            val finalFile = processClassicYuvFusionJob(
+                jobDir = jobDir,
+                onStatus = { post(it) },
+                requestedParams = fusionParams
+            )
             post("YUV reprocess: exporting...")
             val bitmap = BitmapFactory.decodeFile(finalFile.absolutePath)
                 ?: error("Could not decode reprocessed YUV image.")

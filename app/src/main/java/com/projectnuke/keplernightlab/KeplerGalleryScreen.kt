@@ -26,6 +26,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -129,20 +130,42 @@ private fun KeplerGalleryDetailScreen(
     val scope = rememberCoroutineScope()
     var currentJob by remember(job.id) { mutableStateOf(job) }
     var preview by remember(job.id) { mutableStateOf<Bitmap?>(null) }
+    var debugPreviews by remember(job.id) { mutableStateOf(emptyList<Pair<String, Bitmap>>()) }
     var confirmDelete by remember { mutableStateOf(false) }
     var deleteError by remember { mutableStateOf<String?>(null) }
     var actionStatus by remember { mutableStateOf<String?>(null) }
     var isReprocessing by remember { mutableStateOf(false) }
     var isAnalyzingQuality by remember { mutableStateOf(false) }
+    var selectedFusionPreset by remember(job.id) {
+        mutableStateOf(
+            ClassicYuvFusionPreset.fromName(job.metadata?.optString("fusionPresetName"))
+        )
+    }
     var refreshKey by remember { mutableIntStateOf(0) }
 
     LaunchedEffect(job.id, refreshKey) {
-        currentJob = withContext(Dispatchers.IO) {
+        val refreshedJob = withContext(Dispatchers.IO) {
             loadKeplerGalleryJobs(context).firstOrNull { it.id == job.id }
         } ?: currentJob
-        preview = withContext(Dispatchers.IO) {
-            currentJob.finalPreviewFile?.let { loadThumbnailSafe(it, 1280) }
+        val loadedPreview = withContext(Dispatchers.IO) {
+            refreshedJob.finalPreviewFile?.let { loadThumbnailSafe(it, 1280) }
         }
+        val loadedDebugPreviews = withContext(Dispatchers.IO) {
+            fusionDebugArtifactFiles(refreshedJob).mapNotNull { (label, file) ->
+                loadThumbnailSafe(file, 1280)?.let { label to it }
+            }
+        }
+        currentJob = refreshedJob
+        preview = loadedPreview
+        debugPreviews = loadedDebugPreviews
+    }
+    DisposableEffect(preview) {
+        val bitmap = preview
+        onDispose { bitmap?.recycle() }
+    }
+    DisposableEffect(debugPreviews) {
+        val bitmaps = debugPreviews.map { it.second }
+        onDispose { bitmaps.forEach { it.recycle() } }
     }
     BackHandler(onBack = onBack)
 
@@ -191,6 +214,27 @@ private fun KeplerGalleryDetailScreen(
                     modifier = Modifier.fillMaxWidth().height(260.dp).background(Color.Black),
                     contentScale = ContentScale.Fit
                 )
+            }
+        }
+        if (debugPreviews.isNotEmpty()) {
+            item {
+                GallerySection("Fusion Debug") {
+                    debugPreviews.forEach { (label, bitmap) ->
+                        Text(label, style = MaterialTheme.typography.titleSmall)
+                        Image(
+                            bitmap = bitmap.asImageBitmap(),
+                            contentDescription = label,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(if (label == "A/B comparison") 220.dp else 260.dp)
+                                .background(Color.Black),
+                            contentScale = ContentScale.Fit
+                        )
+                    }
+                    fusionAlignmentSummary(currentJob.metadata).forEach { row ->
+                        GalleryField("Alignment", row)
+                    }
+                }
             }
         }
         item {
@@ -247,15 +291,62 @@ private fun KeplerGalleryDetailScreen(
                         }
                     ) { Text(if (isReprocessing) "Reprocessing..." else "Reprocess RAW") }
                 } else {
+                    Text("Classic YUV preset", style = MaterialTheme.typography.titleSmall)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf(
+                            ClassicYuvFusionPreset.NATURAL,
+                            ClassicYuvFusionPreset.CLEAN
+                        ).forEach { preset ->
+                            TextButton(
+                                enabled = !isReprocessing && !isAnalyzingQuality,
+                                onClick = { selectedFusionPreset = preset }
+                            ) {
+                                Text(
+                                    if (selectedFusionPreset == preset) {
+                                        "[${preset.displayName}]"
+                                    } else {
+                                        preset.displayName
+                                    }
+                                )
+                            }
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf(
+                            ClassicYuvFusionPreset.SHARP,
+                            ClassicYuvFusionPreset.NIGHT_BRIGHT
+                        ).forEach { preset ->
+                            TextButton(
+                                enabled = !isReprocessing && !isAnalyzingQuality,
+                                onClick = { selectedFusionPreset = preset }
+                            ) {
+                                Text(
+                                    if (selectedFusionPreset == preset) {
+                                        "[${preset.displayName}]"
+                                    } else {
+                                        preset.displayName
+                                    }
+                                )
+                            }
+                        }
+                    }
                     Button(
                         enabled = !isReprocessing && !isAnalyzingQuality,
                         onClick = {
                             isReprocessing = true
-                            actionStatus = "YUV reprocess: loading enabled frames..."
+                            actionStatus =
+                                "YUV reprocess: ${selectedFusionPreset.displayName} preset..."
                             reprocessYuvJob(
                                 context = context,
                                 jobDir = currentJob.directory,
-                                finalOutputFormat = OutputSettingsStore.load(context)
+                                finalOutputFormat = OutputSettingsStore.load(context),
+                                fusionParams = selectedFusionPreset.params
                             ) { status ->
                                 actionStatus = status
                                 if (
@@ -268,7 +359,12 @@ private fun KeplerGalleryDetailScreen(
                                 }
                             }
                         }
-                    ) { Text(if (isReprocessing) "Reprocessing..." else "Reprocess YUV") }
+                    ) {
+                        Text(
+                            if (isReprocessing) "Reprocessing..."
+                            else "Reprocess with preset"
+                        )
+                    }
                 }
             }
         }
@@ -368,8 +464,44 @@ private fun metadataSummary(job: JSONObject?): List<Pair<String, String>> {
         "cameraId", "resolutionMode", "requestedResolutionMode", "actualInputResolutionMode",
         "outputResolutionMode", "processStatus", "exportStatus", "exportVerified",
         "captureCompleteness", "partialCapture", "qualityScored", "qualityScoredAt",
-        "qualityScoringVersion", "qualityScoringBackend", "qualitySummary"
+        "qualityScoringVersion", "qualityScoringBackend", "qualitySummary",
+        "fusionEngine", "fusionVersion", "referenceFrameIndex", "usedFrameCount",
+        "excludedFrameCount", "skippedFrameCount", "ghostSuppressionUsed",
+        "ghostRejectedPixelRatio", "processingTimeMs", "outputWidth", "outputHeight",
+        "fusionPresetName", "fusionParamsVersion", "fusionParams",
+        "debugArtifactStatus", "debugArtifactError", "fusionDebugFile",
+        "fusedClassicPresetFile"
     ).mapNotNull { key ->
         if (!job.has(key) || job.isNull(key)) null else key to job.get(key).toString()
+    }
+}
+
+private fun fusionDebugArtifactFiles(
+    job: KeplerGalleryJobSummary
+): List<Pair<String, java.io.File>> {
+    val metadata = job.metadata ?: return emptyList()
+    return listOf(
+        "Reference frame" to metadata.optString("referenceFrameDebugFile", "reference_frame.png"),
+        "Fused output" to metadata.optString("fusedClassicDebugFile", "fused_classic_yuv_v1.png"),
+        "A/B comparison" to metadata.optString("comparisonDebugFile", "compare_reference_vs_fused.png")
+    ).mapNotNull { (label, name) ->
+        java.io.File(job.directory, name).takeIf { name.isNotBlank() && it.isFile }?.let { label to it }
+    }
+}
+
+private fun fusionAlignmentSummary(job: JSONObject?): List<String> {
+    val alignments = job?.optJSONArray("fusionAlignmentSummary") ?: return emptyList()
+    return buildList {
+        repeat(alignments.length()) { index ->
+            val item = alignments.optJSONObject(index) ?: return@repeat
+            add(
+                "frame=${item.optInt("frameIndex", index)} " +
+                    "dx=${item.optInt("alignDx")} dy=${item.optInt("alignDy")} " +
+                    "score=${"%.4f".format(java.util.Locale.US, item.optDouble("alignmentScore", 0.0))} " +
+                    "weight=${"%.3f".format(java.util.Locale.US, item.optDouble("globalWeight", 0.0))} " +
+                    "used=${item.optBoolean("used")} " +
+                    "skip=${item.optString("skipReason").ifBlank { "none" }}"
+            )
+        }
     }
 }
