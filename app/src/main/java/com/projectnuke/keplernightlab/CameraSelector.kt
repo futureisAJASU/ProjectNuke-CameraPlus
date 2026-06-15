@@ -91,17 +91,37 @@ fun loadBackCameraCandidates(context: Context): List<CameraCandidate> {
                 characteristics.physicalCameraIds.mapNotNull { physicalCameraId ->
                     runCatching {
                         val physical = cameraManager.getCameraCharacteristics(physicalCameraId)
-                        val physicalMap = physical.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                        val physicalMap = runCatching {
+                            physical.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                        }.getOrNull()
                         PhysicalCameraCandidate(
                             physicalCameraId = physicalCameraId,
-                            lensFacing = physical.get(CameraCharacteristics.LENS_FACING),
-                            focalLengths = physical
-                                .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                            lensFacing = runCatching {
+                                physical.get(CameraCharacteristics.LENS_FACING)
+                            }.getOrNull(),
+                            focalLengths = runCatching {
+                                physical.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                            }.getOrNull()
                                 ?.toList()
                                 .orEmpty(),
-                            maxYuvMegapixels = maxMegapixels(physicalMap?.getOutputSizes(ImageFormat.YUV_420_888)),
-                            maxJpegMegapixels = maxMegapixels(physicalMap?.getOutputSizes(ImageFormat.JPEG)),
-                            maxRawMegapixels = maxMegapixels(physicalMap?.getOutputSizes(ImageFormat.RAW_SENSOR))
+                            maxYuvMegapixels = safeMaxMegapixels(
+                                physicalMap,
+                                ImageFormat.YUV_420_888
+                            ),
+                            maxJpegMegapixels = safeMaxMegapixels(
+                                physicalMap,
+                                ImageFormat.JPEG
+                            ),
+                            maxRawMegapixels = safeMaxMegapixels(
+                                physicalMap,
+                                ImageFormat.RAW_SENSOR
+                            )
+                        )
+                    }.onFailure { error ->
+                        Log.w(
+                            "KeplerPhysicalTele",
+                            "physicalId=$physicalCameraId candidateLoad=failed " +
+                                "exception=${error.javaClass.simpleName}:${error.message}"
                         )
                     }.getOrNull()
                 }
@@ -219,21 +239,25 @@ fun selectCameraForOptions(
                         val physicalTele = selectPhysicalTeleCamera(main)
                         val selection = CameraSelection(
                             cameraId = main.cameraId,
-                            effectiveZoomRatio = 3.0f,
-                            useCrop = true,
+                            effectiveZoomRatio = if (physicalTele != null) 1.0f else 3.0f,
+                            useCrop = physicalTele == null,
                             note = if (physicalTele != null) {
-                                "3x crop fallback. Physical tele candidate ${physicalTele.physicalCameraId} exists, but explicit physical routing is not enabled."
+                                "Physical tele candidate ${physicalTele.physicalCameraId} selected in metadata; explicit physical routing is not enabled."
                             } else {
                                 "Optical tele unavailable; using main 3x crop."
                             },
                             requestedLensSlot = options.lensSlot,
                             requestedThreeXSourceMode = options.threeXSourceMode,
-                            actualLensSource = ActualLensSource.OPTICAL_TELE_UNAVAILABLE_FALLBACK_CROP,
+                            actualLensSource = if (physicalTele != null) {
+                                ActualLensSource.OPTICAL_TELE_PHYSICAL
+                            } else {
+                                ActualLensSource.OPTICAL_TELE_UNAVAILABLE_FALLBACK_CROP
+                            },
                             physicalCameraId = physicalTele?.physicalCameraId,
-                            isOpticalTeleActuallyUsed = false,
-                            isFallback = true,
+                            isOpticalTeleActuallyUsed = physicalTele != null,
+                            isFallback = physicalTele == null,
                             diagnosticReason = if (physicalTele != null) {
-                                "Physical tele candidate detected inside logical cameraId=${main.cameraId}; preview/capture remains on main crop until physical OutputConfiguration routing is implemented."
+                                "Physical tele candidate detected inside logical cameraId=${main.cameraId}; selection metadata points to it, but preview/capture routing is not implemented."
                             } else {
                                 "No separate public logical tele camera or usable physical tele metadata was exposed."
                             }
@@ -455,7 +479,16 @@ private fun selectTeleCamera(
 
 private fun selectPhysicalTeleCamera(main: CameraCandidate): PhysicalCameraCandidate? {
     val mainFocal = main.primaryFocalLength()
-    val threshold = mainFocal * 1.4f
+    val threshold = mainFocal * 1.25f
+    Log.i(
+        "KeplerPhysicalTele",
+        "mainCameraId=${main.cameraId} physicalCandidates=" +
+            main.physicalCameras.map {
+                "${it.physicalCameraId}:${it.focalLengths}:" +
+                    "YUV=${it.maxYuvMegapixels},JPEG=${it.maxJpegMegapixels},RAW=${it.maxRawMegapixels}"
+            } +
+            " mainFocal=$mainFocal threshold=$threshold"
+    )
     val accepted = main.physicalCameras.filter { physical ->
         val physicalFocal = physical.primaryFocalLength()
         val isAccepted = physicalFocal >= threshold
@@ -495,6 +528,13 @@ private fun maxMegapixels(sizes: Array<Size>?): Double {
     return sizes
         ?.maxOfOrNull { size -> size.width.toDouble() * size.height.toDouble() / 1_000_000.0 }
         ?: 0.0
+}
+
+private fun safeMaxMegapixels(
+    map: android.hardware.camera2.params.StreamConfigurationMap?,
+    format: Int
+): Double {
+    return runCatching { maxMegapixels(map?.getOutputSizes(format)) }.getOrDefault(0.0)
 }
 
 private fun maxSize(sizes: Array<Size>?): String {
