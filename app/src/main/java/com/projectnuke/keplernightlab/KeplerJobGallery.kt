@@ -19,9 +19,65 @@ data class KeplerGalleryJobSummary(
     val folderSizeBytes: Long,
     val finalPreviewFile: File?,
     val finalExportExists: Boolean,
-    val frameFiles: List<File>,
+    val frames: List<KeplerGalleryFrame>,
     val metadata: JSONObject?
 )
+
+data class KeplerGalleryFrame(
+    val index: Int,
+    val fileName: String,
+    val timestampNs: Long?,
+    val enabled: Boolean,
+    val excludedByUser: Boolean,
+    val excludeReason: String?,
+    val file: File?
+) {
+    val included: Boolean get() = enabled && !excludedByUser
+}
+
+fun loadJobJson(jobDir: File): JSONObject =
+    JSONObject(File(jobDir, JOB_JSON_FILE_NAME).readText())
+
+fun saveJobJson(jobDir: File, job: JSONObject) {
+    File(jobDir, JOB_JSON_FILE_NAME).writeText(job.toString(2))
+}
+
+fun setFrameExcluded(jobDir: File, frameIndex: Int, excluded: Boolean) {
+    val job = loadJobJson(jobDir)
+    val frames = job.getJSONArray("frames")
+    var found = false
+    repeat(frames.length()) { position ->
+        val frame = frames.getJSONObject(position)
+        if (frame.optInt("index", position) == frameIndex) {
+            frame.put("enabled", !excluded)
+                .put("excludedByUser", excluded)
+                .put("excludeReason", if (excluded) "USER_EXCLUDED" else JSONObject.NULL)
+            found = true
+        }
+    }
+    require(found) { "Frame index $frameIndex not found." }
+    job.put("updatedAt", System.currentTimeMillis())
+    saveJobJson(jobDir, job)
+}
+
+fun getEnabledRawFrames(jobDir: File): List<JSONObject> {
+    val job = loadJobJson(jobDir)
+    val frames = job.optJSONArray("frames") ?: return emptyList()
+    return buildList {
+        repeat(frames.length()) { position ->
+            val frame = frames.getJSONObject(position)
+            val fileName = frame.optString("raw16File")
+            if (
+                frame.optBoolean("enabled", true) &&
+                !frame.optBoolean("excludedByUser", false) &&
+                fileName.isNotBlank() &&
+                File(jobDir, fileName).isFile
+            ) {
+                add(frame)
+            }
+        }
+    }
+}
 
 fun loadKeplerGalleryJobs(context: Context): List<KeplerGalleryJobSummary> {
     return keplerGalleryRoots(context).flatMap { root ->
@@ -59,13 +115,15 @@ private fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
     val job = File(directory, JOB_JSON_FILE_NAME).takeIf { it.isFile }?.let { file ->
         runCatching { JSONObject(file.readText()) }.getOrNull()
     }
-    val frameFiles = job?.optJSONArray("frames").frameNames()
-        .map { File(directory, it) }
-        .filter { it.isFile }
+    val frames = job?.optJSONArray("frames").galleryFrames(directory)
+        .orEmpty()
         .ifEmpty {
             directory.listFiles()
                 ?.filter { it.isFile && isSourceFrame(it) }
                 ?.sortedBy { it.name }
+                ?.mapIndexed { index, file ->
+                    KeplerGalleryFrame(index, file.name, null, true, false, null, file)
+                }
                 .orEmpty()
         }
     val finalPreview = resolveFinalPreview(directory, job)
@@ -90,25 +148,39 @@ private fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
         directory = directory,
         createdAt = createdAt,
         status = job?.optString("status").orEmpty().ifBlank { "UNKNOWN" },
-        requestedFrames = job?.optInt("requestedFrames", frameFiles.size) ?: frameFiles.size,
-        savedFrames = job?.optInt("savedFrames", frameFiles.size) ?: frameFiles.size,
+        requestedFrames = job?.optInt("requestedFrames", frames.size) ?: frames.size,
+        savedFrames = job?.optInt("savedFrames", frames.size) ?: frames.size,
         width = width,
         height = height,
         folderSizeBytes = folderSizeBytes(directory),
         finalPreviewFile = finalPreview,
         finalExportExists = exportExists,
-        frameFiles = frameFiles,
+        frames = frames,
         metadata = job
     )
 }
 
-private fun JSONArray?.frameNames(): List<String> {
+private fun JSONArray?.galleryFrames(directory: File): List<KeplerGalleryFrame> {
     if (this == null) return emptyList()
     return buildList {
-        repeat(length()) { index ->
-            optJSONObject(index)?.optString("file")
-                ?.takeIf { it.isNotBlank() }
-                ?.let(::add)
+        repeat(length()) { position ->
+            val frame = optJSONObject(position) ?: return@repeat
+            val fileName = frame.optString("raw16File")
+                .ifBlank { frame.optString("file") }
+                .ifBlank { frame.optString("dngFile") }
+            val file = fileName.takeIf { it.isNotBlank() }?.let { File(directory, it) }
+            add(
+                KeplerGalleryFrame(
+                    index = frame.optInt("index", position),
+                    fileName = fileName.ifBlank { "frame_$position" },
+                    timestampNs = frame.optLong("timestampNs", 0L).takeIf { it > 0L },
+                    enabled = frame.optBoolean("enabled", true),
+                    excludedByUser = frame.optBoolean("excludedByUser", false),
+                    excludeReason = frame.optString("excludeReason")
+                        .takeIf { it.isNotBlank() && it != "null" },
+                    file = file?.takeIf { it.isFile }
+                )
+            )
         }
     }
 }

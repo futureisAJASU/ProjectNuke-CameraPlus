@@ -22,6 +22,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -30,6 +31,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -38,6 +40,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
@@ -123,13 +126,21 @@ private fun KeplerGalleryDetailScreen(
     onDeleted: () -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var currentJob by remember(job.id) { mutableStateOf(job) }
     var preview by remember(job.id) { mutableStateOf<Bitmap?>(null) }
     var confirmDelete by remember { mutableStateOf(false) }
     var deleteError by remember { mutableStateOf<String?>(null) }
+    var actionStatus by remember { mutableStateOf<String?>(null) }
+    var isReprocessing by remember { mutableStateOf(false) }
+    var refreshKey by remember { mutableIntStateOf(0) }
 
-    LaunchedEffect(job.id) {
+    LaunchedEffect(job.id, refreshKey) {
+        currentJob = withContext(Dispatchers.IO) {
+            loadKeplerGalleryJobs(context).firstOrNull { it.id == job.id }
+        } ?: currentJob
         preview = withContext(Dispatchers.IO) {
-            job.finalPreviewFile?.let { loadThumbnailSafe(it, 1280) }
+            currentJob.finalPreviewFile?.let { loadThumbnailSafe(it, 1280) }
         }
     }
     BackHandler(onBack = onBack)
@@ -138,11 +149,11 @@ private fun KeplerGalleryDetailScreen(
         AlertDialog(
             onDismissRequest = { confirmDelete = false },
             title = { Text("Delete job?") },
-            text = { Text("Permanently delete ${job.directory.name} and all source frames?") },
+            text = { Text("Permanently delete ${currentJob.directory.name} and all source frames?") },
             confirmButton = {
                 TextButton(onClick = {
                     confirmDelete = false
-                    deleteKeplerGalleryJob(context, job.directory)
+                    deleteKeplerGalleryJob(context, currentJob.directory)
                         .onSuccess { onDeleted() }
                         .onFailure { deleteError = it.message ?: "Delete failed." }
                 }) { Text("Delete") }
@@ -167,8 +178,9 @@ private fun KeplerGalleryDetailScreen(
                 Button(onClick = onBack) { Text("Back") }
                 Button(onClick = { confirmDelete = true }) { Text("Delete") }
             }
-            Text(job.directory.name, style = MaterialTheme.typography.headlineSmall)
+            Text(currentJob.directory.name, style = MaterialTheme.typography.headlineSmall)
             deleteError?.let { Text(it, color = Color(0xFFFFB4A9)) }
+            actionStatus?.let { Text(it, color = galleryMuted) }
         }
         preview?.let { bitmap ->
             item {
@@ -182,25 +194,88 @@ private fun KeplerGalleryDetailScreen(
         }
         item {
             GallerySection("Summary") {
-                GalleryField("Type", job.jobType)
-                GalleryField("Created", formatTimestamp(job.createdAt))
-                GalleryField("Status", job.status)
-                GalleryField("Frames", "${job.savedFrames}/${job.requestedFrames}")
-                GalleryField("Resolution", resolutionText(job))
-                GalleryField("Folder size", formatBytes(job.folderSizeBytes))
-                GalleryField("Final/export", if (job.finalExportExists) "Available" else "Not found")
-                GalleryField("Path", job.directory.absolutePath)
+                val enabledCount = currentJob.frames.count { it.included && it.file != null }
+                val excludedCount = currentJob.frames.count { !it.included }
+                GalleryField("Type", currentJob.jobType)
+                GalleryField("Created", formatTimestamp(currentJob.createdAt))
+                GalleryField("Status", currentJob.status)
+                GalleryField("Frames", "${currentJob.savedFrames}/${currentJob.requestedFrames}")
+                GalleryField("Enabled / excluded", "$enabledCount / $excludedCount")
+                GalleryField("Resolution", resolutionText(currentJob))
+                GalleryField("Folder size", formatBytes(currentJob.folderSizeBytes))
+                GalleryField("Final/export", if (currentJob.finalExportExists) "Available" else "Not found")
+                GalleryField("Path", currentJob.directory.absolutePath)
+                if (currentJob.jobType == "RAW_NIGHT_FUSION") {
+                    Button(
+                        enabled = !isReprocessing,
+                        onClick = {
+                            isReprocessing = true
+                            actionStatus = "Starting RAW reprocess..."
+                            reprocessRawJob(
+                                context = context,
+                                jobDir = currentJob.directory,
+                                finalOutputFormat = OutputSettingsStore.load(context)
+                            ) { status ->
+                                actionStatus = status
+                                if (
+                                    status.startsWith("RAW reprocess complete") ||
+                                    status.startsWith("RAW reprocess failed") ||
+                                    status.startsWith("Not enough enabled frames")
+                                ) {
+                                    isReprocessing = false
+                                    refreshKey++
+                                }
+                            }
+                        }
+                    ) { Text(if (isReprocessing) "Reprocessing..." else "Reprocess RAW") }
+                } else {
+                    Button(enabled = false, onClick = {}) { Text("Reprocess YUV (TODO)") }
+                }
             }
         }
         item {
             GallerySection("Metadata") {
-                metadataSummary(job.metadata).forEach { (key, value) -> GalleryField(key, value) }
+                metadataSummary(currentJob.metadata).forEach { (key, value) -> GalleryField(key, value) }
             }
         }
-        item {
-            GallerySection("Frame files (${job.frameFiles.size})") {
-                job.frameFiles.forEach { GalleryField(it.name, formatBytes(it.length())) }
-                if (job.frameFiles.isEmpty()) Text("No source frame files found.", color = galleryMuted)
+        items(currentJob.frames, key = { it.index }) { frame ->
+            GallerySection("Frame ${frame.index}") {
+                GalleryField("File", frame.fileName)
+                GalleryField("Timestamp ns", frame.timestampNs?.toString() ?: "none")
+                GalleryField("File exists", if (frame.file != null) "yes" else "no")
+                GalleryField("State", if (frame.included) "Included" else "Excluded")
+                frame.excludeReason?.let { GalleryField("Reason", it) }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(if (frame.included) "Included" else "Excluded")
+                    Switch(
+                        checked = frame.included,
+                        onCheckedChange = { included ->
+                            scope.launch {
+                                runCatching {
+                                    withContext(Dispatchers.IO) {
+                                        setFrameExcluded(
+                                            currentJob.directory,
+                                            frame.index,
+                                            excluded = !included
+                                        )
+                                    }
+                                }.onSuccess {
+                                    actionStatus = if (included) {
+                                        "Frame ${frame.index} included."
+                                    } else {
+                                        "Frame ${frame.index} excluded. Source file kept."
+                                    }
+                                    refreshKey++
+                                }.onFailure {
+                                    actionStatus = "Frame update failed: ${it.message}"
+                                }
+                            }
+                        }
+                    )
+                }
             }
         }
         item { Spacer(Modifier.height(20.dp)) }

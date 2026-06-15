@@ -235,6 +235,13 @@ fun captureYuvBurstColorWithMotion(
 
         val outputWidth = if (rotationDegrees == 90 || rotationDegrees == 270) yuvSize.height else yuvSize.width
         val outputHeight = if (rotationDegrees == 90 || rotationDegrees == 270) yuvSize.width else yuvSize.height
+        val useMemoryBuffer = canUseYuvMemoryBuffer(
+            yuvSize.width,
+            yuvSize.height,
+            frameCount
+        )
+        val estimatedBufferBytes =
+            estimateYuvBufferBytes(yuvSize.width, yuvSize.height) * frameCount
 
         val jobFile = File(burstDir, "job.json")
 
@@ -266,7 +273,9 @@ fun captureYuvBurstColorWithMotion(
             autoMinFrames = autoMinFrames,
             autoMaxFrames = autoMaxFrames,
             manualFrames = manualFrames,
-            framePlanReason = framePlanReason
+            framePlanReason = framePlanReason,
+            yuvMemoryBufferUsed = useMemoryBuffer,
+            yuvMemoryBufferEstimatedBytes = estimatedBufferBytes
         )
 
         postStatus("Color Fusion 초기화 4/7: ImageReader 생성 중...")
@@ -279,13 +288,6 @@ fun captureYuvBurstColorWithMotion(
         )
 
         imageReader = reader
-        val useMemoryBuffer = canUseYuvMemoryBuffer(
-            yuvSize.width,
-            yuvSize.height,
-            frameCount
-        )
-        val estimatedBufferBytes =
-            estimateYuvBufferBytes(yuvSize.width, yuvSize.height) * frameCount
         val bufferedFrames = mutableListOf<BufferedYuvFrame>()
         if (useMemoryBuffer) {
             postStatus(
@@ -363,7 +365,7 @@ fun captureYuvBurstColorWithMotion(
                         bufferedFrames.add(bufferedFrame)
                         savedFrames++
                         frameTimestampsNs.add(imageTimestampNs)
-                        postStatus("YUV capture: buffered $savedFrames/$frameCount")
+                        postStatus("YUV buffered frame $savedFrames/$frameCount")
 
                         if (savedFrames >= frameCount) {
                             val savedMotionFiles = saveMotionOnce(burstDir)
@@ -377,9 +379,7 @@ fun captureYuvBurstColorWithMotion(
                                     rotationDegrees = rotationDegrees
                                 )
                                 savedFrameFiles.add(fileName)
-                                postStatus(
-                                    "YUV memory buffer flush: ${flushIndex + 1}/${bufferedFrames.size}"
-                                )
+                                postStatus("YUV flushing frame ${flushIndex + 1}/${bufferedFrames.size}")
                             }
                             bufferedFrames.clear()
                             writeColorJobJson(
@@ -408,7 +408,9 @@ fun captureYuvBurstColorWithMotion(
                                 autoMinFrames = autoMinFrames,
                                 autoMaxFrames = autoMaxFrames,
                                 manualFrames = manualFrames,
-                                framePlanReason = framePlanReason
+                                framePlanReason = framePlanReason,
+                                yuvMemoryBufferUsed = useMemoryBuffer,
+                                yuvMemoryBufferEstimatedBytes = estimatedBufferBytes
                             )
                             postStatus("YUV capture complete: saved $savedFrames/$frameCount")
                             onComplete(burstDir)
@@ -463,7 +465,9 @@ fun captureYuvBurstColorWithMotion(
                         autoMinFrames = autoMinFrames,
                         autoMaxFrames = autoMaxFrames,
                         manualFrames = manualFrames,
-                        framePlanReason = framePlanReason
+                        framePlanReason = framePlanReason,
+                        yuvMemoryBufferUsed = useMemoryBuffer,
+                        yuvMemoryBufferEstimatedBytes = estimatedBufferBytes
                     )
 
                     postStatus("YUV capture: saved $savedFrames/$frameCount")
@@ -507,7 +511,9 @@ fun captureYuvBurstColorWithMotion(
                             autoMinFrames = autoMinFrames,
                             autoMaxFrames = autoMaxFrames,
                             manualFrames = manualFrames,
-                            framePlanReason = framePlanReason
+                            framePlanReason = framePlanReason,
+                            yuvMemoryBufferUsed = useMemoryBuffer,
+                            yuvMemoryBufferEstimatedBytes = estimatedBufferBytes
                         )
 
                         postStatus("YUV capture complete: saved $savedFrames/$frameCount")
@@ -523,6 +529,12 @@ fun captureYuvBurstColorWithMotion(
                                 "폴더:\n${burstDir.absolutePath}"
                         )
                     }
+                } catch (oom: OutOfMemoryError) {
+                    bufferedFrames.clear()
+                    finish(
+                        "YUV memory buffer failed: OutOfMemoryError while copying/flushing; " +
+                            "job directory and completed source frames kept."
+                    )
                 } catch (e: Exception) {
                     finish("컬러 프레임 저장 실패\n${e.stackTraceToString()}")
                 } finally {
@@ -1048,7 +1060,9 @@ fun writeColorJobJson(
     autoMinFrames: Int = 4,
     autoMaxFrames: Int = 8,
     manualFrames: Int = 4,
-    framePlanReason: String = "Default"
+    framePlanReason: String = "Default",
+    yuvMemoryBufferUsed: Boolean = false,
+    yuvMemoryBufferEstimatedBytes: Long = 0L
 ) {
     val framesArray = JSONArray()
 
@@ -1095,6 +1109,10 @@ fun writeColorJobJson(
         .put("rotationDegrees", rotationDegrees)
         .put("requestedFrames", requestedFrames)
         .put("savedFrames", savedFrames)
+        .put("yuvMemoryBufferUsed", yuvMemoryBufferUsed)
+        .put("yuvMemoryBufferEstimatedBytes", yuvMemoryBufferEstimatedBytes)
+        .put("yuvMemoryBufferFrameLimit", MAX_YUV_MEMORY_BUFFER_FRAMES)
+        .put("yuvMemoryBufferByteLimit", MAX_YUV_MEMORY_BUFFER_BYTES)
         .put("frames", framesArray)
         .put("motion", motionObject)
         .put("updatedAt", now)

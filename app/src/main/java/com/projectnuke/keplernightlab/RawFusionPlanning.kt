@@ -65,6 +65,9 @@ internal fun prepareRawFusionFrames(
     val metadata = mutableListOf<JSONObject>()
     for (i in 0 until frames.length()) {
         val frame = frames.getJSONObject(i)
+        val enabled = frame.optBoolean("enabled", true)
+        val excludedByUser = frame.optBoolean("excludedByUser", false)
+        if (!enabled || excludedByUser) continue
         val rawFile = File(jobDir, frame.getString("raw16File"))
         if (rawFile.exists() && rawFile.length() >= pixelCount * 2L) {
             inputs += RawFrameInput(rawFile, frame)

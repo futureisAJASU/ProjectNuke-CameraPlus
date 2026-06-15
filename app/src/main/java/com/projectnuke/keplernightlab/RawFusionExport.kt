@@ -242,3 +242,115 @@ fun captureProcessExportRawNightFusion(
         onError = { post("PIPELINE_FAILED: RAW capture failed; keeping cache.\n$it") }
     )
 }
+
+fun reprocessRawJob(
+    context: Context,
+    jobDir: File,
+    finalOutputFormat: FinalOutputFormat,
+    onStatus: (String) -> Unit
+) {
+    val main = Handler(Looper.getMainLooper())
+    fun post(message: String) = main.post { onStatus(message) }
+    val thread = HandlerThread("KeplerRawReprocessThread").apply { start() }
+    Handler(thread.looper).post {
+        val enabledCount = runCatching { getEnabledRawFrames(jobDir).size }.getOrDefault(0)
+        val totalCount = runCatching {
+            loadJobJson(jobDir).optJSONArray("frames")?.length() ?: 0
+        }.getOrDefault(0)
+        if (enabledCount < MIN_RAW_FUSION_FRAMES) {
+            updateReprocessHistory(
+                jobDir, enabledCount, totalCount - enabledCount,
+                "FAILED_NOT_ENOUGH_ENABLED_FRAMES"
+            )
+            post("Not enough enabled frames to reprocess")
+            thread.quitSafely()
+            return@post
+        }
+        try {
+            post("Reprocessing RAW: using $enabledCount/$totalCount frames")
+            val process = processRawFusionJob(
+                context = context,
+                jobDir = jobDir,
+                saveNativeMp24DebugPng = finalOutputFormat.isDebugPng
+            ) { post(it) }
+            if (!process.success || !process.hasExportableBitmapSource()) {
+                val reason = process.errorMessage ?: "RAW fusion process failed"
+                updateReprocessHistory(jobDir, enabledCount, totalCount - enabledCount, "FAILED: $reason")
+                post("RAW reprocess failed; source frames kept. $reason")
+                return@post
+            }
+            val requestedFormat = requestedOutputFormatForSetting(finalOutputFormat)
+            post("Exporting reprocessed ${requestedFormat.label}...")
+            var exportBitmap: Bitmap? = null
+            val export = try {
+                val loaded = process.loadExportBitmap()
+                exportBitmap = loaded.bitmap
+                updateRawExportBitmapMetadata(
+                    jobDir = jobDir,
+                    source = loaded.source,
+                    nativeRgbaDirectExportUsed = loaded.nativeRgbaDirect,
+                    nativeRgbaBitmapLoadedForExport = loaded.nativeRgbaDirect,
+                    finalPngDecodeSkippedForExport = loaded.nativeRgbaDirect,
+                    exportBitmapWidth = loaded.bitmap.width,
+                    exportBitmapHeight = loaded.bitmap.height
+                )
+                exportNightFusionBitmapToGallery(
+                    context = context,
+                    bitmap = loaded.bitmap,
+                    displayNameBase = "Kepler_RAW_REPROCESS_${
+                        SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                    }",
+                    requestedFormat = requestedFormat
+                )
+            } finally {
+                exportBitmap?.takeUnless { it.isRecycled }?.recycle()
+            }
+            if (!export.success || export.uriString.isNullOrBlank() ||
+                !verifyGalleryExport(context, export.uriString)
+            ) {
+                val reason = export.errorMessage ?: "Export or verification failed"
+                updateExportFailure(jobDir, reason, finalOutputFormat)
+                updateReprocessHistory(jobDir, enabledCount, totalCount - enabledCount, "FAILED: $reason")
+                post("RAW reprocess export failed; source frames kept. $reason")
+                return@post
+            }
+            updateExportMetadata(
+                jobDir = jobDir,
+                export = export,
+                verified = true,
+                finalOutputFormat = finalOutputFormat,
+                rawSidecarResult = null
+            )
+            updateReprocessHistory(jobDir, enabledCount, totalCount - enabledCount, "SUCCESS")
+            post("RAW reprocess complete: used $enabledCount frames; source frames kept.")
+        } catch (oom: OutOfMemoryError) {
+            updateReprocessHistory(jobDir, enabledCount, totalCount - enabledCount, "FAILED_OUT_OF_MEMORY")
+            post("RAW reprocess failed: out of memory; source frames kept.")
+        } catch (e: Exception) {
+            updateReprocessHistory(
+                jobDir, enabledCount, totalCount - enabledCount,
+                "FAILED: ${e.javaClass.simpleName}: ${e.message}"
+            )
+            post("RAW reprocess failed; source frames kept. ${e.javaClass.simpleName}: ${e.message}")
+        } finally {
+            thread.quitSafely()
+        }
+    }
+}
+
+private fun updateReprocessHistory(
+    jobDir: File,
+    usedFrameCount: Int,
+    excludedFrameCount: Int,
+    status: String
+) {
+    runCatching {
+        val job = loadJobJson(jobDir)
+        job.put("reprocessCount", job.optInt("reprocessCount", 0) + 1)
+            .put("lastReprocessedAt", System.currentTimeMillis())
+            .put("lastReprocessUsedFrameCount", usedFrameCount)
+            .put("lastReprocessExcludedFrameCount", excludedFrameCount)
+            .put("lastReprocessStatus", status)
+        saveJobJson(jobDir, job)
+    }
+}
