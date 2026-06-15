@@ -239,25 +239,21 @@ fun selectCameraForOptions(
                         val physicalTele = selectPhysicalTeleCamera(main)
                         val selection = CameraSelection(
                             cameraId = main.cameraId,
-                            effectiveZoomRatio = if (physicalTele != null) 1.0f else 3.0f,
-                            useCrop = physicalTele == null,
+                            effectiveZoomRatio = 3.0f,
+                            useCrop = true,
                             note = if (physicalTele != null) {
-                                "Physical tele candidate ${physicalTele.physicalCameraId} selected in metadata; explicit physical routing is not enabled."
+                                "Physical tele candidate ${physicalTele.physicalCameraId} found, but physical routing is disabled; using main 3x crop fallback."
                             } else {
                                 "Optical tele unavailable; using main 3x crop."
                             },
                             requestedLensSlot = options.lensSlot,
                             requestedThreeXSourceMode = options.threeXSourceMode,
-                            actualLensSource = if (physicalTele != null) {
-                                ActualLensSource.OPTICAL_TELE_PHYSICAL
-                            } else {
-                                ActualLensSource.OPTICAL_TELE_UNAVAILABLE_FALLBACK_CROP
-                            },
+                            actualLensSource = ActualLensSource.OPTICAL_TELE_UNAVAILABLE_FALLBACK_CROP,
                             physicalCameraId = physicalTele?.physicalCameraId,
-                            isOpticalTeleActuallyUsed = physicalTele != null,
-                            isFallback = physicalTele == null,
+                            isOpticalTeleActuallyUsed = false,
+                            isFallback = true,
                             diagnosticReason = if (physicalTele != null) {
-                                "Physical tele candidate detected inside logical cameraId=${main.cameraId}; selection metadata points to it, but preview/capture routing is not implemented."
+                                "Physical tele candidate detected inside logical cameraId=${main.cameraId}, but preview/capture routing is not implemented; main 3x crop fallback remains active."
                             } else {
                                 "No separate public logical tele camera or usable physical tele metadata was exposed."
                             }
