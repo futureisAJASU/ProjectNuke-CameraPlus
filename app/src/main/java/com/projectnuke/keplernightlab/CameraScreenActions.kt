@@ -261,25 +261,41 @@ internal fun startCapturePipeline(
     request: CapturePipelineRequest,
     onStatus: (String) -> Unit
 ) {
-    val physicalCameraId = request.prepared.selection.physicalCameraId.takeIf {
-        request.prepared.selection.actualLensSource == ActualLensSource.OPTICAL_TELE_PHYSICAL
+    val selection = request.prepared.selection
+    val shouldDisablePhysicalStillRouting = selection.actualLensSource == ActualLensSource.OPTICAL_TELE_PHYSICAL
+    val physicalCameraId: String? = null
+    val captureZoomRatio = if (shouldDisablePhysicalStillRouting) {
+        LensSlot.THREE_X.targetZoomRatio.coerceIn(
+            request.zoomUiState.minZoom,
+            request.zoomUiState.maxZoom
+        )
+    } else {
+        request.prepared.captureZoomRatio
     }
     Log.i(
         "KeplerPhysicalRoute",
         "capturePipeline selectedResolution=${request.selectedResolution} " +
-            "pipelineMode=${request.pipelineMode} cameraId=${request.prepared.selection.cameraId} " +
-            "actual=${request.prepared.selection.actualLensSource} " +
-            "requestedPhysicalCameraId=${request.prepared.selection.physicalCameraId} " +
+            "pipelineMode=${request.pipelineMode} cameraId=${selection.cameraId} " +
+            "actual=${selection.actualLensSource} " +
+            "requestedPhysicalCameraId=${selection.physicalCameraId} " +
             "routedPhysicalCameraId=$physicalCameraId " +
-            "captureZoom=${request.prepared.captureZoomRatio}"
+            "captureZoom=$captureZoomRatio " +
+            "physicalStillRoutingDisabled=$shouldDisablePhysicalStillRouting"
     )
+    if (shouldDisablePhysicalStillRouting) {
+        Log.w(
+            "KeplerPhysicalRoute",
+            "capture physical routing disabled; using logical 3x crop fallback " +
+                "cameraId=${selection.cameraId} requestedPhysicalCameraId=${selection.physicalCameraId}"
+        )
+    }
     if (request.selectedResolution == CaptureResolutionMode.MP24_FUSION) {
         captureProcessExportSuperResolutionFusion(
             context = request.context,
-            cameraId = request.prepared.selection.cameraId,
+            cameraId = selection.cameraId,
             frameCount = request.prepared.framePlan.framesToCapture,
             finalOutputFormat = request.finalOutputFormat,
-            zoomRatio = request.prepared.captureZoomRatio,
+            zoomRatio = captureZoomRatio,
             physicalCameraId = physicalCameraId,
             focusAeState = request.focusAeState,
             frameCountMode = request.prepared.settings.mode,
@@ -292,12 +308,12 @@ internal fun startCapturePipeline(
     } else if (request.pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
         captureProcessExportRawNightFusion(
             context = request.context,
-            cameraId = request.prepared.selection.cameraId,
+            cameraId = selection.cameraId,
             frameCount = request.prepared.framePlan.framesToCapture,
             resolutionMode = request.selectedResolution,
             resolutionPlan = request.resolutionPlan,
             finalOutputFormat = request.finalOutputFormat,
-            zoomRatio = request.prepared.captureZoomRatio,
+            zoomRatio = captureZoomRatio,
             physicalCameraId = physicalCameraId,
             focusAeState = request.focusAeState,
             onStatus = onStatus
@@ -305,11 +321,11 @@ internal fun startCapturePipeline(
     } else {
         captureProcessExportNightFusion(
             context = request.context,
-            cameraId = request.prepared.selection.cameraId,
+            cameraId = selection.cameraId,
             frameCount = request.prepared.framePlan.framesToCapture,
             resolutionMode = request.selectedResolution,
             finalOutputFormat = request.finalOutputFormat,
-            zoomRatio = request.prepared.captureZoomRatio,
+            zoomRatio = captureZoomRatio,
             physicalCameraId = physicalCameraId,
             focusAeState = request.focusAeState,
             cleanupPolicy = CacheCleanupPolicy.DELETE_SOURCE_FRAMES_AFTER_VERIFIED_EXPORT,
