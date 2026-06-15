@@ -331,7 +331,7 @@ internal fun startCapturePipeline(
             zoomRatio = captureZoomRatio,
             physicalCameraId = physicalCameraId,
             focusAeState = request.focusAeState,
-            cleanupPolicy = CacheCleanupPolicy.DELETE_SOURCE_FRAMES_AFTER_VERIFIED_EXPORT,
+            cleanupPolicy = CacheCleanupPolicy.KEEP_ALL,
             frameCountMode = request.prepared.settings.mode,
             autoMinFrames = request.prepared.settings.autoMinFrames,
             autoMaxFrames = request.prepared.settings.autoMaxFrames,
