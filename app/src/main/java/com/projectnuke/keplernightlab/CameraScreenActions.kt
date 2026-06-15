@@ -201,6 +201,7 @@ internal fun prepareCaptureAttempt(
                 "source=${selection.requestedThreeXSourceMode} " +
                 "cameraId=${selection.cameraId} captureZoom=$captureZoomRatio " +
                 "actual=${selection.actualLensSource} " +
+                "physicalCameraId=${selection.physicalCameraId} " +
                 "physicalTele=${selection.isOpticalTeleActuallyUsed && !selection.useCrop} " +
                 "mainCrop=${selection.actualLensSource == ActualLensSource.MAIN_CROP_3X}"
         )
@@ -263,6 +264,15 @@ internal fun startCapturePipeline(
     val physicalCameraId = request.prepared.selection.physicalCameraId.takeIf {
         request.prepared.selection.actualLensSource == ActualLensSource.OPTICAL_TELE_PHYSICAL
     }
+    Log.i(
+        "KeplerPhysicalRoute",
+        "capturePipeline selectedResolution=${request.selectedResolution} " +
+            "pipelineMode=${request.pipelineMode} cameraId=${request.prepared.selection.cameraId} " +
+            "actual=${request.prepared.selection.actualLensSource} " +
+            "requestedPhysicalCameraId=${request.prepared.selection.physicalCameraId} " +
+            "routedPhysicalCameraId=$physicalCameraId " +
+            "captureZoom=${request.prepared.captureZoomRatio}"
+    )
     if (request.selectedResolution == CaptureResolutionMode.MP24_FUSION) {
         captureProcessExportSuperResolutionFusion(
             context = request.context,
