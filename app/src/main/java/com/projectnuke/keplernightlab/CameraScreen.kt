@@ -289,6 +289,10 @@ fun MainCameraScreen(
     )
     val levelState = rememberDeviceLevelState(enabled = overlaySettings.showLevel)
 
+    LaunchedEffect(Unit) {
+        logLongReport("KeplerCameraDump", buildFullCameraDumpReport(context))
+    }
+
     var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var latestSummary by remember { mutableStateOf("최근 결과 없음") }
 
@@ -431,6 +435,8 @@ fun MainCameraScreen(
             state = CameraPreviewPaneState(
                 cameraSelection = cameraState.selection,
                 previewZoomRatio = cameraState.previewZoomRatio,
+                selectedLensSlot = selectedLensSlot,
+                selectedThreeXSource = selectedThreeXSource,
                 focusAeState = focusAeState,
                 previewEnabled = previewEnabled,
                 isCapturing = isCapturing,

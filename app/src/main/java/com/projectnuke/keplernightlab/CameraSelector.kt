@@ -303,6 +303,85 @@ fun buildCameraSelectionDebugReport(context: Context): String {
     }.trim()
 }
 
+fun buildFullCameraDumpReport(context: Context): String {
+    val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+
+    return buildString {
+        cameraManager.cameraIdList.forEach { cameraId ->
+            runCatching {
+                val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+                val capabilities = characteristics
+                    .get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                    ?.toList()
+                    .orEmpty()
+                val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                val physicalIds = if (Build.VERSION.SDK_INT >= 28) {
+                    characteristics.physicalCameraIds.toList()
+                } else {
+                    emptyList()
+                }
+                val zoomRatioRange = if (Build.VERSION.SDK_INT >= 30) {
+                    characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+                } else {
+                    null
+                }
+
+                val logicalLine = "cameraId=$cameraId " +
+                    "lensFacing=${characteristics.get(CameraCharacteristics.LENS_FACING)} " +
+                    "focalLengths=${characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.toList().orEmpty()} " +
+                    "capabilities=$capabilities " +
+                    "isLogicalMultiCamera=${capabilities.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA)} " +
+                    "physicalCameraIds=$physicalIds " +
+                    "maxYUV=${maxSize(map?.getOutputSizes(ImageFormat.YUV_420_888))} " +
+                    "maxJPEG=${maxSize(map?.getOutputSizes(ImageFormat.JPEG))} " +
+                    "maxRAW=${maxSize(map?.getOutputSizes(ImageFormat.RAW_SENSOR))} " +
+                    "zoomRatioRange=$zoomRatioRange"
+                appendLine(logicalLine)
+                physicalIds.forEach { physicalId ->
+                    appendLine(describePhysicalCamera(cameraManager, physicalId))
+                }
+            }.onFailure { error ->
+                appendLine(
+                    "cameraId=$cameraId skipped=true " +
+                        "failure=${error.javaClass.simpleName}:${error.message}"
+                )
+            }
+        }
+    }.trim()
+}
+
+private fun describePhysicalCamera(
+    cameraManager: CameraManager,
+    physicalId: String
+): String {
+    return runCatching {
+        val characteristics = cameraManager.getCameraCharacteristics(physicalId)
+        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val capabilities = characteristics
+            .get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+            ?.toList()
+        val zoomRatioRange = if (Build.VERSION.SDK_INT >= 30) {
+            characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+        } else {
+            null
+        }
+
+        "  physicalId=$physicalId getCharacteristics=success " +
+            "lensFacing=${characteristics.get(CameraCharacteristics.LENS_FACING)} " +
+            "focalLengths=${characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.toList().orEmpty()} " +
+            "activeArray=${characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)} " +
+            "pixelArray=${characteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)} " +
+            "maxYUV=${maxSize(map?.getOutputSizes(ImageFormat.YUV_420_888))} " +
+            "maxJPEG=${maxSize(map?.getOutputSizes(ImageFormat.JPEG))} " +
+            "maxRAW=${maxSize(map?.getOutputSizes(ImageFormat.RAW_SENSOR))} " +
+            "capabilities=${capabilities ?: "unavailable"} " +
+            "zoomRatioRange=$zoomRatioRange streamConfigurationMapExists=${map != null}"
+    }.getOrElse { error ->
+        "  physicalId=$physicalId getCharacteristics=failed " +
+            "exception=${error.javaClass.simpleName}:${error.message}"
+    }
+}
+
 fun buildCenterCropRegion(
     characteristics: CameraCharacteristics,
     zoomRatio: Float
@@ -376,9 +455,28 @@ private fun selectTeleCamera(
 
 private fun selectPhysicalTeleCamera(main: CameraCandidate): PhysicalCameraCandidate? {
     val mainFocal = main.primaryFocalLength()
-    return main.physicalCameras
-        .filter { it.primaryFocalLength() >= mainFocal * 1.4f }
-        .maxByOrNull { it.primaryFocalLength() }
+    val threshold = mainFocal * 1.4f
+    val accepted = main.physicalCameras.filter { physical ->
+        val physicalFocal = physical.primaryFocalLength()
+        val isAccepted = physicalFocal >= threshold
+        Log.i(
+            "KeplerPhysicalTele",
+            "mainCameraId=${main.cameraId} mainFocal=$mainFocal threshold=$threshold " +
+                "physicalId=${physical.physicalCameraId} focalLengths=${physical.focalLengths} " +
+                "comparison=$physicalFocal>=$threshold accepted=$isAccepted " +
+                "reason=${if (isAccepted) "focal meets tele threshold" else "focal below tele threshold"} " +
+                "maxYuvMp=${physical.maxYuvMegapixels} " +
+                "maxJpegMp=${physical.maxJpegMegapixels} maxRawMp=${physical.maxRawMegapixels}"
+        )
+        isAccepted
+    }
+    val selected = accepted.maxByOrNull { it.primaryFocalLength() }
+    Log.i(
+        "KeplerPhysicalTele",
+        "mainCameraId=${main.cameraId} threshold=$threshold candidates=${main.physicalCameras.size} " +
+            "accepted=${accepted.map { it.physicalCameraId }} selected=${selected?.physicalCameraId}"
+    )
+    return selected
 }
 
 private fun CameraCandidate.primaryFocalLength(): Float {
@@ -397,4 +495,11 @@ private fun maxMegapixels(sizes: Array<Size>?): Double {
     return sizes
         ?.maxOfOrNull { size -> size.width.toDouble() * size.height.toDouble() / 1_000_000.0 }
         ?: 0.0
+}
+
+private fun maxSize(sizes: Array<Size>?): String {
+    val size = sizes?.maxByOrNull { it.width.toLong() * it.height.toLong() }
+        ?: return "unavailable"
+    val megapixels = size.width.toDouble() * size.height.toDouble() / 1_000_000.0
+    return "${size.width}x${size.height}(${"%.1f".format(megapixels)}MP)"
 }

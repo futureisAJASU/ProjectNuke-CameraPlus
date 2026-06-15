@@ -12,8 +12,11 @@ import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.MeteringRectangle
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
@@ -44,6 +47,9 @@ fun Camera2Preview(
     modifier: Modifier = Modifier,
     cameraId: String,
     zoomRatio: Float = 1.0f,
+    selectedLensSlot: LensSlot,
+    selectedThreeXSource: ThreeXSourceMode,
+    actualLensSource: ActualLensSource,
     focusAeState: FocusAeState = FocusAeState(),
     meteringMode: MeteringMode = MeteringModeState.mode,
     enabled: Boolean = true,
@@ -63,6 +69,14 @@ fun Camera2Preview(
 
     LaunchedEffect(zoomRatio) {
         controller.updateZoomRatio(zoomRatio)
+    }
+
+    LaunchedEffect(selectedLensSlot, selectedThreeXSource, actualLensSource) {
+        controller.updateLensDiagnostics(
+            selectedLensSlot = selectedLensSlot,
+            selectedThreeXSource = selectedThreeXSource,
+            actualLensSource = actualLensSource
+        )
     }
 
     LaunchedEffect(focusAeState) {
@@ -117,6 +131,10 @@ private class CameraPreviewController(
     private var previewSurface: Surface? = null
     private var currentPreviewSize: Size? = null
     @Volatile private var latestZoomRatio: Float = 1.0f
+    @Volatile private var latestSelectedLensSlot: LensSlot = LensSlot.MAIN_1X
+    @Volatile private var latestSelectedThreeXSource: ThreeXSourceMode = ThreeXSourceMode.OPTICAL
+    @Volatile private var latestActualLensSource: ActualLensSource = ActualLensSource.MAIN_1X
+    private var lastActivePhysicalLog: String? = null
     @Volatile private var latestFocusAeState: FocusAeState = FocusAeState()
     @Volatile private var latestMeteringMode: MeteringMode = MeteringModeState.mode
     @Volatile private var started = false
@@ -241,6 +259,46 @@ private class CameraPreviewController(
             )
             if (abs(previous - latestZoomRatio) >= 0.02f) {
                 Log.d(TAG, "zoom changed ratio=$latestZoomRatio")
+            }
+        }
+    }
+
+    fun updateLensDiagnostics(
+        selectedLensSlot: LensSlot,
+        selectedThreeXSource: ThreeXSourceMode,
+        actualLensSource: ActualLensSource
+    ) {
+        latestSelectedLensSlot = selectedLensSlot
+        latestSelectedThreeXSource = selectedThreeXSource
+        latestActualLensSource = actualLensSource
+        lastActivePhysicalLog = null
+    }
+
+    private val activePhysicalCaptureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            val activePhysicalId = if (Build.VERSION.SDK_INT >= 28) {
+                result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
+            } else {
+                null
+            }
+            val resultZoomRatio = if (Build.VERSION.SDK_INT >= 30) {
+                result.get(CaptureResult.CONTROL_ZOOM_RATIO)
+            } else {
+                null
+            }
+            val message =
+                "requestedZoomRatio=$latestZoomRatio " +
+                    "selectedLensSlot=$latestSelectedLensSlot " +
+                    "selected3xSourceMode=$latestSelectedThreeXSource " +
+                    "cameraId=$cameraId actualLensSource=$latestActualLensSource " +
+                    "activePhysicalId=$activePhysicalId resultZoomRatio=$resultZoomRatio"
+            if (message != lastActivePhysicalLog) {
+                lastActivePhysicalLog = message
+                Log.i("KeplerActivePhysical", message)
             }
         }
     }
@@ -451,7 +509,7 @@ private class CameraPreviewController(
                     },
                     afTrigger = CaptureRequest.CONTROL_AF_TRIGGER_IDLE
                 ),
-                null,
+                activePhysicalCaptureCallback,
                 handler
             )
             Log.d(

@@ -94,6 +94,8 @@ internal data class CapturePipelineRequest(
 internal data class CameraPreviewPaneState(
     val cameraSelection: CameraSelection,
     val previewZoomRatio: Float,
+    val selectedLensSlot: LensSlot,
+    val selectedThreeXSource: ThreeXSourceMode,
     val focusAeState: FocusAeState,
     val previewEnabled: Boolean,
     val isCapturing: Boolean,
