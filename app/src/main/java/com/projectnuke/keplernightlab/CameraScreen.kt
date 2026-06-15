@@ -228,7 +228,8 @@ fun parseCaptureProgress(
 @Composable
 fun MainCameraScreen(
     onOpenDebug: () -> Unit,
-    onOpenCacheJobs: () -> Unit
+    onOpenCacheJobs: () -> Unit,
+    onOpenGallery: () -> Unit
 ) {
     val context = LocalContext.current
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
@@ -677,8 +678,7 @@ fun MainCameraScreen(
                     status = "캐시 삭제 완료 ($deleted)"
                 },
                 onThumbnail = {
-                    refreshLatestResult()
-                    status = shortStatus(latestSummary)
+                    onOpenGallery()
                 }
             )
 

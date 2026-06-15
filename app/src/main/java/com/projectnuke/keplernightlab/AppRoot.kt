@@ -42,6 +42,7 @@ fun KeplerAppRoot() {
     }
     var showDebug by remember { mutableStateOf(false) }
     var showCacheJobs by remember { mutableStateOf(false) }
+    var showGallery by remember { mutableStateOf(false) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -70,9 +71,13 @@ fun KeplerAppRoot() {
                 showCacheJobs -> CacheJobsScreen {
                     showCacheJobs = false
                 }
+                showGallery -> KeplerGalleryScreen {
+                    showGallery = false
+                }
                 else -> MainCameraScreen(
                     onOpenDebug = { showDebug = true },
-                    onOpenCacheJobs = { showCacheJobs = true }
+                    onOpenCacheJobs = { showCacheJobs = true },
+                    onOpenGallery = { showGallery = true }
                 )
             }
         }
