@@ -261,6 +261,12 @@ internal fun startCapturePipeline(
     request: CapturePipelineRequest,
     onStatus: (String) -> Unit
 ) {
+    val loggedStatus: (String) -> Unit = { newStatus ->
+        newStatus.chunked(3000).forEachIndexed { index, chunk ->
+            Log.i("KeplerCaptureStatus", "part=${index + 1}: $chunk")
+        }
+        onStatus(newStatus)
+    }
     val selection = request.prepared.selection
     val shouldDisablePhysicalStillRouting = selection.actualLensSource == ActualLensSource.OPTICAL_TELE_PHYSICAL
     val physicalCameraId: String? = null
@@ -300,7 +306,7 @@ internal fun startCapturePipeline(
             autoMaxFrames = request.prepared.settings.autoMaxFrames,
             manualFrames = request.prepared.settings.manualFrames,
             framePlanReason = request.prepared.framePlan.reason,
-            onStatus = onStatus
+            onStatus = loggedStatus
         )
     } else if (request.pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
         captureProcessExportRawNightFusion(
@@ -313,7 +319,7 @@ internal fun startCapturePipeline(
             zoomRatio = captureZoomRatio,
             physicalCameraId = physicalCameraId,
             focusAeState = request.focusAeState,
-            onStatus = onStatus
+            onStatus = loggedStatus
         )
     } else {
         captureProcessExportNightFusion(
@@ -331,7 +337,7 @@ internal fun startCapturePipeline(
             autoMaxFrames = request.prepared.settings.autoMaxFrames,
             manualFrames = request.prepared.settings.manualFrames,
             framePlanReason = request.prepared.framePlan.reason,
-            onStatus = onStatus
+            onStatus = loggedStatus
         )
     }
 }

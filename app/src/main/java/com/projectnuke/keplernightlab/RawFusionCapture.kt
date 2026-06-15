@@ -41,6 +41,8 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
 
+private const val SAVE_RAW_FUSION_DNG_SIDECARS = false
+
 @SuppressLint("MissingPermission")
 fun captureRawBurstForFusion(
     context: Context,
@@ -141,9 +143,11 @@ fun captureRawBurstForFusion(
             null
         }
         if (frameClampReason != null) post(frameClampReason)
-        val saveDngSidecars = !highResolutionRaw
+        val saveDngSidecars = SAVE_RAW_FUSION_DNG_SIDECARS && !highResolutionRaw
         val dngSidecarSkipReason = if (saveDngSidecars) {
             null
+        } else if (!SAVE_RAW_FUSION_DNG_SIDECARS) {
+            "Per-frame DNG sidecars disabled by default for RAW Night Fusion; compact raw16 retained."
         } else {
             "v0 memory/storage policy: per-frame DNG disabled for 50MP-class high-resolution RAW; compact raw16 retained."
         }

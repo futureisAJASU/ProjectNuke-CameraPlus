@@ -32,6 +32,63 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
 
+private const val ENABLE_YUV_MEMORY_BURST_BUFFER = true
+private const val MAX_YUV_MEMORY_BUFFER_FRAMES = 6
+private const val MAX_YUV_MEMORY_BUFFER_BYTES = 160L * 1024L * 1024L
+
+private data class BufferedYuvFrame(
+    val index: Int,
+    val timestampNs: Long,
+    val width: Int,
+    val height: Int,
+    val y: ByteArray,
+    val u: ByteArray,
+    val v: ByteArray,
+    val yRowStride: Int,
+    val yPixelStride: Int,
+    val uRowStride: Int,
+    val uPixelStride: Int,
+    val vRowStride: Int,
+    val vPixelStride: Int
+)
+
+private fun estimateYuvBufferBytes(width: Int, height: Int): Long =
+    width.toLong() * height.toLong() * 3L / 2L
+
+private fun canUseYuvMemoryBuffer(width: Int, height: Int, frameCount: Int): Boolean {
+    if (!ENABLE_YUV_MEMORY_BURST_BUFFER) return false
+    if (frameCount > MAX_YUV_MEMORY_BUFFER_FRAMES) return false
+    val estimated = estimateYuvBufferBytes(width, height) * frameCount
+    return estimated <= MAX_YUV_MEMORY_BUFFER_BYTES
+}
+
+private fun copyYuvFrameToMemory(image: Image, index: Int): BufferedYuvFrame {
+    fun copyPlane(plane: Image.Plane): ByteArray {
+        val buffer = plane.buffer.duplicate()
+        buffer.position(0)
+        return ByteArray(buffer.limit()).also(buffer::get)
+    }
+
+    val yPlane = image.planes[0]
+    val uPlane = image.planes[1]
+    val vPlane = image.planes[2]
+    return BufferedYuvFrame(
+        index = index,
+        timestampNs = image.timestamp,
+        width = image.width,
+        height = image.height,
+        y = copyPlane(yPlane),
+        u = copyPlane(uPlane),
+        v = copyPlane(vPlane),
+        yRowStride = yPlane.rowStride,
+        yPixelStride = yPlane.pixelStride,
+        uRowStride = uPlane.rowStride,
+        uPixelStride = uPlane.pixelStride,
+        vRowStride = vPlane.rowStride,
+        vPixelStride = vPlane.pixelStride
+    )
+}
+
 @SuppressLint("MissingPermission")
 fun captureYuvBurstColorWithMotion(
     context: Context,
@@ -222,6 +279,31 @@ fun captureYuvBurstColorWithMotion(
         )
 
         imageReader = reader
+        val useMemoryBuffer = canUseYuvMemoryBuffer(
+            yuvSize.width,
+            yuvSize.height,
+            frameCount
+        )
+        val estimatedBufferBytes =
+            estimateYuvBufferBytes(yuvSize.width, yuvSize.height) * frameCount
+        val bufferedFrames = mutableListOf<BufferedYuvFrame>()
+        if (useMemoryBuffer) {
+            postStatus(
+                "YUV memory buffer enabled: frames=$frameCount " +
+                    "estimated=${estimatedBufferBytes / 1024L / 1024L}MB"
+            )
+            Log.i(
+                "KeplerCaptureStatus",
+                "YUV memory buffer enabled: frames=$frameCount " +
+                    "estimated=${estimatedBufferBytes / 1024L / 1024L}MB"
+            )
+        } else {
+            postStatus("YUV memory buffer disabled; using direct PNG save")
+            Log.i(
+                "KeplerCaptureStatus",
+                "YUV memory buffer disabled; using direct PNG save"
+            )
+        }
         postStatus("YUV capture: saved 0/$frameCount")
 
         postStatus("Color Fusion 초기화 5/7: 모션 센서 시작 중...")
@@ -265,6 +347,80 @@ fun captureYuvBurstColorWithMotion(
 
                     val frameIndex = savedFrames
                     val imageTimestampNs = image.timestamp
+
+                    if (useMemoryBuffer) {
+                        val bufferedFrame = try {
+                            copyYuvFrameToMemory(image, frameIndex)
+                        } catch (oom: OutOfMemoryError) {
+                            finish(
+                                "YUV memory buffer failed: OutOfMemoryError before frame " +
+                                    "${frameIndex + 1}/$frameCount"
+                            )
+                            return@setOnImageAvailableListener
+                        }
+                        image.close()
+                        image = null
+                        bufferedFrames.add(bufferedFrame)
+                        savedFrames++
+                        frameTimestampsNs.add(imageTimestampNs)
+                        postStatus("YUV capture: buffered $savedFrames/$frameCount")
+
+                        if (savedFrames >= frameCount) {
+                            val savedMotionFiles = saveMotionOnce(burstDir)
+                            val finalLogger = motionLogger
+                            bufferedFrames.sortedBy { it.index }.forEachIndexed { flushIndex, frame ->
+                                val fileName =
+                                    "frame_${frame.index.toString().padStart(2, '0')}_color.png"
+                                saveRotatedColorPngFromBufferedYuv(
+                                    frame = frame,
+                                    outFile = File(burstDir, fileName),
+                                    rotationDegrees = rotationDegrees
+                                )
+                                savedFrameFiles.add(fileName)
+                                postStatus(
+                                    "YUV memory buffer flush: ${flushIndex + 1}/${bufferedFrames.size}"
+                                )
+                            }
+                            bufferedFrames.clear()
+                            writeColorJobJson(
+                                jobFile = jobFile,
+                                status = "CAPTURE_COMPLETE",
+                                cameraId = cameraId,
+                                width = yuvSize.width,
+                                height = yuvSize.height,
+                                outputWidth = outputWidth,
+                                outputHeight = outputHeight,
+                                rotationDegrees = rotationDegrees,
+                                requestedFrames = frameCount,
+                                savedFrames = savedFrames,
+                                frameFiles = savedFrameFiles,
+                                frameTimestampsNs = frameTimestampsNs,
+                                gyroFile = savedMotionFiles.first,
+                                rotationVectorFile = savedMotionFiles.second,
+                                gyroSampleCount = finalLogger?.gyroCount() ?: 0,
+                                rotationVectorSampleCount = finalLogger?.rotationVectorCount() ?: 0,
+                                motionInfo = motionInfo,
+                                resolutionMode = resolutionMode,
+                                zoomRatio = zoomRatio,
+                                cropApplied = cropApplied,
+                                frameCountMode = frameCountMode,
+                                plannedFrames = frameCount,
+                                autoMinFrames = autoMinFrames,
+                                autoMaxFrames = autoMaxFrames,
+                                manualFrames = manualFrames,
+                                framePlanReason = framePlanReason
+                            )
+                            postStatus("YUV capture complete: saved $savedFrames/$frameCount")
+                            onComplete(burstDir)
+                            finish(
+                                "Color Burst + Motion complete\n" +
+                                    "Frames: $savedFrames\n" +
+                                    "Output: ${outputWidth}x${outputHeight}\n" +
+                                    "Folder:\n${burstDir.absolutePath}"
+                            )
+                        }
+                        return@setOnImageAvailableListener
+                    }
 
                     val fileName = "frame_${frameIndex.toString().padStart(2, '0')}_color.png"
                     val outFile = File(burstDir, fileName)
@@ -668,6 +824,51 @@ fun saveRotatedColorPngFromYuv(
 
     bitmap.recycle()
 }
+
+private fun saveRotatedColorPngFromBufferedYuv(
+    frame: BufferedYuvFrame,
+    outFile: File,
+    rotationDegrees: Int
+) {
+    val bitmap = yuv420BufferToBitmap(frame)
+    val rotated = rotateBitmapIfNeeded(bitmap, rotationDegrees)
+    FileOutputStream(outFile).use { output ->
+        rotated.compress(Bitmap.CompressFormat.PNG, 100, output)
+    }
+    if (rotated !== bitmap) rotated.recycle()
+    bitmap.recycle()
+}
+
+private fun yuv420BufferToBitmap(frame: BufferedYuvFrame): Bitmap {
+    val pixels = IntArray(frame.width * frame.height)
+    for (y in 0 until frame.height) {
+        val yRow = y * frame.yRowStride
+        val uvRow = y / 2
+        for (x in 0 until frame.width) {
+            val yValue = frame.y.safeGet(yRow + x * frame.yPixelStride).toInt() and 0xFF
+            val uValue = (
+                frame.u.safeGet(uvRow * frame.uRowStride + (x / 2) * frame.uPixelStride)
+                    .toInt() and 0xFF
+                ) - 128
+            val vValue = (
+                frame.v.safeGet(uvRow * frame.vRowStride + (x / 2) * frame.vPixelStride)
+                    .toInt() and 0xFF
+                ) - 128
+            val r = clampToByte((yValue + 1.402f * vValue).toInt())
+            val g = clampToByte(
+                (yValue - 0.344136f * uValue - 0.714136f * vValue).toInt()
+            )
+            val b = clampToByte((yValue + 1.772f * uValue).toInt())
+            pixels[y * frame.width + x] = Color.rgb(r, g, b)
+        }
+    }
+    return Bitmap.createBitmap(frame.width, frame.height, Bitmap.Config.ARGB_8888).apply {
+        setPixels(pixels, 0, frame.width, 0, 0, frame.width, frame.height)
+    }
+}
+
+private fun ByteArray.safeGet(index: Int): Byte =
+    if (index in indices) this[index] else 0
 
 fun yuv420ToBitmap(image: Image): Bitmap {
     val width = image.width
