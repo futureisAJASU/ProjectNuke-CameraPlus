@@ -44,93 +44,14 @@ fun processLatestNightFusionV02(
 
     workerHandler.post {
         try {
-            postStatus("Night Fusion v0.2: loading latest burst...")
-
             val jobDir = findLatestColorBurstJobDir(context)
                 ?: run {
-                    postStatus("Night Fusion v0.2 failed: no KeplerColorBurst job found.")
-                    workerThread.quitSafely()
+                    postStatus("Classic YUV fusion failed: no KeplerColorBurst job found.")
                     return@post
                 }
-            val jobFile = File(jobDir, "job.json")
-            val job = JSONObject(jobFile.readText())
-            val frames = loadColorFrames(jobDir, job)
-
-            if (frames.isEmpty()) {
-                postStatus("Night Fusion v0.2 failed: no usable color frames.")
-                workerThread.quitSafely()
-                return@post
-            }
-
-            postStatus("Night Fusion v0.2: normalizing ${frames.size} frames...")
-
-            val width = frames.first().bitmap.width
-            val height = frames.first().bitmap.height
-            val lumas = frames.map { computeMeanLuma(it.bitmap) }
-            val referenceLuma = lumas.sorted()[lumas.size / 2].coerceAtLeast(1.0)
-            val gyroSamples = readGyroSamples(File(jobDir, "gyro.csv"))
-            val frameWeights = frames.mapIndexed { index, frame ->
-                val motionScore = frame.timestampNs?.let { timestamp ->
-                    motionScoreNear(gyroSamples, timestamp)
-                } ?: 0.0
-                val weight = 1.0 / (1.0 + motionScore * 8.0)
-                weight.coerceIn(0.25, 1.0)
-            }
-
-            val average = weightedAverageFrames(
-                frames = frames,
-                frameLumas = lumas,
-                frameWeights = frameWeights,
-                referenceLuma = referenceLuma,
-                width = width,
-                height = height
-            )
-
-            val averageFile = File(jobDir, "average_color_rotated.png")
-            saveBitmapPng(average, averageFile)
-
-            postStatus("Night Fusion v0.2: denoising chroma...")
-            val denoised = chromaDenoise3x3(average)
-            val denoiseFile = File(jobDir, "denoise_color.png")
-            saveBitmapPng(denoised, denoiseFile)
-
-            postStatus("Night Fusion v0.2: sharpening and tone mapping...")
-            val sharpened = sharpenAndToneMap(denoised)
-            val finalFile = File(jobDir, "sharpened_night_fusion.png")
-            saveBitmapPng(sharpened, finalFile)
-
-            val notes = buildString {
-                append("Night Fusion v0.2 weighted average, brightness normalization, chroma denoise, mild unsharp mask, tone curve.")
-                append(" usedFrames=${frames.size}.")
-                if (gyroSamples.isEmpty()) append(" Gyro missing; equal motion weights.")
-                // TODO: Future gyro-based warp alignment should use gyro integration between frame timestamps.
-                // TODO: Future image-based micro-alignment should reduce hand-shake ghosting before accumulation.
-            }
-
-            val updatedJob = JSONObject(job.toString())
-                .put("processStatus", "NIGHT_FUSION_V0_2_COMPLETE")
-                .put("averageColorFile", averageFile.name)
-                .put("denoiseColorFile", denoiseFile.name)
-                .put("finalNightFusionFile", finalFile.name)
-                .put("usedFrameCount", frames.size)
-                .put("processingNotes", notes)
-                .put("processedAt", System.currentTimeMillis())
-
-            jobFile.writeText(updatedJob.toString(2))
-
-            frames.forEach { it.bitmap.recycle() }
-            average.recycle()
-            denoised.recycle()
-            sharpened.recycle()
-
-            postStatus(
-                "Night Fusion v0.2 complete\n" +
-                    "Frames: ${frames.size}\n" +
-                    "Final: ${finalFile.name}\n" +
-                    "Folder:\n${jobDir.absolutePath}"
-            )
+            processClassicYuvFusionJob(jobDir) { postStatus(it) }
         } catch (e: Exception) {
-            postStatus("Night Fusion v0.2 failed\n${e.stackTraceToString()}")
+            postStatus("PIPELINE_FAILED: Classic YUV fusion failed; cache kept.\n${e.stackTraceToString()}")
         } finally {
             workerThread.quitSafely()
         }
@@ -158,74 +79,7 @@ fun estimateLatestColorBurstScene(context: Context): LatestSceneEstimate {
 fun processNightFusionJobV02Sync(
     jobDir: File,
     onStatus: (String) -> Unit
-): File {
-    onStatus("Processing Night Fusion...")
-    val jobFile = File(jobDir, "job.json")
-    val job = JSONObject(jobFile.readText())
-    val frames = loadColorFrames(jobDir, job)
-    val totalFrameCount = job.optJSONArray("frames")?.length() ?: 0
-    val excludedFrameCount = totalFrameCount - frames.size
-
-    if (frames.size < 2) {
-        frames.forEach { it.bitmap.recycle() }
-        error("Not enough enabled YUV frames to reprocess")
-    }
-
-    val width = frames.first().bitmap.width
-    val height = frames.first().bitmap.height
-    val lumas = frames.map { computeMeanLuma(it.bitmap) }
-    val referenceLuma = lumas.sorted()[lumas.size / 2].coerceAtLeast(1.0)
-    val gyroSamples = readGyroSamples(File(jobDir, "gyro.csv"))
-    val frameWeights = frames.map { frame ->
-        val motionScore = frame.timestampNs?.let { motionScoreNear(gyroSamples, it) } ?: 0.0
-        (1.0 / (1.0 + motionScore * 8.0)).coerceIn(0.25, 1.0)
-    }
-
-    val average = weightedAverageFrames(
-        frames = frames,
-        frameLumas = lumas,
-        frameWeights = frameWeights,
-        referenceLuma = referenceLuma,
-        width = width,
-        height = height
-    )
-    val averageFile = File(jobDir, "average_color_rotated.png")
-    saveBitmapPng(average, averageFile)
-
-    val denoised = chromaDenoise3x3(average)
-    val denoiseFile = File(jobDir, "denoise_color.png")
-    saveBitmapPng(denoised, denoiseFile)
-
-    val sharpened = sharpenAndToneMap(denoised)
-    val finalFile = File(jobDir, "sharpened_night_fusion.png")
-    saveBitmapPng(sharpened, finalFile)
-
-    val notes = buildString {
-        append("Night Fusion YUV pipeline v0.2. Weighted average, brightness normalization, chroma denoise, mild unsharp mask, tone curve.")
-        append(" usedFrames=${frames.size}.")
-        if (gyroSamples.isEmpty()) append(" Gyro missing; equal motion weights.")
-    }
-
-    val updatedJob = JSONObject(job.toString())
-        .put("jobType", job.optString("jobType", "YUV_BURST_COLOR"))
-        .put("processStatus", "NIGHT_FUSION_V0_2_COMPLETE")
-        .put("averageColorFile", averageFile.name)
-        .put("denoiseColorFile", denoiseFile.name)
-        .put("finalNightFusionFile", finalFile.name)
-        .put("usedFrameCount", frames.size)
-        .put("excludedFrameCount", excludedFrameCount)
-        .put("processingNotes", notes)
-        .put("processedAt", System.currentTimeMillis())
-
-    jobFile.writeText(updatedJob.toString(2))
-
-    frames.forEach { it.bitmap.recycle() }
-    average.recycle()
-    denoised.recycle()
-    sharpened.recycle()
-
-    return finalFile
-}
+): File = processClassicYuvFusionJob(jobDir, onStatus)
 
 fun findLatestColorBurstJobDir(context: Context): File? {
     val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return null

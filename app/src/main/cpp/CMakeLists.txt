@@ -2,7 +2,12 @@ cmake_minimum_required(VERSION 3.22.1)
 
 project(kepler_raw_engine)
 
-add_library(kepler_raw_engine SHARED kepler_raw_engine.cpp)
+add_library(
+    kepler_raw_engine
+    SHARED
+    kepler_raw_engine.cpp
+    frame_quality.cpp
+)
 
 find_library(log-lib log)
 

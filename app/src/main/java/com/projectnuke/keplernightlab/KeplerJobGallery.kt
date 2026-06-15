@@ -30,7 +30,18 @@ data class KeplerGalleryFrame(
     val enabled: Boolean,
     val excludedByUser: Boolean,
     val excludeReason: String?,
-    val file: File?
+    val file: File?,
+    val sharpnessScore: Float?,
+    val motionScore: Float?,
+    val exposureScore: Float?,
+    val brightnessMean: Float?,
+    val brightnessStdDev: Float?,
+    val clippedShadowRatio: Float?,
+    val clippedHighlightRatio: Float?,
+    val qualityScore: Float?,
+    val qualityLabel: String?,
+    val recommendedExclude: Boolean,
+    val qualityReason: String?
 ) {
     val included: Boolean get() = enabled && !excludedByUser
 }
@@ -122,7 +133,10 @@ private fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
                 ?.filter { it.isFile && isSourceFrame(it) }
                 ?.sortedBy { it.name }
                 ?.mapIndexed { index, file ->
-                    KeplerGalleryFrame(index, file.name, null, true, false, null, file)
+                    KeplerGalleryFrame(
+                        index, file.name, null, true, false, null, file,
+                        null, null, null, null, null, null, null, null, null, false, null
+                    )
                 }
                 .orEmpty()
         }
@@ -178,11 +192,29 @@ private fun JSONArray?.galleryFrames(directory: File): List<KeplerGalleryFrame> 
                     excludedByUser = frame.optBoolean("excludedByUser", false),
                     excludeReason = frame.optString("excludeReason")
                         .takeIf { it.isNotBlank() && it != "null" },
-                    file = file?.takeIf { it.isFile }
+                    file = file?.takeIf { it.isFile },
+                    sharpnessScore = frame.optionalFloat("sharpnessScore"),
+                    motionScore = frame.optionalFloat("motionScore"),
+                    exposureScore = frame.optionalFloat("exposureScore"),
+                    brightnessMean = frame.optionalFloat("brightnessMean"),
+                    brightnessStdDev = frame.optionalFloat("brightnessStdDev"),
+                    clippedShadowRatio = frame.optionalFloat("clippedShadowRatio"),
+                    clippedHighlightRatio = frame.optionalFloat("clippedHighlightRatio"),
+                    qualityScore = frame.optionalFloat("qualityScore"),
+                    qualityLabel = frame.optString("qualityLabel")
+                        .takeIf { it.isNotBlank() && it != "null" },
+                    recommendedExclude = frame.optBoolean("recommendedExclude", false),
+                    qualityReason = frame.optString("qualityReason")
+                        .takeIf { it.isNotBlank() && it != "null" }
                 )
             )
         }
     }
+}
+
+private fun JSONObject.optionalFloat(key: String): Float? {
+    if (!has(key) || isNull(key)) return null
+    return optDouble(key, Double.NaN).takeUnless { it.isNaN() }?.toFloat()
 }
 
 private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {

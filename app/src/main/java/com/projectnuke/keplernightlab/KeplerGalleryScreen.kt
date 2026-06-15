@@ -133,6 +133,7 @@ private fun KeplerGalleryDetailScreen(
     var deleteError by remember { mutableStateOf<String?>(null) }
     var actionStatus by remember { mutableStateOf<String?>(null) }
     var isReprocessing by remember { mutableStateOf(false) }
+    var isAnalyzingQuality by remember { mutableStateOf(false) }
     var refreshKey by remember { mutableIntStateOf(0) }
 
     LaunchedEffect(job.id, refreshKey) {
@@ -205,9 +206,26 @@ private fun KeplerGalleryDetailScreen(
                 GalleryField("Folder size", formatBytes(currentJob.folderSizeBytes))
                 GalleryField("Final/export", if (currentJob.finalExportExists) "Available" else "Not found")
                 GalleryField("Path", currentJob.directory.absolutePath)
+                Button(
+                    enabled = !isReprocessing && !isAnalyzingQuality,
+                    onClick = {
+                        isAnalyzingQuality = true
+                        actionStatus = "Analyzing frame 1/${currentJob.frames.size}..."
+                        analyzeKeplerFrameQuality(
+                            jobDir = currentJob.directory,
+                            onStatus = { actionStatus = it },
+                            onComplete = {
+                                isAnalyzingQuality = false
+                                refreshKey++
+                            }
+                        )
+                    }
+                ) {
+                    Text(if (isAnalyzingQuality) "Analyzing..." else "Analyze Frame Quality")
+                }
                 if (currentJob.jobType == "RAW_NIGHT_FUSION") {
                     Button(
-                        enabled = !isReprocessing,
+                        enabled = !isReprocessing && !isAnalyzingQuality,
                         onClick = {
                             isReprocessing = true
                             actionStatus = "Starting RAW reprocess..."
@@ -230,7 +248,7 @@ private fun KeplerGalleryDetailScreen(
                     ) { Text(if (isReprocessing) "Reprocessing..." else "Reprocess RAW") }
                 } else {
                     Button(
-                        enabled = !isReprocessing,
+                        enabled = !isReprocessing && !isAnalyzingQuality,
                         onClick = {
                             isReprocessing = true
                             actionStatus = "YUV reprocess: loading enabled frames..."
@@ -266,6 +284,23 @@ private fun KeplerGalleryDetailScreen(
                 GalleryField("File exists", if (frame.file != null) "yes" else "no")
                 GalleryField("State", if (frame.included) "Included" else "Excluded")
                 frame.excludeReason?.let { GalleryField("Reason", it) }
+                frame.qualityLabel?.let { GalleryField("Quality", it) }
+                frame.qualityScore?.let { GalleryField("Quality score", formatMetric(it)) }
+                frame.sharpnessScore?.let { GalleryField("Sharpness", formatMetric(it)) }
+                frame.motionScore?.let { GalleryField("Motion", formatMetric(it)) }
+                frame.exposureScore?.let { GalleryField("Exposure", formatMetric(it)) }
+                frame.brightnessMean?.let { GalleryField("Brightness mean", formatMetric(it)) }
+                frame.brightnessStdDev?.let { GalleryField("Brightness std dev", formatMetric(it)) }
+                frame.clippedShadowRatio?.let { GalleryField("Clipped shadows", formatMetric(it)) }
+                frame.clippedHighlightRatio?.let { GalleryField("Clipped highlights", formatMetric(it)) }
+                frame.qualityReason?.let { GalleryField("Quality reason", it) }
+                if (frame.recommendedExclude) {
+                    Text(
+                        "Recommended to exclude",
+                        color = Color(0xFFFFB4A9),
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween
@@ -325,12 +360,15 @@ private fun resolutionText(job: KeplerGalleryJobSummary): String {
     return if (job.width != null && job.height != null) "${job.width}x${job.height}" else "unknown"
 }
 
+private fun formatMetric(value: Float): String = "%.3f".format(java.util.Locale.US, value)
+
 private fun metadataSummary(job: JSONObject?): List<Pair<String, String>> {
     if (job == null) return listOf("job.json" to "Missing or unreadable")
     return listOf(
         "cameraId", "resolutionMode", "requestedResolutionMode", "actualInputResolutionMode",
         "outputResolutionMode", "processStatus", "exportStatus", "exportVerified",
-        "captureCompleteness", "partialCapture"
+        "captureCompleteness", "partialCapture", "qualityScored", "qualityScoredAt",
+        "qualityScoringVersion", "qualityScoringBackend", "qualitySummary"
     ).mapNotNull { key ->
         if (!job.has(key) || job.isNull(key)) null else key to job.get(key).toString()
     }
