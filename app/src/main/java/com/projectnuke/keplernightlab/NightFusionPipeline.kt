@@ -130,6 +130,115 @@ fun captureProcessExportNightFusion(
     )
 }
 
+fun reprocessYuvJob(
+    context: Context,
+    jobDir: File,
+    finalOutputFormat: FinalOutputFormat,
+    onStatus: (String) -> Unit
+) {
+    val mainHandler = Handler(Looper.getMainLooper())
+    fun post(message: String) = mainHandler.post { onStatus(message) }
+    val workerThread = HandlerThread("KeplerYuvReprocessThread").apply { start() }
+    Handler(workerThread.looper).post {
+        val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
+        var totalFrames = 0
+        var enabledFrames = 0
+        try {
+            val initialJob = JSONObject(jobFile.readText())
+            val frames = initialJob.optJSONArray("frames")
+            totalFrames = frames?.length() ?: 0
+            repeat(totalFrames) { index ->
+                val frame = frames?.optJSONObject(index) ?: return@repeat
+                val fileName = frame.optString("file")
+                if (
+                    frame.optBoolean("enabled", true) &&
+                    !frame.optBoolean("excludedByUser", false) &&
+                    fileName.isNotBlank() &&
+                    File(jobDir, fileName).isFile
+                ) {
+                    enabledFrames++
+                }
+            }
+            if (enabledFrames < 2) {
+                updateYuvReprocessHistory(
+                    jobDir, enabledFrames, totalFrames - enabledFrames,
+                    "FAILED_NOT_ENOUGH_ENABLED_FRAMES"
+                )
+                post("Not enough enabled YUV frames to reprocess")
+                return@post
+            }
+
+            post("YUV reprocess: loading enabled frames...")
+            post("YUV reprocess: using $enabledFrames/$totalFrames frames...")
+            val finalFile = processNightFusionJobV02Sync(jobDir) { post(it) }
+            post("YUV reprocess: exporting...")
+            val bitmap = BitmapFactory.decodeFile(finalFile.absolutePath)
+                ?: error("Could not decode reprocessed YUV image.")
+            val requestedFormat = requestedOutputFormatForSetting(finalOutputFormat)
+            val export = try {
+                exportNightFusionBitmapToGallery(
+                    context = context,
+                    bitmap = bitmap,
+                    displayNameBase = "Kepler_YUV_REPROCESS_${
+                        SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                    }",
+                    requestedFormat = requestedFormat
+                )
+            } finally {
+                bitmap.recycle()
+            }
+            if (!export.success || export.uriString.isNullOrBlank()) {
+                error(export.errorMessage ?: "YUV export failed")
+            }
+            val verified = verifyGalleryExport(context, export.uriString)
+            if (!verified) error("YUV export verification failed")
+            updateExportMetadata(
+                jobDir = jobDir,
+                export = export,
+                verified = true,
+                finalOutputFormat = finalOutputFormat,
+                rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
+            )
+            updateYuvReprocessHistory(
+                jobDir, enabledFrames, totalFrames - enabledFrames, "SUCCESS"
+            )
+            post(
+                "PIPELINE_COMPLETE: YUV reprocess saved ${export.formatUsed.label}; " +
+                    "used $enabledFrames/$totalFrames frames; cache kept."
+            )
+        } catch (e: Exception) {
+            runCatching {
+                updateYuvReprocessHistory(
+                    jobDir,
+                    enabledFrames,
+                    (totalFrames - enabledFrames).coerceAtLeast(0),
+                    "FAILED: ${e.javaClass.simpleName}: ${e.message}"
+                )
+            }
+            post("PIPELINE_FAILED: YUV reprocess failed; cache kept. ${e.message}")
+        } finally {
+            workerThread.quitSafely()
+        }
+    }
+}
+
+private fun updateYuvReprocessHistory(
+    jobDir: File,
+    usedFrameCount: Int,
+    excludedFrameCount: Int,
+    status: String
+) {
+    val job = loadJobJson(jobDir)
+    job.put("usedFrameCount", usedFrameCount)
+        .put("excludedFrameCount", excludedFrameCount)
+        .put("reprocessCount", job.optInt("reprocessCount", 0) + 1)
+        .put("lastReprocessedAt", System.currentTimeMillis())
+        .put("lastReprocessUsedFrameCount", usedFrameCount)
+        .put("lastReprocessExcludedFrameCount", excludedFrameCount)
+        .put("lastReprocessStatus", status)
+    saveJobJson(jobDir, job)
+}
+
 fun cleanupNightFusionJobAfterVerifiedExport(
     jobDir: File,
     policy: CacheCleanupPolicy,

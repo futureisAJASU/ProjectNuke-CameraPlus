@@ -163,9 +163,12 @@ fun processNightFusionJobV02Sync(
     val jobFile = File(jobDir, "job.json")
     val job = JSONObject(jobFile.readText())
     val frames = loadColorFrames(jobDir, job)
+    val totalFrameCount = job.optJSONArray("frames")?.length() ?: 0
+    val excludedFrameCount = totalFrameCount - frames.size
 
-    if (frames.isEmpty()) {
-        error("No usable color frames.")
+    if (frames.size < 2) {
+        frames.forEach { it.bitmap.recycle() }
+        error("Not enough enabled YUV frames to reprocess")
     }
 
     val width = frames.first().bitmap.width
@@ -210,6 +213,7 @@ fun processNightFusionJobV02Sync(
         .put("denoiseColorFile", denoiseFile.name)
         .put("finalNightFusionFile", finalFile.name)
         .put("usedFrameCount", frames.size)
+        .put("excludedFrameCount", excludedFrameCount)
         .put("processingNotes", notes)
         .put("processedAt", System.currentTimeMillis())
 
@@ -240,6 +244,12 @@ private fun loadColorFrames(jobDir: File, job: JSONObject): List<LoadedColorFram
 
     for (i in 0 until framesArray.length()) {
         val frameObject = framesArray.optJSONObject(i) ?: continue
+        if (
+            !frameObject.optBoolean("enabled", true) ||
+            frameObject.optBoolean("excludedByUser", false)
+        ) {
+            continue
+        }
         val fileName = frameObject.optString("file")
         if (fileName.isBlank()) continue
 

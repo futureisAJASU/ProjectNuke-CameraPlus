@@ -229,7 +229,28 @@ private fun KeplerGalleryDetailScreen(
                         }
                     ) { Text(if (isReprocessing) "Reprocessing..." else "Reprocess RAW") }
                 } else {
-                    Button(enabled = false, onClick = {}) { Text("Reprocess YUV (TODO)") }
+                    Button(
+                        enabled = !isReprocessing,
+                        onClick = {
+                            isReprocessing = true
+                            actionStatus = "YUV reprocess: loading enabled frames..."
+                            reprocessYuvJob(
+                                context = context,
+                                jobDir = currentJob.directory,
+                                finalOutputFormat = OutputSettingsStore.load(context)
+                            ) { status ->
+                                actionStatus = status
+                                if (
+                                    status.startsWith("PIPELINE_COMPLETE: YUV reprocess") ||
+                                    status.startsWith("PIPELINE_FAILED: YUV reprocess") ||
+                                    status.startsWith("Not enough enabled YUV frames")
+                                ) {
+                                    isReprocessing = false
+                                    refreshKey++
+                                }
+                            }
+                        }
+                    ) { Text(if (isReprocessing) "Reprocessing..." else "Reprocess YUV") }
                 }
             }
         }
