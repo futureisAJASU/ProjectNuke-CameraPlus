@@ -265,10 +265,7 @@ internal fun startCapturePipeline(
     val shouldDisablePhysicalStillRouting = selection.actualLensSource == ActualLensSource.OPTICAL_TELE_PHYSICAL
     val physicalCameraId: String? = null
     val captureZoomRatio = if (shouldDisablePhysicalStillRouting) {
-        LensSlot.THREE_X.targetZoomRatio.coerceIn(
-            request.zoomUiState.minZoom,
-            request.zoomUiState.maxZoom
-        )
+        3.0f
     } else {
         request.prepared.captureZoomRatio
     }
