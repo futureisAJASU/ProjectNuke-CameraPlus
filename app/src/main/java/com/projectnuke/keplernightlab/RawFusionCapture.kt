@@ -21,6 +21,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.util.Log
 import android.util.Size
 import org.json.JSONArray
 import org.json.JSONObject
@@ -48,6 +49,7 @@ fun captureRawBurstForFusion(
     resolutionMode: CaptureResolutionMode = CaptureResolutionMode.MP12,
     resolutionPlan: ResolutionCapturePlan? = null,
     zoomRatio: Float = 1.0f,
+    physicalCameraId: String? = null,
     focusAeState: FocusAeState = FocusAeState(),
     onStatus: (String) -> Unit,
     onComplete: (File) -> Unit,
@@ -461,11 +463,21 @@ fun captureRawBurstForFusion(
             object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     cameraDevice = camera
-                    camera.createCaptureSession(
-                        listOf(imageReader.surface),
-                        object : CameraCaptureSession.StateCallback() {
-                            override fun onConfigured(configured: CameraCaptureSession) {
+                    createRoutedStillCaptureSession(
+                        camera = camera,
+                        surface = imageReader.surface,
+                        cameraId = cameraId,
+                        physicalCameraId = physicalCameraId,
+                        handler = handler,
+                        onConfigured = { configured, physicalRoute ->
                                 session = configured
+                                val requestZoomRatio = if (physicalRoute) {
+                                    zoomRatio
+                                } else if (physicalCameraId != null) {
+                                    3.0f
+                                } else {
+                                    zoomRatio
+                                }
                                 val requests = List(requestedFrames) {
                                     camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                                         addTarget(imageReader.surface)
@@ -490,7 +502,7 @@ fun captureRawBurstForFusion(
                                         }
                                         applyZoomAndFocusAe(
                                             characteristics = characteristics,
-                                            zoomRatio = zoomRatio,
+                                            zoomRatio = requestZoomRatio,
                                             focusAeState = focusAeState,
                                             useMaximumResolutionActiveArray = rawSelection.requiresMaximumResolutionPixelMode,
                                             cameraId = cameraId
@@ -508,6 +520,13 @@ fun captureRawBurstForFusion(
                                             result: TotalCaptureResult
                                         ) {
                                             val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
+                                            Log.i(
+                                                "KeplerPhysicalRoute",
+                                                "capture completed path=${if (physicalRoute) "physical" else "cropFallback"} " +
+                                                    "requestedPhysicalCameraId=$physicalCameraId " +
+                                                    "activePhysicalId=${result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)} " +
+                                                    "zoomRatio=$requestZoomRatio"
+                                            )
                                             if (timestamp != null && !finished.get()) {
                                                 resultsByTimestamp[timestamp] = result
                                                 completedResults++
@@ -553,13 +572,13 @@ fun captureRawBurstForFusion(
                                     },
                                     handler
                                 )
-                            }
-
-                            override fun onConfigureFailed(session: CameraCaptureSession) {
-                                finishError("CAPTURE_FAILED", "PIPELINE_FAILED: RAW fusion session configure failed")
-                            }
-                        },
-                        handler
+                            },
+                        onFailed = { reason ->
+                            finishError(
+                                "CAPTURE_FAILED",
+                                "PIPELINE_FAILED: RAW fusion session configure failed: $reason"
+                            )
+                        }
                     )
                 }
 

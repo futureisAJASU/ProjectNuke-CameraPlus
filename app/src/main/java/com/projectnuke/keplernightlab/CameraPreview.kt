@@ -16,6 +16,8 @@ import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.MeteringRectangle
+import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.SessionConfiguration
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -46,6 +48,7 @@ private const val PREVIEW_ROTATION_FIX_DEGREES = 0f
 fun Camera2Preview(
     modifier: Modifier = Modifier,
     cameraId: String,
+    physicalCameraId: String? = null,
     zoomRatio: Float = 1.0f,
     selectedLensSlot: LensSlot,
     selectedThreeXSource: ThreeXSourceMode,
@@ -59,10 +62,12 @@ fun Camera2Preview(
     var textureView by remember { mutableStateOf<TextureView?>(null) }
     val latestOnAeCapabilitiesChanged = rememberUpdatedState(onAeCapabilitiesChanged)
 
-    val controller = remember(cameraId) {
+    val controller = remember(cameraId, physicalCameraId) {
         CameraPreviewController(
             context = context.applicationContext,
             cameraId = cameraId,
+            physicalCameraId = physicalCameraId,
+            actualLensSource = actualLensSource,
             onAeCapabilitiesChangedProvider = { latestOnAeCapabilitiesChanged.value }
         )
     }
@@ -119,6 +124,8 @@ fun Camera2Preview(
 private class CameraPreviewController(
     private val context: Context,
     private val cameraId: String,
+    private val physicalCameraId: String?,
+    private val actualLensSource: ActualLensSource,
     private val onAeCapabilitiesChangedProvider: () -> (minIndex: Int, maxIndex: Int, stepEv: Float) -> Unit
 ) {
     private val lock = Any()
@@ -391,39 +398,163 @@ private class CameraPreviewController(
             runCatching { camera.close() }
             return
         }
+        Log.i(
+            "KeplerPhysicalRoute",
+            "requestedPhysicalCameraId=$physicalCameraId cameraId=$cameraId " +
+                "actualLensSource=$actualLensSource previewZoomRatio=$latestZoomRatio " +
+                "sessionMode=${if (physicalCameraId != null && Build.VERSION.SDK_INT >= 28) "physicalOutput" else "normalOutput"}"
+        )
+        if (physicalCameraId != null && Build.VERSION.SDK_INT >= 28) {
+            createPhysicalPreviewSession(
+                camera = camera,
+                surface = surface,
+                characteristics = characteristics,
+                localGeneration = localGeneration,
+                textureView = textureView
+            )
+        } else {
+            createNormalPreviewSession(
+                camera = camera,
+                surface = surface,
+                localGeneration = localGeneration,
+                textureView = textureView
+            )
+        }
+    }
+
+    private fun createPhysicalPreviewSession(
+        camera: CameraDevice,
+        surface: Surface,
+        characteristics: CameraCharacteristics,
+        localGeneration: Int,
+        textureView: TextureView
+    ) {
+        val handler = backgroundHandler ?: return
+        try {
+            val output = OutputConfiguration(surface).apply {
+                setPhysicalCameraId(physicalCameraId)
+            }
+            val callback = previewSessionStateCallback(
+                localGeneration = localGeneration,
+                textureView = textureView,
+                sessionMode = "physicalOutput",
+                onFailure = {
+                    latestZoomRatio = 3.0f
+                    Log.w(
+                        "KeplerPhysicalRoute",
+                        "physical output failed; fallback=normalOutput previewZoomRatio=$latestZoomRatio"
+                    )
+                    createNormalPreviewSession(
+                        camera = camera,
+                        surface = surface,
+                        localGeneration = localGeneration,
+                        textureView = textureView
+                    )
+                }
+            )
+            camera.createCaptureSession(
+                SessionConfiguration(
+                    SessionConfiguration.SESSION_REGULAR,
+                    listOf(output),
+                    { command -> handler.post(command) },
+                    callback
+                )
+            )
+        } catch (error: Exception) {
+            Log.e(
+                "KeplerPhysicalRoute",
+                "sessionMode=physicalOutput create failed cameraId=$cameraId " +
+                    "physicalCameraId=$physicalCameraId exception=${error.javaClass.simpleName}:${error.message}",
+                error
+            )
+            latestZoomRatio = 3.0f
+            createNormalPreviewSession(
+                camera = camera,
+                surface = surface,
+                localGeneration = localGeneration,
+                textureView = textureView
+            )
+        }
+    }
+
+    private fun createNormalPreviewSession(
+        camera: CameraDevice,
+        surface: Surface,
+        localGeneration: Int,
+        textureView: TextureView
+    ) {
         try {
             camera.createCaptureSession(
                 listOf(surface),
-                object : CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(session: CameraCaptureSession) {
-                        if (!isActive(localGeneration) || !textureView.isAvailable) {
-                            Log.w(TAG, "stale onConfigured ignored generation=$localGeneration")
-                            runCatching { session.close() }
-                            return
-                        }
-                        captureSession = session
-
-                        try {
-                            applyFocusAeStateOnCameraThread(
-                                newState = latestFocusAeState,
-                                previousState = FocusAeState(),
-                                localGeneration = localGeneration,
-                                forceTrigger = latestFocusAeState.point != null
-                            )
-                        } catch (_: Exception) {
-                            stop()
-                        }
-                    }
-
-                    override fun onConfigureFailed(session: CameraCaptureSession) {
-                        runCatching { session.close() }
+                previewSessionStateCallback(
+                    localGeneration = localGeneration,
+                    textureView = textureView,
+                    sessionMode = "normalOutput",
+                    onFailure = {
                         if (isActive(localGeneration)) stop()
                     }
-                },
+                ),
                 backgroundHandler
             )
-        } catch (_: Exception) {
+        } catch (error: Exception) {
+            Log.e(
+                "KeplerPhysicalRoute",
+                "sessionMode=normalOutput create failed cameraId=$cameraId " +
+                    "exception=${error.javaClass.simpleName}:${error.message}",
+                error
+            )
             stop()
+        }
+    }
+
+    private fun previewSessionStateCallback(
+        localGeneration: Int,
+        textureView: TextureView,
+        sessionMode: String,
+        onFailure: () -> Unit
+    ): CameraCaptureSession.StateCallback {
+        return object : CameraCaptureSession.StateCallback() {
+            override fun onConfigured(session: CameraCaptureSession) {
+                if (!isActive(localGeneration) || !textureView.isAvailable) {
+                    Log.w(TAG, "stale onConfigured ignored generation=$localGeneration")
+                    runCatching { session.close() }
+                    return
+                }
+                captureSession = session
+                Log.i(
+                    "KeplerPhysicalRoute",
+                    "session configured mode=$sessionMode cameraId=$cameraId " +
+                        "requestedPhysicalCameraId=$physicalCameraId previewZoomRatio=$latestZoomRatio"
+                )
+
+                try {
+                    applyFocusAeStateOnCameraThread(
+                        newState = latestFocusAeState,
+                        previousState = FocusAeState(),
+                        localGeneration = localGeneration,
+                        forceTrigger = latestFocusAeState.point != null
+                    )
+                } catch (error: Exception) {
+                    Log.e(
+                        "KeplerPhysicalRoute",
+                        "sessionMode=$sessionMode request failed " +
+                            "exception=${error.javaClass.simpleName}:${error.message}",
+                        error
+                    )
+                    runCatching { session.close() }
+                    onFailure()
+                }
+            }
+
+            override fun onConfigureFailed(session: CameraCaptureSession) {
+                Log.e(
+                    "KeplerPhysicalRoute",
+                    "session configuration failed mode=$sessionMode cameraId=$cameraId " +
+                        "requestedPhysicalCameraId=$physicalCameraId"
+                )
+                runCatching { session.close() }
+                onFailure()
+            }
         }
     }
 

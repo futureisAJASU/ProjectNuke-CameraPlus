@@ -66,6 +66,9 @@ internal fun PreviewStage(
             Camera2Preview(
                 modifier = Modifier.fillMaxSize(),
                 cameraId = state.cameraSelection.cameraId,
+                physicalCameraId = state.cameraSelection.physicalCameraId.takeIf {
+                    state.cameraSelection.actualLensSource == ActualLensSource.OPTICAL_TELE_PHYSICAL
+                },
                 zoomRatio = state.previewZoomRatio,
                 selectedLensSlot = state.selectedLensSlot,
                 selectedThreeXSource = state.selectedThreeXSource,

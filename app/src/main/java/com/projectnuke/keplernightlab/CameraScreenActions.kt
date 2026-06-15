@@ -260,6 +260,9 @@ internal fun startCapturePipeline(
     request: CapturePipelineRequest,
     onStatus: (String) -> Unit
 ) {
+    val physicalCameraId = request.prepared.selection.physicalCameraId.takeIf {
+        request.prepared.selection.actualLensSource == ActualLensSource.OPTICAL_TELE_PHYSICAL
+    }
     if (request.selectedResolution == CaptureResolutionMode.MP24_FUSION) {
         captureProcessExportSuperResolutionFusion(
             context = request.context,
@@ -267,6 +270,7 @@ internal fun startCapturePipeline(
             frameCount = request.prepared.framePlan.framesToCapture,
             finalOutputFormat = request.finalOutputFormat,
             zoomRatio = request.prepared.captureZoomRatio,
+            physicalCameraId = physicalCameraId,
             focusAeState = request.focusAeState,
             frameCountMode = request.prepared.settings.mode,
             autoMinFrames = request.prepared.settings.autoMinFrames,
@@ -284,6 +288,7 @@ internal fun startCapturePipeline(
             resolutionPlan = request.resolutionPlan,
             finalOutputFormat = request.finalOutputFormat,
             zoomRatio = request.prepared.captureZoomRatio,
+            physicalCameraId = physicalCameraId,
             focusAeState = request.focusAeState,
             onStatus = onStatus
         )
@@ -295,6 +300,7 @@ internal fun startCapturePipeline(
             resolutionMode = request.selectedResolution,
             finalOutputFormat = request.finalOutputFormat,
             zoomRatio = request.prepared.captureZoomRatio,
+            physicalCameraId = physicalCameraId,
             focusAeState = request.focusAeState,
             cleanupPolicy = CacheCleanupPolicy.DELETE_SOURCE_FRAMES_AFTER_VERIFIED_EXPORT,
             frameCountMode = request.prepared.settings.mode,

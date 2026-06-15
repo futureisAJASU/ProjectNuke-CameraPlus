@@ -70,6 +70,7 @@ fun captureProcessExportRawNightFusion(
     resolutionPlan: ResolutionCapturePlan? = null,
     finalOutputFormat: FinalOutputFormat,
     zoomRatio: Float,
+    physicalCameraId: String? = null,
     focusAeState: FocusAeState = FocusAeState(),
     onStatus: (String) -> Unit
 ) {
@@ -83,6 +84,7 @@ fun captureProcessExportRawNightFusion(
         resolutionMode = resolutionMode,
         resolutionPlan = resolutionPlan,
         zoomRatio = zoomRatio,
+        physicalCameraId = physicalCameraId,
         focusAeState = focusAeState,
         onStatus = { post(it) },
         onComplete = { jobDir ->

@@ -136,7 +136,7 @@ internal fun rememberCameraSelectionState(
     }
     val requestedZoomRatio = zoomUiState.zoomRatio
         .coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
-    val resolvedZoomRatio = when (selection.actualLensSource) {
+    val previewZoomRatio = when (selection.actualLensSource) {
         ActualLensSource.MAIN_1X,
         ActualLensSource.MAIN_CROP_2X,
         ActualLensSource.MAIN_CROP_3X,
@@ -146,6 +146,7 @@ internal fun rememberCameraSelectionState(
         ActualLensSource.OPTICAL_TELE_LOGICAL,
         ActualLensSource.OPTICAL_TELE_PHYSICAL -> selection.effectiveZoomRatio
     }
+    val captureZoomRatio = previewZoomRatio
 
     LaunchedEffect(
         selectedResolution,
@@ -164,7 +165,7 @@ internal fun rememberCameraSelectionState(
                     "cameraId=${selection.cameraId} actual=${selection.actualLensSource} " +
                     "physicalCameraId=${selection.physicalCameraId} " +
                     "effectiveZoom=${selection.effectiveZoomRatio} useCrop=${selection.useCrop} " +
-                    "previewZoom=$resolvedZoomRatio captureZoom=$resolvedZoomRatio " +
+                    "previewZoom=$previewZoomRatio captureZoom=$captureZoomRatio " +
                     "physicalTele=${selection.isOpticalTeleActuallyUsed && !selection.useCrop} " +
                     "mainCrop=${selection.actualLensSource == ActualLensSource.MAIN_CROP_3X}"
             )
@@ -174,8 +175,8 @@ internal fun rememberCameraSelectionState(
     return CameraSelectionUiState(
         options = options,
         selection = selection,
-        previewZoomRatio = resolvedZoomRatio,
-        captureZoomRatio = resolvedZoomRatio
+        previewZoomRatio = previewZoomRatio,
+        captureZoomRatio = captureZoomRatio
     )
 }
 

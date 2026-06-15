@@ -11,13 +11,16 @@ import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.TotalCaptureResult
 import android.media.Image
 import android.media.ImageReader
 import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.util.Log
 import android.util.Size
 import org.json.JSONArray
 import org.json.JSONObject
@@ -36,6 +39,7 @@ fun captureYuvBurstColorWithMotion(
     frameCount: Int = 4,
     resolutionMode: CaptureResolutionMode = CaptureResolutionMode.MP12,
     zoomRatio: Float = 1.0f,
+    physicalCameraId: String? = null,
     focusAeState: FocusAeState = FocusAeState(),
     frameCountMode: FrameCountMode = FrameCountMode.AUTO,
     autoMinFrames: Int = 4,
@@ -382,14 +386,24 @@ fun captureYuvBurstColorWithMotion(
                     postStatus("카메라 열림. Color Burst 세션 생성 중...")
 
                     try {
-                        camera.createCaptureSession(
-                            listOf(reader.surface),
-                            object : CameraCaptureSession.StateCallback() {
-                                override fun onConfigured(session: CameraCaptureSession) {
+                        createRoutedStillCaptureSession(
+                            camera = camera,
+                            surface = reader.surface,
+                            cameraId = cameraId,
+                            physicalCameraId = physicalCameraId,
+                            handler = backgroundHandler,
+                            onConfigured = { session, physicalRoute ->
                                     captureSession = session
                                     postStatus("Color Fusion 초기화 7/7: 세션 준비 완료. $frameCount 장 촬영 중...")
 
                                     try {
+                                        val requestZoomRatio = if (physicalRoute) {
+                                            zoomRatio
+                                        } else if (physicalCameraId != null) {
+                                            3.0f
+                                        } else {
+                                            zoomRatio
+                                        }
                                         val requests = List(frameCount) {
                                             camera.createCaptureRequest(
                                                 CameraDevice.TEMPLATE_STILL_CAPTURE
@@ -418,7 +432,7 @@ fun captureYuvBurstColorWithMotion(
 
                                                 applyZoomAndFocusAe(
                                                     characteristics = characteristics,
-                                                    zoomRatio = zoomRatio,
+                                                    zoomRatio = requestZoomRatio,
                                                     focusAeState = focusAeState,
                                                     cameraId = cameraId
                                                 )
@@ -427,19 +441,31 @@ fun captureYuvBurstColorWithMotion(
 
                                         session.captureBurst(
                                             requests,
-                                            object : CameraCaptureSession.CaptureCallback() {},
+                                            object : CameraCaptureSession.CaptureCallback() {
+                                                override fun onCaptureCompleted(
+                                                    session: CameraCaptureSession,
+                                                    request: CaptureRequest,
+                                                    result: TotalCaptureResult
+                                                ) {
+                                                    Log.i(
+                                                        "KeplerPhysicalRoute",
+                                                        "capture completed path=${if (physicalRoute) "physical" else "cropFallback"} " +
+                                                            "requestedPhysicalCameraId=$physicalCameraId " +
+                                                            "activePhysicalId=${result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)} " +
+                                                            "zoomRatio=$requestZoomRatio"
+                                                    )
+                                                }
+                                            },
                                             backgroundHandler
                                         )
                                     } catch (e: Exception) {
                                         finish("Color Burst 캡처 요청 실패\n${e.stackTraceToString()}")
                                     }
-                                }
-
-                                override fun onConfigureFailed(session: CameraCaptureSession) {
-                                    finish("Color Burst 세션 구성 실패")
-                                }
                             },
-                            backgroundHandler
+
+                            onFailed = { reason ->
+                                    finish("Color Burst 세션 구성 실패")
+                            }
                         )
                     } catch (e: Exception) {
                         finish("Color Burst 세션 생성 실패\n${e.stackTraceToString()}")

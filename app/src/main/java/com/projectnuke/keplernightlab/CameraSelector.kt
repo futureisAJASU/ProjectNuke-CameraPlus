@@ -239,28 +239,32 @@ fun selectCameraForOptions(
                         val physicalTele = selectPhysicalTeleCamera(main)
                         val selection = CameraSelection(
                             cameraId = main.cameraId,
-                            effectiveZoomRatio = 3.0f,
-                            useCrop = true,
+                            effectiveZoomRatio = if (physicalTele != null) 1.0f else 3.0f,
+                            useCrop = physicalTele == null,
                             note = if (physicalTele != null) {
-                                "Physical tele candidate ${physicalTele.physicalCameraId} found, but physical routing is disabled; using main 3x crop fallback."
+                                "Physical tele candidate ${physicalTele.physicalCameraId} selected for experimental preview and capture output routing."
                             } else {
                                 "Optical tele unavailable; using main 3x crop."
                             },
                             requestedLensSlot = options.lensSlot,
                             requestedThreeXSourceMode = options.threeXSourceMode,
-                            actualLensSource = ActualLensSource.OPTICAL_TELE_UNAVAILABLE_FALLBACK_CROP,
+                            actualLensSource = if (physicalTele != null) {
+                                ActualLensSource.OPTICAL_TELE_PHYSICAL
+                            } else {
+                                ActualLensSource.OPTICAL_TELE_UNAVAILABLE_FALLBACK_CROP
+                            },
                             physicalCameraId = physicalTele?.physicalCameraId,
-                            isOpticalTeleActuallyUsed = false,
-                            isFallback = true,
+                            isOpticalTeleActuallyUsed = physicalTele != null,
+                            isFallback = physicalTele == null,
                             diagnosticReason = if (physicalTele != null) {
-                                "Physical tele candidate detected inside logical cameraId=${main.cameraId}, but preview/capture routing is not implemented; main 3x crop fallback remains active."
+                                "Physical tele candidate routed for preview and capture inside logical cameraId=${main.cameraId}; failed physical sessions fall back to main 3x crop."
                             } else {
                                 "No separate public logical tele camera or usable physical tele metadata was exposed."
                             }
                         )
                         Log.d(
                             "Kepler3xSelection",
-                            "3x optical fallback cameraId=${selection.cameraId} physical=${selection.physicalCameraId} " +
+                            "3x optical selection cameraId=${selection.cameraId} physical=${selection.physicalCameraId} " +
                                 "mainFocal=${main.primaryFocalLength()} physicalFocal=${physicalTele?.primaryFocalLength()} " +
                                 "candidates=${candidates.joinToString { candidate -> candidate.cameraId + ':' + candidate.focalLengths }}"
                         )
