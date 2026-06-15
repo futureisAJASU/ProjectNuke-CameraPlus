@@ -302,6 +302,7 @@ fun MainCameraScreen(
     }
 
     LaunchedEffect(Unit) {
+        Log.d("KeplerSmoke", "CameraScreen mounted")
         refreshLatestResult()
     }
 
@@ -529,9 +530,23 @@ fun MainCameraScreen(
                 },
                 selectedThreeXSource = selectedThreeXSource,
                 onThreeXSourceChange = { source ->
+                    Log.d(
+                        "Kepler3xSelection",
+                        "phase=uiEvent requestedSource=$source previousSource=$selectedThreeXSource " +
+                            "newSource=$source selectedLensSlot=$selectedLensSlot " +
+                            "zoom=${zoomUiState.zoomRatio} optical=${zoomUiState.useOpticalTeleAt3x} " +
+                            "cameraId=${cameraState.selection.cameraId} " +
+                            "actual=${cameraState.selection.actualLensSource} " +
+                            "physicalCameraId=${cameraState.selection.physicalCameraId} " +
+                            "effectiveZoom=${cameraState.selection.effectiveZoomRatio} " +
+                            "useCrop=${cameraState.selection.useCrop} " +
+                            "previewZoom=${cameraState.previewZoomRatio} " +
+                            "captureZoom=${cameraState.captureZoomRatio}"
+                    )
                     val result = handleThreeXSourceChange(
                         context = context,
                         source = source,
+                        previousThreeXSource = selectedThreeXSource,
                         selectedResolution = selectedResolution,
                         zoomUiState = zoomUiState
                     )
@@ -1198,7 +1213,10 @@ fun ZoomSelector(
                         if (selected == value) Color(0xFF4A4A52)
                         else Color.Transparent
                     )
-                    .clickable { onSelect(value) },
+                    .clickable {
+                        Log.d("KeplerSmoke", "ZoomSelector clicked lensSlot=$value")
+                        onSelect(value)
+                    },
                 contentAlignment = Alignment.Center
             ) {
                 Text(
@@ -1292,12 +1310,18 @@ fun ThreeXSourceDots(
     ) {
         ThreeXSourceDot(
             selected = selected == ThreeXSourceMode.OPTICAL,
-            onClick = { onSelect(ThreeXSourceMode.OPTICAL) }
+            onClick = {
+                Log.d("KeplerSmoke", "ThreeXSourceDot clicked source=OPTICAL")
+                onSelect(ThreeXSourceMode.OPTICAL)
+            }
         )
 
         ThreeXSourceDot(
             selected = selected == ThreeXSourceMode.MAIN_CROP,
-            onClick = { onSelect(ThreeXSourceMode.MAIN_CROP) }
+            onClick = {
+                Log.d("KeplerSmoke", "ThreeXSourceDot clicked source=MAIN_CROP")
+                onSelect(ThreeXSourceMode.MAIN_CROP)
+            }
         )
     }
 }

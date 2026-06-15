@@ -116,6 +116,7 @@ internal fun handleLensSlotChange(
         threeXSource = effectiveThreeXSource,
         zoomUiState = updatedZoomState,
         forcedResolution = forcedResolution,
+        cameraSelection = selection,
         status = cameraSelectionStatus(selection)
     )
 }
@@ -123,6 +124,7 @@ internal fun handleLensSlotChange(
 internal fun handleThreeXSourceChange(
     context: Context,
     source: ThreeXSourceMode,
+    previousThreeXSource: ThreeXSourceMode,
     selectedResolution: CaptureResolutionMode,
     zoomUiState: ZoomUiState
 ): LensChangeResult {
@@ -141,12 +143,22 @@ internal fun handleThreeXSourceChange(
         threeXSourceMode = source
     )
     val selection = selectCameraForOptions(context, selectionOptions)
-    logThreeXTransition("source", LensSlot.THREE_X, source, updatedZoomState, selection)
+    Log.d(
+        "Kepler3xSelection",
+        "phase=stateResult requestedSource=$source previousSource=$previousThreeXSource " +
+            "newSource=$source selectedLensSlot=${LensSlot.THREE_X} " +
+            "zoom=${updatedZoomState.zoomRatio} optical=${updatedZoomState.useOpticalTeleAt3x} " +
+            "cameraId=${selection.cameraId} actual=${selection.actualLensSource} " +
+            "physicalCameraId=${selection.physicalCameraId} " +
+            "effectiveZoom=${selection.effectiveZoomRatio} useCrop=${selection.useCrop} " +
+            "previewZoom=${selection.effectiveZoomRatio} captureZoom=${selection.effectiveZoomRatio}"
+    )
     return LensChangeResult(
         lensSlot = LensSlot.THREE_X,
         threeXSource = source,
         zoomUiState = updatedZoomState,
         forcedResolution = forcedResolution,
+        cameraSelection = selection,
         status = cameraSelectionStatus(selection)
     )
 }
@@ -220,8 +232,10 @@ private fun logThreeXTransition(
         "Kepler3xSelection",
         "phase=$phase lens=$lensSlot source=$source " +
             "zoom=${zoomUiState.zoomRatio} optical=${zoomUiState.useOpticalTeleAt3x} " +
-            "cameraId=${selection.cameraId} previewZoom=${selection.effectiveZoomRatio} " +
-            "captureZoom=${selection.effectiveZoomRatio} actual=${selection.actualLensSource} " +
+            "cameraId=${selection.cameraId} actual=${selection.actualLensSource} " +
+            "physicalCameraId=${selection.physicalCameraId} " +
+            "effectiveZoom=${selection.effectiveZoomRatio} useCrop=${selection.useCrop} " +
+            "previewZoom=${selection.effectiveZoomRatio} captureZoom=${selection.effectiveZoomRatio} " +
             "physicalTele=${selection.isOpticalTeleActuallyUsed && !selection.useCrop} " +
             "mainCrop=${selection.actualLensSource == ActualLensSource.MAIN_CROP_3X}"
     )

@@ -24,6 +24,7 @@ internal data class LensChangeResult(
     val threeXSource: ThreeXSourceMode,
     val zoomUiState: ZoomUiState,
     val forcedResolution: CaptureResolutionMode?,
+    val cameraSelection: CameraSelection,
     val status: String
 )
 
@@ -131,8 +132,18 @@ internal fun rememberCameraSelectionState(
     ) {
         selectCameraForOptions(context, options)
     }
-    val resolvedZoomRatio = selection.effectiveZoomRatio
+    val requestedZoomRatio = zoomUiState.zoomRatio
         .coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
+    val resolvedZoomRatio = when (selection.actualLensSource) {
+        ActualLensSource.MAIN_1X,
+        ActualLensSource.MAIN_CROP_2X,
+        ActualLensSource.MAIN_CROP_3X,
+        ActualLensSource.OPTICAL_TELE_UNAVAILABLE_FALLBACK_CROP -> requestedZoomRatio
+
+        ActualLensSource.ULTRAWIDE,
+        ActualLensSource.OPTICAL_TELE_LOGICAL,
+        ActualLensSource.OPTICAL_TELE_PHYSICAL -> selection.effectiveZoomRatio
+    }
 
     LaunchedEffect(
         selectedResolution,
@@ -144,11 +155,14 @@ internal fun rememberCameraSelectionState(
         if (selectedLensSlot == LensSlot.THREE_X) {
             Log.d(
                 "Kepler3xSelection",
-                "lens=$selectedLensSlot source=$selectedThreeXSource " +
+                "phase=finalSelection selectedLensSlot=$selectedLensSlot " +
+                    "previousSource=unknown newSource=$selectedThreeXSource " +
                     "zoom=${zoomUiState.zoomRatio} " +
                     "optical=${zoomUiState.useOpticalTeleAt3x} " +
-                    "cameraId=${selection.cameraId} previewZoom=$resolvedZoomRatio " +
-                    "captureZoom=$resolvedZoomRatio actual=${selection.actualLensSource} " +
+                    "cameraId=${selection.cameraId} actual=${selection.actualLensSource} " +
+                    "physicalCameraId=${selection.physicalCameraId} " +
+                    "effectiveZoom=${selection.effectiveZoomRatio} useCrop=${selection.useCrop} " +
+                    "previewZoom=$resolvedZoomRatio captureZoom=$resolvedZoomRatio " +
                     "physicalTele=${selection.isOpticalTeleActuallyUsed && !selection.useCrop} " +
                     "mainCrop=${selection.actualLensSource == ActualLensSource.MAIN_CROP_3X}"
             )
