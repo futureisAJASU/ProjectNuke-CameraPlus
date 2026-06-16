@@ -806,6 +806,7 @@ struct NativeIspRenderParams {
 
 struct NativeIspRenderStats {
     uint64_t hotPixelCount = 0;
+    uint64_t rawDenoisedSampleCount = 0;
     double beforeR = 0.0;
     double beforeG = 0.0;
     double beforeB = 0.0;
@@ -821,6 +822,7 @@ struct NativeIspRenderStats {
     uint64_t overexposed = 0;
     uint64_t sampleCount = 0;
     float exposureGain = 1.0f;
+    bool fullBufferFallbackUsed = true;
 };
 
 std::string readTextFile(const std::string& path) {
@@ -1434,6 +1436,127 @@ uint64_t suppressHotPixelsCfaPlane(std::vector<uint16_t>& raw, int width, int he
     return hotPixels;
 }
 
+uint64_t denoiseCfaPlaneSameColor(
+    std::vector<uint16_t>& raw,
+    int width,
+    int height,
+    int whiteRange,
+    float strength
+) {
+    if (width < 8 || height < 8 || strength <= 0.001f) return 0;
+    std::vector<uint16_t> fixed = raw;
+    uint64_t changed = 0;
+    const float blend = std::clamp(strength, 0.0f, 0.75f) * 0.35f;
+    const int edgeThreshold = std::max(64, whiteRange / 22);
+    const int highlightProtect = static_cast<int>(whiteRange * 0.82f);
+    for (int y = 2; y < height - 2; ++y) {
+        for (int x = 2; x < width - 2; ++x) {
+            const size_t index = static_cast<size_t>(y) * width + x;
+            const int value = raw[index];
+            uint16_t neighbors[4] = {
+                raw[static_cast<size_t>(y - 2) * width + x],
+                raw[static_cast<size_t>(y + 2) * width + x],
+                raw[static_cast<size_t>(y) * width + x - 2],
+                raw[static_cast<size_t>(y) * width + x + 2]
+            };
+            std::nth_element(neighbors, neighbors + 2, neighbors + 4);
+            const int median = (static_cast<int>(neighbors[1]) + static_cast<int>(neighbors[2])) / 2;
+            const int delta = std::abs(value - median);
+            if (value > highlightProtect && value > median + edgeThreshold) continue;
+            if (delta > edgeThreshold) continue;
+            const int denoised = static_cast<int>(std::lround(value * (1.0f - blend) + median * blend));
+            if (denoised != value) {
+                fixed[index] = static_cast<uint16_t>(std::clamp(denoised, 0, whiteRange));
+                ++changed;
+            }
+        }
+    }
+    raw.swap(fixed);
+    return changed;
+}
+
+std::array<float, 3> demosaicBilinearSafe(
+    const std::vector<uint16_t>& raw,
+    const RawImageGeometry& geometry,
+    int cfaPattern,
+    int sx,
+    int sy,
+    int whiteRange
+) {
+    auto rawAt = [&](int x, int y) {
+        return sampleCfaValue(raw, geometry, x, y);
+    };
+    auto average2 = [](int a, int b) { return (a + b) / 2; };
+    auto average4 = [](int a, int b, int c, int d) { return (a + b + c + d) / 4; };
+    const int value = rawAt(sx, sy);
+    float r = 0.0f;
+    float g = 0.0f;
+    float b = 0.0f;
+    const char color = bayerColorAt(sx, sy, cfaPattern);
+    if (color == 'R' || color == 'B') {
+        const int horizontalGradient =
+            std::abs(rawAt(sx - 1, sy) - rawAt(sx + 1, sy)) +
+            std::abs(2 * value - rawAt(sx - 2, sy) - rawAt(sx + 2, sy));
+        const int verticalGradient =
+            std::abs(rawAt(sx, sy - 1) - rawAt(sx, sy + 1)) +
+            std::abs(2 * value - rawAt(sx, sy - 2) - rawAt(sx, sy + 2));
+        if (horizontalGradient < verticalGradient) {
+            g = static_cast<float>(average2(rawAt(sx - 1, sy), rawAt(sx + 1, sy)));
+        } else if (verticalGradient < horizontalGradient) {
+            g = static_cast<float>(average2(rawAt(sx, sy - 1), rawAt(sx, sy + 1)));
+        } else {
+            g = static_cast<float>(average4(rawAt(sx - 1, sy), rawAt(sx + 1, sy), rawAt(sx, sy - 1), rawAt(sx, sy + 1)));
+        }
+        const int diagonalOneGradient = std::abs(rawAt(sx - 1, sy - 1) - rawAt(sx + 1, sy + 1));
+        const int diagonalTwoGradient = std::abs(rawAt(sx + 1, sy - 1) - rawAt(sx - 1, sy + 1));
+        const float opposite = diagonalOneGradient < diagonalTwoGradient
+            ? static_cast<float>(average2(rawAt(sx - 1, sy - 1), rawAt(sx + 1, sy + 1)))
+            : diagonalTwoGradient < diagonalOneGradient
+                ? static_cast<float>(average2(rawAt(sx + 1, sy - 1), rawAt(sx - 1, sy + 1)))
+                : static_cast<float>(average4(rawAt(sx - 1, sy - 1), rawAt(sx + 1, sy - 1), rawAt(sx - 1, sy + 1), rawAt(sx + 1, sy + 1)));
+        if (color == 'R') {
+            r = static_cast<float>(value);
+            b = opposite;
+        } else {
+            b = static_cast<float>(value);
+            r = opposite;
+        }
+    } else {
+        g = static_cast<float>(value);
+        const bool greenOnRedRow = (cfaPattern == 2 || cfaPattern == 3) ? ((sy & 1) != 0) : ((sy & 1) == 0);
+        const float horizontalColor = static_cast<float>(average2(rawAt(sx - 1, sy), rawAt(sx + 1, sy)));
+        const float verticalColor = static_cast<float>(average2(rawAt(sx, sy - 1), rawAt(sx, sy + 1)));
+        const float horizontalGreen = static_cast<float>(average2(rawAt(sx - 2, sy), rawAt(sx + 2, sy)));
+        const float verticalGreen = static_cast<float>(average2(rawAt(sx, sy - 2), rawAt(sx, sy + 2)));
+        const float correctedHorizontal = horizontalColor + 0.5f * (g - horizontalGreen);
+        const float correctedVertical = verticalColor + 0.5f * (g - verticalGreen);
+        if (greenOnRedRow) {
+            r = correctedHorizontal;
+            b = correctedVertical;
+        } else {
+            r = correctedVertical;
+            b = correctedHorizontal;
+        }
+    }
+    return {
+        std::clamp(r / whiteRange, 0.0f, 1.0f),
+        std::clamp(g / whiteRange, 0.0f, 1.0f),
+        std::clamp(b / whiteRange, 0.0f, 1.0f)
+    };
+}
+
+std::array<float, 3> demosaicMhc5x5(
+    const std::vector<uint16_t>& raw,
+    const RawImageGeometry& geometry,
+    int cfaPattern,
+    int sx,
+    int sy,
+    int whiteRange
+) {
+    // TODO v0.3: implement Malvar-He-Cutler 5x5 from published filter equations.
+    return demosaicBilinearSafe(raw, geometry, cfaPattern, sx, sy, whiteRange);
+}
+
 float toneLinearToDisplay(float value, const NativeIspRenderParams& params, float exposureGain) {
     float x = std::clamp(value * exposureGain, 0.0f, 4.0f);
     const float shadowLift = params.toneMaxShadowLift * (1.0f - std::clamp(x / 0.25f, 0.0f, 1.0f));
@@ -1472,6 +1595,13 @@ bool renderRaw16NativeIspV2(
     if (!readRaw16(rawPath, width, height, raw, error)) return false;
     const int whiteRange = std::max(1, whiteLevel - blackLevel);
     stats.hotPixelCount = suppressHotPixelsCfaPlane(raw, width, height, whiteRange);
+    stats.rawDenoisedSampleCount = denoiseCfaPlaneSameColor(
+        raw,
+        width,
+        height,
+        whiteRange,
+        params.denoiseStrength
+    );
 
     const RawImageGeometry geometry{width, height, blackLevel, whiteLevel};
     auto rawAt = [&](int x, int y) {
@@ -1483,7 +1613,7 @@ bool renderRaw16NativeIspV2(
         int source = static_cast<int>((static_cast<int64_t>(outputCoordinate) * inputSize) / outputSize);
         return std::clamp((source / 2) * 2 + (outputCoordinate & 1), 0, inputSize - 1);
     };
-    auto demosaicBilinearSafe = [&](int sx, int sy) -> std::array<float, 3> {
+    auto legacyInlineDemosaic = [&](int sx, int sy) -> std::array<float, 3> {
         const int value = rawAt(sx, sy);
         float r = 0.0f;
         float g = 0.0f;
@@ -1557,7 +1687,7 @@ bool renderRaw16NativeIspV2(
         const int sy = sourceCoordinate(oy, height, outputHeight);
         for (int ox = sampleStepX / 2; ox < outputWidth; ox += sampleStepX) {
             const int sx = sourceCoordinate(ox, width, outputWidth);
-            const auto rgb = demosaicBilinearSafe(sx, sy);
+            const auto rgb = demosaicBilinearSafe(raw, geometry, cfaPattern, sx, sy, whiteRange);
             const auto corrected = applyWbAndMatrix(rgb);
             const float luma = std::clamp(0.2126f * corrected[0] + 0.7152f * corrected[1] + 0.0722f * corrected[2], 0.0f, 1.0f);
             if (luma < 0.02f || luma > 0.96f) continue;
@@ -1575,7 +1705,7 @@ bool renderRaw16NativeIspV2(
         const int sy = sourceCoordinate(oy, height, outputHeight);
         for (int ox = 0; ox < outputWidth; ++ox) {
             const int sx = sourceCoordinate(ox, width, outputWidth);
-            const auto rgb = demosaicBilinearSafe(sx, sy);
+            const auto rgb = demosaicBilinearSafe(raw, geometry, cfaPattern, sx, sy, whiteRange);
             const float wbR = rgb[0] * params.wbR;
             const float wbG = rgb[1] * params.wbG;
             const float wbB = rgb[2] * params.wbB;
@@ -1695,6 +1825,7 @@ bool writeNativeIspV2DebugJson(
            << "  \"rawRenderVersion\": \"native_raw_isp_v0.2\",\n"
            << "  \"nativeRawIspUsed\": true,\n"
            << "  \"nativePostprocess\": true,\n"
+           << "  \"nativeRawIspFullBufferFallbackUsed\": " << (stats.fullBufferFallbackUsed ? "true" : "false") << ",\n"
            << "  \"inputWidth\": " << width << ",\n"
            << "  \"inputHeight\": " << height << ",\n"
            << "  \"outputWidth\": " << outputWidth << ",\n"
@@ -1711,6 +1842,10 @@ bool writeNativeIspV2DebugJson(
            << params.colorMatrix[3] << ", " << params.colorMatrix[4] << ", " << params.colorMatrix[5] << ", "
            << params.colorMatrix[6] << ", " << params.colorMatrix[7] << ", " << params.colorMatrix[8] << "],\n"
            << "  \"demosaicMethod\": \"BILINEAR_SAFE_V0\",\n"
+           << "  \"mhcBoundaryAvailable\": true,\n"
+           << "  \"rawDenoiseVersion\": \"same_color_cfa_edge_aware_v0_2\",\n"
+           << "  \"rawDenoiseStrength\": " << params.denoiseStrength << ",\n"
+           << "  \"rawDenoisedSampleCount\": " << stats.rawDenoisedSampleCount << ",\n"
            << "  \"denoiseVersion\": \"native_chroma_luma_v0.2\",\n"
            << "  \"denoiseStrength\": " << params.denoiseStrength << ",\n"
            << "  \"chromaDenoiseStrength\": " << params.chromaDenoiseStrength << ",\n"

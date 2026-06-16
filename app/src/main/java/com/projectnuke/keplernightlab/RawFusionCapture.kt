@@ -931,6 +931,7 @@ private object RawFusionExportCoordinator {
             .put("rawReferenceDebugFile", if (referenceDebugRgbaFile.exists()) referenceDebugRgbaFile.name else JSONObject.NULL)
             .put("rawMergedLinearDebugFile", if (mergedLinearDebugRgbaFile.exists()) mergedLinearDebugRgbaFile.name else JSONObject.NULL)
             .put("rawFinalRenderDebugFile", nativeRgbaFile.name)
+            .put("nativeRawIspFullBufferFallbackUsed", debug?.optBoolean("nativeRawIspFullBufferFallbackUsed", true) ?: true)
             .put("rawRenderWarnings", nativeWarnings)
             .put("rawRenderColorTransform", renderMetadata.colorTransform?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
             .put("rawRenderCameraWbGains", renderMetadata.cameraWbGains?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
