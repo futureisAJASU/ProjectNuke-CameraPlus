@@ -65,8 +65,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextOverflow
@@ -175,7 +177,7 @@ fun parseCaptureProgress(
                 lower.contains("saved to gallery") -> CaptureStage.COMPLETE
         lower.contains("cleanup") || lower.contains("cleaning") -> CaptureStage.CLEANING
         lower.contains("verifying") || lower.contains("verification") -> CaptureStage.VERIFYING
-        lower.contains("exporting") || lower.contains("export ") -> CaptureStage.EXPORTING
+        lower.contains("exporting") || lower.contains("export ") || lower.contains("tone/export") -> CaptureStage.EXPORTING
         lower.contains("demosaic") -> CaptureStage.DEMOSAICING
         text.contains("CAPTURE_COMPLETE", ignoreCase = true) ||
                 text.contains("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true) ||
@@ -253,6 +255,7 @@ fun MainCameraScreen(
     var status by remember { mutableStateOf("대기 중") }
     var previewEnabled by remember { mutableStateOf(true) }
     var isCapturing by remember { mutableStateOf(false) }
+    var isPipelineBusy by remember { mutableStateOf(false) }
     var currentScreen by remember { mutableStateOf(MainScreen.CAMERA) }
     var captureProgress by remember { mutableStateOf(CaptureProgressState()) }
 
@@ -353,6 +356,10 @@ fun MainCameraScreen(
     LaunchedEffect(Unit) {
         Log.d("KeplerSmoke", "CameraScreen mounted")
         refreshLatestResult()
+    }
+
+    LaunchedEffect(isPipelineBusy) {
+        Log.i("KeplerPipelineState", if (isPipelineBusy) "busy indicator shown" else "busy indicator hidden")
     }
 
     LaunchedEffect(focusAeUiNonce, focusAeState.locked) {
@@ -456,13 +463,16 @@ fun MainCameraScreen(
         timeoutMillis: Long = 120_000L,
         job: ((String) -> Unit) -> Unit
     ) {
-        if (isCapturing) {
-            Log.d("KeplerCaptureState", "Capture request ignored; pipeline busy")
+        if (isPipelineBusy) {
+            status = "Pipeline busy: current fusion/export is still running."
+            Log.i("KeplerPipelineState", "capture ignored: pipeline busy status=$status")
             return
         }
         status = startMessage
+        isPipelineBusy = true
         isCapturing = true
         previewEnabled = false
+        Log.i("KeplerPipelineState", "pipeline start message=$startMessage requestedFrames=$requestedFrames")
         captureProgress = CaptureProgressState(
             stage = CaptureStage.PREPARING,
             message = "Preparing capture...",
@@ -474,14 +484,24 @@ fun MainCameraScreen(
             status = timeoutStatus
             captureProgress = parseCaptureProgress(timeoutStatus, captureProgress)
             isCapturing = false
+            isPipelineBusy = false
             previewEnabled = true
+            Log.i("KeplerPipelineState", "pipeline timeout; preview re-enabled")
         }
         mainHandler.postDelayed(watchdog, timeoutMillis)
 
         fun finishIfTerminal(newStatus: String) {
             captureProgress = parseCaptureProgress(newStatus, captureProgress)
-            if (newStatus.contains("CAPTURE_COMPLETE", ignoreCase = true)) {
-                Log.d("KeplerCaptureState", "Capture stage complete; waiting for processing/export")
+            if (isCaptureStageCompleteButPipelineStillRunning(newStatus)) {
+                isCapturing = false
+                previewEnabled = false
+                captureProgress = captureProgress.copy(
+                    stage = CaptureStage.PROCESSING,
+                    message = "Capture complete. Processing fusion...",
+                    progressPercent = max(captureProgress.progressPercent, 0.65f)
+                )
+                Log.i("KeplerPipelineState", "Capture stage complete; waiting for processing/export")
+                return
             }
             if (isTerminalStatus(newStatus)) {
                 val lower = newStatus.lowercase()
@@ -490,11 +510,16 @@ fun MainCameraScreen(
                         newStatus.contains("EXPORT_COMPLETE", ignoreCase = true) ||
                         lower.contains("saved to gallery")
                 mainHandler.removeCallbacks(watchdog)
+                isPipelineBusy = false
                 isCapturing = false
                 refreshLatestResult(showPreview = terminalSuccess)
+                Log.i("KeplerPipelineState", "pipeline final terminalSuccess=$terminalSuccess status=$newStatus")
 
                 mainHandler.postDelayed(
-                    { previewEnabled = true },
+                    {
+                        previewEnabled = true
+                        Log.i("KeplerPipelineState", "preview re-enabled")
+                    },
                     250L
                 )
             }
@@ -663,14 +688,16 @@ fun MainCameraScreen(
                     applyZoomRatio(it)
                 },
                 isCapturing = isCapturing,
+                isPipelineBusy = isPipelineBusy,
                 captureProgress = captureProgress,
                 onHideFocusAeControls = {
                     showFocusAeControls = false
                     showZoomSlider = false
                 },
                 onCapture = captureClick@{
-                    if (isCapturing) {
-                        Log.d("KeplerCaptureState", "Capture click ignored; pipeline busy")
+                    if (isPipelineBusy) {
+                        status = "Pipeline busy: current fusion/export is still running."
+                        Log.i("KeplerPipelineState", "click ignored while busy status=$status")
                         return@captureClick
                     }
                     val clickResult = handleCaptureClick(
@@ -729,7 +756,12 @@ fun MainCameraScreen(
                         }
                     }
                 },
-                onAverage = {
+                onAverage = average@{
+                    if (isPipelineBusy) {
+                        status = "Pipeline busy: current fusion/export is still running."
+                        Log.i("KeplerPipelineState", "average/reprocess ignored while busy status=$status")
+                        return@average
+                    }
                     status = "최근 촬영 컬러 합성 시작..."
                     processLatestNightFusionV02(context) { newStatus ->
                         status = newStatus
@@ -1040,6 +1072,7 @@ fun CameraBottomPanel(
     onToggleZoomSlider: () -> Unit,
     onZoomRatioChange: (Float) -> Unit,
     isCapturing: Boolean,
+    isPipelineBusy: Boolean,
     captureProgress: CaptureProgressState,
     onHideFocusAeControls: () -> Unit,
     onCapture: () -> Unit,
@@ -1142,11 +1175,18 @@ fun CameraBottomPanel(
                         .clickable(onClick = onHideFocusAeControls)
                 )
 
-                ShutterButton(
-                    enabled = !isCapturing,
-                    isCapturing = isCapturing,
-                    onClick = onCapture
-                )
+                if (isPipelineBusy) {
+                    PipelineBusyShutterIndicator(
+                        captureProgress = captureProgress,
+                        modifier = Modifier.size(ShutterOuterSize)
+                    )
+                } else {
+                    ShutterButton(
+                        enabled = true,
+                        isCapturing = false,
+                        onClick = onCapture
+                    )
+                }
 
                 Spacer(
                     modifier = Modifier
@@ -1155,7 +1195,7 @@ fun CameraBottomPanel(
                 )
 
                 CameraSwitchButton(
-                    enabled = !isCapturing,
+                    enabled = !isPipelineBusy,
                     onClick = onAverage
                 )
             }
@@ -1171,7 +1211,7 @@ fun CameraBottomPanel(
                 modifier = Modifier.align(Alignment.CenterHorizontally)
             )
 
-            if (isCapturing) {
+            if (isPipelineBusy) {
                 CaptureProgressRow(captureProgress = captureProgress)
             }
 
@@ -1186,21 +1226,21 @@ fun CameraBottomPanel(
                 MiniActionButton(
                     modifier = Modifier.weight(1f),
                     text = "RAW",
-                    enabled = !isCapturing,
+                    enabled = !isPipelineBusy,
                     onClick = onRaw
                 )
 
                 MiniActionButton(
                     modifier = Modifier.weight(1f),
                     text = "RAW 4장",
-                    enabled = !isCapturing,
+                    enabled = !isPipelineBusy,
                     onClick = onRawBurst
                 )
 
                 MiniActionButton(
                     modifier = Modifier.weight(1f),
                     text = "삭제",
-                    enabled = !isCapturing,
+                    enabled = !isPipelineBusy,
                     onClick = onClear
                 )
             }
@@ -1296,6 +1336,61 @@ fun ResultPreviewCard(
                 }
             }
         }
+    }
+}
+
+@Composable
+fun PipelineBusyShutterIndicator(
+    captureProgress: CaptureProgressState,
+    modifier: Modifier = Modifier
+) {
+    val progress = captureProgress.progressPercent.coerceIn(0f, 1f)
+    val percent = (progress * 100f).roundToInt()
+    val label = when {
+        percent in 5..99 -> "$percent%"
+        captureProgress.stage == CaptureStage.CAPTURING -> "촬영 중"
+        captureProgress.stage == CaptureStage.EXPORTING ||
+            captureProgress.stage == CaptureStage.VERIFYING ||
+            captureProgress.stage == CaptureStage.CLEANING -> "저장 중"
+        captureProgress.stage == CaptureStage.PROCESSING ||
+            captureProgress.stage == CaptureStage.DEMOSAICING -> "합성 중"
+        else -> "처리 중"
+    }
+
+    Box(
+        modifier = modifier
+            .clip(CircleShape)
+            .background(Color(0xCC111218)),
+        contentAlignment = Alignment.Center
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val strokeWidth = 7.dp.toPx()
+            val inset = strokeWidth / 2f + 3.dp.toPx()
+            val arcSize = Size(size.width - inset * 2f, size.height - inset * 2f)
+            drawCircle(
+                color = Color.White.copy(alpha = 0.18f),
+                radius = size.minDimension / 2f - inset,
+                style = Stroke(width = strokeWidth)
+            )
+            drawArc(
+                color = Color(0xFFFFD33D),
+                startAngle = -90f,
+                sweepAngle = 360f * progress.coerceAtLeast(0.08f),
+                useCenter = false,
+                topLeft = Offset(inset, inset),
+                size = arcSize,
+                style = Stroke(width = strokeWidth)
+            )
+            drawCircle(
+                color = Color.White.copy(alpha = 0.10f),
+                radius = size.minDimension / 2f - 15.dp.toPx()
+            )
+        }
+        Text(
+            text = label,
+            color = Color.White,
+            style = MaterialTheme.typography.labelMedium
+        )
     }
 }
 

@@ -26,11 +26,19 @@ data class CaptureProgressState(
 
 private val zeroFailedCounterRegex = Regex("\\bfailed\\s+0\\b", RegexOption.IGNORE_CASE)
 
+fun isCaptureStageCompleteButPipelineStillRunning(status: String): Boolean {
+    return status.contains("CAPTURE_COMPLETE", ignoreCase = true) &&
+        !status.contains("PIPELINE_COMPLETE", ignoreCase = true)
+}
+
 fun isTerminalStatus(status: String): Boolean {
     if (status.contains("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true)) {
         return false
     }
     if (status.contains("CAPTURE_COMPLETE", ignoreCase = true)) {
+        return false
+    }
+    if (status.contains("RAW capture sequence done", ignoreCase = true)) {
         return false
     }
 
