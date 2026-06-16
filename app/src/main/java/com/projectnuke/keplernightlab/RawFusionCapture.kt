@@ -53,6 +53,7 @@ fun captureRawBurstForFusion(
     zoomRatio: Float = 1.0f,
     physicalCameraId: String? = null,
     focusAeState: FocusAeState = FocusAeState(),
+    rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
     onStatus: (String) -> Unit,
     onComplete: (File) -> Unit,
     onError: (String) -> Unit
@@ -85,6 +86,9 @@ fun captureRawBurstForFusion(
     var maxResolutionPixelModeFailure: String? = null
     var sensorPixelModeUsed = false
     var timeoutRunnable: Runnable? = null
+    val rawCaptureStartedAt = System.currentTimeMillis()
+    var rawFirstImageDelayMs: Long? = null
+    val rawFrameSaveTimesMs = mutableListOf<Long>()
     fun postCaptureProgress() {
         post("RAW capture: saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames, failed $failedCaptures")
     }
@@ -284,6 +288,17 @@ fun captureRawBurstForFusion(
             .put("highResRawFrameLimit", HIGH_RES_RAW_FRAME_LIMIT)
             .put("dngSidecarSaved", saveDngSidecars)
             .put("dngSidecarSkipReason", dngSidecarSkipReason ?: JSONObject.NULL)
+            .put("rawSpeedMode", rawSpeedMode.name)
+            .put("rawCaptureStartedAt", rawCaptureStartedAt)
+            .put("rawDebugPreviewSkipped", rawSpeedMode == RawSpeedMode.BALANCED)
+            .put(
+                "rawDebugPreviewSkipReason",
+                if (rawSpeedMode == RawSpeedMode.BALANCED) {
+                    "RAW speed mode Balanced skips optional debug preview PNGs during processing."
+                } else {
+                    JSONObject.NULL
+                }
+            )
             .put("attemptedFrames", attemptedFrames)
             .put("captureCompleteness", "FAILED")
             .put("partialCapture", false)
@@ -348,6 +363,23 @@ fun captureRawBurstForFusion(
                 .put("receivedImages", receivedImages)
                 .put("completedResults", completedResults)
                 .put("failedCaptures", failedCaptures)
+                .put("rawSpeedMode", rawSpeedMode.name)
+                .put("rawCaptureStartedAt", rawCaptureStartedAt)
+                .put("rawFirstImageDelayMs", rawFirstImageDelayMs ?: JSONObject.NULL)
+                .put(
+                    "rawAverageFrameSaveMs",
+                    rawFrameSaveTimesMs.takeIf { it.isNotEmpty() }?.average() ?: JSONObject.NULL
+                )
+                .put("rawTotalCaptureMs", System.currentTimeMillis() - rawCaptureStartedAt)
+                .put("rawDebugPreviewSkipped", rawSpeedMode == RawSpeedMode.BALANCED)
+                .put(
+                    "rawDebugPreviewSkipReason",
+                    if (rawSpeedMode == RawSpeedMode.BALANCED) {
+                        "RAW speed mode Balanced skips optional debug preview PNGs during processing."
+                    } else {
+                        JSONObject.NULL
+                    }
+                )
                 .put("captureCompleteness", completeness)
                 .put("partialCapture", partial)
                 .put("frames", frameObjects)
@@ -383,6 +415,7 @@ fun captureRawBurstForFusion(
                 val dngName = "frame_${index.toString().padStart(2, '0')}.dng"
                 try {
                     post("RAW saving frame ${index + 1}/$requestedFrames...")
+                    val saveStartedAt = System.currentTimeMillis()
                     writeCompactRaw16(image, File(jobDir, raw16Name))
                     if (saveDngSidecars) {
                         FileOutputStream(File(jobDir, dngName)).use { output ->
@@ -417,8 +450,12 @@ fun captureRawBurstForFusion(
                             .put("cropRegion", cropSelection.region?.toString() ?: JSONObject.NULL)
                     )
                     savedFrames++
-                    post("RAW saved frame $savedFrames/$requestedFrames")
-                    writeJobStatus(jobFile, baseJob, "CAPTURING")
+                    val saveMs = System.currentTimeMillis() - saveStartedAt
+                    rawFrameSaveTimesMs += saveMs
+                    post("RAW saved frame $savedFrames/$requestedFrames (${saveMs}ms)")
+                    if (savedFrames == 1 || savedFrames == requestedFrames) {
+                        writeJobStatus(jobFile, baseJob, "CAPTURING")
+                    }
                     postCaptureProgress()
                     if (savedFrames >= requestedFrames) {
                         finishSuccess()
@@ -457,6 +494,10 @@ fun captureRawBurstForFusion(
                 return@setOnImageAvailableListener
             }
             receivedImages++
+            if (rawFirstImageDelayMs == null) {
+                rawFirstImageDelayMs = System.currentTimeMillis() - rawCaptureStartedAt
+                post("RAW first image delay: ${rawFirstImageDelayMs}ms")
+            }
             imagesByTimestamp[image.timestamp] = image
             postCaptureProgress()
             trySaveReadyFrames()
@@ -768,6 +809,7 @@ private object RawFusionExportCoordinator {
     private fun exportStandardBitmap(context: RawFusionExportContext): RawFusionProcessResult {
         val previewFile = File(context.files.jobDir, "raw_fusion_preview.png")
         val finalFile = File(context.files.jobDir, "raw_fusion_final.png")
+        val skipDebugPreview = context.job.optString("rawSpeedMode") == RawSpeedMode.BALANCED.name
         val targetSize = chooseRawDemosaicTarget(
             context.sensor.width,
             context.sensor.height,
@@ -815,7 +857,9 @@ private object RawFusionExportCoordinator {
                     context.sensor.whiteLevel - context.sensor.blackLevel
                 )
             }
-            saveRawFusionPng(preview, previewFile)
+            if (!skipDebugPreview) {
+                saveRawFusionPng(preview, previewFile)
+            }
             context.onStatus("Processing RAW fusion: tone/sharpen...")
             toned = toneMapRawFusion(preview)
             preview.recycle()
@@ -855,8 +899,17 @@ private object RawFusionExportCoordinator {
             .put("processStatus", "RAW_FUSION_COMPLETE")
             .put("mergedRawFile", context.files.mergedRawFile.name)
             .put("mergedDngFile", JSONObject.NULL)
-            .put("previewFile", previewFile.name)
+            .put("previewFile", if (skipDebugPreview) JSONObject.NULL else previewFile.name)
             .put("finalFile", finalFile.name)
+            .put("rawDebugPreviewSkipped", skipDebugPreview)
+            .put(
+                "rawDebugPreviewSkipReason",
+                if (skipDebugPreview) {
+                    "RAW speed mode Balanced skips optional debug preview PNGs during processing."
+                } else {
+                    JSONObject.NULL
+                }
+            )
             .put("finalOutputSource", "final_png")
             .put("outputFallbackReason", outputFallbackReason ?: JSONObject.NULL)
             .put("fullSizeKotlinDemosaicUsed", !context.highResolutionRaw)
@@ -914,7 +967,7 @@ private object RawFusionExportCoordinator {
             true,
             context.files.mergedRawFile,
             null,
-            previewFile,
+            if (skipDebugPreview) null else previewFile,
             finalFile,
             null
         )

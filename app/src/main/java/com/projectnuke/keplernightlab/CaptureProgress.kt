@@ -30,6 +30,9 @@ fun isTerminalStatus(status: String): Boolean {
     if (status.contains("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true)) {
         return false
     }
+    if (status.contains("CAPTURE_COMPLETE", ignoreCase = true)) {
+        return false
+    }
 
     val lower = status.lowercase()
     val hasExplicitFailure = status.contains("PIPELINE_FAILED", ignoreCase = true) ||
@@ -39,7 +42,7 @@ fun isTerminalStatus(status: String): Boolean {
     val hasGenericFailure = lower.contains("failed") && !zeroFailedCounterRegex.containsMatchIn(status)
 
     return status.contains("PIPELINE_COMPLETE", ignoreCase = true) ||
-            status.contains("CAPTURE_COMPLETE", ignoreCase = true) ||
+            status.contains("EXPORT_COMPLETE", ignoreCase = true) ||
             hasExplicitFailure ||
             status.contains("CAPTURE_TIMEOUT", ignoreCase = true) ||
             status.contains("PROCESS_TIMEOUT", ignoreCase = true) ||

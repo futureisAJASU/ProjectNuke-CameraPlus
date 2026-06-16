@@ -72,6 +72,7 @@ fun captureProcessExportRawNightFusion(
     zoomRatio: Float,
     physicalCameraId: String? = null,
     focusAeState: FocusAeState = FocusAeState(),
+    rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
     onStatus: (String) -> Unit
 ) {
     val main = Handler(Looper.getMainLooper())
@@ -86,6 +87,7 @@ fun captureProcessExportRawNightFusion(
         zoomRatio = zoomRatio,
         physicalCameraId = physicalCameraId,
         focusAeState = focusAeState,
+        rawSpeedMode = rawSpeedMode,
         onStatus = { post(it) },
         onComplete = { jobDir ->
             val thread = HandlerThread("KeplerRawFusionPipelineThread").apply { start() }
@@ -94,7 +96,7 @@ fun captureProcessExportRawNightFusion(
                     val process = processRawFusionJob(
                         context = context,
                         jobDir = jobDir,
-                        saveNativeMp24DebugPng = finalOutputFormat.isDebugPng
+                        saveNativeMp24DebugPng = finalOutputFormat.isDebugPng && rawSpeedMode == RawSpeedMode.QUALITY
                     ) { post(it) }
                     if (!process.success || !process.hasExportableBitmapSource()) {
                         updateExportFailure(

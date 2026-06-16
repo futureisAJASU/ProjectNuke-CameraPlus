@@ -312,13 +312,18 @@ internal fun startCapturePipeline(
         captureProcessExportRawNightFusion(
             context = request.context,
             cameraId = selection.cameraId,
-            frameCount = request.prepared.framePlan.framesToCapture,
+            frameCount = if (request.rawSpeedMode == RawSpeedMode.BALANCED) {
+                request.prepared.framePlan.framesToCapture.coerceAtMost(4)
+            } else {
+                request.prepared.framePlan.framesToCapture
+            },
             resolutionMode = request.selectedResolution,
             resolutionPlan = request.resolutionPlan,
             finalOutputFormat = request.finalOutputFormat,
             zoomRatio = captureZoomRatio,
             physicalCameraId = physicalCameraId,
             focusAeState = request.focusAeState,
+            rawSpeedMode = request.rawSpeedMode,
             onStatus = loggedStatus
         )
     } else {

@@ -81,7 +81,16 @@ import kotlin.math.roundToInt
 
 data class LatestKeplerResult(
     val bitmap: Bitmap?,
-    val summary: String
+    val summary: String,
+    val jobType: String = "",
+    val fusionEngine: String = "",
+    val usedFrames: Int = 0,
+    val requestedFrames: Int = 0,
+    val outputWidth: Int? = null,
+    val outputHeight: Int? = null,
+    val fileName: String = "",
+    val jobName: String = "",
+    val filePath: String = ""
 )
 
 private fun logLongReport(tag: String, report: String) {
@@ -160,13 +169,19 @@ fun parseCaptureProgress(
                 text.contains("실패") ||
                 text.contains("오류") -> CaptureStage.FAILED
         text.contains("PIPELINE_COMPLETE", ignoreCase = true) ||
-                text.contains("완료") ||
+                text.contains("EXPORT_COMPLETE", ignoreCase = true) ||
+                text.contains("최종 완료") ||
+                text.contains("내보내기 완료") ||
                 lower.contains("saved to gallery") -> CaptureStage.COMPLETE
         lower.contains("cleanup") || lower.contains("cleaning") -> CaptureStage.CLEANING
         lower.contains("verifying") || lower.contains("verification") -> CaptureStage.VERIFYING
         lower.contains("exporting") || lower.contains("export ") -> CaptureStage.EXPORTING
         lower.contains("demosaic") -> CaptureStage.DEMOSAICING
-        text.contains("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true) ||
+        text.contains("CAPTURE_COMPLETE", ignoreCase = true) ||
+                text.contains("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true) ||
+                text.contains("Classic RAW fusion:", ignoreCase = true) ||
+                text.contains("Classic YUV fusion:", ignoreCase = true) ||
+                text.contains("Processing RAW fusion:", ignoreCase = true) ||
                 lower.contains("processing") || lower.contains("merging") || lower.contains("loading frames") -> CaptureStage.PROCESSING
         lower.contains("capture") || lower.contains("capturing") || lower.contains("frame saved") -> CaptureStage.CAPTURING
         lower.contains("prepar") || text.contains("준비") || text.contains("초기화") -> CaptureStage.PREPARING
@@ -233,6 +248,7 @@ fun MainCameraScreen(
 ) {
     val context = LocalContext.current
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
+    val savedSettings = remember { CameraSettingsStore.load(context) }
 
     var status by remember { mutableStateOf("대기 중") }
     var previewEnabled by remember { mutableStateOf(true) }
@@ -241,11 +257,27 @@ fun MainCameraScreen(
     var captureProgress by remember { mutableStateOf(CaptureProgressState()) }
 
     val selectedMode = "사진"
-    var selectedResolution by remember { mutableStateOf(CaptureResolutionMode.MP12) }
-    var selectedLensSlot by remember { mutableStateOf(LensSlot.MAIN_1X) }
-    var selectedThreeXSource by remember { mutableStateOf(ThreeXSourceMode.OPTICAL) }
-    var zoomUiState by remember { mutableStateOf(ZoomUiState()) }
-    var pipelineMode by remember { mutableStateOf(PipelineMode.RAW_NIGHT_FUSION) }
+    var selectedResolution by remember {
+        mutableStateOf(CaptureResolutionMode.entries.firstOrNull { it.name == savedSettings.selectedResolutionName } ?: CaptureResolutionMode.MP12)
+    }
+    var selectedLensSlot by remember {
+        mutableStateOf(LensSlot.entries.firstOrNull { it.name == savedSettings.selectedLensSlotName } ?: LensSlot.MAIN_1X)
+    }
+    var selectedThreeXSource by remember {
+        mutableStateOf(ThreeXSourceMode.entries.firstOrNull { it.name == savedSettings.selectedThreeXSourceName } ?: ThreeXSourceMode.OPTICAL)
+    }
+    var zoomUiState by remember {
+        mutableStateOf(
+            ZoomUiState(
+                zoomRatio = savedSettings.zoomRatio,
+                lensSlot = LensSlot.entries.firstOrNull { it.name == savedSettings.selectedLensSlotName } ?: LensSlot.MAIN_1X,
+                useOpticalTeleAt3x = (ThreeXSourceMode.entries.firstOrNull { it.name == savedSettings.selectedThreeXSourceName } ?: ThreeXSourceMode.OPTICAL) == ThreeXSourceMode.OPTICAL
+            )
+        )
+    }
+    var pipelineMode by remember {
+        mutableStateOf(PipelineMode.entries.firstOrNull { it.name == savedSettings.pipelineModeName } ?: PipelineMode.RAW_NIGHT_FUSION)
+    }
     var finalOutputFormat by remember { mutableStateOf(OutputSettingsStore.load(context)) }
     var focusAeState by remember { mutableStateOf(FocusAeState()) }
     var showFocusAeControls by remember { mutableStateOf(false) }
@@ -254,10 +286,15 @@ fun MainCameraScreen(
     var overlaySettings by remember {
         mutableStateOf(UiOverlaySettingsStore.load(context))
     }
-    var frameCountMode by remember { mutableStateOf(FrameCountMode.AUTO) }
-    var autoMinFrames by remember { mutableStateOf(4) }
-    var autoMaxFrames by remember { mutableStateOf(8) }
-    var manualFrames by remember { mutableStateOf(4) }
+    var frameCountMode by remember {
+        mutableStateOf(FrameCountMode.entries.firstOrNull { it.name == savedSettings.frameCountModeName } ?: FrameCountMode.AUTO)
+    }
+    var autoMinFrames by remember { mutableStateOf(savedSettings.autoMinFrames) }
+    var autoMaxFrames by remember { mutableStateOf(savedSettings.autoMaxFrames) }
+    var manualFrames by remember { mutableStateOf(savedSettings.manualFrames) }
+    var rawSpeedMode by remember {
+        mutableStateOf(RawSpeedMode.entries.firstOrNull { it.name == savedSettings.rawSpeedModeName } ?: RawSpeedMode.BALANCED)
+    }
     var latestSceneLuma by remember { mutableStateOf<Double?>(null) }
     var latestMotionScore by remember { mutableStateOf<Double?>(null) }
     var capabilityRefreshNonce by remember { mutableStateOf(0) }
@@ -296,11 +333,18 @@ fun MainCameraScreen(
 
     var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var latestSummary by remember { mutableStateOf("최근 결과 없음") }
+    var latestResult by remember { mutableStateOf<LatestKeplerResult?>(null) }
+    var showResultPreview by remember { mutableStateOf(false) }
 
-    fun refreshLatestResult() {
+    fun refreshLatestResult(showPreview: Boolean = false) {
         val result = loadLatestKeplerResultV2(context)
+        latestBitmap?.takeIf { it !== result.bitmap && !it.isRecycled }?.recycle()
         latestBitmap = result.bitmap
         latestSummary = result.summary
+        latestResult = result
+        if (showPreview && result.fileName.isNotBlank()) {
+            showResultPreview = true
+        }
         val estimate = estimateLatestColorBurstScene(context)
         latestSceneLuma = estimate.meanLuma
         latestMotionScore = estimate.motionScore
@@ -330,6 +374,35 @@ fun MainCameraScreen(
             selectedResolution = CaptureResolutionMode.MP12
             status = "Resolution changed to 12M: selected lens does not support current mode."
         }
+    }
+
+    LaunchedEffect(
+        selectedResolution,
+        selectedLensSlot,
+        selectedThreeXSource,
+        pipelineMode,
+        frameCountMode,
+        autoMinFrames,
+        autoMaxFrames,
+        manualFrames,
+        zoomUiState.zoomRatio,
+        rawSpeedMode
+    ) {
+        CameraSettingsStore.save(
+            context,
+            CameraUiSettings(
+                selectedResolutionName = selectedResolution.name,
+                selectedLensSlotName = selectedLensSlot.name,
+                selectedThreeXSourceName = selectedThreeXSource.name,
+                pipelineModeName = pipelineMode.name,
+                frameCountModeName = frameCountMode.name,
+                autoMinFrames = autoMinFrames,
+                autoMaxFrames = autoMaxFrames,
+                manualFrames = manualFrames,
+                zoomRatio = zoomUiState.zoomRatio,
+                rawSpeedModeName = rawSpeedMode.name
+            )
+        )
     }
 
     LaunchedEffect(frameCountMode, autoMinFrames, autoMaxFrames, manualFrames, selectedMode, latestSceneLuma, latestMotionScore) {
@@ -383,6 +456,10 @@ fun MainCameraScreen(
         timeoutMillis: Long = 120_000L,
         job: ((String) -> Unit) -> Unit
     ) {
+        if (isCapturing) {
+            Log.d("KeplerCaptureState", "Capture request ignored; pipeline busy")
+            return
+        }
         status = startMessage
         isCapturing = true
         previewEnabled = false
@@ -403,10 +480,18 @@ fun MainCameraScreen(
 
         fun finishIfTerminal(newStatus: String) {
             captureProgress = parseCaptureProgress(newStatus, captureProgress)
+            if (newStatus.contains("CAPTURE_COMPLETE", ignoreCase = true)) {
+                Log.d("KeplerCaptureState", "Capture stage complete; waiting for processing/export")
+            }
             if (isTerminalStatus(newStatus)) {
+                val lower = newStatus.lowercase()
+                val terminalSuccess =
+                    newStatus.contains("PIPELINE_COMPLETE", ignoreCase = true) ||
+                        newStatus.contains("EXPORT_COMPLETE", ignoreCase = true) ||
+                        lower.contains("saved to gallery")
                 mainHandler.removeCallbacks(watchdog)
                 isCapturing = false
-                refreshLatestResult()
+                refreshLatestResult(showPreview = terminalSuccess)
 
                 mainHandler.postDelayed(
                     { previewEnabled = true },
@@ -584,6 +669,10 @@ fun MainCameraScreen(
                     showZoomSlider = false
                 },
                 onCapture = captureClick@{
+                    if (isCapturing) {
+                        Log.d("KeplerCaptureState", "Capture click ignored; pipeline busy")
+                        return@captureClick
+                    }
                     val clickResult = handleCaptureClick(
                         CaptureClickInput(
                             context = context,
@@ -631,7 +720,8 @@ fun MainCameraScreen(
                                         selectedResolution = selectedResolution,
                                         resolutionPlan = clickResult.resolutionPlan,
                                         finalOutputFormat = finalOutputFormat,
-                                        focusAeState = focusAeState
+                                        focusAeState = focusAeState,
+                                        rawSpeedMode = rawSpeedMode
                                     ),
                                     onStatus = callback
                                 )
@@ -682,6 +772,16 @@ fun MainCameraScreen(
                 }
             )
 
+        ResultPreviewCard(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .padding(18.dp),
+            visible = showResultPreview,
+            result = latestResult,
+            onOpenGallery = onOpenGallery,
+            onDismiss = { showResultPreview = false }
+        )
+
         if (currentScreen == MainScreen.SETTINGS) {
             SettingsScreen(
                 frameCountMode = frameCountMode,
@@ -701,6 +801,8 @@ fun MainCameraScreen(
                 latestFramePlan = latestFramePlan,
                 pipelineMode = pipelineMode,
                 onPipelineModeChange = { pipelineMode = it },
+                rawSpeedMode = rawSpeedMode,
+                onRawSpeedModeChange = { rawSpeedMode = it },
                 finalOutputFormat = finalOutputFormat,
                 onFinalOutputFormatChange = { newFormat ->
                     finalOutputFormat = newFormat
@@ -1107,6 +1209,97 @@ fun CameraBottomPanel(
 }
 
 @Composable
+fun ResultPreviewCard(
+    modifier: Modifier = Modifier,
+    visible: Boolean,
+    result: LatestKeplerResult?,
+    onOpenGallery: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AnimatedVisibility(
+        modifier = modifier,
+        visible = visible,
+        enter = fadeIn() + expandVertically(),
+        exit = fadeOut() + shrinkVertically()
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = Color(0xEE11131B),
+            shape = RoundedCornerShape(24.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "Result saved",
+                    color = Color.White,
+                    style = MaterialTheme.typography.titleMedium
+                )
+                val bitmap = result?.bitmap
+                if (bitmap != null && !bitmap.isRecycled) {
+                    Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = "Latest fused result",
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(260.dp)
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(Color.Black),
+                        contentScale = ContentScale.Fit
+                    )
+                } else {
+                    Text(
+                        text = "Result saved, preview unavailable\n${result?.filePath?.ifBlank { result.jobName }.orEmpty()}",
+                        color = Color.White.copy(alpha = 0.78f),
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+                Text(
+                    text = buildString {
+                        val r = result
+                        append(r?.jobType?.ifBlank { "Kepler job" } ?: "Kepler job")
+                        r?.fusionEngine?.takeIf { it.isNotBlank() }?.let { append(" | ").append(it) }
+                        if ((r?.usedFrames ?: 0) > 0 || (r?.requestedFrames ?: 0) > 0) {
+                            append(" | frames=").append(r?.usedFrames ?: 0).append("/").append(r?.requestedFrames ?: 0)
+                        }
+                        if (r?.outputWidth != null && r.outputHeight != null) {
+                            append(" | ").append(r.outputWidth).append("x").append(r.outputHeight)
+                        }
+                        r?.fileName?.takeIf { it.isNotBlank() }?.let { append("\n").append(it) }
+                    },
+                    color = Color.White.copy(alpha = 0.72f),
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = onOpenGallery,
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Text("Open Gallery / Jobs")
+                    }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = onDismiss,
+                        shape = RoundedCornerShape(16.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF232633),
+                            contentColor = Color.White
+                        )
+                    ) {
+                        Text("Dismiss")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun CaptureProgressRow(
     captureProgress: CaptureProgressState
 ) {
@@ -1401,6 +1594,8 @@ fun SettingsScreen(
     latestFramePlan: FramePlan,
     pipelineMode: PipelineMode,
     onPipelineModeChange: (PipelineMode) -> Unit,
+    rawSpeedMode: RawSpeedMode,
+    onRawSpeedModeChange: (RawSpeedMode) -> Unit,
     finalOutputFormat: FinalOutputFormat,
     onFinalOutputFormatChange: (FinalOutputFormat) -> Unit,
     overlaySettings: UiOverlaySettings,
@@ -1487,7 +1682,9 @@ fun SettingsScreen(
 
                 PipelineModeSettingsSection(
                     pipelineMode = pipelineMode,
-                    onPipelineModeChange = onPipelineModeChange
+                    onPipelineModeChange = onPipelineModeChange,
+                    rawSpeedMode = rawSpeedMode,
+                    onRawSpeedModeChange = onRawSpeedModeChange
                 )
 
                 OutputFormatSettingsSection(
@@ -1684,7 +1881,9 @@ fun FrameCountSettingsSection(
 @Composable
 fun PipelineModeSettingsSection(
     pipelineMode: PipelineMode,
-    onPipelineModeChange: (PipelineMode) -> Unit
+    onPipelineModeChange: (PipelineMode) -> Unit,
+    rawSpeedMode: RawSpeedMode,
+    onRawSpeedModeChange: (RawSpeedMode) -> Unit
 ) {
     Column(
         verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -1705,6 +1904,20 @@ fun PipelineModeSettingsSection(
                 selected = pipelineMode == PipelineMode.YUV_NIGHT_FUSION,
                 onClick = { onPipelineModeChange(PipelineMode.YUV_NIGHT_FUSION) }
             )
+        }
+        Text(
+            text = "RAW Speed",
+            color = Color.White.copy(alpha = 0.72f),
+            style = MaterialTheme.typography.bodySmall
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            RawSpeedMode.entries.forEach { mode ->
+                FrameModeChip(
+                    text = mode.label,
+                    selected = rawSpeedMode == mode,
+                    onClick = { onRawSpeedModeChange(mode) }
+                )
+            }
         }
     }
 }
@@ -1947,34 +2160,38 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
         val picturesDir = context.getExternalFilesDir(android.os.Environment.DIRECTORY_PICTURES)
             ?: return LatestKeplerResult(null, "Pictures folder unavailable")
 
-        val latestJobDir = listOf(
-            File(picturesDir, "KeplerColorBurst"),
-            File(picturesDir, "KeplerRawFusion"),
-            File(picturesDir, "KeplerSuperRes")
-        )
-            .flatMap { root ->
-                root.listFiles()
-                    ?.filter { it.isDirectory && File(it, "job.json").exists() }
-                    .orEmpty()
-            }
-            .maxByOrNull { it.lastModified() }
+        val latestJobs = listOf(
+            File(picturesDir, "KeplerColorBurst") to "KPL_COLOR_BURST_",
+            File(picturesDir, "KeplerRawFusion") to "KPL_RAW_FUSION_"
+        ).flatMap { (root, prefix) ->
+            root.listFiles()
+                ?.filter { it.isDirectory && it.name.startsWith(prefix) && File(it, "job.json").exists() }
+                .orEmpty()
+        }.sortedByDescending { it.lastModified() }
+
+        val latest = latestJobs.firstNotNullOfOrNull { jobDir ->
+            val job = runCatching { JSONObject(File(jobDir, "job.json").readText()) }.getOrNull()
+                ?: return@firstNotNullOfOrNull null
+            val file = chooseLatestResultFile(jobDir, job) ?: return@firstNotNullOfOrNull null
+            Triple(jobDir, job, file)
+        }
             ?: return LatestKeplerResult(null, "No Kepler jobs found")
 
-        val job = JSONObject(File(latestJobDir, "job.json").readText())
-        val firstFrameName = job.optJSONArray("frames")
-            ?.optJSONObject(0)
-            ?.optString("file")
-            .orEmpty()
-        val previewName = listOf(
-            job.optString("finalNightFusionFile", ""),
-            job.optString("finalFile", ""),
-            job.optString("averageColorFile", ""),
-            firstFrameName
+        val latestJobDir = latest.first
+        val job = latest.second
+        val previewFile = latest.third
+        val bitmap = decodeLatestResultPreview(previewFile)
+        val jobType = job.optString("jobType", latestJobDir.parentFile?.name.orEmpty())
+        val fusionEngine = listOf(
+            job.optString("fusionEngine", ""),
+            job.optString("rawFusionEngine", ""),
+            job.optString("fusionVersion", ""),
+            job.optString("rawFusionVersion", "")
         ).firstOrNull { it.isNotBlank() }.orEmpty()
-        val bitmap = previewName.takeIf { it.isNotBlank() }
-            ?.let { File(latestJobDir, it) }
-            ?.takeIf { it.exists() }
-            ?.let { decodeLatestResultPreview(it) }
+        val usedFrames = job.optInt("usedFrameCount", job.optInt("savedFrames", 0))
+        val requestedFrames = job.optInt("requestedFrames", 0)
+        val outputWidth = job.optInt("outputWidth", 0).takeIf { it > 0 }
+        val outputHeight = job.optInt("outputHeight", 0).takeIf { it > 0 }
 
         val summary = buildString {
             append("status=")
@@ -1997,11 +2214,41 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
             append(job.optString("cleanupStatus", "none"))
             append(", job=")
             append(latestJobDir.name)
+            append(", file=")
+            append(previewFile.name)
         }
-        LatestKeplerResult(bitmap, summary)
+        LatestKeplerResult(
+            bitmap = bitmap,
+            summary = summary,
+            jobType = jobType,
+            fusionEngine = fusionEngine,
+            usedFrames = usedFrames,
+            requestedFrames = requestedFrames,
+            outputWidth = outputWidth,
+            outputHeight = outputHeight,
+            fileName = previewFile.name,
+            jobName = latestJobDir.name,
+            filePath = previewFile.absolutePath
+        )
     } catch (e: Exception) {
         LatestKeplerResult(null, "Latest result load failed: ${e.javaClass.simpleName}")
     }
+}
+
+private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
+    val names = listOf(
+        job.optString("finalFile", ""),
+        job.optString("finalNightFusionFile", ""),
+        "sharpened_night_fusion.png",
+        "raw_fusion_final.png",
+        "average_color_rotated.png",
+        "compare_reference_vs_fused.png"
+    )
+    return names
+        .asSequence()
+        .filter { it.isNotBlank() && it != "null" }
+        .map { File(jobDir, it) }
+        .firstOrNull { it.exists() && it.length() > 0L }
 }
 
 private fun decodeLatestResultPreview(file: File, maxDimension: Int = 1280): Bitmap? {

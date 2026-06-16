@@ -22,6 +22,7 @@ import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
 import android.util.Size
+import android.view.Surface
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -244,6 +245,9 @@ fun captureYuvBurstColorWithMotion(
             estimateYuvBufferBytes(yuvSize.width, yuvSize.height) * frameCount
 
         val jobFile = File(burstDir, "job.json")
+        var yuvCaptureRequestTemplate = "UNSELECTED"
+        var yuvCaptureRequestTemplateFallbackUsed = false
+        val yuvCaptureRequestTemplateFailures = mutableListOf<String>()
 
         postStatus("Color Fusion 초기화 3/7: job.json 생성 중...")
 
@@ -573,39 +577,38 @@ fun captureYuvBurstColorWithMotion(
                                             zoomRatio
                                         }
                                         val requests = List(frameCount) {
-                                            camera.createCaptureRequest(
-                                                CameraDevice.TEMPLATE_STILL_CAPTURE
-                                            ).apply {
-                                                addTarget(reader.surface)
-
-                                                set(
-                                                    CaptureRequest.CONTROL_MODE,
-                                                    CaptureRequest.CONTROL_MODE_AUTO
-                                                )
-
-                                                set(
-                                                    CaptureRequest.CONTROL_AF_MODE,
-                                                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-                                                )
-
-                                                set(
-                                                    CaptureRequest.NOISE_REDUCTION_MODE,
-                                                    CaptureRequest.NOISE_REDUCTION_MODE_FAST
-                                                )
-
-                                                set(
-                                                    CaptureRequest.EDGE_MODE,
-                                                    CaptureRequest.EDGE_MODE_FAST
-                                                )
-
-                                                applyZoomAndFocusAe(
+                                            val (builder, selectedTemplate) =
+                                                createYuvBurstCaptureRequestBuilder(
+                                                    camera = camera,
+                                                    readerSurface = reader.surface,
                                                     characteristics = characteristics,
                                                     zoomRatio = requestZoomRatio,
                                                     focusAeState = focusAeState,
-                                                    cameraId = cameraId
+                                                    cameraId = cameraId,
+                                                    postStatus = ::postStatus,
+                                                    failureMessages = yuvCaptureRequestTemplateFailures
                                                 )
-                                            }.build()
+                                            yuvCaptureRequestTemplate =
+                                                yuvTemplateLabel(selectedTemplate)
+                                            yuvCaptureRequestTemplateFallbackUsed =
+                                                selectedTemplate != CameraDevice.TEMPLATE_STILL_CAPTURE
+                                            builder.build()
                                         }
+                                        updateYuvCaptureRequestTemplateMetadata(
+                                            jobFile = jobFile,
+                                            template = yuvCaptureRequestTemplate,
+                                            fallbackUsed = yuvCaptureRequestTemplateFallbackUsed,
+                                            failures = yuvCaptureRequestTemplateFailures
+                                        )
+                                        Log.i(
+                                            "KeplerCaptureStatus",
+                                            "YUV capture request template selected: " +
+                                                yuvCaptureRequestTemplate
+                                        )
+                                        postStatus(
+                                            "YUV capture request template selected: " +
+                                                yuvCaptureRequestTemplate
+                                        )
 
                                         session.captureBurst(
                                             requests,
@@ -627,7 +630,19 @@ fun captureYuvBurstColorWithMotion(
                                             backgroundHandler
                                         )
                                     } catch (e: Exception) {
-                                        finish("Color Burst 캡처 요청 실패\n${e.stackTraceToString()}")
+                                        val templateFailure =
+                                            e.message?.contains(
+                                                "YUV capture request template creation failed"
+                                            ) == true
+                                        if (templateFailure) {
+                                            finish(
+                                                "PIPELINE_FAILED: ${e.message}\n" +
+                                                    "Failures: " +
+                                                    yuvCaptureRequestTemplateFailures.joinToString(" | ")
+                                            )
+                                        } else {
+                                            finish("Color Burst 캡처 요청 실패\n${e.stackTraceToString()}")
+                                        }
                                     }
                             },
 
@@ -1034,6 +1049,106 @@ fun chooseColorFusionSize(
     }
 }
 
+private fun createYuvBurstCaptureRequestBuilder(
+    camera: CameraDevice,
+    readerSurface: Surface,
+    characteristics: CameraCharacteristics,
+    zoomRatio: Float,
+    focusAeState: FocusAeState,
+    cameraId: String,
+    postStatus: (String) -> Unit,
+    failureMessages: MutableList<String>? = null
+): Pair<CaptureRequest.Builder, Int> {
+    val templates = listOf(
+        CameraDevice.TEMPLATE_STILL_CAPTURE,
+        CameraDevice.TEMPLATE_PREVIEW,
+        CameraDevice.TEMPLATE_RECORD
+    )
+    val failures = mutableListOf<String>()
+    for (template in templates) {
+        val builder = try {
+            camera.createCaptureRequest(template)
+        } catch (e: Exception) {
+            val message =
+                "${yuvTemplateLabel(template)}: ${e.javaClass.simpleName}: ${e.message}"
+            failures += message
+            failureMessages?.add(message.take(240))
+            Log.w("KeplerCaptureStatus", "YUV capture request template failed: $message")
+            val next = templates.dropWhile { it != template }.drop(1).firstOrNull()
+            if (next != null) {
+                postStatus(
+                    "YUV capture request template ${yuvTemplateShortName(template)} failed; " +
+                        "trying ${yuvTemplateShortName(next)}..."
+                )
+            }
+            continue
+        }
+        builder.addTarget(readerSurface)
+        builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+        val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+            ?.toSet()
+            .orEmpty()
+        if (CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE in afModes) {
+            runCatching {
+                builder.set(
+                    CaptureRequest.CONTROL_AF_MODE,
+                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                )
+            }
+        }
+        runCatching {
+            builder.set(
+                CaptureRequest.NOISE_REDUCTION_MODE,
+                CaptureRequest.NOISE_REDUCTION_MODE_FAST
+            )
+        }
+        runCatching {
+            builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_FAST)
+        }
+        builder.applyZoomAndFocusAe(
+            characteristics = characteristics,
+            zoomRatio = zoomRatio,
+            focusAeState = focusAeState,
+            cameraId = cameraId
+        )
+        return builder to template
+    }
+    throw IllegalStateException(
+        "YUV capture request template creation failed for all templates: " +
+            failures.joinToString(" | ")
+    )
+}
+
+private fun yuvTemplateLabel(template: Int): String = when (template) {
+    CameraDevice.TEMPLATE_STILL_CAPTURE -> "STILL_CAPTURE"
+    CameraDevice.TEMPLATE_PREVIEW -> "PREVIEW_FALLBACK"
+    CameraDevice.TEMPLATE_RECORD -> "RECORD_FALLBACK"
+    else -> "UNKNOWN_$template"
+}
+
+private fun yuvTemplateShortName(template: Int): String = when (template) {
+    CameraDevice.TEMPLATE_STILL_CAPTURE -> "STILL"
+    CameraDevice.TEMPLATE_PREVIEW -> "PREVIEW"
+    CameraDevice.TEMPLATE_RECORD -> "RECORD"
+    else -> "UNKNOWN_$template"
+}
+
+private fun updateYuvCaptureRequestTemplateMetadata(
+    jobFile: File,
+    template: String,
+    fallbackUsed: Boolean,
+    failures: List<String>
+) {
+    runCatching {
+        val job = if (jobFile.isFile) JSONObject(jobFile.readText()) else JSONObject()
+        job.put("yuvCaptureRequestTemplate", template)
+            .put("yuvCaptureRequestTemplateFallbackUsed", fallbackUsed)
+            .put("yuvCaptureRequestTemplateFailures", JSONArray(failures.take(6)))
+            .put("updatedAt", System.currentTimeMillis())
+        jobFile.writeText(job.toString(2))
+    }
+}
+
 fun writeColorJobJson(
     jobFile: File,
     status: String,
@@ -1062,9 +1177,17 @@ fun writeColorJobJson(
     manualFrames: Int = 4,
     framePlanReason: String = "Default",
     yuvMemoryBufferUsed: Boolean = false,
-    yuvMemoryBufferEstimatedBytes: Long = 0L
+    yuvMemoryBufferEstimatedBytes: Long = 0L,
+    yuvCaptureRequestTemplate: String? = null,
+    yuvCaptureRequestTemplateFallbackUsed: Boolean? = null,
+    yuvCaptureRequestTemplateFailures: List<String>? = null
 ) {
     val framesArray = JSONArray()
+    val previousJob = if (jobFile.exists()) {
+        runCatching { JSONObject(jobFile.readText()) }.getOrNull()
+    } else {
+        null
+    }
 
     frameFiles.forEachIndexed { index, fileName ->
         val frameObject = JSONObject()
@@ -1113,16 +1236,35 @@ fun writeColorJobJson(
         .put("yuvMemoryBufferEstimatedBytes", yuvMemoryBufferEstimatedBytes)
         .put("yuvMemoryBufferFrameLimit", MAX_YUV_MEMORY_BUFFER_FRAMES)
         .put("yuvMemoryBufferByteLimit", MAX_YUV_MEMORY_BUFFER_BYTES)
+        .put(
+            "yuvCaptureRequestTemplate",
+            yuvCaptureRequestTemplate
+                ?: previousJob?.optString("yuvCaptureRequestTemplate", "UNSELECTED")
+                ?: "UNSELECTED"
+        )
+        .put(
+            "yuvCaptureRequestTemplateFallbackUsed",
+            yuvCaptureRequestTemplateFallbackUsed
+                ?: previousJob?.optBoolean("yuvCaptureRequestTemplateFallbackUsed", false)
+                ?: false
+        )
+        .put(
+            "yuvCaptureRequestTemplateFailures",
+            JSONArray(
+                yuvCaptureRequestTemplateFailures
+                    ?: previousJob?.optJSONArray("yuvCaptureRequestTemplateFailures")
+                        ?.let { array -> List(array.length()) { array.optString(it) } }
+                    ?: emptyList<String>()
+            )
+        )
         .put("frames", framesArray)
         .put("motion", motionObject)
         .put("updatedAt", now)
 
-    if (!jobFile.exists()) {
+    if (previousJob == null) {
         json.put("createdAt", now)
     } else {
-        val oldCreatedAt = runCatching {
-            JSONObject(jobFile.readText()).optLong("createdAt", now)
-        }.getOrDefault(now)
+        val oldCreatedAt = previousJob.optLong("createdAt", now)
 
         json.put("createdAt", oldCreatedAt)
     }
