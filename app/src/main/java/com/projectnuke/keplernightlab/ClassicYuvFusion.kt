@@ -30,6 +30,14 @@ private data class ClassicFrame(
     var alignDx: Int = 0,
     var alignDy: Int = 0,
     var alignmentScore: Float = 0f,
+    var alignmentConfidence: Float = 1f,
+    var alignIntegerDx: Int = 0,
+    var alignIntegerDy: Int = 0,
+    var alignSubpixelDx: Float = 0f,
+    var alignSubpixelDy: Float = 0f,
+    var alignmentBackend: String = "kotlin_integer_v1",
+    var alignmentUsedSubpixel: Boolean = false,
+    var alignmentFallbackUsed: Boolean = false,
     var alignmentUsed: Boolean = true,
     var isReference: Boolean = false
 )
@@ -43,9 +51,17 @@ private data class LumaThumbnail(
 )
 
 private data class AlignmentResult(
-    val dx: Int,
-    val dy: Int,
-    val score: Float
+    val dx: Float,
+    val dy: Float,
+    val integerDx: Int,
+    val integerDy: Int,
+    val subpixelDx: Float,
+    val subpixelDy: Float,
+    val score: Float,
+    val confidence: Float,
+    val backend: String,
+    val usedSubpixel: Boolean,
+    val fallbackUsed: Boolean
 )
 
 private data class MergeResult(
@@ -87,6 +103,9 @@ internal fun processClassicYuvFusionJob(
         onStatus("Classic YUV fusion: selected reference frame ${reference.jsonIndex + 1}")
 
         val referenceThumbnail = requireNotNull(reference.thumbnail)
+        var nativeAlignmentUsed = false
+        var fallbackAlignmentCount = 0
+        var lowConfidenceAlignmentCount = 0
         frames.forEachIndexed { index, frame ->
             onStatus("Classic YUV fusion: aligning frame ${index + 1}/${frames.size}...")
             if (frame === reference) {
@@ -98,7 +117,18 @@ internal fun processClassicYuvFusionJob(
                 val fullScaleY = frame.thumbnail!!.sampleSize.toFloat()
                 frame.alignDx = (alignment.dx * fullScaleX).roundToInt()
                 frame.alignDy = (alignment.dy * fullScaleY).roundToInt()
+                frame.alignIntegerDx = (alignment.integerDx * fullScaleX).roundToInt()
+                frame.alignIntegerDy = (alignment.integerDy * fullScaleY).roundToInt()
+                frame.alignSubpixelDx = alignment.subpixelDx * fullScaleX
+                frame.alignSubpixelDy = alignment.subpixelDy * fullScaleY
                 frame.alignmentScore = alignment.score
+                frame.alignmentConfidence = alignment.confidence
+                frame.alignmentBackend = alignment.backend
+                frame.alignmentUsedSubpixel = alignment.usedSubpixel
+                frame.alignmentFallbackUsed = alignment.fallbackUsed
+                if (alignment.backend == "native_subpixel_v1") nativeAlignmentUsed = true
+                if (alignment.fallbackUsed) fallbackAlignmentCount++
+                if (alignment.confidence < 0.35f) lowConfidenceAlignmentCount++
                 frame.alignmentUsed =
                     alignment.score.isFinite() &&
                         alignment.score <= params.alignmentRejectThreshold
@@ -153,6 +183,11 @@ internal fun processClassicYuvFusionJob(
             .put("fusionParamsVersion", CLASSIC_YUV_FUSION_PARAMS_VERSION)
             .put("fusionPresetName", params.presetName)
             .put("fusionParams", params.toJson())
+            .put("nativeAlignmentAvailable", NativeFusionAlignment.isAvailable())
+            .put("nativeAlignmentUsed", nativeAlignmentUsed)
+            .put("alignmentVersion", if (nativeAlignmentUsed) "native_subpixel_v1" else "kotlin_integer_v1")
+            .put("fallbackAlignmentCount", fallbackAlignmentCount)
+            .put("lowConfidenceAlignmentCount", lowConfidenceAlignmentCount)
             .put("usedFrameCount", compatibleFrames.size)
             .put("excludedFrameCount", excludedFrameCount)
             .put("skippedFrameCount", skippedFrameCount)
@@ -181,7 +216,10 @@ internal fun processClassicYuvFusionJob(
                 processingTimeMs = processingTimeMs,
                 outputWidth = dimensions.first,
                 outputHeight = dimensions.second,
-                params = params
+                params = params,
+                nativeAlignmentUsed = nativeAlignmentUsed,
+                fallbackAlignmentCount = fallbackAlignmentCount,
+                lowConfidenceAlignmentCount = lowConfidenceAlignmentCount
             )
         }.exceptionOrNull()
         generateFusionDebugArtifacts(
@@ -323,7 +361,46 @@ private fun estimateTranslation(
             }
         }
     }
-    return AlignmentResult(bestDx, bestDy, bestScore)
+    val native = if (NativeFusionAlignment.isAvailable()) {
+        NativeFusionAlignment.alignLumaFrames(
+            reference = reference.luma,
+            candidate = candidate.luma,
+            width = reference.width,
+            height = reference.height,
+            rowStride = reference.width,
+            searchRadius = CLASSIC_FUSION_ALIGNMENT_SEARCH_RADIUS
+        )
+    } else {
+        null
+    }
+    if (native != null && native.confidence >= 0.35f) {
+        return AlignmentResult(
+            dx = native.dx,
+            dy = native.dy,
+            integerDx = native.integerDx,
+            integerDy = native.integerDy,
+            subpixelDx = native.subpixelDx,
+            subpixelDy = native.subpixelDy,
+            score = native.score,
+            confidence = native.confidence,
+            backend = native.backend,
+            usedSubpixel = native.usedSubpixel,
+            fallbackUsed = false
+        )
+    }
+    return AlignmentResult(
+        dx = bestDx.toFloat(),
+        dy = bestDy.toFloat(),
+        integerDx = bestDx,
+        integerDy = bestDy,
+        subpixelDx = 0f,
+        subpixelDy = 0f,
+        score = bestScore,
+        confidence = (1f - bestScore / 0.20f).coerceIn(0f, 1f),
+        backend = "kotlin_integer_v1",
+        usedSubpixel = false,
+        fallbackUsed = native != null
+    )
 }
 
 private fun alignmentMad(
@@ -566,7 +643,15 @@ private fun updateAlignmentMetadata(
     val globalWeight = globalWeightFor(frame, params)
     frameJson.put("alignDx", frame.alignDx)
         .put("alignDy", frame.alignDy)
+        .put("alignIntegerDx", frame.alignIntegerDx)
+        .put("alignIntegerDy", frame.alignIntegerDy)
+        .put("alignSubpixelDx", frame.alignSubpixelDx.toDouble())
+        .put("alignSubpixelDy", frame.alignSubpixelDy.toDouble())
         .put("alignmentScore", frame.alignmentScore.toDouble())
+        .put("alignmentConfidence", frame.alignmentConfidence.toDouble())
+        .put("alignmentBackend", frame.alignmentBackend)
+        .put("alignmentUsedSubpixel", frame.alignmentUsedSubpixel)
+        .put("alignmentFallbackUsed", frame.alignmentFallbackUsed)
         .put("alignmentUsed", frame.alignmentUsed)
         .put("globalWeight", globalWeight.toDouble())
         .put("fusionUsed", used)
@@ -582,7 +667,10 @@ private fun writeFusionDebugMetadata(
     processingTimeMs: Long,
     outputWidth: Int,
     outputHeight: Int,
-    params: ClassicYuvFusionParams
+    params: ClassicYuvFusionParams,
+    nativeAlignmentUsed: Boolean,
+    fallbackAlignmentCount: Int,
+    lowConfidenceAlignmentCount: Int
 ) {
     val frameMap = frames.associateBy { it.jsonIndex }
     val sourceFrames = job.optJSONArray("frames") ?: JSONArray()
@@ -607,6 +695,10 @@ private fun writeFusionDebugMetadata(
                 .put("file", fileName)
                 .put("alignDx", frame?.alignDx ?: source.optInt("alignDx", 0))
                 .put("alignDy", frame?.alignDy ?: source.optInt("alignDy", 0))
+                .put("alignIntegerDx", frame?.alignIntegerDx ?: source.optInt("alignIntegerDx", 0))
+                .put("alignIntegerDy", frame?.alignIntegerDy ?: source.optInt("alignIntegerDy", 0))
+                .put("alignSubpixelDx", frame?.alignSubpixelDx?.toDouble() ?: source.optDouble("alignSubpixelDx", 0.0))
+                .put("alignSubpixelDy", frame?.alignSubpixelDy?.toDouble() ?: source.optDouble("alignSubpixelDy", 0.0))
                 .put(
                     "alignmentScore",
                     frame?.alignmentScore?.toDouble()
@@ -617,6 +709,10 @@ private fun writeFusionDebugMetadata(
                     frame?.let { globalWeightFor(it, params).toDouble() }
                         ?: source.optDouble("globalWeight", 0.0)
                 )
+                .put("alignmentConfidence", frame?.alignmentConfidence?.toDouble() ?: source.optDouble("alignmentConfidence", 0.0))
+                .put("alignmentBackend", frame?.alignmentBackend ?: source.optString("alignmentBackend", "none"))
+                .put("alignmentUsedSubpixel", frame?.alignmentUsedSubpixel ?: source.optBoolean("alignmentUsedSubpixel", false))
+                .put("alignmentFallbackUsed", frame?.alignmentFallbackUsed ?: source.optBoolean("alignmentFallbackUsed", false))
                 .put("used", frame != null)
                 .put("skipReason", skipReason ?: JSONObject.NULL)
         )
@@ -627,6 +723,11 @@ private fun writeFusionDebugMetadata(
         .put("fusionParamsVersion", CLASSIC_YUV_FUSION_PARAMS_VERSION)
         .put("fusionPresetName", params.presetName)
         .put("fusionParams", params.toJson())
+        .put("nativeAlignmentAvailable", NativeFusionAlignment.isAvailable())
+        .put("nativeAlignmentUsed", nativeAlignmentUsed)
+        .put("alignmentVersion", if (nativeAlignmentUsed) "native_subpixel_v1" else "kotlin_integer_v1")
+        .put("fallbackAlignmentCount", fallbackAlignmentCount)
+        .put("lowConfidenceAlignmentCount", lowConfidenceAlignmentCount)
         .put("referenceFrameIndex", job.optInt("referenceFrameIndex"))
         .put("usedFrameCount", frames.size)
         .put("excludedFrameCount", countExcludedFrames(job))

@@ -7,6 +7,7 @@ add_library(
     SHARED
     kepler_raw_engine.cpp
     frame_quality.cpp
+    fusion_alignment.cpp
 )
 
 find_library(log-lib log)

@@ -470,7 +470,10 @@ private fun metadataSummary(job: JSONObject?): List<Pair<String, String>> {
         "ghostRejectedPixelRatio", "processingTimeMs", "outputWidth", "outputHeight",
         "fusionPresetName", "fusionParamsVersion", "fusionParams",
         "debugArtifactStatus", "debugArtifactError", "fusionDebugFile",
-        "fusedClassicPresetFile"
+        "fusedClassicPresetFile", "rawFusionEngine", "rawFusionVersion",
+        "rawReferenceFrameIndex", "rawGhostSuppressionUsed", "rawOutlierRejectedRatio",
+        "rawFusionProcessingTimeMs", "rawFusionDebugFile", "rawDebugArtifactStatus",
+        "rawDebugArtifactError"
     ).mapNotNull { key ->
         if (!job.has(key) || job.isNull(key)) null else key to job.get(key).toString()
     }
@@ -483,7 +486,10 @@ private fun fusionDebugArtifactFiles(
     return listOf(
         "Reference frame" to metadata.optString("referenceFrameDebugFile", "reference_frame.png"),
         "Fused output" to metadata.optString("fusedClassicDebugFile", "fused_classic_yuv_v1.png"),
-        "A/B comparison" to metadata.optString("comparisonDebugFile", "compare_reference_vs_fused.png")
+        "A/B comparison" to metadata.optString("comparisonDebugFile", "compare_reference_vs_fused.png"),
+        "RAW reference" to metadata.optString("rawReferencePreviewFile", "raw_reference_preview.png"),
+        "RAW fused" to metadata.optString("rawFusedPreviewFile", "raw_fused_classic_v1_preview.png"),
+        "RAW A/B comparison" to metadata.optString("rawComparePreviewFile", "raw_compare_reference_vs_fused.png")
     ).mapNotNull { (label, name) ->
         java.io.File(job.directory, name).takeIf { name.isNotBlank() && it.isFile }?.let { label to it }
     }

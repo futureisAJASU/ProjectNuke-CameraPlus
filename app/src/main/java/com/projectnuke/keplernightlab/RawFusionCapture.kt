@@ -738,9 +738,16 @@ private object RawFusionExportCoordinator {
             .put("referenceFrameIndex", context.referenceSelection.index)
             .put("referenceFrameReason", context.referenceSelection.reason)
             .put("alignmentStatus", context.nativeMerge.alignmentStatus)
-            .put("nativeRawMerge", true)
+            .put("nativeRawMerge", context.nativeMerge.mergedOk)
             .put("alignmentFile", context.files.alignmentFile.name)
-            .put("mergedRawFormat", "black_level_subtracted_aligned_compact_raw16")
+            .put(
+                "mergedRawFormat",
+                if (context.job.optString("rawFusionEngine") == "classic_raw_v1") {
+                    "black_level_subtracted_classic_raw_v1_compact_raw16"
+                } else {
+                    "black_level_subtracted_aligned_compact_raw16"
+                }
+            )
             .put("sensorOrientation", context.job.opt("sensorOrientation") ?: JSONObject.NULL)
             .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
             .put("processedAt", System.currentTimeMillis())
@@ -975,80 +982,39 @@ fun processRawFusionJob(
         )
 
         onStatus("Processing RAW fusion: using ${frameInputs.size}/$requestedFrames frames")
-        val mergedRawFile = File(jobDir, "merged_raw.raw16")
-        val alignmentFile = File(jobDir, ALIGNMENT_JSON_FILE_NAME)
+        val mergedRawFile = File(jobDir, "merged_raw_classic_v1.raw16")
+        val alignmentFile = File(jobDir, "raw_fusion_debug.json")
         val files = RawFusionFiles(jobDir, jobFile, mergedRawFile, alignmentFile)
-        if (isNativeRawEngineAvailable()) {
-            onStatus("Processing RAW fusion: native alignment...")
-        }
-        val nativeStatus = runNativeRawMerge(
-            NativeMergeRequest(
-                frameInputs = frameInputs,
-                exposureScales = exposureScales,
-                frameWeights = frameWeights,
-                width = width,
-                height = height,
-                cfa = cfa,
-                blackLevel = blackLevel,
-                whiteLevel = whiteLevel,
-                referenceIndex = referenceSelection.index,
-                mergedRawFile = mergedRawFile,
-                alignmentFile = alignmentFile
-            )
+        val classicMerge = runClassicRawFusionMerge(
+            jobDir = jobDir,
+            job = job,
+            preparedFrames = preparedFrames,
+            sensor = sensor,
+            blackLevelEstimate = blackLevelEstimate,
+            mergedRawFile = mergedRawFile,
+            alignmentFile = alignmentFile,
+            onStatus = onStatus
         )
-        val nativeMergedOk = nativeStatus.startsWith("OK:") &&
+        val classicMergedOk = classicMerge.success &&
             mergedRawFile.exists() &&
             mergedRawFile.length() >= pixelCount * 2L &&
             alignmentFile.exists()
-        if (nativeMergedOk) {
-            onStatus("Processing RAW fusion: native Bayer merge complete")
-        } else {
-            if (highResolutionRaw) {
-                job.put("processStatus", "NATIVE_MERGE_FAILED_KEEPING_CACHE")
-                    .put("nativeRawMerge", false)
-                    .put("alignmentStatus", "NATIVE_TILE_MERGE_FAILED")
-                    .put("alignmentError", nativeStatus)
-                    .put("processedAt", System.currentTimeMillis())
-                jobFile.writeText(job.toString(2))
-                onStatus("RAW fusion native tile merge failed. RAW cache kept.")
-                return RawFusionProcessResult(
-                    success = false,
-                    mergedRawFile = null,
-                    mergedDngFile = null,
-                    previewPngFile = null,
-                    finalPngFile = null,
-                    errorMessage = "Native RAW merge required for 50MP-class high-resolution input; Kotlin fallback disabled. $nativeStatus"
-                )
-            }
-            onStatus("Processing RAW fusion: native failed, falling back to Kotlin merge")
-            mergeRawFramesInKotlin(
-                KotlinRawMergeRequest(
-                    frameInputs = frameInputs,
-                    mergePreparation = mergePreparation,
-                    sensor = sensor,
-                    blackLevelEstimate = blackLevelEstimate,
-                    job = job,
-                    mergedRawFile = mergedRawFile,
-                    onStatus = onStatus
-                )
+        if (!classicMergedOk) {
+            jobFile.writeText(job.toString(2))
+            onStatus("Classic RAW fusion failed. RAW cache kept.")
+            return RawFusionProcessResult(
+                success = false,
+                mergedRawFile = null,
+                mergedDngFile = null,
+                previewPngFile = null,
+                finalPngFile = null,
+                errorMessage = classicMerge.errorMessage ?: "Classic RAW fusion failed"
             )
         }
-        val nativeAlignmentMetadata = if (nativeMergedOk) {
-            runCatching { JSONObject(alignmentFile.readText()) }.getOrNull()
-        } else {
-            null
-        }
-        val nativeAlignmentStatus =
-            resolveNativeAlignmentStatus(nativeMergedOk, nativeAlignmentMetadata)
-        if (nativeMergedOk) {
-            applyNativeMergeMetadata(job, nativeAlignmentMetadata)
-                .put("alignmentStatus", nativeAlignmentStatus)
-                .put("nativeRawMerge", true)
-                .put("alignmentFile", alignmentFile.name)
-            jobFile.writeText(job.toString(2))
-        }
+        jobFile.writeText(job.toString(2))
 
         onStatus("Processing RAW fusion: demosaicing...")
+        onStatus("Classic RAW fusion: tone/export...")
         val outputMode = CaptureResolutionMode.entries.firstOrNull { it.name == job.optString("outputResolutionMode") }
             ?: CaptureResolutionMode.entries.firstOrNull { it.label == job.optString("resolutionMode") }
             ?: CaptureResolutionMode.MP12
@@ -1060,12 +1026,15 @@ fun processRawFusionJob(
                 frames = preparedFrames,
                 blackLevelEstimate = blackLevelEstimate,
                 whiteLevelEstimate = whiteLevelEstimate,
-                referenceSelection = referenceSelection,
+                referenceSelection = RawReferenceSelection(
+                    classicMerge.referenceIndex,
+                    classicMerge.referenceReason
+                ),
                 nativeMerge = NativeMergeOutcome(
-                    mergedOk = nativeMergedOk,
-                    status = nativeStatus,
-                    alignmentMetadata = nativeAlignmentMetadata,
-                    alignmentStatus = nativeAlignmentStatus
+                    mergedOk = false,
+                    status = "OK: classic_raw_v1",
+                    alignmentMetadata = classicMerge.debugMetadata,
+                    alignmentStatus = classicMerge.alignmentStatus
                 ),
                 outputMode = outputMode,
                 highResolutionRaw = highResolutionRaw,
