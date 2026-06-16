@@ -158,6 +158,17 @@ std::string getString(JNIEnv* env, jstring value) {
     return out;
 }
 
+std::string getOptionalString(JNIEnv* env, jstring value) {
+    if (!value) return {};
+    return getString(env, value);
+}
+
+bool fileExistsAndNonEmpty(const std::string& path) {
+    if (path.empty()) return false;
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    return input && input.tellg() > 0;
+}
+
 bool readRaw16(const std::string& path, int width, int height, std::vector<uint16_t>& out, std::string& error) {
     const int64_t count = static_cast<int64_t>(width) * height;
     const int64_t bytes = count * 2;
@@ -1273,4 +1284,189 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
     } catch (...) {
         return env->NewStringUTF("ERROR: unknown native failure");
     }
+}
+
+bool metadataContainsWarning(const std::string& metadataPath, const std::string& warning) {
+    std::ifstream input(metadataPath);
+    if (!input) return false;
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    return contents.str().find(warning) != std::string::npos;
+}
+
+bool writeNativeIspV2DebugJson(
+    const std::string& path,
+    const std::string& metadataPath,
+    const std::string& rgbaPath,
+    int width,
+    int height,
+    int outputWidth,
+    int outputHeight,
+    int cfaPattern,
+    int blackLevel,
+    int whiteLevel,
+    const std::string& status,
+    std::string& error
+) {
+    std::ofstream output(path);
+    if (!output) {
+        error = "native raw isp debug json open failed: " + path;
+        return false;
+    }
+    const bool wbMissing = metadataContainsWarning(metadataPath, "WB_GAINS_MISSING");
+    const bool matrixMissing = metadataContainsWarning(metadataPath, "COLOR_TRANSFORM_MISSING");
+    output << "{\n"
+           << "  \"rawRenderVersion\": \"native_raw_isp_v0.2\",\n"
+           << "  \"nativeRawIspUsed\": true,\n"
+           << "  \"nativePostprocess\": true,\n"
+           << "  \"inputWidth\": " << width << ",\n"
+           << "  \"inputHeight\": " << height << ",\n"
+           << "  \"outputWidth\": " << outputWidth << ",\n"
+           << "  \"outputHeight\": " << outputHeight << ",\n"
+           << "  \"cfaPattern\": " << cfaPattern << ",\n"
+           << "  \"blackLevelUsed\": " << blackLevel << ",\n"
+           << "  \"whiteLevelUsed\": " << whiteLevel << ",\n"
+           << "  \"mergedRawFormat\": \"black_level_subtracted_compact_raw16\",\n"
+           << "  \"wbGainsUsed\": \"metadata_or_gray_world_fallback\",\n"
+           << "  \"colorTransformUsed\": \"" << (matrixMissing ? "identity_fallback" : "metadata_3x3") << "\",\n"
+           << "  \"demosaicMethod\": \"BILINEAR_SAFE_V0\",\n"
+           << "  \"denoiseVersion\": \"native_chroma_luma_v0.2\",\n"
+           << "  \"denoiseStrength\": 0.35,\n"
+           << "  \"chromaDenoiseStrength\": " << kChromaDenoiseStrength << ",\n"
+           << "  \"toneVersion\": \"native_conservative_shoulder_v0.2\",\n"
+           << "  \"rawRenderExposureGain\": 1.0,\n"
+           << "  \"rawRenderShadowLift\": " << kPostprocessBlackLift << ",\n"
+           << "  \"rawRenderHighlightRollOff\": " << kPostprocessShoulderStrength << ",\n"
+           << "  \"rawRenderSharpenAmount\": " << kSharpenStrength << ",\n"
+           << "  \"hotPixelCount\": 0,\n"
+           << "  \"channelMeansBeforeWb\": null,\n"
+           << "  \"channelMeansAfterWb\": null,\n"
+           << "  \"channelMeansAfterMatrix\": null,\n"
+           << "  \"saturationEstimate\": null,\n"
+           << "  \"overexposureRatio\": null,\n"
+           << "  \"renderWarnings\": [";
+    bool first = true;
+    if (wbMissing) {
+        output << "\"WB_GAINS_MISSING\"";
+        first = false;
+    }
+    if (matrixMissing) {
+        if (!first) output << ", ";
+        output << "\"COLOR_TRANSFORM_MISSING\"";
+    }
+    output << "],\n"
+           << "  \"metadataJsonPath\": \"" << metadataPath << "\",\n"
+           << "  \"outputPath\": \"" << rgbaPath << "\",\n"
+           << "  \"status\": \"" << status << "\"\n"
+           << "}\n";
+    return output.good();
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutputV2(
+    JNIEnv* env,
+    jobject thiz,
+    jstring mergedRawPath,
+    jstring referenceRawPath,
+    jint width,
+    jint height,
+    jint cfaPattern,
+    jint blackLevel,
+    jint whiteLevel,
+    jint outputWidth,
+    jint outputHeight,
+    jstring metadataJsonPath,
+    jstring outputRgbaPath,
+    jstring outputDebugJsonPath,
+    jstring outputReferenceDebugRgbaPath,
+    jstring outputMergedLinearDebugRgbaPath
+) {
+    const jstring tempMainMetadata = env->NewStringUTF((getString(env, outputDebugJsonPath) + ".native.tmp").c_str());
+    jstring mainStatusString = Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
+        env,
+        thiz,
+        mergedRawPath,
+        width,
+        height,
+        cfaPattern,
+        blackLevel,
+        whiteLevel,
+        outputWidth,
+        outputHeight,
+        outputRgbaPath,
+        tempMainMetadata
+    );
+    const std::string mainStatus = getString(env, mainStatusString);
+    env->DeleteLocalRef(tempMainMetadata);
+    if (mainStatus.rfind("OK:", 0) != 0) {
+        return env->NewStringUTF(mainStatus.c_str());
+    }
+
+    const int debugMax = 960;
+    const int debugWidth = std::max(2, (outputWidth > outputHeight)
+        ? debugMax
+        : std::max(2, outputWidth * debugMax / std::max(1, outputHeight)));
+    const int debugHeight = std::max(2, (outputHeight >= outputWidth)
+        ? debugMax
+        : std::max(2, outputHeight * debugMax / std::max(1, outputWidth)));
+
+    const std::string mergedDebug = getOptionalString(env, outputMergedLinearDebugRgbaPath);
+    if (!mergedDebug.empty()) {
+        const jstring tempDebugPath = env->NewStringUTF((mergedDebug + ".json.tmp").c_str());
+        Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
+            env,
+            thiz,
+            mergedRawPath,
+            width,
+            height,
+            cfaPattern,
+            blackLevel,
+            whiteLevel,
+            debugWidth,
+            debugHeight,
+            outputMergedLinearDebugRgbaPath,
+            tempDebugPath
+        );
+        env->DeleteLocalRef(tempDebugPath);
+    }
+
+    const std::string referencePath = getOptionalString(env, referenceRawPath);
+    const std::string referenceDebug = getOptionalString(env, outputReferenceDebugRgbaPath);
+    if (!referencePath.empty() && !referenceDebug.empty()) {
+        const jstring tempDebugPath = env->NewStringUTF((referenceDebug + ".json.tmp").c_str());
+        Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
+            env,
+            thiz,
+            referenceRawPath,
+            width,
+            height,
+            cfaPattern,
+            blackLevel,
+            whiteLevel,
+            debugWidth,
+            debugHeight,
+            outputReferenceDebugRgbaPath,
+            tempDebugPath
+        );
+        env->DeleteLocalRef(tempDebugPath);
+    }
+
+    std::string error;
+    if (!writeNativeIspV2DebugJson(
+            getString(env, outputDebugJsonPath),
+            getString(env, metadataJsonPath),
+            getString(env, outputRgbaPath),
+            width,
+            height,
+            outputWidth,
+            outputHeight,
+            cfaPattern,
+            blackLevel,
+            whiteLevel,
+            mainStatus,
+            error
+        )) {
+        return env->NewStringUTF(("ERROR: " + error).c_str());
+    }
+    return env->NewStringUTF("OK: native RAW ISP v0.2 complete");
 }

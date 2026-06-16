@@ -22,6 +22,9 @@ private const val CLASSIC_RAW_TILE_ROWS = 192
 private const val CLASSIC_RAW_REFERENCE_WEIGHT = 1.65f
 private const val CLASSIC_RAW_OUTLIER_THRESHOLD = 0.12f
 private const val CLASSIC_RAW_OUTLIER_WEIGHT = 0.05f
+private const val CLASSIC_RAW_NOISE_MODEL_VERSION = "classic_raw_noise_model_v0_2"
+private const val CLASSIC_RAW_SHOT_COEFF = 0.025f
+private const val CLASSIC_RAW_READ_NOISE_COEFF = 32.0f
 
 internal data class ClassicRawFusionResult(
     val success: Boolean,
@@ -194,7 +197,11 @@ internal fun runClassicRawFusionMerge(
                     countRawExcludedFrames(job) - frames.size).coerceAtLeast(0)
             )
             .put("rawGhostSuppressionUsed", true)
+            .put("rawNoiseModelVersion", CLASSIC_RAW_NOISE_MODEL_VERSION)
+            .put("shotCoeff", CLASSIC_RAW_SHOT_COEFF)
+            .put("readNoiseCoeff", CLASSIC_RAW_READ_NOISE_COEFF)
             .put("rawOutlierRejectedRatio", mergeStats.rejectedRatio)
+            .put("rawOutlierDownweightedRatio", mergeStats.downweightedRatio)
             .put("rawAlignmentSummary", debug.optJSONArray("alignments") ?: JSONArray())
             .put("nativeAlignmentAvailable", NativeFusionAlignment.isAvailable())
             .put("nativeAlignmentUsed", nativeAlignmentUsed)
@@ -208,7 +215,7 @@ internal fun runClassicRawFusionMerge(
             .put("alignmentFile", alignmentFile.name)
             .put("alignmentStatus", "CLASSIC_RAW_FUSION_V1_COMPLETE")
             .put("nativeRawMerge", false)
-            .put("rawFusionNotes", "Classic RAW v1: downsampled green-channel alignment, tiled RAW-domain robust merge, conservative outlier suppression.")
+            .put("rawFusionNotes", "Classic RAW v1: downsampled green-channel alignment, tiled RAW-domain robust merge, signal-aware conservative outlier suppression.")
 
         ClassicRawFusionResult(
             success = true,
@@ -246,10 +253,13 @@ internal fun runClassicRawFusionMerge(
 
 private data class RawMergeStats(
     val rejectedPixels: Long,
-    val comparedPixels: Long
+    val comparedPixels: Long,
+    val downweightedPixels: Long
 ) {
     val rejectedRatio: Double get() =
         if (comparedPixels > 0L) rejectedPixels.toDouble() / comparedPixels else 0.0
+    val downweightedRatio: Double get() =
+        if (comparedPixels > 0L) downweightedPixels.toDouble() / comparedPixels else 0.0
 }
 
 private fun buildRawProxy(
@@ -414,6 +424,7 @@ private fun mergeClassicRawTiles(
     onStatus: (String) -> Unit
 ): RawMergeStats {
     var rejected = 0L
+    var downweighted = 0L
     var compared = 0L
     val whiteRange = (sensor.whiteLevel - sensor.blackLevel).coerceAtLeast(1)
     val frameInputs = frames.associateWith { RandomAccessFile(it.input.file, "r") }
@@ -461,13 +472,23 @@ private fun mergeClassicRawTiles(
                                 val refRaw = refRows[row][x].toInt() and 0xFFFF
                                 val refBlack = blackLevelForPixel(x, y, sensor.cfa, blackLevelEstimate)
                                 val refCorrected = (refRaw - refBlack).coerceAtLeast(0).toFloat()
-                                val diff = abs(corrected - refCorrected) / whiteRange
+                                val diffAbs = abs(corrected - refCorrected)
+                                val variance = CLASSIC_RAW_SHOT_COEFF *
+                                    max(refCorrected, corrected).coerceAtLeast(0f) +
+                                    CLASSIC_RAW_READ_NOISE_COEFF
+                                val normalizedResidual = diffAbs / kotlin.math.sqrt(variance.coerceAtLeast(1f))
+                                val diff = diffAbs / whiteRange
                                 compared++
-                                if (diff > CLASSIC_RAW_OUTLIER_THRESHOLD) {
-                                    val extra = ((diff - CLASSIC_RAW_OUTLIER_THRESHOLD) /
-                                        (1f - CLASSIC_RAW_OUTLIER_THRESHOLD)).coerceIn(0f, 1f)
-                                    localWeight *= (1f - extra).pow(3).coerceAtLeast(CLASSIC_RAW_OUTLIER_WEIGHT)
+                                if (normalizedResidual > 5.0f) {
+                                    localWeight *= CLASSIC_RAW_OUTLIER_WEIGHT
                                     rejected++
+                                } else if (normalizedResidual > 2.5f) {
+                                    val t = ((normalizedResidual - 2.5f) / 2.5f).coerceIn(0f, 1f)
+                                    localWeight *= (1f - t).pow(2).coerceAtLeast(0.15f)
+                                    downweighted++
+                                } else if (diff > CLASSIC_RAW_OUTLIER_THRESHOLD) {
+                                    localWeight *= 0.35f
+                                    downweighted++
                                 }
                             }
                             acc[index] += corrected * localWeight
@@ -493,7 +514,7 @@ private fun mergeClassicRawTiles(
     } finally {
         frameInputs.values.forEach { runCatching { it.close() } }
     }
-    return RawMergeStats(rejected, compared)
+    return RawMergeStats(rejected, compared, downweighted)
 }
 
 private fun readRawRow(input: RandomAccessFile, width: Int, y: Int, out: ShortArray) {
@@ -566,7 +587,11 @@ private fun buildRawFusionDebug(
         .put("excludedFrameCount", countRawExcludedFrames(job))
         .put("skippedFrameCount", (preparedFrames.savedFrames - frames.size).coerceAtLeast(0))
         .put("rawGhostSuppressionUsed", true)
+        .put("rawNoiseModelVersion", CLASSIC_RAW_NOISE_MODEL_VERSION)
+        .put("shotCoeff", CLASSIC_RAW_SHOT_COEFF)
+        .put("readNoiseCoeff", CLASSIC_RAW_READ_NOISE_COEFF)
         .put("rawOutlierRejectedRatio", mergeStats.rejectedRatio)
+        .put("rawOutlierDownweightedRatio", mergeStats.downweightedRatio)
         .put("rawAlignmentSummary", alignments)
         .put("processingTimeMs", processingTimeMs)
         .put("nativeAlignmentAvailable", NativeFusionAlignment.isAvailable())

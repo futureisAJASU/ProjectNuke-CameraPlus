@@ -42,6 +42,45 @@ import kotlin.math.min
 import kotlin.math.pow
 
 private const val SAVE_RAW_FUSION_DNG_SIDECARS = false
+private const val RAW_RENDER_VERSION = "native_raw_isp_v0.2"
+private const val RAW_RENDER_SHARPEN_AMOUNT = 0.12f
+private const val RAW_RENDER_DENOISE_STRENGTH = 0.35f
+private const val RAW_RENDER_CHROMA_DENOISE_STRENGTH = 0.55f
+private const val RAW_RENDER_DEBUG_MAX_DIMENSION = 1280
+private const val ENABLE_KOTLIN_RAW_RENDER_FALLBACK = false
+
+private data class RawWhiteBalanceGains(
+    val red: Float,
+    val green: Float,
+    val blue: Float,
+    val redMean: Float,
+    val greenMean: Float,
+    val blueMean: Float,
+    val warning: String?
+)
+
+private data class RawRenderToneResult(
+    val bitmap: Bitmap,
+    val exposureGain: Float,
+    val shadowLift: Float,
+    val highlightRollOff: Float
+)
+
+private data class RawRenderStats(
+    val redMean: Float,
+    val greenMean: Float,
+    val blueMean: Float,
+    val saturationEstimate: Float,
+    val overBrightRatio: Float,
+    val underBrightRatio: Float,
+    val noiseEstimate: Float
+)
+
+private data class RawRenderMetadata(
+    val cameraWbGains: FloatArray?,
+    val colorTransform: FloatArray?,
+    val warnings: Set<String>
+)
 
 @SuppressLint("MissingPermission")
 fun captureRawBurstForFusion(
@@ -806,9 +845,145 @@ private object RawFusionExportCoordinator {
         )
     }
 
+    private fun exportStandardNativeRawIsp(context: RawFusionExportContext): RawFusionProcessResult {
+        val targetSize = chooseRawDemosaicTarget(
+            context.sensor.width,
+            context.sensor.height,
+            context.highResolutionRaw
+        )
+        val outputWidth = targetSize.first
+        val outputHeight = targetSize.second
+        val nativeRgbaFile = File(context.files.jobDir, "raw_fusion_final.rgba")
+        val renderInputMetadataFile = File(context.files.jobDir, "raw_render_input_metadata.json")
+        val renderDebugFile = File(context.files.jobDir, "raw_render_debug.json")
+        val referenceDebugRgbaFile = File(context.files.jobDir, "raw_reference_render_debug.rgba")
+        val mergedLinearDebugRgbaFile = File(context.files.jobDir, "raw_merged_linear_debug.rgba")
+        val renderMetadata = averageFrameMetadataForRender(context.frames.metadata)
+        val warnings = renderMetadata.warnings.toMutableSet()
+        writeRawRenderInputMetadata(
+            file = renderInputMetadataFile,
+            context = context,
+            renderMetadata = renderMetadata,
+            outputWidth = outputWidth,
+            outputHeight = outputHeight,
+            warnings = warnings
+        )
+        val referencePath = context.frames.inputs.getOrNull(context.referenceSelection.index)
+            ?.file
+            ?.absolutePath
+            ?: context.frames.inputs.firstOrNull()?.file?.absolutePath
+        context.onStatus("Processing RAW fusion: native RAW ISP v0.2...")
+        val status = runCatching {
+            NativeRawEngine.processRaw16ToRgbOutputV2(
+                mergedRawPath = context.files.mergedRawFile.absolutePath,
+                referenceRawPath = referencePath,
+                width = context.sensor.width,
+                height = context.sensor.height,
+                cfaPattern = context.sensor.cfa,
+                blackLevel = 0,
+                whiteLevel = context.sensor.whiteLevel - context.sensor.blackLevel,
+                outputWidth = outputWidth,
+                outputHeight = outputHeight,
+                metadataJsonPath = renderInputMetadataFile.absolutePath,
+                outputRgbaPath = nativeRgbaFile.absolutePath,
+                outputDebugJsonPath = renderDebugFile.absolutePath,
+                outputReferenceDebugRgbaPath = referenceDebugRgbaFile.absolutePath,
+                outputMergedLinearDebugRgbaPath = mergedLinearDebugRgbaFile.absolutePath
+            )
+        }.getOrElse { "ERROR: ${it.javaClass.simpleName}: ${it.message}" }
+        val expectedBytes = outputWidth.toLong() * outputHeight.toLong() * 4L
+        val nativeOk = status.startsWith("OK:") &&
+            nativeRgbaFile.exists() &&
+            nativeRgbaFile.length() == expectedBytes &&
+            renderDebugFile.exists()
+        if (!nativeOk) {
+            val failed = applyNativeMergeMetadata(
+                target = JSONObject(context.job.toString()),
+                alignment = context.nativeMerge.alignmentMetadata
+            )
+                .put("processStatus", "NATIVE_RAW_ISP_FAILED_KEEPING_CACHE")
+                .put("nativeRawIspUsed", false)
+                .put("nativePostprocessUsed", false)
+                .put("nativePostprocessStatus", status)
+                .put("rawRenderVersion", RAW_RENDER_VERSION)
+                .put("rawRenderInputMetadataFile", renderInputMetadataFile.name)
+                .put("processedAt", System.currentTimeMillis())
+            context.files.jobFile.writeText(failed.toString(2))
+            context.onStatus("PIPELINE_FAILED: Native RAW ISP failed; RAW cache kept. $status")
+            return RawFusionProcessResult(false, context.files.mergedRawFile, null, null, null, "Native RAW ISP failed: $status")
+        }
+        val debug = runCatching { JSONObject(renderDebugFile.readText()) }.getOrNull()
+        val nativeWarnings = debug?.optJSONArray("renderWarnings") ?: JSONArray()
+        val hasWarnings = nativeWarnings.length() > 0 || warnings.isNotEmpty()
+        val updated = applyNativeMergeMetadata(
+            target = JSONObject(context.job.toString()),
+            alignment = context.nativeMerge.alignmentMetadata
+        )
+            .put("processStatus", if (hasWarnings) "RAW_FUSION_COMPLETE_WITH_RENDER_WARNINGS" else "RAW_FUSION_COMPLETE")
+            .put("rawRenderVersion", RAW_RENDER_VERSION)
+            .put("nativeRawIspUsed", true)
+            .put("nativePostprocessUsed", true)
+            .put("nativePostprocessStatus", status)
+            .put("nativePostprocessRgbaFile", nativeRgbaFile.name)
+            .put("nativePostprocessMetadataFile", renderInputMetadataFile.name)
+            .put("rawRenderInputMetadataFile", renderInputMetadataFile.name)
+            .put("rawRenderDebugFile", renderDebugFile.name)
+            .put("rawReferenceDebugFile", if (referenceDebugRgbaFile.exists()) referenceDebugRgbaFile.name else JSONObject.NULL)
+            .put("rawMergedLinearDebugFile", if (mergedLinearDebugRgbaFile.exists()) mergedLinearDebugRgbaFile.name else JSONObject.NULL)
+            .put("rawFinalRenderDebugFile", nativeRgbaFile.name)
+            .put("rawRenderWarnings", nativeWarnings)
+            .put("rawRenderColorTransform", renderMetadata.colorTransform?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
+            .put("rawRenderCameraWbGains", renderMetadata.cameraWbGains?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
+            .put("rawRenderDenoiseStrength", RAW_RENDER_DENOISE_STRENGTH)
+            .put("rawRenderChromaDenoiseStrength", RAW_RENDER_CHROMA_DENOISE_STRENGTH)
+            .put("rawRenderSharpenAmount", RAW_RENDER_SHARPEN_AMOUNT)
+            .put("finalOutputSource", "native_rgba")
+            .put("fullSizeKotlinDemosaicUsed", false)
+            .put("mergedRawFile", context.files.mergedRawFile.name)
+            .put("finalFile", JSONObject.NULL)
+            .put("usedFrameCount", context.frames.inputs.size)
+            .put("requestedFrames", context.frames.requestedFrames)
+            .put("savedFrames", context.frames.savedFrames)
+            .put("captureCompleteness", context.frames.captureCompleteness)
+            .put("partialCapture", context.frames.partialCapture || context.frames.inputs.size < context.frames.requestedFrames)
+            .put("processingNotes", captureCompletenessNote(context.frames))
+            .put("blackLevelUsed", context.sensor.blackLevel)
+            .put("whiteLevelUsed", context.sensor.whiteLevel)
+            .put("outputWidth", outputWidth)
+            .put("outputHeight", outputHeight)
+            .put("referenceFrameIndex", context.referenceSelection.index)
+            .put("referenceFrameReason", context.referenceSelection.reason)
+            .put("alignmentStatus", context.nativeMerge.alignmentStatus)
+            .put("nativeRawMerge", context.nativeMerge.mergedOk)
+            .put("alignmentFile", context.files.alignmentFile.name)
+            .put("sensorOrientation", context.job.opt("sensorOrientation") ?: JSONObject.NULL)
+            .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
+            .put("processedAt", System.currentTimeMillis())
+        context.files.jobFile.writeText(updated.toString(2))
+        return RawFusionProcessResult(
+            success = true,
+            mergedRawFile = context.files.mergedRawFile,
+            mergedDngFile = null,
+            previewPngFile = null,
+            finalPngFile = null,
+            errorMessage = null,
+            nativeRgbaFile = nativeRgbaFile,
+            nativeRgbaWidth = outputWidth,
+            nativeRgbaHeight = outputHeight
+        )
+    }
+
     private fun exportStandardBitmap(context: RawFusionExportContext): RawFusionProcessResult {
+        val nativeResult = exportStandardNativeRawIsp(context)
+        if (nativeResult.success) return nativeResult
+        if (!ENABLE_KOTLIN_RAW_RENDER_FALLBACK) return nativeResult
+
         val previewFile = File(context.files.jobDir, "raw_fusion_preview.png")
         val finalFile = File(context.files.jobDir, "raw_fusion_final.png")
+        val referenceDebugFile = File(context.files.jobDir, "raw_reference_render_debug.png")
+        val mergedLinearDebugFile = File(context.files.jobDir, "raw_merged_linear_debug.png")
+        val finalRenderDebugFile = File(context.files.jobDir, "raw_final_render_debug.png")
+        val renderDebugFile = File(context.files.jobDir, "raw_render_debug.json")
         val skipDebugPreview = context.job.optString("rawSpeedMode") == RawSpeedMode.BALANCED.name
         val targetSize = chooseRawDemosaicTarget(
             context.sensor.width,
@@ -820,11 +995,23 @@ private object RawFusionExportCoordinator {
             context.sensor.pixelCount
         )
         var preview: Bitmap? = null
+        var whiteBalanced: Bitmap? = null
         var toned: Bitmap? = null
+        var denoised: Bitmap? = null
         var sharpened: Bitmap? = null
         var finalBitmap: Bitmap? = null
         var finalOutputWidth = targetSize.first
         var finalOutputHeight = targetSize.second
+        var wbGains = RawWhiteBalanceGains(1f, 1f, 1f, 0f, 0f, 0f, null)
+        var toneExposureGain = 1.0f
+        var toneShadowLift = 0.0f
+        var toneHighlightRollOff = 0.0f
+        val warnings = mutableSetOf<String>()
+        var mergedStats = RawRenderStats(0f, 0f, 0f, 0f, 0f, 0f, 0f)
+        var finalStats = RawRenderStats(0f, 0f, 0f, 0f, 0f, 0f, 0f)
+        var cfaScores = JSONObject()
+        val renderMetadata = averageFrameMetadataForRender(context.frames.metadata)
+        warnings += renderMetadata.warnings
         val outputFallbackReason = when {
             context.outputMode == CaptureResolutionMode.MP50 ->
                 "MP50 Kotlin ARGB output unsupported until native demosaic/postprocess exists; wrote downscaled preview."
@@ -860,13 +1047,42 @@ private object RawFusionExportCoordinator {
             if (!skipDebugPreview) {
                 saveRawFusionPng(preview, previewFile)
             }
+            mergedStats = estimateRawRenderStats(preview)
+            wbGains = computeRawWhiteBalanceGains(preview, renderMetadata.cameraWbGains)
+            wbGains.warning?.let { warnings += it }
+            cfaScores = computeCfaSanityScores(
+                raw = mergedForDemosaic,
+                width = context.sensor.width,
+                height = context.sensor.height,
+                whiteLevel = context.sensor.whiteLevel - context.sensor.blackLevel,
+                currentCfa = context.sensor.cfa
+            )
+            if (cfaScores.optBoolean("possibleMismatch", false)) warnings += "POSSIBLE_CFA_MISMATCH"
+            whiteBalanced = applyRawWhiteBalance(preview, wbGains)
+            val colorCorrected = applyRawColorTransform(whiteBalanced, renderMetadata.colorTransform)
+            whiteBalanced.recycle()
+            whiteBalanced = colorCorrected
+            saveRawFusionPng(whiteBalanced, mergedLinearDebugFile)
             context.onStatus("Processing RAW fusion: tone/sharpen...")
-            toned = toneMapRawFusion(preview)
+            toned = toneMapRawFusion(whiteBalanced).also {
+                toneExposureGain = it.exposureGain
+                toneShadowLift = it.shadowLift
+                toneHighlightRollOff = it.highlightRollOff
+            }.bitmap
             preview.recycle()
             preview = null
-            sharpened = sharpenRawFusion(toned)
+            whiteBalanced.recycle()
+            whiteBalanced = null
+            denoised = denoiseRawFusion(
+                toned,
+                denoiseStrength = RAW_RENDER_DENOISE_STRENGTH,
+                chromaStrength = RAW_RENDER_CHROMA_DENOISE_STRENGTH
+            )
             toned.recycle()
             toned = null
+            sharpened = sharpenRawFusion(denoised, RAW_RENDER_SHARPEN_AMOUNT)
+            denoised.recycle()
+            denoised = null
             finalBitmap = resizeFinalForResolutionMode(
                 source = sharpened,
                 mode = if (outputFallbackReason == null) {
@@ -883,12 +1099,39 @@ private object RawFusionExportCoordinator {
             finalOutputWidth = finalBitmap.width
             finalOutputHeight = finalBitmap.height
             saveRawFusionPng(finalBitmap, finalFile)
+            saveRawFusionPng(finalBitmap, finalRenderDebugFile)
+            finalStats = estimateRawRenderStats(finalBitmap)
+            if (finalStats.saturationEstimate < 0.035f) warnings += "LOW_SATURATION"
+            if (finalStats.overBrightRatio > 0.12f) warnings += "OVER_BRIGHT"
+            if (mergedStats.noiseEstimate > 0f && finalStats.noiseEstimate > mergedStats.noiseEstimate * 1.35f) {
+                warnings += "NOISE_AMPLIFIED"
+            }
+            saveRawReferenceDebugRender(
+                context = context,
+                gains = wbGains,
+                referenceDebugFile = referenceDebugFile
+            )
         } finally {
             preview?.takeUnless { it.isRecycled }?.recycle()
+            whiteBalanced?.takeUnless { it.isRecycled }?.recycle()
             toned?.takeUnless { it.isRecycled }?.recycle()
+            denoised?.takeUnless { it.isRecycled }?.recycle()
             sharpened?.takeUnless { it.isRecycled }?.recycle()
             finalBitmap?.takeUnless { it.isRecycled }?.recycle()
         }
+        writeRawRenderDebugJson(
+            file = renderDebugFile,
+            context = context,
+            gains = wbGains,
+            mergedStats = mergedStats,
+            finalStats = finalStats,
+            cfaScores = cfaScores,
+            renderMetadata = renderMetadata,
+            warnings = warnings,
+            exposureGain = toneExposureGain,
+            shadowLift = toneShadowLift,
+            highlightRollOff = toneHighlightRollOff
+        )
 
         val partialNote = captureCompletenessNote(context.frames)
         val notes = "RAW Fusion MVP: Bayer weighted merge, black-level correction, exposure/ISO normalization, simple bilinear demosaic, gray-world-ish tone. $partialNote Merged DNG skipped because CaptureResult metadata was not available after process restart. TODO gyro Bayer alignment, image micro-alignment, ghost suppression, RAW super-resolution/detail fusion, proper Camera2 color matrices."
@@ -896,7 +1139,31 @@ private object RawFusionExportCoordinator {
             target = JSONObject(context.job.toString()),
             alignment = context.nativeMerge.alignmentMetadata
         )
-            .put("processStatus", "RAW_FUSION_COMPLETE")
+            .put("processStatus", if (warnings.isEmpty()) "RAW_FUSION_COMPLETE" else "RAW_FUSION_COMPLETE_WITH_RENDER_WARNINGS")
+            .put("rawRenderVersion", RAW_RENDER_VERSION)
+            .put(
+                "rawRenderWhiteBalance",
+                JSONObject()
+                    .put("rGain", wbGains.red)
+                    .put("gGain", wbGains.green)
+                    .put("bGain", wbGains.blue)
+                    .put("redMean", wbGains.redMean)
+                    .put("greenMean", wbGains.greenMean)
+                    .put("blueMean", wbGains.blueMean)
+            )
+            .put("rawRenderDenoiseStrength", RAW_RENDER_DENOISE_STRENGTH)
+            .put("rawRenderChromaDenoiseStrength", RAW_RENDER_CHROMA_DENOISE_STRENGTH)
+            .put("rawRenderSharpenAmount", RAW_RENDER_SHARPEN_AMOUNT)
+            .put("rawRenderExposureGain", toneExposureGain)
+            .put("rawRenderShadowLift", toneShadowLift)
+            .put("rawRenderHighlightRollOff", toneHighlightRollOff)
+            .put("rawRenderWarnings", JSONArray(warnings.toList()))
+            .put("rawRenderColorTransform", renderMetadata.colorTransform?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
+            .put("rawRenderCameraWbGains", renderMetadata.cameraWbGains?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
+            .put("rawReferenceDebugFile", if (referenceDebugFile.exists()) referenceDebugFile.name else JSONObject.NULL)
+            .put("rawMergedLinearDebugFile", mergedLinearDebugFile.name)
+            .put("rawFinalRenderDebugFile", finalRenderDebugFile.name)
+            .put("rawRenderDebugFile", renderDebugFile.name)
             .put("mergedRawFile", context.files.mergedRawFile.name)
             .put("mergedDngFile", JSONObject.NULL)
             .put("previewFile", if (skipDebugPreview) JSONObject.NULL else previewFile.name)
@@ -1490,26 +1757,287 @@ private fun curveRaw(value: Int, whiteLevel: Int): Int {
     return (x.pow(1.0 / 2.2) * 255.0).toInt().coerceIn(0, 255)
 }
 
-private fun toneMapRawFusion(source: Bitmap): Bitmap {
+private fun computeRawWhiteBalanceGains(source: Bitmap, cameraGains: FloatArray?): RawWhiteBalanceGains {
+    if (cameraGains != null && cameraGains.size >= 4) {
+        val green = ((cameraGains[1] + cameraGains[2]) * 0.5f).coerceAtLeast(0.001f)
+        return RawWhiteBalanceGains(
+            red = (cameraGains[0] / green).coerceIn(0.6f, 2.5f),
+            green = 1.0f,
+            blue = (cameraGains[3] / green).coerceIn(0.6f, 2.5f),
+            redMean = 0f,
+            greenMean = 0f,
+            blueMean = 0f,
+            warning = null
+        )
+    }
+
+    /*
+        val targetSize = chooseRawDemosaicTarget(
+            context.sensor.width,
+            context.sensor.height,
+            context.highResolutionRaw
+        )
+        val outputFallbackReason = when {
+            context.outputMode == CaptureResolutionMode.MP50 ->
+                "MP50 native RGBA output is downscaled for memory-safe export."
+            context.outputMode == CaptureResolutionMode.MP24_FUSION && context.highResolutionRaw ->
+                "MP24_FUSION native RGBA output is downscaled for memory-safe export."
+            else -> null
+        }
+        val outputWidth = targetSize.first
+        val outputHeight = targetSize.second
+        val nativeRgbaFile = File(context.files.jobDir, "raw_fusion_final.rgba")
+        val renderInputMetadataFile = File(context.files.jobDir, "raw_render_input_metadata.json")
+        val renderDebugFile = File(context.files.jobDir, "raw_render_debug.json")
+        val referenceDebugRgbaFile = File(context.files.jobDir, "raw_reference_render_debug.rgba")
+        val mergedLinearDebugRgbaFile = File(context.files.jobDir, "raw_merged_linear_debug.rgba")
+        val renderMetadata = averageFrameMetadataForRender(context.frames.metadata)
+        val warnings = renderMetadata.warnings.toMutableSet()
+        writeRawRenderInputMetadata(
+            file = renderInputMetadataFile,
+            context = context,
+            renderMetadata = renderMetadata,
+            outputWidth = outputWidth,
+            outputHeight = outputHeight,
+            warnings = warnings
+        )
+        val referencePath = context.frames.inputs.getOrNull(context.referenceSelection.index)
+            ?.file
+            ?.absolutePath
+            ?: context.frames.inputs.firstOrNull()?.file?.absolutePath
+        context.onStatus("Processing RAW fusion: native RAW ISP v0.2...")
+        val status = runCatching {
+            NativeRawEngine.processRaw16ToRgbOutputV2(
+                mergedRawPath = context.files.mergedRawFile.absolutePath,
+                referenceRawPath = referencePath,
+                width = context.sensor.width,
+                height = context.sensor.height,
+                cfaPattern = context.sensor.cfa,
+                blackLevel = 0,
+                whiteLevel = context.sensor.whiteLevel - context.sensor.blackLevel,
+                outputWidth = outputWidth,
+                outputHeight = outputHeight,
+                metadataJsonPath = renderInputMetadataFile.absolutePath,
+                outputRgbaPath = nativeRgbaFile.absolutePath,
+                outputDebugJsonPath = renderDebugFile.absolutePath,
+                outputReferenceDebugRgbaPath = referenceDebugRgbaFile.absolutePath,
+                outputMergedLinearDebugRgbaPath = mergedLinearDebugRgbaFile.absolutePath
+            )
+        }.getOrElse { "ERROR: ${it.javaClass.simpleName}: ${it.message}" }
+        val expectedBytes = outputWidth.toLong() * outputHeight.toLong() * 4L
+        val nativeOk = status.startsWith("OK:") &&
+            nativeRgbaFile.exists() &&
+            nativeRgbaFile.length() == expectedBytes &&
+            renderDebugFile.exists()
+        if (!nativeOk) {
+            val failed = applyNativeMergeMetadata(
+                target = JSONObject(context.job.toString()),
+                alignment = context.nativeMerge.alignmentMetadata
+            )
+                .put("processStatus", "NATIVE_RAW_ISP_FAILED_KEEPING_CACHE")
+                .put("nativeRawIspUsed", false)
+                .put("nativePostprocessUsed", false)
+                .put("nativePostprocessStatus", status)
+                .put("rawRenderVersion", RAW_RENDER_VERSION)
+                .put("rawRenderInputMetadataFile", renderInputMetadataFile.name)
+                .put("rawRenderDebugFile", renderDebugFile.name)
+                .put("processedAt", System.currentTimeMillis())
+            context.files.jobFile.writeText(failed.toString(2))
+            context.onStatus("PIPELINE_FAILED: Native RAW ISP failed; RAW cache kept. $status")
+            return RawFusionProcessResult(
+                success = false,
+                mergedRawFile = context.files.mergedRawFile,
+                mergedDngFile = null,
+                previewPngFile = null,
+                finalPngFile = null,
+                errorMessage = "Native RAW ISP failed: $status"
+            )
+        }
+        val debug = runCatching { JSONObject(renderDebugFile.readText()) }.getOrNull()
+        val nativeWarnings = debug?.optJSONArray("renderWarnings") ?: JSONArray()
+        val hasWarnings = nativeWarnings.length() > 0 || warnings.isNotEmpty()
+        val partialNote = captureCompletenessNote(context.frames)
+        val updated = applyNativeMergeMetadata(
+            target = JSONObject(context.job.toString()),
+            alignment = context.nativeMerge.alignmentMetadata
+        )
+            .put("processStatus", if (hasWarnings) "RAW_FUSION_COMPLETE_WITH_RENDER_WARNINGS" else "RAW_FUSION_COMPLETE")
+            .put("rawRenderVersion", RAW_RENDER_VERSION)
+            .put("nativeRawIspUsed", true)
+            .put("nativePostprocessUsed", true)
+            .put("nativePostprocessStatus", status)
+            .put("nativePostprocessRgbaFile", nativeRgbaFile.name)
+            .put("nativePostprocessMetadataFile", renderInputMetadataFile.name)
+            .put("rawRenderInputMetadataFile", renderInputMetadataFile.name)
+            .put("rawRenderDebugFile", renderDebugFile.name)
+            .put("rawReferenceDebugFile", if (referenceDebugRgbaFile.exists()) referenceDebugRgbaFile.name else JSONObject.NULL)
+            .put("rawMergedLinearDebugFile", if (mergedLinearDebugRgbaFile.exists()) mergedLinearDebugRgbaFile.name else JSONObject.NULL)
+            .put("rawFinalRenderDebugFile", nativeRgbaFile.name)
+            .put("rawRenderWarnings", nativeWarnings)
+            .put("rawRenderColorTransform", renderMetadata.colorTransform?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
+            .put("rawRenderCameraWbGains", renderMetadata.cameraWbGains?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
+            .put("rawRenderDenoiseStrength", RAW_RENDER_DENOISE_STRENGTH)
+            .put("rawRenderChromaDenoiseStrength", RAW_RENDER_CHROMA_DENOISE_STRENGTH)
+            .put("rawRenderSharpenAmount", RAW_RENDER_SHARPEN_AMOUNT)
+            .put("finalOutputSource", "native_rgba")
+            .put("outputFallbackReason", outputFallbackReason ?: JSONObject.NULL)
+            .put("fullSizeKotlinDemosaicUsed", false)
+            .put("mergedRawFile", context.files.mergedRawFile.name)
+            .put("finalFile", JSONObject.NULL)
+            .put("usedFrameCount", context.frames.inputs.size)
+            .put("requestedFrames", context.frames.requestedFrames)
+            .put("savedFrames", context.frames.savedFrames)
+            .put("captureCompleteness", context.frames.captureCompleteness)
+            .put("partialCapture", context.frames.partialCapture || context.frames.inputs.size < context.frames.requestedFrames)
+            .put("processingNotes", partialNote)
+            .put("blackLevelUsed", context.sensor.blackLevel)
+            .put("whiteLevelUsed", context.sensor.whiteLevel)
+            .put("outputWidth", outputWidth)
+            .put("outputHeight", outputHeight)
+            .put("referenceFrameIndex", context.referenceSelection.index)
+            .put("referenceFrameReason", context.referenceSelection.reason)
+            .put("alignmentStatus", context.nativeMerge.alignmentStatus)
+            .put("nativeRawMerge", context.nativeMerge.mergedOk)
+            .put("alignmentFile", context.files.alignmentFile.name)
+            .put("sensorOrientation", context.job.opt("sensorOrientation") ?: JSONObject.NULL)
+            .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
+            .put("processedAt", System.currentTimeMillis())
+        context.files.jobFile.writeText(updated.toString(2))
+        return RawFusionProcessResult(
+            success = true,
+            mergedRawFile = context.files.mergedRawFile,
+            mergedDngFile = null,
+            previewPngFile = null,
+            finalPngFile = null,
+            errorMessage = null,
+            nativeRgbaFile = nativeRgbaFile,
+            nativeRgbaWidth = outputWidth,
+            nativeRgbaHeight = outputHeight
+        )
+    }
+    */
+    val width = source.width
+    val height = source.height
+    val pixels = IntArray(width * height)
+    source.getPixels(pixels, 0, width, 0, 0, width, height)
+    var rSum = 0.0
+    var gSum = 0.0
+    var bSum = 0.0
+    var count = 0
+    val step = max(1, pixels.size / 250_000)
+    var i = 0
+    while (i < pixels.size) {
+        val c = pixels[i]
+        val r = Color.red(c)
+        val g = Color.green(c)
+        val b = Color.blue(c)
+        val luma = (r * 0.299 + g * 0.587 + b * 0.114).toInt()
+        if (luma in 24..230 && r < 245 && g < 245 && b < 245) {
+            rSum += r
+            gSum += g
+            bSum += b
+            count++
+        }
+        i += step
+    }
+    if (count < 64) return RawWhiteBalanceGains(1f, 1f, 1f, 0f, 0f, 0f, "POSSIBLE_CFA_MISMATCH")
+    val rMean = (rSum / count).toFloat().coerceAtLeast(1f)
+    val gMean = (gSum / count).toFloat().coerceAtLeast(1f)
+    val bMean = (bSum / count).toFloat().coerceAtLeast(1f)
+    val warning = if (rMean < 2f || bMean < 2f) "POSSIBLE_CFA_MISMATCH" else null
+    return RawWhiteBalanceGains(
+        red = (gMean / rMean).coerceIn(0.6f, 2.5f),
+        green = 1.0f,
+        blue = (gMean / bMean).coerceIn(0.6f, 2.5f),
+        redMean = rMean,
+        greenMean = gMean,
+        blueMean = bMean,
+        warning = warning
+    )
+}
+
+private fun applyRawColorTransform(source: Bitmap, matrix: FloatArray?): Bitmap {
+    if (matrix == null || matrix.size < 9) return source.copy(Bitmap.Config.ARGB_8888, false)
     val width = source.width
     val height = source.height
     val pixels = IntArray(width * height)
     source.getPixels(pixels, 0, width, 0, 0, width, height)
     for (i in pixels.indices) {
-        val color = pixels[i]
-        val r = toneChannel(Color.red(color))
-        val g = toneChannel(Color.green(color))
-        val b = toneChannel(Color.blue(color))
-        pixels[i] = Color.rgb(r, g, b)
+        val c = pixels[i]
+        val r = Color.red(c) / 255f
+        val g = Color.green(c) / 255f
+        val b = Color.blue(c) / 255f
+        val rr = (matrix[0] * r + matrix[1] * g + matrix[2] * b).coerceIn(0f, 1f)
+        val gg = (matrix[3] * r + matrix[4] * g + matrix[5] * b).coerceIn(0f, 1f)
+        val bb = (matrix[6] * r + matrix[7] * g + matrix[8] * b).coerceIn(0f, 1f)
+        pixels[i] = Color.rgb((rr * 255f).toInt(), (gg * 255f).toInt(), (bb * 255f).toInt())
     }
     return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
 }
 
-private fun toneChannel(value: Int): Int {
-    val x = value / 255.0
-    val lifted = (x * 1.06 + 0.012).coerceIn(0.0, 1.0)
-    val shouldered = lifted / (lifted + 0.10)
-    return (shouldered / (1.0 / 1.10) * 255.0).toInt().coerceIn(0, 255)
+private fun applyRawWhiteBalance(source: Bitmap, gains: RawWhiteBalanceGains): Bitmap {
+    val width = source.width
+    val height = source.height
+    val pixels = IntArray(width * height)
+    source.getPixels(pixels, 0, width, 0, 0, width, height)
+    for (i in pixels.indices) {
+        val c = pixels[i]
+        pixels[i] = Color.rgb(
+            (Color.red(c) * gains.red).toInt().coerceIn(0, 255),
+            (Color.green(c) * gains.green).toInt().coerceIn(0, 255),
+            (Color.blue(c) * gains.blue).toInt().coerceIn(0, 255)
+        )
+    }
+    return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
+}
+
+private fun toneMapRawFusion(source: Bitmap): RawRenderToneResult {
+    val width = source.width
+    val height = source.height
+    val pixels = IntArray(width * height)
+    source.getPixels(pixels, 0, width, 0, 0, width, height)
+    val meanLuma = pixels
+        .asSequence()
+        .step(max(1, pixels.size / 100_000))
+        .map {
+            (Color.red(it) * 0.299f + Color.green(it) * 0.587f + Color.blue(it) * 0.114f) / 255f
+        }
+        .average()
+        .takeIf { !it.isNaN() }
+        ?.toFloat()
+        ?: 0.35f
+    val exposureGain = (0.35f / meanLuma.coerceAtLeast(0.08f)).coerceIn(0.75f, 1.6f)
+    val shadowLift = if (meanLuma < 0.22f) 0.04f else 0.015f
+    val highlightRollOff = 0.16f
+    for (i in pixels.indices) {
+        val color = pixels[i]
+        val r = toneChannel(Color.red(color), exposureGain, shadowLift, highlightRollOff)
+        val g = toneChannel(Color.green(color), exposureGain, shadowLift, highlightRollOff)
+        val b = toneChannel(Color.blue(color), exposureGain, shadowLift, highlightRollOff)
+        pixels[i] = Color.rgb(r, g, b)
+    }
+    return RawRenderToneResult(
+        bitmap = Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888),
+        exposureGain = exposureGain,
+        shadowLift = shadowLift,
+        highlightRollOff = highlightRollOff
+    )
+}
+
+private fun <T> Sequence<T>.step(step: Int): Sequence<T> = sequence {
+    var index = 0
+    for (item in this@step) {
+        if (index % step == 0) yield(item)
+        index++
+    }
+}
+
+private fun toneChannel(value: Int, exposureGain: Float, shadowLift: Float, highlightRollOff: Float): Int {
+    val x = (value / 255.0 * exposureGain).coerceIn(0.0, 1.0)
+    val lifted = if (x < 0.28) (x + shadowLift * (1.0 - x / 0.28)).coerceAtMost(0.34) else x
+    val rolled = lifted / (1.0 + highlightRollOff * lifted)
+    val normalized = (rolled / (1.0 / (1.0 + highlightRollOff))).coerceIn(0.0, 1.0)
+    return (normalized.pow(1.0 / 1.08) * 255.0).toInt().coerceIn(0, 255)
 }
 
 private fun resizeFinalForResolutionMode(
@@ -1529,7 +2057,53 @@ private fun resizeFinalForResolutionMode(
     }
 }
 
-private fun sharpenRawFusion(source: Bitmap): Bitmap {
+private fun denoiseRawFusion(source: Bitmap, denoiseStrength: Float, chromaStrength: Float): Bitmap {
+    val width = source.width
+    val height = source.height
+    val input = IntArray(width * height)
+    val output = IntArray(width * height)
+    source.getPixels(input, 0, width, 0, 0, width, height)
+    fun pixel(x: Int, y: Int): Int = input[y.coerceIn(0, height - 1) * width + x.coerceIn(0, width - 1)]
+    for (y in 0 until height) {
+        for (x in 0 until width) {
+            val center = pixel(x, y)
+            val cr = Color.red(center)
+            val cg = Color.green(center)
+            val cb = Color.blue(center)
+            val cl = cr * 0.299f + cg * 0.587f + cb * 0.114f
+            var rSum = 0f
+            var gSum = 0f
+            var bSum = 0f
+            var weightSum = 0f
+            for (dy in -1..1) {
+                for (dx in -1..1) {
+                    val c = pixel(x + dx, y + dy)
+                    val l = Color.red(c) * 0.299f + Color.green(c) * 0.587f + Color.blue(c) * 0.114f
+                    if (abs(l - cl) <= 22f || (dx == 0 && dy == 0)) {
+                        val w = if (dx == 0 && dy == 0) 2f else 1f
+                        rSum += Color.red(c) * w
+                        gSum += Color.green(c) * w
+                        bSum += Color.blue(c) * w
+                        weightSum += w
+                    }
+                }
+            }
+            val ar = rSum / weightSum
+            val ag = gSum / weightSum
+            val ab = bSum / weightSum
+            val avgL = ar * 0.299f + ag * 0.587f + ab * 0.114f
+            val lumaMix = denoiseStrength.coerceIn(0f, 1f)
+            val chromaMix = chromaStrength.coerceIn(0f, 1f)
+            val nr = (cr * (1f - lumaMix) + (avgL + (ar - avgL) * chromaMix) * lumaMix).toInt().coerceIn(0, 255)
+            val ng = (cg * (1f - lumaMix) + (avgL + (ag - avgL) * chromaMix) * lumaMix).toInt().coerceIn(0, 255)
+            val nb = (cb * (1f - lumaMix) + (avgL + (ab - avgL) * chromaMix) * lumaMix).toInt().coerceIn(0, 255)
+            output[y * width + x] = Color.rgb(nr, ng, nb)
+        }
+    }
+    return Bitmap.createBitmap(output, width, height, Bitmap.Config.ARGB_8888)
+}
+
+private fun sharpenRawFusion(source: Bitmap, amount: Float = RAW_RENDER_SHARPEN_AMOUNT): Bitmap {
     val width = source.width
     val height = source.height
     val input = IntArray(width * height)
@@ -1550,13 +2124,283 @@ private fun sharpenRawFusion(source: Bitmap): Bitmap {
                     blurB += Color.blue(c)
                 }
             }
-            val r = (Color.red(center) * 1.35f - (blurR / 9f) * 0.35f).toInt().coerceIn(0, 255)
-            val g = (Color.green(center) * 1.35f - (blurG / 9f) * 0.35f).toInt().coerceIn(0, 255)
-            val b = (Color.blue(center) * 1.35f - (blurB / 9f) * 0.35f).toInt().coerceIn(0, 255)
+            val r = (Color.red(center) * (1f + amount) - (blurR / 9f) * amount).toInt().coerceIn(0, 255)
+            val g = (Color.green(center) * (1f + amount) - (blurG / 9f) * amount).toInt().coerceIn(0, 255)
+            val b = (Color.blue(center) * (1f + amount) - (blurB / 9f) * amount).toInt().coerceIn(0, 255)
             output[y * width + x] = Color.rgb(r, g, b)
         }
     }
     return Bitmap.createBitmap(output, width, height, Bitmap.Config.ARGB_8888)
+}
+
+private fun estimateRawRenderStats(bitmap: Bitmap): RawRenderStats {
+    val width = bitmap.width
+    val height = bitmap.height
+    val pixels = IntArray(width * height)
+    bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+    val step = max(1, pixels.size / 200_000)
+    var rSum = 0.0
+    var gSum = 0.0
+    var bSum = 0.0
+    var satSum = 0.0
+    var over = 0
+    var under = 0
+    var noise = 0.0
+    var count = 0
+    var i = 0
+    while (i < pixels.size) {
+        val c = pixels[i]
+        val r = Color.red(c)
+        val g = Color.green(c)
+        val b = Color.blue(c)
+        val maxC = max(r, max(g, b))
+        val minC = min(r, min(g, b))
+        val luma = r * 0.299 + g * 0.587 + b * 0.114
+        rSum += r
+        gSum += g
+        bSum += b
+        satSum += if (maxC > 0) (maxC - minC).toDouble() / maxC.toDouble() else 0.0
+        if (luma > 242.0) over++
+        if (luma < 8.0) under++
+        val x = i % width
+        val y = i / width
+        if (x + 1 < width && y + 1 < height) {
+            val right = pixels[i + 1]
+            val down = pixels[i + width]
+            val lr = Color.red(right) * 0.299 + Color.green(right) * 0.587 + Color.blue(right) * 0.114
+            val ld = Color.red(down) * 0.299 + Color.green(down) * 0.587 + Color.blue(down) * 0.114
+            noise += abs(luma - lr) + abs(luma - ld)
+        }
+        count++
+        i += step
+    }
+    val denom = max(1, count).toFloat()
+    return RawRenderStats(
+        redMean = (rSum / denom).toFloat(),
+        greenMean = (gSum / denom).toFloat(),
+        blueMean = (bSum / denom).toFloat(),
+        saturationEstimate = (satSum / denom).toFloat(),
+        overBrightRatio = over / denom,
+        underBrightRatio = under / denom,
+        noiseEstimate = (noise / denom / 255.0).toFloat()
+    )
+}
+
+private fun computeCfaSanityScores(
+    raw: ShortArray,
+    width: Int,
+    height: Int,
+    whiteLevel: Int,
+    currentCfa: Int
+): JSONObject {
+    val target = chooseDebugTarget(width, height, 640)
+    val scores = JSONObject()
+    var bestCfa = currentCfa
+    var bestScore = 0f
+    var currentScore = 0f
+    for (cfa in 0..3) {
+        val bitmap = demosaicBilinearDownscaled(raw, width, height, cfa, whiteLevel, target.first, target.second)
+        val score = estimateRawRenderStats(bitmap).saturationEstimate
+        bitmap.recycle()
+        scores.put(cfaName(cfa), score)
+        if (cfa == currentCfa) currentScore = score
+        if (score > bestScore) {
+            bestScore = score
+            bestCfa = cfa
+        }
+    }
+    return JSONObject()
+        .put("scores", scores)
+        .put("currentCfa", currentCfa)
+        .put("currentCfaName", cfaName(currentCfa))
+        .put("bestCfa", bestCfa)
+        .put("bestCfaName", cfaName(bestCfa))
+        .put("currentScore", currentScore)
+        .put("bestScore", bestScore)
+        .put("possibleMismatch", currentScore < 0.035f && bestScore > currentScore * 1.6f && bestCfa != currentCfa)
+}
+
+private fun cfaName(cfa: Int): String = when (cfa) {
+    1 -> "GRBG"
+    2 -> "GBRG"
+    3 -> "BGGR"
+    else -> "RGGB"
+}
+
+private fun chooseDebugTarget(width: Int, height: Int, maxDimension: Int): Pair<Int, Int> {
+    val scale = min(1.0, maxDimension.toDouble() / max(width, height).toDouble())
+    val targetWidth = ((width * scale).toInt().coerceAtLeast(2) / 2) * 2
+    val targetHeight = ((height * scale).toInt().coerceAtLeast(2) / 2) * 2
+    return targetWidth to targetHeight
+}
+
+private fun saveRawReferenceDebugRender(
+    context: RawFusionExportContext,
+    gains: RawWhiteBalanceGains,
+    referenceDebugFile: File
+) {
+    runCatching {
+        val input = context.frames.inputs.getOrNull(context.referenceSelection.index)
+            ?: context.frames.inputs.firstOrNull()
+            ?: return
+        val target = chooseDebugTarget(context.sensor.width, context.sensor.height, RAW_RENDER_DEBUG_MAX_DIMENSION)
+        val raw = readRaw16(input.file, context.sensor.pixelCount)
+        var demosaic: Bitmap? = null
+        var balanced: Bitmap? = null
+        var toned: Bitmap? = null
+        try {
+            demosaic = demosaicBilinearDownscaled(
+                raw,
+                context.sensor.width,
+                context.sensor.height,
+                context.sensor.cfa,
+                context.sensor.whiteLevel - context.sensor.blackLevel,
+                target.first,
+                target.second
+            )
+            balanced = applyRawWhiteBalance(demosaic, gains)
+            toned = toneMapRawFusion(balanced).bitmap
+            saveRawFusionPng(toned, referenceDebugFile)
+        } finally {
+            demosaic?.takeUnless { it.isRecycled }?.recycle()
+            balanced?.takeUnless { it.isRecycled }?.recycle()
+            toned?.takeUnless { it.isRecycled }?.recycle()
+        }
+    }
+}
+
+private fun writeRawRenderDebugJson(
+    file: File,
+    context: RawFusionExportContext,
+    gains: RawWhiteBalanceGains,
+    mergedStats: RawRenderStats,
+    finalStats: RawRenderStats,
+    cfaScores: JSONObject,
+    renderMetadata: RawRenderMetadata,
+    warnings: Set<String>,
+    exposureGain: Float,
+    shadowLift: Float,
+    highlightRollOff: Float
+) {
+    val json = JSONObject()
+        .put("rawRenderVersion", RAW_RENDER_VERSION)
+        .put("cfaPattern", context.sensor.cfa)
+        .put("cfaPatternName", cfaName(context.sensor.cfa))
+        .put("blackLevelUsed", context.sensor.blackLevel)
+        .put("whiteLevelUsed", context.sensor.whiteLevel)
+        .put("mergedRawFormat", context.job.optString("mergedRawFormat", "black_level_subtracted_classic_raw_v1_compact_raw16"))
+        .put("redMean", mergedStats.redMean)
+        .put("greenMean", mergedStats.greenMean)
+        .put("blueMean", mergedStats.blueMean)
+        .put("redGain", gains.red)
+        .put("greenGain", gains.green)
+        .put("blueGain", gains.blue)
+        .put("cameraWbGains", renderMetadata.cameraWbGains?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
+        .put("colorCorrectionTransformUsed", renderMetadata.colorTransform?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
+        .put("saturationEstimate", finalStats.saturationEstimate)
+        .put("renderToneVersion", "conservative_auto_exposure_v0_2")
+        .put("renderExposureGain", exposureGain)
+        .put("renderShadowLift", shadowLift)
+        .put("renderHighlightRollOff", highlightRollOff)
+        .put("denoiseVersion", "mild_bilateral_chroma_v0_1")
+        .put("denoiseStrength", RAW_RENDER_DENOISE_STRENGTH)
+        .put("chromaDenoiseStrength", RAW_RENDER_CHROMA_DENOISE_STRENGTH)
+        .put("sharpenAmount", RAW_RENDER_SHARPEN_AMOUNT)
+        .put("cfaSanityScores", cfaScores)
+        .put("finalStats", JSONObject()
+            .put("saturationEstimate", finalStats.saturationEstimate)
+            .put("overBrightRatio", finalStats.overBrightRatio)
+            .put("underBrightRatio", finalStats.underBrightRatio)
+            .put("noiseEstimate", finalStats.noiseEstimate)
+        )
+        .put("warnings", JSONArray(warnings.toList()))
+    file.writeText(json.toString(2))
+}
+
+private fun writeRawRenderInputMetadata(
+    file: File,
+    context: RawFusionExportContext,
+    renderMetadata: RawRenderMetadata,
+    outputWidth: Int,
+    outputHeight: Int,
+    warnings: Set<String>
+) {
+    val json = JSONObject()
+        .put("rawRenderVersion", RAW_RENDER_VERSION)
+        .put("cfaPattern", context.sensor.cfa)
+        .put("blackLevelUsed", 0)
+        .put("whiteLevelUsed", context.sensor.whiteLevel - context.sensor.blackLevel)
+        .put("mergedRawFormat", "black_level_subtracted_compact_raw16")
+        .put("wbGains", renderMetadata.cameraWbGains?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
+        .put("colorTransform3x3", renderMetadata.colorTransform?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
+        .put("outputWidth", outputWidth)
+        .put("outputHeight", outputHeight)
+        .put("denoiseStrength", RAW_RENDER_DENOISE_STRENGTH)
+        .put("chromaDenoiseStrength", RAW_RENDER_CHROMA_DENOISE_STRENGTH)
+        .put("sharpenAmount", RAW_RENDER_SHARPEN_AMOUNT)
+        .put("toneTargetMidGray", 0.35)
+        .put("toneMaxShadowLift", 0.06)
+        .put("highlightRolloff", 0.16)
+        .put("warnings", JSONArray(warnings.toList()))
+    file.writeText(json.toString(2))
+}
+
+private fun averageFrameMetadataForRender(frameMeta: List<JSONObject>): RawRenderMetadata {
+    val warnings = mutableSetOf<String>()
+    val gains = frameMeta.mapNotNull { parseRggbGainsOrNull(it.optString("colorCorrectionGains")) }
+    val matrix = frameMeta.mapNotNull { parseColorTransform3x3OrNull(it.optString("colorCorrectionTransform")) }
+    if (gains.isEmpty()) warnings += "WB_GAINS_MISSING"
+    if (matrix.isEmpty()) warnings += "COLOR_TRANSFORM_MISSING"
+    return RawRenderMetadata(
+        cameraWbGains = gains.takeIf { it.isNotEmpty() }?.let { averageFloatArrays(it, 4) },
+        colorTransform = matrix.takeIf { it.isNotEmpty() }?.let { averageFloatArrays(it, 9) },
+        warnings = warnings
+    )
+}
+
+private fun parseRggbGainsOrNull(text: String?): FloatArray? {
+    val values = parseFloatTokens(text)
+    if (values.size < 4) return null
+    return floatArrayOf(values[0], values[1], values[2], values[3])
+}
+
+private fun parseColorTransform3x3OrNull(text: String?): FloatArray? {
+    val values = parseFloatTokens(text)
+    if (values.size < 9) return null
+    return FloatArray(9) { values[it] }
+}
+
+private fun parseFloatTokens(text: String?): List<Float> {
+    if (text.isNullOrBlank() || text == "null") return emptyList()
+    return Regex("-?\\d+(?:\\.\\d+)?(?:/\\d+(?:\\.\\d+)?)?")
+        .findAll(text)
+        .mapNotNull { token ->
+            val raw = token.value
+            if (raw.contains('/')) {
+                val parts = raw.split('/')
+                val numerator = parts.getOrNull(0)?.toFloatOrNull()
+                val denominator = parts.getOrNull(1)?.toFloatOrNull()
+                if (numerator != null && denominator != null && denominator != 0f) numerator / denominator else null
+            } else {
+                raw.toFloatOrNull()
+            }
+        }
+        .toList()
+}
+
+private fun averageFloatArrays(values: List<FloatArray>, count: Int): FloatArray {
+    val out = FloatArray(count)
+    values.forEach { value ->
+        for (i in 0 until count) out[i] += value[i]
+    }
+    for (i in 0 until count) out[i] /= values.size.toFloat()
+    return out
+}
+
+private fun floatArrayToJson(values: FloatArray): JSONArray {
+    val array = JSONArray()
+    values.forEach { array.put(it.toDouble()) }
+    return array
 }
 
 private fun saveRawFusionPng(bitmap: Bitmap, file: File) {
