@@ -5,6 +5,8 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cctype>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -780,12 +782,119 @@ constexpr float kPostprocessBlackLift = 0.008f;
 constexpr float kPostprocessGamma = 2.20f;
 constexpr float kPostprocessShoulderStrength = 0.16f;
 constexpr float kPostprocessExposureBiasStops = 0.0f;
-constexpr float kChromaDenoiseStrength = 0.18f;
-constexpr float kSharpenStrength = 0.22f;
+constexpr float kChromaDenoiseStrength = 0.55f;
+constexpr float kSharpenStrength = 0.08f;
 constexpr float kDarkSharpenSuppression = 0.70f;
 constexpr float kHighlightSharpenSuppression = 0.85f;
 constexpr float kWbGainMin = 0.6f;
 constexpr float kWbGainMax = 2.2f;
+
+struct NativeIspRenderParams {
+    float wbR = 1.0f;
+    float wbG = 1.0f;
+    float wbB = 1.0f;
+    std::array<float, 9> colorMatrix{1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+    bool wbMissing = true;
+    bool colorTransformMissing = true;
+    float denoiseStrength = 0.35f;
+    float chromaDenoiseStrength = 0.55f;
+    float sharpenAmount = 0.08f;
+    float toneTargetMidGray = 0.35f;
+    float toneMaxShadowLift = 0.06f;
+    float highlightRolloff = 0.16f;
+};
+
+struct NativeIspRenderStats {
+    uint64_t hotPixelCount = 0;
+    double beforeR = 0.0;
+    double beforeG = 0.0;
+    double beforeB = 0.0;
+    double afterWbR = 0.0;
+    double afterWbG = 0.0;
+    double afterWbB = 0.0;
+    double afterMatrixR = 0.0;
+    double afterMatrixG = 0.0;
+    double afterMatrixB = 0.0;
+    double saturationSum = 0.0;
+    double lumaSum = 0.0;
+    double lumaSqSum = 0.0;
+    uint64_t overexposed = 0;
+    uint64_t sampleCount = 0;
+    float exposureGain = 1.0f;
+};
+
+std::string readTextFile(const std::string& path) {
+    std::ifstream input(path);
+    if (!input) return {};
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    return contents.str();
+}
+
+bool parseJsonFloatArray(const std::string& text, const std::string& key, std::vector<float>& out) {
+    const std::string quotedKey = "\"" + key + "\"";
+    const size_t keyPos = text.find(quotedKey);
+    if (keyPos == std::string::npos) return false;
+    const size_t colon = text.find(':', keyPos);
+    if (colon == std::string::npos) return false;
+    size_t valueStart = colon + 1;
+    while (valueStart < text.size() && std::isspace(static_cast<unsigned char>(text[valueStart]))) ++valueStart;
+    if (valueStart >= text.size() || text[valueStart] != '[') return false;
+    const size_t open = valueStart;
+    const size_t close = text.find(']', open == std::string::npos ? keyPos : open);
+    if (open == std::string::npos || close == std::string::npos || close <= open) return false;
+    out.clear();
+    size_t pos = open + 1;
+    while (pos < close) {
+        while (pos < close && !(text[pos] == '-' || text[pos] == '+' || text[pos] == '.' || std::isdigit(static_cast<unsigned char>(text[pos])))) ++pos;
+        if (pos >= close) break;
+        char* endPtr = nullptr;
+        const float value = std::strtof(text.c_str() + pos, &endPtr);
+        if (endPtr == text.c_str() + pos) break;
+        out.push_back(value);
+        pos = static_cast<size_t>(endPtr - text.c_str());
+    }
+    return !out.empty();
+}
+
+float parseJsonFloat(const std::string& text, const std::string& key, float fallback) {
+    const std::string quotedKey = "\"" + key + "\"";
+    const size_t keyPos = text.find(quotedKey);
+    if (keyPos == std::string::npos) return fallback;
+    const size_t colon = text.find(':', keyPos);
+    if (colon == std::string::npos) return fallback;
+    size_t pos = colon + 1;
+    while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+    char* endPtr = nullptr;
+    const float value = std::strtof(text.c_str() + pos, &endPtr);
+    if (endPtr == text.c_str() + pos || !std::isfinite(value)) return fallback;
+    return value;
+}
+
+NativeIspRenderParams parseNativeIspRenderParams(const std::string& metadataPath) {
+    NativeIspRenderParams params;
+    const std::string text = readTextFile(metadataPath);
+    std::vector<float> values;
+    if (parseJsonFloatArray(text, "wbGains", values) && values.size() >= 4) {
+        const float green = std::max(0.001f, (values[1] + values[2]) * 0.5f);
+        params.wbR = std::clamp(values[0] / green, kWbGainMin, kWbGainMax);
+        params.wbG = 1.0f;
+        params.wbB = std::clamp(values[3] / green, kWbGainMin, kWbGainMax);
+        params.wbMissing = false;
+    }
+    values.clear();
+    if (parseJsonFloatArray(text, "colorTransform3x3", values) && values.size() >= 9) {
+        for (size_t i = 0; i < 9; ++i) params.colorMatrix[i] = values[i];
+        params.colorTransformMissing = false;
+    }
+    params.denoiseStrength = std::clamp(parseJsonFloat(text, "denoiseStrength", params.denoiseStrength), 0.0f, 0.75f);
+    params.chromaDenoiseStrength = std::clamp(parseJsonFloat(text, "chromaDenoiseStrength", params.chromaDenoiseStrength), 0.0f, 0.85f);
+    params.sharpenAmount = std::clamp(parseJsonFloat(text, "sharpenAmount", params.sharpenAmount), 0.0f, 0.12f);
+    params.toneTargetMidGray = std::clamp(parseJsonFloat(text, "toneTargetMidGray", params.toneTargetMidGray), 0.20f, 0.45f);
+    params.toneMaxShadowLift = std::clamp(parseJsonFloat(text, "toneMaxShadowLift", params.toneMaxShadowLift), 0.0f, 0.06f);
+    params.highlightRolloff = std::clamp(parseJsonFloat(text, "highlightRolloff", params.highlightRolloff), 0.02f, 0.35f);
+    return params;
+}
 
 uint8_t toneRawV02(float value, int whiteRange) {
     const float exposureScale = std::pow(2.0f, kPostprocessExposureBiasStops);
@@ -1294,6 +1403,267 @@ bool metadataContainsWarning(const std::string& metadataPath, const std::string&
     return contents.str().find(warning) != std::string::npos;
 }
 
+uint64_t suppressHotPixelsCfaPlane(std::vector<uint16_t>& raw, int width, int height, int whiteRange) {
+    if (width < 8 || height < 8) return 0;
+    std::vector<uint16_t> fixed = raw;
+    uint64_t hotPixels = 0;
+    const int absoluteThreshold = std::max(96, whiteRange / 48);
+    const int relativeThreshold = std::max(64, whiteRange / 64);
+    for (int y = 2; y < height - 2; ++y) {
+        for (int x = 2; x < width - 2; ++x) {
+            uint16_t neighbors[8] = {
+                raw[static_cast<size_t>(y - 2) * width + x],
+                raw[static_cast<size_t>(y + 2) * width + x],
+                raw[static_cast<size_t>(y) * width + x - 2],
+                raw[static_cast<size_t>(y) * width + x + 2],
+                raw[static_cast<size_t>(y - 2) * width + x - 2],
+                raw[static_cast<size_t>(y - 2) * width + x + 2],
+                raw[static_cast<size_t>(y + 2) * width + x - 2],
+                raw[static_cast<size_t>(y + 2) * width + x + 2]
+            };
+            std::nth_element(neighbors, neighbors + 4, neighbors + 8);
+            const int median = neighbors[4];
+            const int value = raw[static_cast<size_t>(y) * width + x];
+            if (value > median + absoluteThreshold && value - median > relativeThreshold) {
+                fixed[static_cast<size_t>(y) * width + x] = static_cast<uint16_t>(median);
+                ++hotPixels;
+            }
+        }
+    }
+    raw.swap(fixed);
+    return hotPixels;
+}
+
+float toneLinearToDisplay(float value, const NativeIspRenderParams& params, float exposureGain) {
+    float x = std::clamp(value * exposureGain, 0.0f, 4.0f);
+    const float shadowLift = params.toneMaxShadowLift * (1.0f - std::clamp(x / 0.25f, 0.0f, 1.0f));
+    x = std::clamp(x + shadowLift, 0.0f, 4.0f);
+    x = x / (1.0f + params.highlightRolloff * std::max(0.0f, x));
+    x = std::clamp(x, 0.0f, 1.0f);
+    return std::pow(x, 1.0f / kPostprocessGamma) * 255.0f;
+}
+
+bool renderRaw16NativeIspV2(
+    const std::string& rawPath,
+    const std::string& outputPath,
+    int width,
+    int height,
+    int cfaPattern,
+    int blackLevel,
+    int whiteLevel,
+    int outputWidth,
+    int outputHeight,
+    const NativeIspRenderParams& params,
+    NativeIspRenderStats& stats,
+    std::string& error
+) {
+    if (width <= 0 || height <= 0 || outputWidth <= 0 || outputHeight <= 0) {
+        error = "invalid dimensions";
+        return false;
+    }
+    const int64_t inputPixels = static_cast<int64_t>(width) * height;
+    const int64_t outputPixels = static_cast<int64_t>(outputWidth) * outputHeight;
+    if (inputPixels <= 0 || inputPixels > 120000000LL || outputPixels <= 0 || outputPixels > 32000000LL) {
+        error = "dimensions exceed native raw isp v0.2 limits";
+        return false;
+    }
+
+    std::vector<uint16_t> raw;
+    if (!readRaw16(rawPath, width, height, raw, error)) return false;
+    const int whiteRange = std::max(1, whiteLevel - blackLevel);
+    stats.hotPixelCount = suppressHotPixelsCfaPlane(raw, width, height, whiteRange);
+
+    const RawImageGeometry geometry{width, height, blackLevel, whiteLevel};
+    auto rawAt = [&](int x, int y) {
+        return sampleCfaValue(raw, geometry, x, y);
+    };
+    auto average2 = [](int a, int b) { return (a + b) / 2; };
+    auto average4 = [](int a, int b, int c, int d) { return (a + b + c + d) / 4; };
+    auto sourceCoordinate = [](int outputCoordinate, int inputSize, int outputSize) {
+        int source = static_cast<int>((static_cast<int64_t>(outputCoordinate) * inputSize) / outputSize);
+        return std::clamp((source / 2) * 2 + (outputCoordinate & 1), 0, inputSize - 1);
+    };
+    auto demosaicBilinearSafe = [&](int sx, int sy) -> std::array<float, 3> {
+        const int value = rawAt(sx, sy);
+        float r = 0.0f;
+        float g = 0.0f;
+        float b = 0.0f;
+        const char color = bayerColorAt(sx, sy, cfaPattern);
+        if (color == 'R' || color == 'B') {
+            const int horizontalGradient =
+                std::abs(rawAt(sx - 1, sy) - rawAt(sx + 1, sy)) +
+                std::abs(2 * value - rawAt(sx - 2, sy) - rawAt(sx + 2, sy));
+            const int verticalGradient =
+                std::abs(rawAt(sx, sy - 1) - rawAt(sx, sy + 1)) +
+                std::abs(2 * value - rawAt(sx, sy - 2) - rawAt(sx, sy + 2));
+            if (horizontalGradient < verticalGradient) {
+                g = static_cast<float>(average2(rawAt(sx - 1, sy), rawAt(sx + 1, sy)));
+            } else if (verticalGradient < horizontalGradient) {
+                g = static_cast<float>(average2(rawAt(sx, sy - 1), rawAt(sx, sy + 1)));
+            } else {
+                g = static_cast<float>(average4(rawAt(sx - 1, sy), rawAt(sx + 1, sy), rawAt(sx, sy - 1), rawAt(sx, sy + 1)));
+            }
+            const int diagonalOneGradient = std::abs(rawAt(sx - 1, sy - 1) - rawAt(sx + 1, sy + 1));
+            const int diagonalTwoGradient = std::abs(rawAt(sx + 1, sy - 1) - rawAt(sx - 1, sy + 1));
+            const float opposite = diagonalOneGradient < diagonalTwoGradient
+                ? static_cast<float>(average2(rawAt(sx - 1, sy - 1), rawAt(sx + 1, sy + 1)))
+                : diagonalTwoGradient < diagonalOneGradient
+                    ? static_cast<float>(average2(rawAt(sx + 1, sy - 1), rawAt(sx - 1, sy + 1)))
+                    : static_cast<float>(average4(rawAt(sx - 1, sy - 1), rawAt(sx + 1, sy - 1), rawAt(sx - 1, sy + 1), rawAt(sx + 1, sy + 1)));
+            if (color == 'R') {
+                r = static_cast<float>(value);
+                b = opposite;
+            } else {
+                b = static_cast<float>(value);
+                r = opposite;
+            }
+        } else {
+            g = static_cast<float>(value);
+            const bool greenOnRedRow = (cfaPattern == 2 || cfaPattern == 3) ? ((sy & 1) != 0) : ((sy & 1) == 0);
+            const float horizontalColor = static_cast<float>(average2(rawAt(sx - 1, sy), rawAt(sx + 1, sy)));
+            const float verticalColor = static_cast<float>(average2(rawAt(sx, sy - 1), rawAt(sx, sy + 1)));
+            const float horizontalGreen = static_cast<float>(average2(rawAt(sx - 2, sy), rawAt(sx + 2, sy)));
+            const float verticalGreen = static_cast<float>(average2(rawAt(sx, sy - 2), rawAt(sx, sy + 2)));
+            const float correctedHorizontal = horizontalColor + 0.5f * (g - horizontalGreen);
+            const float correctedVertical = verticalColor + 0.5f * (g - verticalGreen);
+            if (greenOnRedRow) {
+                r = correctedHorizontal;
+                b = correctedVertical;
+            } else {
+                r = correctedVertical;
+                b = correctedHorizontal;
+            }
+        }
+        return {
+            std::clamp(r / whiteRange, 0.0f, 1.0f),
+            std::clamp(g / whiteRange, 0.0f, 1.0f),
+            std::clamp(b / whiteRange, 0.0f, 1.0f)
+        };
+    };
+    auto applyWbAndMatrix = [&](const std::array<float, 3>& rgb) -> std::array<float, 3> {
+        const float wbR = rgb[0] * params.wbR;
+        const float wbG = rgb[1] * params.wbG;
+        const float wbB = rgb[2] * params.wbB;
+        return {
+            params.colorMatrix[0] * wbR + params.colorMatrix[1] * wbG + params.colorMatrix[2] * wbB,
+            params.colorMatrix[3] * wbR + params.colorMatrix[4] * wbG + params.colorMatrix[5] * wbB,
+            params.colorMatrix[6] * wbR + params.colorMatrix[7] * wbG + params.colorMatrix[8] * wbB
+        };
+    };
+
+    const int sampleStepX = std::max(8, outputWidth / 180);
+    const int sampleStepY = std::max(8, outputHeight / 120);
+    for (int oy = sampleStepY / 2; oy < outputHeight; oy += sampleStepY) {
+        const int sy = sourceCoordinate(oy, height, outputHeight);
+        for (int ox = sampleStepX / 2; ox < outputWidth; ox += sampleStepX) {
+            const int sx = sourceCoordinate(ox, width, outputWidth);
+            const auto rgb = demosaicBilinearSafe(sx, sy);
+            const auto corrected = applyWbAndMatrix(rgb);
+            const float luma = std::clamp(0.2126f * corrected[0] + 0.7152f * corrected[1] + 0.0722f * corrected[2], 0.0f, 1.0f);
+            if (luma < 0.02f || luma > 0.96f) continue;
+            stats.lumaSum += luma;
+            ++stats.sampleCount;
+        }
+    }
+    const float meanLuma = stats.sampleCount > 0 ? static_cast<float>(stats.lumaSum / stats.sampleCount) : 0.25f;
+    stats.exposureGain = std::clamp(params.toneTargetMidGray / std::max(0.08f, meanLuma), 0.75f, 1.6f);
+    stats.sampleCount = 0;
+    stats.lumaSum = 0.0;
+
+    std::vector<uint8_t> toned(static_cast<size_t>(outputPixels) * 3);
+    for (int oy = 0; oy < outputHeight; ++oy) {
+        const int sy = sourceCoordinate(oy, height, outputHeight);
+        for (int ox = 0; ox < outputWidth; ++ox) {
+            const int sx = sourceCoordinate(ox, width, outputWidth);
+            const auto rgb = demosaicBilinearSafe(sx, sy);
+            const float wbR = rgb[0] * params.wbR;
+            const float wbG = rgb[1] * params.wbG;
+            const float wbB = rgb[2] * params.wbB;
+            const auto corrected = applyWbAndMatrix(rgb);
+            const size_t p = (static_cast<size_t>(oy) * outputWidth + ox) * 3;
+            toned[p] = clampToByte(toneLinearToDisplay(corrected[0], params, stats.exposureGain));
+            toned[p + 1] = clampToByte(toneLinearToDisplay(corrected[1], params, stats.exposureGain));
+            toned[p + 2] = clampToByte(toneLinearToDisplay(corrected[2], params, stats.exposureGain));
+            if (((ox | oy) & 7) == 0) {
+                const float r = std::max(0.0f, corrected[0]);
+                const float g = std::max(0.0f, corrected[1]);
+                const float b = std::max(0.0f, corrected[2]);
+                const float maxC = std::max({r, g, b});
+                const float minC = std::min({r, g, b});
+                const float luma = std::clamp(0.2126f * r + 0.7152f * g + 0.0722f * b, 0.0f, 2.0f);
+                stats.beforeR += rgb[0];
+                stats.beforeG += rgb[1];
+                stats.beforeB += rgb[2];
+                stats.afterWbR += wbR;
+                stats.afterWbG += wbG;
+                stats.afterWbB += wbB;
+                stats.afterMatrixR += r;
+                stats.afterMatrixG += g;
+                stats.afterMatrixB += b;
+                stats.saturationSum += maxC > 0.0001f ? (maxC - minC) / maxC : 0.0f;
+                stats.lumaSum += luma;
+                stats.lumaSqSum += luma * luma;
+                if (maxC > 0.98f) ++stats.overexposed;
+                ++stats.sampleCount;
+            }
+        }
+    }
+
+    std::ofstream output(outputPath, std::ios::binary);
+    if (!output) {
+        error = "RGBA output open failed";
+        return false;
+    }
+    std::vector<uint8_t> rgbaRow(static_cast<size_t>(outputWidth) * 4);
+    for (int y = 0; y < outputHeight; ++y) {
+        for (int x = 0; x < outputWidth; ++x) {
+            const size_t center = (static_cast<size_t>(y) * outputWidth + x) * 3;
+            const size_t out = static_cast<size_t>(x) * 4;
+            const float centerR = toned[center];
+            const float centerG = toned[center + 1];
+            const float centerB = toned[center + 2];
+            const float centerLuma = 0.25f * centerR + 0.50f * centerG + 0.25f * centerB;
+            double lumaSum = 0.0;
+            double chromaRSum = 0.0;
+            double chromaBSum = 0.0;
+            for (int dy = -1; dy <= 1; ++dy) {
+                const int yy = std::clamp(y + dy, 0, outputHeight - 1);
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int xx = std::clamp(x + dx, 0, outputWidth - 1);
+                    const size_t p = (static_cast<size_t>(yy) * outputWidth + xx) * 3;
+                    const float r = toned[p];
+                    const float g = toned[p + 1];
+                    const float b = toned[p + 2];
+                    const float luma = 0.25f * r + 0.50f * g + 0.25f * b;
+                    lumaSum += luma;
+                    chromaRSum += r - luma;
+                    chromaBSum += b - luma;
+                }
+            }
+            const float localLuma = static_cast<float>(lumaSum / 9.0);
+            const float centerChromaR = centerR - centerLuma;
+            const float centerChromaB = centerB - centerLuma;
+            const float denoisedChromaR = centerChromaR * (1.0f - params.chromaDenoiseStrength) +
+                static_cast<float>(chromaRSum / 9.0) * params.chromaDenoiseStrength;
+            const float denoisedChromaB = centerChromaB * (1.0f - params.chromaDenoiseStrength) +
+                static_cast<float>(chromaBSum / 9.0) * params.chromaDenoiseStrength;
+            const float noiseProxy = std::abs(centerLuma - localLuma) / 255.0f;
+            const float adaptiveStrength = params.sharpenAmount * std::clamp(1.0f - noiseProxy * 5.0f, 0.0f, 1.0f);
+            const float sharpenedLuma = std::clamp(centerLuma + (centerLuma - localLuma) * adaptiveStrength, 0.0f, 255.0f);
+            rgbaRow[out] = clampToByte(sharpenedLuma + denoisedChromaR);
+            rgbaRow[out + 1] = clampToByte(sharpenedLuma - 0.5f * denoisedChromaR - 0.5f * denoisedChromaB);
+            rgbaRow[out + 2] = clampToByte(sharpenedLuma + denoisedChromaB);
+            rgbaRow[out + 3] = 255;
+        }
+        output.write(reinterpret_cast<const char*>(rgbaRow.data()), static_cast<std::streamsize>(rgbaRow.size()));
+    }
+    if (!output.good()) {
+        error = "RGBA output write failed";
+        return false;
+    }
+    return true;
+}
+
 bool writeNativeIspV2DebugJson(
     const std::string& path,
     const std::string& metadataPath,
@@ -1306,6 +1676,8 @@ bool writeNativeIspV2DebugJson(
     int blackLevel,
     int whiteLevel,
     const std::string& status,
+    const NativeIspRenderParams& params,
+    const NativeIspRenderStats& stats,
     std::string& error
 ) {
     std::ofstream output(path);
@@ -1313,8 +1685,12 @@ bool writeNativeIspV2DebugJson(
         error = "native raw isp debug json open failed: " + path;
         return false;
     }
-    const bool wbMissing = metadataContainsWarning(metadataPath, "WB_GAINS_MISSING");
-    const bool matrixMissing = metadataContainsWarning(metadataPath, "COLOR_TRANSFORM_MISSING");
+    const double denom = static_cast<double>(std::max<uint64_t>(1, stats.sampleCount));
+    const double meanLuma = stats.lumaSum / denom;
+    const double noiseVariance = std::max(0.0, stats.lumaSqSum / denom - meanLuma * meanLuma);
+    const double noiseEstimate = std::sqrt(noiseVariance);
+    const double saturation = stats.saturationSum / denom;
+    const double overRatio = static_cast<double>(stats.overexposed) / denom;
     output << "{\n"
            << "  \"rawRenderVersion\": \"native_raw_isp_v0.2\",\n"
            << "  \"nativeRawIspUsed\": true,\n"
@@ -1327,33 +1703,45 @@ bool writeNativeIspV2DebugJson(
            << "  \"blackLevelUsed\": " << blackLevel << ",\n"
            << "  \"whiteLevelUsed\": " << whiteLevel << ",\n"
            << "  \"mergedRawFormat\": \"black_level_subtracted_compact_raw16\",\n"
-           << "  \"wbGainsUsed\": \"metadata_or_gray_world_fallback\",\n"
-           << "  \"colorTransformUsed\": \"" << (matrixMissing ? "identity_fallback" : "metadata_3x3") << "\",\n"
+           << "  \"wbGainsUsed\": {\"r\": " << params.wbR << ", \"g\": " << params.wbG
+           << ", \"b\": " << params.wbB << ", \"source\": \""
+           << (params.wbMissing ? "neutral_fallback" : "metadata_rggb") << "\"},\n"
+           << "  \"colorTransformUsed\": ["
+           << params.colorMatrix[0] << ", " << params.colorMatrix[1] << ", " << params.colorMatrix[2] << ", "
+           << params.colorMatrix[3] << ", " << params.colorMatrix[4] << ", " << params.colorMatrix[5] << ", "
+           << params.colorMatrix[6] << ", " << params.colorMatrix[7] << ", " << params.colorMatrix[8] << "],\n"
            << "  \"demosaicMethod\": \"BILINEAR_SAFE_V0\",\n"
            << "  \"denoiseVersion\": \"native_chroma_luma_v0.2\",\n"
-           << "  \"denoiseStrength\": 0.35,\n"
-           << "  \"chromaDenoiseStrength\": " << kChromaDenoiseStrength << ",\n"
+           << "  \"denoiseStrength\": " << params.denoiseStrength << ",\n"
+           << "  \"chromaDenoiseStrength\": " << params.chromaDenoiseStrength << ",\n"
            << "  \"toneVersion\": \"native_conservative_shoulder_v0.2\",\n"
-           << "  \"rawRenderExposureGain\": 1.0,\n"
-           << "  \"rawRenderShadowLift\": " << kPostprocessBlackLift << ",\n"
-           << "  \"rawRenderHighlightRollOff\": " << kPostprocessShoulderStrength << ",\n"
-           << "  \"rawRenderSharpenAmount\": " << kSharpenStrength << ",\n"
-           << "  \"hotPixelCount\": 0,\n"
-           << "  \"channelMeansBeforeWb\": null,\n"
-           << "  \"channelMeansAfterWb\": null,\n"
-           << "  \"channelMeansAfterMatrix\": null,\n"
-           << "  \"saturationEstimate\": null,\n"
-           << "  \"overexposureRatio\": null,\n"
+           << "  \"rawRenderExposureGain\": " << stats.exposureGain << ",\n"
+           << "  \"rawRenderShadowLift\": " << params.toneMaxShadowLift << ",\n"
+           << "  \"rawRenderHighlightRollOff\": " << params.highlightRolloff << ",\n"
+           << "  \"rawRenderSharpenAmount\": " << params.sharpenAmount << ",\n"
+           << "  \"hotPixelCount\": " << stats.hotPixelCount << ",\n"
+           << "  \"channelMeansBeforeWb\": {\"r\": " << stats.beforeR / denom
+           << ", \"g\": " << stats.beforeG / denom << ", \"b\": " << stats.beforeB / denom << "},\n"
+           << "  \"channelMeansAfterWb\": {\"r\": " << stats.afterWbR / denom
+           << ", \"g\": " << stats.afterWbG / denom << ", \"b\": " << stats.afterWbB / denom << "},\n"
+           << "  \"channelMeansAfterMatrix\": {\"r\": " << stats.afterMatrixR / denom
+           << ", \"g\": " << stats.afterMatrixG / denom << ", \"b\": " << stats.afterMatrixB / denom << "},\n"
+           << "  \"saturationEstimate\": " << saturation << ",\n"
+           << "  \"overexposureRatio\": " << overRatio << ",\n"
+           << "  \"noiseEstimate\": " << noiseEstimate << ",\n"
            << "  \"renderWarnings\": [";
     bool first = true;
-    if (wbMissing) {
-        output << "\"WB_GAINS_MISSING\"";
-        first = false;
-    }
-    if (matrixMissing) {
+    auto appendWarning = [&](const char* warning) {
         if (!first) output << ", ";
-        output << "\"COLOR_TRANSFORM_MISSING\"";
-    }
+        output << "\"" << warning << "\"";
+        first = false;
+    };
+    if (params.wbMissing) appendWarning("WB_GAINS_MISSING");
+    if (params.colorTransformMissing) appendWarning("COLOR_TRANSFORM_MISSING");
+    if (saturation < 0.035) appendWarning("LOW_SATURATION");
+    if (overRatio > 0.03) appendWarning("OVER_BRIGHT");
+    if (noiseEstimate > 0.16) appendWarning("NOISE_AMPLIFIED");
+    if (saturation < 0.02 && !params.wbMissing) appendWarning("POSSIBLE_CFA_MISMATCH");
     output << "],\n"
            << "  \"metadataJsonPath\": \"" << metadataPath << "\",\n"
            << "  \"outputPath\": \"" << rgbaPath << "\",\n"
@@ -1381,92 +1769,102 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutputV2(
     jstring outputReferenceDebugRgbaPath,
     jstring outputMergedLinearDebugRgbaPath
 ) {
-    const jstring tempMainMetadata = env->NewStringUTF((getString(env, outputDebugJsonPath) + ".native.tmp").c_str());
-    jstring mainStatusString = Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
-        env,
-        thiz,
-        mergedRawPath,
-        width,
-        height,
-        cfaPattern,
-        blackLevel,
-        whiteLevel,
-        outputWidth,
-        outputHeight,
-        outputRgbaPath,
-        tempMainMetadata
-    );
-    const std::string mainStatus = getString(env, mainStatusString);
-    env->DeleteLocalRef(tempMainMetadata);
-    if (mainStatus.rfind("OK:", 0) != 0) {
-        return env->NewStringUTF(mainStatus.c_str());
-    }
+    try {
+        const std::string metadataPath = getString(env, metadataJsonPath);
+        const NativeIspRenderParams params = parseNativeIspRenderParams(metadataPath);
+        NativeIspRenderStats mainStats;
+        std::string error;
+        if (!renderRaw16NativeIspV2(
+                getString(env, mergedRawPath),
+                getString(env, outputRgbaPath),
+                width,
+                height,
+                cfaPattern,
+                blackLevel,
+                whiteLevel,
+                outputWidth,
+                outputHeight,
+                params,
+                mainStats,
+                error
+            )) {
+            return env->NewStringUTF(("ERROR: " + error).c_str());
+        }
+        const std::string mainStatus = "OK: native_raw_isp_v0.2 render complete";
 
-    const int debugMax = 960;
-    const int debugWidth = std::max(2, (outputWidth > outputHeight)
-        ? debugMax
-        : std::max(2, outputWidth * debugMax / std::max(1, outputHeight)));
-    const int debugHeight = std::max(2, (outputHeight >= outputWidth)
-        ? debugMax
-        : std::max(2, outputHeight * debugMax / std::max(1, outputWidth)));
+        const int debugMax = 960;
+        const int debugWidth = std::max(2, (outputWidth > outputHeight)
+            ? debugMax
+            : std::max(2, outputWidth * debugMax / std::max(1, outputHeight)));
+        const int debugHeight = std::max(2, (outputHeight >= outputWidth)
+            ? debugMax
+            : std::max(2, outputHeight * debugMax / std::max(1, outputWidth)));
 
-    const std::string mergedDebug = getOptionalString(env, outputMergedLinearDebugRgbaPath);
-    if (!mergedDebug.empty()) {
-        const jstring tempDebugPath = env->NewStringUTF((mergedDebug + ".json.tmp").c_str());
-        Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
-            env,
-            thiz,
-            mergedRawPath,
-            width,
-            height,
-            cfaPattern,
-            blackLevel,
-            whiteLevel,
-            debugWidth,
-            debugHeight,
-            outputMergedLinearDebugRgbaPath,
-            tempDebugPath
-        );
-        env->DeleteLocalRef(tempDebugPath);
-    }
+        const std::string mergedDebug = getOptionalString(env, outputMergedLinearDebugRgbaPath);
+        if (!mergedDebug.empty()) {
+            NativeIspRenderStats debugStats;
+            std::string ignoredError;
+            renderRaw16NativeIspV2(
+                getString(env, mergedRawPath),
+                mergedDebug,
+                width,
+                height,
+                cfaPattern,
+                blackLevel,
+                whiteLevel,
+                debugWidth,
+                debugHeight,
+                params,
+                debugStats,
+                ignoredError
+            );
+        }
 
-    const std::string referencePath = getOptionalString(env, referenceRawPath);
-    const std::string referenceDebug = getOptionalString(env, outputReferenceDebugRgbaPath);
-    if (!referencePath.empty() && !referenceDebug.empty()) {
-        const jstring tempDebugPath = env->NewStringUTF((referenceDebug + ".json.tmp").c_str());
-        Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
-            env,
-            thiz,
-            referenceRawPath,
-            width,
-            height,
-            cfaPattern,
-            blackLevel,
-            whiteLevel,
-            debugWidth,
-            debugHeight,
-            outputReferenceDebugRgbaPath,
-            tempDebugPath
-        );
-        env->DeleteLocalRef(tempDebugPath);
-    }
+        const std::string referencePath = getOptionalString(env, referenceRawPath);
+        const std::string referenceDebug = getOptionalString(env, outputReferenceDebugRgbaPath);
+        if (!referencePath.empty() && !referenceDebug.empty() && fileExistsAndNonEmpty(referencePath)) {
+            NativeIspRenderStats debugStats;
+            std::string ignoredError;
+            renderRaw16NativeIspV2(
+                referencePath,
+                referenceDebug,
+                width,
+                height,
+                cfaPattern,
+                blackLevel,
+                whiteLevel,
+                debugWidth,
+                debugHeight,
+                params,
+                debugStats,
+                ignoredError
+            );
+        }
 
-    std::string error;
-    if (!writeNativeIspV2DebugJson(
-            getString(env, outputDebugJsonPath),
-            getString(env, metadataJsonPath),
-            getString(env, outputRgbaPath),
-            width,
-            height,
-            outputWidth,
-            outputHeight,
-            cfaPattern,
-            blackLevel,
-            whiteLevel,
-            mainStatus,
-            error
-        )) {
-        return env->NewStringUTF(("ERROR: " + error).c_str());
+        if (!writeNativeIspV2DebugJson(
+                getString(env, outputDebugJsonPath),
+                metadataPath,
+                getString(env, outputRgbaPath),
+                width,
+                height,
+                outputWidth,
+                outputHeight,
+                cfaPattern,
+                blackLevel,
+                whiteLevel,
+                mainStatus,
+                params,
+                mainStats,
+                error
+            )) {
+            return env->NewStringUTF(("ERROR: " + error).c_str());
+        }
+        return env->NewStringUTF("OK: native_raw_isp_v0.2 render complete");
+    } catch (const std::bad_alloc&) {
+        return env->NewStringUTF("ERROR: native out of memory");
+    } catch (const std::exception& e) {
+        return env->NewStringUTF((std::string("ERROR: ") + e.what()).c_str());
+    } catch (...) {
+        return env->NewStringUTF("ERROR: unknown native failure");
     }
-    return env->NewStringUTF("OK: native RAW ISP v0.2 complete");
 }
