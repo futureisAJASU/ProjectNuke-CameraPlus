@@ -799,7 +799,7 @@ struct NativeIspRenderParams {
     float denoiseStrength = 0.35f;
     float chromaDenoiseStrength = 0.55f;
     float sharpenAmount = 0.08f;
-    float toneTargetMidGray = 0.35f;
+    float toneTargetMidGray = 0.42f;
     float toneMaxShadowLift = 0.06f;
     float highlightRolloff = 0.16f;
 };
@@ -892,7 +892,7 @@ NativeIspRenderParams parseNativeIspRenderParams(const std::string& metadataPath
     params.denoiseStrength = std::clamp(parseJsonFloat(text, "denoiseStrength", params.denoiseStrength), 0.0f, 0.75f);
     params.chromaDenoiseStrength = std::clamp(parseJsonFloat(text, "chromaDenoiseStrength", params.chromaDenoiseStrength), 0.0f, 0.85f);
     params.sharpenAmount = std::clamp(parseJsonFloat(text, "sharpenAmount", params.sharpenAmount), 0.0f, 0.12f);
-    params.toneTargetMidGray = std::clamp(parseJsonFloat(text, "toneTargetMidGray", params.toneTargetMidGray), 0.20f, 0.45f);
+    params.toneTargetMidGray = std::clamp(parseJsonFloat(text, "toneTargetMidGray", params.toneTargetMidGray), 0.20f, 0.50f);
     params.toneMaxShadowLift = std::clamp(parseJsonFloat(text, "toneMaxShadowLift", params.toneMaxShadowLift), 0.0f, 0.06f);
     params.highlightRolloff = std::clamp(parseJsonFloat(text, "highlightRolloff", params.highlightRolloff), 0.02f, 0.35f);
     return params;
@@ -1696,7 +1696,7 @@ bool renderRaw16NativeIspV2(
         }
     }
     const float meanLuma = stats.sampleCount > 0 ? static_cast<float>(stats.lumaSum / stats.sampleCount) : 0.25f;
-    stats.exposureGain = std::clamp(params.toneTargetMidGray / std::max(0.08f, meanLuma), 0.75f, 1.6f);
+    stats.exposureGain = std::clamp(params.toneTargetMidGray / std::max(0.08f, meanLuma), 0.75f, 2.4f);
     stats.sampleCount = 0;
     stats.lumaSum = 0.0;
 

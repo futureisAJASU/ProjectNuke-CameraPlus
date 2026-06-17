@@ -1,5 +1,6 @@
 package com.projectnuke.keplernightlab
 
+import android.util.Log
 import org.json.JSONObject
 import java.io.File
 
@@ -108,4 +109,10 @@ internal fun updateRawExportBitmapMetadata(
         .put("exportBitmapWidth", exportBitmapWidth)
         .put("exportBitmapHeight", exportBitmapHeight)
     jobFile.writeText(job.toString(2))
+    Log.i(
+        "KeplerRawPipeline",
+        "finalOutputSource=${job.optString("finalOutputSource")} exportBitmapSource=$source " +
+            "nativePostprocessRgbaFile=${job.optString("nativePostprocessRgbaFile")} " +
+            "rawRenderDebugFile=${job.optString("rawRenderDebugFile")}"
+    )
 }

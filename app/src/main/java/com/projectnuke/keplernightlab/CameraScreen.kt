@@ -78,7 +78,9 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 import org.json.JSONObject
 import java.io.File
+import java.io.RandomAccessFile
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 data class LatestKeplerResult(
@@ -178,14 +180,17 @@ fun parseCaptureProgress(
         lower.contains("cleanup") || lower.contains("cleaning") -> CaptureStage.CLEANING
         lower.contains("verifying") || lower.contains("verification") -> CaptureStage.VERIFYING
         lower.contains("exporting") || lower.contains("export ") || lower.contains("tone/export") -> CaptureStage.EXPORTING
-        lower.contains("demosaic") -> CaptureStage.DEMOSAICING
+        lower.contains("demosaic") || text.contains("렌더링") -> CaptureStage.DEMOSAICING
         text.contains("CAPTURE_COMPLETE", ignoreCase = true) ||
                 text.contains("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true) ||
                 text.contains("Classic RAW fusion:", ignoreCase = true) ||
                 text.contains("Classic YUV fusion:", ignoreCase = true) ||
+                text.contains("처리하는 중") ||
+                text.contains("정렬하는 중") ||
+                text.contains("병합하는 중") ||
                 text.contains("Processing RAW fusion:", ignoreCase = true) ||
                 lower.contains("processing") || lower.contains("merging") || lower.contains("loading frames") -> CaptureStage.PROCESSING
-        lower.contains("capture") || lower.contains("capturing") || lower.contains("frame saved") -> CaptureStage.CAPTURING
+        lower.contains("capture") || lower.contains("capturing") || lower.contains("frame saved") || text.contains("캡처 중") -> CaptureStage.CAPTURING
         lower.contains("prepar") || text.contains("준비") || text.contains("초기화") -> CaptureStage.PREPARING
         else -> fallback.stage
     }
@@ -497,7 +502,7 @@ fun MainCameraScreen(
                 previewEnabled = false
                 captureProgress = captureProgress.copy(
                     stage = CaptureStage.PROCESSING,
-                    message = "Capture complete. Processing fusion...",
+                    message = "캡처가 완료되었습니다. RAW 합성 및 렌더링을 처리하는 중입니다.",
                     progressPercent = max(captureProgress.progressPercent, 0.65f)
                 )
                 Log.i("KeplerPipelineState", "Capture stage complete; waiting for processing/export")
@@ -1401,13 +1406,13 @@ fun CaptureProgressRow(
     val stageText = when (captureProgress.stage) {
         CaptureStage.IDLE -> "Ready"
         CaptureStage.PREPARING -> "Preparing"
-        CaptureStage.CAPTURING -> "Capturing"
-        CaptureStage.PROCESSING -> "Processing"
-        CaptureStage.DEMOSAICING -> "Demosaicing"
-        CaptureStage.EXPORTING -> "Exporting"
-        CaptureStage.VERIFYING -> "Verifying"
-        CaptureStage.CLEANING -> "Cleaning"
-        CaptureStage.COMPLETE -> "Complete"
+        CaptureStage.CAPTURING -> "RAW 캡처 중입니다..."
+        CaptureStage.PROCESSING -> "RAW 합성 처리 중입니다..."
+        CaptureStage.DEMOSAICING -> "Native RAW ISP 렌더링 중입니다..."
+        CaptureStage.EXPORTING -> "결과를 저장하는 중입니다..."
+        CaptureStage.VERIFYING -> "결과를 저장하는 중입니다..."
+        CaptureStage.CLEANING -> "결과를 저장하는 중입니다..."
+        CaptureStage.COMPLETE -> "처리가 완료되었습니다."
         CaptureStage.FAILED -> "Failed"
         CaptureStage.TIMEOUT -> "Timeout"
     }
@@ -1417,7 +1422,17 @@ fun CaptureProgressRow(
         ""
     }
     val detailText = buildString {
-        if (captureProgress.receivedImages > 0 || captureProgress.completedResults > 0) {
+        if (captureProgress.stage == CaptureStage.CAPTURING) {
+            append("촬영 중입니다. 기기를 움직이지 마세요.")
+        } else if (
+            captureProgress.stage == CaptureStage.PROCESSING ||
+            captureProgress.stage == CaptureStage.DEMOSAICING ||
+            captureProgress.stage == CaptureStage.EXPORTING ||
+            captureProgress.stage == CaptureStage.VERIFYING ||
+            captureProgress.stage == CaptureStage.CLEANING
+        ) {
+            append("처리 중입니다.")
+        } else if (captureProgress.receivedImages > 0 || captureProgress.completedResults > 0) {
             append("Images ${captureProgress.receivedImages}")
             if (captureProgress.requestedFrames > 0) append(" / ${captureProgress.requestedFrames}")
             append(" · Results ${captureProgress.completedResults}")
@@ -2275,7 +2290,17 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
         val latestJobDir = latest.first
         val job = latest.second
         val previewFile = latest.third
-        val bitmap = decodeLatestResultPreview(previewFile)
+        val outputWidth = job.optInt("outputWidth", 0).takeIf { it > 0 }
+        val outputHeight = job.optInt("outputHeight", 0).takeIf { it > 0 }
+        val bitmap = if (
+            previewFile.extension.equals("rgba", ignoreCase = true) &&
+            outputWidth != null &&
+            outputHeight != null
+        ) {
+            decodeNativeRgbaPreview(previewFile, outputWidth, outputHeight)
+        } else {
+            decodeLatestResultPreview(previewFile)
+        }
         val jobType = job.optString("jobType", latestJobDir.parentFile?.name.orEmpty())
         val fusionEngine = listOf(
             job.optString("fusionEngine", ""),
@@ -2285,9 +2310,6 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
         ).firstOrNull { it.isNotBlank() }.orEmpty()
         val usedFrames = job.optInt("usedFrameCount", job.optInt("savedFrames", 0))
         val requestedFrames = job.optInt("requestedFrames", 0)
-        val outputWidth = job.optInt("outputWidth", 0).takeIf { it > 0 }
-        val outputHeight = job.optInt("outputHeight", 0).takeIf { it > 0 }
-
         val summary = buildString {
             append("status=")
             append(job.optString("status", "unknown"))
@@ -2311,6 +2333,8 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
             append(latestJobDir.name)
             append(", file=")
             append(previewFile.name)
+            append(", source=")
+            append(job.optString("finalOutputSource", "bitmap"))
         }
         LatestKeplerResult(
             bitmap = bitmap,
@@ -2331,6 +2355,15 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
 }
 
 private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
+    if (
+        job.optBoolean("nativeRawIspUsed", false) &&
+        job.optString("finalOutputSource") == "native_rgba"
+    ) {
+        val nativeName = job.optString("nativePostprocessRgbaFile", "")
+        File(jobDir, nativeName).takeIf {
+            nativeName.isNotBlank() && it.exists() && it.length() > 0L
+        }?.let { return it }
+    }
     val names = listOf(
         job.optString("finalFile", ""),
         job.optString("finalNightFusionFile", ""),
@@ -2344,6 +2377,43 @@ private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
         .filter { it.isNotBlank() && it != "null" }
         .map { File(jobDir, it) }
         .firstOrNull { it.exists() && it.length() > 0L }
+}
+
+private fun decodeNativeRgbaPreview(
+    file: File,
+    width: Int,
+    height: Int,
+    maxDimension: Int = 1280
+): Bitmap? {
+    if (width <= 0 || height <= 0) return null
+    val expectedBytes = width.toLong() * height.toLong() * 4L
+    if (!file.exists() || file.length() != expectedBytes) return null
+    val scale = max(1, max(width, height) / maxDimension)
+    val outWidth = max(1, width / scale)
+    val outHeight = max(1, height / scale)
+    val bitmap = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
+    val row = ByteArray(outWidth * 4)
+    RandomAccessFile(file, "r").use { input ->
+        for (y in 0 until outHeight) {
+            val sourceY = min(height - 1, y * scale)
+            val sourceXStep = scale * 4L
+            var sourceOffset = (sourceY.toLong() * width.toLong()) * 4L
+            for (x in 0 until outWidth) {
+                input.seek(sourceOffset)
+                input.readFully(row, x * 4, 4)
+                sourceOffset += sourceXStep
+            }
+            for (x in 0 until outWidth) {
+                val p = x * 4
+                val r = row[p].toInt() and 0xFF
+                val g = row[p + 1].toInt() and 0xFF
+                val b = row[p + 2].toInt() and 0xFF
+                val a = row[p + 3].toInt() and 0xFF
+                bitmap.setPixel(x, y, android.graphics.Color.argb(a, r, g, b))
+            }
+        }
+    }
+    return bitmap
 }
 
 private fun decodeLatestResultPreview(file: File, maxDimension: Int = 1280): Bitmap? {

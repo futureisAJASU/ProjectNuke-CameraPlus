@@ -171,6 +171,7 @@ fun updateExportMetadata(
     val jobFile = File(jobDir, "job.json")
     val job = if (jobFile.exists()) JSONObject(jobFile.readText()) else JSONObject()
     job.put("finalOutputFormatSetting", finalOutputFormat.name)
+        .put("currentPipelineStage", if (verified) "COMPLETE" else "PROCESSING")
         .put("exportStatus", when {
             export == null -> "FAILED"
             verified -> "EXPORTED"
@@ -199,6 +200,13 @@ fun updateExportMetadata(
         })
         .put("exportedAt", System.currentTimeMillis())
     jobFile.writeText(job.toString(2))
+    Log.i(
+        "KeplerRawPipeline",
+        "PIPELINE_COMPLETE jobDir=${jobDir.absolutePath} processStatus=${job.optString("processStatus")} " +
+            "finalOutputSource=${job.optString("finalOutputSource")} " +
+            "nativePostprocessRgbaFile=${job.optString("nativePostprocessRgbaFile")} " +
+            "rawRenderDebugFile=${job.optString("rawRenderDebugFile")}"
+    )
 }
 
 fun updateExportFailure(
@@ -211,6 +219,7 @@ fun updateExportFailure(
     val job = if (jobFile.exists()) JSONObject(jobFile.readText()) else JSONObject()
     job.put("finalOutputFormatSetting", finalOutputFormat.name)
         .put("processStatus", "EXPORT_FAILED_KEEPING_CACHE")
+        .put("currentPipelineStage", "FAILED")
         .put("exportStatus", "FAILED")
         .put("exportVerified", false)
         .put("exportError", error)

@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.util.Log
 import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
@@ -77,7 +78,7 @@ fun captureProcessExportRawNightFusion(
 ) {
     val main = Handler(Looper.getMainLooper())
     fun post(message: String) = main.post { onStatus(message) }
-    post("RAW capture: saved 0/$frameCount, images 0/$frameCount, results 0/$frameCount")
+    post("RAW 캡처 중입니다... saved 0/$frameCount, images 0/$frameCount, results 0/$frameCount")
     captureRawBurstForFusion(
         context = context,
         cameraId = cameraId,
@@ -90,6 +91,8 @@ fun captureProcessExportRawNightFusion(
         rawSpeedMode = rawSpeedMode,
         onStatus = { post(it) },
         onComplete = { jobDir ->
+            Log.i("KeplerRawPipeline", "PROCESSING_STARTED jobDir=${jobDir.absolutePath}")
+            post("캡처가 완료되었습니다. RAW 합성 및 렌더링을 처리하는 중입니다.")
             val thread = HandlerThread("KeplerRawFusionPipelineThread").apply { start() }
             Handler(thread.looper).post {
                 try {
@@ -122,7 +125,7 @@ fun captureProcessExportRawNightFusion(
                         usedFrameCount < requestedFrames
                     )
                     val requestedOutputFormat = requestedOutputFormatForSetting(finalOutputFormat)
-                    post("Exporting ${requestedOutputFormat.label}...")
+                    post("결과를 저장하는 중입니다...")
                     var exportBitmap: Bitmap? = null
                     val result = try {
                         val loaded = process.loadExportBitmap()
@@ -203,12 +206,14 @@ fun captureProcessExportRawNightFusion(
                         ""
                     }
                     if (partialCapture) {
+                        post("처리가 완료되었습니다.")
                         post(
                             "PIPELINE_COMPLETE_PARTIAL: Saved ${result.formatUsed.label}$rawSuffix. " +
                                 "Used $usedFrameCount/$requestedFrames frames. " +
                                 "Partial fallback was used.\nRAW cache kept for reprocessing."
                         )
                     } else {
+                        post("처리가 완료되었습니다.")
                         post(
                             "PIPELINE_COMPLETE: Saved ${result.formatUsed.label}$rawSuffix. " +
                                 "Used $usedFrameCount/$requestedFrames frames.\n" +
