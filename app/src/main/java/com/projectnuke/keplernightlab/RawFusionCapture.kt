@@ -42,7 +42,7 @@ import kotlin.math.min
 import kotlin.math.pow
 
 private const val SAVE_RAW_FUSION_DNG_SIDECARS = false
-private const val RAW_RENDER_VERSION = "native_raw_isp_v0.2"
+private const val RAW_RENDER_VERSION = "native_raw_isp_v0.3"
 private const val RAW_RENDER_SHARPEN_AMOUNT = 0.12f
 private const val RAW_RENDER_DENOISE_STRENGTH = 0.35f
 private const val RAW_RENDER_CHROMA_DENOISE_STRENGTH = 0.55f
@@ -130,7 +130,7 @@ fun captureRawBurstForFusion(
     var rawFirstImageDelayMs: Long? = null
     val rawFrameSaveTimesMs = mutableListOf<Long>()
     fun postCaptureProgress() {
-        post("RAW 캡처 중입니다... saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames, failed $failedCaptures")
+        post("RAW 캡처 중입니다. 기기를 움직이지 마세요. saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames, failed $failedCaptures")
     }
 
     fun cleanup() {
@@ -258,7 +258,7 @@ fun captureRawBurstForFusion(
         val jobDir = File(root, "KPL_RAW_FUSION_$stamp").apply { mkdirs() }
         val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
         val adbDebugHint = "adb shell ls -la '${jobDir.absolutePath}'"
-        Log.i(RAW_PIPELINE_LOG_TAG, "jobDir=${jobDir.absolutePath}")
+        Log.i(RAW_PIPELINE_LOG_TAG, "jobDirAbsolutePath=${jobDir.absolutePath}")
 
         val baseJob = JSONObject()
             .put("app", "Kepler Night Lab")
@@ -269,6 +269,13 @@ fun captureRawBurstForFusion(
             .put("captureStageCompleteAt", JSONObject.NULL)
             .put("processingStartedAt", JSONObject.NULL)
             .put("userCanMoveDevice", false)
+            .put("rawCaptureMs", JSONObject.NULL)
+            .put("rawSaveTotalMs", JSONObject.NULL)
+            .put("nativeAlignMs", JSONObject.NULL)
+            .put("nativeMergeMs", JSONObject.NULL)
+            .put("nativeIspRenderMs", JSONObject.NULL)
+            .put("nativePreviewPrepareMs", JSONObject.NULL)
+            .put("totalPipelineMs", JSONObject.NULL)
             .put("jobDirAbsolutePath", jobDir.absolutePath)
             .put("adbDebugHint", adbDebugHint)
             .put("cameraId", cameraId)
@@ -418,6 +425,8 @@ fun captureRawBurstForFusion(
                 .put("failedCaptures", failedCaptures)
                 .put("rawSpeedMode", rawSpeedMode.name)
                 .put("rawCaptureStartedAt", rawCaptureStartedAt)
+                .put("rawCaptureMs", System.currentTimeMillis() - rawCaptureStartedAt)
+                .put("rawSaveTotalMs", rawFrameSaveTimesMs.sum())
                 .put("captureStageCompleteAt", System.currentTimeMillis())
                 .put("processingStartedAt", JSONObject.NULL)
                 .put("userCanMoveDevice", true)
@@ -447,11 +456,11 @@ fun captureRawBurstForFusion(
                 .put("capturedAt", System.currentTimeMillis())
             if (partial) completeJob.put("partialReason", partialReason)
             jobFile.writeText(completeJob.toString(2))
-            Log.i(RAW_PIPELINE_LOG_TAG, "CAPTURE_COMPLETE jobDir=${jobDir.absolutePath} savedFrames=$savedFrames/$requestedFrames partial=$partial")
+            Log.i(RAW_PIPELINE_LOG_TAG, "CAPTURE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} savedFrames=$savedFrames/$requestedFrames partial=$partial")
             if (partial) {
-                post("CAPTURE_COMPLETE_PARTIAL: 캡처가 완료되었습니다. RAW 합성 및 렌더링을 처리하는 중입니다. saved $savedFrames/$requestedFrames frames")
+                post("CAPTURE_COMPLETE_PARTIAL: 캡처가 완료되었습니다. 이제 기기를 움직여도 됩니다. saved $savedFrames/$requestedFrames frames")
             } else {
-                post("CAPTURE_COMPLETE: 캡처가 완료되었습니다. RAW 합성 및 렌더링을 처리하는 중입니다. saved $savedFrames/$requestedFrames frames")
+                post("CAPTURE_COMPLETE: 캡처가 완료되었습니다. 이제 기기를 움직여도 됩니다. saved $savedFrames/$requestedFrames frames")
             }
             mainHandler.post { onComplete(jobDir) }
             cleanup()
@@ -723,7 +732,9 @@ private object RawFusionExportCoordinator {
         )
         val outputWidth = 5664
         val outputHeight = 4248
-        context.onStatus("Native RAW ISP 렌더링 중입니다...")
+        val nativeIspStartedAt = System.currentTimeMillis()
+        Log.i(RAW_PIPELINE_LOG_TAG, "NATIVE_ISP_STARTED jobDirAbsolutePath=${context.files.jobDir.absolutePath}")
+        context.onStatus("Native RAW ISP 렌더링 중입니다.")
         val postprocessStatus = runCatching {
             NativeRawEngine.processRaw16ToRgbOutput(
                 mergedRawPath = context.files.mergedRawFile.absolutePath,
@@ -744,6 +755,8 @@ private object RawFusionExportCoordinator {
             nativeRgbaFile.exists() &&
             nativeRgbaFile.length() == expectedRgbaBytes &&
             nativeMetadataFile.exists()
+        val nativeIspRenderMs = System.currentTimeMillis() - nativeIspStartedAt
+        Log.i(RAW_PIPELINE_LOG_TAG, "NATIVE_ISP_COMPLETE jobDirAbsolutePath=${context.files.jobDir.absolutePath} nativeIspRenderMs=$nativeIspRenderMs")
         Log.i(
             RAW_PIPELINE_LOG_TAG,
             "nativeRawIspUsed=$nativePostprocessUsed native status=$postprocessStatus " +
@@ -764,6 +777,7 @@ private object RawFusionExportCoordinator {
                 .put("nativePostprocessUsed", false)
                 .put("nativePostprocessStatus", postprocessStatus)
                 .put("currentPipelineStage", "FAILED")
+                .put("nativeIspRenderMs", nativeIspRenderMs)
                 .put("alignmentStatus", context.nativeMerge.alignmentStatus)
                 .put("processedAt", System.currentTimeMillis())
             context.files.jobFile.writeText(failed.toString(2))
@@ -784,7 +798,7 @@ private object RawFusionExportCoordinator {
         if (nativeMp24DebugPngRequested) {
             var nativeBitmap: Bitmap? = null
             try {
-                context.onStatus("결과를 저장하는 중입니다...")
+                context.onStatus("결과를 저장하는 중입니다.")
                 nativeBitmap = loadRawRgbaBitmap(nativeRgbaFile, outputWidth, outputHeight)
                 saveRawFusionPng(nativeBitmap, finalFile)
                 nativeMp24DebugPngWritten = true
@@ -838,6 +852,7 @@ private object RawFusionExportCoordinator {
             .put("nativePostprocessRequired", true)
             .put("nativePostprocessUsed", true)
             .put("nativePostprocessStatus", postprocessStatus)
+            .put("nativeIspRenderMs", nativeIspRenderMs)
             .put("nativePostprocessMetadataFile", nativeMetadataFile.name)
             .put("nativePostprocessRgbaFile", nativeRgbaFile.name)
             .put("fullSizeKotlinDemosaicUsed", false)
@@ -900,7 +915,9 @@ private object RawFusionExportCoordinator {
             ?.file
             ?.absolutePath
             ?: context.frames.inputs.firstOrNull()?.file?.absolutePath
-        context.onStatus("Native RAW ISP 렌더링 중입니다...")
+        val nativeIspStartedAt = System.currentTimeMillis()
+        Log.i(RAW_PIPELINE_LOG_TAG, "NATIVE_ISP_STARTED jobDirAbsolutePath=${context.files.jobDir.absolutePath}")
+        context.onStatus("Native RAW ISP 렌더링 중입니다.")
         val status = runCatching {
             NativeRawEngine.processRaw16ToRgbOutputV2(
                 mergedRawPath = context.files.mergedRawFile.absolutePath,
@@ -924,6 +941,8 @@ private object RawFusionExportCoordinator {
             nativeRgbaFile.exists() &&
             nativeRgbaFile.length() == expectedBytes &&
             renderDebugFile.exists()
+        val nativeIspRenderMs = System.currentTimeMillis() - nativeIspStartedAt
+        Log.i(RAW_PIPELINE_LOG_TAG, "NATIVE_ISP_COMPLETE jobDirAbsolutePath=${context.files.jobDir.absolutePath} nativeIspRenderMs=$nativeIspRenderMs")
         Log.i(
             RAW_PIPELINE_LOG_TAG,
             "nativeRawIspUsed=$nativeOk native status=$status " +
@@ -942,6 +961,7 @@ private object RawFusionExportCoordinator {
                 .put("rawRenderInputMetadataFile", renderInputMetadataFile.name)
                 .put("rawRenderDebugFile", renderDebugFile.name)
                 .put("currentPipelineStage", "FAILED")
+                .put("nativeIspRenderMs", nativeIspRenderMs)
                 .put("processedAt", System.currentTimeMillis())
             context.files.jobFile.writeText(failed.toString(2))
             context.onStatus("PIPELINE_FAILED: Native RAW ISP failed; RAW cache kept. $status")
@@ -966,6 +986,7 @@ private object RawFusionExportCoordinator {
             .put("nativeRawIspUsed", true)
             .put("nativePostprocessUsed", true)
             .put("nativePostprocessStatus", status)
+            .put("nativeIspRenderMs", debug?.optLong("nativeIspRenderMs", nativeIspRenderMs) ?: nativeIspRenderMs)
             .put("nativePostprocessRgbaFile", nativeRgbaFile.name)
             .put("nativePostprocessMetadataFile", renderInputMetadataFile.name)
             .put("rawRenderInputMetadataFile", renderInputMetadataFile.name)
@@ -980,6 +1001,17 @@ private object RawFusionExportCoordinator {
             .put("rawRenderDenoiseStrength", RAW_RENDER_DENOISE_STRENGTH)
             .put("rawRenderChromaDenoiseStrength", RAW_RENDER_CHROMA_DENOISE_STRENGTH)
             .put("rawRenderSharpenAmount", RAW_RENDER_SHARPEN_AMOUNT)
+            .put("demosaicMethod", debug?.optString("demosaicMethod", "MHC_5X5_V0") ?: "MHC_5X5_V0")
+            .put("demosaicFallbackPixelCount", debug?.optLong("demosaicFallbackPixelCount", 0L) ?: 0L)
+            .put("mhcBoundaryFallbackUsed", debug?.optBoolean("mhcBoundaryFallbackUsed", false) ?: false)
+            .put("weightAwareDenoiseUsed", debug?.optBoolean("weightAwareDenoiseUsed", false) ?: false)
+            .put("mergeWeightMapAvailable", debug?.optBoolean("mergeWeightMapAvailable", false) ?: false)
+            .put("mergeWeightMapFile", debug?.opt("mergeWeightMapFile") ?: JSONObject.NULL)
+            .put("mergeRejectMapAvailable", debug?.optBoolean("mergeRejectMapAvailable", false) ?: false)
+            .put("mergeRejectMapFile", debug?.opt("mergeRejectMapFile") ?: JSONObject.NULL)
+            .put("chromaArtifactSuppressionUsed", debug?.optBoolean("chromaArtifactSuppressionUsed", false) ?: false)
+            .put("adaptiveSharpenUsed", debug?.optBoolean("adaptiveSharpenUsed", false) ?: false)
+            .put("sharpenSuppressionLowConfidenceUsed", debug?.optBoolean("sharpenSuppressionLowConfidenceUsed", false) ?: false)
             .put("finalOutputSource", "native_rgba")
             .put("fullSizeKotlinDemosaicUsed", false)
             .put("mergedRawFile", context.files.mergedRawFile.name)
@@ -1313,9 +1345,9 @@ fun processRawFusionJob(
             .put("userCanMoveDevice", true)
         Log.i(
             RAW_PIPELINE_LOG_TAG,
-            "PROCESSING_STARTED jobDir=${jobDir.absolutePath} processStatus=${job.optString("processStatus")}"
+            "PROCESSING_STARTED jobDirAbsolutePath=${jobDir.absolutePath} processStatus=${job.optString("processStatus")}"
         )
-        onStatus("RAW 프레임을 정렬하는 중입니다...")
+        onStatus("RAW 프레임을 정렬하는 중입니다.")
         applyRawFusionMemoryMetadata(job, estimateRawFusionMemory(pixelCountLong))
         jobFile.writeText(job.toString(2))
         val highResolutionRaw = pixelCountLong >= HIGH_RES_RAW_MIN_PIXELS
@@ -1324,7 +1356,7 @@ fun processRawFusionJob(
         val frameMeta = preparedFrames.metadata
         val requestedFrames = preparedFrames.requestedFrames
 
-        onStatus("RAW 프레임을 정렬하는 중입니다...")
+        onStatus("RAW 프레임을 정렬하는 중입니다.")
         val fallbackSample = if (needsRawBlackLevelFallback(job, frameMeta)) {
             readRaw16(frameInputs.first().file, min(pixelCount, 4096))
         } else {
@@ -1353,7 +1385,7 @@ fun processRawFusionJob(
             whiteLevel = whiteLevel
         )
 
-        onStatus("RAW 프레임을 병합하는 중입니다... using ${frameInputs.size}/$requestedFrames frames")
+        onStatus("RAW 프레임을 병합하는 중입니다. using ${frameInputs.size}/$requestedFrames frames")
         val mergedRawFile = File(jobDir, "merged_raw_classic_v1.raw16")
         val alignmentFile = File(jobDir, "raw_fusion_debug.json")
         val files = RawFusionFiles(jobDir, jobFile, mergedRawFile, alignmentFile)
@@ -1385,12 +1417,12 @@ fun processRawFusionJob(
         }
         jobFile.writeText(job.toString(2))
 
-        onStatus("Native RAW ISP 렌더링 중입니다...")
-        onStatus("결과를 저장하는 중입니다...")
+        onStatus("Native RAW ISP 렌더링 중입니다.")
+        onStatus("결과를 저장하는 중입니다.")
         val outputMode = CaptureResolutionMode.entries.firstOrNull { it.name == job.optString("outputResolutionMode") }
             ?: CaptureResolutionMode.entries.firstOrNull { it.label == job.optString("resolutionMode") }
             ?: CaptureResolutionMode.MP12
-        RawFusionExportCoordinator.export(
+        val exportResult = RawFusionExportCoordinator.export(
             RawFusionExportContext(
                 files = files,
                 job = job,
@@ -1414,6 +1446,15 @@ fun processRawFusionJob(
                 onStatus = onStatus
             )
         )
+        runCatching {
+            val updated = JSONObject(jobFile.readText())
+            val pipelineStartedAt = updated.optLong("rawCaptureStartedAt", 0L)
+                .takeIf { it > 0L }
+                ?: updated.optLong("createdAt", System.currentTimeMillis())
+            updated.put("totalPipelineMs", System.currentTimeMillis() - pipelineStartedAt)
+            jobFile.writeText(updated.toString(2))
+        }
+        exportResult
     } catch (oom: OutOfMemoryError) {
         runCatching {
             val job = if (jobFile.exists()) JSONObject(jobFile.readText()) else JSONObject()
@@ -2388,6 +2429,7 @@ private fun writeRawRenderInputMetadata(
         .put("colorTransform3x3", renderMetadata.colorTransform?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
         .put("outputWidth", outputWidth)
         .put("outputHeight", outputHeight)
+        .put("demosaicMethod", "MHC_5X5_V0")
         .put("denoiseStrength", RAW_RENDER_DENOISE_STRENGTH)
         .put("chromaDenoiseStrength", RAW_RENDER_CHROMA_DENOISE_STRENGTH)
         .put("sharpenAmount", RAW_RENDER_SHARPEN_AMOUNT)

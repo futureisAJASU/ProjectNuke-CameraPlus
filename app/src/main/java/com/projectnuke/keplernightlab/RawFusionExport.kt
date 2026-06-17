@@ -78,7 +78,7 @@ fun captureProcessExportRawNightFusion(
 ) {
     val main = Handler(Looper.getMainLooper())
     fun post(message: String) = main.post { onStatus(message) }
-    post("RAW 캡처 중입니다... saved 0/$frameCount, images 0/$frameCount, results 0/$frameCount")
+    post("RAW 캡처 중입니다. 기기를 움직이지 마세요. saved 0/$frameCount, images 0/$frameCount, results 0/$frameCount")
     captureRawBurstForFusion(
         context = context,
         cameraId = cameraId,
@@ -91,8 +91,8 @@ fun captureProcessExportRawNightFusion(
         rawSpeedMode = rawSpeedMode,
         onStatus = { post(it) },
         onComplete = { jobDir ->
-            Log.i("KeplerRawPipeline", "PROCESSING_STARTED jobDir=${jobDir.absolutePath}")
-            post("캡처가 완료되었습니다. RAW 합성 및 렌더링을 처리하는 중입니다.")
+            Log.i("KeplerRawPipeline", "PROCESSING_STARTED jobDirAbsolutePath=${jobDir.absolutePath}")
+            post("캡처가 완료되었습니다. 이제 기기를 움직여도 됩니다.")
             val thread = HandlerThread("KeplerRawFusionPipelineThread").apply { start() }
             Handler(thread.looper).post {
                 try {
@@ -125,11 +125,13 @@ fun captureProcessExportRawNightFusion(
                         usedFrameCount < requestedFrames
                     )
                     val requestedOutputFormat = requestedOutputFormatForSetting(finalOutputFormat)
-                    post("결과를 저장하는 중입니다...")
+                    post("결과 미리보기를 준비하는 중입니다.")
+                    val previewPrepareStartedAt = System.currentTimeMillis()
                     var exportBitmap: Bitmap? = null
                     val result = try {
                         val loaded = process.loadExportBitmap()
                         exportBitmap = loaded.bitmap
+                        val nativePreviewPrepareMs = System.currentTimeMillis() - previewPrepareStartedAt
                         updateRawExportBitmapMetadata(
                             jobDir = jobDir,
                             source = loaded.source,
@@ -137,8 +139,10 @@ fun captureProcessExportRawNightFusion(
                             nativeRgbaBitmapLoadedForExport = loaded.nativeRgbaDirect,
                             finalPngDecodeSkippedForExport = loaded.nativeRgbaDirect,
                             exportBitmapWidth = loaded.bitmap.width,
-                            exportBitmapHeight = loaded.bitmap.height
+                            exportBitmapHeight = loaded.bitmap.height,
+                            nativePreviewPrepareMs = nativePreviewPrepareMs
                         )
+                        post("결과를 저장하는 중입니다.")
                         exportNightFusionBitmapToGallery(
                             context = context,
                             bitmap = loaded.bitmap,

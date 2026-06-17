@@ -2,6 +2,7 @@ package com.projectnuke.keplernightlab
 
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedOutputStream
@@ -100,6 +101,9 @@ internal fun runClassicRawFusionMerge(
             error("Not enough enabled RAW frames to reprocess")
         }
 
+        val alignStartedAt = System.currentTimeMillis()
+        Log.i("KeplerRawPipeline", "ALIGN_STARTED jobDirAbsolutePath=${jobDir.absolutePath}")
+        onStatus("RAW 프레임을 정렬하는 중입니다.")
         onStatus("Classic RAW fusion: building alignment proxies...")
         frames.toList().forEach { frame ->
             try {
@@ -159,7 +163,12 @@ internal fun runClassicRawFusionMerge(
             }
             applyRawAlignmentToFrameJson(frame)
         }
+        val nativeAlignMs = System.currentTimeMillis() - alignStartedAt
+        Log.i("KeplerRawPipeline", "ALIGN_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} nativeAlignMs=$nativeAlignMs")
 
+        val mergeStartedAt = System.currentTimeMillis()
+        Log.i("KeplerRawPipeline", "MERGE_STARTED jobDirAbsolutePath=${jobDir.absolutePath}")
+        onStatus("RAW 프레임을 병합하는 중입니다.")
         onStatus("Classic RAW fusion: merging RAW tiles...")
         val mergeStats = mergeClassicRawTiles(
             frames = frames,
@@ -169,7 +178,9 @@ internal fun runClassicRawFusionMerge(
             mergedRawFile = mergedRawFile,
             onStatus = onStatus
         )
-        onStatus("Classic RAW fusion: demosaic...")
+        val nativeMergeMs = System.currentTimeMillis() - mergeStartedAt
+        Log.i("KeplerRawPipeline", "MERGE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} nativeMergeMs=$nativeMergeMs")
+        onStatus("Native RAW ISP 렌더링 중입니다.")
         val debug = buildRawFusionDebug(
             job = job,
             frames = frames,
@@ -182,6 +193,18 @@ internal fun runClassicRawFusionMerge(
             fallbackAlignmentCount = fallbackAlignmentCount,
             lowConfidenceAlignmentCount = lowConfidenceAlignmentCount
         )
+        debug.put("nativeAlignMs", nativeAlignMs)
+            .put("nativeMergeMs", nativeMergeMs)
+            .put("mergeWeightMapAvailable", false)
+            .put("mergeWeightMapFile", JSONObject.NULL)
+            .put("mergeRejectMapAvailable", false)
+            .put("mergeRejectMapFile", JSONObject.NULL)
+        job.put("nativeAlignMs", nativeAlignMs)
+            .put("nativeMergeMs", nativeMergeMs)
+            .put("mergeWeightMapAvailable", false)
+            .put("mergeWeightMapFile", JSONObject.NULL)
+            .put("mergeRejectMapAvailable", false)
+            .put("mergeRejectMapFile", JSONObject.NULL)
         alignmentFile.writeText(debug.toString(2))
         writeRawFusionDebugPreviews(jobDir, reference, mergedRawFile, sensor, blackLevelEstimate, job)
 

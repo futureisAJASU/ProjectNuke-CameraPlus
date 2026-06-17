@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -823,6 +824,20 @@ struct NativeIspRenderStats {
     uint64_t sampleCount = 0;
     float exposureGain = 1.0f;
     bool fullBufferFallbackUsed = true;
+    uint64_t demosaicFallbackPixelCount = 0;
+    bool mhcBoundaryFallbackUsed = false;
+    double rawDenoiseStrengthEffectiveSum = 0.0;
+    uint64_t rawDenoiseStrengthEffectiveCount = 0;
+    bool weightAwareDenoiseUsed = false;
+    bool mergeWeightMapAvailable = false;
+    bool mergeRejectMapAvailable = false;
+    double weightMapMean = 0.0;
+    double weightMapLowConfidenceRatio = 0.0;
+    bool chromaArtifactSuppressionUsed = true;
+    float chromaLowLightBoost = 0.25f;
+    bool adaptiveSharpenUsed = true;
+    bool sharpenSuppressionLowConfidenceUsed = false;
+    int64_t nativeIspRenderMs = 0;
 };
 
 std::string readTextFile(const std::string& path) {
@@ -1553,8 +1568,75 @@ std::array<float, 3> demosaicMhc5x5(
     int sy,
     int whiteRange
 ) {
-    // TODO v0.3: implement Malvar-He-Cutler 5x5 from published filter equations.
-    return demosaicBilinearSafe(raw, geometry, cfaPattern, sx, sy, whiteRange);
+    if (sx < 2 || sy < 2 || sx >= geometry.width - 2 || sy >= geometry.height - 2) {
+        return demosaicBilinearSafe(raw, geometry, cfaPattern, sx, sy, whiteRange);
+    }
+    auto v = [&](int dx, int dy) -> float {
+        return static_cast<float>(sampleCfaValue(raw, geometry, sx + dx, sy + dy));
+    };
+    auto clampRaw = [&](float value) {
+        return std::clamp(value, 0.0f, static_cast<float>(whiteRange));
+    };
+    const float c = v(0, 0);
+    const char color = bayerColorAt(sx, sy, cfaPattern);
+    float r = 0.0f;
+    float g = 0.0f;
+    float b = 0.0f;
+    const bool greenOnRedRow =
+        (cfaPattern == 2 || cfaPattern == 3) ? ((sy & 1) != 0) : ((sy & 1) == 0);
+
+    const float greenAtRedBlue = (
+        4.0f * c +
+        2.0f * (v(-1, 0) + v(1, 0) + v(0, -1) + v(0, 1)) -
+        (v(-2, 0) + v(2, 0) + v(0, -2) + v(0, 2))
+    ) / 8.0f;
+    auto redBlueAtGreenHorizontal = [&]() {
+        return (
+            5.0f * c +
+            4.0f * (v(-1, 0) + v(1, 0)) -
+            (v(-2, 0) + v(2, 0)) -
+            (v(0, -1) + v(0, 1)) +
+            0.5f * (v(0, -2) + v(0, 2))
+        ) / 8.0f;
+    };
+    auto redBlueAtGreenVertical = [&]() {
+        return (
+            5.0f * c +
+            4.0f * (v(0, -1) + v(0, 1)) -
+            (v(0, -2) + v(0, 2)) -
+            (v(-1, 0) + v(1, 0)) +
+            0.5f * (v(-2, 0) + v(2, 0))
+        ) / 8.0f;
+    };
+    const float oppositeAtRedBlue = (
+        6.0f * c +
+        2.0f * (v(-1, -1) + v(1, -1) + v(-1, 1) + v(1, 1)) -
+        1.5f * (v(-2, 0) + v(2, 0) + v(0, -2) + v(0, 2))
+    ) / 8.0f;
+
+    if (color == 'R') {
+        r = c;
+        g = greenAtRedBlue;
+        b = oppositeAtRedBlue;
+    } else if (color == 'B') {
+        b = c;
+        g = greenAtRedBlue;
+        r = oppositeAtRedBlue;
+    } else {
+        g = c;
+        if (greenOnRedRow) {
+            r = redBlueAtGreenHorizontal();
+            b = redBlueAtGreenVertical();
+        } else {
+            r = redBlueAtGreenVertical();
+            b = redBlueAtGreenHorizontal();
+        }
+    }
+    return {
+        clampRaw(r) / whiteRange,
+        clampRaw(g) / whiteRange,
+        clampRaw(b) / whiteRange
+    };
 }
 
 float toneLinearToDisplay(float value, const NativeIspRenderParams& params, float exposureGain) {
@@ -1580,6 +1662,7 @@ bool renderRaw16NativeIspV2(
     NativeIspRenderStats& stats,
     std::string& error
 ) {
+    const auto renderStartedAt = std::chrono::steady_clock::now();
     if (width <= 0 || height <= 0 || outputWidth <= 0 || outputHeight <= 0) {
         error = "invalid dimensions";
         return false;
@@ -1604,6 +1687,14 @@ bool renderRaw16NativeIspV2(
     );
 
     const RawImageGeometry geometry{width, height, blackLevel, whiteLevel};
+    auto demosaicFinal = [&](int sx, int sy) -> std::array<float, 3> {
+        if (sx < 2 || sy < 2 || sx >= width - 2 || sy >= height - 2) {
+            ++stats.demosaicFallbackPixelCount;
+            stats.mhcBoundaryFallbackUsed = true;
+            return demosaicBilinearSafe(raw, geometry, cfaPattern, sx, sy, whiteRange);
+        }
+        return demosaicMhc5x5(raw, geometry, cfaPattern, sx, sy, whiteRange);
+    };
     auto rawAt = [&](int x, int y) {
         return sampleCfaValue(raw, geometry, x, y);
     };
@@ -1687,7 +1778,7 @@ bool renderRaw16NativeIspV2(
         const int sy = sourceCoordinate(oy, height, outputHeight);
         for (int ox = sampleStepX / 2; ox < outputWidth; ox += sampleStepX) {
             const int sx = sourceCoordinate(ox, width, outputWidth);
-            const auto rgb = demosaicBilinearSafe(raw, geometry, cfaPattern, sx, sy, whiteRange);
+            const auto rgb = demosaicFinal(sx, sy);
             const auto corrected = applyWbAndMatrix(rgb);
             const float luma = std::clamp(0.2126f * corrected[0] + 0.7152f * corrected[1] + 0.0722f * corrected[2], 0.0f, 1.0f);
             if (luma < 0.02f || luma > 0.96f) continue;
@@ -1705,7 +1796,7 @@ bool renderRaw16NativeIspV2(
         const int sy = sourceCoordinate(oy, height, outputHeight);
         for (int ox = 0; ox < outputWidth; ++ox) {
             const int sx = sourceCoordinate(ox, width, outputWidth);
-            const auto rgb = demosaicBilinearSafe(raw, geometry, cfaPattern, sx, sy, whiteRange);
+            const auto rgb = demosaicFinal(sx, sy);
             const float wbR = rgb[0] * params.wbR;
             const float wbG = rgb[1] * params.wbG;
             const float wbB = rgb[2] * params.wbB;
@@ -1773,12 +1864,19 @@ bool renderRaw16NativeIspV2(
             const float localLuma = static_cast<float>(lumaSum / 9.0);
             const float centerChromaR = centerR - centerLuma;
             const float centerChromaB = centerB - centerLuma;
-            const float denoisedChromaR = centerChromaR * (1.0f - params.chromaDenoiseStrength) +
-                static_cast<float>(chromaRSum / 9.0) * params.chromaDenoiseStrength;
-            const float denoisedChromaB = centerChromaB * (1.0f - params.chromaDenoiseStrength) +
-                static_cast<float>(chromaBSum / 9.0) * params.chromaDenoiseStrength;
+            const float lowLightBoost = centerLuma < 72.0f ? stats.chromaLowLightBoost : 0.0f;
+            const float chromaStrength = std::clamp(params.chromaDenoiseStrength + lowLightBoost, 0.0f, 0.90f);
+            const float denoisedChromaR = centerChromaR * (1.0f - chromaStrength) +
+                static_cast<float>(chromaRSum / 9.0) * chromaStrength;
+            const float denoisedChromaB = centerChromaB * (1.0f - chromaStrength) +
+                static_cast<float>(chromaBSum / 9.0) * chromaStrength;
             const float noiseProxy = std::abs(centerLuma - localLuma) / 255.0f;
-            const float adaptiveStrength = params.sharpenAmount * std::clamp(1.0f - noiseProxy * 5.0f, 0.0f, 1.0f);
+            const float darkSuppression = centerLuma < 48.0f ? 0.20f : 1.0f;
+            const float highlightSuppression = centerLuma > 230.0f ? 0.35f : 1.0f;
+            const float adaptiveStrength = params.sharpenAmount *
+                std::clamp(1.0f - noiseProxy * 5.0f, 0.0f, 1.0f) *
+                darkSuppression *
+                highlightSuppression;
             const float sharpenedLuma = std::clamp(centerLuma + (centerLuma - localLuma) * adaptiveStrength, 0.0f, 255.0f);
             rgbaRow[out] = clampToByte(sharpenedLuma + denoisedChromaR);
             rgbaRow[out + 1] = clampToByte(sharpenedLuma - 0.5f * denoisedChromaR - 0.5f * denoisedChromaB);
@@ -1791,6 +1889,11 @@ bool renderRaw16NativeIspV2(
         error = "RGBA output write failed";
         return false;
     }
+    stats.rawDenoiseStrengthEffectiveSum = params.denoiseStrength;
+    stats.rawDenoiseStrengthEffectiveCount = 1;
+    stats.nativeIspRenderMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - renderStartedAt
+    ).count();
     return true;
 }
 
@@ -1822,7 +1925,7 @@ bool writeNativeIspV2DebugJson(
     const double saturation = stats.saturationSum / denom;
     const double overRatio = static_cast<double>(stats.overexposed) / denom;
     output << "{\n"
-           << "  \"rawRenderVersion\": \"native_raw_isp_v0.2\",\n"
+           << "  \"rawRenderVersion\": \"native_raw_isp_v0.3\",\n"
            << "  \"nativeRawIspUsed\": true,\n"
            << "  \"nativePostprocess\": true,\n"
            << "  \"nativeRawIspFullBufferFallbackUsed\": " << (stats.fullBufferFallbackUsed ? "true" : "false") << ",\n"
@@ -1841,19 +1944,38 @@ bool writeNativeIspV2DebugJson(
            << params.colorMatrix[0] << ", " << params.colorMatrix[1] << ", " << params.colorMatrix[2] << ", "
            << params.colorMatrix[3] << ", " << params.colorMatrix[4] << ", " << params.colorMatrix[5] << ", "
            << params.colorMatrix[6] << ", " << params.colorMatrix[7] << ", " << params.colorMatrix[8] << "],\n"
-           << "  \"demosaicMethod\": \"BILINEAR_SAFE_V0\",\n"
+           << "  \"demosaicMethod\": \"MHC_5X5_V0\",\n"
+           << "  \"demosaicFallbackPixelCount\": " << stats.demosaicFallbackPixelCount << ",\n"
+           << "  \"mhcBoundaryFallbackUsed\": " << (stats.mhcBoundaryFallbackUsed ? "true" : "false") << ",\n"
            << "  \"mhcBoundaryAvailable\": true,\n"
-           << "  \"rawDenoiseVersion\": \"same_color_cfa_edge_aware_v0_2\",\n"
+           << "  \"rawDenoiseVersion\": \"same_color_cfa_edge_aware_v0_3\",\n"
            << "  \"rawDenoiseStrength\": " << params.denoiseStrength << ",\n"
            << "  \"rawDenoisedSampleCount\": " << stats.rawDenoisedSampleCount << ",\n"
-           << "  \"denoiseVersion\": \"native_chroma_luma_v0.2\",\n"
+           << "  \"rawDenoiseStrengthEffectiveMean\": "
+           << (stats.rawDenoiseStrengthEffectiveCount > 0
+                ? stats.rawDenoiseStrengthEffectiveSum / stats.rawDenoiseStrengthEffectiveCount
+                : params.denoiseStrength) << ",\n"
+           << "  \"weightAwareDenoiseUsed\": " << (stats.weightAwareDenoiseUsed ? "true" : "false") << ",\n"
+           << "  \"mergeWeightMapAvailable\": " << (stats.mergeWeightMapAvailable ? "true" : "false") << ",\n"
+           << "  \"mergeWeightMapFile\": null,\n"
+           << "  \"mergeRejectMapAvailable\": " << (stats.mergeRejectMapAvailable ? "true" : "false") << ",\n"
+           << "  \"mergeRejectMapFile\": null,\n"
+           << "  \"weightMapFile\": null,\n"
+           << "  \"weightMapMean\": " << stats.weightMapMean << ",\n"
+           << "  \"weightMapLowConfidenceRatio\": " << stats.weightMapLowConfidenceRatio << ",\n"
+           << "  \"denoiseVersion\": \"native_chroma_luma_v0.3\",\n"
            << "  \"denoiseStrength\": " << params.denoiseStrength << ",\n"
+           << "  \"chromaArtifactSuppressionUsed\": " << (stats.chromaArtifactSuppressionUsed ? "true" : "false") << ",\n"
            << "  \"chromaDenoiseStrength\": " << params.chromaDenoiseStrength << ",\n"
+           << "  \"chromaLowLightBoost\": " << stats.chromaLowLightBoost << ",\n"
            << "  \"toneVersion\": \"native_conservative_shoulder_v0.2\",\n"
+           << "  \"toneTargetMidGray\": " << params.toneTargetMidGray << ",\n"
            << "  \"rawRenderExposureGain\": " << stats.exposureGain << ",\n"
            << "  \"rawRenderShadowLift\": " << params.toneMaxShadowLift << ",\n"
            << "  \"rawRenderHighlightRollOff\": " << params.highlightRolloff << ",\n"
            << "  \"rawRenderSharpenAmount\": " << params.sharpenAmount << ",\n"
+           << "  \"adaptiveSharpenUsed\": " << (stats.adaptiveSharpenUsed ? "true" : "false") << ",\n"
+           << "  \"sharpenSuppressionLowConfidenceUsed\": " << (stats.sharpenSuppressionLowConfidenceUsed ? "true" : "false") << ",\n"
            << "  \"hotPixelCount\": " << stats.hotPixelCount << ",\n"
            << "  \"channelMeansBeforeWb\": {\"r\": " << stats.beforeR / denom
            << ", \"g\": " << stats.beforeG / denom << ", \"b\": " << stats.beforeB / denom << "},\n"
@@ -1877,9 +1999,11 @@ bool writeNativeIspV2DebugJson(
     if (overRatio > 0.03) appendWarning("OVER_BRIGHT");
     if (noiseEstimate > 0.16) appendWarning("NOISE_AMPLIFIED");
     if (saturation < 0.02 && !params.wbMissing) appendWarning("POSSIBLE_CFA_MISMATCH");
+    if (stats.mhcBoundaryFallbackUsed) appendWarning("MHC_BOUNDARY_FALLBACK_USED");
     output << "],\n"
            << "  \"metadataJsonPath\": \"" << metadataPath << "\",\n"
            << "  \"outputPath\": \"" << rgbaPath << "\",\n"
+           << "  \"nativeIspRenderMs\": " << stats.nativeIspRenderMs << ",\n"
            << "  \"status\": \"" << status << "\"\n"
            << "}\n";
     return output.good();
@@ -1925,7 +2049,7 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutputV2(
             )) {
             return env->NewStringUTF(("ERROR: " + error).c_str());
         }
-        const std::string mainStatus = "OK: native_raw_isp_v0.2 render complete";
+        const std::string mainStatus = "OK: native_raw_isp_v0.3 render complete";
 
         const int debugMax = 960;
         const int debugWidth = std::max(2, (outputWidth > outputHeight)
@@ -1994,7 +2118,7 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutputV2(
             )) {
             return env->NewStringUTF(("ERROR: " + error).c_str());
         }
-        return env->NewStringUTF("OK: native_raw_isp_v0.2 render complete");
+        return env->NewStringUTF("OK: native_raw_isp_v0.3 render complete");
     } catch (const std::bad_alloc&) {
         return env->NewStringUTF("ERROR: native out of memory");
     } catch (const std::exception& e) {

@@ -179,7 +179,8 @@ fun parseCaptureProgress(
                 lower.contains("saved to gallery") -> CaptureStage.COMPLETE
         lower.contains("cleanup") || lower.contains("cleaning") -> CaptureStage.CLEANING
         lower.contains("verifying") || lower.contains("verification") -> CaptureStage.VERIFYING
-        lower.contains("exporting") || lower.contains("export ") || lower.contains("tone/export") -> CaptureStage.EXPORTING
+        text.contains("결과 미리보기") ||
+                lower.contains("exporting") || lower.contains("export ") || lower.contains("tone/export") -> CaptureStage.EXPORTING
         lower.contains("demosaic") || text.contains("렌더링") -> CaptureStage.DEMOSAICING
         text.contains("CAPTURE_COMPLETE", ignoreCase = true) ||
                 text.contains("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true) ||
@@ -502,7 +503,7 @@ fun MainCameraScreen(
                 previewEnabled = false
                 captureProgress = captureProgress.copy(
                     stage = CaptureStage.PROCESSING,
-                    message = "캡처가 완료되었습니다. RAW 합성 및 렌더링을 처리하는 중입니다.",
+                    message = "캡처가 완료되었습니다. 이제 기기를 움직여도 됩니다.",
                     progressPercent = max(captureProgress.progressPercent, 0.65f)
                 )
                 Log.i("KeplerPipelineState", "Capture stage complete; waiting for processing/export")
@@ -1406,12 +1407,12 @@ fun CaptureProgressRow(
     val stageText = when (captureProgress.stage) {
         CaptureStage.IDLE -> "Ready"
         CaptureStage.PREPARING -> "Preparing"
-        CaptureStage.CAPTURING -> "RAW 캡처 중입니다..."
-        CaptureStage.PROCESSING -> "RAW 합성 처리 중입니다..."
-        CaptureStage.DEMOSAICING -> "Native RAW ISP 렌더링 중입니다..."
-        CaptureStage.EXPORTING -> "결과를 저장하는 중입니다..."
-        CaptureStage.VERIFYING -> "결과를 저장하는 중입니다..."
-        CaptureStage.CLEANING -> "결과를 저장하는 중입니다..."
+        CaptureStage.CAPTURING -> "RAW 캡처 중입니다."
+        CaptureStage.PROCESSING -> "RAW 합성 처리 중입니다."
+        CaptureStage.DEMOSAICING -> "Native RAW ISP 렌더링 중입니다."
+        CaptureStage.EXPORTING -> "결과 미리보기를 준비하는 중입니다."
+        CaptureStage.VERIFYING -> "결과를 저장하는 중입니다."
+        CaptureStage.CLEANING -> "결과를 저장하는 중입니다."
         CaptureStage.COMPLETE -> "처리가 완료되었습니다."
         CaptureStage.FAILED -> "Failed"
         CaptureStage.TIMEOUT -> "Timeout"
@@ -1431,7 +1432,7 @@ fun CaptureProgressRow(
             captureProgress.stage == CaptureStage.VERIFYING ||
             captureProgress.stage == CaptureStage.CLEANING
         ) {
-            append("처리 중입니다.")
+            append("처리 중입니다. 이제 기기를 움직여도 됩니다.")
         } else if (captureProgress.receivedImages > 0 || captureProgress.completedResults > 0) {
             append("Images ${captureProgress.receivedImages}")
             if (captureProgress.requestedFrames > 0) append(" / ${captureProgress.requestedFrames}")
@@ -2366,6 +2367,7 @@ private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
     }
     val names = listOf(
         job.optString("finalFile", ""),
+        job.optString("previewFile", ""),
         job.optString("finalNightFusionFile", ""),
         "sharpened_night_fusion.png",
         "raw_fusion_final.png",
@@ -2392,19 +2394,15 @@ private fun decodeNativeRgbaPreview(
     val outWidth = max(1, width / scale)
     val outHeight = max(1, height / scale)
     val bitmap = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
-    val row = ByteArray(outWidth * 4)
+    val row = ByteArray(width * 4)
     RandomAccessFile(file, "r").use { input ->
         for (y in 0 until outHeight) {
             val sourceY = min(height - 1, y * scale)
-            val sourceXStep = scale * 4L
-            var sourceOffset = (sourceY.toLong() * width.toLong()) * 4L
+            input.seek((sourceY.toLong() * width.toLong()) * 4L)
+            input.readFully(row)
             for (x in 0 until outWidth) {
-                input.seek(sourceOffset)
-                input.readFully(row, x * 4, 4)
-                sourceOffset += sourceXStep
-            }
-            for (x in 0 until outWidth) {
-                val p = x * 4
+                val sourceX = min(width - 1, x * scale)
+                val p = sourceX * 4
                 val r = row[p].toInt() and 0xFF
                 val g = row[p + 1].toInt() and 0xFF
                 val b = row[p + 2].toInt() and 0xFF

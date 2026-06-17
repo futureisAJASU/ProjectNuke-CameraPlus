@@ -199,10 +199,16 @@ fun updateExportMetadata(
             else -> rawSidecarResult?.errorMessage ?: JSONObject.NULL
         })
         .put("exportedAt", System.currentTimeMillis())
+    val pipelineStartedAt = job.optLong("rawCaptureStartedAt", 0L)
+        .takeIf { it > 0L }
+        ?: job.optLong("createdAt", 0L).takeIf { it > 0L }
+    if (pipelineStartedAt != null) {
+        job.put("totalPipelineMs", System.currentTimeMillis() - pipelineStartedAt)
+    }
     jobFile.writeText(job.toString(2))
     Log.i(
         "KeplerRawPipeline",
-        "PIPELINE_COMPLETE jobDir=${jobDir.absolutePath} processStatus=${job.optString("processStatus")} " +
+        "PIPELINE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} processStatus=${job.optString("processStatus")} " +
             "finalOutputSource=${job.optString("finalOutputSource")} " +
             "nativePostprocessRgbaFile=${job.optString("nativePostprocessRgbaFile")} " +
             "rawRenderDebugFile=${job.optString("rawRenderDebugFile")}"

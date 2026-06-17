@@ -56,6 +56,12 @@ internal fun applyNativeMergeMetadata(
                 ?.takeUnless { it == JSONObject.NULL }
                 ?: JSONObject.NULL
         )
+        .put("nativeAlignMs", alignment.optLong("nativeAlignMs", 0L))
+        .put("nativeMergeMs", alignment.optLong("nativeMergeMs", 0L))
+        .put("mergeWeightMapAvailable", alignment.optBoolean("mergeWeightMapAvailable", false))
+        .put("mergeWeightMapFile", alignment.opt("mergeWeightMapFile") ?: JSONObject.NULL)
+        .put("mergeRejectMapAvailable", alignment.optBoolean("mergeRejectMapAvailable", false))
+        .put("mergeRejectMapFile", alignment.opt("mergeRejectMapFile") ?: JSONObject.NULL)
 }
 
 internal fun applyNativePostprocessMetadata(
@@ -98,7 +104,8 @@ internal fun updateRawExportBitmapMetadata(
     nativeRgbaBitmapLoadedForExport: Boolean,
     finalPngDecodeSkippedForExport: Boolean,
     exportBitmapWidth: Int,
-    exportBitmapHeight: Int
+    exportBitmapHeight: Int,
+    nativePreviewPrepareMs: Long = 0L
 ) {
     val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
     val job = if (jobFile.exists()) JSONObject(jobFile.readText()) else JSONObject()
@@ -108,6 +115,7 @@ internal fun updateRawExportBitmapMetadata(
         .put("finalPngDecodeSkippedForExport", finalPngDecodeSkippedForExport)
         .put("exportBitmapWidth", exportBitmapWidth)
         .put("exportBitmapHeight", exportBitmapHeight)
+        .put("nativePreviewPrepareMs", nativePreviewPrepareMs)
     jobFile.writeText(job.toString(2))
     Log.i(
         "KeplerRawPipeline",
