@@ -458,9 +458,9 @@ fun captureRawBurstForFusion(
             jobFile.writeText(completeJob.toString(2))
             Log.i(RAW_PIPELINE_LOG_TAG, "CAPTURE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} savedFrames=$savedFrames/$requestedFrames partial=$partial")
             if (partial) {
-                post("CAPTURE_COMPLETE_PARTIAL: 캡처가 완료되었습니다. 이제 기기를 움직여도 됩니다. saved $savedFrames/$requestedFrames frames")
+                post("CAPTURE_COMPLETE_PARTIAL: 캡처가 완료되었습니다. saved $savedFrames/$requestedFrames frames")
             } else {
-                post("CAPTURE_COMPLETE: 캡처가 완료되었습니다. 이제 기기를 움직여도 됩니다. saved $savedFrames/$requestedFrames frames")
+                post("CAPTURE_COMPLETE: 캡처가 완료되었습니다. saved $savedFrames/$requestedFrames frames")
             }
             mainHandler.post { onComplete(jobDir) }
             cleanup()

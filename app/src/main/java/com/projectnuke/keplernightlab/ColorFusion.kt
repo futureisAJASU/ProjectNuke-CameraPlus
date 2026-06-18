@@ -94,7 +94,7 @@ private fun copyYuvFrameToMemory(image: Image, index: Int): BufferedYuvFrame {
 fun captureYuvBurstColorWithMotion(
     context: Context,
     cameraId: String,
-    frameCount: Int = 4,
+    frameCount: Int = 6,
     resolutionMode: CaptureResolutionMode = CaptureResolutionMode.MP12,
     zoomRatio: Float = 1.0f,
     physicalCameraId: String? = null,
@@ -209,7 +209,7 @@ fun captureYuvBurstColorWithMotion(
             return
         }
 
-        val keplerDir = File(picturesDir, "KeplerColorBurst").apply {
+        val keplerDir = File(picturesDir, "KeplerYuvFusion").apply {
             if (!exists()) {
                 val ok = mkdirs()
                 if (!ok && !exists()) {
@@ -224,7 +224,7 @@ fun captureYuvBurstColorWithMotion(
             Locale.US
         ).format(Date())
 
-        val burstDir = File(keplerDir, "KPL_COLOR_BURST_$burstTimestamp").apply {
+        val burstDir = File(keplerDir, "KPL_YUV_FUSION_$burstTimestamp").apply {
             if (!exists()) {
                 val ok = mkdirs()
                 if (!ok && !exists()) {
@@ -311,6 +311,7 @@ fun captureYuvBurstColorWithMotion(
             )
         }
         postStatus("YUV capture: saved 0/$frameCount")
+        postStatus("YUV 캡처 중입니다. 기기를 움직이지 마세요.")
 
         postStatus("Color Fusion 초기화 5/7: 모션 센서 시작 중...")
 
@@ -416,7 +417,7 @@ fun captureYuvBurstColorWithMotion(
                                 yuvMemoryBufferUsed = useMemoryBuffer,
                                 yuvMemoryBufferEstimatedBytes = estimatedBufferBytes
                             )
-                            postStatus("YUV capture complete: saved $savedFrames/$frameCount")
+                            postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
                             onComplete(burstDir)
                             finish(
                                 "Color Burst + Motion complete\n" +
@@ -520,7 +521,7 @@ fun captureYuvBurstColorWithMotion(
                             yuvMemoryBufferEstimatedBytes = estimatedBufferBytes
                         )
 
-                        postStatus("YUV capture complete: saved $savedFrames/$frameCount")
+                        postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
                         onComplete(burstDir)
 
                         finish(
@@ -695,7 +696,7 @@ fun averageLatestYuvBurstColor(
                 return@post
             }
 
-            val colorRoot = File(picturesDir, "KeplerColorBurst")
+            val colorRoot = File(picturesDir, "KeplerYuvFusion")
 
             if (!colorRoot.exists()) {
                 postStatus("KeplerColorBurst 폴더가 없음. 먼저 Color Fusion 캡처를 해야 함.")
@@ -1212,8 +1213,44 @@ fun writeColorJobJson(
 
     val json = JSONObject()
         .put("app", "Kepler Night Lab")
-        .put("jobType", "YUV_BURST_COLOR")
+        .put("jobType", "YUV_NIGHT_FUSION")
         .put("status", status)
+        .put("currentPipelineStage", status)
+        .put("userCanMoveDevice", status == "CAPTURE_COMPLETE" || status == "PIPELINE_COMPLETE")
+        .put(
+            "captureStageCompleteAt",
+            if (status == "CAPTURE_COMPLETE" || status == "PIPELINE_COMPLETE") {
+                previousJob?.opt("captureStageCompleteAt")?.takeUnless { it == JSONObject.NULL } ?: now
+            } else {
+                JSONObject.NULL
+            }
+        )
+        .put("processingStartedAt", previousJob?.opt("processingStartedAt") ?: JSONObject.NULL)
+        .put("processStatus", previousJob?.optString("processStatus", status) ?: status)
+        .put("frameCount", requestedFrames)
+        .put("yuvWidth", width)
+        .put("yuvHeight", height)
+        .put("finalOutputSource", previousJob?.optString("finalOutputSource", "pending") ?: "pending")
+        .put("finalFile", previousJob?.optString("finalFile", "") ?: "")
+        .put("yuvFusionVersion", "YUV_NIGHT_FUSION_V0")
+        .put("yuvAlignVersion", "YUV_GLOBAL_SHIFT_V0")
+        .put("yuvMergeVersion", "YUV_TEMPORAL_GHOST_V0")
+        .put("yuvDenoiseVersion", "YUV_LUMA_CHROMA_EDGE_AWARE_V0")
+        .put("yuvDetailVersion", "YUV_LUMA_DETAIL_V0")
+        .put("yuvSharpenVersion", "YUV_ADAPTIVE_LUMA_SHARPEN_V0")
+        .put("yuvLookVersion", "YUV_NATURAL_NIGHT_LOOK_V0")
+        .put(
+            "timing",
+            previousJob?.optJSONObject("timing") ?: JSONObject()
+                .put("yuvCaptureMs", if (status == "CAPTURE_COMPLETE") now - (previousJob?.optLong("createdAt", now) ?: now) else 0L)
+                .put("yuvSaveMs", 0L)
+                .put("yuvAlignMs", 0L)
+                .put("yuvMergeMs", 0L)
+                .put("yuvDenoiseMs", 0L)
+                .put("yuvLookMs", 0L)
+                .put("yuvExportMs", 0L)
+                .put("totalPipelineMs", 0L)
+        )
         .put("cameraId", cameraId)
         .put("selectedCameraId", cameraId)
         .put("resolutionMode", resolutionMode.label)

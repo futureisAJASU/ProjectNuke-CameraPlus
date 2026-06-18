@@ -46,7 +46,7 @@ fun processLatestNightFusionV02(
         try {
             val jobDir = findLatestColorBurstJobDir(context)
                 ?: run {
-                    postStatus("Classic YUV fusion failed: no KeplerColorBurst job found.")
+                    postStatus("YUV Night Fusion failed: no YUV fusion job found.")
                     return@post
                 }
             processClassicYuvFusionJob(jobDir) { postStatus(it) }
@@ -83,11 +83,13 @@ fun processNightFusionJobV02Sync(
 
 fun findLatestColorBurstJobDir(context: Context): File? {
     val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return null
-    val colorRoot = File(picturesDir, "KeplerColorBurst")
-    return colorRoot
-        .listFiles()
-        ?.filter { it.isDirectory && File(it, "job.json").exists() }
-        ?.maxByOrNull { it.lastModified() }
+    return listOf(File(picturesDir, "KeplerYuvFusion"), File(picturesDir, "KeplerColorBurst"))
+        .flatMap { root ->
+            root.listFiles()
+                ?.filter { it.isDirectory && File(it, "job.json").exists() }
+                .orEmpty()
+        }
+        .maxByOrNull { it.lastModified() }
 }
 
 private fun loadColorFrames(jobDir: File, job: JSONObject): List<LoadedColorFrame> {

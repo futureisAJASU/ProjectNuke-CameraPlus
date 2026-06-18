@@ -5,6 +5,7 @@ import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
 import android.graphics.Color
 import android.graphics.Rect
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -82,7 +83,16 @@ internal fun processClassicYuvFusionJob(
     var merged: Bitmap? = null
     var finalBitmap: Bitmap? = null
     try {
-        onStatus("Classic YUV fusion: loading frames...")
+        fun markStage(stage: String, status: String) {
+            job.put("currentPipelineStage", stage)
+                .put("processStatus", status)
+                .put("processingStartedAt", processingStartedAt)
+            jobFile.writeText(job.toString(2))
+            Log.i("KeplerYuvPipeline", "$stage: $status")
+            onStatus(status)
+        }
+
+        markStage("YUV_ALIGNING", "YUV 프레임을 정렬하는 중입니다.")
         val candidateFrames = loadClassicFrames(jobDir, job)
         val totalFrames = job.optJSONArray("frames")?.length() ?: 0
         val frames = candidateFrames.mapNotNull { frame ->
@@ -107,7 +117,7 @@ internal fun processClassicYuvFusionJob(
         var fallbackAlignmentCount = 0
         var lowConfidenceAlignmentCount = 0
         frames.forEachIndexed { index, frame ->
-            onStatus("Classic YUV fusion: aligning frame ${index + 1}/${frames.size}...")
+            onStatus("YUV 프레임을 정렬하는 중입니다.")
             if (frame === reference) {
                 frame.alignmentScore = 0f
                 frame.alignmentUsed = true
@@ -137,7 +147,9 @@ internal fun processClassicYuvFusionJob(
         }
 
         val dimensions = decodeImageDimensions(reference.file)
-        val compatibleFrames = frames.filter { decodeImageDimensions(it.file) == dimensions }
+        val sameSizeFrames = frames.filter { decodeImageDimensions(it.file) == dimensions }
+        val acceptedFrames = sameSizeFrames.filter { it === reference || it.alignmentUsed }
+        val compatibleFrames = if (acceptedFrames.size >= 2) acceptedFrames else sameSizeFrames.take(2)
         if (compatibleFrames.size < 2) error("Not enough same-size YUV frames to fuse")
         val activeReference = compatibleFrames.find { it === reference } ?: compatibleFrames.first()
         activeReference.isReference = true
@@ -146,10 +158,16 @@ internal fun processClassicYuvFusionJob(
         }
         frames.filterNot { it in compatibleFrames }.forEach { frame ->
             updateAlignmentMetadata(
-                job, frame, params, used = false, skipReason = "DIMENSION_MISMATCH"
+                job,
+                frame,
+                params,
+                used = false,
+                skipReason = if (frame !in sameSizeFrames) "DIMENSION_MISMATCH" else "LOW_ALIGNMENT_CONFIDENCE"
             )
         }
 
+        val alignDoneAt = System.currentTimeMillis()
+        markStage("YUV_MERGING", "YUV 프레임을 합성하는 중입니다.")
         val mergeResult = mergeClassicFrames(
             frames = compatibleFrames,
             reference = activeReference,
@@ -159,13 +177,17 @@ internal fun processClassicYuvFusionJob(
             onStatus = onStatus
         )
         merged = mergeResult.bitmap
+        val mergeDoneAt = System.currentTimeMillis()
         val averageFile = File(jobDir, "average_color_rotated.png")
         saveClassicBitmap(merged, averageFile)
 
-        onStatus("Classic YUV fusion: tone/sharpen...")
+        markStage("YUV_DENOISE_SHARPEN", "노이즈와 선명도를 보정하는 중입니다.")
         finalBitmap = finishClassicFusion(merged, params)
+        val lookDoneAt = System.currentTimeMillis()
+        markStage("YUV_EXPORTING", "결과를 저장하는 중입니다.")
         val finalFile = File(jobDir, "sharpened_night_fusion.png")
         saveClassicBitmap(finalBitmap, finalFile)
+        val exportDoneAt = System.currentTimeMillis()
         val processingTimeMs = System.currentTimeMillis() - processingStartedAt
         val excludedFrameCount = countExcludedFrames(job)
         val skippedFrameCount =
@@ -176,30 +198,67 @@ internal fun processClassicYuvFusionJob(
         } else {
             0.0
         }
-        job.put("jobType", job.optString("jobType", "YUV_BURST_COLOR"))
-            .put("processStatus", "CLASSIC_YUV_FUSION_V1_COMPLETE")
-            .put("fusionEngine", "classic_yuv_v1")
+        job.put("jobType", "YUV_NIGHT_FUSION")
+            .put("currentPipelineStage", "PIPELINE_COMPLETE")
+            .put("userCanMoveDevice", true)
+            .put("processingStartedAt", processingStartedAt)
+            .put("processStatus", "PIPELINE_COMPLETE")
+            .put("fusionEngine", "yuv_night_fusion_v0")
             .put("fusionVersion", CLASSIC_FUSION_VERSION)
+            .put("yuvFusionVersion", "YUV_NIGHT_FUSION_V0")
             .put("fusionParamsVersion", CLASSIC_YUV_FUSION_PARAMS_VERSION)
             .put("fusionPresetName", params.presetName)
             .put("fusionParams", params.toJson())
             .put("nativeAlignmentAvailable", NativeFusionAlignment.isAvailable())
             .put("nativeAlignmentUsed", nativeAlignmentUsed)
             .put("alignmentVersion", if (nativeAlignmentUsed) "native_subpixel_v1" else "kotlin_integer_v1")
+            .put("yuvAlignVersion", "YUV_GLOBAL_SHIFT_V0")
+            .put("yuvMergeVersion", "YUV_TEMPORAL_GHOST_V0")
+            .put("yuvDenoiseVersion", "YUV_LUMA_CHROMA_EDGE_AWARE_V0")
+            .put("yuvDetailVersion", "YUV_LUMA_DETAIL_V0")
+            .put("yuvSharpenVersion", "YUV_ADAPTIVE_LUMA_SHARPEN_V0")
+            .put("yuvLookVersion", "YUV_NATURAL_NIGHT_LOOK_V0")
             .put("fallbackAlignmentCount", fallbackAlignmentCount)
             .put("lowConfidenceAlignmentCount", lowConfidenceAlignmentCount)
             .put("usedFrameCount", compatibleFrames.size)
+            .put("acceptedFrameCount", compatibleFrames.size)
+            .put("rejectedFrameCount", (sameSizeFrames.size - compatibleFrames.size).coerceAtLeast(0) + skippedFrameCount)
             .put("excludedFrameCount", excludedFrameCount)
             .put("skippedFrameCount", skippedFrameCount)
             .put("referenceFrameIndex", activeReference.jsonIndex)
             .put("ghostSuppressionUsed", true)
+            .put("ghostSuppressionEnabled", true)
             .put("ghostRejectedPixelRatio", rejectedRatio)
+            .put("rejectedGhostSampleRatio", rejectedRatio)
             .put("averageColorFile", averageFile.name)
             .put("finalNightFusionFile", finalFile.name)
             .put("finalFile", finalFile.name)
+            .put("finalOutputSource", "yuv_fusion_rgba")
             .put("processingTimeMs", processingTimeMs)
             .put("outputWidth", dimensions.first)
             .put("outputHeight", dimensions.second)
+            .put("frameCount", totalFrames)
+            .put("yuvWidth", dimensions.first)
+            .put("yuvHeight", dimensions.second)
+            .put("lumaDenoiseStrength", params.denoiseStrength.toDouble())
+            .put("chromaDenoiseStrength", params.denoiseStrength.toDouble())
+            .put("lowLightChromaBoost", true)
+            .put("adaptiveSharpenUsed", true)
+            .put("blackPoint", 0.018)
+            .put("contrastCurve", "mild_s_curve")
+            .put("saturationBoost", params.saturationBoost.toDouble())
+            .put("vibranceBoost", 0.04)
+            .put("localContrastAmount", params.localContrastAmount.toDouble())
+            .put(
+                "timing",
+                (job.optJSONObject("timing") ?: JSONObject())
+                    .put("yuvAlignMs", alignDoneAt - processingStartedAt)
+                    .put("yuvMergeMs", mergeDoneAt - alignDoneAt)
+                    .put("yuvDenoiseMs", lookDoneAt - mergeDoneAt)
+                    .put("yuvLookMs", lookDoneAt - mergeDoneAt)
+                    .put("yuvExportMs", exportDoneAt - lookDoneAt)
+                    .put("totalPipelineMs", exportDoneAt - job.optLong("createdAt", processingStartedAt))
+            )
             .put("processedAt", System.currentTimeMillis())
             .put(
                 "processingNotes",
@@ -237,7 +296,7 @@ internal fun processClassicYuvFusionJob(
                 )
         }
         jobFile.writeText(job.toString(2))
-        onStatus("Classic YUV fusion complete")
+        onStatus("처리가 완료되었습니다.")
         return finalFile
     } catch (oom: OutOfMemoryError) {
         recordClassicFailure(jobFile, job, "OOM_FAILED_KEEPING_CACHE", "OutOfMemoryError")

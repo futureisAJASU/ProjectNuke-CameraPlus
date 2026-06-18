@@ -92,7 +92,7 @@ fun captureProcessExportRawNightFusion(
         onStatus = { post(it) },
         onComplete = { jobDir ->
             Log.i("KeplerRawPipeline", "PROCESSING_STARTED jobDirAbsolutePath=${jobDir.absolutePath}")
-            post("캡처가 완료되었습니다. 이제 기기를 움직여도 됩니다.")
+            post("캡처가 완료되었습니다.")
             val thread = HandlerThread("KeplerRawFusionPipelineThread").apply { start() }
             Handler(thread.looper).post {
                 try {

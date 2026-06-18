@@ -285,7 +285,7 @@ fun MainCameraScreen(
         )
     }
     var pipelineMode by remember {
-        mutableStateOf(PipelineMode.entries.firstOrNull { it.name == savedSettings.pipelineModeName } ?: PipelineMode.RAW_NIGHT_FUSION)
+        mutableStateOf(PipelineMode.entries.firstOrNull { it.name == savedSettings.pipelineModeName } ?: PipelineMode.YUV_NIGHT_FUSION)
     }
     var finalOutputFormat by remember { mutableStateOf(OutputSettingsStore.load(context)) }
     var focusAeState by remember { mutableStateOf(FocusAeState()) }
@@ -503,7 +503,7 @@ fun MainCameraScreen(
                 previewEnabled = false
                 captureProgress = captureProgress.copy(
                     stage = CaptureStage.PROCESSING,
-                    message = "캡처가 완료되었습니다. 이제 기기를 움직여도 됩니다.",
+                    message = "캡처가 완료되었습니다.",
                     progressPercent = max(captureProgress.progressPercent, 0.65f)
                 )
                 Log.i("KeplerPipelineState", "Capture stage complete; waiting for processing/export")
@@ -1432,7 +1432,7 @@ fun CaptureProgressRow(
             captureProgress.stage == CaptureStage.VERIFYING ||
             captureProgress.stage == CaptureStage.CLEANING
         ) {
-            append("처리 중입니다. 이제 기기를 움직여도 됩니다.")
+            append("처리 중입니다.")
         } else if (captureProgress.receivedImages > 0 || captureProgress.completedResults > 0) {
             append("Images ${captureProgress.receivedImages}")
             if (captureProgress.requestedFrames > 0) append(" / ${captureProgress.requestedFrames}")
@@ -2000,22 +2000,31 @@ fun PipelineModeSettingsSection(
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Text(
-            text = "Pipeline",
+            text = "야간 모드",
             color = Color.White,
             style = MaterialTheme.typography.titleMedium
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             FrameModeChip(
-                text = "RAW Night",
-                selected = pipelineMode == PipelineMode.RAW_NIGHT_FUSION,
-                onClick = { onPipelineModeChange(PipelineMode.RAW_NIGHT_FUSION) }
-            )
-            FrameModeChip(
-                text = "YUV Night",
+                text = "빠른 야간 모드",
                 selected = pipelineMode == PipelineMode.YUV_NIGHT_FUSION,
                 onClick = { onPipelineModeChange(PipelineMode.YUV_NIGHT_FUSION) }
             )
+            FrameModeChip(
+                text = "고품질 RAW 야간 모드",
+                selected = pipelineMode == PipelineMode.RAW_NIGHT_FUSION,
+                onClick = { onPipelineModeChange(PipelineMode.RAW_NIGHT_FUSION) }
+            )
         }
+        Text(
+            text = if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
+                "RAW 처리는 시간이 더 오래 걸릴 수 있습니다.\nRAW 원본을 합성하여 더 높은 품질을 목표로 처리합니다. 시간이 더 오래 걸릴 수 있습니다."
+            } else {
+                "빠르게 여러 장을 합성하여 노이즈를 줄이고 선명도를 개선합니다."
+            },
+            color = Color.White.copy(alpha = 0.72f),
+            style = MaterialTheme.typography.bodySmall
+        )
         Text(
             text = "RAW Speed",
             color = Color.White.copy(alpha = 0.72f),
@@ -2204,12 +2213,12 @@ fun loadLatestKeplerResult(context: Context): LatestKeplerResult {
                 summary = "Pictures 폴더를 찾지 못함"
             )
 
-        val colorRoot = File(picturesDir, "KeplerColorBurst")
+        val colorRoot = File(picturesDir, "KeplerYuvFusion")
 
         if (!colorRoot.exists()) {
             return LatestKeplerResult(
                 bitmap = null,
-                summary = "KeplerColorBurst 폴더가 없음"
+                summary = "KeplerYuvFusion 폴더가 없음"
             )
         }
 
@@ -2219,7 +2228,7 @@ fun loadLatestKeplerResult(context: Context): LatestKeplerResult {
             ?.maxByOrNull { it.lastModified() }
             ?: return LatestKeplerResult(
                 bitmap = null,
-                summary = "최근 Color Fusion job 없음"
+                summary = "최근 YUV Night Fusion job 없음"
             )
 
         val jobFile = File(latestJobDir, "job.json")
@@ -2272,6 +2281,7 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
             ?: return LatestKeplerResult(null, "Pictures folder unavailable")
 
         val latestJobs = listOf(
+            File(picturesDir, "KeplerYuvFusion") to "KPL_YUV_FUSION_",
             File(picturesDir, "KeplerColorBurst") to "KPL_COLOR_BURST_",
             File(picturesDir, "KeplerRawFusion") to "KPL_RAW_FUSION_"
         ).flatMap { (root, prefix) ->

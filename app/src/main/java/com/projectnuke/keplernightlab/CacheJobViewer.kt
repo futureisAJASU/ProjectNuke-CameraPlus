@@ -705,6 +705,7 @@ fun findKeplerJobDirectories(context: Context): List<File> {
     val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return emptyList()
     val roots = listOf(
         "KeplerRawFusion",
+        "KeplerYuvFusion",
         "KeplerColorBurst",
         "KeplerSuperRes",
         "Kepler50MpTest",

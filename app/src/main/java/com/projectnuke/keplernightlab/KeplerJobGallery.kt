@@ -112,12 +112,14 @@ private fun keplerGalleryRoots(context: Context): List<File> {
     val pictures = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return emptyList()
     return listOf(
         File(pictures, "KeplerRawFusion"),
+        File(pictures, "KeplerYuvFusion"),
         File(pictures, "KeplerColorBurst")
     )
 }
 
 private fun matchesJobPrefix(root: File, name: String): Boolean = when (root.name) {
     "KeplerRawFusion" -> name.startsWith("KPL_RAW_FUSION_")
+    "KeplerYuvFusion" -> name.startsWith("KPL_YUV_FUSION_")
     "KeplerColorBurst" -> name.startsWith("KPL_COLOR_BURST_")
     else -> false
 }
@@ -150,6 +152,8 @@ private fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
     val jobType = when {
         rawType == "RAW_NIGHT_FUSION" || directory.name.startsWith("KPL_RAW_FUSION_") ->
             "RAW_NIGHT_FUSION"
+        rawType == "YUV_NIGHT_FUSION" || directory.name.startsWith("KPL_YUV_FUSION_") ->
+            "YUV_NIGHT_FUSION"
         else -> "COLOR/YUV"
     }
     val exportExists = finalPreview != null ||

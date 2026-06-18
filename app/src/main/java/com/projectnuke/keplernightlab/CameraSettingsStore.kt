@@ -34,8 +34,8 @@ object CameraSettingsStore {
                 ?: LensSlot.MAIN_1X.name,
             selectedThreeXSourceName = prefs.getString("selectedThreeXSource", ThreeXSourceMode.OPTICAL.name)
                 ?: ThreeXSourceMode.OPTICAL.name,
-            pipelineModeName = prefs.getString("pipelineMode", PipelineMode.RAW_NIGHT_FUSION.name)
-                ?: PipelineMode.RAW_NIGHT_FUSION.name,
+            pipelineModeName = prefs.getString("pipelineMode", PipelineMode.YUV_NIGHT_FUSION.name)
+                ?: PipelineMode.YUV_NIGHT_FUSION.name,
             frameCountModeName = prefs.getString("frameCountMode", FrameCountMode.AUTO.name)
                 ?: FrameCountMode.AUTO.name,
             autoMinFrames = autoMin,
