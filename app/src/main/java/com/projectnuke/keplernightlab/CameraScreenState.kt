@@ -158,17 +158,19 @@ internal fun rememberCameraSelectionState(
     ) {
         if (selectedLensSlot == LensSlot.THREE_X) {
             Log.d(
-                "Kepler3xSelection",
+                "Kepler3xRoute",
                 "phase=finalSelection selectedLensSlot=$selectedLensSlot " +
-                    "previousSource=unknown newSource=$selectedThreeXSource " +
-                    "zoom=${zoomUiState.zoomRatio} " +
-                    "optical=${zoomUiState.useOpticalTeleAt3x} " +
-                    "cameraId=${selection.cameraId} actual=${selection.actualLensSource} " +
+                    "uiSelectedZoom=$selectedLensSlot uiSelectedRoute=$selectedThreeXSource " +
+                    "requestedZoomRatio=${zoomUiState.zoomRatio} " +
+                    "previewCameraId=${selection.cameraId} captureCameraId=${selection.cameraId} " +
                     "physicalCameraId=${selection.physicalCameraId} " +
-                    "effectiveZoom=${selection.effectiveZoomRatio} useCrop=${selection.useCrop} " +
+                    "usePhysicalTele=${selection.physicalCameraId != null && !selection.useCrop} " +
+                    "useMainCrop=${selection.useCrop} cropRegion=unknown " +
+                    "finalRoute=${selection.finalZoomRouteName()} " +
+                    "fallbackReason=${selection.routeFallbackReason() ?: "none"} " +
+                    "actual=${selection.actualLensSource} effectiveZoom=${selection.effectiveZoomRatio} " +
                     "previewZoom=$previewZoomRatio captureZoom=$captureZoomRatio " +
-                    "physicalTele=${selection.isOpticalTeleActuallyUsed && !selection.useCrop} " +
-                    "mainCrop=${selection.actualLensSource == ActualLensSource.MAIN_CROP_3X}"
+                    "requestedZoomRoute=${selectedThreeXSource.name}"
             )
         }
     }

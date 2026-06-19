@@ -83,12 +83,7 @@ internal fun handleLensSlotChange(
     selectedThreeXSource: ThreeXSourceMode,
     zoomUiState: ZoomUiState
 ): LensChangeResult {
-    val enteringThreeXFromOtherSlot = lensSlot == LensSlot.THREE_X && zoomUiState.lensSlot != LensSlot.THREE_X
-    val effectiveThreeXSource = if (enteringThreeXFromOtherSlot) {
-        ThreeXSourceMode.OPTICAL
-    } else {
-        selectedThreeXSource
-    }
+    val effectiveThreeXSource = selectedThreeXSource
     val clampedZoom =
         lensSlot.targetZoomRatio.coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
     val updatedZoomState = zoomUiState.copy(
@@ -268,30 +263,26 @@ internal fun startCapturePipeline(
         onStatus(newStatus)
     }
     val selection = request.prepared.selection
-    val shouldDisablePhysicalStillRouting = selection.actualLensSource == ActualLensSource.OPTICAL_TELE_PHYSICAL
-    val physicalCameraId: String? = null
-    val captureZoomRatio = if (shouldDisablePhysicalStillRouting) {
-        3.0f
-    } else {
-        request.prepared.captureZoomRatio
-    }
+    val physicalCameraId = selection.physicalCameraId
+    val captureZoomRatio = request.prepared.captureZoomRatio
+    val finalRoute = selection.finalZoomRouteName()
+    val fallbackReason = selection.routeFallbackReason()
     Log.i(
-        "KeplerPhysicalRoute",
+        "Kepler3xRoute",
         "capturePipeline selectedResolution=${request.selectedResolution} " +
             "pipelineMode=${request.pipelineMode} cameraId=${selection.cameraId} " +
             "actual=${selection.actualLensSource} " +
+            "uiSelectedZoom=${selection.requestedLensSlot} " +
+            "uiSelectedRoute=${selection.requestedThreeXSourceMode} " +
+            "requestedZoomRatio=${request.prepared.captureZoomRatio} " +
+            "previewCameraId=${selection.cameraId} captureCameraId=${selection.cameraId} " +
             "requestedPhysicalCameraId=${selection.physicalCameraId} " +
             "routedPhysicalCameraId=$physicalCameraId " +
+            "physicalCameraId=$physicalCameraId " +
+            "usePhysicalTele=${physicalCameraId != null} useMainCrop=${selection.useCrop} " +
             "captureZoom=$captureZoomRatio " +
-            "physicalStillRoutingDisabled=$shouldDisablePhysicalStillRouting"
+            "finalRoute=$finalRoute fallbackReason=${fallbackReason ?: "none"}"
     )
-    if (shouldDisablePhysicalStillRouting) {
-        Log.w(
-            "KeplerPhysicalRoute",
-            "capture physical routing disabled; using logical 3x crop fallback " +
-                "cameraId=${selection.cameraId} requestedPhysicalCameraId=${selection.physicalCameraId}"
-        )
-    }
     if (request.selectedResolution == CaptureResolutionMode.MP24_FUSION) {
         captureProcessExportSuperResolutionFusion(
             context = request.context,
@@ -322,6 +313,9 @@ internal fun startCapturePipeline(
             finalOutputFormat = request.finalOutputFormat,
             zoomRatio = captureZoomRatio,
             physicalCameraId = physicalCameraId,
+            zoomRoute = selection.requestedThreeXSourceMode,
+            previewRoute = finalRoute,
+            routeFallbackReason = fallbackReason,
             focusAeState = request.focusAeState,
             rawSpeedMode = request.rawSpeedMode,
             onStatus = loggedStatus
@@ -335,6 +329,9 @@ internal fun startCapturePipeline(
             finalOutputFormat = request.finalOutputFormat,
             zoomRatio = captureZoomRatio,
             physicalCameraId = physicalCameraId,
+            zoomRoute = selection.requestedThreeXSourceMode,
+            previewRoute = finalRoute,
+            routeFallbackReason = fallbackReason,
             focusAeState = request.focusAeState,
             cleanupPolicy = CacheCleanupPolicy.KEEP_ALL,
             frameCountMode = request.prepared.settings.mode,

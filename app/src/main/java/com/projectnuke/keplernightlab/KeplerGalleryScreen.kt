@@ -17,11 +17,16 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -56,11 +61,25 @@ fun KeplerGalleryScreen(onBack: () -> Unit) {
     var selected by remember { mutableStateOf<KeplerGalleryJobSummary?>(null) }
     var refreshKey by remember { mutableIntStateOf(0) }
     var error by remember { mutableStateOf<String?>(null) }
+    var selectedTab by remember { mutableStateOf(0) }
 
     LaunchedEffect(refreshKey) {
         runCatching { withContext(Dispatchers.IO) { loadKeplerGalleryJobs(context) } }
             .onSuccess { jobs = it; error = null }
             .onFailure { error = "${it.javaClass.simpleName}: ${it.message}" }
+    }
+
+    if (selectedTab == 1) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(galleryBackground)
+                .padding(androidx.compose.foundation.layout.WindowInsets.safeDrawing.asPaddingValues())
+        ) {
+            GalleryTabs(selectedTab) { selectedTab = it }
+            CacheJobsScreen(onBack = onBack)
+        }
+        return
     }
 
     selected?.let { job ->
@@ -76,30 +95,41 @@ fun KeplerGalleryScreen(onBack: () -> Unit) {
     }
 
     BackHandler(onBack = onBack)
-    LazyColumn(
+    Column(
         modifier = Modifier
             .fillMaxSize()
             .background(galleryBackground)
             .padding(androidx.compose.foundation.layout.WindowInsets.safeDrawing.asPaddingValues())
             .padding(horizontal = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        item {
-            Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onBack) { Text("Back") }
-                Button(onClick = { refreshKey++ }) { Text("Refresh") }
-            }
-            Text("Kepler Job Gallery", style = MaterialTheme.typography.headlineMedium)
-            Text(error ?: "${jobs.size} jobs, newest first", color = galleryMuted)
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = onBack) { Text("뒤로") }
+            Button(onClick = { refreshKey++ }) { Text("새로고침") }
         }
-        items(jobs, key = { it.id }) { job ->
-            GalleryJobCard(job) { selected = job }
-        }
+        GalleryTabs(selectedTab) { selectedTab = it }
+        Text(error ?: "${jobs.size}개 항목, 최신순", color = galleryMuted)
         if (jobs.isEmpty() && error == null) {
-            item { Text("No RAW or Color Fusion jobs found.", color = galleryMuted) }
+            Text("표시할 사진이 없습니다.", color = galleryMuted)
         }
-        item { Spacer(Modifier.height(20.dp)) }
+        LazyVerticalGrid(
+            columns = GridCells.Adaptive(150.dp),
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            gridItems(jobs, key = { it.id }) { job ->
+                GalleryJobCard(job) { selected = job }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GalleryTabs(selectedTab: Int, onSelect: (Int) -> Unit) {
+    TabRow(selectedTabIndex = selectedTab, containerColor = galleryBackground) {
+        Tab(selected = selectedTab == 0, onClick = { onSelect(0) }, text = { Text("사진") })
+        Tab(selected = selectedTab == 1, onClick = { onSelect(1) }, text = { Text("디버그") })
     }
 }
 
@@ -111,11 +141,19 @@ private fun GalleryJobCard(job: KeplerGalleryJobSummary, onOpen: () -> Unit) {
         shape = RoundedCornerShape(16.dp)
     ) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            Text(job.jobType, style = MaterialTheme.typography.titleMedium)
-            Text(job.directory.name, color = galleryMuted)
-            Text("${formatTimestamp(job.createdAt)} | ${job.status}")
-            Text("Frames ${job.savedFrames}/${job.requestedFrames} | ${resolutionText(job)}")
-            Text("${formatBytes(job.folderSizeBytes)} | Final/export: ${if (job.finalExportExists) "yes" else "no"}")
+            job.finalPreviewFile?.let { file ->
+                loadThumbnailSafe(file, 512)?.let { bitmap ->
+                    Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = null,
+                        modifier = Modifier.fillMaxWidth().height(120.dp).background(Color.Black),
+                        contentScale = ContentScale.Crop
+                    )
+                }
+            }
+            Text(modeLabel(job), style = MaterialTheme.typography.titleMedium)
+            Text("${formatTimestamp(job.createdAt)} | ${routeLabel(job)}", color = galleryMuted)
+            Text(if (job.status.contains("COMPLETE")) resolutionText(job) else job.status)
         }
     }
 }
@@ -134,6 +172,7 @@ private fun KeplerGalleryDetailScreen(
     var confirmDelete by remember { mutableStateOf(false) }
     var deleteError by remember { mutableStateOf<String?>(null) }
     var actionStatus by remember { mutableStateOf<String?>(null) }
+    var showDebugInfo by remember { mutableStateOf(false) }
     var isReprocessing by remember { mutableStateOf(false) }
     var isAnalyzingQuality by remember { mutableStateOf(false) }
     var selectedFusionPreset by remember(job.id) {
@@ -142,6 +181,11 @@ private fun KeplerGalleryDetailScreen(
         )
     }
     var refreshKey by remember { mutableIntStateOf(0) }
+
+    if (showDebugInfo) {
+        JobDetailScreen(jobDir = currentJob.directory, onBack = { showDebugInfo = false })
+        return
+    }
 
     LaunchedEffect(job.id, refreshKey) {
         val refreshedJob = withContext(Dispatchers.IO) {
@@ -216,6 +260,9 @@ private fun KeplerGalleryDetailScreen(
                 )
             }
         }
+        item {
+            QualityDiagnosticSection(currentJob)
+        }
         if (debugPreviews.isNotEmpty()) {
             item {
                 GallerySection("Fusion Debug") {
@@ -250,6 +297,9 @@ private fun KeplerGalleryDetailScreen(
                 GalleryField("Folder size", formatBytes(currentJob.folderSizeBytes))
                 GalleryField("Final/export", if (currentJob.finalExportExists) "Available" else "Not found")
                 GalleryField("Path", currentJob.directory.absolutePath)
+                Button(onClick = { showDebugInfo = true }) {
+                    Text("디버그 정보 보기")
+                }
                 Button(
                     enabled = !isReprocessing && !isAnalyzingQuality,
                     onClick = {
@@ -452,8 +502,55 @@ private fun GalleryField(label: String, value: String) {
     }
 }
 
+@Composable
+private fun QualityDiagnosticSection(job: KeplerGalleryJobSummary) {
+    val metadata = job.metadata
+    val compareName = metadata?.optString("compareReferenceVsFinalFile").orEmpty()
+        .ifBlank { metadata?.optString("yuvCompareReferenceVsFinalFile").orEmpty() }
+        .ifBlank { metadata?.optString("qualityDiagnosticCompareFile").orEmpty() }
+    val compareBitmap = remember(job.id, compareName) {
+        if (compareName.isBlank()) null else loadThumbnailSafe(java.io.File(job.directory, compareName), 960)
+    }
+    GallerySection("품질 진단") {
+        GalleryField("quality hint", metadata?.optString("fusionQualityHint").orEmpty().ifBlank { "none" })
+        GalleryField("sharpness", qualitySummary(metadata, "Sharpness"))
+        GalleryField("noise", qualitySummary(metadata, "NoiseEstimate"))
+        GalleryField("sharpness drop", metadata.value("sharpnessDropReferenceToFused") + " / " + metadata.value("sharpnessDropFusedToFinal"))
+        GalleryField("noise reduction", metadata.value("noiseReductionReferenceToFused") + " / " + metadata.value("noiseReductionFusedToFinal"))
+        compareBitmap?.let { bitmap ->
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = "reference vs final",
+                modifier = Modifier.fillMaxWidth().height(220.dp).background(Color.Black),
+                contentScale = ContentScale.Fit
+            )
+        }
+    }
+}
+
 private fun resolutionText(job: KeplerGalleryJobSummary): String {
     return if (job.width != null && job.height != null) "${job.width}x${job.height}" else "unknown"
+}
+
+private fun modeLabel(job: KeplerGalleryJobSummary): String = when (job.jobType) {
+    "RAW_NIGHT_FUSION" -> "고품질 RAW"
+    "YUV_NIGHT_FUSION" -> "빠른 야간"
+    else -> job.jobType
+}
+
+private fun routeLabel(job: KeplerGalleryJobSummary): String {
+    val route = job.metadata?.optString("finalZoomRoute").orEmpty()
+        .ifBlank { job.metadata?.optString("captureRoute").orEmpty() }
+    return when (route) {
+        "OPTICAL" -> "3x 광학"
+        "CROP" -> "3x 크롭"
+        "MAIN_1X" -> "1x"
+        else -> if ((job.metadata?.optDouble("requestedZoomRatio", 1.0) ?: 1.0) >= 2.9) {
+            "3x"
+        } else {
+            "1x"
+        }
+    }
 }
 
 private fun formatMetric(value: Float): String = "%.3f".format(java.util.Locale.US, value)
@@ -473,10 +570,30 @@ private fun metadataSummary(job: JSONObject?): List<Pair<String, String>> {
         "fusedClassicPresetFile", "rawFusionEngine", "rawFusionVersion",
         "rawReferenceFrameIndex", "rawGhostSuppressionUsed", "rawOutlierRejectedRatio",
         "rawFusionProcessingTimeMs", "rawFusionDebugFile", "rawDebugArtifactStatus",
-        "rawDebugArtifactError"
+        "rawDebugArtifactError", "fusionQualityHint", "referenceSharpness",
+        "fusedSharpness", "denoisedSharpness", "finalSharpness",
+        "referenceNoiseEstimate", "fusedNoiseEstimate", "denoisedNoiseEstimate",
+        "finalNoiseEstimate", "sharpnessDropReferenceToFused",
+        "sharpnessDropFusedToFinal", "noiseReductionReferenceToFused",
+        "noiseReductionFusedToFinal", "compareReferenceVsFinalFile",
+        "yuvCompareReferenceVsFinalFile", "qualityDiagnosticNativeLimited"
     ).mapNotNull { key ->
         if (!job.has(key) || job.isNull(key)) null else key to job.get(key).toString()
     }
+}
+
+private fun qualitySummary(job: JSONObject?, suffix: String): String {
+    if (job == null) return "none"
+    return listOf("reference", "fused", "denoised", "final")
+        .joinToString(" | ") { label ->
+            val key = label + suffix
+            "$label=${job.value(key)}"
+        }
+}
+
+private fun JSONObject?.value(key: String): String {
+    if (this == null || !has(key) || isNull(key)) return "none"
+    return opt(key)?.toString()?.takeIf { it.isNotBlank() && it != "null" } ?: "none"
 }
 
 private fun fusionDebugArtifactFiles(
@@ -487,6 +604,8 @@ private fun fusionDebugArtifactFiles(
         "Reference frame" to metadata.optString("referenceFrameDebugFile", "reference_frame.png"),
         "Fused output" to metadata.optString("fusedClassicDebugFile", "fused_classic_yuv_v1.png"),
         "A/B comparison" to metadata.optString("comparisonDebugFile", "compare_reference_vs_fused.png"),
+        "Reference vs final" to metadata.optString("compareReferenceVsFinalFile", "compare_reference_vs_final.png"),
+        "YUV reference vs final" to metadata.optString("yuvCompareReferenceVsFinalFile", "yuv_compare_reference_vs_final.png"),
         "RAW reference" to metadata.optString("rawReferencePreviewFile", "raw_reference_preview.png"),
         "RAW fused" to metadata.optString("rawFusedPreviewFile", "raw_fused_classic_v1_preview.png"),
         "RAW A/B comparison" to metadata.optString("rawComparePreviewFile", "raw_compare_reference_vs_fused.png")

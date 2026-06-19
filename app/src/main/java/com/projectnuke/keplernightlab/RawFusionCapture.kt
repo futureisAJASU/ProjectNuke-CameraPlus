@@ -92,6 +92,9 @@ fun captureRawBurstForFusion(
     resolutionPlan: ResolutionCapturePlan? = null,
     zoomRatio: Float = 1.0f,
     physicalCameraId: String? = null,
+    zoomRoute: ThreeXSourceMode = ThreeXSourceMode.AUTO,
+    previewRoute: String? = null,
+    routeFallbackReason: String? = null,
     focusAeState: FocusAeState = FocusAeState(),
     rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
     onStatus: (String) -> Unit,
@@ -270,6 +273,10 @@ fun captureRawBurstForFusion(
             .put("processingStartedAt", JSONObject.NULL)
             .put("userCanMoveDevice", false)
             .put("rawCaptureMs", JSONObject.NULL)
+            .put("galleryDisplayFile", JSONObject.NULL)
+            .put("galleryThumbnailFile", JSONObject.NULL)
+            .put("galleryDisplaySource", JSONObject.NULL)
+            .put("isDebugPreviewUsedAsFinal", false)
             .put("rawSaveTotalMs", JSONObject.NULL)
             .put("nativeAlignMs", JSONObject.NULL)
             .put("nativeMergeMs", JSONObject.NULL)
@@ -279,7 +286,13 @@ fun captureRawBurstForFusion(
             .put("jobDirAbsolutePath", jobDir.absolutePath)
             .put("adbDebugHint", adbDebugHint)
             .put("cameraId", cameraId)
-            .put("physicalCameraId", JSONObject.NULL)
+            .put("physicalCameraId", physicalCameraId ?: JSONObject.NULL)
+            .put("requestedZoomRatio", zoomRatio.toDouble())
+            .put("requestedZoomRoute", zoomRoute.name)
+            .put("finalZoomRoute", if (physicalCameraId != null) "OPTICAL" else if (cropApplied) "CROP" else "AUTO")
+            .put("previewRoute", previewRoute ?: JSONObject.NULL)
+            .put("captureRoute", if (physicalCameraId != null) "OPTICAL" else if (cropApplied) "CROP" else "AUTO")
+            .put("routeFallbackReason", routeFallbackReason ?: JSONObject.NULL)
             .put("resolutionMode", resolutionMode.label)
             .put("requestedResolutionMode", resolutionMode.name)
             .put("actualInputResolutionMode", actualInputMode.name)
@@ -585,13 +598,7 @@ fun captureRawBurstForFusion(
                         handler = handler,
                         onConfigured = { configured, physicalRoute ->
                                 session = configured
-                                val requestZoomRatio = if (physicalRoute) {
-                                    zoomRatio
-                                } else if (physicalCameraId != null) {
-                                    3.0f
-                                } else {
-                                    zoomRatio
-                                }
+                                val requestZoomRatio = if (physicalRoute) 1.0f else zoomRatio
                                 val requests = List(requestedFrames) {
                                     camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                                         addTarget(imageReader.surface)
@@ -826,6 +833,10 @@ private object RawFusionExportCoordinator {
             .put("previewFile", JSONObject.NULL)
             .put("finalFile", if (nativeMp24DebugPngWritten) finalFile.name else JSONObject.NULL)
             .put("finalOutputSource", "native_rgba")
+            .put("galleryDisplayFile", nativeRgbaFile.name)
+            .put("galleryThumbnailFile", nativeRgbaFile.name)
+            .put("galleryDisplaySource", "nativePostprocessRgbaFile")
+            .put("isDebugPreviewUsedAsFinal", false)
             .put("nativeMp24DebugPngRequested", nativeMp24DebugPngRequested)
             .put("nativeMp24DebugPngWritten", nativeMp24DebugPngWritten)
             .put(
@@ -1056,6 +1067,11 @@ private object RawFusionExportCoordinator {
         val previewFile = File(context.files.jobDir, "raw_fusion_preview.png")
         val finalFile = File(context.files.jobDir, "raw_fusion_final.png")
         val referenceDebugFile = File(context.files.jobDir, "raw_reference_render_debug.png")
+        val referenceSinglePreviewFile = File(context.files.jobDir, "reference_single_preview.png")
+        val fusedBeforeDenoisePreviewFile = File(context.files.jobDir, "fused_before_denoise_preview.png")
+        val fusedAfterDenoiseNoSharpenPreviewFile = File(context.files.jobDir, "fused_after_denoise_no_sharpen_preview.png")
+        val finalPreviewFile = File(context.files.jobDir, "final_preview.png")
+        val compareReferenceVsFinalFile = File(context.files.jobDir, "compare_reference_vs_final.png")
         val mergedLinearDebugFile = File(context.files.jobDir, "raw_merged_linear_debug.png")
         val finalRenderDebugFile = File(context.files.jobDir, "raw_final_render_debug.png")
         val renderDebugFile = File(context.files.jobDir, "raw_render_debug.json")
@@ -1075,6 +1091,10 @@ private object RawFusionExportCoordinator {
         var denoised: Bitmap? = null
         var sharpened: Bitmap? = null
         var finalBitmap: Bitmap? = null
+        var diagnosticFusedBeforeDenoise: Bitmap? = null
+        var diagnosticDenoisedNoSharpen: Bitmap? = null
+        var diagnosticFinal: Bitmap? = null
+        var diagnosticReference: Bitmap? = null
         var finalOutputWidth = targetSize.first
         var finalOutputHeight = targetSize.second
         var wbGains = RawWhiteBalanceGains(1f, 1f, 1f, 0f, 0f, 0f, null)
@@ -1153,6 +1173,8 @@ private object RawFusionExportCoordinator {
                 denoiseStrength = RAW_RENDER_DENOISE_STRENGTH,
                 chromaStrength = RAW_RENDER_CHROMA_DENOISE_STRENGTH
             )
+            diagnosticFusedBeforeDenoise = saveBoundedDiagnosticPreview(toned, fusedBeforeDenoisePreviewFile)
+            diagnosticDenoisedNoSharpen = saveBoundedDiagnosticPreview(denoised, fusedAfterDenoiseNoSharpenPreviewFile)
             toned.recycle()
             toned = null
             sharpened = sharpenRawFusion(denoised, RAW_RENDER_SHARPEN_AMOUNT)
@@ -1175,6 +1197,7 @@ private object RawFusionExportCoordinator {
             finalOutputHeight = finalBitmap.height
             saveRawFusionPng(finalBitmap, finalFile)
             saveRawFusionPng(finalBitmap, finalRenderDebugFile)
+            diagnosticFinal = saveBoundedDiagnosticPreview(finalBitmap, finalPreviewFile)
             finalStats = estimateRawRenderStats(finalBitmap)
             if (finalStats.saturationEstimate < 0.035f) warnings += "LOW_SATURATION"
             if (finalStats.overBrightRatio > 0.12f) warnings += "OVER_BRIGHT"
@@ -1186,6 +1209,19 @@ private object RawFusionExportCoordinator {
                 gains = wbGains,
                 referenceDebugFile = referenceDebugFile
             )
+            diagnosticReference = loadBoundedDiagnosticPreview(referenceDebugFile)?.also {
+                saveRawFusionPng(it, referenceSinglePreviewFile)
+            }
+            writeFusionQualityDiagnostics(
+                job = context.job,
+                jobDir = context.files.jobDir,
+                prefix = "raw",
+                reference = diagnosticReference,
+                fused = diagnosticFusedBeforeDenoise,
+                denoised = diagnosticDenoisedNoSharpen,
+                finalImage = diagnosticFinal,
+                compareFileName = compareReferenceVsFinalFile.name
+            )
         } finally {
             preview?.takeUnless { it.isRecycled }?.recycle()
             whiteBalanced?.takeUnless { it.isRecycled }?.recycle()
@@ -1193,6 +1229,10 @@ private object RawFusionExportCoordinator {
             denoised?.takeUnless { it.isRecycled }?.recycle()
             sharpened?.takeUnless { it.isRecycled }?.recycle()
             finalBitmap?.takeUnless { it.isRecycled }?.recycle()
+            diagnosticFusedBeforeDenoise?.takeUnless { it.isRecycled }?.recycle()
+            diagnosticDenoisedNoSharpen?.takeUnless { it.isRecycled }?.recycle()
+            diagnosticFinal?.takeUnless { it.isRecycled }?.recycle()
+            diagnosticReference?.takeUnless { it.isRecycled }?.recycle()
         }
         writeRawRenderDebugJson(
             file = renderDebugFile,
@@ -1236,6 +1276,11 @@ private object RawFusionExportCoordinator {
             .put("rawRenderColorTransform", renderMetadata.colorTransform?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
             .put("rawRenderCameraWbGains", renderMetadata.cameraWbGains?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
             .put("rawReferenceDebugFile", if (referenceDebugFile.exists()) referenceDebugFile.name else JSONObject.NULL)
+            .put("referenceSinglePreviewFile", if (referenceSinglePreviewFile.exists()) referenceSinglePreviewFile.name else JSONObject.NULL)
+            .put("fusedBeforeDenoisePreviewFile", if (fusedBeforeDenoisePreviewFile.exists()) fusedBeforeDenoisePreviewFile.name else JSONObject.NULL)
+            .put("fusedAfterDenoiseNoSharpenPreviewFile", if (fusedAfterDenoiseNoSharpenPreviewFile.exists()) fusedAfterDenoiseNoSharpenPreviewFile.name else JSONObject.NULL)
+            .put("finalPreviewFile", if (finalPreviewFile.exists()) finalPreviewFile.name else JSONObject.NULL)
+            .put("compareReferenceVsFinalFile", if (compareReferenceVsFinalFile.exists()) compareReferenceVsFinalFile.name else JSONObject.NULL)
             .put("rawMergedLinearDebugFile", mergedLinearDebugFile.name)
             .put("rawFinalRenderDebugFile", finalRenderDebugFile.name)
             .put("rawRenderDebugFile", renderDebugFile.name)
@@ -1243,6 +1288,10 @@ private object RawFusionExportCoordinator {
             .put("mergedDngFile", JSONObject.NULL)
             .put("previewFile", if (skipDebugPreview) JSONObject.NULL else previewFile.name)
             .put("finalFile", finalFile.name)
+            .put("galleryDisplayFile", finalFile.name)
+            .put("galleryThumbnailFile", finalFile.name)
+            .put("galleryDisplaySource", "finalFile")
+            .put("isDebugPreviewUsedAsFinal", false)
             .put("rawDebugPreviewSkipped", skipDebugPreview)
             .put(
                 "rawDebugPreviewSkipReason",

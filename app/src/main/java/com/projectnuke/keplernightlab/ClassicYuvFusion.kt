@@ -226,6 +226,7 @@ internal fun processClassicYuvFusionJob(
             .put("excludedFrameCount", excludedFrameCount)
             .put("skippedFrameCount", skippedFrameCount)
             .put("referenceFrameIndex", activeReference.jsonIndex)
+            .put("yuvReferenceFrameIndex", activeReference.jsonIndex)
             .put("ghostSuppressionUsed", true)
             .put("ghostSuppressionEnabled", true)
             .put("ghostRejectedPixelRatio", rejectedRatio)
@@ -234,6 +235,20 @@ internal fun processClassicYuvFusionJob(
             .put("finalNightFusionFile", finalFile.name)
             .put("finalFile", finalFile.name)
             .put("finalOutputSource", "yuv_fusion_rgba")
+            .put("galleryDisplayFile", finalFile.name)
+            .put("galleryThumbnailFile", finalFile.name)
+            .put("galleryDisplaySource", "yuv_final_file")
+            .put("isDebugPreviewUsedAsFinal", false)
+            .put("yuvFusionLooksWorseHint", JSONObject.NULL)
+            .put("yuvQualityDiagnosticHints", JSONArray(listOf(
+                "alignment blur",
+                "over-denoise",
+                "over-sharpen",
+                "chroma plane shift",
+                "wrong UV order",
+                "output resize issue",
+                "wrong 3x route"
+            )))
             .put("processingTimeMs", processingTimeMs)
             .put("outputWidth", dimensions.first)
             .put("outputHeight", dimensions.second)
@@ -285,6 +300,7 @@ internal fun processClassicYuvFusionJob(
             jobDir = jobDir,
             job = job,
             referenceFile = activeReference.file,
+            mergedBitmap = merged,
             fusedBitmap = finalBitmap,
             params = params
         )
@@ -295,6 +311,7 @@ internal fun processClassicYuvFusionJob(
                     "${debugMetadataFailure.javaClass.simpleName}: ${debugMetadataFailure.message}".take(240)
                 )
         }
+        File(jobDir, "yuv_debug.json").writeText(job.toString(2))
         jobFile.writeText(job.toString(2))
         onStatus("처리가 완료되었습니다.")
         return finalFile
@@ -801,7 +818,9 @@ private fun writeFusionDebugMetadata(
         .put("outputWidth", outputWidth)
         .put("outputHeight", outputHeight)
     File(jobDir, "fusion_debug.json").writeText(debug.toString(2))
+    File(jobDir, "yuv_debug.json").writeText(debug.toString(2))
     job.put("fusionDebugFile", "fusion_debug.json")
+        .put("yuvDebugFile", "yuv_debug.json")
         .put("fusionAlignmentSummary", alignments)
 }
 
@@ -809,14 +828,19 @@ private fun generateFusionDebugArtifacts(
     jobDir: File,
     job: JSONObject,
     referenceFile: File,
+    mergedBitmap: Bitmap,
     fusedBitmap: Bitmap,
     params: ClassicYuvFusionParams
 ) {
     try {
         val referenceOutput = File(jobDir, "reference_frame.png")
         referenceFile.copyTo(referenceOutput, overwrite = true)
+        val yuvReferenceOutput = File(jobDir, "yuv_reference_preview.png")
+        referenceFile.copyTo(yuvReferenceOutput, overwrite = true)
         val fusedOutput = File(jobDir, "fused_classic_yuv_v1.png")
         saveClassicBitmap(fusedBitmap, fusedOutput)
+        val yuvFusedOutput = File(jobDir, "yuv_fused_preview.png")
+        saveClassicBitmap(fusedBitmap, yuvFusedOutput)
         val presetOutput = File(
             jobDir,
             "fused_classic_yuv_v1_${params.presetName.lowercase()}.png"
@@ -824,6 +848,19 @@ private fun generateFusionDebugArtifacts(
         saveClassicBitmap(fusedBitmap, presetOutput)
 
         val referencePreview = decodeDebugPreview(referenceFile)
+        val yuvBeforeDenoisePreview = saveBoundedDiagnosticPreview(
+            mergedBitmap,
+            File(jobDir, "yuv_fused_before_denoise_preview.png")
+        )
+        val yuvNoSharpenPreview = finishClassicFusion(
+            yuvBeforeDenoisePreview,
+            params.copy(sharpenAmount = 0f, localContrastAmount = 0f)
+        )
+        saveClassicBitmap(yuvNoSharpenPreview, File(jobDir, "yuv_fused_after_denoise_no_sharpen_preview.png"))
+        val yuvFinalPreview = saveBoundedDiagnosticPreview(
+            fusedBitmap,
+            File(jobDir, "yuv_final_preview.png")
+        )
         var fusedPreview: Bitmap? = null
         var comparison: Bitmap? = null
         try {
@@ -842,15 +879,36 @@ private fun generateFusionDebugArtifacts(
             canvas.drawBitmap(referencePreview, 0f, 0f, null)
             canvas.drawBitmap(fusedPreview, referencePreview.width.toFloat(), 0f, null)
             saveClassicBitmap(comparison, File(jobDir, "compare_reference_vs_fused.png"))
+            saveClassicBitmap(comparison, File(jobDir, "yuv_compare_reference_vs_fused.png"))
+            writeFusionQualityDiagnostics(
+                job = job,
+                jobDir = jobDir,
+                prefix = "yuv",
+                reference = referencePreview,
+                fused = yuvBeforeDenoisePreview,
+                denoised = yuvNoSharpenPreview,
+                finalImage = yuvFinalPreview,
+                compareFileName = "yuv_compare_reference_vs_final.png"
+            )
         } finally {
             comparison?.recycle()
             if (fusedPreview != null && fusedPreview !== fusedBitmap) fusedPreview.recycle()
+            yuvBeforeDenoisePreview.recycle()
+            yuvNoSharpenPreview.recycle()
+            yuvFinalPreview.recycle()
             referencePreview.recycle()
         }
         job.put("referenceFrameDebugFile", referenceOutput.name)
+            .put("yuvReferencePreviewFile", yuvReferenceOutput.name)
             .put("fusedClassicDebugFile", fusedOutput.name)
+            .put("yuvFusedPreviewFile", yuvFusedOutput.name)
+            .put("yuvFusedBeforeDenoisePreviewFile", "yuv_fused_before_denoise_preview.png")
+            .put("yuvFusedAfterDenoiseNoSharpenPreviewFile", "yuv_fused_after_denoise_no_sharpen_preview.png")
+            .put("yuvFinalPreviewFile", "yuv_final_preview.png")
             .put("fusedClassicPresetFile", presetOutput.name)
             .put("comparisonDebugFile", "compare_reference_vs_fused.png")
+            .put("yuvComparePreviewFile", "yuv_compare_reference_vs_fused.png")
+            .put("yuvCompareReferenceVsFinalFile", "yuv_compare_reference_vs_final.png")
             .put("debugArtifactStatus", "COMPLETE")
             .remove("debugArtifactError")
     } catch (oom: OutOfMemoryError) {

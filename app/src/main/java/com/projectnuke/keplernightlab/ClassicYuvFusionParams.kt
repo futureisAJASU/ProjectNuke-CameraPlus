@@ -56,7 +56,7 @@ enum class ClassicYuvFusionPreset(
 ) {
     NATURAL(
         "Natural",
-        ClassicYuvFusionParams("NATURAL", 1.5f, 34f, 0.05f, 0.20f, 0.24f, 0.24f, 0.035f, 1.02f, 0.018f, 0.10f)
+        ClassicYuvFusionParams("NATURAL", 1.5f, 34f, 0.04f, 0.20f, 0.14f, 0.10f, 0.020f, 1.01f, 0.014f, 0.08f)
     ),
     CLEAN(
         "Clean",

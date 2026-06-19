@@ -98,6 +98,9 @@ fun captureYuvBurstColorWithMotion(
     resolutionMode: CaptureResolutionMode = CaptureResolutionMode.MP12,
     zoomRatio: Float = 1.0f,
     physicalCameraId: String? = null,
+    zoomRoute: ThreeXSourceMode = ThreeXSourceMode.AUTO,
+    previewRoute: String? = null,
+    routeFallbackReason: String? = null,
     focusAeState: FocusAeState = FocusAeState(),
     frameCountMode: FrameCountMode = FrameCountMode.AUTO,
     autoMinFrames: Int = 4,
@@ -272,6 +275,10 @@ fun captureYuvBurstColorWithMotion(
             resolutionMode = resolutionMode,
             zoomRatio = zoomRatio,
             cropApplied = cropApplied,
+            physicalCameraId = physicalCameraId,
+            zoomRoute = zoomRoute,
+            previewRoute = previewRoute,
+            routeFallbackReason = routeFallbackReason,
             frameCountMode = frameCountMode,
             plannedFrames = frameCount,
             autoMinFrames = autoMinFrames,
@@ -408,6 +415,10 @@ fun captureYuvBurstColorWithMotion(
                                 resolutionMode = resolutionMode,
                                 zoomRatio = zoomRatio,
                                 cropApplied = cropApplied,
+                                physicalCameraId = physicalCameraId,
+                                zoomRoute = zoomRoute,
+                                previewRoute = previewRoute,
+                                routeFallbackReason = routeFallbackReason,
                                 frameCountMode = frameCountMode,
                                 plannedFrames = frameCount,
                                 autoMinFrames = autoMinFrames,
@@ -465,6 +476,10 @@ fun captureYuvBurstColorWithMotion(
                         resolutionMode = resolutionMode,
                         zoomRatio = zoomRatio,
                         cropApplied = cropApplied,
+                        physicalCameraId = physicalCameraId,
+                        zoomRoute = zoomRoute,
+                        previewRoute = previewRoute,
+                        routeFallbackReason = routeFallbackReason,
                         frameCountMode = frameCountMode,
                         plannedFrames = frameCount,
                         autoMinFrames = autoMinFrames,
@@ -511,6 +526,10 @@ fun captureYuvBurstColorWithMotion(
                             resolutionMode = resolutionMode,
                             zoomRatio = zoomRatio,
                             cropApplied = cropApplied,
+                            physicalCameraId = physicalCameraId,
+                            zoomRoute = zoomRoute,
+                            previewRoute = previewRoute,
+                            routeFallbackReason = routeFallbackReason,
                             frameCountMode = frameCountMode,
                             plannedFrames = frameCount,
                             autoMinFrames = autoMinFrames,
@@ -570,13 +589,7 @@ fun captureYuvBurstColorWithMotion(
                                     postStatus("Color Fusion 초기화 7/7: 세션 준비 완료. $frameCount 장 촬영 중...")
 
                                     try {
-                                        val requestZoomRatio = if (physicalRoute) {
-                                            zoomRatio
-                                        } else if (physicalCameraId != null) {
-                                            3.0f
-                                        } else {
-                                            zoomRatio
-                                        }
+                                        val requestZoomRatio = if (physicalRoute) 1.0f else zoomRatio
                                         val requests = List(frameCount) {
                                             val (builder, selectedTemplate) =
                                                 createYuvBurstCaptureRequestBuilder(
@@ -1171,6 +1184,10 @@ fun writeColorJobJson(
     resolutionMode: CaptureResolutionMode = CaptureResolutionMode.MP12,
     zoomRatio: Float = 1.0f,
     cropApplied: Boolean = false,
+    physicalCameraId: String? = null,
+    zoomRoute: ThreeXSourceMode = ThreeXSourceMode.AUTO,
+    previewRoute: String? = null,
+    routeFallbackReason: String? = null,
     frameCountMode: FrameCountMode = FrameCountMode.AUTO,
     plannedFrames: Int = requestedFrames,
     autoMinFrames: Int = 4,
@@ -1253,6 +1270,13 @@ fun writeColorJobJson(
         )
         .put("cameraId", cameraId)
         .put("selectedCameraId", cameraId)
+        .put("physicalCameraId", physicalCameraId ?: JSONObject.NULL)
+        .put("requestedZoomRatio", zoomRatio.toDouble())
+        .put("requestedZoomRoute", zoomRoute.name)
+        .put("finalZoomRoute", if (physicalCameraId != null) "OPTICAL" else if (cropApplied) "CROP" else "AUTO")
+        .put("previewRoute", previewRoute ?: JSONObject.NULL)
+        .put("captureRoute", if (physicalCameraId != null) "OPTICAL" else if (cropApplied) "CROP" else "AUTO")
+        .put("routeFallbackReason", routeFallbackReason ?: JSONObject.NULL)
         .put("resolutionMode", resolutionMode.label)
         .put("zoomRatio", zoomRatio.toDouble())
         .put("cropApplied", cropApplied)

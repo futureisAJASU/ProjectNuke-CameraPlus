@@ -1618,36 +1618,38 @@ fun ThreeXSourceDots(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        ThreeXSourceDot(
-            selected = selected == ThreeXSourceMode.OPTICAL,
-            onClick = {
-                Log.d("KeplerSmoke", "ThreeXSourceDot clicked source=OPTICAL")
-                onSelect(ThreeXSourceMode.OPTICAL)
-            }
-        )
-
-        ThreeXSourceDot(
-            selected = selected == ThreeXSourceMode.MAIN_CROP,
-            onClick = {
-                Log.d("KeplerSmoke", "ThreeXSourceDot clicked source=MAIN_CROP")
-                onSelect(ThreeXSourceMode.MAIN_CROP)
-            }
-        )
+        ThreeXSourceMode.entries.forEach { source ->
+            ThreeXSourceDot(
+                source = source,
+                selected = selected == source,
+                onClick = {
+                    Log.d("KeplerSmoke", "ThreeXSourceDot clicked source=$source")
+                    onSelect(source)
+                }
+            )
+        }
     }
 }
 
 @Composable
 fun ThreeXSourceDot(
+    source: ThreeXSourceMode,
     selected: Boolean,
     onClick: () -> Unit
 ) {
     Box(
         modifier = Modifier
-            .size(14.dp)
-            .clip(CircleShape)
-            .background(if (selected) Color.White else Color.White.copy(alpha = 0.28f))
+            .clip(RoundedCornerShape(14.dp))
+            .background(if (selected) Color.White else Color.White.copy(alpha = 0.16f))
             .clickable(onClick = onClick)
-    )
+            .padding(horizontal = 10.dp, vertical = 6.dp)
+    ) {
+        Text(
+            text = source.label,
+            color = if (selected) Color.Black else Color.White,
+            style = MaterialTheme.typography.labelSmall
+        )
+    }
 }
 
 @Composable

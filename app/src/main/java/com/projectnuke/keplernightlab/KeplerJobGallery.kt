@@ -222,21 +222,48 @@ private fun JSONObject.optionalFloat(key: String): Float? {
 }
 
 private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
+    val explicit = job?.optString("galleryDisplayFile").orEmpty()
+    File(directory, explicit).takeIf { explicit.isNotBlank() && it.isFile && !isDebugPreviewFinalBlocked(it.name) }
+        ?.let { return it }
     val keys = listOf(
+        "nativePostprocessRgbaFile",
         "finalNightFusionFile",
         "finalFile",
-        "averageColorFile",
-        "outputFile",
-        "previewFile"
+        "outputFile"
     )
     keys.forEach { key ->
         val name = job?.optString(key).orEmpty()
-        File(directory, name).takeIf { name.isNotBlank() && it.isFile && it.extension.equals("png", true) }
+        File(directory, name).takeIf {
+            name.isNotBlank() &&
+                it.isFile &&
+                !isDebugPreviewFinalBlocked(it.name) &&
+                (it.extension.equals("png", true) || it.extension.equals("jpg", true) || it.extension.equals("jpeg", true) || it.extension.equals("rgba", true))
+        }
             ?.let { return it }
     }
     return directory.listFiles()
-        ?.filter { it.isFile && it.extension.equals("png", true) && !isSourceFrame(it) }
+        ?.filter {
+            it.isFile &&
+                it.extension.equals("png", true) &&
+                !isSourceFrame(it) &&
+                !isDebugPreviewFinalBlocked(it.name)
+        }
         ?.maxByOrNull { it.lastModified() }
+}
+
+private fun isDebugPreviewFinalBlocked(name: String): Boolean {
+    val lower = name.lowercase()
+    return lower in setOf(
+        "raw_reference_preview.png",
+        "raw_fused_classic_v1_preview.png",
+        "raw_compare_reference_vs_fused.png",
+        "reference_frame.png",
+        "fused_classic_yuv_v1.png",
+        "compare_reference_vs_fused.png",
+        "yuv_reference_preview.png",
+        "yuv_fused_preview.png",
+        "yuv_compare_reference_vs_fused.png"
+    )
 }
 
 private fun firstPositive(job: JSONObject?, vararg keys: String): Int? {

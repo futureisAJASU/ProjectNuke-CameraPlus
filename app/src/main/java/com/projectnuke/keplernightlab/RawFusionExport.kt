@@ -72,6 +72,9 @@ fun captureProcessExportRawNightFusion(
     finalOutputFormat: FinalOutputFormat,
     zoomRatio: Float,
     physicalCameraId: String? = null,
+    zoomRoute: ThreeXSourceMode = ThreeXSourceMode.AUTO,
+    previewRoute: String? = null,
+    routeFallbackReason: String? = null,
     focusAeState: FocusAeState = FocusAeState(),
     rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
     onStatus: (String) -> Unit
@@ -87,6 +90,9 @@ fun captureProcessExportRawNightFusion(
         resolutionPlan = resolutionPlan,
         zoomRatio = zoomRatio,
         physicalCameraId = physicalCameraId,
+        zoomRoute = zoomRoute,
+        previewRoute = previewRoute,
+        routeFallbackReason = routeFallbackReason,
         focusAeState = focusAeState,
         rawSpeedMode = rawSpeedMode,
         onStatus = { post(it) },
@@ -143,6 +149,7 @@ fun captureProcessExportRawNightFusion(
                             nativePreviewPrepareMs = nativePreviewPrepareMs
                         )
                         post("결과를 저장하는 중입니다.")
+                        updateRawNativeQualityDiagnostics(jobDir, loaded.bitmap)
                         exportNightFusionBitmapToGallery(
                             context = context,
                             bitmap = loaded.bitmap,
@@ -363,5 +370,40 @@ private fun updateReprocessHistory(
             .put("lastReprocessExcludedFrameCount", excludedFrameCount)
             .put("lastReprocessStatus", status)
         saveJobJson(jobDir, job)
+    }
+}
+
+private fun updateRawNativeQualityDiagnostics(jobDir: File, bitmap: Bitmap) {
+    runCatching {
+        val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
+        val job = JSONObject(jobFile.readText())
+        val finalPreview = saveBoundedDiagnosticPreview(bitmap, File(jobDir, "final_preview.png"))
+        val referencePreview = finalPreview.copy(Bitmap.Config.ARGB_8888, false)
+        saveBoundedDiagnosticPreview(referencePreview, File(jobDir, "reference_single_preview.png"))
+        saveBoundedDiagnosticPreview(finalPreview, File(jobDir, "fused_before_denoise_preview.png"))
+        saveBoundedDiagnosticPreview(finalPreview, File(jobDir, "fused_after_denoise_no_sharpen_preview.png"))
+        writeFusionQualityDiagnostics(
+            job = job,
+            jobDir = jobDir,
+            prefix = "raw",
+            reference = referencePreview,
+            fused = finalPreview,
+            denoised = finalPreview,
+            finalImage = finalPreview,
+            compareFileName = "compare_reference_vs_final.png"
+        )
+        job.put("referenceSinglePreviewFile", "reference_single_preview.png")
+            .put("fusedBeforeDenoisePreviewFile", "fused_before_denoise_preview.png")
+            .put("fusedAfterDenoiseNoSharpenPreviewFile", "fused_after_denoise_no_sharpen_preview.png")
+            .put("finalPreviewFile", "final_preview.png")
+            .put("compareReferenceVsFinalFile", "compare_reference_vs_final.png")
+            .put("qualityDiagnosticNativeLimited", true)
+            .put(
+                "qualityDiagnosticNativeLimitedReason",
+                "Native RGBA path only exposes final display bitmap to Kotlin export stage."
+            )
+        jobFile.writeText(job.toString(2))
+        referencePreview.recycle()
+        finalPreview.recycle()
     }
 }

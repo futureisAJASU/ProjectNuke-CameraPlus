@@ -272,6 +272,13 @@ fun selectCameraForOptions(
                     }
                 }
 
+                ThreeXSourceMode.AUTO -> {
+                    selectCameraForOptions(
+                        context,
+                        options.copy(threeXSourceMode = ThreeXSourceMode.OPTICAL)
+                    ).copy(requestedThreeXSourceMode = ThreeXSourceMode.AUTO)
+                }
+
                 ThreeXSourceMode.MAIN_CROP -> {
                     CameraSelection(
                         cameraId = main.cameraId,
@@ -543,3 +550,18 @@ private fun maxSize(sizes: Array<Size>?): String {
     val megapixels = size.width.toDouble() * size.height.toDouble() / 1_000_000.0
     return "${size.width}x${size.height}(${"%.1f".format(megapixels)}MP)"
 }
+
+fun CameraSelection.finalZoomRouteName(): String = when (actualLensSource) {
+    ActualLensSource.OPTICAL_TELE_LOGICAL,
+    ActualLensSource.OPTICAL_TELE_PHYSICAL -> "OPTICAL"
+    ActualLensSource.MAIN_CROP_3X,
+    ActualLensSource.OPTICAL_TELE_UNAVAILABLE_FALLBACK_CROP -> "CROP"
+    else -> requestedLensSlot.name
+}
+
+fun CameraSelection.routeFallbackReason(): String? =
+    if (actualLensSource == ActualLensSource.OPTICAL_TELE_UNAVAILABLE_FALLBACK_CROP) {
+        diagnosticReason
+    } else {
+        null
+    }

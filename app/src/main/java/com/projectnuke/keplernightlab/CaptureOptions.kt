@@ -21,8 +21,9 @@ enum class LensSlot(
 enum class ThreeXSourceMode(
     val label: String
 ) {
-    OPTICAL("Optical"),
-    MAIN_CROP("Crop")
+    AUTO("자동"),
+    OPTICAL("3x 광학"),
+    MAIN_CROP("3x 크롭")
 }
 
 data class SelectedCaptureOptions(
