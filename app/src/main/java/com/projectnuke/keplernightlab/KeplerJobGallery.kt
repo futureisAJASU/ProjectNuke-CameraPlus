@@ -17,10 +17,39 @@ data class KeplerGalleryJobSummary(
     val width: Int?,
     val height: Int?,
     val folderSizeBytes: Long,
+    val storage: KeplerJobStorageInfo,
     val finalPreviewFile: File?,
     val finalExportExists: Boolean,
     val frames: List<KeplerGalleryFrame>,
     val metadata: JSONObject?
+)
+
+data class KeplerJobStorageInfo(
+    val totalJobBytes: Long,
+    val totalJobSizeText: String,
+    val finalOutputBytes: Long,
+    val finalOutputSizeText: String,
+    val rawFramesBytes: Long,
+    val intermediateFilesBytes: Long,
+    val debugFilesBytes: Long,
+    val previewFilesBytes: Long,
+    val cacheFilesBytes: Long,
+    val cleanableBytes: Long,
+    val fileCount: Int
+)
+
+enum class KeplerJobCleanupType {
+    DEBUG_ONLY,
+    SOURCE_FRAMES_ONLY,
+    FINAL_ONLY,
+    SOURCE_ONLY,
+    FAILED_JOB_DELETE
+}
+
+data class KeplerJobCleanupResult(
+    val bytesFreed: Long,
+    val failedPaths: List<String>,
+    val metadataWarning: String?
 )
 
 data class KeplerGalleryFrame(
@@ -98,14 +127,104 @@ fun loadKeplerGalleryJobs(context: Context): List<KeplerGalleryJobSummary> {
     }.map(::readKeplerGalleryJob).sortedByDescending { it.createdAt }
 }
 
+data class KeplerGalleryStorageSummary(
+    val totalBytes: Long,
+    val finalOutputBytes: Long,
+    val sourceFrameBytes: Long,
+    val intermediateBytes: Long,
+    val debugDiagnosticBytes: Long,
+    val cleanableBytes: Long,
+    val rawBytes: Long,
+    val yuvBytes: Long,
+    val debugCacheBytes: Long,
+    val jobCount: Int
+)
+
+fun summarizeKeplerGalleryStorage(jobs: List<KeplerGalleryJobSummary>): KeplerGalleryStorageSummary {
+    return KeplerGalleryStorageSummary(
+        totalBytes = jobs.sumOf { it.storage.totalJobBytes },
+        finalOutputBytes = jobs.sumOf { it.storage.finalOutputBytes },
+        sourceFrameBytes = jobs.sumOf { it.storage.rawFramesBytes },
+        intermediateBytes = jobs.sumOf { it.storage.intermediateFilesBytes },
+        debugDiagnosticBytes = jobs.sumOf { it.storage.debugFilesBytes + it.storage.previewFilesBytes },
+        cleanableBytes = jobs.sumOf { it.storage.cleanableBytes },
+        rawBytes = jobs.filter { it.jobType == "RAW_NIGHT_FUSION" }.sumOf { it.storage.totalJobBytes },
+        yuvBytes = jobs.filter { it.jobType == "YUV_NIGHT_FUSION" }.sumOf { it.storage.totalJobBytes },
+        debugCacheBytes = jobs.sumOf { it.storage.debugFilesBytes + it.storage.cacheFilesBytes },
+        jobCount = jobs.size
+    )
+}
+
 fun deleteKeplerGalleryJob(context: Context, jobDirectory: File): Result<Unit> = runCatching {
-    val target = jobDirectory.canonicalFile
-    val allowed = keplerGalleryRoots(context).any { root ->
-        target.parentFile == root.canonicalFile && matchesJobPrefix(root, target.name)
-    }
-    require(allowed) { "Refusing to delete directory outside Kepler job roots." }
+    val target = requireCleanupSafeJobDirectory(context, jobDirectory)
     require(target.isDirectory) { "Job directory no longer exists." }
     check(target.deleteRecursively()) { "Failed to delete ${target.name}." }
+}
+
+fun cleanupKeplerGalleryJob(
+    context: Context,
+    jobDirectory: File,
+    cleanupType: KeplerJobCleanupType
+): Result<KeplerJobCleanupResult> = runCatching {
+    val target = requireCleanupSafeJobDirectory(context, jobDirectory)
+    val before = folderSizeBytes(target)
+    val job = File(target, JOB_JSON_FILE_NAME).takeIf { it.isFile }?.let { file ->
+        runCatching { JSONObject(file.readText()) }.getOrNull()
+    } ?: JSONObject()
+    val finalFiles = finalFilesForCleanup(target, job)
+    if (
+        cleanupType != KeplerJobCleanupType.DEBUG_ONLY &&
+        cleanupType != KeplerJobCleanupType.SOURCE_ONLY &&
+        finalFiles.isEmpty()
+    ) {
+        throw IllegalStateException("Final output missing; cleanup refused.")
+    }
+    val filesToDelete = target.walkTopDown()
+        .filter { it.isFile }
+        .filter { file ->
+            when (cleanupType) {
+                KeplerJobCleanupType.DEBUG_ONLY -> isDeletableDebugFile(file, finalFiles)
+                KeplerJobCleanupType.SOURCE_FRAMES_ONLY -> isDeletableSourceOrIntermediate(file, finalFiles)
+                KeplerJobCleanupType.FINAL_ONLY ->
+                    file.name != JOB_JSON_FILE_NAME && file.canonicalFile !in finalFiles.map { it.canonicalFile }.toSet()
+                KeplerJobCleanupType.SOURCE_ONLY -> isDeletableForSourceOnly(file, finalFiles)
+                KeplerJobCleanupType.FAILED_JOB_DELETE -> false
+            }
+        }
+        .toList()
+    val failed = mutableListOf<String>()
+    filesToDelete.forEach { file ->
+        if (file.exists() && !file.delete()) failed += file.absolutePath
+    }
+    val after = folderSizeBytes(target)
+    val sourceAvailable = target.walkTopDown().any { it.isFile && isSourceFrame(it) }
+    val debugAvailable = target.walkTopDown().any { it.isFile && isDebugFile(it, finalFiles.map { f -> f.name }.toSet()) }
+    val finalOutputAvailable = if (cleanupType == KeplerJobCleanupType.SOURCE_ONLY) {
+        false
+    } else {
+        finalFiles.any { it.isFile }
+    }
+    val metadataWarning = runCatching {
+        val updated = computeKeplerJobStorage(target, job, finalFiles.firstOrNull())
+        job.put("cleanupApplied", true)
+            .put("cleanupType", cleanupType.name)
+            .put("cleanupAt", System.currentTimeMillis())
+            .put("bytesFreed", before - after)
+            .put("remainingJobBytes", after)
+            .put("sourceFramesAvailable", sourceAvailable)
+            .put("finalOutputAvailable", finalOutputAvailable)
+            .put("debugFilesAvailable", debugAvailable)
+            .put("canReprocess", sourceAvailable)
+            .put("galleryDisplayUnavailable", cleanupType == KeplerJobCleanupType.SOURCE_ONLY)
+            .put("galleryVisible", cleanupType != KeplerJobCleanupType.SOURCE_ONLY)
+        putStorageMetadata(job, updated)
+        saveJobJson(target, job)
+    }.exceptionOrNull()?.let { "${it.javaClass.simpleName}: ${it.message}" }
+    KeplerJobCleanupResult(
+        bytesFreed = before - after,
+        failedPaths = failed,
+        metadataWarning = metadataWarning
+    )
 }
 
 private fun keplerGalleryRoots(context: Context): List<File> {
@@ -115,6 +234,23 @@ private fun keplerGalleryRoots(context: Context): List<File> {
         File(pictures, "KeplerYuvFusion"),
         File(pictures, "KeplerColorBurst")
     )
+}
+
+private fun cleanupSafeRoots(context: Context): List<File> {
+    val pictures = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return emptyList()
+    return listOf(
+        File(pictures, "KeplerRawFusion"),
+        File(pictures, "KeplerYuvFusion")
+    )
+}
+
+private fun requireCleanupSafeJobDirectory(context: Context, jobDirectory: File): File {
+    val target = jobDirectory.canonicalFile
+    val allowed = cleanupSafeRoots(context).any { root ->
+        target.parentFile == root.canonicalFile && matchesJobPrefix(root, target.name)
+    }
+    require(allowed) { "Refusing to modify directory outside RAW/YUV Kepler job roots." }
+    return target
 }
 
 private fun matchesJobPrefix(root: File, name: String): Boolean = when (root.name) {
@@ -143,6 +279,8 @@ private fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
                 .orEmpty()
         }
     val finalPreview = resolveFinalPreview(directory, job)
+    val storage = computeKeplerJobStorage(directory, job, finalPreview)
+    maybePersistStorageMetadata(directory, job, storage)
     val createdAt = job?.optLong("createdAt", 0L)
         ?.takeIf { it > 0L }
         ?: directory.lastModified()
@@ -170,12 +308,175 @@ private fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
         savedFrames = job?.optInt("savedFrames", frames.size) ?: frames.size,
         width = width,
         height = height,
-        folderSizeBytes = folderSizeBytes(directory),
+        folderSizeBytes = storage.totalJobBytes,
+        storage = storage,
         finalPreviewFile = finalPreview,
         finalExportExists = exportExists,
         frames = frames,
         metadata = job
     )
+}
+
+private fun computeKeplerJobStorage(
+    directory: File,
+    job: JSONObject?,
+    finalPreview: File?
+): KeplerJobStorageInfo {
+    val files = directory.walkTopDown().filter { it.isFile }.toList()
+    val finalNames = setOfNotNull(
+        finalPreview?.name,
+        job?.optString("galleryDisplayFile").orEmpty().ifBlank { null },
+        job?.optString("finalNightFusionFile").orEmpty().ifBlank { null },
+        job?.optString("finalFile").orEmpty().ifBlank { null },
+        job?.optString("outputFile").orEmpty().ifBlank { null },
+        job?.optString("nativePostprocessRgbaFile").orEmpty().ifBlank { null }
+    )
+    val finalBytes = files.filter { it.name in finalNames }.sumOf { it.length() }
+    val rawBytes = files.filter { isSourceFrame(it) }.sumOf { it.length() }
+    val debugBytes = files.filter { isDebugFile(it, finalNames) }.sumOf { it.length() }
+    val previewBytes = files.filter { isPreviewFile(it, finalNames) }.sumOf { it.length() }
+    val cacheBytes = files.filter { isCacheFile(it, finalNames) }.sumOf { it.length() }
+    val intermediateBytes = files.filter { isIntermediateFile(it, finalNames) }.sumOf { it.length() }
+    val totalBytes = files.sumOf { it.length() }
+    val cleanableBytes = files
+        .filter {
+            it.name != JOB_JSON_FILE_NAME &&
+                it.name !in finalNames &&
+                (isSourceFrame(it) || isDebugFile(it, finalNames) || isPreviewFile(it, finalNames) ||
+                    isCacheFile(it, finalNames) || isIntermediateFile(it, finalNames))
+        }
+        .sumOf { it.length() }
+    return KeplerJobStorageInfo(
+        totalJobBytes = totalBytes,
+        totalJobSizeText = formatBytes(totalBytes),
+        finalOutputBytes = finalBytes,
+        finalOutputSizeText = formatBytes(finalBytes),
+        rawFramesBytes = rawBytes,
+        intermediateFilesBytes = intermediateBytes,
+        debugFilesBytes = debugBytes,
+        previewFilesBytes = previewBytes,
+        cacheFilesBytes = cacheBytes,
+        cleanableBytes = cleanableBytes,
+        fileCount = files.size
+    )
+}
+
+private fun maybePersistStorageMetadata(
+    directory: File,
+    job: JSONObject?,
+    storage: KeplerJobStorageInfo
+) {
+    if (job == null) return
+    if (
+        job.optLong("totalJobBytes", -1L) == storage.totalJobBytes &&
+        job.optInt("fileCount", -1) == storage.fileCount
+    ) return
+    runCatching {
+        putStorageMetadata(job, storage)
+            .put("storageScannedAt", System.currentTimeMillis())
+        saveJobJson(directory, job)
+    }
+}
+
+private fun putStorageMetadata(job: JSONObject, storage: KeplerJobStorageInfo): JSONObject {
+    return job.put("totalJobBytes", storage.totalJobBytes)
+        .put("totalJobSizeText", storage.totalJobSizeText)
+        .put("finalOutputBytes", storage.finalOutputBytes)
+        .put("finalOutputSizeText", storage.finalOutputSizeText)
+        .put("rawFramesBytes", storage.rawFramesBytes)
+        .put("intermediateFilesBytes", storage.intermediateFilesBytes)
+        .put("debugFilesBytes", storage.debugFilesBytes)
+        .put("previewFilesBytes", storage.previewFilesBytes)
+        .put("cacheFilesBytes", storage.cacheFilesBytes)
+        .put("cleanableBytes", storage.cleanableBytes)
+        .put("fileCount", storage.fileCount)
+}
+
+private fun finalFilesForCleanup(directory: File, job: JSONObject?): Set<File> {
+    val names = setOfNotNull(
+        job?.optString("galleryDisplayFile").orEmpty().ifBlank { null },
+        job?.optString("galleryThumbnailFile").orEmpty().ifBlank { null },
+        job?.optString("finalNightFusionFile").orEmpty().ifBlank { null },
+        job?.optString("finalFile").orEmpty().ifBlank { null },
+        job?.optString("outputFile").orEmpty().ifBlank { null },
+        job?.optString("nativePostprocessRgbaFile").orEmpty().ifBlank { null },
+        resolveFinalPreview(directory, job)?.name
+    )
+    return names.mapNotNull { name -> File(directory, name).takeIf { it.isFile }?.canonicalFile }.toSet()
+}
+
+private fun isDeletableDebugFile(file: File, finalFiles: Set<File>): Boolean {
+    if (file.name == JOB_JSON_FILE_NAME || file.canonicalFile in finalFiles) return false
+    val name = file.name.lowercase()
+    if (name == "raw_render_debug.json" || name == "fusion_debug.json" || name == "yuv_debug.json") return false
+    return isDebugFile(file, finalFiles.map { it.name }.toSet()) ||
+        name.contains("diagnostic") ||
+        name.contains("contact") ||
+        name.endsWith(".log")
+}
+
+private fun isDeletableSourceOrIntermediate(file: File, finalFiles: Set<File>): Boolean {
+    if (file.name == JOB_JSON_FILE_NAME || file.canonicalFile in finalFiles) return false
+    return isSourceFrame(file) || isIntermediateFile(file, finalFiles.map { it.name }.toSet())
+}
+
+private fun isDeletableForSourceOnly(file: File, finalFiles: Set<File>): Boolean {
+    if (file.name == JOB_JSON_FILE_NAME || isRequiredSourceOnlyMetadata(file) || isSourceFrame(file)) return false
+    val name = file.name.lowercase()
+    return file.canonicalFile in finalFiles ||
+        isDeletableDebugFile(file, finalFiles) ||
+        isIntermediateFile(file, finalFiles.map { it.name }.toSet()) ||
+        isCacheFile(file, finalFiles.map { it.name }.toSet()) ||
+        isPreviewFile(file, finalFiles.map { it.name }.toSet()) ||
+        name.startsWith("final") ||
+        name.contains("thumbnail") ||
+        name.contains("gallery") ||
+        name.contains("temp") ||
+        name.contains("tmp")
+}
+
+private fun isRequiredSourceOnlyMetadata(file: File): Boolean {
+    val name = file.name.lowercase()
+    return name == "raw_render_input_metadata.json" ||
+        name == "gyro.csv" ||
+        name == "rotation_vector.csv" ||
+        name == "alignment.json" ||
+        name == "capture_metadata.json"
+}
+
+private fun isDebugFile(file: File, finalNames: Set<String>): Boolean {
+    val name = file.name.lowercase()
+    if (file.name in finalNames) return false
+    return name.contains("debug") ||
+        name.contains("compare") ||
+        name.endsWith(".json") ||
+        name.endsWith(".log")
+}
+
+private fun isPreviewFile(file: File, finalNames: Set<String>): Boolean {
+    val name = file.name.lowercase()
+    if (file.name in finalNames) return false
+    return name.contains("preview") ||
+        name.contains("reference") ||
+        name.endsWith(".jpg") ||
+        name.endsWith(".jpeg") ||
+        name.endsWith(".png")
+}
+
+private fun isCacheFile(file: File, finalNames: Set<String>): Boolean {
+    val name = file.name.lowercase()
+    if (file.name in finalNames) return false
+    return name.endsWith(".rgba") || name.endsWith(".rgb") || name.endsWith(".bin")
+}
+
+private fun isIntermediateFile(file: File, finalNames: Set<String>): Boolean {
+    val name = file.name.lowercase()
+    if (file.name in finalNames) return false
+    return name.startsWith("merged_raw") ||
+        name.contains("merged_yuv") ||
+        name.contains("intermediate") ||
+        name.contains("linear") ||
+        name.endsWith(".yuv")
 }
 
 private fun JSONArray?.galleryFrames(directory: File): List<KeplerGalleryFrame> {
@@ -273,5 +574,6 @@ private fun firstPositive(job: JSONObject?, vararg keys: String): Int? {
 private fun isSourceFrame(file: File): Boolean {
     val name = file.name.lowercase()
     return name.startsWith("frame_") &&
-        (name.endsWith(".png") || name.endsWith(".raw16") || name.endsWith(".dng"))
+        (name.endsWith(".png") || name.endsWith(".raw16") || name.endsWith(".dng") ||
+            name.endsWith(".yuv") || name.endsWith(".nv21") || name.endsWith(".yuv420"))
 }

@@ -1,10 +1,12 @@
 package com.projectnuke.keplernightlab
 
 import android.graphics.Bitmap
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -33,6 +35,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -62,10 +65,31 @@ fun KeplerGalleryScreen(onBack: () -> Unit) {
     var refreshKey by remember { mutableIntStateOf(0) }
     var error by remember { mutableStateOf<String?>(null) }
     var selectedTab by remember { mutableStateOf(0) }
+    var selectedIds by remember { mutableStateOf(emptySet<String>()) }
+    var confirmDeleteSelected by remember { mutableStateOf(false) }
+    var confirmDeleteFailed by remember { mutableStateOf(false) }
+    var deleteError by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    val selectedJobs by remember(jobs, selectedIds) {
+        derivedStateOf { jobs.filter { it.id in selectedIds } }
+    }
+    val visiblePhotoJobs by remember(jobs) {
+        derivedStateOf { jobs.filterNot { it.isSourceOnlyJob() } }
+    }
+    val selectedTotalBytes by remember(selectedJobs) {
+        derivedStateOf { selectedJobs.sumOf { it.storage.totalJobBytes } }
+    }
+    val selectedCleanableBytes by remember(selectedJobs) {
+        derivedStateOf { selectedJobs.sumOf { it.storage.cleanableBytes } }
+    }
 
     LaunchedEffect(refreshKey) {
         runCatching { withContext(Dispatchers.IO) { loadKeplerGalleryJobs(context) } }
-            .onSuccess { jobs = it; error = null }
+            .onSuccess {
+                jobs = it
+                selectedIds = selectedIds.intersect(it.map { job -> job.id }.toSet())
+                error = null
+            }
             .onFailure { error = "${it.javaClass.simpleName}: ${it.message}" }
     }
 
@@ -94,6 +118,74 @@ fun KeplerGalleryScreen(onBack: () -> Unit) {
         return
     }
 
+    if (confirmDeleteSelected) {
+        AlertDialog(
+            onDismissRequest = { confirmDeleteSelected = false },
+            title = { Text("선택한 사진을 삭제하시겠습니까?") },
+            text = { Text("사진과 관련된 RAW/YUV 원본, 합성 파일, 디버그 파일이 함께 삭제됩니다. 이 작업은 되돌릴 수 없습니다.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDeleteSelected = false
+                    val targets = selectedJobs.map { it.directory }
+                    scope.launch {
+                        val failed = withContext(Dispatchers.IO) {
+                            targets.mapNotNull { dir ->
+                                deleteKeplerGalleryJob(context, dir).exceptionOrNull()?.let {
+                                    "${dir.absolutePath}: ${it.message}"
+                                }
+                            }
+                        }
+                        if (failed.isEmpty()) {
+                            Toast.makeText(context, "삭제되었습니다.", Toast.LENGTH_SHORT).show()
+                        } else {
+                            deleteError = "일부 파일을 삭제하지 못했습니다.\n" + failed.joinToString("\n")
+                            Toast.makeText(context, "일부 파일을 삭제하지 못했습니다.", Toast.LENGTH_LONG).show()
+                        }
+                        selectedIds = emptySet()
+                        refreshKey++
+                    }
+                }) { Text("삭제") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDeleteSelected = false }) { Text("취소") }
+            }
+        )
+    }
+
+    if (confirmDeleteFailed) {
+        AlertDialog(
+            onDismissRequest = { confirmDeleteFailed = false },
+            title = { Text("실패한 작업을 삭제하시겠습니까?") },
+            text = { Text("실패한 RAW/YUV 작업 폴더와 관련 파일이 함께 삭제됩니다. 이 작업은 되돌릴 수 없습니다.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDeleteFailed = false
+                    val targets = jobs.filter { it.isFailedJob() }.map { it.directory }
+                    scope.launch {
+                        val failed = withContext(Dispatchers.IO) {
+                            targets.mapNotNull { dir ->
+                                deleteKeplerGalleryJob(context, dir).exceptionOrNull()?.let {
+                                    "${dir.absolutePath}: ${it.message}"
+                                }
+                            }
+                        }
+                        if (failed.isEmpty()) {
+                            Toast.makeText(context, "삭제되었습니다.", Toast.LENGTH_SHORT).show()
+                        } else {
+                            deleteError = "일부 파일을 삭제하지 못했습니다.\n" + failed.joinToString("\n")
+                            Toast.makeText(context, "일부 파일을 삭제하지 못했습니다.", Toast.LENGTH_LONG).show()
+                        }
+                        selectedIds = emptySet()
+                        refreshKey++
+                    }
+                }) { Text("삭제") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDeleteFailed = false }) { Text("취소") }
+            }
+        )
+    }
+
     BackHandler(onBack = onBack)
     Column(
         modifier = Modifier
@@ -108,8 +200,22 @@ fun KeplerGalleryScreen(onBack: () -> Unit) {
             Button(onClick = { refreshKey++ }) { Text("새로고침") }
         }
         GalleryTabs(selectedTab) { selectedTab = it }
-        Text(error ?: "${jobs.size}개 항목, 최신순", color = galleryMuted)
-        if (jobs.isEmpty() && error == null) {
+        GalleryStorageHeader(summarizeKeplerGalleryStorage(jobs))
+        TextButton(onClick = { confirmDeleteFailed = true }) {
+            Text("실패한 작업 삭제")
+        }
+        if (selectedIds.isNotEmpty()) {
+            GallerySelectionBar(
+                selectedCount = selectedIds.size,
+                selectedBytes = selectedTotalBytes,
+                cleanableBytes = selectedCleanableBytes,
+                onClear = { selectedIds = emptySet() },
+                onDelete = { confirmDeleteSelected = true }
+            )
+        }
+        deleteError?.let { Text(it, color = Color(0xFFFFB4A9)) }
+        Text(error ?: "${visiblePhotoJobs.size}개 항목, 최신순", color = galleryMuted)
+        if (visiblePhotoJobs.isEmpty() && error == null) {
             Text("표시할 사진이 없습니다.", color = galleryMuted)
         }
         LazyVerticalGrid(
@@ -118,11 +224,60 @@ fun KeplerGalleryScreen(onBack: () -> Unit) {
             verticalArrangement = Arrangement.spacedBy(12.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            gridItems(jobs, key = { it.id }) { job ->
-                GalleryJobCard(job) { selected = job }
+            gridItems(visiblePhotoJobs, key = { it.id }) { job ->
+                GalleryJobCard(
+                    job = job,
+                    selected = job.id in selectedIds,
+                    selectionMode = selectedIds.isNotEmpty(),
+                    onOpen = {
+                        if (selectedIds.isNotEmpty()) {
+                            selectedIds = selectedIds.toggle(job.id)
+                        } else {
+                            selected = job
+                        }
+                    },
+                    onLongPress = {
+                        selectedIds = selectedIds + job.id
+                    }
+                )
             }
         }
     }
+}
+
+private fun Set<String>.toggle(id: String): Set<String> =
+    if (id in this) this - id else this + id
+
+private fun KeplerGalleryJobSummary.isFailedJob(): Boolean {
+    val process = metadata?.optString("processStatus").orEmpty()
+    val export = metadata?.optString("exportStatus").orEmpty()
+    val combined = listOf(status, process, export).joinToString(" ").uppercase()
+    return combined.contains("FAILED") || combined.contains("FAILURE") || combined.contains("ERROR")
+}
+
+private fun KeplerGalleryJobSummary.isSourceOnlyJob(): Boolean =
+    metadata?.optString("cleanupType") == "SOURCE_ONLY" ||
+        metadata?.optBoolean("galleryDisplayUnavailable", false) == true ||
+        metadata?.optBoolean("galleryVisible", true) == false
+
+private fun cleanupTitle(type: KeplerJobCleanupType): String = when (type) {
+    KeplerJobCleanupType.DEBUG_ONLY -> "디버그 파일을 정리하시겠습니까?"
+    KeplerJobCleanupType.SOURCE_FRAMES_ONLY -> "원본 프레임을 삭제하시겠습니까?"
+    KeplerJobCleanupType.FINAL_ONLY -> "최종 사진만 남기시겠습니까?"
+    KeplerJobCleanupType.SOURCE_ONLY -> "원본만 남기시겠습니까?"
+    KeplerJobCleanupType.FAILED_JOB_DELETE -> "실패한 작업을 삭제하시겠습니까?"
+}
+
+private fun cleanupBody(type: KeplerJobCleanupType): String = when (type) {
+    KeplerJobCleanupType.DEBUG_ONLY -> "최종 사진은 유지하고, 비교 이미지와 진단용 파일만 삭제합니다."
+    KeplerJobCleanupType.SOURCE_FRAMES_ONLY ->
+        "원본 RAW/YUV 프레임을 삭제하면 이 작업을 다시 합성하거나 재처리할 수 없습니다. 최종 사진은 유지됩니다."
+    KeplerJobCleanupType.FINAL_ONLY ->
+        "최종 사진과 기본 정보만 남기고 원본 프레임, 중간 합성 파일, 디버그 파일을 삭제합니다. 이 작업은 되돌릴 수 없습니다."
+    KeplerJobCleanupType.SOURCE_ONLY ->
+        "최종 사진, 미리보기, 중간 합성 파일, 디버그 파일을 삭제하고 원본 프레임만 보존합니다. 갤러리에는 최종 사진이 표시되지 않을 수 있지만, 나중에 다시 합성할 수 있습니다."
+    KeplerJobCleanupType.FAILED_JOB_DELETE ->
+        "실패한 RAW/YUV 작업 폴더와 관련 파일이 함께 삭제됩니다. 이 작업은 되돌릴 수 없습니다."
 }
 
 @Composable
@@ -134,10 +289,56 @@ private fun GalleryTabs(selectedTab: Int, onSelect: (Int) -> Unit) {
 }
 
 @Composable
-private fun GalleryJobCard(job: KeplerGalleryJobSummary, onOpen: () -> Unit) {
+private fun GalleryStorageHeader(summary: KeplerGalleryStorageSummary) {
+    GallerySection("저장 공간") {
+        GalleryField("전체 사용량", formatBytes(summary.totalBytes))
+        GalleryField("최종 사진", formatBytes(summary.finalOutputBytes))
+        GalleryField("원본 프레임", formatBytes(summary.sourceFrameBytes))
+        GalleryField("중간 합성 파일", formatBytes(summary.intermediateBytes))
+        GalleryField("디버그/진단 파일", formatBytes(summary.debugDiagnosticBytes))
+        GalleryField("정리 가능 용량", formatBytes(summary.cleanableBytes))
+        GalleryField("RAW 작업", formatBytes(summary.rawBytes))
+        GalleryField("YUV 작업", formatBytes(summary.yuvBytes))
+        GalleryField("디버그/캐시", formatBytes(summary.debugCacheBytes))
+        GalleryField("작업 수", "${summary.jobCount}개")
+    }
+}
+
+@Composable
+private fun GallerySelectionBar(
+    selectedCount: Int,
+    selectedBytes: Long,
+    cleanableBytes: Long,
+    onClear: () -> Unit,
+    onDelete: () -> Unit
+) {
+    Surface(color = galleryCard, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("선택됨: ${selectedCount}개")
+            Text("선택한 항목 크기: ${formatBytes(selectedBytes)}", color = galleryMuted)
+            Text("정리 가능 용량: ${formatBytes(cleanableBytes)}", color = galleryMuted)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = onDelete) { Text("삭제") }
+                TextButton(onClick = onClear) { Text("선택 해제") }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun GalleryJobCard(
+    job: KeplerGalleryJobSummary,
+    selected: Boolean,
+    selectionMode: Boolean,
+    onOpen: () -> Unit,
+    onLongPress: () -> Unit
+) {
     Surface(
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onOpen),
-        color = galleryCard,
+        modifier = Modifier
+            .fillMaxWidth()
+            .combinedClickable(onClick = onOpen, onLongClick = onLongPress),
+        color = if (selected) Color(0xFF263449) else galleryCard,
         shape = RoundedCornerShape(16.dp)
     ) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
@@ -154,6 +355,8 @@ private fun GalleryJobCard(job: KeplerGalleryJobSummary, onOpen: () -> Unit) {
             Text(modeLabel(job), style = MaterialTheme.typography.titleMedium)
             Text("${formatTimestamp(job.createdAt)} | ${routeLabel(job)}", color = galleryMuted)
             Text(if (job.status.contains("COMPLETE")) resolutionText(job) else job.status)
+            Text("파일 크기: ${job.storage.finalOutputSizeText}", color = galleryMuted)
+            if (selectionMode) Text(if (selected) "선택됨" else "선택 가능", color = galleryMuted)
         }
     }
 }
@@ -170,6 +373,7 @@ private fun KeplerGalleryDetailScreen(
     var preview by remember(job.id) { mutableStateOf<Bitmap?>(null) }
     var debugPreviews by remember(job.id) { mutableStateOf(emptyList<Pair<String, Bitmap>>()) }
     var confirmDelete by remember { mutableStateOf(false) }
+    var confirmCleanupType by remember { mutableStateOf<KeplerJobCleanupType?>(null) }
     var deleteError by remember { mutableStateOf<String?>(null) }
     var actionStatus by remember { mutableStateOf<String?>(null) }
     var showDebugInfo by remember { mutableStateOf(false) }
@@ -216,18 +420,60 @@ private fun KeplerGalleryDetailScreen(
     if (confirmDelete) {
         AlertDialog(
             onDismissRequest = { confirmDelete = false },
-            title = { Text("Delete job?") },
-            text = { Text("Permanently delete ${currentJob.directory.name} and all source frames?") },
+            title = { Text("선택한 사진을 삭제하시겠습니까?") },
+            text = { Text("사진과 관련된 RAW/YUV 원본, 합성 파일, 디버그 파일이 함께 삭제됩니다. 이 작업은 되돌릴 수 없습니다.") },
             confirmButton = {
                 TextButton(onClick = {
                     confirmDelete = false
                     deleteKeplerGalleryJob(context, currentJob.directory)
-                        .onSuccess { onDeleted() }
-                        .onFailure { deleteError = it.message ?: "Delete failed." }
-                }) { Text("Delete") }
+                        .onSuccess {
+                            Toast.makeText(context, "삭제되었습니다.", Toast.LENGTH_SHORT).show()
+                            onDeleted()
+                        }
+                        .onFailure {
+                            deleteError = it.message ?: "일부 파일을 삭제하지 못했습니다."
+                            Toast.makeText(context, "일부 파일을 삭제하지 못했습니다.", Toast.LENGTH_LONG).show()
+                        }
+                }) { Text("삭제") }
             },
             dismissButton = {
-                TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
+                TextButton(onClick = { confirmDelete = false }) { Text("취소") }
+            }
+        )
+    }
+
+    confirmCleanupType?.let { cleanupType ->
+        val confirmText = if (cleanupType == KeplerJobCleanupType.SOURCE_ONLY) "원본만 남기기" else "삭제"
+        AlertDialog(
+            onDismissRequest = { confirmCleanupType = null },
+            title = { Text(cleanupTitle(cleanupType)) },
+            text = { Text(cleanupBody(cleanupType)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmCleanupType = null
+                    scope.launch {
+                        val result = withContext(Dispatchers.IO) {
+                            cleanupKeplerGalleryJob(context, currentJob.directory, cleanupType)
+                        }
+                        result.onSuccess { cleanup ->
+                            val warning = cleanup.metadataWarning?.let { " job.json 경고: $it" }.orEmpty()
+                            val failed = if (cleanup.failedPaths.isEmpty()) {
+                                ""
+                            } else {
+                                "\n일부 파일을 삭제하지 못했습니다.\n" + cleanup.failedPaths.joinToString("\n")
+                            }
+                            actionStatus = "정리되었습니다. 확보된 용량: ${formatBytes(cleanup.bytesFreed)}$warning$failed"
+                            Toast.makeText(context, "정리되었습니다.", Toast.LENGTH_SHORT).show()
+                            refreshKey++
+                        }.onFailure {
+                            actionStatus = "정리하지 못했습니다: ${it.message}"
+                            Toast.makeText(context, "일부 파일을 삭제하지 못했습니다.", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }) { Text(confirmText) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmCleanupType = null }) { Text("취소") }
             }
         )
     }
@@ -294,6 +540,11 @@ private fun KeplerGalleryDetailScreen(
                 GalleryField("Frames", "${currentJob.savedFrames}/${currentJob.requestedFrames}")
                 GalleryField("Enabled / excluded", "$enabledCount / $excludedCount")
                 GalleryField("Resolution", resolutionText(currentJob))
+                GalleryField("파일 크기", currentJob.storage.finalOutputSizeText)
+                GalleryField("작업 폴더 크기", currentJob.storage.totalJobSizeText)
+                GalleryField("원본 프레임 크기", formatBytes(currentJob.storage.rawFramesBytes))
+                GalleryField("디버그 파일 크기", formatBytes(currentJob.storage.debugFilesBytes))
+                GalleryField("파일 개수", "${currentJob.storage.fileCount}개")
                 GalleryField("Folder size", formatBytes(currentJob.folderSizeBytes))
                 GalleryField("Final/export", if (currentJob.finalExportExists) "Available" else "Not found")
                 GalleryField("Path", currentJob.directory.absolutePath)
@@ -416,6 +667,38 @@ private fun KeplerGalleryDetailScreen(
                         )
                     }
                 }
+            }
+        }
+        item {
+            GallerySection("저장공간 정리") {
+                val sourceAvailable = currentJob.storage.rawFramesBytes + currentJob.storage.intermediateFilesBytes > 0L
+                val debugAvailable = currentJob.storage.debugFilesBytes + currentJob.storage.previewFilesBytes + currentJob.storage.cacheFilesBytes > 0L
+                if (!debugAvailable) {
+                    Text("디버그 파일이 이미 정리되었습니다.", color = galleryMuted)
+                }
+                Button(
+                    enabled = debugAvailable,
+                    onClick = { confirmCleanupType = KeplerJobCleanupType.DEBUG_ONLY }
+                ) { Text("디버그 파일만 정리") }
+                if (!sourceAvailable) {
+                    Text("원본 프레임이 이미 삭제되었습니다.", color = galleryMuted)
+                }
+                Button(
+                    enabled = sourceAvailable && currentJob.finalExportExists,
+                    onClick = { confirmCleanupType = KeplerJobCleanupType.SOURCE_FRAMES_ONLY }
+                ) { Text("원본 프레임 삭제") }
+                Button(
+                    enabled = currentJob.finalExportExists && (sourceAvailable || debugAvailable),
+                    onClick = { confirmCleanupType = KeplerJobCleanupType.FINAL_ONLY }
+                ) { Text("최종 사진만 남기기") }
+                Button(
+                    enabled = sourceAvailable,
+                    onClick = { confirmCleanupType = KeplerJobCleanupType.SOURCE_ONLY }
+                ) { Text("원본만 남기기") }
+                TextButton(enabled = false, onClick = {}) {
+                    Text("다시 합성하기는 아직 지원되지 않습니다.")
+                }
+                Button(onClick = { confirmDelete = true }) { Text("작업 전체 삭제") }
             }
         }
         item {
@@ -560,6 +843,9 @@ private fun metadataSummary(job: JSONObject?): List<Pair<String, String>> {
     return listOf(
         "cameraId", "resolutionMode", "requestedResolutionMode", "actualInputResolutionMode",
         "outputResolutionMode", "processStatus", "exportStatus", "exportVerified",
+        "cleanupApplied", "cleanupType", "cleanupAt", "bytesFreed",
+        "remainingJobBytes", "sourceFramesAvailable", "finalOutputAvailable",
+        "debugFilesAvailable", "canReprocess", "galleryVisible", "galleryDisplayUnavailable",
         "captureCompleteness", "partialCapture", "qualityScored", "qualityScoredAt",
         "qualityScoringVersion", "qualityScoringBackend", "qualitySummary",
         "fusionEngine", "fusionVersion", "referenceFrameIndex", "usedFrameCount",

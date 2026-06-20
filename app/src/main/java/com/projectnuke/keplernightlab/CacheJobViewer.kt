@@ -64,6 +64,7 @@ data class KeplerJobSummary(
     val status: String,
     val processStatus: String,
     val exportStatus: String,
+    val cleanupType: String,
     val requestedResolutionMode: String,
     val outputResolutionMode: String,
     val savedFrames: Int,
@@ -222,6 +223,10 @@ private fun JobSummaryCard(job: KeplerJobSummary, onOpen: () -> Unit) {
                 "status=${job.status} | process=${job.processStatus} | export=${job.exportStatus}",
                 color = Color.White.copy(alpha = 0.78f)
             )
+            if (job.cleanupType == "SOURCE_ONLY") {
+                Text("원본만 남은 작업", color = inspectorMuted)
+                Text("다시 합성하기는 아직 지원되지 않습니다.", color = inspectorMuted)
+            }
             Text(
                 "mode=${job.requestedResolutionMode} -> ${job.outputResolutionMode}",
                 color = Color.White.copy(alpha = 0.78f)
@@ -731,6 +736,7 @@ fun loadKeplerJobSummaries(context: Context): List<KeplerJobSummary> {
             status = job.value("status"),
             processStatus = job.value("processStatus"),
             exportStatus = job.value("exportStatus"),
+            cleanupType = job.value("cleanupType"),
             requestedResolutionMode = job.firstValue("requestedResolutionMode", "resolutionMode"),
             outputResolutionMode = job.firstValue("outputResolutionMode", "resolutionMode"),
             savedFrames = job.intValue("savedFrames"),
