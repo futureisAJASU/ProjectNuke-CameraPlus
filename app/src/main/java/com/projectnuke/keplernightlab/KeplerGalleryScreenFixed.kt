@@ -28,9 +28,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -59,13 +59,17 @@ private val galleryFixedBackground = Color(0xFF080A0F)
 private val galleryFixedCard = Color(0xFF141821)
 private val galleryFixedMuted = Color.White.copy(alpha = 0.65f)
 
+private const val TAB_PHOTOS_ONLY = 0
+private const val TAB_INFO = 1
+private const val TAB_DEBUG = 2
+
 @Composable
 fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var jobs by remember { mutableStateOf(emptyList<KeplerGalleryJobSummary>()) }
     var selectedJob by remember { mutableStateOf<KeplerGalleryJobSummary?>(null) }
-    var selectedTab by remember { mutableIntStateOf(0) }
+    var selectedTab by remember { mutableIntStateOf(TAB_PHOTOS_ONLY) }
     var refreshKey by remember { mutableIntStateOf(0) }
     var error by remember { mutableStateOf<String?>(null) }
     var selectedIds by remember { mutableStateOf(emptySet<String>()) }
@@ -113,74 +117,60 @@ fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
     }
 
     if (confirmDeleteSelected) {
-        AlertDialog(
-            onDismissRequest = { confirmDeleteSelected = false },
-            title = { Text("선택한 사진을 삭제하시겠습니까?") },
-            text = { Text("사진과 관련된 RAW/YUV 원본, 합성 파일, 디버그 파일이 함께 삭제됩니다. 이 작업은 되돌릴 수 없습니다.") },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirmDeleteSelected = false
-                    val targets = selectedJobs.map { it.directory }
-                    scope.launch {
-                        val failed = withContext(Dispatchers.IO) {
-                            targets.mapNotNull { dir ->
-                                deleteKeplerGalleryJob(context, dir).exceptionOrNull()?.let {
-                                    "${dir.absolutePath}: ${it.message}"
-                                }
+        ConfirmDeleteJobsDialog(
+            onDismiss = { confirmDeleteSelected = false },
+            onConfirm = {
+                confirmDeleteSelected = false
+                val targets = selectedJobs.map { it.directory }
+                scope.launch {
+                    val failed = withContext(Dispatchers.IO) {
+                        targets.mapNotNull { dir ->
+                            deleteKeplerGalleryJob(context, dir).exceptionOrNull()?.let {
+                                "${dir.absolutePath}: ${it.message}"
                             }
                         }
-                        if (failed.isEmpty()) {
-                            Toast.makeText(context, "삭제되었습니다.", Toast.LENGTH_SHORT).show()
-                        } else {
-                            deleteError = "일부 파일을 삭제하지 못했습니다.\n" + failed.joinToString("\n")
-                            Toast.makeText(context, "일부 파일을 삭제하지 못했습니다.", Toast.LENGTH_LONG).show()
-                        }
-                        selectedIds = emptySet()
-                        refreshKey++
                     }
-                }) { Text("삭제") }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmDeleteSelected = false }) { Text("취소") }
+                    if (failed.isEmpty()) {
+                        Toast.makeText(context, "삭제되었습니다.", Toast.LENGTH_SHORT).show()
+                    } else {
+                        deleteError = "일부 파일을 삭제하지 못했습니다.\n" + failed.joinToString("\n")
+                        Toast.makeText(context, "일부 파일을 삭제하지 못했습니다.", Toast.LENGTH_LONG).show()
+                    }
+                    selectedIds = emptySet()
+                    refreshKey++
+                }
             }
         )
     }
 
     if (confirmDeleteFailed) {
-        AlertDialog(
-            onDismissRequest = { confirmDeleteFailed = false },
-            title = { Text("실패한 작업을 삭제하시겠습니까?") },
-            text = { Text("실패한 RAW/YUV 작업 폴더와 관련 파일이 함께 삭제됩니다. 이 작업은 되돌릴 수 없습니다.") },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirmDeleteFailed = false
-                    val targets = jobs.filter { it.isFailedGalleryJob() }.map { it.directory }
-                    scope.launch {
-                        val failed = withContext(Dispatchers.IO) {
-                            targets.mapNotNull { dir ->
-                                deleteKeplerGalleryJob(context, dir).exceptionOrNull()?.let {
-                                    "${dir.absolutePath}: ${it.message}"
-                                }
+        ConfirmFailedDeleteDialog(
+            onDismiss = { confirmDeleteFailed = false },
+            onConfirm = {
+                confirmDeleteFailed = false
+                val targets = jobs.filter { it.isFailedGalleryJob() }.map { it.directory }
+                scope.launch {
+                    val failed = withContext(Dispatchers.IO) {
+                        targets.mapNotNull { dir ->
+                            deleteKeplerGalleryJob(context, dir).exceptionOrNull()?.let {
+                                "${dir.absolutePath}: ${it.message}"
                             }
                         }
-                        if (failed.isEmpty()) {
-                            Toast.makeText(context, "삭제되었습니다.", Toast.LENGTH_SHORT).show()
-                        } else {
-                            deleteError = "일부 파일을 삭제하지 못했습니다.\n" + failed.joinToString("\n")
-                            Toast.makeText(context, "일부 파일을 삭제하지 못했습니다.", Toast.LENGTH_LONG).show()
-                        }
-                        selectedIds = emptySet()
-                        refreshKey++
                     }
-                }) { Text("삭제") }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmDeleteFailed = false }) { Text("취소") }
+                    if (failed.isEmpty()) {
+                        Toast.makeText(context, "삭제되었습니다.", Toast.LENGTH_SHORT).show()
+                    } else {
+                        deleteError = "일부 파일을 삭제하지 못했습니다.\n" + failed.joinToString("\n")
+                        Toast.makeText(context, "일부 파일을 삭제하지 못했습니다.", Toast.LENGTH_LONG).show()
+                    }
+                    selectedIds = emptySet()
+                    refreshKey++
+                }
             }
         )
     }
 
-    if (selectedTab == 1) {
+    if (selectedTab == TAB_DEBUG) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -199,6 +189,137 @@ fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
         return
     }
 
+    if (selectedTab == TAB_PHOTOS_ONLY) {
+        GalleryPhotosOnlyGrid(
+            visiblePhotoJobs = visiblePhotoJobs,
+            selectedIds = selectedIds,
+            error = error,
+            onBack = onBack,
+            onRefresh = { refreshKey++ },
+            onSelectTab = { selectedTab = it },
+            onOpen = { job ->
+                if (selectedIds.isNotEmpty()) {
+                    selectedIds = selectedIds.toggleGalleryId(job.id)
+                } else {
+                    selectedJob = job
+                }
+            },
+            onLongPress = { job -> selectedIds = selectedIds + job.id },
+            onClearSelection = { selectedIds = emptySet() },
+            onDeleteSelection = { confirmDeleteSelected = true },
+            selectedTotalBytes = selectedTotalBytes,
+            selectedCleanableBytes = selectedCleanableBytes,
+            deleteError = deleteError
+        )
+        return
+    }
+
+    GalleryInfoGrid(
+        jobs = jobs,
+        visiblePhotoJobs = visiblePhotoJobs,
+        selectedIds = selectedIds,
+        error = error,
+        onBack = onBack,
+        onRefresh = { refreshKey++ },
+        onSelectTab = { selectedTab = it },
+        onDeleteFailed = { confirmDeleteFailed = true },
+        onOpen = { job ->
+            if (selectedIds.isNotEmpty()) {
+                selectedIds = selectedIds.toggleGalleryId(job.id)
+            } else {
+                selectedJob = job
+            }
+        },
+        onLongPress = { job -> selectedIds = selectedIds + job.id },
+        onClearSelection = { selectedIds = emptySet() },
+        onDeleteSelection = { confirmDeleteSelected = true },
+        selectedTotalBytes = selectedTotalBytes,
+        selectedCleanableBytes = selectedCleanableBytes,
+        deleteError = deleteError
+    )
+}
+
+@Composable
+private fun GalleryPhotosOnlyGrid(
+    visiblePhotoJobs: List<KeplerGalleryJobSummary>,
+    selectedIds: Set<String>,
+    error: String?,
+    onBack: () -> Unit,
+    onRefresh: () -> Unit,
+    onSelectTab: (Int) -> Unit,
+    onOpen: (KeplerGalleryJobSummary) -> Unit,
+    onLongPress: (KeplerGalleryJobSummary) -> Unit,
+    onClearSelection: () -> Unit,
+    onDeleteSelection: () -> Unit,
+    selectedTotalBytes: Long,
+    selectedCleanableBytes: Long,
+    deleteError: String?
+) {
+    LazyVerticalGrid(
+        columns = GridCells.Adaptive(118.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .background(galleryFixedBackground)
+            .padding(androidx.compose.foundation.layout.WindowInsets.safeDrawing.asPaddingValues())
+            .padding(horizontal = 10.dp),
+        contentPadding = PaddingValues(bottom = 96.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        item(span = { GridItemSpan(maxLineSpan) }) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Spacer(Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = onBack) { Text("뒤로") }
+                    Button(onClick = onRefresh) { Text("새로고침") }
+                }
+                GalleryFixedTabs(TAB_PHOTOS_ONLY, onSelectTab)
+                if (selectedIds.isNotEmpty()) {
+                    GalleryFixedSelectionBar(
+                        selectedCount = selectedIds.size,
+                        selectedBytes = selectedTotalBytes,
+                        cleanableBytes = selectedCleanableBytes,
+                        onClear = onClearSelection,
+                        onDelete = onDeleteSelection
+                    )
+                }
+                deleteError?.let { Text(it, color = Color(0xFFFFB4A9)) }
+                Text(error ?: "${visiblePhotoJobs.size}개 항목", color = galleryFixedMuted)
+                if (visiblePhotoJobs.isEmpty() && error == null) {
+                    Text("표시할 사진이 없습니다.", color = galleryFixedMuted)
+                }
+            }
+        }
+        items(visiblePhotoJobs, key = { it.id }) { job ->
+            GalleryPhotoOnlyCard(
+                job = job,
+                selected = job.id in selectedIds,
+                selectionMode = selectedIds.isNotEmpty(),
+                onOpen = { onOpen(job) },
+                onLongPress = { onLongPress(job) }
+            )
+        }
+    }
+}
+
+@Composable
+private fun GalleryInfoGrid(
+    jobs: List<KeplerGalleryJobSummary>,
+    visiblePhotoJobs: List<KeplerGalleryJobSummary>,
+    selectedIds: Set<String>,
+    error: String?,
+    onBack: () -> Unit,
+    onRefresh: () -> Unit,
+    onSelectTab: (Int) -> Unit,
+    onDeleteFailed: () -> Unit,
+    onOpen: (KeplerGalleryJobSummary) -> Unit,
+    onLongPress: (KeplerGalleryJobSummary) -> Unit,
+    onClearSelection: () -> Unit,
+    onDeleteSelection: () -> Unit,
+    selectedTotalBytes: Long,
+    selectedCleanableBytes: Long,
+    deleteError: String?
+) {
     LazyVerticalGrid(
         columns = GridCells.Adaptive(150.dp),
         modifier = Modifier
@@ -215,20 +336,18 @@ fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
                 Spacer(Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = onBack) { Text("뒤로") }
-                    Button(onClick = { refreshKey++ }) { Text("새로고침") }
+                    Button(onClick = onRefresh) { Text("새로고침") }
                 }
-                GalleryFixedTabs(selectedTab) { selectedTab = it }
+                GalleryFixedTabs(TAB_INFO, onSelectTab)
                 GalleryFixedStorageHeader(summarizeKeplerGalleryStorage(jobs))
-                TextButton(onClick = { confirmDeleteFailed = true }) {
-                    Text("실패한 작업 삭제")
-                }
+                TextButton(onClick = onDeleteFailed) { Text("실패한 작업 삭제") }
                 if (selectedIds.isNotEmpty()) {
                     GalleryFixedSelectionBar(
                         selectedCount = selectedIds.size,
                         selectedBytes = selectedTotalBytes,
                         cleanableBytes = selectedCleanableBytes,
-                        onClear = { selectedIds = emptySet() },
-                        onDelete = { confirmDeleteSelected = true }
+                        onClear = onClearSelection,
+                        onDelete = onDeleteSelection
                     )
                 }
                 deleteError?.let { Text(it, color = Color(0xFFFFB4A9)) }
@@ -243,14 +362,8 @@ fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
                 job = job,
                 selected = job.id in selectedIds,
                 selectionMode = selectedIds.isNotEmpty(),
-                onOpen = {
-                    if (selectedIds.isNotEmpty()) {
-                        selectedIds = selectedIds.toggleGalleryId(job.id)
-                    } else {
-                        selectedJob = job
-                    }
-                },
-                onLongPress = { selectedIds = selectedIds + job.id }
+                onOpen = { onOpen(job) },
+                onLongPress = { onLongPress(job) }
             )
         }
     }
@@ -273,9 +386,10 @@ private fun KeplerGalleryJobSummary.isSourceOnlyGalleryJob(): Boolean =
 
 @Composable
 private fun GalleryFixedTabs(selectedTab: Int, onSelect: (Int) -> Unit) {
-    TabRow(selectedTabIndex = selectedTab, containerColor = galleryFixedBackground) {
-        Tab(selected = selectedTab == 0, onClick = { onSelect(0) }, text = { Text("사진") })
-        Tab(selected = selectedTab == 1, onClick = { onSelect(1) }, text = { Text("디버그") })
+    PrimaryTabRow(selectedTabIndex = selectedTab, containerColor = galleryFixedBackground) {
+        Tab(selected = selectedTab == TAB_PHOTOS_ONLY, onClick = { onSelect(TAB_PHOTOS_ONLY) }, text = { Text("사진만") })
+        Tab(selected = selectedTab == TAB_INFO, onClick = { onSelect(TAB_INFO) }, text = { Text("정보") })
+        Tab(selected = selectedTab == TAB_DEBUG, onClick = { onSelect(TAB_DEBUG) }, text = { Text("디버그") })
     }
 }
 
@@ -313,6 +427,77 @@ private fun GalleryFixedSelectionBar(
     }
 }
 
+@Composable
+private fun AsyncThumbnailImage(
+    file: File?,
+    maxDimension: Int,
+    modifier: Modifier,
+    contentScale: ContentScale,
+    contentDescription: String? = null
+) {
+    var bitmap by remember(file?.absolutePath, maxDimension) { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(file?.absolutePath, maxDimension) {
+        bitmap = null
+        val loaded = withContext(Dispatchers.IO) {
+            file?.let { loadThumbnailSafe(it, maxDimension) }
+        }
+        bitmap = loaded
+    }
+    DisposableEffect(bitmap) {
+        val oldBitmap = bitmap
+        onDispose { oldBitmap?.recycle() }
+    }
+    Box(modifier = modifier.background(Color.Black)) {
+        bitmap?.let {
+            Image(
+                bitmap = it.asImageBitmap(),
+                contentDescription = contentDescription,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = contentScale
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun GalleryPhotoOnlyCard(
+    job: KeplerGalleryJobSummary,
+    selected: Boolean,
+    selectionMode: Boolean,
+    onOpen: () -> Unit,
+    onLongPress: () -> Unit
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .combinedClickable(onClick = onOpen, onLongClick = onLongPress),
+        color = if (selected) Color(0xFF263449) else galleryFixedCard,
+        shape = RoundedCornerShape(10.dp)
+    ) {
+        Box {
+            AsyncThumbnailImage(
+                file = job.finalPreviewFile,
+                maxDimension = 384,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(128.dp),
+                contentScale = ContentScale.Crop
+            )
+            if (selectionMode) {
+                Text(
+                    text = if (selected) "선택됨" else "선택 가능",
+                    color = Color.White,
+                    modifier = Modifier
+                        .background(Color.Black.copy(alpha = 0.55f))
+                        .padding(6.dp),
+                    style = MaterialTheme.typography.labelSmall
+                )
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun GalleryFixedJobCard(
@@ -330,23 +515,14 @@ private fun GalleryFixedJobCard(
         shape = RoundedCornerShape(16.dp)
     ) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            val bitmap = remember(job.id, job.finalPreviewFile?.absolutePath) {
-                job.finalPreviewFile?.let { loadThumbnailSafe(it, 512) }
-            }
-            DisposableEffect(bitmap) {
-                onDispose { bitmap?.recycle() }
-            }
-            bitmap?.let {
-                Image(
-                    bitmap = it.asImageBitmap(),
-                    contentDescription = null,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(120.dp)
-                        .background(Color.Black),
-                    contentScale = ContentScale.Crop
-                )
-            }
+            AsyncThumbnailImage(
+                file = job.finalPreviewFile,
+                maxDimension = 512,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(120.dp),
+                contentScale = ContentScale.Crop
+            )
             Text(modeLabelFixed(job), style = MaterialTheme.typography.titleMedium)
             Text("${formatTimestamp(job.createdAt)} | ${routeLabelFixed(job)}", color = galleryFixedMuted)
             Text(if (job.status.contains("COMPLETE")) resolutionTextFixed(job) else job.status)
@@ -365,7 +541,6 @@ private fun KeplerGalleryDetailScreenFixed(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var currentJob by remember(job.id) { mutableStateOf(job) }
-    var preview by remember(job.id) { mutableStateOf<Bitmap?>(null) }
     var confirmDelete by remember { mutableStateOf(false) }
     var confirmCleanupType by remember { mutableStateOf<KeplerJobCleanupType?>(null) }
     var showDebugInfo by remember { mutableStateOf(false) }
@@ -381,40 +556,26 @@ private fun KeplerGalleryDetailScreenFixed(
     BackHandler(onBack = onBack)
 
     LaunchedEffect(job.id, refreshKey) {
-        val refreshedJob = withContext(Dispatchers.IO) {
+        currentJob = withContext(Dispatchers.IO) {
             loadKeplerGalleryJobs(context).firstOrNull { it.id == job.id }
         } ?: currentJob
-        val loadedPreview = withContext(Dispatchers.IO) {
-            refreshedJob.finalPreviewFile?.let { loadThumbnailSafe(it, 1280) }
-        }
-        currentJob = refreshedJob
-        preview = loadedPreview
-    }
-    DisposableEffect(preview) {
-        val bitmap = preview
-        onDispose { bitmap?.recycle() }
     }
 
     if (confirmDelete) {
-        AlertDialog(
-            onDismissRequest = { confirmDelete = false },
-            title = { Text("선택한 사진을 삭제하시겠습니까?") },
-            text = { Text("사진과 관련된 RAW/YUV 원본, 합성 파일, 디버그 파일이 함께 삭제됩니다. 이 작업은 되돌릴 수 없습니다.") },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirmDelete = false
-                    deleteKeplerGalleryJob(context, currentJob.directory)
-                        .onSuccess {
-                            Toast.makeText(context, "삭제되었습니다.", Toast.LENGTH_SHORT).show()
-                            onDeleted()
-                        }
-                        .onFailure {
-                            deleteError = it.message ?: "일부 파일을 삭제하지 못했습니다."
-                            Toast.makeText(context, "일부 파일을 삭제하지 못했습니다.", Toast.LENGTH_LONG).show()
-                        }
-                }) { Text("삭제") }
-            },
-            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("취소") } }
+        ConfirmDeleteJobsDialog(
+            onDismiss = { confirmDelete = false },
+            onConfirm = {
+                confirmDelete = false
+                deleteKeplerGalleryJob(context, currentJob.directory)
+                    .onSuccess {
+                        Toast.makeText(context, "삭제되었습니다.", Toast.LENGTH_SHORT).show()
+                        onDeleted()
+                    }
+                    .onFailure {
+                        deleteError = it.message ?: "일부 파일을 삭제하지 못했습니다."
+                        Toast.makeText(context, "일부 파일을 삭제하지 못했습니다.", Toast.LENGTH_LONG).show()
+                    }
+            }
         )
     }
 
@@ -470,22 +631,18 @@ private fun KeplerGalleryDetailScreenFixed(
             deleteError?.let { Text(it, color = Color(0xFFFFB4A9)) }
             actionStatus?.let { Text(it, color = galleryFixedMuted) }
         }
-        preview?.let { bitmap ->
-            item {
-                Image(
-                    bitmap = bitmap.asImageBitmap(),
-                    contentDescription = "Final image",
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(300.dp)
-                        .background(Color.Black),
-                    contentScale = ContentScale.Fit
-                )
-            }
-        }
         item {
-            GalleryFixedQualitySection(currentJob)
+            AsyncThumbnailImage(
+                file = currentJob.finalPreviewFile,
+                maxDimension = 1280,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(300.dp),
+                contentScale = ContentScale.Fit,
+                contentDescription = "Final image"
+            )
         }
+        item { GalleryFixedQualitySection(currentJob) }
         item {
             GalleryFixedSection("요약") {
                 GalleryFixedField("모드", modeLabelFixed(currentJob))
@@ -524,9 +681,7 @@ private fun KeplerGalleryDetailScreenFixed(
                     enabled = sourceAvailable,
                     onClick = { confirmCleanupType = KeplerJobCleanupType.SOURCE_ONLY }
                 ) { Text("원본만 남기기") }
-                TextButton(enabled = false, onClick = {}) {
-                    Text("다시 합성하기는 아직 지원되지 않습니다.")
-                }
+                TextButton(enabled = false, onClick = {}) { Text("다시 합성하기는 아직 지원되지 않습니다.") }
                 Button(onClick = { confirmDelete = true }) { Text("작업 전체 삭제") }
             }
         }
@@ -538,6 +693,28 @@ private fun KeplerGalleryDetailScreenFixed(
             }
         }
     }
+}
+
+@Composable
+private fun ConfirmDeleteJobsDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("선택한 사진을 삭제하시겠습니까?") },
+        text = { Text("사진과 관련된 RAW/YUV 원본, 합성 파일, 디버그 파일이 함께 삭제됩니다. 이 작업은 되돌릴 수 없습니다.") },
+        confirmButton = { TextButton(onClick = onConfirm) { Text("삭제") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("취소") } }
+    )
+}
+
+@Composable
+private fun ConfirmFailedDeleteDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("실패한 작업을 삭제하시겠습니까?") },
+        text = { Text("실패한 RAW/YUV 작업 폴더와 관련 파일이 함께 삭제됩니다. 이 작업은 되돌릴 수 없습니다.") },
+        confirmButton = { TextButton(onClick = onConfirm) { Text("삭제") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("취소") } }
+    )
 }
 
 @Composable
@@ -564,27 +741,21 @@ private fun GalleryFixedQualitySection(job: KeplerGalleryJobSummary) {
     val compareName = metadata?.optString("compareReferenceVsFinalFile").orEmpty()
         .ifBlank { metadata?.optString("yuvCompareReferenceVsFinalFile").orEmpty() }
         .ifBlank { metadata?.optString("qualityDiagnosticCompareFile").orEmpty() }
-    val compareBitmap = remember(job.id, compareName) {
-        if (compareName.isBlank()) null else loadThumbnailSafe(File(job.directory, compareName), 960)
-    }
-    DisposableEffect(compareBitmap) {
-        onDispose { compareBitmap?.recycle() }
-    }
     GalleryFixedSection("품질 진단") {
         GalleryFixedField("quality hint", metadata?.optString("fusionQualityHint").orEmpty().ifBlank { "none" })
         GalleryFixedField("sharpness", qualitySummaryFixed(metadata, "Sharpness"))
         GalleryFixedField("noise", qualitySummaryFixed(metadata, "NoiseEstimate"))
         GalleryFixedField("sharpness drop", metadata.valueFixed("sharpnessDropReferenceToFused") + " / " + metadata.valueFixed("sharpnessDropFusedToFinal"))
         GalleryFixedField("noise reduction", metadata.valueFixed("noiseReductionReferenceToFused") + " / " + metadata.valueFixed("noiseReductionFusedToFinal"))
-        compareBitmap?.let { bitmap ->
-            Image(
-                bitmap = bitmap.asImageBitmap(),
-                contentDescription = "reference vs final",
+        if (compareName.isNotBlank()) {
+            AsyncThumbnailImage(
+                file = File(job.directory, compareName),
+                maxDimension = 960,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(220.dp)
-                    .background(Color.Black),
-                contentScale = ContentScale.Fit
+                    .height(220.dp),
+                contentScale = ContentScale.Fit,
+                contentDescription = "reference vs final"
             )
         }
     }
