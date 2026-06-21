@@ -71,7 +71,7 @@ fun KeplerAppRoot() {
                 showCacheJobs -> CacheJobsScreen {
                     showCacheJobs = false
                 }
-                showGallery -> KeplerGalleryScreen {
+                showGallery -> KeplerGalleryScreenFixed {
                     showGallery = false
                 }
                 else -> MainCameraScreen(
