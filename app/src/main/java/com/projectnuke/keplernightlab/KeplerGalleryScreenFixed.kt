@@ -59,9 +59,9 @@ import java.io.File
 private val galleryFixedBackground = Color(0xFF080A0F)
 private val galleryFixedCard = Color(0xFF141821)
 private val galleryFixedMuted = Color.White.copy(alpha = 0.65f)
-private val galleryFixedSelectedBorder = Color(0xFF8B5CF6)
-private val galleryFixedSelectedCard = Color(0xFF241B35)
-private val galleryFixedSelectedOverlay = Color.Black.copy(alpha = 0.24f)
+private val galleryFixedSelectedBorder = Color.White
+private val galleryFixedSelectedCard = Color(0xFF202020)
+private val galleryFixedSelectedOverlay = Color.Black.copy(alpha = 0.28f)
 private val galleryFixedUnselectedDim = Color.Black.copy(alpha = 0.18f)
 
 private const val TAB_PHOTOS_ONLY = 0
@@ -455,12 +455,12 @@ private fun AsyncThumbnailImage(
 private fun GallerySelectionBadge(modifier: Modifier = Modifier) {
     Surface(
         modifier = modifier,
-        color = galleryFixedSelectedBorder,
+        color = Color.White,
         shape = RoundedCornerShape(999.dp)
     ) {
         Text(
             text = "✓ 선택됨",
-            color = Color.White,
+            color = Color.Black,
             modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
             style = MaterialTheme.typography.labelSmall
         )
