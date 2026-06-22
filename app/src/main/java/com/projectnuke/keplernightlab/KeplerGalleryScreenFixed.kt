@@ -6,6 +6,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -42,6 +43,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -57,6 +59,10 @@ import java.io.File
 private val galleryFixedBackground = Color(0xFF080A0F)
 private val galleryFixedCard = Color(0xFF141821)
 private val galleryFixedMuted = Color.White.copy(alpha = 0.65f)
+private val galleryFixedSelectedBorder = Color(0xFF8B5CF6)
+private val galleryFixedSelectedCard = Color(0xFF241B35)
+private val galleryFixedSelectedOverlay = Color.Black.copy(alpha = 0.24f)
+private val galleryFixedUnselectedDim = Color.Black.copy(alpha = 0.18f)
 
 private const val TAB_PHOTOS_ONLY = 0
 private const val TAB_INFO = 1
@@ -445,6 +451,22 @@ private fun AsyncThumbnailImage(
     }
 }
 
+@Composable
+private fun GallerySelectionBadge(modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier,
+        color = galleryFixedSelectedBorder,
+        shape = RoundedCornerShape(999.dp)
+    ) {
+        Text(
+            text = "✓ 선택됨",
+            color = Color.White,
+            modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+            style = MaterialTheme.typography.labelSmall
+        )
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun GalleryPhotoOnlyCard(
@@ -454,12 +476,18 @@ private fun GalleryPhotoOnlyCard(
     onOpen: () -> Unit,
     onLongPress: () -> Unit
 ) {
+    val shape = RoundedCornerShape(10.dp)
     Surface(
         modifier = Modifier
             .fillMaxWidth()
+            .border(
+                width = if (selected) 3.dp else 0.dp,
+                color = if (selected) galleryFixedSelectedBorder else Color.Transparent,
+                shape = shape
+            )
             .combinedClickable(onClick = onOpen, onLongClick = onLongPress),
-        color = if (selected) Color(0xFF263449) else galleryFixedCard,
-        shape = RoundedCornerShape(10.dp)
+        color = if (selected) galleryFixedSelectedCard else galleryFixedCard,
+        shape = shape
     ) {
         Box {
             AsyncThumbnailImage(
@@ -470,14 +498,23 @@ private fun GalleryPhotoOnlyCard(
                     .height(128.dp),
                 contentScale = ContentScale.Crop
             )
-            if (selectionMode) {
-                Text(
-                    text = if (selected) "선택됨" else "선택 가능",
-                    color = Color.White,
+            if (selectionMode && !selected) {
+                Box(
                     modifier = Modifier
-                        .background(Color.Black.copy(alpha = 0.55f))
-                        .padding(6.dp),
-                    style = MaterialTheme.typography.labelSmall
+                        .fillMaxSize()
+                        .background(galleryFixedUnselectedDim)
+                )
+            }
+            if (selected) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(galleryFixedSelectedOverlay)
+                )
+                GallerySelectionBadge(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(7.dp)
                 )
             }
         }
@@ -493,27 +530,60 @@ private fun GalleryFixedJobCard(
     onOpen: () -> Unit,
     onLongPress: () -> Unit
 ) {
+    val shape = RoundedCornerShape(16.dp)
     Surface(
         modifier = Modifier
             .fillMaxWidth()
+            .border(
+                width = if (selected) 3.dp else 0.dp,
+                color = if (selected) galleryFixedSelectedBorder else Color.Transparent,
+                shape = shape
+            )
             .combinedClickable(onClick = onOpen, onLongClick = onLongPress),
-        color = if (selected) Color(0xFF263449) else galleryFixedCard,
-        shape = RoundedCornerShape(16.dp)
+        color = if (selected) galleryFixedSelectedCard else galleryFixedCard,
+        shape = shape
     ) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            AsyncThumbnailImage(
-                file = job.finalPreviewFile,
-                maxDimension = 512,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(120.dp),
-                contentScale = ContentScale.Crop
-            )
+            Box {
+                AsyncThumbnailImage(
+                    file = job.finalPreviewFile,
+                    maxDimension = 512,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(120.dp),
+                    contentScale = ContentScale.Crop
+                )
+                if (selectionMode && !selected) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(galleryFixedUnselectedDim)
+                    )
+                }
+                if (selected) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(galleryFixedSelectedOverlay)
+                    )
+                    GallerySelectionBadge(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(7.dp)
+                    )
+                }
+            }
             Text(modeLabelFixed(job), style = MaterialTheme.typography.titleMedium)
             Text("${formatTimestamp(job.createdAt)} | ${routeLabelFixed(job)}", color = galleryFixedMuted)
             Text(if (job.status.contains("COMPLETE")) resolutionTextFixed(job) else job.status)
             Text("파일 크기: ${job.storage.finalOutputSizeText}", color = galleryFixedMuted)
-            if (selectionMode) Text(if (selected) "선택됨" else "선택 가능", color = galleryFixedMuted)
+            if (selectionMode) {
+                Text(
+                    if (selected) "선택됨" else "선택 가능",
+                    color = if (selected) galleryFixedSelectedBorder else galleryFixedMuted,
+                    style = MaterialTheme.typography.labelLarge
+                )
+            }
         }
     }
 }
