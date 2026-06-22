@@ -28,17 +28,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
-<<<<<<< HEAD
-import androidx.compose.material3.PrimaryTabRow
-=======
->>>>>>> e823d6dec25145b851b7b8616c5ddae809883641
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -202,11 +197,7 @@ fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
             onRefresh = { refreshKey++ },
             onSelectTab = { selectedTab = it },
             onOpen = { job ->
-                if (selectedIds.isNotEmpty()) {
-                    selectedIds = selectedIds.toggleGalleryId(job.id)
-                } else {
-                    selectedJob = job
-                }
+                if (selectedIds.isNotEmpty()) selectedIds = selectedIds.toggleGalleryId(job.id) else selectedJob = job
             },
             onLongPress = { job -> selectedIds = selectedIds + job.id },
             onClearSelection = { selectedIds = emptySet() },
@@ -228,11 +219,7 @@ fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
         onSelectTab = { selectedTab = it },
         onDeleteFailed = { confirmDeleteFailed = true },
         onOpen = { job ->
-            if (selectedIds.isNotEmpty()) {
-                selectedIds = selectedIds.toggleGalleryId(job.id)
-            } else {
-                selectedJob = job
-            }
+            if (selectedIds.isNotEmpty()) selectedIds = selectedIds.toggleGalleryId(job.id) else selectedJob = job
         },
         onLongPress = { job -> selectedIds = selectedIds + job.id },
         onClearSelection = { selectedIds = emptySet() },
@@ -390,15 +377,10 @@ private fun KeplerGalleryJobSummary.isSourceOnlyGalleryJob(): Boolean =
 
 @Composable
 private fun GalleryFixedTabs(selectedTab: Int, onSelect: (Int) -> Unit) {
-    PrimaryTabRow(selectedTabIndex = selectedTab, containerColor = galleryFixedBackground) {
-<<<<<<< HEAD
-        Tab(selected = selectedTab == 0, onClick = { onSelect(0) }, text = { Text("사진") })
-        Tab(selected = selectedTab == 1, onClick = { onSelect(1) }, text = { Text("디버그") })
-=======
+    TabRow(selectedTabIndex = selectedTab, containerColor = galleryFixedBackground) {
         Tab(selected = selectedTab == TAB_PHOTOS_ONLY, onClick = { onSelect(TAB_PHOTOS_ONLY) }, text = { Text("사진만") })
         Tab(selected = selectedTab == TAB_INFO, onClick = { onSelect(TAB_INFO) }, text = { Text("정보") })
         Tab(selected = selectedTab == TAB_DEBUG, onClick = { onSelect(TAB_DEBUG) }, text = { Text("디버그") })
->>>>>>> e823d6dec25145b851b7b8616c5ddae809883641
     }
 }
 
@@ -447,14 +429,9 @@ private fun AsyncThumbnailImage(
     var bitmap by remember(file?.absolutePath, maxDimension) { mutableStateOf<Bitmap?>(null) }
     LaunchedEffect(file?.absolutePath, maxDimension) {
         bitmap = null
-        val loaded = withContext(Dispatchers.IO) {
+        bitmap = withContext(Dispatchers.IO) {
             file?.let { loadThumbnailSafe(it, maxDimension) }
         }
-        bitmap = loaded
-    }
-    DisposableEffect(bitmap) {
-        val oldBitmap = bitmap
-        onDispose { oldBitmap?.recycle() }
     }
     Box(modifier = modifier.background(Color.Black)) {
         bitmap?.let {
