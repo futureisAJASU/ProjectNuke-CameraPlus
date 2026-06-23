@@ -240,7 +240,8 @@ private fun cleanupSafeRoots(context: Context): List<File> {
     val pictures = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return emptyList()
     return listOf(
         File(pictures, "KeplerRawFusion"),
-        File(pictures, "KeplerYuvFusion")
+        File(pictures, "KeplerYuvFusion"),
+        File(pictures, "KeplerColorBurst")
     )
 }
 
@@ -249,7 +250,7 @@ private fun requireCleanupSafeJobDirectory(context: Context, jobDirectory: File)
     val allowed = cleanupSafeRoots(context).any { root ->
         target.parentFile == root.canonicalFile && matchesJobPrefix(root, target.name)
     }
-    require(allowed) { "Refusing to modify directory outside RAW/YUV Kepler job roots." }
+    require(allowed) { "Refusing to modify directory outside known Kepler job roots." }
     return target
 }
 
