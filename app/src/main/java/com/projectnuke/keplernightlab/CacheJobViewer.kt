@@ -37,6 +37,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -46,6 +47,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -225,7 +227,7 @@ private fun JobSummaryCard(job: KeplerJobSummary, onOpen: () -> Unit) {
             )
             if (job.cleanupType == "SOURCE_ONLY") {
                 Text("원본만 남은 작업", color = inspectorMuted)
-                Text("다시 합성하기는 아직 지원되지 않습니다.", color = inspectorMuted)
+                Text("상세 화면에서 원본 프레임으로 다시 합성할 수 있습니다.", color = inspectorMuted)
             }
             Text(
                 "mode=${job.requestedResolutionMode} -> ${job.outputResolutionMode}",
@@ -247,6 +249,7 @@ private fun JobSummaryCard(job: KeplerJobSummary, onOpen: () -> Unit) {
 @Composable
 fun JobDetailScreen(jobDir: File, onBack: () -> Unit) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val clipboard = remember {
         context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     }
@@ -260,6 +263,7 @@ fun JobDetailScreen(jobDir: File, onBack: () -> Unit) {
     var showJobJson by remember(jobDir) { mutableStateOf(false) }
     var showAlignmentJson by remember(jobDir) { mutableStateOf(false) }
     var showNativeJson by remember(jobDir) { mutableStateOf(false) }
+    var isReprocessing by remember(jobDir) { mutableStateOf(false) }
 
     LaunchedEffect(jobDir, refreshKey) {
         loading = true
@@ -385,6 +389,30 @@ fun JobDetailScreen(jobDir: File, onBack: () -> Unit) {
 
         if (loaded != null) {
             item { SummarySection(jobDir, job) }
+            item {
+                InspectorReprocessSection(
+                    jobDir = jobDir,
+                    isReprocessing = isReprocessing,
+                    onStart = {
+                        isReprocessing = true
+                        scope.launch {
+                            val result = reprocessKeplerGalleryJob(
+                                context = context,
+                                jobDir = jobDir,
+                                outputSettings = OutputSettingsStore.load(context),
+                                onProgress = { message = it }
+                            )
+                            result.onSuccess {
+                                message = "다시 합성되었습니다."
+                            }.onFailure {
+                                message = it.message ?: "다시 합성하지 못했습니다."
+                            }
+                            isReprocessing = false
+                            refreshKey++
+                        }
+                    }
+                )
+            }
             item { CaptureSection(job) }
             item { HighResolutionSection(job) }
             item { AlignmentSection(job, loaded) }
@@ -404,6 +432,42 @@ fun JobDetailScreen(jobDir: File, onBack: () -> Unit) {
             }
         }
         item { Spacer(Modifier.height(24.dp)) }
+    }
+}
+
+@Composable
+private fun InspectorReprocessSection(
+    jobDir: File,
+    isReprocessing: Boolean,
+    onStart: () -> Unit
+) {
+    val context = LocalContext.current
+    var capability by remember(jobDir.absolutePath, jobDir.lastModified()) {
+        mutableStateOf<ReprocessCapability?>(null)
+    }
+    LaunchedEffect(jobDir.absolutePath, jobDir.lastModified()) {
+        capability = withContext(Dispatchers.IO) {
+            detectReprocessCapability(context, jobDir)
+        }
+    }
+    val currentCapability = capability
+    InspectorSection("다시 합성") {
+        if (currentCapability == null) {
+            Text("원본 프레임 확인 중…", color = inspectorMuted)
+        } else {
+            DetailField("jobKind", currentCapability.jobKind.name)
+            DetailField("sourceFrameCount", currentCapability.sourceFrameCount.toString())
+            DetailField("finalOutputExists", currentCapability.finalOutputExists.toString())
+            if (!currentCapability.canReprocess) {
+                Text(currentCapability.reason, color = inspectorMuted)
+            }
+            Button(
+                enabled = currentCapability.canReprocess && !isReprocessing,
+                onClick = onStart
+            ) {
+                Text(if (isReprocessing) "다시 합성 중…" else "다시 합성하기")
+            }
+        }
     }
 }
 

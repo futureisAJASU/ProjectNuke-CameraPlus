@@ -602,6 +602,7 @@ private fun KeplerGalleryDetailScreenFixed(
     var showDebugInfo by remember { mutableStateOf(false) }
     var actionStatus by remember { mutableStateOf<String?>(null) }
     var deleteError by remember { mutableStateOf<String?>(null) }
+    var isReprocessing by remember { mutableStateOf(false) }
     var refreshKey by remember { mutableIntStateOf(0) }
 
     if (showDebugInfo) {
@@ -716,6 +717,32 @@ private fun KeplerGalleryDetailScreenFixed(
             }
         }
         item {
+            GalleryFixedReprocessSection(
+                currentJob = currentJob,
+                isReprocessing = isReprocessing,
+                onStart = {
+                    isReprocessing = true
+                    scope.launch {
+                        val result = reprocessKeplerGalleryJob(
+                            context = context,
+                            jobDir = currentJob.directory,
+                            outputSettings = OutputSettingsStore.load(context),
+                            onProgress = { actionStatus = it }
+                        )
+                        result.onSuccess {
+                            actionStatus = "다시 합성되었습니다."
+                            Toast.makeText(context, "다시 합성되었습니다.", Toast.LENGTH_SHORT).show()
+                        }.onFailure {
+                            actionStatus = it.message ?: "다시 합성하지 못했습니다."
+                            Toast.makeText(context, "다시 합성하지 못했습니다.", Toast.LENGTH_LONG).show()
+                        }
+                        isReprocessing = false
+                        refreshKey++
+                    }
+                }
+            )
+        }
+        item {
             GalleryFixedSection("저장공간 정리") {
                 val sourceAvailable = currentJob.storage.rawFramesBytes + currentJob.storage.intermediateFilesBytes > 0L
                 val debugAvailable = currentJob.storage.debugFilesBytes + currentJob.storage.previewFilesBytes + currentJob.storage.cacheFilesBytes > 0L
@@ -737,7 +764,6 @@ private fun KeplerGalleryDetailScreenFixed(
                     enabled = sourceAvailable,
                     onClick = { confirmCleanupType = KeplerJobCleanupType.SOURCE_ONLY }
                 ) { Text("원본만 남기기") }
-                TextButton(enabled = false, onClick = {}) { Text("다시 합성하기는 아직 지원되지 않습니다.") }
                 Button(onClick = { confirmDelete = true }) { Text("작업 전체 삭제") }
             }
         }
@@ -746,6 +772,41 @@ private fun KeplerGalleryDetailScreenFixed(
                 metadataSummaryFixed(currentJob.metadata).forEach { (key, value) ->
                     GalleryFixedField(key, value)
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GalleryFixedReprocessSection(
+    currentJob: KeplerGalleryJobSummary,
+    isReprocessing: Boolean,
+    onStart: () -> Unit
+) {
+    val context = LocalContext.current
+    var capability by remember(currentJob.id, currentJob.storage.totalJobBytes) {
+        mutableStateOf<ReprocessCapability?>(null)
+    }
+    LaunchedEffect(currentJob.id, currentJob.storage.totalJobBytes) {
+        capability = withContext(Dispatchers.IO) {
+            detectReprocessCapability(context, currentJob.directory)
+        }
+    }
+    val currentCapability = capability
+    GalleryFixedSection("다시 합성") {
+        if (currentCapability == null) {
+            Text("원본 프레임 확인 중…", color = galleryFixedMuted)
+        } else {
+            GalleryFixedField("원본 프레임", "${currentCapability.sourceFrameCount}개")
+            GalleryFixedField("최종 사진", if (currentCapability.finalOutputExists) "있음" else "없음")
+            if (!currentCapability.canReprocess) {
+                Text(currentCapability.reason, color = galleryFixedMuted)
+            }
+            Button(
+                enabled = currentCapability.canReprocess && !isReprocessing,
+                onClick = onStart
+            ) {
+                Text(if (isReprocessing) "다시 합성 중…" else "다시 합성하기")
             }
         }
     }

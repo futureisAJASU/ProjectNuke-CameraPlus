@@ -695,9 +695,6 @@ private fun KeplerGalleryDetailScreen(
                     enabled = sourceAvailable,
                     onClick = { confirmCleanupType = KeplerJobCleanupType.SOURCE_ONLY }
                 ) { Text("원본만 남기기") }
-                TextButton(enabled = false, onClick = {}) {
-                    Text("다시 합성하기는 아직 지원되지 않습니다.")
-                }
                 Button(onClick = { confirmDelete = true }) { Text("작업 전체 삭제") }
             }
         }
