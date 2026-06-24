@@ -2,7 +2,9 @@ package com.projectnuke.keplernightlab
 
 import android.content.Context
 import android.os.Environment
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
@@ -42,6 +44,20 @@ suspend fun reprocessKeplerGalleryJob(
     jobDir: File,
     outputSettings: OutputSettings,
     onProgress: (String) -> Unit
+): Result<KeplerReprocessResult> = reprocessKeplerGalleryJob(
+    context = context,
+    jobDir = jobDir,
+    outputSettings = outputSettings,
+    frameSelection = null,
+    onProgress = onProgress
+)
+
+suspend fun reprocessKeplerGalleryJob(
+    context: Context,
+    jobDir: File,
+    outputSettings: OutputSettings,
+    frameSelection: Set<Int>?,
+    onProgress: (String) -> Unit
 ): Result<KeplerReprocessResult> {
     val target = runCatching { requireReprocessSafeJobDirectory(context, jobDir) }
         .getOrElse { return Result.failure(it) }
@@ -52,13 +68,41 @@ suspend fun reprocessKeplerGalleryJob(
     }
 
     onProgress("원본 프레임 확인 중…")
+    val job = loadJobJsonSafe(target)
+    val kind = detectJobKind(target, job)
+    val reviewItems = loadFrameReviewItems(context, target).getOrElse {
+        writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
+        return Result.failure(it)
+    }
+    val resolvedSelection = resolveFrameSelection(target, kind, reviewItems, frameSelection).getOrElse {
+        writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
+        return Result.failure(it)
+    }
+    if (resolvedSelection.size < requiredSelectedFrameCount(kind)) {
+        val message = "선택한 원본 프레임이 부족하여 다시 합성할 수 없습니다."
+        writeReprocessFailure(target, message)
+        return Result.failure(IllegalStateException(message))
+    }
+    val selectionMode = resolveSelectionMode(job, frameSelection)
+    onProgress("프레임 선택 적용 중…")
+    saveFrameSelection(
+        jobDir = target,
+        mode = selectionMode,
+        frames = applyFrameSelectionToItems(reviewItems, resolvedSelection, selectionMode)
+    ).getOrElse {
+        writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
+        return Result.failure(it)
+    }
+
     val beforeFinals = finalOutputCandidates(target, loadJobJsonSafe(target))
     val backups = backupFinalOutputs(target, beforeFinals)
     val beforeBytes = beforeFinals.filter { it.isFile }.sumOf { it.length() }
 
     val pipelineResult = when (capability.jobKind) {
-        ReprocessJobKind.RAW_FUSION -> awaitRawReprocess(context, target, outputSettings, onProgress)
-        ReprocessJobKind.YUV_FUSION -> awaitYuvReprocess(context, target, outputSettings, onProgress)
+        ReprocessJobKind.RAW_FUSION ->
+            awaitRawReprocess(context, target, outputSettings, resolvedSelection, onProgress)
+        ReprocessJobKind.YUV_FUSION ->
+            awaitYuvReprocess(context, target, outputSettings, resolvedSelection, onProgress)
         ReprocessJobKind.COLOR_BURST ->
             Result.failure(UnsupportedOperationException("ColorBurst 다시 합성은 아직 지원되지 않습니다."))
         ReprocessJobKind.UNSUPPORTED ->
@@ -68,17 +112,19 @@ suspend fun reprocessKeplerGalleryJob(
     return pipelineResult.fold(
         onSuccess = {
             onProgress("갤러리 정보 갱신 중…")
-            val job = loadJobJsonSafe(target)
-            val finalFile = resolveReprocessFinalOutput(target, job)
+            val updatedJob = loadJobJsonSafe(target)
+            val finalFile = resolveReprocessFinalOutput(target, updatedJob)
             val previewFile = finalFile
-            val afterBytes = finalOutputCandidates(target, job).filter { it.isFile }.sumOf { it.length() }
+            val afterBytes = finalOutputCandidates(target, updatedJob).filter { it.isFile }.sumOf { it.length() }
             val bytesWritten = (afterBytes - beforeBytes).coerceAtLeast(finalFile?.length() ?: 0L)
             writeReprocessSuccess(
                 jobDir = target,
                 jobKind = capability.jobKind,
-                sourceFrameCount = capability.sourceFrameCount,
+                sourceFrameCount = resolvedSelection.size,
                 finalOutputFile = finalFile,
-                previewFile = previewFile
+                previewFile = previewFile,
+                selectionMode = selectionMode,
+                includedFrameIndices = resolvedSelection
             )
             deleteBackups(backups)
             Result.success(
@@ -121,7 +167,11 @@ fun detectReprocessCapability(context: Context, jobDir: File): ReprocessCapabili
             ReprocessCapability(
                 canReprocess = canRun,
                 jobKind = kind,
-                reason = if (canRun) "RAW 원본 프레임으로 다시 합성할 수 있습니다." else "원본 프레임이 삭제되어 다시 합성할 수 없습니다.",
+                reason = if (canRun) {
+                    "RAW 원본 프레임으로 다시 합성할 수 있습니다."
+                } else {
+                    "원본 프레임이 부족하여 다시 합성할 수 없습니다."
+                },
                 sourceFrameCount = sourceCount,
                 finalOutputExists = finalExists,
                 sourceFramesAvailable = sourceAvailable
@@ -132,7 +182,11 @@ fun detectReprocessCapability(context: Context, jobDir: File): ReprocessCapabili
             ReprocessCapability(
                 canReprocess = canRun,
                 jobKind = kind,
-                reason = if (canRun) "YUV 원본 프레임으로 다시 합성할 수 있습니다." else "원본 프레임이 삭제되어 다시 합성할 수 없습니다.",
+                reason = if (canRun) {
+                    "YUV 원본 프레임으로 다시 합성할 수 있습니다."
+                } else {
+                    "원본 프레임이 부족하여 다시 합성할 수 없습니다."
+                },
                 sourceFrameCount = sourceCount,
                 finalOutputExists = finalExists,
                 sourceFramesAvailable = sourceAvailable
@@ -161,10 +215,11 @@ private suspend fun awaitRawReprocess(
     context: Context,
     jobDir: File,
     outputSettings: OutputSettings,
+    frameSelection: Set<Int>,
     onProgress: (String) -> Unit
 ): Result<Unit> = suspendCancellableCoroutine { continuation ->
     var lastStatus = ""
-    reprocessRawJob(context, jobDir, outputSettings) { status ->
+    reprocessRawJob(context, jobDir, outputSettings, frameSelection) { status ->
         lastStatus = status
         onProgress(if (status.contains("Exporting", ignoreCase = true)) "최종 사진 저장 중…" else "RAW 합성 중…")
         if (!continuation.isActive) return@reprocessRawJob
@@ -185,10 +240,11 @@ private suspend fun awaitYuvReprocess(
     context: Context,
     jobDir: File,
     outputSettings: OutputSettings,
+    frameSelection: Set<Int>,
     onProgress: (String) -> Unit
 ): Result<Unit> = suspendCancellableCoroutine { continuation ->
     var lastStatus = ""
-    reprocessYuvJob(context, jobDir, outputSettings) { status ->
+    reprocessYuvJob(context, jobDir, outputSettings, selectedFrameIndices = frameSelection) { status ->
         lastStatus = status
         onProgress(if (status.contains("export", ignoreCase = true)) "최종 사진 저장 중…" else "YUV 합성 중…")
         if (!continuation.isActive) return@reprocessYuvJob
@@ -204,7 +260,7 @@ private suspend fun awaitYuvReprocess(
     }
 }
 
-private fun requireReprocessSafeJobDirectory(context: Context, jobDirectory: File): File {
+internal fun requireReprocessSafeJobDirectory(context: Context, jobDirectory: File): File {
     val target = jobDirectory.canonicalFile
     require(target.isDirectory) { "Job directory no longer exists." }
     val allowed = reprocessSafeRoots(context).any { root ->
@@ -230,7 +286,7 @@ private fun matchesReprocessJobPrefix(root: File, name: String): Boolean = when 
     else -> false
 }
 
-private fun detectJobKind(jobDir: File, job: JSONObject): ReprocessJobKind {
+internal fun detectJobKind(jobDir: File, job: JSONObject): ReprocessJobKind {
     val rawType = job.optString("jobType").uppercase(Locale.US)
     return when {
         rawType == "RAW_NIGHT_FUSION" || jobDir.name.startsWith("KPL_RAW_FUSION_") -> ReprocessJobKind.RAW_FUSION
@@ -267,12 +323,11 @@ private fun countActualSourceFrames(jobDir: File, job: JSONObject, kind: Reproce
     }
     if (fromMetadata.isNotEmpty()) return fromMetadata.size
     return jobDir.listFiles()
-        ?.filter { it.isFile && isReprocessSourceFrame(it, kind) }
-        ?.size
+        ?.count { it.isFile && isReprocessSourceFrame(it, kind) }
         ?: 0
 }
 
-private fun isReprocessSourceFrame(file: File, kind: ReprocessJobKind): Boolean {
+internal fun isReprocessSourceFrame(file: File, kind: ReprocessJobKind): Boolean {
     val name = file.name.lowercase(Locale.US)
     if (!name.startsWith("frame_")) return false
     return when (kind) {
@@ -284,7 +339,7 @@ private fun isReprocessSourceFrame(file: File, kind: ReprocessJobKind): Boolean 
     }
 }
 
-private fun loadJobJsonSafe(jobDir: File): JSONObject =
+internal fun loadJobJsonSafe(jobDir: File): JSONObject =
     File(jobDir, JOB_JSON_FILE_NAME).takeIf { it.isFile }?.let { file ->
         runCatching { JSONObject(file.readText()) }.getOrNull()
     } ?: JSONObject()
@@ -337,7 +392,9 @@ private fun writeReprocessSuccess(
     jobKind: ReprocessJobKind,
     sourceFrameCount: Int,
     finalOutputFile: File?,
-    previewFile: File?
+    previewFile: File?,
+    selectionMode: FrameSelectionMode,
+    includedFrameIndices: Set<Int>
 ) {
     val job = loadJobJsonSafe(jobDir)
     job.put("processStatus", "REPROCESS_COMPLETE")
@@ -349,6 +406,8 @@ private fun writeReprocessSuccess(
             ReprocessJobKind.COLOR_BURST -> "color_burst_reprocess_v1"
             ReprocessJobKind.UNSUPPORTED -> "unsupported"
         })
+        .put("frameSelectionMode", selectionMode.name)
+        .put("includedFrameIndices", JSONArray(includedFrameIndices.sorted()))
         .put("reprocessSourceFrameCount", sourceFrameCount)
         .put("finalOutputAvailable", finalOutputFile?.isFile == true)
         .put("galleryVisible", true)
@@ -391,3 +450,44 @@ private fun putReprocessAvailability(
 
 private fun nowIso8601(): String =
     SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US).format(Date())
+
+private fun resolveFrameSelection(
+    jobDir: File,
+    kind: ReprocessJobKind,
+    frames: List<KeplerFrameReviewItem>,
+    explicitSelection: Set<Int>?
+): Result<Set<Int>> = runCatching {
+    val explicit = explicitSelection
+        ?.filter { index -> frames.any { it.index == index && it.file.isFile && it.file.length() > 0L } }
+        ?.toSet()
+        .orEmpty()
+    if (explicit.isNotEmpty()) return@runCatching explicit
+
+    val job = loadJobJsonSafe(jobDir)
+    val persisted = persistedIncludedFrameIndices(job)
+        .filter { index -> frames.any { it.index == index && it.file.isFile && it.file.length() > 0L } }
+        .toSet()
+    if (persisted.isNotEmpty()) return@runCatching persisted
+
+    val recommendation = runBlocking { RuleBasedFrameSelectionAdvisor().recommend(null, frames) }
+    val recommended = recommendation.includedFrameIndices
+        .filter { index -> frames.any { it.index == index && it.file.isFile && it.file.length() > 0L } }
+        .toSet()
+    if (recommended.size >= requiredSelectedFrameCount(kind)) {
+        recommended
+    } else {
+        frames.filter { it.file.isFile && it.file.length() > 0L }.map { it.index }.toSet()
+    }
+}
+
+private fun resolveSelectionMode(job: JSONObject, explicitSelection: Set<Int>?): FrameSelectionMode {
+    if (explicitSelection != null) return FrameSelectionMode.MANUAL
+    return persistedFrameSelectionMode(job) ?: FrameSelectionMode.AUTO_RULE_BASED
+}
+
+private fun requiredSelectedFrameCount(kind: ReprocessJobKind): Int = when (kind) {
+    ReprocessJobKind.RAW_FUSION -> MIN_RAW_FUSION_FRAMES
+    ReprocessJobKind.YUV_FUSION -> 2
+    ReprocessJobKind.COLOR_BURST,
+    ReprocessJobKind.UNSUPPORTED -> Int.MAX_VALUE
+}

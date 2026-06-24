@@ -33,7 +33,7 @@ private data class QualityGyroSample(
     val magnitude: Float
 )
 
-private data class FrameQualityMetrics(
+private data class InternalFrameQualityMetrics(
     val scoringBackend: String,
     val sharpnessRaw: Float,
     val sharpnessScore: Float,
@@ -125,7 +125,7 @@ private fun analyzeFrame(
     job: JSONObject,
     frame: JSONObject,
     gyro: List<QualityGyroSample>
-): FrameQualityMetrics {
+): InternalFrameQualityMetrics {
     val rawFileName = frame.optString("raw16File")
     val colorFileName = frame.optString("file")
     val sample = when {
@@ -241,7 +241,7 @@ private fun scoreLumaSample(
     motionScore: Float?,
     exposureTimeNs: Long?,
     sensitivityIso: Int?
-): FrameQualityMetrics {
+): InternalFrameQualityMetrics {
     require(sample.values.isNotEmpty()) { "No luminance samples" }
     val nativeMetrics = if (NativeFrameQuality.isAvailable()) {
         val luma = ByteArray(sample.values.size) { index ->
@@ -311,7 +311,7 @@ private fun scoreLumaSample(
         "SUSPECT" -> "Combined quality metrics are below conservative threshold."
         else -> null
     }
-    return FrameQualityMetrics(
+    return InternalFrameQualityMetrics(
         scoringBackend = scoringBackend,
         sharpnessRaw = sharpnessRaw,
         sharpnessScore = sharpness,
@@ -378,7 +378,7 @@ private fun motionScoreNear(samples: List<QualityGyroSample>, timestampNs: Long)
     return (meanMagnitude / 1.5f).coerceIn(0f, 1f)
 }
 
-private fun suspectMetrics(backend: String, reason: String): FrameQualityMetrics = FrameQualityMetrics(
+private fun suspectMetrics(backend: String, reason: String): InternalFrameQualityMetrics = InternalFrameQualityMetrics(
     scoringBackend = backend,
     sharpnessRaw = 0f,
     sharpnessScore = 0f,
@@ -394,7 +394,7 @@ private fun suspectMetrics(backend: String, reason: String): FrameQualityMetrics
     qualityReason = reason
 )
 
-private fun writeMetrics(frame: JSONObject, metrics: FrameQualityMetrics) {
+private fun writeMetrics(frame: JSONObject, metrics: InternalFrameQualityMetrics) {
     frame.put("qualityScoringBackend", metrics.scoringBackend)
         .put("sharpnessRaw", metrics.sharpnessRaw.toDouble())
         .put("sharpnessScore", metrics.sharpnessScore.toDouble())

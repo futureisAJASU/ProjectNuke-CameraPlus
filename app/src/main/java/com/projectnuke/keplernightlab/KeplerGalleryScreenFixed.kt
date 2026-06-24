@@ -49,6 +49,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -110,7 +111,7 @@ fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
     }
 
     selectedJob?.let { job ->
-        KeplerGalleryDetailScreenFixed(
+        KeplerGalleryDetailScreenFixedV2(
             job = job,
             onBack = { selectedJob = null },
             onDeleted = {
@@ -810,6 +811,322 @@ private fun GalleryFixedReprocessSection(
             }
         }
     }
+}
+
+@Composable
+private fun KeplerGalleryDetailScreenFixedV2(
+    job: KeplerGalleryJobSummary,
+    onBack: () -> Unit,
+    onDeleted: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var currentJob by remember(job.id) { mutableStateOf(job) }
+    var actionStatus by remember { mutableStateOf<String?>(null) }
+    var frameReviewItems by remember(job.id) { mutableStateOf<List<KeplerFrameReviewItem>>(emptyList()) }
+    var frameSelectionMode by remember(job.id) { mutableStateOf(FrameSelectionMode.MANUAL) }
+    var isReprocessing by remember { mutableStateOf(false) }
+    var refreshKey by remember { mutableIntStateOf(0) }
+    var showReview by remember { mutableStateOf(false) }
+    var showAiDialog by remember { mutableStateOf<FrameSelectionRecommendation?>(null) }
+
+    LaunchedEffect(job.id, refreshKey) {
+        currentJob = withContext(Dispatchers.IO) {
+            loadKeplerGalleryJobs(context).firstOrNull { it.id == job.id }
+        } ?: currentJob
+        frameReviewItems = withContext(Dispatchers.IO) {
+            loadFrameReviewItems(context, currentJob.directory).getOrElse { emptyList() }
+        }
+        frameSelectionMode = persistedFrameSelectionMode(currentJob.metadata ?: JSONObject())
+            ?: FrameSelectionMode.MANUAL
+    }
+
+    if (showReview) {
+        FrameReviewScreenFixed(
+            job = currentJob,
+            frames = frameReviewItems,
+            onBack = {
+                showReview = false
+                scope.launch {
+                    withContext(Dispatchers.IO) {
+                        saveFrameSelection(currentJob.directory, frameSelectionMode, frameReviewItems)
+                    }
+                    refreshKey++
+                }
+            },
+            onFramesChanged = {
+                frameReviewItems = it
+                frameSelectionMode = FrameSelectionMode.MANUAL
+            }
+        )
+        return
+    }
+
+    showAiDialog?.let { recommendation ->
+        AlertDialog(
+            onDismissRequest = { showAiDialog = null },
+            title = { Text("AI 추천") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(recommendation.summary)
+                    Text("포함 ${recommendation.includedFrameIndices.size}개", color = galleryFixedMuted)
+                    recommendation.excludedFrameReasons.entries.take(5).forEach { (index, reason) ->
+                        Text("#$index 제외: $reason", color = galleryFixedMuted)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val updated = applyRecommendationToReviewItems(frameReviewItems, recommendation)
+                    frameReviewItems = updated
+                    frameSelectionMode = FrameSelectionMode.AI_RECOMMENDED
+                    showAiDialog = null
+                    scope.launch {
+                        withContext(Dispatchers.IO) {
+                            saveFrameSelection(currentJob.directory, FrameSelectionMode.AI_RECOMMENDED, updated)
+                        }
+                        actionStatus = recommendation.summary
+                        refreshKey++
+                    }
+                }) { Text("추천 적용") }
+            },
+            dismissButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = {
+                        frameReviewItems = applyRecommendationToReviewItems(frameReviewItems, recommendation)
+                        frameSelectionMode = FrameSelectionMode.AI_RECOMMENDED
+                        showAiDialog = null
+                        showReview = true
+                    }) { Text("직접 수정") }
+                    TextButton(onClick = { showAiDialog = null }) { Text("취소") }
+                }
+            }
+        )
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(galleryFixedBackground)
+            .padding(androidx.compose.foundation.layout.WindowInsets.safeDrawing.asPaddingValues())
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Button(onClick = onBack) { Text("뒤로") }
+            Button(onClick = onDeleted) { Text("목록 갱신") }
+        }
+        if (actionStatus != null) {
+            Text(
+                text = actionStatus.orEmpty(),
+                color = galleryFixedMuted,
+                modifier = Modifier.padding(horizontal = 16.dp)
+            )
+        }
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+            contentPadding = PaddingValues(bottom = 96.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item {
+                Text(currentJob.directory.name, style = MaterialTheme.typography.headlineSmall)
+            }
+            item {
+                AsyncThumbnailImage(
+                    file = currentJob.finalPreviewFile,
+                    maxDimension = 1280,
+                    modifier = Modifier.fillMaxWidth().height(300.dp),
+                    contentScale = ContentScale.Fit,
+                    contentDescription = "Final image"
+                )
+            }
+            item { GalleryFixedQualitySection(currentJob) }
+            item {
+                GalleryFixedSection("프레임 선택") {
+                    GalleryFixedField("원본 프레임", "${frameReviewItems.size}개")
+                    GalleryFixedField("선택 포함", "${frameReviewItems.count { it.included }}개")
+                    GalleryFixedField("선택 모드", frameSelectionMode.name)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(enabled = frameReviewItems.isNotEmpty(), onClick = { showReview = true }) { Text("프레임 확인") }
+                        Button(
+                            enabled = frameReviewItems.isNotEmpty(),
+                            onClick = {
+                                scope.launch {
+                                    val recommendation = withContext(Dispatchers.IO) {
+                                        RuleBasedFrameSelectionAdvisor().recommend(currentJob, frameReviewItems)
+                                    }
+                                    val updated = applyRecommendationToReviewItems(frameReviewItems, recommendation)
+                                    frameReviewItems = updated
+                                    frameSelectionMode = FrameSelectionMode.AUTO_RULE_BASED
+                                    withContext(Dispatchers.IO) {
+                                        saveFrameSelection(currentJob.directory, FrameSelectionMode.AUTO_RULE_BASED, updated)
+                                    }
+                                    actionStatus = recommendation.summary
+                                    refreshKey++
+                                }
+                            }
+                        ) { Text("자동 선택") }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(enabled = frameReviewItems.isNotEmpty(), onClick = {
+                            scope.launch {
+                                showAiDialog = withContext(Dispatchers.IO) {
+                                    AiFrameSelectionAdvisor().recommend(currentJob, frameReviewItems)
+                                }
+                            }
+                        }) { Text("AI 추천") }
+                        Button(
+                            enabled = !isReprocessing && frameReviewItems.any { it.included },
+                            onClick = {
+                                isReprocessing = true
+                                scope.launch {
+                                    val selected = frameReviewItems.filter { it.included }.map { it.index }.toSet()
+                                    withContext(Dispatchers.IO) {
+                                        saveFrameSelection(currentJob.directory, frameSelectionMode, frameReviewItems)
+                                    }
+                                    val result = reprocessKeplerGalleryJob(
+                                        context = context,
+                                        jobDir = currentJob.directory,
+                                        outputSettings = OutputSettingsStore.load(context),
+                                        frameSelection = selected,
+                                        onProgress = { actionStatus = it }
+                                    )
+                                    result.onSuccess {
+                                        actionStatus = "다시 합성했습니다."
+                                    }.onFailure {
+                                        actionStatus = it.message ?: "다시 합성하지 못했습니다."
+                                    }
+                                    isReprocessing = false
+                                    refreshKey++
+                                }
+                            }
+                        ) { Text(if (isReprocessing) "다시 합성 중…" else "선택한 프레임으로 다시 합성") }
+                    }
+                }
+            }
+            item {
+                GalleryFixedSection("요약") {
+                    GalleryFixedField("모드", modeLabelFixed(currentJob))
+                    GalleryFixedField("생성", formatTimestamp(currentJob.createdAt))
+                    GalleryFixedField("상태", currentJob.status)
+                    GalleryFixedField("해상도", resolutionTextFixed(currentJob))
+                    GalleryFixedField("경로", currentJob.directory.absolutePath)
+                }
+            }
+            item {
+                Button(onClick = onDeleted) { Text("목록으로") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FrameReviewScreenFixed(
+    job: KeplerGalleryJobSummary,
+    frames: List<KeplerFrameReviewItem>,
+    onBack: () -> Unit,
+    onFramesChanged: (List<KeplerFrameReviewItem>) -> Unit
+) {
+    LazyVerticalGrid(
+        columns = GridCells.Adaptive(148.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .background(galleryFixedBackground)
+            .padding(androidx.compose.foundation.layout.WindowInsets.safeDrawing.asPaddingValues())
+            .padding(horizontal = 12.dp),
+        contentPadding = PaddingValues(bottom = 96.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        item(span = { GridItemSpan(maxLineSpan) }) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = onBack) { Text("뒤로") }
+                }
+                Text(job.directory.name, style = MaterialTheme.typography.titleMedium)
+                Text("포함 ${frames.count { it.included }} / 전체 ${frames.size}", color = galleryFixedMuted)
+            }
+        }
+        items(frames, key = { it.index }) { item ->
+            Surface(
+                color = if (item.included) galleryFixedSelectedCard else galleryFixedCard,
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(2.dp, if (item.included) Color.White else galleryFixedMuted, RoundedCornerShape(8.dp))
+                    .combinedClickable(
+                        onClick = { onFramesChanged(toggleFrameReviewItem(frames, item.index)) },
+                        onLongClick = { onFramesChanged(toggleFrameReviewItem(frames, item.index)) }
+                    )
+            ) {
+                Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Box(modifier = Modifier.fillMaxWidth().height(120.dp)) {
+                        AsyncThumbnailImage(
+                            file = item.thumbnailFile,
+                            maxDimension = 480,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop,
+                            contentDescription = item.fileName
+                        )
+                        if (!item.included) {
+                            Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
+                        }
+                        Text(
+                            text = if (item.included) "포함" else "제외",
+                            color = if (item.included) Color.Black else Color.White,
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(6.dp)
+                                .background(if (item.included) Color.White else Color.Black.copy(alpha = 0.55f), RoundedCornerShape(999.dp))
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                    Text("#${item.index}", style = MaterialTheme.typography.labelLarge)
+                    Text(item.fileName, color = galleryFixedMuted)
+                    Text(item.quality?.label ?: "품질 미평가", color = galleryFixedMuted)
+                    Text(
+                        text = item.reason ?: "사유 없음",
+                        color = galleryFixedMuted,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Button(onClick = { onFramesChanged(toggleFrameReviewItem(frames, item.index)) }) {
+                        Text(if (item.included) "제외" else "포함")
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun toggleFrameReviewItem(
+    frames: List<KeplerFrameReviewItem>,
+    index: Int
+): List<KeplerFrameReviewItem> = frames.map { frame ->
+    if (frame.index != index) {
+        frame
+    } else {
+        val included = !frame.included
+        frame.copy(
+            included = included,
+            userDecision = if (included) FrameUserDecision.INCLUDE else FrameUserDecision.EXCLUDE,
+            reason = if (included) frame.reason else frame.reason ?: "사용자 제외"
+        )
+    }
+}
+
+private fun applyRecommendationToReviewItems(
+    frames: List<KeplerFrameReviewItem>,
+    recommendation: FrameSelectionRecommendation
+): List<KeplerFrameReviewItem> = frames.map { frame ->
+    val included = frame.index in recommendation.includedFrameIndices
+    frame.copy(
+        included = included,
+        recommendedInclude = included,
+        userDecision = if (included) FrameUserDecision.AUTO else FrameUserDecision.EXCLUDE,
+        reason = if (included) frame.reason else recommendation.excludedFrameReasons[frame.index] ?: frame.reason
+    )
 }
 
 @Composable

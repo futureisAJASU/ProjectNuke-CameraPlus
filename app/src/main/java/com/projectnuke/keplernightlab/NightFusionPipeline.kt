@@ -140,6 +140,7 @@ fun reprocessYuvJob(
     context: Context,
     jobDir: File,
     finalOutputFormat: FinalOutputFormat,
+    selectedFrameIndices: Set<Int>? = null,
     fusionParams: ClassicYuvFusionParams? = null,
     onStatus: (String) -> Unit
 ) {
@@ -151,6 +152,9 @@ fun reprocessYuvJob(
         var totalFrames = 0
         var enabledFrames = 0
         try {
+            if (selectedFrameIndices != null) {
+                applyExplicitYuvFrameSelection(jobDir, selectedFrameIndices)
+            }
             val initialJob = JSONObject(jobFile.readText())
             val frames = initialJob.optJSONArray("frames")
             totalFrames = frames?.length() ?: 0
@@ -231,6 +235,22 @@ fun reprocessYuvJob(
             workerThread.quitSafely()
         }
     }
+}
+
+private fun applyExplicitYuvFrameSelection(jobDir: File, selectedFrameIndices: Set<Int>) {
+    val job = loadJobJson(jobDir)
+    val frames = job.optJSONArray("frames") ?: return
+    repeat(frames.length()) { position ->
+        val frame = frames.optJSONObject(position) ?: return@repeat
+        val index = frame.optInt("index", position)
+        val included = index in selectedFrameIndices
+        frame.put("enabled", included)
+            .put("excludedByUser", !included)
+            .put("excludeReason", if (included) JSONObject.NULL else "FRAME_SELECTION")
+    }
+    job.put("includedFrameIndices", org.json.JSONArray(selectedFrameIndices.sorted()))
+        .put("frameSelectionUpdatedAt", System.currentTimeMillis())
+    saveJobJson(jobDir, job)
 }
 
 private fun updateYuvReprocessHistory(

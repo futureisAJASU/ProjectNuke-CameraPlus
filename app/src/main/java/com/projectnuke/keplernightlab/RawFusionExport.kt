@@ -265,12 +265,16 @@ fun reprocessRawJob(
     context: Context,
     jobDir: File,
     finalOutputFormat: FinalOutputFormat,
+    selectedFrameIndices: Set<Int>? = null,
     onStatus: (String) -> Unit
 ) {
     val main = Handler(Looper.getMainLooper())
     fun post(message: String) = main.post { onStatus(message) }
     val thread = HandlerThread("KeplerRawReprocessThread").apply { start() }
     Handler(thread.looper).post {
+        if (selectedFrameIndices != null) {
+            applyExplicitFrameSelection(jobDir, selectedFrameIndices)
+        }
         val enabledCount = runCatching { getEnabledRawFrames(jobDir).size }.getOrDefault(0)
         val totalCount = runCatching {
             loadJobJson(jobDir).optJSONArray("frames")?.length() ?: 0
@@ -354,6 +358,22 @@ fun reprocessRawJob(
             thread.quitSafely()
         }
     }
+}
+
+private fun applyExplicitFrameSelection(jobDir: File, selectedFrameIndices: Set<Int>) {
+    val job = loadJobJson(jobDir)
+    val frames = job.optJSONArray("frames") ?: return
+    repeat(frames.length()) { position ->
+        val frame = frames.optJSONObject(position) ?: return@repeat
+        val index = frame.optInt("index", position)
+        val included = index in selectedFrameIndices
+        frame.put("enabled", included)
+            .put("excludedByUser", !included)
+            .put("excludeReason", if (included) JSONObject.NULL else "FRAME_SELECTION")
+    }
+    job.put("includedFrameIndices", org.json.JSONArray(selectedFrameIndices.sorted()))
+        .put("frameSelectionUpdatedAt", System.currentTimeMillis())
+    saveJobJson(jobDir, job)
 }
 
 private fun updateReprocessHistory(
