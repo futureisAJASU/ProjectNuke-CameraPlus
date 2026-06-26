@@ -953,12 +953,16 @@ private fun KeplerGalleryDetailScreenFixedV2(
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Button(
-                                modifier = Modifier.weight(1f),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(56.dp),
                                 enabled = frameReviewItems.isNotEmpty(),
                                 onClick = { showReview = true }
-                            ) { Text("프레임 확인", textAlign = TextAlign.Center) }
+                            ) { Text("프레임 확인", textAlign = TextAlign.Center, maxLines = 1) }
                             Button(
-                                modifier = Modifier.weight(1f),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(56.dp),
                                 enabled = frameReviewItems.isNotEmpty(),
                                 onClick = {
                                     scope.launch {
@@ -975,9 +979,11 @@ private fun KeplerGalleryDetailScreenFixedV2(
                                         refreshKey++
                                     }
                                 }
-                            ) { Text("자동 선택", textAlign = TextAlign.Center) }
+                            ) { Text("자동 선택", textAlign = TextAlign.Center, maxLines = 1) }
                             Button(
-                                modifier = Modifier.weight(1f),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(56.dp),
                                 enabled = frameReviewItems.isNotEmpty(),
                                 onClick = {
                                     scope.launch {
@@ -986,10 +992,12 @@ private fun KeplerGalleryDetailScreenFixedV2(
                                         }
                                     }
                                 }
-                            ) { Text("AI 추천", textAlign = TextAlign.Center) }
+                            ) { Text("AI 추천", textAlign = TextAlign.Center, maxLines = 1) }
                         }
                         Button(
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(56.dp),
                             enabled = !isReprocessing && frameReviewItems.any { it.included },
                             onClick = {
                                 isReprocessing = true
@@ -1017,7 +1025,8 @@ private fun KeplerGalleryDetailScreenFixedV2(
                         ) {
                             Text(
                                 if (isReprocessing) "다시 합성 중…" else "선택한 프레임으로 다시 합성",
-                                textAlign = TextAlign.Center
+                                textAlign = TextAlign.Center,
+                                maxLines = 1
                             )
                         }
                     }
