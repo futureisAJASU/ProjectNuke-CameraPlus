@@ -481,8 +481,8 @@ private fun resolveFrameSelection(
 }
 
 private fun resolveSelectionMode(job: JSONObject, explicitSelection: Set<Int>?): FrameSelectionMode {
-    if (explicitSelection != null) return FrameSelectionMode.MANUAL
-    return persistedFrameSelectionMode(job) ?: FrameSelectionMode.AUTO_RULE_BASED
+    return persistedFrameSelectionMode(job)
+        ?: if (explicitSelection != null) FrameSelectionMode.MANUAL else FrameSelectionMode.AUTO_RULE_BASED
 }
 
 private fun requiredSelectedFrameCount(kind: ReprocessJobKind): Int = when (kind) {
