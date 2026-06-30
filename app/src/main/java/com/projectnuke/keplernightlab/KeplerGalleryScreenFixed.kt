@@ -1030,64 +1030,6 @@ private fun KeplerGalleryDetailScreenFixedV2(
                             )
                         }
                     }
-                    if (false) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(enabled = frameReviewItems.isNotEmpty(), onClick = { showReview = true }) { Text("프레임 확인") }
-                        Button(
-                            enabled = frameReviewItems.isNotEmpty(),
-                            onClick = {
-                                scope.launch {
-                                    val recommendation = withContext(Dispatchers.IO) {
-                                        RuleBasedFrameSelectionAdvisor().recommend(currentJob, frameReviewItems)
-                                    }
-                                    val updated = applyRecommendationToReviewItems(frameReviewItems, recommendation)
-                                    frameReviewItems = updated
-                                    frameSelectionMode = FrameSelectionMode.AUTO_RULE_BASED
-                                    withContext(Dispatchers.IO) {
-                                        saveFrameSelection(currentJob.directory, FrameSelectionMode.AUTO_RULE_BASED, updated)
-                                    }
-                                    actionStatus = recommendation.summary
-                                    refreshKey++
-                                }
-                            }
-                        ) { Text("자동 선택") }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(enabled = frameReviewItems.isNotEmpty(), onClick = {
-                            scope.launch {
-                                showAiDialog = withContext(Dispatchers.IO) {
-                                    AiFrameSelectionAdvisor().recommend(currentJob, frameReviewItems)
-                                }
-                            }
-                        }) { Text("AI 추천") }
-                        Button(
-                            enabled = !isReprocessing && frameReviewItems.any { it.included },
-                            onClick = {
-                                isReprocessing = true
-                                scope.launch {
-                                    val selected = frameReviewItems.filter { it.included }.map { it.index }.toSet()
-                                    withContext(Dispatchers.IO) {
-                                        saveFrameSelection(currentJob.directory, frameSelectionMode, frameReviewItems)
-                                    }
-                                    val result = reprocessKeplerGalleryJob(
-                                        context = context,
-                                        jobDir = currentJob.directory,
-                                        outputSettings = OutputSettingsStore.load(context),
-                                        frameSelection = selected,
-                                        onProgress = { actionStatus = it }
-                                    )
-                                    result.onSuccess {
-                                        actionStatus = "다시 합성했습니다."
-                                    }.onFailure {
-                                        actionStatus = it.message ?: "다시 합성하지 못했습니다."
-                                    }
-                                    isReprocessing = false
-                                    refreshKey++
-                                }
-                            }
-                        ) { Text(if (isReprocessing) "다시 합성 중…" else "선택한 프레임으로 다시 합성") }
-                    }
-                    }
                 }
             }
             item {
