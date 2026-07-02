@@ -273,14 +273,14 @@ fun MainCameraScreen(
         mutableStateOf(LensSlot.entries.firstOrNull { it.name == savedSettings.selectedLensSlotName } ?: LensSlot.MAIN_1X)
     }
     var selectedThreeXSource by remember {
-        mutableStateOf(ThreeXSourceMode.entries.firstOrNull { it.name == savedSettings.selectedThreeXSourceName } ?: ThreeXSourceMode.OPTICAL)
+        mutableStateOf(parseThreeXSourceModeOrDefault(savedSettings.selectedThreeXSourceName))
     }
     var zoomUiState by remember {
         mutableStateOf(
             ZoomUiState(
                 zoomRatio = savedSettings.zoomRatio,
                 lensSlot = LensSlot.entries.firstOrNull { it.name == savedSettings.selectedLensSlotName } ?: LensSlot.MAIN_1X,
-                useOpticalTeleAt3x = (ThreeXSourceMode.entries.firstOrNull { it.name == savedSettings.selectedThreeXSourceName } ?: ThreeXSourceMode.OPTICAL) == ThreeXSourceMode.OPTICAL
+                useOpticalTeleAt3x = parseThreeXSourceModeOrDefault(savedSettings.selectedThreeXSourceName) == ThreeXSourceMode.OPTICAL
             )
         )
     }
@@ -655,16 +655,15 @@ fun MainCameraScreen(
                 onThreeXSourceChange = { source ->
                     Log.d(
                         "Kepler3xSelection",
-                        "phase=uiEvent requestedSource=$source previousSource=$selectedThreeXSource " +
-                            "newSource=$source selectedLensSlot=$selectedLensSlot " +
-                            "zoom=${zoomUiState.zoomRatio} optical=${zoomUiState.useOpticalTeleAt3x} " +
+                        "phase=uiEvent selectedSource=$source previousSource=$selectedThreeXSource " +
+                            "selectedLensSlot=$selectedLensSlot " +
                             "cameraId=${cameraState.selection.cameraId} " +
-                            "actual=${cameraState.selection.actualLensSource} " +
+                            "actualLensSource=${cameraState.selection.actualLensSource} " +
                             "physicalCameraId=${cameraState.selection.physicalCameraId} " +
-                            "effectiveZoom=${cameraState.selection.effectiveZoomRatio} " +
-                            "useCrop=${cameraState.selection.useCrop} " +
-                            "previewZoom=${cameraState.previewZoomRatio} " +
-                            "captureZoom=${cameraState.captureZoomRatio}"
+                            "requestedUiZoomRatio=${zoomUiState.zoomRatio} " +
+                            "previewZoomRatio=${cameraState.previewZoomRatio} " +
+                            "captureZoomRatio=${cameraState.captureZoomRatio} " +
+                            "finalRequestZoom=${cameraState.captureZoomRatio}"
                     )
                     val result = handleThreeXSourceChange(
                         context = context,
@@ -1620,7 +1619,7 @@ fun ThreeXSourceDots(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        ThreeXSourceMode.entries.forEach { source ->
+        VisibleThreeXSourceModes.forEach { source ->
             ThreeXSourceDot(
                 source = source,
                 selected = selected == source,

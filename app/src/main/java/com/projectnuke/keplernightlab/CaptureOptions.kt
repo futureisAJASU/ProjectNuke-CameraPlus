@@ -22,9 +22,22 @@ enum class ThreeXSourceMode(
     val label: String
 ) {
     AUTO("자동"),
-    OPTICAL("3x 광학"),
-    MAIN_CROP("3x 크롭")
+    OPTICAL("광학"),
+    MAIN_CROP("크롭")
 }
+
+internal fun parseThreeXSourceModeOrDefault(name: String?): ThreeXSourceMode = when (name) {
+    ThreeXSourceMode.MAIN_CROP.name -> ThreeXSourceMode.MAIN_CROP
+    ThreeXSourceMode.OPTICAL.name,
+    ThreeXSourceMode.AUTO.name,
+    null -> ThreeXSourceMode.OPTICAL
+    else -> ThreeXSourceMode.OPTICAL
+}
+
+internal val VisibleThreeXSourceModes: List<ThreeXSourceMode> = listOf(
+    ThreeXSourceMode.OPTICAL,
+    ThreeXSourceMode.MAIN_CROP
+)
 
 data class SelectedCaptureOptions(
     val lensSlot: LensSlot,

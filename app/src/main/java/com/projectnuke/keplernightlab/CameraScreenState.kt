@@ -162,16 +162,16 @@ internal fun rememberCameraSelectionState(
             Log.d(
                 "Kepler3xRoute",
                 "phase=finalSelection selectedLensSlot=$selectedLensSlot " +
-                    "uiSelectedZoom=$selectedLensSlot uiSelectedRoute=$selectedThreeXSource " +
-                    "requestedZoomRatio=${zoomUiState.zoomRatio} " +
-                    "previewCameraId=${selection.cameraId} captureCameraId=${selection.cameraId} " +
+                    "selectedSource=$selectedThreeXSource " +
+                    "cameraId=${selection.cameraId} " +
+                    "actualLensSource=${selection.actualLensSource} " +
                     "physicalCameraId=${selection.physicalCameraId} " +
-                    "usePhysicalTele=${selection.physicalCameraId != null && !selection.useCrop} " +
-                    "useMainCrop=${selection.useCrop} cropRegion=unknown " +
+                    "requestedUiZoomRatio=${zoomUiState.zoomRatio} " +
+                    "previewZoomRatio=$previewZoomRatio " +
+                    "captureZoomRatio=$captureZoomRatio " +
+                    "finalRequestZoom=$captureZoomRatio " +
                     "finalRoute=${selection.finalZoomRouteName()} " +
                     "fallbackReason=${selection.routeFallbackReason() ?: "none"} " +
-                    "actual=${selection.actualLensSource} effectiveZoom=${selection.effectiveZoomRatio} " +
-                    "previewZoom=$previewZoomRatio captureZoom=$captureZoomRatio " +
                     "requestedZoomRoute=${selectedThreeXSource.name}"
             )
         }

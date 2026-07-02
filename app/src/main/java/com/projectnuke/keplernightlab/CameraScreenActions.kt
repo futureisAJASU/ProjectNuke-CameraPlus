@@ -140,13 +140,14 @@ internal fun handleThreeXSourceChange(
     val selection = selectCameraForOptions(context, selectionOptions)
     Log.d(
         "Kepler3xSelection",
-        "phase=stateResult requestedSource=$source previousSource=$previousThreeXSource " +
-            "newSource=$source selectedLensSlot=${LensSlot.THREE_X} " +
-            "zoom=${updatedZoomState.zoomRatio} optical=${updatedZoomState.useOpticalTeleAt3x} " +
-            "cameraId=${selection.cameraId} actual=${selection.actualLensSource} " +
+        "phase=stateResult selectedSource=$source previousSource=$previousThreeXSource " +
+            "selectedLensSlot=${LensSlot.THREE_X} " +
+            "cameraId=${selection.cameraId} actualLensSource=${selection.actualLensSource} " +
             "physicalCameraId=${selection.physicalCameraId} " +
-            "effectiveZoom=${selection.effectiveZoomRatio} useCrop=${selection.useCrop} " +
-            "previewZoom=${selection.effectiveZoomRatio} captureZoom=${selection.effectiveZoomRatio}"
+            "requestedUiZoomRatio=${updatedZoomState.zoomRatio} " +
+            "previewZoomRatio=${selection.effectiveZoomRatio} " +
+            "captureZoomRatio=${selection.effectiveZoomRatio} " +
+            "finalRequestZoom=${selection.effectiveZoomRatio}"
     )
     return LensChangeResult(
         lensSlot = LensSlot.THREE_X,
