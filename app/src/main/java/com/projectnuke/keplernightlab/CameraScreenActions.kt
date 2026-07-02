@@ -188,13 +188,14 @@ internal fun prepareCaptureAttempt(
         latestMotionScore = input.latestMotionScore
     )
     val selection = input.cameraSelection
+    val requestedUiZoomRatio = input.requestedUiZoomRatio
     val captureZoomRatio = input.captureZoomRatio
     if (selection.requestedLensSlot == LensSlot.THREE_X) {
         Log.d(
             "Kepler3xSelection",
             "phase=capture lens=${selection.requestedLensSlot} " +
                 "source=${selection.requestedThreeXSourceMode} " +
-                "cameraId=${selection.cameraId} captureZoom=$captureZoomRatio " +
+                "cameraId=${selection.cameraId} requestedUiZoom=$requestedUiZoomRatio captureZoom=$captureZoomRatio " +
                 "actual=${selection.actualLensSource} " +
                 "physicalCameraId=${selection.physicalCameraId} " +
                 "physicalTele=${selection.isOpticalTeleActuallyUsed && !selection.useCrop} " +
@@ -205,6 +206,7 @@ internal fun prepareCaptureAttempt(
         settings = settings,
         framePlan = framePlan,
         selection = selection,
+        requestedUiZoomRatio = requestedUiZoomRatio,
         captureZoomRatio = captureZoomRatio,
         startMessage = buildCaptureStartMessage(
             input.selectedResolution,
@@ -264,6 +266,7 @@ internal fun startCapturePipeline(
     }
     val selection = request.prepared.selection
     val physicalCameraId = selection.physicalCameraId
+    val requestedUiZoomRatio = request.prepared.requestedUiZoomRatio
     val captureZoomRatio = request.prepared.captureZoomRatio
     val finalRoute = selection.finalZoomRouteName()
     val fallbackReason = selection.routeFallbackReason()
@@ -274,6 +277,7 @@ internal fun startCapturePipeline(
             "actual=${selection.actualLensSource} " +
             "uiSelectedZoom=${selection.requestedLensSlot} " +
             "uiSelectedRoute=${selection.requestedThreeXSourceMode} " +
+            "requestedUiZoomRatio=$requestedUiZoomRatio " +
             "requestedZoomRatio=${request.prepared.captureZoomRatio} " +
             "previewCameraId=${selection.cameraId} captureCameraId=${selection.cameraId} " +
             "requestedPhysicalCameraId=${selection.physicalCameraId} " +
@@ -290,6 +294,7 @@ internal fun startCapturePipeline(
             frameCount = request.prepared.framePlan.framesToCapture,
             finalOutputFormat = request.finalOutputFormat,
             zoomRatio = captureZoomRatio,
+            requestedUiZoomRatio = requestedUiZoomRatio,
             physicalCameraId = physicalCameraId,
             focusAeState = request.focusAeState,
             frameCountMode = request.prepared.settings.mode,
@@ -312,6 +317,7 @@ internal fun startCapturePipeline(
             resolutionPlan = request.resolutionPlan,
             finalOutputFormat = request.finalOutputFormat,
             zoomRatio = captureZoomRatio,
+            requestedUiZoomRatio = requestedUiZoomRatio,
             physicalCameraId = physicalCameraId,
             zoomRoute = selection.requestedThreeXSourceMode,
             previewRoute = finalRoute,
@@ -328,6 +334,7 @@ internal fun startCapturePipeline(
             resolutionMode = request.selectedResolution,
             finalOutputFormat = request.finalOutputFormat,
             zoomRatio = captureZoomRatio,
+            requestedUiZoomRatio = requestedUiZoomRatio,
             physicalCameraId = physicalCameraId,
             zoomRoute = selection.requestedThreeXSourceMode,
             previewRoute = finalRoute,

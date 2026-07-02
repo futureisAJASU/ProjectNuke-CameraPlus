@@ -30,6 +30,7 @@ internal data class LensChangeResult(
 
 internal data class CapturePreparationInput(
     val cameraSelection: CameraSelection,
+    val requestedUiZoomRatio: Float,
     val captureZoomRatio: Float,
     val resolutionPlan: ResolutionCapturePlan,
     val selectedResolution: CaptureResolutionMode,
@@ -46,6 +47,7 @@ internal data class PreparedCaptureAttempt(
     val settings: FrameCountSettings,
     val framePlan: FramePlan,
     val selection: CameraSelection,
+    val requestedUiZoomRatio: Float,
     val captureZoomRatio: Float,
     val startMessage: String
 )

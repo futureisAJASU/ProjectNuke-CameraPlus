@@ -715,6 +715,7 @@ fun MainCameraScreen(
                             buildPreparationInput = { activePlan ->
                                 CapturePreparationInput(
                                     cameraSelection = cameraState.selection,
+                                    requestedUiZoomRatio = zoomUiState.zoomRatio,
                                     captureZoomRatio = cameraState.captureZoomRatio,
                                     resolutionPlan = activePlan,
                                     selectedResolution = selectedResolution,
@@ -912,6 +913,7 @@ fun MainCameraScreen(
                             frameCount = 1,
                             resolutionMode = CaptureResolutionMode.MP50,
                             zoomRatio = 1.0f,
+                            requestedUiZoomRatio = 1.0f,
                             focusAeState = focusAeState,
                             onStatus = callback,
                             onComplete = { jobDir ->

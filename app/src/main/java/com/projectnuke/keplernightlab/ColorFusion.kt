@@ -97,6 +97,7 @@ fun captureYuvBurstColorWithMotion(
     frameCount: Int = 6,
     resolutionMode: CaptureResolutionMode = CaptureResolutionMode.MP12,
     zoomRatio: Float = 1.0f,
+    requestedUiZoomRatio: Float,
     physicalCameraId: String? = null,
     zoomRoute: ThreeXSourceMode = ThreeXSourceMode.AUTO,
     previewRoute: String? = null,
@@ -583,13 +584,16 @@ fun captureYuvBurstColorWithMotion(
                             surface = reader.surface,
                             cameraId = cameraId,
                             physicalCameraId = physicalCameraId,
+                            requestedUiZoomRatio = requestedUiZoomRatio,
+                            requestedCaptureZoomRatio = zoomRatio,
+                            selectedRoute = zoomRoute,
                             handler = backgroundHandler,
-                            onConfigured = { session, physicalRoute ->
+                            onConfigured = { session, captureRoute ->
                                     captureSession = session
                                     postStatus("Color Fusion 초기화 7/7: 세션 준비 완료. $frameCount 장 촬영 중...")
 
                                     try {
-                                        val requestZoomRatio = if (physicalRoute) 1.0f else zoomRatio
+                                        val requestZoomRatio = captureRoute.finalRequestZoomRatio(zoomRatio)
                                         val requests = List(frameCount) {
                                             val (builder, selectedTemplate) =
                                                 createYuvBurstCaptureRequestBuilder(
@@ -634,10 +638,11 @@ fun captureYuvBurstColorWithMotion(
                                                 ) {
                                                     Log.i(
                                                         "KeplerPhysicalRoute",
-                                                        "capture completed path=${if (physicalRoute) "physical" else "cropFallback"} " +
+                                                        "capture completed selectedRoute=$zoomRoute actualRoute=$captureRoute " +
+                                                            "requestedUiZoomRatio=$requestedUiZoomRatio " +
                                                             "requestedPhysicalCameraId=$physicalCameraId " +
                                                             "activePhysicalId=${result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)} " +
-                                                            "zoomRatio=$requestZoomRatio"
+                                                            "finalRequestZoom=$requestZoomRatio"
                                                     )
                                                 }
                                             },

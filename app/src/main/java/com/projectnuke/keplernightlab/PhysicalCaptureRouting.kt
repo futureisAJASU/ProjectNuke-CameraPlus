@@ -9,22 +9,42 @@ import android.os.Handler
 import android.util.Log
 import android.view.Surface
 
+internal enum class PhysicalCaptureRoute {
+    NORMAL,
+    PHYSICAL,
+    PHYSICAL_FAILED_CROP_FALLBACK
+}
+
+internal fun PhysicalCaptureRoute.finalRequestZoomRatio(normalZoomRatio: Float): Float = when (this) {
+    PhysicalCaptureRoute.NORMAL -> normalZoomRatio
+    PhysicalCaptureRoute.PHYSICAL -> 1.0f
+    PhysicalCaptureRoute.PHYSICAL_FAILED_CROP_FALLBACK -> 3.0f
+}
+
 internal fun createRoutedStillCaptureSession(
     camera: CameraDevice,
     surface: Surface,
     cameraId: String,
     physicalCameraId: String?,
+    requestedUiZoomRatio: Float,
+    requestedCaptureZoomRatio: Float,
+    selectedRoute: ThreeXSourceMode,
     handler: Handler,
-    onConfigured: (CameraCaptureSession, Boolean) -> Unit,
+    onConfigured: (CameraCaptureSession, PhysicalCaptureRoute) -> Unit,
     onFailed: (String) -> Unit
 ) {
-    fun createNormalOutput(reason: String, cropFallback: Boolean) {
-        val path = if (cropFallback) "cropFallback" else "normal"
-        val zoom = if (cropFallback) "3.0" else "unchanged"
+    fun createNormalOutput(reason: String, route: PhysicalCaptureRoute) {
+        val path = when (route) {
+            PhysicalCaptureRoute.NORMAL -> "normal"
+            PhysicalCaptureRoute.PHYSICAL_FAILED_CROP_FALLBACK -> "cropFallback"
+            PhysicalCaptureRoute.PHYSICAL -> "physical"
+        }
+        val finalRequestZoom = route.finalRequestZoomRatio(requestedCaptureZoomRatio)
         Log.i(
             "KeplerPhysicalRoute",
             "capture path=$path cameraId=$cameraId requestedPhysicalCameraId=$physicalCameraId " +
-                "reason=$reason zoomRatio=$zoom"
+                "requestedUiZoomRatio=$requestedUiZoomRatio selectedRoute=$selectedRoute " +
+                "actualRoute=$route finalRequestZoom=$finalRequestZoom reason=$reason"
         )
         try {
             camera.createCaptureSession(
@@ -33,9 +53,11 @@ internal fun createRoutedStillCaptureSession(
                     override fun onConfigured(session: CameraCaptureSession) {
                         Log.i(
                             "KeplerPhysicalRoute",
-                            "capture normal output configured path=$path cameraId=$cameraId zoomRatio=$zoom"
+                            "capture normal output configured path=$path cameraId=$cameraId " +
+                                "requestedUiZoomRatio=$requestedUiZoomRatio selectedRoute=$selectedRoute " +
+                                "actualRoute=$route finalRequestZoom=$finalRequestZoom"
                         )
-                        onConfigured(session, false)
+                        onConfigured(session, route)
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
@@ -54,7 +76,7 @@ internal fun createRoutedStillCaptureSession(
     }
 
     if (physicalCameraId == null || Build.VERSION.SDK_INT < 28) {
-        createNormalOutput("physical output not requested", cropFallback = false)
+        createNormalOutput("physical output not requested", PhysicalCaptureRoute.NORMAL)
         return
     }
 
@@ -72,9 +94,11 @@ internal fun createRoutedStillCaptureSession(
                         Log.i(
                             "KeplerPhysicalRoute",
                             "capture physical output configured path=physical cameraId=$cameraId " +
-                                "requestedPhysicalCameraId=$physicalCameraId zoomRatio=1.0"
+                                "requestedPhysicalCameraId=$physicalCameraId " +
+                                "requestedUiZoomRatio=$requestedUiZoomRatio selectedRoute=$selectedRoute " +
+                                "actualRoute=${PhysicalCaptureRoute.PHYSICAL} finalRequestZoom=1.0"
                         )
-                        onConfigured(session, true)
+                        onConfigured(session, PhysicalCaptureRoute.PHYSICAL)
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
@@ -86,7 +110,7 @@ internal fun createRoutedStillCaptureSession(
                         )
                         createNormalOutput(
                             "physical session configuration failed",
-                            cropFallback = true
+                            PhysicalCaptureRoute.PHYSICAL_FAILED_CROP_FALLBACK
                         )
                     }
                 }
@@ -100,6 +124,9 @@ internal fun createRoutedStillCaptureSession(
                 "exception=${error.javaClass.simpleName}:${error.message}",
             error
         )
-        createNormalOutput("physical session creation exception", cropFallback = true)
+        createNormalOutput(
+            "physical session creation exception",
+            PhysicalCaptureRoute.PHYSICAL_FAILED_CROP_FALLBACK
+        )
     }
 }

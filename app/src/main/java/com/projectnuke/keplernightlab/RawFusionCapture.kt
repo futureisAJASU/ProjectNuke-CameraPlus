@@ -91,6 +91,7 @@ fun captureRawBurstForFusion(
     resolutionMode: CaptureResolutionMode = CaptureResolutionMode.MP12,
     resolutionPlan: ResolutionCapturePlan? = null,
     zoomRatio: Float = 1.0f,
+    requestedUiZoomRatio: Float,
     physicalCameraId: String? = null,
     zoomRoute: ThreeXSourceMode = ThreeXSourceMode.AUTO,
     previewRoute: String? = null,
@@ -595,10 +596,13 @@ fun captureRawBurstForFusion(
                         surface = imageReader.surface,
                         cameraId = cameraId,
                         physicalCameraId = physicalCameraId,
+                        requestedUiZoomRatio = requestedUiZoomRatio,
+                        requestedCaptureZoomRatio = zoomRatio,
+                        selectedRoute = zoomRoute,
                         handler = handler,
-                        onConfigured = { configured, physicalRoute ->
+                        onConfigured = { configured, captureRoute ->
                                 session = configured
-                                val requestZoomRatio = if (physicalRoute) 1.0f else zoomRatio
+                                val requestZoomRatio = captureRoute.finalRequestZoomRatio(zoomRatio)
                                 val requests = List(requestedFrames) {
                                     camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                                         addTarget(imageReader.surface)
@@ -643,10 +647,11 @@ fun captureRawBurstForFusion(
                                             val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
                                             Log.i(
                                                 "KeplerPhysicalRoute",
-                                                "capture completed path=${if (physicalRoute) "physical" else "cropFallback"} " +
+                                                "capture completed selectedRoute=$zoomRoute actualRoute=$captureRoute " +
+                                                    "requestedUiZoomRatio=$requestedUiZoomRatio " +
                                                     "requestedPhysicalCameraId=$physicalCameraId " +
                                                     "activePhysicalId=${result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)} " +
-                                                    "zoomRatio=$requestZoomRatio"
+                                                    "finalRequestZoom=$requestZoomRatio"
                                             )
                                             if (timestamp != null && !finished.get()) {
                                                 resultsByTimestamp[timestamp] = result
