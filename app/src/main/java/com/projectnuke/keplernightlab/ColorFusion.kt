@@ -1206,7 +1206,7 @@ fun writeColorJobJson(
     yuvCaptureRequestTemplateFailures: List<String>? = null
 ) {
     val metadataRoute = inferMetadataZoomRoute(
-        requestedUiZoomRatio = requestedUiZoomRatio,
+        requestedUiZoomRatio = zoomRatio,
         captureZoomRatio = zoomRatio,
         physicalCameraId = physicalCameraId,
         cropApplied = cropApplied,

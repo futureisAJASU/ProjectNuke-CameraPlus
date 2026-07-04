@@ -264,7 +264,6 @@ fun captureRawBurstForFusion(
         val adbDebugHint = "adb shell ls -la '${jobDir.absolutePath}'"
         Log.i(RAW_PIPELINE_LOG_TAG, "jobDirAbsolutePath=${jobDir.absolutePath}")
 
-        val baseJob = JSONObject()
         val metadataRoute = inferMetadataZoomRoute(
             requestedUiZoomRatio = requestedUiZoomRatio,
             captureZoomRatio = zoomRatio,
