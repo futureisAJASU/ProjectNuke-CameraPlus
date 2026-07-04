@@ -20,7 +20,7 @@ fun captureProcessExportNightFusion(
     zoomRatio: Float,
     requestedUiZoomRatio: Float,
     physicalCameraId: String? = null,
-    zoomRoute: ThreeXSourceMode = ThreeXSourceMode.AUTO,
+    zoomRoute: ThreeXSourceMode = ThreeXSourceMode.OPTICAL,
     previewRoute: String? = null,
     routeFallbackReason: String? = null,
     focusAeState: FocusAeState = FocusAeState(),

@@ -99,7 +99,7 @@ fun captureYuvBurstColorWithMotion(
     zoomRatio: Float = 1.0f,
     requestedUiZoomRatio: Float,
     physicalCameraId: String? = null,
-    zoomRoute: ThreeXSourceMode = ThreeXSourceMode.AUTO,
+    zoomRoute: ThreeXSourceMode = ThreeXSourceMode.OPTICAL,
     previewRoute: String? = null,
     routeFallbackReason: String? = null,
     focusAeState: FocusAeState = FocusAeState(),
@@ -1190,7 +1190,7 @@ fun writeColorJobJson(
     zoomRatio: Float = 1.0f,
     cropApplied: Boolean = false,
     physicalCameraId: String? = null,
-    zoomRoute: ThreeXSourceMode = ThreeXSourceMode.AUTO,
+    zoomRoute: ThreeXSourceMode = ThreeXSourceMode.OPTICAL,
     previewRoute: String? = null,
     routeFallbackReason: String? = null,
     frameCountMode: FrameCountMode = FrameCountMode.AUTO,
@@ -1205,6 +1205,13 @@ fun writeColorJobJson(
     yuvCaptureRequestTemplateFallbackUsed: Boolean? = null,
     yuvCaptureRequestTemplateFailures: List<String>? = null
 ) {
+    val metadataRoute = inferMetadataZoomRoute(
+        requestedUiZoomRatio = requestedUiZoomRatio,
+        captureZoomRatio = zoomRatio,
+        physicalCameraId = physicalCameraId,
+        cropApplied = cropApplied,
+        previewRoute = previewRoute
+    )
     val framesArray = JSONArray()
     val previousJob = if (jobFile.exists()) {
         runCatching { JSONObject(jobFile.readText()) }.getOrNull()
@@ -1278,9 +1285,9 @@ fun writeColorJobJson(
         .put("physicalCameraId", physicalCameraId ?: JSONObject.NULL)
         .put("requestedZoomRatio", zoomRatio.toDouble())
         .put("requestedZoomRoute", zoomRoute.name)
-        .put("finalZoomRoute", if (physicalCameraId != null) "OPTICAL" else if (cropApplied) "CROP" else "AUTO")
+        .put("finalZoomRoute", metadataRoute)
         .put("previewRoute", previewRoute ?: JSONObject.NULL)
-        .put("captureRoute", if (physicalCameraId != null) "OPTICAL" else if (cropApplied) "CROP" else "AUTO")
+        .put("captureRoute", metadataRoute)
         .put("routeFallbackReason", routeFallbackReason ?: JSONObject.NULL)
         .put("resolutionMode", resolutionMode.label)
         .put("zoomRatio", zoomRatio.toDouble())

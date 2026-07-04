@@ -1237,6 +1237,7 @@ private fun routeLabelFixed(job: KeplerGalleryJobSummary): String {
     return when (route) {
         "OPTICAL" -> "3x 광학"
         "CROP" -> "3x 크롭"
+        "MAIN_CROP" -> "3x"
         "MAIN_1X" -> "1x"
         else -> if ((job.metadata?.optDouble("requestedZoomRatio", 1.0) ?: 1.0) >= 2.9) "3x" else "1x"
     }

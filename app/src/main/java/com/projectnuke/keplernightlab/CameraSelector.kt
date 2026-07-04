@@ -272,13 +272,6 @@ fun selectCameraForOptions(
                     }
                 }
 
-                ThreeXSourceMode.AUTO -> {
-                    selectCameraForOptions(
-                        context,
-                        options.copy(threeXSourceMode = ThreeXSourceMode.OPTICAL)
-                    ).copy(requestedThreeXSourceMode = ThreeXSourceMode.AUTO)
-                }
-
                 ThreeXSourceMode.MAIN_CROP -> {
                     CameraSelection(
                         cameraId = main.cameraId,
@@ -555,7 +548,7 @@ fun CameraSelection.finalZoomRouteName(): String = when (actualLensSource) {
     ActualLensSource.OPTICAL_TELE_LOGICAL,
     ActualLensSource.OPTICAL_TELE_PHYSICAL -> "OPTICAL"
     ActualLensSource.MAIN_CROP_3X,
-    ActualLensSource.OPTICAL_TELE_UNAVAILABLE_FALLBACK_CROP -> "CROP"
+    ActualLensSource.OPTICAL_TELE_UNAVAILABLE_FALLBACK_CROP -> "MAIN_CROP"
     else -> requestedLensSlot.name
 }
 
