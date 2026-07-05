@@ -14,6 +14,18 @@ private const val V2_QUALITY_MAX_SAMPLE_DIMENSION = 320
 private const val V2_NEUTRAL_SCORE = 0.5
 private const val V2_NEUTRAL_WEIGHT = 1.0
 
+private val V2_OWNED_METADATA_KEYS = listOf(
+    "experimentalFusionVersion",
+    "v2SkeletonUsed",
+    "yuvFusionV2DryRun",
+    "yuvFusionV2FrameQualityScores",
+    "yuvFusionV2SkippedFrames",
+    "yuvFusionV2ScoringFailed",
+    "yuvFusionV2MergePlanPreview",
+    "yuvFusionV2MergePlanEmpty",
+    "yuvFusionV2MergePlanReason"
+)
+
 internal data class YuvFusionV2FrameQuality(
     val frameIndex: Int,
     val fileName: String,
@@ -21,6 +33,24 @@ internal data class YuvFusionV2FrameQuality(
     val exposureScore: Double?,
     val metadataScore: Double?,
     val finalWeight: Double
+)
+
+private data class YuvFusionV2FrameInput(
+    val frameIndex: Int,
+    val fileName: String
+)
+
+private data class YuvFusionV2MergeWeight(
+    val frameIndex: Int,
+    val fileName: String,
+    val sourceFinalWeight: Double,
+    val normalizedWeight: Double
+)
+
+private data class YuvFusionV2MergePlan(
+    val weights: List<YuvFusionV2MergeWeight>,
+    val empty: Boolean,
+    val reason: String
 )
 
 private data class YuvFusionV2SkippedFrame(
@@ -55,14 +85,27 @@ internal fun processYuvFusionJobV2(
     dryRun: Boolean = false
 ): File {
     val scoringResult = safeScoreYuvFusionV2Frames(jobDir)
-    // Future V2 merge will consume scoringResult here before writing merged output.
+    val mergePlan = runCatching { buildYuvFusionV2MergePlan(scoringResult) }
+        .getOrElse {
+            YuvFusionV2MergePlan(
+                weights = emptyList(),
+                empty = true,
+                reason = "MERGE_PLAN_FAILED"
+            )
+        }
+    // Future V2 merge will consume scoringResult and mergePlan here before writing merged output.
     val finalFile = processClassicYuvFusionJob(
         jobDir = jobDir,
         onStatus = onStatus,
         requestedParams = requestedParams
     )
     runCatching {
-        writeYuvFusionV2Metadata(jobDir, dryRun = dryRun, scoringResult = scoringResult)
+        writeYuvFusionV2Metadata(
+            jobDir = jobDir,
+            dryRun = dryRun,
+            scoringResult = scoringResult,
+            mergePlan = mergePlan
+        )
     }
     return finalFile
 }
@@ -135,6 +178,78 @@ private fun scoreYuvFusionV2Frames(jobDir: File): YuvFusionV2ScoringResult {
         scores = scores,
         skipped = skipped,
         scoringFailed = false
+    )
+}
+
+private fun buildYuvFusionV2MergePlan(scoringResult: YuvFusionV2ScoringResult): YuvFusionV2MergePlan {
+    if (scoringResult.scoringFailed) {
+        return YuvFusionV2MergePlan(
+            weights = emptyList(),
+            empty = true,
+            reason = "SCORING_FAILED"
+        )
+    }
+    if (scoringResult.scores.isEmpty()) {
+        return YuvFusionV2MergePlan(
+            weights = emptyList(),
+            empty = true,
+            reason = "NO_SCORED_FRAMES"
+        )
+    }
+    val inputs = scoringResult.scores.map { score ->
+        YuvFusionV2FrameInput(
+            frameIndex = score.frameIndex,
+            fileName = score.fileName
+        )
+    }
+    val rawWeights = scoringResult.scores.map { score ->
+        YuvFusionV2MergeWeight(
+            frameIndex = score.frameIndex,
+            fileName = score.fileName,
+            sourceFinalWeight = score.finalWeight,
+            normalizedWeight = 0.0
+        )
+    }
+    return normalizeYuvFusionV2Weights(inputs, rawWeights)
+}
+
+private fun normalizeYuvFusionV2Weights(
+    inputs: List<YuvFusionV2FrameInput>,
+    rawWeights: List<YuvFusionV2MergeWeight>
+): YuvFusionV2MergePlan {
+    if (inputs.isEmpty() || rawWeights.isEmpty()) {
+        return YuvFusionV2MergePlan(
+            weights = emptyList(),
+            empty = true,
+            reason = "NO_VALID_WEIGHTS"
+        )
+    }
+    val validWeights = rawWeights.mapNotNull { weight ->
+        val source = weight.sourceFinalWeight
+        if (!source.isFinite() || source <= 0.0) null else weight
+    }
+    if (validWeights.isEmpty()) {
+        return YuvFusionV2MergePlan(
+            weights = emptyList(),
+            empty = true,
+            reason = "ALL_WEIGHTS_INVALID"
+        )
+    }
+    val total = validWeights.sumOf { it.sourceFinalWeight }
+    if (!total.isFinite() || total <= 0.0) {
+        return YuvFusionV2MergePlan(
+            weights = emptyList(),
+            empty = true,
+            reason = "ZERO_TOTAL_WEIGHT"
+        )
+    }
+    val normalized = validWeights.map { weight ->
+        weight.copy(normalizedWeight = (weight.sourceFinalWeight / total).coerceIn(0.0, 1.0))
+    }
+    return YuvFusionV2MergePlan(
+        weights = normalized,
+        empty = normalized.isEmpty(),
+        reason = if (normalized.isEmpty()) "NO_VALID_WEIGHTS" else "OK"
     )
 }
 
@@ -277,23 +392,32 @@ private fun decodeV2LumaSample(file: File): YuvFusionV2LumaSample? {
     }
 }
 
+private fun clearYuvFusionV2Metadata(job: JSONObject) {
+    V2_OWNED_METADATA_KEYS.forEach { key -> job.remove(key) }
+}
+
 private fun writeYuvFusionV2Metadata(
     jobDir: File,
     dryRun: Boolean,
-    scoringResult: YuvFusionV2ScoringResult
+    scoringResult: YuvFusionV2ScoringResult,
+    mergePlan: YuvFusionV2MergePlan
 ) {
     val job = loadJobJson(jobDir)
+    clearYuvFusionV2Metadata(job)
     job.put("experimentalFusionVersion", YUV_FUSION_V2_SKELETON_VERSION)
         .put("v2SkeletonUsed", true)
         .put("yuvFusionV2DryRun", dryRun)
-    if (scoringResult.scoringFailed) {
-        job.put("yuvFusionV2ScoringFailed", true)
-    }
+        .put("yuvFusionV2ScoringFailed", scoringResult.scoringFailed)
+        .put("yuvFusionV2MergePlanEmpty", mergePlan.empty)
+        .put("yuvFusionV2MergePlanReason", mergePlan.reason)
     if (scoringResult.scores.isNotEmpty()) {
         job.put("yuvFusionV2FrameQualityScores", frameQualityScoresToJson(scoringResult.scores))
     }
     if (scoringResult.skipped.isNotEmpty()) {
         job.put("yuvFusionV2SkippedFrames", skippedFramesToJson(scoringResult.skipped))
+    }
+    if (mergePlan.weights.isNotEmpty()) {
+        job.put("yuvFusionV2MergePlanPreview", mergePlanPreviewToJson(mergePlan.weights))
     }
     saveJobJson(jobDir, job)
 }
@@ -321,6 +445,19 @@ private fun skippedFramesToJson(skipped: List<YuvFusionV2SkippedFrame>): JSONArr
                     .put("frameIndex", frame.frameIndex)
                     .put("fileName", frame.fileName)
                     .put("reason", frame.reason)
+            )
+        }
+    }
+
+private fun mergePlanPreviewToJson(weights: List<YuvFusionV2MergeWeight>): JSONArray =
+    JSONArray().apply {
+        weights.forEach { weight ->
+            put(
+                JSONObject()
+                    .put("frameIndex", weight.frameIndex)
+                    .put("fileName", weight.fileName)
+                    .put("normalizedWeight", weight.normalizedWeight)
+                    .put("sourceFinalWeight", weight.sourceFinalWeight)
             )
         }
     }
