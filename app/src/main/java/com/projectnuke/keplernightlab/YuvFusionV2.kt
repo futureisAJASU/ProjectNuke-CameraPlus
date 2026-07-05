@@ -33,7 +33,8 @@ private val V2_OWNED_METADATA_KEYS = listOf(
 )
 
 internal data class YuvFusionV2FrameQuality(
-    val frameIndex: Int,
+    val jsonIndex: Int,
+    val displayFrameIndex: Int,
     val fileName: String,
     val sharpnessScore: Double?,
     val exposureScore: Double?,
@@ -42,12 +43,13 @@ internal data class YuvFusionV2FrameQuality(
 )
 
 private data class YuvFusionV2FrameInput(
-    val frameIndex: Int,
+    val jsonIndex: Int,
     val fileName: String
 )
 
 private data class YuvFusionV2MergeWeight(
-    val frameIndex: Int,
+    val jsonIndex: Int,
+    val displayFrameIndex: Int,
     val fileName: String,
     val sourceFinalWeight: Double,
     val normalizedWeight: Double
@@ -60,7 +62,8 @@ private data class YuvFusionV2MergePlan(
 )
 
 private data class YuvFusionV2SkippedFrame(
-    val frameIndex: Int,
+    val jsonIndex: Int,
+    val displayFrameIndex: Int,
     val fileName: String,
     val reason: String
 )
@@ -72,7 +75,8 @@ private data class YuvFusionV2ScoringResult(
 )
 
 private data class YuvFusionV2FrameQualityInput(
-    val frameIndex: Int,
+    val jsonIndex: Int,
+    val displayFrameIndex: Int,
     val fileName: String,
     val file: File?,
     val frameJson: JSONObject
@@ -248,7 +252,8 @@ private fun scoreYuvFusionV2Frames(jobDir: File): YuvFusionV2ScoringResult {
         val file = input.file
         if (file == null) {
             skipped += YuvFusionV2SkippedFrame(
-                frameIndex = input.frameIndex,
+                jsonIndex = input.jsonIndex,
+                displayFrameIndex = input.displayFrameIndex,
                 fileName = input.fileName,
                 reason = "FILE_MISSING"
             )
@@ -263,7 +268,8 @@ private fun scoreYuvFusionV2Frames(jobDir: File): YuvFusionV2ScoringResult {
         }
         if (sample == null && !hasUsableMetadataScores(input.frameJson)) {
             skipped += YuvFusionV2SkippedFrame(
-                frameIndex = input.frameIndex,
+                jsonIndex = input.jsonIndex,
+                displayFrameIndex = input.displayFrameIndex,
                 fileName = input.fileName,
                 reason = "DECODE_FAILED"
             )
@@ -274,14 +280,16 @@ private fun scoreYuvFusionV2Frames(jobDir: File): YuvFusionV2ScoringResult {
         val metadata = estimateMetadataScore(input.frameJson)
         if (sharpness == null && exposure == null && metadata == null) {
             skipped += YuvFusionV2SkippedFrame(
-                frameIndex = input.frameIndex,
+                jsonIndex = input.jsonIndex,
+                displayFrameIndex = input.displayFrameIndex,
                 fileName = input.fileName,
                 reason = "INSUFFICIENT_SIGNAL"
             )
             return@forEach
         }
         scores += combineFrameQualityScores(
-            frameIndex = input.frameIndex,
+            jsonIndex = input.jsonIndex,
+            displayFrameIndex = input.displayFrameIndex,
             fileName = input.fileName,
             sharpnessScore = sharpness,
             exposureScore = exposure,
@@ -312,13 +320,14 @@ private fun buildYuvFusionV2MergePlan(scoringResult: YuvFusionV2ScoringResult): 
     }
     val inputs = scoringResult.scores.map { score ->
         YuvFusionV2FrameInput(
-            frameIndex = score.frameIndex,
+            jsonIndex = score.jsonIndex,
             fileName = score.fileName
         )
     }
     val rawWeights = scoringResult.scores.map { score ->
         YuvFusionV2MergeWeight(
-            frameIndex = score.frameIndex,
+            jsonIndex = score.jsonIndex,
+            displayFrameIndex = score.displayFrameIndex,
             fileName = score.fileName,
             sourceFinalWeight = score.finalWeight,
             normalizedWeight = 0.0
@@ -371,7 +380,7 @@ private fun mergePlanToExternalFrameWeights(mergePlan: YuvFusionV2MergePlan): Ma
     if (mergePlan.empty || mergePlan.weights.isEmpty()) return null
     val weights = mergePlan.weights.associate { weight ->
         val value = weight.sourceFinalWeight.toFloat()
-        weight.frameIndex to if (value.isFinite() && value > 0f) value else 1.0f
+        weight.jsonIndex to if (value.isFinite() && value > 0f) value else 1.0f
     }
     return weights.takeIf { it.isNotEmpty() }
 }
@@ -390,7 +399,8 @@ private fun loadFrameQualityInputs(jobDir: File): List<YuvFusionV2FrameQualityIn
             val file = File(jobDir, fileName).takeIf { it.isFile }
             add(
                 YuvFusionV2FrameQualityInput(
-                    frameIndex = frame.optInt("index", position),
+                    jsonIndex = position,
+                    displayFrameIndex = frame.optInt("index", position),
                     fileName = fileName,
                     file = file,
                     frameJson = frame
@@ -459,7 +469,8 @@ private fun estimateMetadataScore(frameJson: JSONObject): Double? {
 }
 
 private fun combineFrameQualityScores(
-    frameIndex: Int,
+    jsonIndex: Int,
+    displayFrameIndex: Int,
     fileName: String,
     sharpnessScore: Double?,
     exposureScore: Double?,
@@ -471,7 +482,8 @@ private fun combineFrameQualityScores(
     val combined = (sharpness * 0.40 + exposure * 0.35 + metadata * 0.25).coerceIn(0.0, 1.0)
     val finalWeight = (V2_NEUTRAL_WEIGHT * (0.35 + combined * 0.65)).coerceIn(0.15, 1.0)
     return YuvFusionV2FrameQuality(
-        frameIndex = frameIndex,
+        jsonIndex = jsonIndex,
+        displayFrameIndex = displayFrameIndex,
         fileName = fileName,
         sharpnessScore = sharpnessScore,
         exposureScore = exposureScore,
@@ -565,8 +577,11 @@ private fun frameQualityScoresToJson(scores: List<YuvFusionV2FrameQuality>): JSO
     JSONArray().apply {
         scores.forEach { score ->
             put(
-                JSONObject()
-                    .put("frameIndex", score.frameIndex)
+                putFrameIdentity(
+                    JSONObject(),
+                    jsonIndex = score.jsonIndex,
+                    displayFrameIndex = score.displayFrameIndex
+                )
                     .put("fileName", score.fileName)
                     .put("sharpnessScore", score.sharpnessScore ?: JSONObject.NULL)
                     .put("exposureScore", score.exposureScore ?: JSONObject.NULL)
@@ -580,8 +595,11 @@ private fun skippedFramesToJson(skipped: List<YuvFusionV2SkippedFrame>): JSONArr
     JSONArray().apply {
         skipped.forEach { frame ->
             put(
-                JSONObject()
-                    .put("frameIndex", frame.frameIndex)
+                putFrameIdentity(
+                    JSONObject(),
+                    jsonIndex = frame.jsonIndex,
+                    displayFrameIndex = frame.displayFrameIndex
+                )
                     .put("fileName", frame.fileName)
                     .put("reason", frame.reason)
             )
@@ -592,14 +610,26 @@ private fun mergePlanPreviewToJson(weights: List<YuvFusionV2MergeWeight>): JSONA
     JSONArray().apply {
         weights.forEach { weight ->
             put(
-                JSONObject()
-                    .put("frameIndex", weight.frameIndex)
+                putFrameIdentity(
+                    JSONObject(),
+                    jsonIndex = weight.jsonIndex,
+                    displayFrameIndex = weight.displayFrameIndex
+                )
                     .put("fileName", weight.fileName)
                     .put("normalizedWeight", weight.normalizedWeight)
                     .put("sourceFinalWeight", weight.sourceFinalWeight)
             )
         }
     }
+
+private fun putFrameIdentity(
+    target: JSONObject,
+    jsonIndex: Int,
+    displayFrameIndex: Int
+): JSONObject = target
+    .put("jsonIndex", jsonIndex)
+    .put("displayFrameIndex", displayFrameIndex)
+    .put("frameIndex", jsonIndex)
 
 private fun JSONObject.optDoubleOrNull(key: String): Double? {
     if (!has(key) || isNull(key)) return null

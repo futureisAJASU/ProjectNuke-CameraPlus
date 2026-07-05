@@ -218,18 +218,6 @@ internal fun processClassicYuvFusionJob(
             .put("alignmentVersion", if (nativeAlignmentUsed) "native_subpixel_v1" else "kotlin_integer_v1")
             .put("yuvAlignVersion", "YUV_GLOBAL_SHIFT_V0")
             .put("yuvMergeVersion", "YUV_TEMPORAL_GHOST_V0")
-            .put(
-                "yuvExternalFrameWeightsUsed",
-                externalFrameWeights != null && externalFrameWeights.isNotEmpty()
-            )
-            .put(
-                "yuvExternalFrameWeightsTarget",
-                if (externalFrameWeights != null && externalFrameWeights.isNotEmpty()) {
-                    "NON_REFERENCE_FRAMES_ONLY"
-                } else {
-                    JSONObject.NULL
-                }
-            )
             .put("yuvDenoiseVersion", "YUV_LUMA_CHROMA_EDGE_AWARE_V0")
             .put("yuvDetailVersion", "YUV_LUMA_DETAIL_V0")
             .put("yuvSharpenVersion", "YUV_ADAPTIVE_LUMA_SHARPEN_V0")
@@ -296,6 +284,10 @@ internal fun processClassicYuvFusionJob(
                 "Classic YUV Fusion v1: integer translation alignment, robust local weights, " +
                     "ghost suppression, mild chroma denoise, tone, and sharpen."
             )
+        if (externalFrameWeights != null && externalFrameWeights.isNotEmpty()) {
+            job.put("yuvExternalFrameWeightsUsed", true)
+                .put("yuvExternalFrameWeightsTarget", "NON_REFERENCE_FRAMES_ONLY")
+        }
         val debugMetadataFailure = runCatching {
             writeFusionDebugMetadata(
                 jobDir = jobDir,
@@ -611,9 +603,10 @@ private fun mergeClassicFrames(
                         val refColor = referencePixels[outputIndex]
                         val adjustedLuma = luma(color) * gain
                         val difference = abs(adjustedLuma - luma(refColor))
-                        val localWeight = ghostWeight(difference, params) * alignmentWeight * externalWeight
+                        val ghost = ghostWeight(difference, params)
+                        val localWeight = ghost * alignmentWeight * externalWeight
                         comparedPixels++
-                        if (localWeight < alignmentWeight * 0.25f) rejectedPixels++
+                        if (ghost < 0.25f) rejectedPixels++
                         sumR[outputIndex] += Color.red(color) * gain * localWeight
                         sumG[outputIndex] += Color.green(color) * gain * localWeight
                         sumB[outputIndex] += Color.blue(color) * gain * localWeight
