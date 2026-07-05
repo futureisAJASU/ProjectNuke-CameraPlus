@@ -123,6 +123,7 @@ fun captureRawBurstForFusion(
     var receivedImages = 0
     var completedResults = 0
     val finished = AtomicBoolean(false)
+    val cleanupStarted = AtomicBoolean(false)
     val imagesByTimestamp = mutableMapOf<Long, Image>()
     val resultsByTimestamp = mutableMapOf<Long, TotalCaptureResult>()
     val savedTimestamps = mutableSetOf<Long>()
@@ -138,14 +139,18 @@ fun captureRawBurstForFusion(
     }
 
     fun cleanup() {
+        if (!cleanupStarted.compareAndSet(false, true)) return
         timeoutRunnable?.let { handler.removeCallbacks(it) }
         timeoutRunnable = null
+        runCatching { reader?.setOnImageAvailableListener(null, null) }
         imagesByTimestamp.values.forEach { runCatching { it.close() } }
         imagesByTimestamp.clear()
         resultsByTimestamp.clear()
+        try { session?.abortCaptures() } catch (_: Exception) {}
+        try { session?.stopRepeating() } catch (_: Exception) {}
         try { session?.close() } catch (_: Exception) {}
-        try { cameraDevice?.close() } catch (_: Exception) {}
         try { reader?.close() } catch (_: Exception) {}
+        try { cameraDevice?.close() } catch (_: Exception) {}
         try { motionLogger?.stop() } catch (_: Exception) {}
         try { thread.quitSafely() } catch (_: Exception) {}
     }
@@ -271,6 +276,11 @@ fun captureRawBurstForFusion(
             cropApplied = cropApplied,
             previewRoute = previewRoute
         )
+        var finalRequestZoom = zoomRatio
+        var finalCropSelection = cropSelection
+        var finalCropApplied = cropApplied
+        var finalCaptureRoute: PhysicalCaptureRoute? = null
+        var activePhysicalId: String? = null
         val baseJob = JSONObject()
             .put("app", "Kepler Night Lab")
             .put("jobType", "RAW_NIGHT_FUSION")
@@ -295,9 +305,14 @@ fun captureRawBurstForFusion(
             .put("adbDebugHint", adbDebugHint)
             .put("cameraId", cameraId)
             .put("physicalCameraId", physicalCameraId ?: JSONObject.NULL)
+            .put("requestedPhysicalCameraId", physicalCameraId ?: JSONObject.NULL)
+            .put("selectedRoute", zoomRoute.name)
+            .put("actualRoute", JSONObject.NULL)
+            .put("activePhysicalId", JSONObject.NULL)
             .put("requestedZoomRatio", zoomRatio.toDouble())
             .put("requestedZoomRoute", zoomRoute.name)
             .put("finalZoomRoute", metadataRoute)
+            .put("finalRequestZoom", finalRequestZoom.toDouble())
             .put("previewRoute", previewRoute ?: JSONObject.NULL)
             .put("captureRoute", metadataRoute)
             .put("routeFallbackReason", routeFallbackReason ?: JSONObject.NULL)
@@ -387,6 +402,37 @@ fun captureRawBurstForFusion(
             .put("createdAt", System.currentTimeMillis())
             .put("notes", "True RAW fusion input. Stores RAW_SENSOR DNG backup plus compact raw16 per frame. TODO retry budget: targetFrames=8, maxAttempts=9 or 10, continue until target saved or maxAttempts/timeout.")
         jobFile.writeText(baseJob.toString(2))
+
+        fun updateFinalRouteMetadata(captureRoute: PhysicalCaptureRoute) {
+            finalCaptureRoute = captureRoute
+            finalRequestZoom = captureRoute.finalRequestZoomRatio(zoomRatio)
+            finalCropSelection = buildCenterCropRegionForPixelMode(
+                characteristics = characteristics,
+                zoomRatio = finalRequestZoom,
+                useMaximumResolutionActiveArray = rawSelection.requiresMaximumResolutionPixelMode
+            )
+            finalCropApplied = finalRequestZoom > 1f && finalCropSelection.region != null
+            val finalZoomRoute = inferMetadataZoomRoute(
+                requestedUiZoomRatio = requestedUiZoomRatio,
+                captureZoomRatio = finalRequestZoom,
+                physicalCameraId = if (captureRoute == PhysicalCaptureRoute.PHYSICAL) physicalCameraId else null,
+                cropApplied = finalCropApplied,
+                previewRoute = previewRoute
+            )
+            baseJob
+                .put("physicalCameraId", physicalCameraId ?: JSONObject.NULL)
+                .put("requestedPhysicalCameraId", physicalCameraId ?: JSONObject.NULL)
+                .put("selectedRoute", zoomRoute.name)
+                .put("actualRoute", captureRoute.name)
+                .put("activePhysicalId", activePhysicalId ?: JSONObject.NULL)
+                .put("finalZoomRoute", finalZoomRoute)
+                .put("captureRoute", captureRoute.name)
+                .put("finalRequestZoom", finalRequestZoom.toDouble())
+                .put("zoomRatio", finalRequestZoom.toDouble())
+                .put("cropApplied", finalCropApplied)
+                .put("cropActiveArraySource", finalCropSelection.activeArraySource)
+                .put("cropRegion", finalCropSelection.region?.toString() ?: JSONObject.NULL)
+        }
 
         if (
             rawSelection.requiresMaximumResolutionPixelMode &&
@@ -487,8 +533,22 @@ fun captureRawBurstForFusion(
             cleanup()
         }
 
+        fun closeUnmatchedImages(force: Boolean = false) {
+            val limit = requestedFrames + 2
+            val stale = imagesByTimestamp.keys
+                .filter { timestamp ->
+                    force || (imagesByTimestamp.size > limit && !resultsByTimestamp.containsKey(timestamp))
+                }
+                .sorted()
+                .take(if (force) Int.MAX_VALUE else (imagesByTimestamp.size - limit).coerceAtLeast(0))
+            stale.forEach { timestamp ->
+                imagesByTimestamp.remove(timestamp)?.let { runCatching { it.close() } }
+            }
+        }
+
         fun trySaveReadyFrames() {
             if (finished.get()) return
+            closeUnmatchedImages()
             val ready = imagesByTimestamp.keys
                 .filter { it !in savedTimestamps && resultsByTimestamp.containsKey(it) }
                 .sorted()
@@ -534,10 +594,15 @@ fun captureRawBurstForFusion(
                             .put("colorCorrectionGains", result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.toString() ?: JSONObject.NULL)
                             .put("colorCorrectionTransform", result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.toString() ?: JSONObject.NULL)
                             .put("cameraId", cameraId)
-                            .put("zoomRatio", zoomRatio.toDouble())
-                            .put("cropApplied", cropApplied)
-                            .put("cropActiveArraySource", cropSelection.activeArraySource)
-                            .put("cropRegion", cropSelection.region?.toString() ?: JSONObject.NULL)
+                            .put("zoomRatio", finalRequestZoom.toDouble())
+                            .put("selectedRoute", zoomRoute.name)
+                            .put("actualRoute", finalCaptureRoute?.name ?: JSONObject.NULL)
+                            .put("requestedPhysicalCameraId", physicalCameraId ?: JSONObject.NULL)
+                            .put("activePhysicalId", activePhysicalId ?: JSONObject.NULL)
+                            .put("finalRequestZoom", finalRequestZoom.toDouble())
+                            .put("cropApplied", finalCropApplied)
+                            .put("cropActiveArraySource", finalCropSelection.activeArraySource)
+                            .put("cropRegion", finalCropSelection.region?.toString() ?: JSONObject.NULL)
                     )
                     savedFrames++
                     val saveMs = System.currentTimeMillis() - saveStartedAt
@@ -583,12 +648,18 @@ fun captureRawBurstForFusion(
                 post("RAW capture: acquireNextImage returned null; waiting for next image")
                 return@setOnImageAvailableListener
             }
+            if (finished.get()) {
+                runCatching { image.close() }
+                return@setOnImageAvailableListener
+            }
             receivedImages++
             if (rawFirstImageDelayMs == null) {
                 rawFirstImageDelayMs = System.currentTimeMillis() - rawCaptureStartedAt
                 post("RAW first image delay: ${rawFirstImageDelayMs}ms")
             }
+            imagesByTimestamp.remove(image.timestamp)?.let { runCatching { it.close() } }
             imagesByTimestamp[image.timestamp] = image
+            closeUnmatchedImages()
             postCaptureProgress()
             trySaveReadyFrames()
         }, handler)
@@ -608,7 +679,9 @@ fun captureRawBurstForFusion(
                         selectedRoute = zoomRoute,
                         handler = handler,
                         onConfigured = { configured, captureRoute ->
+                            try {
                                 session = configured
+                                updateFinalRouteMetadata(captureRoute)
                                 val requestZoomRatio = captureRoute.finalRequestZoomRatio(zoomRatio)
                                 val requests = List(requestedFrames) {
                                     camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
@@ -626,10 +699,7 @@ fun captureRawBurstForFusion(
                                                 maxResolutionPixelModeFailure =
                                                     "SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION failed: " +
                                                         "${error.javaClass.simpleName}: ${error.message}"
-                                                throw IllegalStateException(
-                                                    maxResolutionPixelModeFailure,
-                                                    error
-                                                )
+                                                throw error
                                             }
                                         }
                                         applyZoomAndFocusAe(
@@ -652,12 +722,14 @@ fun captureRawBurstForFusion(
                                             result: TotalCaptureResult
                                         ) {
                                             val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
+                                            activePhysicalId = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
+                                            baseJob.put("activePhysicalId", activePhysicalId ?: JSONObject.NULL)
                                             Log.i(
                                                 "KeplerPhysicalRoute",
                                                 "capture completed selectedRoute=$zoomRoute actualRoute=$captureRoute " +
                                                     "requestedUiZoomRatio=$requestedUiZoomRatio " +
                                                     "requestedPhysicalCameraId=$physicalCameraId " +
-                                                    "activePhysicalId=${result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)} " +
+                                                    "activePhysicalId=$activePhysicalId " +
                                                     "finalRequestZoom=$requestZoomRatio"
                                             )
                                             if (timestamp != null && !finished.get()) {
@@ -705,6 +777,12 @@ fun captureRawBurstForFusion(
                                     },
                                     handler
                                 )
+                            } catch (e: Exception) {
+                                finishError(
+                                    "CAPTURE_FAILED",
+                                    "PIPELINE_FAILED: RAW fusion capture request failed\n${e.stackTraceToString()}"
+                                )
+                            }
                             },
                         onFailed = { reason ->
                             finishError(

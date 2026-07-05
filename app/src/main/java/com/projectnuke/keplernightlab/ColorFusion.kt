@@ -31,6 +31,7 @@ import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 
 private const val ENABLE_YUV_MEMORY_BURST_BUFFER = true
@@ -127,7 +128,8 @@ fun captureYuvBurstColorWithMotion(
     var imageReader: ImageReader? = null
 
     var savedFrames = 0
-    var finished = false
+    val finished = AtomicBoolean(false)
+    val cleanupStarted = AtomicBoolean(false)
     var motionSaved = false
     var motionFiles: Pair<String?, String?> = Pair(null, null)
     var motionInfo = "motion_not_started"
@@ -136,17 +138,27 @@ fun captureYuvBurstColorWithMotion(
     val savedFrameFiles = mutableListOf<String>()
 
     fun cleanup() {
+        if (!cleanupStarted.compareAndSet(false, true)) return
+        try { imageReader?.setOnImageAvailableListener(null, null) } catch (_: Exception) {}
+        try { captureSession?.abortCaptures() } catch (_: Exception) {}
+        try { captureSession?.stopRepeating() } catch (_: Exception) {}
         try { captureSession?.close() } catch (_: Exception) {}
-        try { cameraDevice?.close() } catch (_: Exception) {}
         try { imageReader?.close() } catch (_: Exception) {}
+        try { cameraDevice?.close() } catch (_: Exception) {}
         try { motionLogger?.stop() } catch (_: Exception) {}
         try { backgroundThread.quitSafely() } catch (_: Exception) {}
     }
 
     fun finish(message: String) {
-        if (finished) return
-        finished = true
+        if (!finished.compareAndSet(false, true)) return
         postStatus(message)
+        cleanup()
+    }
+
+    fun finishError(message: String) {
+        if (!finished.compareAndSet(false, true)) return
+        postStatus(message)
+        mainHandler.post { onError(message) }
         cleanup()
     }
 
@@ -180,14 +192,14 @@ fun captureYuvBurstColorWithMotion(
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
 
         if (map == null) {
-            finish("Color Fusion 초기화 실패: StreamConfigurationMap이 null임")
+            finishError("Color Fusion 초기화 실패: StreamConfigurationMap이 null임")
             return
         }
 
         val yuvSizes = map.getOutputSizes(ImageFormat.YUV_420_888)
 
         if (yuvSizes.isNullOrEmpty()) {
-            finish("Color Fusion 초기화 실패: YUV_420_888 출력 크기를 찾지 못함")
+            finishError("Color Fusion 초기화 실패: YUV_420_888 출력 크기를 찾지 못함")
             return
         }
 
@@ -202,6 +214,9 @@ fun captureYuvBurstColorWithMotion(
             null
         }
         val cropApplied = zoomRatio > 1f && buildCenterCropRegion(characteristics, zoomRatio) != null
+        var finalRequestZoom = zoomRatio
+        var finalCropApplied = cropApplied
+        var actualCaptureRoute: PhysicalCaptureRoute? = null
         val rotationDegrees = calculateResultRotationDegrees(characteristics)
 
         postStatus("Color Fusion 초기화 2/7: 저장 폴더 준비 중...")
@@ -209,7 +224,7 @@ fun captureYuvBurstColorWithMotion(
         val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
 
         if (picturesDir == null) {
-            finish("Color Fusion 초기화 실패: Pictures 폴더가 null임")
+            finishError("Color Fusion 초기화 실패: Pictures 폴더가 null임")
             return
         }
 
@@ -217,7 +232,7 @@ fun captureYuvBurstColorWithMotion(
             if (!exists()) {
                 val ok = mkdirs()
                 if (!ok && !exists()) {
-                    finish("Color Fusion 초기화 실패: KeplerColorBurst 폴더 생성 실패\n$absolutePath")
+                    finishError("Color Fusion 초기화 실패: KeplerColorBurst 폴더 생성 실패\n$absolutePath")
                     return
                 }
             }
@@ -232,7 +247,7 @@ fun captureYuvBurstColorWithMotion(
             if (!exists()) {
                 val ok = mkdirs()
                 if (!ok && !exists()) {
-                    finish("Color Fusion 초기화 실패: Burst 폴더 생성 실패\n$absolutePath")
+                    finishError("Color Fusion 초기화 실패: Burst 폴더 생성 실패\n$absolutePath")
                     return
                 }
             }
@@ -287,7 +302,11 @@ fun captureYuvBurstColorWithMotion(
             manualFrames = manualFrames,
             framePlanReason = framePlanReason,
             yuvMemoryBufferUsed = useMemoryBuffer,
-            yuvMemoryBufferEstimatedBytes = estimatedBufferBytes
+            yuvMemoryBufferEstimatedBytes = estimatedBufferBytes,
+            selectedRoute = zoomRoute,
+            actualRoute = actualCaptureRoute?.name,
+            requestedPhysicalCameraId = physicalCameraId,
+            finalRequestZoom = finalRequestZoom
         )
 
         postStatus("Color Fusion 초기화 4/7: ImageReader 생성 중...")
@@ -348,7 +367,7 @@ fun captureYuvBurstColorWithMotion(
 
         reader.setOnImageAvailableListener(
             { r ->
-                if (finished) return@setOnImageAvailableListener
+                if (finished.get()) return@setOnImageAvailableListener
 
                 var image: Image? = null
 
@@ -367,7 +386,7 @@ fun captureYuvBurstColorWithMotion(
                         val bufferedFrame = try {
                             copyYuvFrameToMemory(image, frameIndex)
                         } catch (oom: OutOfMemoryError) {
-                            finish(
+                            finishError(
                                 "YUV memory buffer failed: OutOfMemoryError before frame " +
                                     "${frameIndex + 1}/$frameCount"
                             )
@@ -415,7 +434,7 @@ fun captureYuvBurstColorWithMotion(
                                 motionInfo = motionInfo,
                                 resolutionMode = resolutionMode,
                                 zoomRatio = zoomRatio,
-                                cropApplied = cropApplied,
+                                cropApplied = finalCropApplied,
                                 physicalCameraId = physicalCameraId,
                                 zoomRoute = zoomRoute,
                                 previewRoute = previewRoute,
@@ -427,7 +446,11 @@ fun captureYuvBurstColorWithMotion(
                                 manualFrames = manualFrames,
                                 framePlanReason = framePlanReason,
                                 yuvMemoryBufferUsed = useMemoryBuffer,
-                                yuvMemoryBufferEstimatedBytes = estimatedBufferBytes
+                                yuvMemoryBufferEstimatedBytes = estimatedBufferBytes,
+                                selectedRoute = zoomRoute,
+                                actualRoute = actualCaptureRoute?.name,
+                                requestedPhysicalCameraId = physicalCameraId,
+                                finalRequestZoom = finalRequestZoom
                             )
                             postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
                             onComplete(burstDir)
@@ -476,7 +499,7 @@ fun captureYuvBurstColorWithMotion(
                         motionInfo = motionInfo,
                         resolutionMode = resolutionMode,
                         zoomRatio = zoomRatio,
-                        cropApplied = cropApplied,
+                        cropApplied = finalCropApplied,
                         physicalCameraId = physicalCameraId,
                         zoomRoute = zoomRoute,
                         previewRoute = previewRoute,
@@ -488,7 +511,11 @@ fun captureYuvBurstColorWithMotion(
                         manualFrames = manualFrames,
                         framePlanReason = framePlanReason,
                         yuvMemoryBufferUsed = useMemoryBuffer,
-                        yuvMemoryBufferEstimatedBytes = estimatedBufferBytes
+                        yuvMemoryBufferEstimatedBytes = estimatedBufferBytes,
+                        selectedRoute = zoomRoute,
+                        actualRoute = actualCaptureRoute?.name,
+                        requestedPhysicalCameraId = physicalCameraId,
+                        finalRequestZoom = finalRequestZoom
                     )
 
                     postStatus("YUV capture: saved $savedFrames/$frameCount")
@@ -526,7 +553,7 @@ fun captureYuvBurstColorWithMotion(
                             motionInfo = motionInfo,
                             resolutionMode = resolutionMode,
                             zoomRatio = zoomRatio,
-                            cropApplied = cropApplied,
+                            cropApplied = finalCropApplied,
                             physicalCameraId = physicalCameraId,
                             zoomRoute = zoomRoute,
                             previewRoute = previewRoute,
@@ -538,7 +565,11 @@ fun captureYuvBurstColorWithMotion(
                             manualFrames = manualFrames,
                             framePlanReason = framePlanReason,
                             yuvMemoryBufferUsed = useMemoryBuffer,
-                            yuvMemoryBufferEstimatedBytes = estimatedBufferBytes
+                            yuvMemoryBufferEstimatedBytes = estimatedBufferBytes,
+                            selectedRoute = zoomRoute,
+                            actualRoute = actualCaptureRoute?.name,
+                            requestedPhysicalCameraId = physicalCameraId,
+                            finalRequestZoom = finalRequestZoom
                         )
 
                         postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
@@ -556,12 +587,12 @@ fun captureYuvBurstColorWithMotion(
                     }
                 } catch (oom: OutOfMemoryError) {
                     bufferedFrames.clear()
-                    finish(
+                    finishError(
                         "YUV memory buffer failed: OutOfMemoryError while copying/flushing; " +
                             "job directory and completed source frames kept."
                     )
                 } catch (e: Exception) {
-                    finish("컬러 프레임 저장 실패\n${e.stackTraceToString()}")
+                    finishError("컬러 프레임 저장 실패\n${e.stackTraceToString()}")
                 } finally {
                     try { image?.close() } catch (_: Exception) {}
                 }
@@ -593,7 +624,49 @@ fun captureYuvBurstColorWithMotion(
                                     postStatus("Color Fusion 초기화 7/7: 세션 준비 완료. $frameCount 장 촬영 중...")
 
                                     try {
-                                        val requestZoomRatio = captureRoute.finalRequestZoomRatio(zoomRatio)
+                                        actualCaptureRoute = captureRoute
+                                        finalRequestZoom = captureRoute.finalRequestZoomRatio(zoomRatio)
+                                        finalCropApplied = finalRequestZoom > 1f &&
+                                            buildCenterCropRegion(characteristics, finalRequestZoom) != null
+                                        val requestZoomRatio = finalRequestZoom
+                                        writeColorJobJson(
+                                            jobFile = jobFile,
+                                            status = "CAPTURING",
+                                            cameraId = cameraId,
+                                            width = yuvSize.width,
+                                            height = yuvSize.height,
+                                            outputWidth = outputWidth,
+                                            outputHeight = outputHeight,
+                                            rotationDegrees = rotationDegrees,
+                                            requestedFrames = frameCount,
+                                            savedFrames = savedFrames,
+                                            frameFiles = savedFrameFiles,
+                                            frameTimestampsNs = frameTimestampsNs,
+                                            gyroFile = null,
+                                            rotationVectorFile = null,
+                                            gyroSampleCount = motionLogger?.gyroCount() ?: 0,
+                                            rotationVectorSampleCount = motionLogger?.rotationVectorCount() ?: 0,
+                                            motionInfo = motionInfo,
+                                            resolutionMode = resolutionMode,
+                                            zoomRatio = zoomRatio,
+                                            cropApplied = finalCropApplied,
+                                            physicalCameraId = physicalCameraId,
+                                            zoomRoute = zoomRoute,
+                                            previewRoute = previewRoute,
+                                            routeFallbackReason = routeFallbackReason,
+                                            frameCountMode = frameCountMode,
+                                            plannedFrames = frameCount,
+                                            autoMinFrames = autoMinFrames,
+                                            autoMaxFrames = autoMaxFrames,
+                                            manualFrames = manualFrames,
+                                            framePlanReason = framePlanReason,
+                                            yuvMemoryBufferUsed = useMemoryBuffer,
+                                            yuvMemoryBufferEstimatedBytes = estimatedBufferBytes,
+                                            selectedRoute = zoomRoute,
+                                            actualRoute = actualCaptureRoute?.name,
+                                            requestedPhysicalCameraId = physicalCameraId,
+                                            finalRequestZoom = finalRequestZoom
+                                        )
                                         val requests = List(frameCount) {
                                             val (builder, selectedTemplate) =
                                                 createYuvBurstCaptureRequestBuilder(
@@ -654,38 +727,38 @@ fun captureYuvBurstColorWithMotion(
                                                 "YUV capture request template creation failed"
                                             ) == true
                                         if (templateFailure) {
-                                            finish(
+                                            finishError(
                                                 "PIPELINE_FAILED: ${e.message}\n" +
                                                     "Failures: " +
                                                     yuvCaptureRequestTemplateFailures.joinToString(" | ")
                                             )
                                         } else {
-                                            finish("Color Burst 캡처 요청 실패\n${e.stackTraceToString()}")
+                                            finishError("Color Burst 캡처 요청 실패\n${e.stackTraceToString()}")
                                         }
                                     }
                             },
 
                             onFailed = { reason ->
-                                    finish("Color Burst 세션 구성 실패")
+                                    finishError("Color Burst 세션 구성 실패: $reason")
                             }
                         )
                     } catch (e: Exception) {
-                        finish("Color Burst 세션 생성 실패\n${e.stackTraceToString()}")
+                        finishError("Color Burst 세션 생성 실패\n${e.stackTraceToString()}")
                     }
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
-                    finish("카메라 연결 해제됨")
+                    finishError("카메라 연결 해제됨")
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
-                    finish("카메라 오류: $error")
+                    finishError("카메라 오류: $error")
                 }
             },
             backgroundHandler
         )
     } catch (e: Exception) {
-        finish(
+        finishError(
             "Color Fusion 초기화 실패\n" +
                 "원인:\n${e.stackTraceToString()}"
         )
@@ -1203,15 +1276,20 @@ fun writeColorJobJson(
     yuvMemoryBufferEstimatedBytes: Long = 0L,
     yuvCaptureRequestTemplate: String? = null,
     yuvCaptureRequestTemplateFallbackUsed: Boolean? = null,
-    yuvCaptureRequestTemplateFailures: List<String>? = null
+    yuvCaptureRequestTemplateFailures: List<String>? = null,
+    selectedRoute: ThreeXSourceMode = zoomRoute,
+    actualRoute: String? = null,
+    requestedPhysicalCameraId: String? = physicalCameraId,
+    finalRequestZoom: Float = zoomRatio
 ) {
     val metadataRoute = inferMetadataZoomRoute(
-        requestedUiZoomRatio = zoomRatio,
-        captureZoomRatio = zoomRatio,
-        physicalCameraId = physicalCameraId,
+        requestedUiZoomRatio = finalRequestZoom,
+        captureZoomRatio = finalRequestZoom,
+        physicalCameraId = if (actualRoute == PhysicalCaptureRoute.PHYSICAL.name) physicalCameraId else null,
         cropApplied = cropApplied,
         previewRoute = previewRoute
     )
+    val captureRouteValue = actualRoute ?: metadataRoute
     val framesArray = JSONArray()
     val previousJob = if (jobFile.exists()) {
         runCatching { JSONObject(jobFile.readText()) }.getOrNull()
@@ -1283,14 +1361,18 @@ fun writeColorJobJson(
         .put("cameraId", cameraId)
         .put("selectedCameraId", cameraId)
         .put("physicalCameraId", physicalCameraId ?: JSONObject.NULL)
+        .put("requestedPhysicalCameraId", requestedPhysicalCameraId ?: JSONObject.NULL)
+        .put("selectedRoute", selectedRoute.name)
+        .put("actualRoute", actualRoute ?: JSONObject.NULL)
         .put("requestedZoomRatio", zoomRatio.toDouble())
         .put("requestedZoomRoute", zoomRoute.name)
         .put("finalZoomRoute", metadataRoute)
+        .put("finalRequestZoom", finalRequestZoom.toDouble())
         .put("previewRoute", previewRoute ?: JSONObject.NULL)
-        .put("captureRoute", metadataRoute)
+        .put("captureRoute", captureRouteValue)
         .put("routeFallbackReason", routeFallbackReason ?: JSONObject.NULL)
         .put("resolutionMode", resolutionMode.label)
-        .put("zoomRatio", zoomRatio.toDouble())
+        .put("zoomRatio", finalRequestZoom.toDouble())
         .put("cropApplied", cropApplied)
         .put("frameCountMode", frameCountMode.label)
         .put("plannedFrames", plannedFrames)
