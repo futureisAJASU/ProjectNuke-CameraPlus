@@ -1,19 +1,231 @@
 package com.projectnuke.keplernightlab
 
+import android.graphics.BitmapFactory
+import android.graphics.Color
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
+import kotlin.math.abs
+import kotlin.math.max
 
 internal const val YUV_FUSION_V2_SKELETON_VERSION = "YUV_FUSION_V2_SKELETON"
 
+private const val V2_QUALITY_MAX_SAMPLE_DIMENSION = 320
+private const val V2_NEUTRAL_SCORE = 0.5
+private const val V2_NEUTRAL_WEIGHT = 1.0
+
+internal data class YuvFusionV2FrameQuality(
+    val frameIndex: Int,
+    val fileName: String,
+    val sharpnessScore: Double?,
+    val exposureScore: Double?,
+    val metadataScore: Double?,
+    val finalWeight: Double
+)
+
+private data class YuvFusionV2FrameQualityInput(
+    val frameIndex: Int,
+    val fileName: String,
+    val file: File?,
+    val frameJson: JSONObject
+)
+
+private data class YuvFusionV2LumaSample(
+    val width: Int,
+    val height: Int,
+    val values: FloatArray
+)
+
 internal fun processYuvFusionJobV2(
     jobDir: File,
-    onStatus: (String) -> Unit
+    onStatus: (String) -> Unit,
+    requestedParams: ClassicYuvFusionParams? = null
 ): File {
-    val finalFile = processClassicYuvFusionJob(jobDir, onStatus = onStatus)
+    val finalFile = processClassicYuvFusionJob(
+        jobDir = jobDir,
+        onStatus = onStatus,
+        requestedParams = requestedParams
+    )
+    val qualityScores = runCatching { scoreYuvFusionV2Frames(jobDir) }.getOrNull()
     runCatching {
         val job = loadJobJson(jobDir)
         job.put("experimentalFusionVersion", YUV_FUSION_V2_SKELETON_VERSION)
             .put("v2SkeletonUsed", true)
+        qualityScores
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { scores -> job.put("yuvFusionV2FrameQualityScores", frameQualityScoresToJson(scores)) }
         saveJobJson(jobDir, job)
     }
     return finalFile
+}
+
+private fun scoreYuvFusionV2Frames(jobDir: File): List<YuvFusionV2FrameQuality> =
+    loadFrameQualityInputs(jobDir).map { input ->
+        val sample = input.file?.let { file ->
+            runCatching { decodeV2LumaSample(file) }.getOrNull()
+        }
+        val sharpness = estimateSharpnessScore(input.frameJson, sample)
+        val exposure = estimateExposureScore(input.frameJson, sample)
+        val metadata = estimateMetadataScore(input.frameJson)
+        combineFrameQualityScores(
+            frameIndex = input.frameIndex,
+            fileName = input.fileName,
+            sharpnessScore = sharpness,
+            exposureScore = exposure,
+            metadataScore = metadata
+        )
+    }
+
+private fun loadFrameQualityInputs(jobDir: File): List<YuvFusionV2FrameQualityInput> {
+    val job = runCatching { loadJobJson(jobDir) }.getOrNull() ?: return emptyList()
+    val frames = job.optJSONArray("frames") ?: return emptyList()
+    return buildList {
+        repeat(frames.length()) { position ->
+            val frame = frames.optJSONObject(position) ?: return@repeat
+            if (!frame.optBoolean("enabled", true) || frame.optBoolean("excludedByUser", false)) {
+                return@repeat
+            }
+            val fileName = frame.optString("file")
+            if (fileName.isBlank()) return@repeat
+            val file = File(jobDir, fileName).takeIf { it.isFile }
+            add(
+                YuvFusionV2FrameQualityInput(
+                    frameIndex = frame.optInt("index", position),
+                    fileName = fileName,
+                    file = file,
+                    frameJson = frame
+                )
+            )
+        }
+    }
+}
+
+private fun estimateSharpnessScore(
+    frameJson: JSONObject,
+    sample: YuvFusionV2LumaSample?
+): Double? {
+    frameJson.optDoubleOrNull("sharpnessScore")?.let { return it.coerceIn(0.0, 1.0) }
+    val luma = sample ?: return null
+    if (luma.values.isEmpty()) return null
+    var gradientSum = 0.0
+    var gradientCount = 0
+    for (y in 1 until luma.height - 1) {
+        for (x in 1 until luma.width - 1) {
+            val index = y * luma.width + x
+            gradientSum += abs(luma.values[index + 1] - luma.values[index - 1])
+            gradientSum += abs(luma.values[index + luma.width] - luma.values[index - luma.width])
+            gradientCount += 2
+        }
+    }
+    if (gradientCount == 0) return null
+    return (gradientSum / gradientCount / 24.0).coerceIn(0.0, 1.0)
+}
+
+private fun estimateExposureScore(
+    frameJson: JSONObject,
+    sample: YuvFusionV2LumaSample?
+): Double? {
+    frameJson.optDoubleOrNull("exposureScore")?.let { return it.coerceIn(0.0, 1.0) }
+    val luma = sample ?: return null
+    if (luma.values.isEmpty()) return null
+    val mean = luma.values.average().toFloat()
+    var shadows = 0
+    var highlights = 0
+    luma.values.forEach { value ->
+        if (value <= 5f) shadows++
+        if (value >= 250f) highlights++
+    }
+    val shadowRatio = shadows.toFloat() / luma.values.size
+    val highlightRatio = highlights.toFloat() / luma.values.size
+    val brightnessPenalty = (abs(mean - 115f) / 180f).coerceIn(0f, 0.55f)
+    val clippingPenalty = (shadowRatio * 0.7f + highlightRatio * 0.9f).coerceIn(0f, 0.75f)
+    return (1.0 - brightnessPenalty - clippingPenalty).coerceIn(0.0, 1.0)
+}
+
+private fun estimateMetadataScore(frameJson: JSONObject): Double? {
+    frameJson.optDoubleOrNull("qualityScore")?.let { return it.coerceIn(0.0, 1.0) }
+    val components = listOfNotNull(
+        frameJson.optDoubleOrNull("sharpnessScore"),
+        frameJson.optDoubleOrNull("exposureScore"),
+        frameJson.optDoubleOrNull("motionScore")?.let { (1.0 - it).coerceIn(0.0, 1.0) }
+    )
+    if (components.isEmpty()) return null
+    return components.average().coerceIn(0.0, 1.0)
+}
+
+private fun combineFrameQualityScores(
+    frameIndex: Int,
+    fileName: String,
+    sharpnessScore: Double?,
+    exposureScore: Double?,
+    metadataScore: Double?
+): YuvFusionV2FrameQuality {
+    val sharpness = sharpnessScore ?: V2_NEUTRAL_SCORE
+    val exposure = exposureScore ?: V2_NEUTRAL_SCORE
+    val metadata = metadataScore ?: V2_NEUTRAL_SCORE
+    val combined = (sharpness * 0.40 + exposure * 0.35 + metadata * 0.25).coerceIn(0.0, 1.0)
+    val finalWeight = (V2_NEUTRAL_WEIGHT * (0.35 + combined * 0.65)).coerceIn(0.15, 1.0)
+    return YuvFusionV2FrameQuality(
+        frameIndex = frameIndex,
+        fileName = fileName,
+        sharpnessScore = sharpnessScore,
+        exposureScore = exposureScore,
+        metadataScore = metadataScore,
+        finalWeight = finalWeight
+    )
+}
+
+private fun decodeV2LumaSample(file: File): YuvFusionV2LumaSample? {
+    if (!file.isFile) return null
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(file.absolutePath, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+    var sampleSize = 1
+    while (
+        max(bounds.outWidth / sampleSize, bounds.outHeight / sampleSize) > V2_QUALITY_MAX_SAMPLE_DIMENSION
+    ) {
+        sampleSize *= 2
+    }
+    val bitmap = BitmapFactory.decodeFile(
+        file.absolutePath,
+        BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+            inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
+        }
+    ) ?: return null
+    return try {
+        val pixels = IntArray(bitmap.width * bitmap.height)
+        bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        val values = FloatArray(pixels.size)
+        pixels.forEachIndexed { index, color ->
+            values[index] = (
+                0.299f * Color.red(color) +
+                    0.587f * Color.green(color) +
+                    0.114f * Color.blue(color)
+                )
+        }
+        YuvFusionV2LumaSample(bitmap.width, bitmap.height, values)
+    } finally {
+        bitmap.recycle()
+    }
+}
+
+private fun frameQualityScoresToJson(scores: List<YuvFusionV2FrameQuality>): JSONArray =
+    JSONArray().apply {
+        scores.forEach { score ->
+            put(
+                JSONObject()
+                    .put("frameIndex", score.frameIndex)
+                    .put("fileName", score.fileName)
+                    .put("sharpnessScore", score.sharpnessScore ?: JSONObject.NULL)
+                    .put("exposureScore", score.exposureScore ?: JSONObject.NULL)
+                    .put("metadataScore", score.metadataScore ?: JSONObject.NULL)
+                    .put("finalWeight", score.finalWeight)
+            )
+        }
+    }
+
+private fun JSONObject.optDoubleOrNull(key: String): Double? {
+    if (!has(key) || isNull(key)) return null
+    return optDouble(key).takeIf { it.isFinite() }
 }

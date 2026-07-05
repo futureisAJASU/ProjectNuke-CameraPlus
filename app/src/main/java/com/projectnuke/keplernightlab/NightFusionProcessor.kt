@@ -49,7 +49,7 @@ fun processLatestNightFusionV02(
                     postStatus("YUV Night Fusion failed: no YUV fusion job found.")
                     return@post
                 }
-            processClassicYuvFusionJob(jobDir) { postStatus(it) }
+            processNightFusionJobV02Sync(jobDir, onStatus = { postStatus(it) })
         } catch (e: Exception) {
             postStatus("PIPELINE_FAILED: Classic YUV fusion failed; cache kept.\n${e.stackTraceToString()}")
         } finally {
@@ -87,7 +87,7 @@ fun processNightFusionJobV02Sync(
         return processClassicYuvFusionJob(jobDir, onStatus = onStatus, requestedParams = requestedParams)
     }
     return try {
-        processYuvFusionJobV2(jobDir, onStatus)
+        processYuvFusionJobV2(jobDir, onStatus, requestedParams)
     } catch (t: Throwable) {
         onStatus("YUV Fusion V2 failed; falling back to classic V1: ${t.javaClass.simpleName}")
         processClassicYuvFusionJob(jobDir, onStatus = onStatus, requestedParams = requestedParams)
