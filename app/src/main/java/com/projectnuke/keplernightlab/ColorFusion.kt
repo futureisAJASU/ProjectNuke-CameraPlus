@@ -37,6 +37,79 @@ import kotlin.math.abs
 private const val ENABLE_YUV_MEMORY_BURST_BUFFER = true
 private const val MAX_YUV_MEMORY_BUFFER_FRAMES = 6
 private const val MAX_YUV_MEMORY_BUFFER_BYTES = 160L * 1024L * 1024L
+private const val YUV_CAPTURE_LOG_TAG = "KeplerYuvCapture"
+
+private data class YuvCaptureFailureSnapshot(
+    val jobFile: File?,
+    val savedFrames: Int,
+    val receivedImages: Int,
+    val completedResults: Int,
+    val failedCaptures: Int,
+    val frameFiles: List<String>,
+    val frameTimestampsNs: List<Long>
+)
+
+private fun logYuvCaptureFailure(
+    stage: String,
+    throwable: Throwable? = null,
+    detail: String? = null
+) {
+    val message = buildString {
+        append("YUV_CAPTURE_FAILED: ")
+        append(stage)
+        if (!detail.isNullOrBlank()) {
+            append(" - ")
+            append(detail)
+        }
+    }
+    if (throwable != null) {
+        Log.e(YUV_CAPTURE_LOG_TAG, message, throwable)
+    } else {
+        Log.e(YUV_CAPTURE_LOG_TAG, message)
+    }
+}
+
+private fun persistYuvCaptureFailure(
+    snapshot: YuvCaptureFailureSnapshot,
+    source: String,
+    throwable: Throwable? = null,
+    failureType: String? = null,
+    failureMessage: String? = null
+) {
+    val jobFile = snapshot.jobFile ?: return
+    runCatching {
+        val job = if (jobFile.exists()) {
+            JSONObject(jobFile.readText())
+        } else {
+            JSONObject()
+        }
+        val framesArray = JSONArray()
+        snapshot.frameFiles.forEachIndexed { index, fileName ->
+            val frameObject = JSONObject()
+                .put("index", index)
+                .put("file", fileName)
+            if (index < snapshot.frameTimestampsNs.size) {
+                frameObject.put("timestampNs", snapshot.frameTimestampsNs[index])
+            }
+            framesArray.put(frameObject)
+        }
+        job.put("status", "CAPTURE_FAILED")
+            .put("currentPipelineStage", "CAPTURE_FAILED")
+            .put("processStatus", "CAPTURE_FAILED")
+            .put("captureFailed", true)
+            .put("captureFailureSource", source)
+            .put("captureFailureType", failureType ?: throwable?.javaClass?.name ?: "Unknown")
+            .put("captureFailureMessage", failureMessage ?: throwable?.message ?: "")
+            .put("captureFailureStackTrace", throwable?.stackTraceToString() ?: "")
+            .put("savedFrames", snapshot.savedFrames)
+            .put("receivedImages", snapshot.receivedImages)
+            .put("completedResults", snapshot.completedResults)
+            .put("failedCaptures", snapshot.failedCaptures)
+            .put("frames", framesArray)
+            .put("updatedAt", System.currentTimeMillis())
+        jobFile.writeText(job.toString(2))
+    }
+}
 
 private data class BufferedYuvFrame(
     val index: Int,
@@ -128,14 +201,29 @@ fun captureYuvBurstColorWithMotion(
     var imageReader: ImageReader? = null
 
     var savedFrames = 0
+    var receivedImages = 0
+    var completedResults = 0
+    var failedCaptures = 0
     val finished = AtomicBoolean(false)
     val cleanupStarted = AtomicBoolean(false)
     var motionSaved = false
     var motionFiles: Pair<String?, String?> = Pair(null, null)
     var motionInfo = "motion_not_started"
+    var jobFile: File? = null
+    var burstDir: File? = null
 
     val frameTimestampsNs = mutableListOf<Long>()
     val savedFrameFiles = mutableListOf<String>()
+
+    fun captureFailureSnapshot(): YuvCaptureFailureSnapshot = YuvCaptureFailureSnapshot(
+        jobFile = jobFile,
+        savedFrames = savedFrames,
+        receivedImages = receivedImages,
+        completedResults = completedResults,
+        failedCaptures = failedCaptures,
+        frameFiles = savedFrameFiles.toList(),
+        frameTimestampsNs = frameTimestampsNs.toList()
+    )
 
     fun cleanup() {
         if (!cleanupStarted.compareAndSet(false, true)) return
@@ -155,8 +243,26 @@ fun captureYuvBurstColorWithMotion(
         cleanup()
     }
 
-    fun finishError(message: String) {
+    fun finishError(
+        message: String,
+        source: String,
+        throwable: Throwable? = null,
+        failureType: String? = null,
+        failureMessage: String? = null
+    ) {
         if (!finished.compareAndSet(false, true)) return
+        logYuvCaptureFailure(
+            stage = source,
+            throwable = throwable,
+            detail = failureMessage ?: message
+        )
+        persistYuvCaptureFailure(
+            snapshot = captureFailureSnapshot(),
+            source = source,
+            throwable = throwable,
+            failureType = failureType,
+            failureMessage = failureMessage ?: message
+        )
         postStatus(message)
         mainHandler.post { onError(message) }
         cleanup()
@@ -199,14 +305,24 @@ fun captureYuvBurstColorWithMotion(
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
 
         if (map == null) {
-            finishError("Color Fusion 초기화 실패: StreamConfigurationMap이 null임")
+            finishError(
+                message = "Color Fusion 초기화 실패: StreamConfigurationMap이 null임",
+                source = "captureYuvBurstColorWithMotion.init",
+                failureType = "ConfigurationError",
+                failureMessage = "StreamConfigurationMap is null"
+            )
             return
         }
 
         val yuvSizes = map.getOutputSizes(ImageFormat.YUV_420_888)
 
         if (yuvSizes.isNullOrEmpty()) {
-            finishError("Color Fusion 초기화 실패: YUV_420_888 출력 크기를 찾지 못함")
+            finishError(
+                message = "Color Fusion 초기화 실패: YUV_420_888 출력 크기를 찾지 못함",
+                source = "captureYuvBurstColorWithMotion.init",
+                failureType = "ConfigurationError",
+                failureMessage = "No YUV_420_888 output sizes"
+            )
             return
         }
 
@@ -233,7 +349,12 @@ fun captureYuvBurstColorWithMotion(
         val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
 
         if (picturesDir == null) {
-            finishError("Color Fusion 초기화 실패: Pictures 폴더가 null임")
+            finishError(
+                message = "Color Fusion 초기화 실패: Pictures 폴더가 null임",
+                source = "captureYuvBurstColorWithMotion.init",
+                failureType = "StorageError",
+                failureMessage = "Pictures directory is null"
+            )
             return
         }
 
@@ -241,7 +362,12 @@ fun captureYuvBurstColorWithMotion(
             if (!exists()) {
                 val ok = mkdirs()
                 if (!ok && !exists()) {
-                    finishError("Color Fusion 초기화 실패: KeplerColorBurst 폴더 생성 실패\n$absolutePath")
+                    finishError(
+                        message = "Color Fusion 초기화 실패: KeplerColorBurst 폴더 생성 실패\n$absolutePath",
+                        source = "captureYuvBurstColorWithMotion.init",
+                        failureType = "StorageError",
+                        failureMessage = "Failed to create KeplerYuvFusion directory"
+                    )
                     return
                 }
             }
