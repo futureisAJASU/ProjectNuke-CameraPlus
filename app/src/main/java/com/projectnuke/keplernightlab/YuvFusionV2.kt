@@ -9,6 +9,8 @@ import kotlin.math.abs
 import kotlin.math.max
 
 internal const val YUV_FUSION_V2_SKELETON_VERSION = "YUV_FUSION_V2_SKELETON"
+internal const val YUV_FUSION_V2_DRY_RUN_VERSION = "YUV_FUSION_V2_DRY_RUN"
+internal const val YUV_FUSION_V2_QUALITY_WEIGHTED_VERSION = "YUV_FUSION_V2_QUALITY_WEIGHTED"
 
 private const val V2_QUALITY_MAX_SAMPLE_DIMENSION = 320
 private const val V2_NEUTRAL_SCORE = 0.5
@@ -23,7 +25,11 @@ private val V2_OWNED_METADATA_KEYS = listOf(
     "yuvFusionV2ScoringFailed",
     "yuvFusionV2MergePlanPreview",
     "yuvFusionV2MergePlanEmpty",
-    "yuvFusionV2MergePlanReason"
+    "yuvFusionV2MergePlanReason",
+    "yuvFusionV2WeightedMergeAttempted",
+    "yuvFusionV2WeightedMergeUsed",
+    "yuvFusionV2FallbackToV1",
+    "yuvFusionV2FallbackReason"
 )
 
 internal data class YuvFusionV2FrameQuality(
@@ -78,6 +84,16 @@ private data class YuvFusionV2LumaSample(
     val values: FloatArray
 )
 
+private data class YuvFusionV2MetadataWrite(
+    val dryRun: Boolean,
+    val scoringResult: YuvFusionV2ScoringResult,
+    val mergePlan: YuvFusionV2MergePlan,
+    val weightedMergeAttempted: Boolean,
+    val weightedMergeUsed: Boolean,
+    val fallbackToV1: Boolean,
+    val fallbackReason: String?
+)
+
 internal fun processYuvFusionJobV2(
     jobDir: File,
     onStatus: (String) -> Unit,
@@ -93,21 +109,119 @@ internal fun processYuvFusionJobV2(
                 reason = "MERGE_PLAN_FAILED"
             )
         }
-    // Future V2 merge will consume scoringResult and mergePlan here before writing merged output.
-    val finalFile = processClassicYuvFusionJob(
-        jobDir = jobDir,
-        onStatus = onStatus,
-        requestedParams = requestedParams
-    )
-    runCatching {
-        writeYuvFusionV2Metadata(
+
+    if (dryRun) {
+        val finalFile = processClassicYuvFusionJob(
             jobDir = jobDir,
-            dryRun = dryRun,
-            scoringResult = scoringResult,
-            mergePlan = mergePlan
+            onStatus = onStatus,
+            requestedParams = requestedParams
         )
+        runCatching {
+            writeYuvFusionV2Metadata(
+                jobDir = jobDir,
+                metadata = YuvFusionV2MetadataWrite(
+                    dryRun = true,
+                    scoringResult = scoringResult,
+                    mergePlan = mergePlan,
+                    weightedMergeAttempted = false,
+                    weightedMergeUsed = false,
+                    fallbackToV1 = false,
+                    fallbackReason = null
+                )
+            )
+        }
+        return finalFile
     }
-    return finalFile
+
+    val externalWeights = mergePlanToExternalFrameWeights(mergePlan)
+    if (externalWeights == null) {
+        val finalFile = processClassicYuvFusionJob(
+            jobDir = jobDir,
+            onStatus = onStatus,
+            requestedParams = requestedParams
+        )
+        runCatching {
+            writeYuvFusionV2Metadata(
+                jobDir = jobDir,
+                metadata = YuvFusionV2MetadataWrite(
+                    dryRun = false,
+                    scoringResult = scoringResult,
+                    mergePlan = mergePlan,
+                    weightedMergeAttempted = true,
+                    weightedMergeUsed = false,
+                    fallbackToV1 = true,
+                    fallbackReason = mergePlan.reason
+                )
+            )
+        }
+        return finalFile
+    }
+
+    return try {
+        val finalFile = processClassicYuvFusionJob(
+            jobDir = jobDir,
+            onStatus = onStatus,
+            requestedParams = requestedParams,
+            externalFrameWeights = externalWeights
+        )
+        runCatching {
+            writeYuvFusionV2Metadata(
+                jobDir = jobDir,
+                metadata = YuvFusionV2MetadataWrite(
+                    dryRun = false,
+                    scoringResult = scoringResult,
+                    mergePlan = mergePlan,
+                    weightedMergeAttempted = true,
+                    weightedMergeUsed = true,
+                    fallbackToV1 = false,
+                    fallbackReason = null
+                )
+            )
+        }
+        finalFile
+    } catch (oom: OutOfMemoryError) {
+        val finalFile = processClassicYuvFusionJob(
+            jobDir = jobDir,
+            onStatus = onStatus,
+            requestedParams = requestedParams
+        )
+        runCatching {
+            writeYuvFusionV2Metadata(
+                jobDir = jobDir,
+                metadata = YuvFusionV2MetadataWrite(
+                    dryRun = false,
+                    scoringResult = scoringResult,
+                    mergePlan = mergePlan,
+                    weightedMergeAttempted = true,
+                    weightedMergeUsed = false,
+                    fallbackToV1 = true,
+                    fallbackReason = "OutOfMemoryError"
+                )
+            )
+        }
+        finalFile
+    } catch (t: Throwable) {
+        val finalFile = processClassicYuvFusionJob(
+            jobDir = jobDir,
+            onStatus = onStatus,
+            requestedParams = requestedParams
+        )
+        runCatching {
+            writeYuvFusionV2Metadata(
+                jobDir = jobDir,
+                metadata = YuvFusionV2MetadataWrite(
+                    dryRun = false,
+                    scoringResult = scoringResult,
+                    mergePlan = mergePlan,
+                    weightedMergeAttempted = true,
+                    weightedMergeUsed = false,
+                    fallbackToV1 = true,
+                    fallbackReason = "${t.javaClass.simpleName}: ${t.message}".take(120)
+                )
+            )
+        }
+        finalFile
+    }
 }
 
 private fun safeScoreYuvFusionV2Frames(jobDir: File): YuvFusionV2ScoringResult =
@@ -251,6 +365,15 @@ private fun normalizeYuvFusionV2Weights(
         empty = normalized.isEmpty(),
         reason = if (normalized.isEmpty()) "NO_VALID_WEIGHTS" else "OK"
     )
+}
+
+private fun mergePlanToExternalFrameWeights(mergePlan: YuvFusionV2MergePlan): Map<Int, Float>? {
+    if (mergePlan.empty || mergePlan.weights.isEmpty()) return null
+    val weights = mergePlan.weights.associate { weight ->
+        val value = weight.sourceFinalWeight.toFloat()
+        weight.frameIndex to if (value.isFinite() && value > 0f) value else 1.0f
+    }
+    return weights.takeIf { it.isNotEmpty() }
 }
 
 private fun loadFrameQualityInputs(jobDir: File): List<YuvFusionV2FrameQualityInput> {
@@ -398,26 +521,42 @@ private fun clearYuvFusionV2Metadata(job: JSONObject) {
 
 private fun writeYuvFusionV2Metadata(
     jobDir: File,
-    dryRun: Boolean,
-    scoringResult: YuvFusionV2ScoringResult,
-    mergePlan: YuvFusionV2MergePlan
+    metadata: YuvFusionV2MetadataWrite
 ) {
     val job = loadJobJson(jobDir)
     clearYuvFusionV2Metadata(job)
-    job.put("experimentalFusionVersion", YUV_FUSION_V2_SKELETON_VERSION)
-        .put("v2SkeletonUsed", true)
-        .put("yuvFusionV2DryRun", dryRun)
-        .put("yuvFusionV2ScoringFailed", scoringResult.scoringFailed)
-        .put("yuvFusionV2MergePlanEmpty", mergePlan.empty)
-        .put("yuvFusionV2MergePlanReason", mergePlan.reason)
-    if (scoringResult.scores.isNotEmpty()) {
-        job.put("yuvFusionV2FrameQualityScores", frameQualityScoresToJson(scoringResult.scores))
+    val experimentalVersion = when {
+        metadata.dryRun -> YUV_FUSION_V2_DRY_RUN_VERSION
+        metadata.weightedMergeUsed -> YUV_FUSION_V2_QUALITY_WEIGHTED_VERSION
+        metadata.fallbackToV1 -> YUV_FUSION_V2_SKELETON_VERSION
+        else -> YUV_FUSION_V2_SKELETON_VERSION
     }
-    if (scoringResult.skipped.isNotEmpty()) {
-        job.put("yuvFusionV2SkippedFrames", skippedFramesToJson(scoringResult.skipped))
+    job.put("experimentalFusionVersion", experimentalVersion)
+        .put("v2SkeletonUsed", metadata.dryRun || !metadata.weightedMergeUsed)
+        .put("yuvFusionV2DryRun", metadata.dryRun)
+        .put("yuvFusionV2ScoringFailed", metadata.scoringResult.scoringFailed)
+        .put("yuvFusionV2MergePlanEmpty", metadata.mergePlan.empty)
+        .put("yuvFusionV2MergePlanReason", metadata.mergePlan.reason)
+        .put("yuvFusionV2WeightedMergeAttempted", metadata.weightedMergeAttempted)
+        .put("yuvFusionV2WeightedMergeUsed", metadata.weightedMergeUsed)
+        .put("yuvFusionV2FallbackToV1", metadata.fallbackToV1)
+    metadata.fallbackReason?.let { reason ->
+        job.put("yuvFusionV2FallbackReason", reason)
     }
-    if (mergePlan.weights.isNotEmpty()) {
-        job.put("yuvFusionV2MergePlanPreview", mergePlanPreviewToJson(mergePlan.weights))
+    if (metadata.scoringResult.scores.isNotEmpty()) {
+        job.put(
+            "yuvFusionV2FrameQualityScores",
+            frameQualityScoresToJson(metadata.scoringResult.scores)
+        )
+    }
+    if (metadata.scoringResult.skipped.isNotEmpty()) {
+        job.put(
+            "yuvFusionV2SkippedFrames",
+            skippedFramesToJson(metadata.scoringResult.skipped)
+        )
+    }
+    if (metadata.mergePlan.weights.isNotEmpty()) {
+        job.put("yuvFusionV2MergePlanPreview", mergePlanPreviewToJson(metadata.mergePlan.weights))
     }
     saveJobJson(jobDir, job)
 }

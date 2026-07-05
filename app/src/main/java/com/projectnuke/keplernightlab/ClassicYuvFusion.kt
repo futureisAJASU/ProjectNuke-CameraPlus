@@ -21,6 +21,8 @@ private const val CLASSIC_FUSION_ALIGNMENT_MAX_DIMENSION = 512
 private const val CLASSIC_FUSION_ALIGNMENT_SEARCH_RADIUS = 24
 private const val CLASSIC_FUSION_TILE_ROWS = 256
 private const val CLASSIC_FUSION_DEBUG_MAX_DIMENSION = 1024
+private const val EXTERNAL_FRAME_WEIGHT_MIN = 0.15f
+private const val EXTERNAL_FRAME_WEIGHT_MAX = 1.25f
 
 private data class ClassicFrame(
     val jsonIndex: Int,
@@ -74,6 +76,7 @@ private data class MergeResult(
 internal fun processClassicYuvFusionJob(
     jobDir: File,
     requestedParams: ClassicYuvFusionParams? = null,
+    externalFrameWeights: Map<Int, Float>? = null,
     onStatus: (String) -> Unit
 ): File {
     val processingStartedAt = System.currentTimeMillis()
@@ -174,6 +177,7 @@ internal fun processClassicYuvFusionJob(
             width = dimensions.first,
             height = dimensions.second,
             params = params,
+            externalFrameWeights = externalFrameWeights,
             onStatus = onStatus
         )
         merged = mergeResult.bitmap
@@ -214,6 +218,18 @@ internal fun processClassicYuvFusionJob(
             .put("alignmentVersion", if (nativeAlignmentUsed) "native_subpixel_v1" else "kotlin_integer_v1")
             .put("yuvAlignVersion", "YUV_GLOBAL_SHIFT_V0")
             .put("yuvMergeVersion", "YUV_TEMPORAL_GHOST_V0")
+            .put(
+                "yuvExternalFrameWeightsUsed",
+                externalFrameWeights != null && externalFrameWeights.isNotEmpty()
+            )
+            .put(
+                "yuvExternalFrameWeightsTarget",
+                if (externalFrameWeights != null && externalFrameWeights.isNotEmpty()) {
+                    "NON_REFERENCE_FRAMES_ONLY"
+                } else {
+                    JSONObject.NULL
+                }
+            )
             .put("yuvDenoiseVersion", "YUV_LUMA_CHROMA_EDGE_AWARE_V0")
             .put("yuvDetailVersion", "YUV_LUMA_DETAIL_V0")
             .put("yuvSharpenVersion", "YUV_ADAPTIVE_LUMA_SHARPEN_V0")
@@ -515,6 +531,7 @@ private fun mergeClassicFrames(
     width: Int,
     height: Int,
     params: ClassicYuvFusionParams,
+    externalFrameWeights: Map<Int, Float>? = null,
     onStatus: (String) -> Unit
 ): MergeResult {
     val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
@@ -575,6 +592,7 @@ private fun mergeClassicFrames(
                     frame.alignmentScore,
                     params.alignmentRejectThreshold
                 )
+                val externalWeight = resolveExternalFrameWeight(externalFrameWeights, frame.jsonIndex)
                 val gain = (
                     requireNotNull(reference.thumbnail).mean /
                         requireNotNull(frame.thumbnail).mean.coerceAtLeast(1f)
@@ -593,7 +611,7 @@ private fun mergeClassicFrames(
                         val refColor = referencePixels[outputIndex]
                         val adjustedLuma = luma(color) * gain
                         val difference = abs(adjustedLuma - luma(refColor))
-                        val localWeight = ghostWeight(difference, params) * alignmentWeight
+                        val localWeight = ghostWeight(difference, params) * alignmentWeight * externalWeight
                         comparedPixels++
                         if (localWeight < alignmentWeight * 0.25f) rejectedPixels++
                         sumR[outputIndex] += Color.red(color) * gain * localWeight
@@ -620,6 +638,16 @@ private fun mergeClassicFrames(
         decoders.values.forEach { it.recycle() }
     }
     return MergeResult(output, rejectedPixels, comparedPixels)
+}
+
+private fun resolveExternalFrameWeight(
+    externalFrameWeights: Map<Int, Float>?,
+    frameIndex: Int
+): Float {
+    if (externalFrameWeights == null) return 1.0f
+    val raw = externalFrameWeights[frameIndex] ?: 1.0f
+    if (!raw.isFinite() || raw <= 0f) return 1.0f
+    return raw.coerceIn(EXTERNAL_FRAME_WEIGHT_MIN, EXTERNAL_FRAME_WEIGHT_MAX)
 }
 
 private fun alignmentWeight(score: Float, rejectThreshold: Float): Float {
