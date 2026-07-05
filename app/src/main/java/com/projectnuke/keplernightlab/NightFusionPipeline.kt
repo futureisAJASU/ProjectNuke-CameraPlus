@@ -60,7 +60,7 @@ fun captureProcessExportNightFusion(
             Handler(workerThread.looper).post {
                 try {
                     post("Processing Night Fusion...")
-                    val finalFile = processNightFusionJobV02Sync(jobDir) { post(it) }
+                    val finalFile = processNightFusionJobV02Sync(jobDir, onStatus = { post(it) })
 
                     val requestedOutputFormat = requestedOutputFormatForSetting(finalOutputFormat)
                     post("Exporting ${requestedOutputFormat.label}...")
@@ -183,7 +183,7 @@ fun reprocessYuvJob(
 
             post("YUV reprocess: loading enabled frames...")
             post("YUV reprocess: using $enabledFrames/$totalFrames frames...")
-            val finalFile = processClassicYuvFusionJob(
+            val finalFile = processNightFusionJobV02Sync(
                 jobDir = jobDir,
                 onStatus = { post(it) },
                 requestedParams = fusionParams

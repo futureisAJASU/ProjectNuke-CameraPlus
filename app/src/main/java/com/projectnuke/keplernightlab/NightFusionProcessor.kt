@@ -76,10 +76,23 @@ fun estimateLatestColorBurstScene(context: Context): LatestSceneEstimate {
     return LatestSceneEstimate(luma, gyro)
 }
 
+private const val ENABLE_YUV_FUSION_V2 = false
+
 fun processNightFusionJobV02Sync(
     jobDir: File,
-    onStatus: (String) -> Unit
-): File = processClassicYuvFusionJob(jobDir, onStatus = onStatus)
+    onStatus: (String) -> Unit,
+    requestedParams: ClassicYuvFusionParams? = null
+): File {
+    if (!ENABLE_YUV_FUSION_V2) {
+        return processClassicYuvFusionJob(jobDir, onStatus = onStatus, requestedParams = requestedParams)
+    }
+    return try {
+        processYuvFusionJobV2(jobDir, onStatus)
+    } catch (t: Throwable) {
+        onStatus("YUV Fusion V2 failed; falling back to classic V1: ${t.javaClass.simpleName}")
+        processClassicYuvFusionJob(jobDir, onStatus = onStatus, requestedParams = requestedParams)
+    }
+}
 
 fun findLatestColorBurstJobDir(context: Context): File? {
     val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return null
