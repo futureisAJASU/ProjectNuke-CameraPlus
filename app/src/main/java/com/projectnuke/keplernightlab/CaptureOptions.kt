@@ -13,7 +13,7 @@ enum class LensSlot(
     val targetZoomRatio: Float
 ) {
     ULTRAWIDE(".6", 0.6f),
-    MAIN_1X("1횞", 1.0f),
+    MAIN_1X("1", 1.0f),
     MAIN_2X("2", 2.0f),
     THREE_X("3", 3.0f)
 }

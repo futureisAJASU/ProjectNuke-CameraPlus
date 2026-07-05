@@ -224,6 +224,8 @@ fun captureYuvBurstColorWithMotion(
         var finalRequestZoom = zoomRatio
         var finalCropApplied = cropApplied
         var actualCaptureRoute: PhysicalCaptureRoute? = null
+        fun actualPhysicalCameraId(): String? =
+            if (actualCaptureRoute == PhysicalCaptureRoute.PHYSICAL) physicalCameraId else null
         val rotationDegrees = calculateResultRotationDegrees(characteristics)
 
         postStatus("Color Fusion 초기화 2/7: 저장 폴더 준비 중...")
@@ -298,7 +300,7 @@ fun captureYuvBurstColorWithMotion(
             resolutionMode = resolutionMode,
             zoomRatio = zoomRatio,
             cropApplied = cropApplied,
-            physicalCameraId = physicalCameraId,
+            physicalCameraId = null,
             zoomRoute = zoomRoute,
             previewRoute = previewRoute,
             routeFallbackReason = routeFallbackReason,
@@ -424,7 +426,7 @@ fun captureYuvBurstColorWithMotion(
                             bufferedFrames.clear()
                             writeColorJobJson(
                                 jobFile = jobFile,
-                                status = "PIPELINE_COMPLETE",
+                                status = "CAPTURE_COMPLETE",
                                 cameraId = cameraId,
                                 width = yuvSize.width,
                                 height = yuvSize.height,
@@ -464,7 +466,7 @@ fun captureYuvBurstColorWithMotion(
                             postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
                             finishSuccess(
                                 burstDir,
-                                "PIPELINE_COMPLETE: Color Burst + Motion complete\n" +
+                                "CAPTURE_COMPLETE: Color Burst + Motion complete\n" +
                                     "Frames: $savedFrames\n" +
                                     "Output: ${outputWidth}x${outputHeight}\n" +
                                     "Folder:\n${burstDir.absolutePath}"
@@ -544,7 +546,7 @@ fun captureYuvBurstColorWithMotion(
 
                         writeColorJobJson(
                             jobFile = jobFile,
-                            status = "PIPELINE_COMPLETE",
+                            status = "CAPTURE_COMPLETE",
                             cameraId = cameraId,
                             width = yuvSize.width,
                             height = yuvSize.height,
@@ -583,10 +585,9 @@ fun captureYuvBurstColorWithMotion(
                         )
 
                         postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
-                        postStatus("PIPELINE_COMPLETE: Color Burst + Motion complete")
                         finishSuccess(
                             burstDir,
-                            "PIPELINE_COMPLETE: Color Burst + Motion 저장 완료\n" +
+                            "CAPTURE_COMPLETE: Color Burst + Motion 저장 완료\n" +
                                 "프레임: $savedFrames 장\n" +
                                 "출력: ${outputWidth}x${outputHeight}\n" +
                                 "rotation: ${rotationDegrees}도\n" +
@@ -660,7 +661,7 @@ fun captureYuvBurstColorWithMotion(
                                             resolutionMode = resolutionMode,
                                             zoomRatio = finalRequestZoom,
                                             cropApplied = finalCropApplied,
-                                            physicalCameraId = physicalCameraId,
+                                            physicalCameraId = actualPhysicalCameraId(),
                                             zoomRoute = zoomRoute,
                                             previewRoute = previewRoute,
                                             routeFallbackReason = routeFallbackReason,

@@ -540,18 +540,20 @@ fun captureRawBurstForFusion(
             } else {
                 post("CAPTURE_COMPLETE: 캡처가 완료되었습니다. saved $savedFrames/$requestedFrames frames")
             }
-            mainHandler.post { onComplete(jobDir) }
             cleanup()
+            mainHandler.post { onComplete(jobDir) }
         }
 
         fun closeUnmatchedImages(force: Boolean = false) {
-            val limit = requestedFrames + 2
+            val maxOpenImages = requestedFrames + 2
+            val pendingLimit = (maxOpenImages - 1).coerceAtLeast(1)
+            val excess = imagesByTimestamp.size - pendingLimit + 1
             val stale = imagesByTimestamp.keys
                 .filter { timestamp ->
-                    force || (imagesByTimestamp.size > limit && !resultsByTimestamp.containsKey(timestamp))
+                    force || (imagesByTimestamp.size >= pendingLimit && !resultsByTimestamp.containsKey(timestamp))
                 }
                 .sorted()
-                .take(if (force) Int.MAX_VALUE else (imagesByTimestamp.size - limit).coerceAtLeast(0))
+                .take(if (force) Int.MAX_VALUE else excess.coerceAtLeast(0))
             stale.forEach { timestamp ->
                 imagesByTimestamp.remove(timestamp)?.let {
                     droppedUnmatchedImages++
