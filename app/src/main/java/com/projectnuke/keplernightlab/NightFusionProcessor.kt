@@ -8,6 +8,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.util.Log
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -43,15 +44,32 @@ fun processLatestNightFusionV02(
     val workerHandler = Handler(workerThread.looper)
 
     workerHandler.post {
+        var jobDir: File? = null
         try {
-            val jobDir = findLatestColorBurstJobDir(context)
+            jobDir = findLatestColorBurstJobDir(context)
                 ?: run {
                     postStatus("YUV Night Fusion failed: no YUV fusion job found.")
                     return@post
                 }
             processNightFusionJobV02Sync(jobDir, onStatus = { postStatus(it) })
         } catch (e: Exception) {
-            postStatus("PIPELINE_FAILED: Classic YUV fusion failed; cache kept.\n${e.stackTraceToString()}")
+            Log.e("KeplerYuvPipeline", "PIPELINE_FAILED in processLatestNightFusionV02", e)
+            runCatching {
+                val targetDir = jobDir ?: findLatestColorBurstJobDir(context) ?: return@runCatching
+                val job = loadJobJson(targetDir)
+                job.put("currentPipelineStage", "PIPELINE_FAILED")
+                    .put("processStatus", "PIPELINE_FAILED")
+                    .put("pipelineFailed", true)
+                    .put("pipelineFailureSource", "processLatestNightFusionV02")
+                    .put("pipelineFailureType", e.javaClass.name)
+                    .put("pipelineFailureMessage", e.message ?: "")
+                    .put("pipelineFailureStackTrace", e.stackTraceToString())
+                    .put("updatedAt", System.currentTimeMillis())
+                saveJobJson(targetDir, job)
+            }
+            postStatus(
+                "PIPELINE_FAILED: YUV Night Fusion failed; cache kept. See logcat/job.json for details."
+            )
         } finally {
             workerThread.quitSafely()
         }
