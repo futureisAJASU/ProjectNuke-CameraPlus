@@ -162,6 +162,13 @@ fun captureYuvBurstColorWithMotion(
         cleanup()
     }
 
+    fun finishSuccess(jobDir: File, message: String) {
+        if (!finished.compareAndSet(false, true)) return
+        cleanup()
+        mainHandler.post { onComplete(jobDir) }
+        postStatus(message)
+    }
+
     fun saveMotionOnce(dir: File): Pair<String?, String?> {
         if (motionSaved) return motionFiles
 
@@ -306,7 +313,8 @@ fun captureYuvBurstColorWithMotion(
             selectedRoute = zoomRoute,
             actualRoute = actualCaptureRoute?.name,
             requestedPhysicalCameraId = physicalCameraId,
-            finalRequestZoom = finalRequestZoom
+            finalRequestZoom = finalRequestZoom,
+            requestedZoomRatio = zoomRatio
         )
 
         postStatus("Color Fusion 초기화 4/7: ImageReader 생성 중...")
@@ -416,7 +424,7 @@ fun captureYuvBurstColorWithMotion(
                             bufferedFrames.clear()
                             writeColorJobJson(
                                 jobFile = jobFile,
-                                status = "CAPTURE_COMPLETE",
+                                status = "PIPELINE_COMPLETE",
                                 cameraId = cameraId,
                                 width = yuvSize.width,
                                 height = yuvSize.height,
@@ -433,7 +441,7 @@ fun captureYuvBurstColorWithMotion(
                                 rotationVectorSampleCount = finalLogger?.rotationVectorCount() ?: 0,
                                 motionInfo = motionInfo,
                                 resolutionMode = resolutionMode,
-                                zoomRatio = zoomRatio,
+                                zoomRatio = finalRequestZoom,
                                 cropApplied = finalCropApplied,
                                 physicalCameraId = physicalCameraId,
                                 zoomRoute = zoomRoute,
@@ -450,12 +458,13 @@ fun captureYuvBurstColorWithMotion(
                                 selectedRoute = zoomRoute,
                                 actualRoute = actualCaptureRoute?.name,
                                 requestedPhysicalCameraId = physicalCameraId,
-                                finalRequestZoom = finalRequestZoom
+                                finalRequestZoom = finalRequestZoom,
+                                requestedZoomRatio = zoomRatio
                             )
                             postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
-                            onComplete(burstDir)
-                            finish(
-                                "Color Burst + Motion complete\n" +
+                            finishSuccess(
+                                burstDir,
+                                "PIPELINE_COMPLETE: Color Burst + Motion complete\n" +
                                     "Frames: $savedFrames\n" +
                                     "Output: ${outputWidth}x${outputHeight}\n" +
                                     "Folder:\n${burstDir.absolutePath}"
@@ -498,7 +507,7 @@ fun captureYuvBurstColorWithMotion(
                         rotationVectorSampleCount = logger?.rotationVectorCount() ?: 0,
                         motionInfo = motionInfo,
                         resolutionMode = resolutionMode,
-                        zoomRatio = zoomRatio,
+                        zoomRatio = finalRequestZoom,
                         cropApplied = finalCropApplied,
                         physicalCameraId = physicalCameraId,
                         zoomRoute = zoomRoute,
@@ -535,7 +544,7 @@ fun captureYuvBurstColorWithMotion(
 
                         writeColorJobJson(
                             jobFile = jobFile,
-                            status = "CAPTURE_COMPLETE",
+                            status = "PIPELINE_COMPLETE",
                             cameraId = cameraId,
                             width = yuvSize.width,
                             height = yuvSize.height,
@@ -552,7 +561,7 @@ fun captureYuvBurstColorWithMotion(
                             rotationVectorSampleCount = finalLogger?.rotationVectorCount() ?: 0,
                             motionInfo = motionInfo,
                             resolutionMode = resolutionMode,
-                            zoomRatio = zoomRatio,
+                            zoomRatio = finalRequestZoom,
                             cropApplied = finalCropApplied,
                             physicalCameraId = physicalCameraId,
                             zoomRoute = zoomRoute,
@@ -569,14 +578,15 @@ fun captureYuvBurstColorWithMotion(
                             selectedRoute = zoomRoute,
                             actualRoute = actualCaptureRoute?.name,
                             requestedPhysicalCameraId = physicalCameraId,
-                            finalRequestZoom = finalRequestZoom
+                            finalRequestZoom = finalRequestZoom,
+                            requestedZoomRatio = zoomRatio
                         )
 
                         postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
-                        onComplete(burstDir)
-
-                        finish(
-                            "Color Burst + Motion 저장 완료\n" +
+                        postStatus("PIPELINE_COMPLETE: Color Burst + Motion complete")
+                        finishSuccess(
+                            burstDir,
+                            "PIPELINE_COMPLETE: Color Burst + Motion 저장 완료\n" +
                                 "프레임: $savedFrames 장\n" +
                                 "출력: ${outputWidth}x${outputHeight}\n" +
                                 "rotation: ${rotationDegrees}도\n" +
@@ -648,7 +658,7 @@ fun captureYuvBurstColorWithMotion(
                                             rotationVectorSampleCount = motionLogger?.rotationVectorCount() ?: 0,
                                             motionInfo = motionInfo,
                                             resolutionMode = resolutionMode,
-                                            zoomRatio = zoomRatio,
+                                            zoomRatio = finalRequestZoom,
                                             cropApplied = finalCropApplied,
                                             physicalCameraId = physicalCameraId,
                                             zoomRoute = zoomRoute,
@@ -665,7 +675,8 @@ fun captureYuvBurstColorWithMotion(
                                             selectedRoute = zoomRoute,
                                             actualRoute = actualCaptureRoute?.name,
                                             requestedPhysicalCameraId = physicalCameraId,
-                                            finalRequestZoom = finalRequestZoom
+                                            finalRequestZoom = finalRequestZoom,
+                                            requestedZoomRatio = zoomRatio
                                         )
                                         val requests = List(frameCount) {
                                             val (builder, selectedTemplate) =
@@ -1280,22 +1291,26 @@ fun writeColorJobJson(
     selectedRoute: ThreeXSourceMode = zoomRoute,
     actualRoute: String? = null,
     requestedPhysicalCameraId: String? = physicalCameraId,
-    finalRequestZoom: Float = zoomRatio
+    finalRequestZoom: Float = zoomRatio,
+    requestedZoomRatio: Float = zoomRatio
 ) {
-    val metadataRoute = inferMetadataZoomRoute(
-        requestedUiZoomRatio = finalRequestZoom,
-        captureZoomRatio = finalRequestZoom,
-        physicalCameraId = if (actualRoute == PhysicalCaptureRoute.PHYSICAL.name) physicalCameraId else null,
-        cropApplied = cropApplied,
-        previewRoute = previewRoute
-    )
-    val captureRouteValue = actualRoute ?: metadataRoute
-    val framesArray = JSONArray()
+    val actualPhysicalCameraId =
+        if (actualRoute == PhysicalCaptureRoute.PHYSICAL.name) physicalCameraId else null
     val previousJob = if (jobFile.exists()) {
         runCatching { JSONObject(jobFile.readText()) }.getOrNull()
     } else {
         null
     }
+    val metadataRoute = inferMetadataZoomRoute(
+        requestedUiZoomRatio = finalRequestZoom,
+        captureZoomRatio = finalRequestZoom,
+        physicalCameraId = actualPhysicalCameraId,
+        cropApplied = cropApplied,
+        previewRoute = previewRoute
+    )
+    val captureRouteValue =
+        previousJob?.optString("captureRoute")?.takeUnless { it.isNullOrBlank() } ?: metadataRoute
+    val framesArray = JSONArray()
 
     frameFiles.forEachIndexed { index, fileName ->
         val frameObject = JSONObject()
@@ -1333,7 +1348,14 @@ fun writeColorJobJson(
             }
         )
         .put("processingStartedAt", previousJob?.opt("processingStartedAt") ?: JSONObject.NULL)
-        .put("processStatus", previousJob?.optString("processStatus", status) ?: status)
+        .put(
+            "processStatus",
+            if (status == "PIPELINE_COMPLETE") {
+                status
+            } else {
+                previousJob?.optString("processStatus", status) ?: status
+            }
+        )
         .put("frameCount", requestedFrames)
         .put("yuvWidth", width)
         .put("yuvHeight", height)
@@ -1349,7 +1371,14 @@ fun writeColorJobJson(
         .put(
             "timing",
             previousJob?.optJSONObject("timing") ?: JSONObject()
-                .put("yuvCaptureMs", if (status == "CAPTURE_COMPLETE") now - (previousJob?.optLong("createdAt", now) ?: now) else 0L)
+                .put(
+                    "yuvCaptureMs",
+                    if (status == "CAPTURE_COMPLETE" || status == "PIPELINE_COMPLETE") {
+                        now - (previousJob?.optLong("createdAt", now) ?: now)
+                    } else {
+                        0L
+                    }
+                )
                 .put("yuvSaveMs", 0L)
                 .put("yuvAlignMs", 0L)
                 .put("yuvMergeMs", 0L)
@@ -1360,11 +1389,11 @@ fun writeColorJobJson(
         )
         .put("cameraId", cameraId)
         .put("selectedCameraId", cameraId)
-        .put("physicalCameraId", physicalCameraId ?: JSONObject.NULL)
+        .put("physicalCameraId", actualPhysicalCameraId ?: JSONObject.NULL)
         .put("requestedPhysicalCameraId", requestedPhysicalCameraId ?: JSONObject.NULL)
         .put("selectedRoute", selectedRoute.name)
         .put("actualRoute", actualRoute ?: JSONObject.NULL)
-        .put("requestedZoomRatio", zoomRatio.toDouble())
+        .put("requestedZoomRatio", requestedZoomRatio.toDouble())
         .put("requestedZoomRoute", zoomRoute.name)
         .put("finalZoomRoute", metadataRoute)
         .put("finalRequestZoom", finalRequestZoom.toDouble())

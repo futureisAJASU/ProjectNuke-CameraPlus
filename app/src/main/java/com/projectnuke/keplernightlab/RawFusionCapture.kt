@@ -104,11 +104,6 @@ fun captureRawBurstForFusion(
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
     fun post(message: String) = mainHandler.post { onStatus(message) }
-    fun fail(message: String) {
-        post(message)
-        onError(message)
-    }
-
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     val thread = HandlerThread("KeplerRawFusionCaptureThread").apply { start() }
     val handler = Handler(thread.looper)
@@ -128,6 +123,7 @@ fun captureRawBurstForFusion(
     val resultsByTimestamp = mutableMapOf<Long, TotalCaptureResult>()
     val savedTimestamps = mutableSetOf<Long>()
     var failedCaptures = 0
+    var droppedUnmatchedImages = 0
     var maxResolutionPixelModeFailure: String? = null
     var sensorPixelModeUsed = false
     var timeoutRunnable: Runnable? = null
@@ -166,6 +162,7 @@ fun captureRawBurstForFusion(
                 .put("receivedImages", receivedImages)
                 .put("completedResults", completedResults)
                 .put("failedCaptures", failedCaptures)
+                .put("droppedUnmatchedImages", droppedUnmatchedImages)
                 .put("sensorPixelModeUsed", sensorPixelModeUsed)
                 .put(
                     "currentPipelineStage",
@@ -304,7 +301,7 @@ fun captureRawBurstForFusion(
             .put("jobDirAbsolutePath", jobDir.absolutePath)
             .put("adbDebugHint", adbDebugHint)
             .put("cameraId", cameraId)
-            .put("physicalCameraId", physicalCameraId ?: JSONObject.NULL)
+            .put("physicalCameraId", JSONObject.NULL)
             .put("requestedPhysicalCameraId", physicalCameraId ?: JSONObject.NULL)
             .put("selectedRoute", zoomRoute.name)
             .put("actualRoute", JSONObject.NULL)
@@ -386,6 +383,7 @@ fun captureRawBurstForFusion(
             .put("dngSidecarSkipReason", dngSidecarSkipReason ?: JSONObject.NULL)
             .put("rawSpeedMode", rawSpeedMode.name)
             .put("rawCaptureStartedAt", rawCaptureStartedAt)
+            .put("droppedUnmatchedImages", droppedUnmatchedImages)
             .put("rawDebugPreviewSkipped", rawSpeedMode == RawSpeedMode.BALANCED)
             .put(
                 "rawDebugPreviewSkipReason",
@@ -420,13 +418,20 @@ fun captureRawBurstForFusion(
                 previewRoute = previewRoute
             )
             baseJob
-                .put("physicalCameraId", physicalCameraId ?: JSONObject.NULL)
+                .put(
+                    "physicalCameraId",
+                    if (captureRoute == PhysicalCaptureRoute.PHYSICAL) {
+                        physicalCameraId ?: JSONObject.NULL
+                    } else {
+                        JSONObject.NULL
+                    }
+                )
                 .put("requestedPhysicalCameraId", physicalCameraId ?: JSONObject.NULL)
                 .put("selectedRoute", zoomRoute.name)
                 .put("actualRoute", captureRoute.name)
                 .put("activePhysicalId", activePhysicalId ?: JSONObject.NULL)
                 .put("finalZoomRoute", finalZoomRoute)
-                .put("captureRoute", captureRoute.name)
+                .put("captureRoute", metadataRoute)
                 .put("finalRequestZoom", finalRequestZoom.toDouble())
                 .put("zoomRatio", finalRequestZoom.toDouble())
                 .put("cropApplied", finalCropApplied)
@@ -441,8 +446,13 @@ fun captureRawBurstForFusion(
         ) {
             val reason =
                 "50MP RAW exists only in maximum-resolution map, but SENSOR_PIXEL_MODE request key is unavailable."
-            writeJobStatus(jobFile, baseJob, "CAPTURE_FAILED", reason)
-            fail("PIPELINE_FAILED: $reason")
+            if (!finished.compareAndSet(false, true)) return
+            if (rawSelection.requiresMaximumResolutionPixelMode && maxResolutionPixelModeFailure == null) {
+                maxResolutionPixelModeFailure = "Maximum-resolution RAW capture failed: PIPELINE_FAILED: $reason"
+            }
+            writeJobStatus(jobFile, baseJob, "CAPTURE_FAILED", "PIPELINE_FAILED: $reason")
+            post("PIPELINE_FAILED: $reason")
+            mainHandler.post { onError("PIPELINE_FAILED: $reason") }
             cleanup()
             return
         }
@@ -481,7 +491,7 @@ fun captureRawBurstForFusion(
             val motionFiles = runCatching { motionLogger?.saveToDirectory(jobDir) }.getOrNull()
             val status = if (partial) "CAPTURE_COMPLETE_PARTIAL" else "CAPTURE_COMPLETE"
             val completeness = if (partial) "PARTIAL" else "FULL"
-            val partialReason = reason ?: "saved $savedFrames/$requestedFrames frames; failedCaptures=$failedCaptures"
+            val partialReason = reason ?: "saved $savedFrames/$requestedFrames frames; failedCaptures=$failedCaptures; droppedUnmatchedImages=$droppedUnmatchedImages"
             val completeJob = JSONObject(baseJob.toString())
                 .put("status", status)
                 .put("savedFrames", savedFrames)
@@ -490,6 +500,7 @@ fun captureRawBurstForFusion(
                 .put("receivedImages", receivedImages)
                 .put("completedResults", completedResults)
                 .put("failedCaptures", failedCaptures)
+                .put("droppedUnmatchedImages", droppedUnmatchedImages)
                 .put("rawSpeedMode", rawSpeedMode.name)
                 .put("rawCaptureStartedAt", rawCaptureStartedAt)
                 .put("rawCaptureMs", System.currentTimeMillis() - rawCaptureStartedAt)
@@ -523,7 +534,7 @@ fun captureRawBurstForFusion(
                 .put("capturedAt", System.currentTimeMillis())
             if (partial) completeJob.put("partialReason", partialReason)
             jobFile.writeText(completeJob.toString(2))
-            Log.i(RAW_PIPELINE_LOG_TAG, "CAPTURE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} savedFrames=$savedFrames/$requestedFrames partial=$partial")
+            Log.i(RAW_PIPELINE_LOG_TAG, "CAPTURE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} savedFrames=$savedFrames/$requestedFrames partial=$partial droppedUnmatchedImages=$droppedUnmatchedImages")
             if (partial) {
                 post("CAPTURE_COMPLETE_PARTIAL: 캡처가 완료되었습니다. saved $savedFrames/$requestedFrames frames")
             } else {
@@ -542,7 +553,10 @@ fun captureRawBurstForFusion(
                 .sorted()
                 .take(if (force) Int.MAX_VALUE else (imagesByTimestamp.size - limit).coerceAtLeast(0))
             stale.forEach { timestamp ->
-                imagesByTimestamp.remove(timestamp)?.let { runCatching { it.close() } }
+                imagesByTimestamp.remove(timestamp)?.let {
+                    droppedUnmatchedImages++
+                    runCatching { it.close() }
+                }
             }
         }
 
@@ -628,9 +642,9 @@ fun captureRawBurstForFusion(
         timeoutRunnable = Runnable {
             if (savedFrames < requestedFrames) {
                 if (savedFrames >= MIN_RAW_FUSION_FRAMES) {
-                    finishSuccess(partial = true, reason = "saved $savedFrames/$requestedFrames frames; timeout; failedCaptures=$failedCaptures")
+                    finishSuccess(partial = true, reason = "saved $savedFrames/$requestedFrames frames; timeout; failedCaptures=$failedCaptures; droppedUnmatchedImages=$droppedUnmatchedImages")
                 } else {
-                    val message = "CAPTURE_TIMEOUT: RAW capture saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames, failed $failedCaptures"
+                    val message = "CAPTURE_TIMEOUT: RAW capture saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames, failed $failedCaptures, droppedUnmatchedImages=$droppedUnmatchedImages"
                     finishError("CAPTURE_TIMEOUT", message)
                 }
             }
@@ -749,9 +763,9 @@ fun captureRawBurstForFusion(
                                             post("RAW capture failure: reason=${failure.reason}, saved $savedFrames/$requestedFrames")
                                             if (savedFrames + failedCaptures >= attemptedFrames) {
                                                 if (savedFrames >= MIN_RAW_FUSION_FRAMES) {
-                                                    finishSuccess(partial = true, reason = "saved $savedFrames/$requestedFrames frames; failedCaptures=$failedCaptures")
+                                                    finishSuccess(partial = true, reason = "saved $savedFrames/$requestedFrames frames; failedCaptures=$failedCaptures; droppedUnmatchedImages=$droppedUnmatchedImages")
                                                 } else {
-                                                    finishError("CAPTURE_FAILED", "PIPELINE_FAILED: RAW capture failed; saved $savedFrames/$requestedFrames, failed $failedCaptures")
+                                                    finishError("CAPTURE_FAILED", "PIPELINE_FAILED: RAW capture failed; saved $savedFrames/$requestedFrames, failed $failedCaptures, droppedUnmatchedImages=$droppedUnmatchedImages")
                                                 }
                                             }
                                         }
@@ -761,9 +775,9 @@ fun captureRawBurstForFusion(
                                             sequenceId: Int
                                         ) {
                                             if (savedFrames >= MIN_RAW_FUSION_FRAMES && savedFrames < requestedFrames) {
-                                                finishSuccess(partial = true, reason = "saved $savedFrames/$requestedFrames frames; sequence aborted; failedCaptures=$failedCaptures")
+                                                finishSuccess(partial = true, reason = "saved $savedFrames/$requestedFrames frames; sequence aborted; failedCaptures=$failedCaptures; droppedUnmatchedImages=$droppedUnmatchedImages")
                                             } else {
-                                                finishError("CAPTURE_ABORTED", "PIPELINE_FAILED: RAW capture sequence aborted; saved $savedFrames/$requestedFrames")
+                                                finishError("CAPTURE_ABORTED", "PIPELINE_FAILED: RAW capture sequence aborted; saved $savedFrames/$requestedFrames; droppedUnmatchedImages=$droppedUnmatchedImages")
                                             }
                                         }
 
@@ -804,7 +818,9 @@ fun captureRawBurstForFusion(
             handler
         )
     } catch (e: Exception) {
-        fail("RAW fusion init failed\n${e.stackTraceToString()}")
+        if (!finished.compareAndSet(false, true)) return
+        post("RAW fusion init failed\n${e.stackTraceToString()}")
+        mainHandler.post { onError("RAW fusion init failed\n${e.stackTraceToString()}") }
         cleanup()
     }
 }
