@@ -77,7 +77,7 @@ fun estimateLatestColorBurstScene(context: Context): LatestSceneEstimate {
 }
 
 private const val ENABLE_YUV_FUSION_V2 = false
-private const val ENABLE_YUV_FUSION_V2_DRY_RUN = false
+private const val ENABLE_YUV_FUSION_V2_DRY_RUN = true
 
 fun processNightFusionJobV02Sync(
     jobDir: File,
