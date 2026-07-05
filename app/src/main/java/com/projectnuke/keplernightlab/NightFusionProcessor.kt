@@ -77,20 +77,37 @@ fun estimateLatestColorBurstScene(context: Context): LatestSceneEstimate {
 }
 
 private const val ENABLE_YUV_FUSION_V2 = false
+private const val ENABLE_YUV_FUSION_V2_DRY_RUN = false
 
 fun processNightFusionJobV02Sync(
     jobDir: File,
     onStatus: (String) -> Unit,
     requestedParams: ClassicYuvFusionParams? = null
 ): File {
-    if (!ENABLE_YUV_FUSION_V2) {
-        return processClassicYuvFusionJob(jobDir, onStatus = onStatus, requestedParams = requestedParams)
-    }
-    return try {
-        processYuvFusionJobV2(jobDir, onStatus, requestedParams)
-    } catch (t: Throwable) {
-        onStatus("YUV Fusion V2 failed; falling back to classic V1: ${t.javaClass.simpleName}")
-        processClassicYuvFusionJob(jobDir, onStatus = onStatus, requestedParams = requestedParams)
+    return when {
+        ENABLE_YUV_FUSION_V2 -> try {
+            processYuvFusionJobV2(
+                jobDir = jobDir,
+                onStatus = onStatus,
+                requestedParams = requestedParams,
+                dryRun = false
+            )
+        } catch (t: Throwable) {
+            onStatus("YUV Fusion V2 failed; falling back to classic V1: ${t.javaClass.simpleName}")
+            processClassicYuvFusionJob(jobDir, onStatus = onStatus, requestedParams = requestedParams)
+        }
+        ENABLE_YUV_FUSION_V2_DRY_RUN -> try {
+            processYuvFusionJobV2(
+                jobDir = jobDir,
+                onStatus = onStatus,
+                requestedParams = requestedParams,
+                dryRun = true
+            )
+        } catch (t: Throwable) {
+            onStatus("YUV Fusion V2 dry-run failed; falling back to classic V1: ${t.javaClass.simpleName}")
+            processClassicYuvFusionJob(jobDir, onStatus = onStatus, requestedParams = requestedParams)
+        }
+        else -> processClassicYuvFusionJob(jobDir, onStatus = onStatus, requestedParams = requestedParams)
     }
 }
 

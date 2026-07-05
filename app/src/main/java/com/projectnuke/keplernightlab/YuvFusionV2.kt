@@ -23,6 +23,18 @@ internal data class YuvFusionV2FrameQuality(
     val finalWeight: Double
 )
 
+private data class YuvFusionV2SkippedFrame(
+    val frameIndex: Int,
+    val fileName: String,
+    val reason: String
+)
+
+private data class YuvFusionV2ScoringResult(
+    val scores: List<YuvFusionV2FrameQuality>,
+    val skipped: List<YuvFusionV2SkippedFrame>,
+    val scoringFailed: Boolean
+)
+
 private data class YuvFusionV2FrameQualityInput(
     val frameIndex: Int,
     val fileName: String,
@@ -39,35 +51,79 @@ private data class YuvFusionV2LumaSample(
 internal fun processYuvFusionJobV2(
     jobDir: File,
     onStatus: (String) -> Unit,
-    requestedParams: ClassicYuvFusionParams? = null
+    requestedParams: ClassicYuvFusionParams? = null,
+    dryRun: Boolean = false
 ): File {
+    val scoringResult = safeScoreYuvFusionV2Frames(jobDir)
+    // Future V2 merge will consume scoringResult here before writing merged output.
     val finalFile = processClassicYuvFusionJob(
         jobDir = jobDir,
         onStatus = onStatus,
         requestedParams = requestedParams
     )
-    val qualityScores = runCatching { scoreYuvFusionV2Frames(jobDir) }.getOrNull()
     runCatching {
-        val job = loadJobJson(jobDir)
-        job.put("experimentalFusionVersion", YUV_FUSION_V2_SKELETON_VERSION)
-            .put("v2SkeletonUsed", true)
-        qualityScores
-            ?.takeIf { it.isNotEmpty() }
-            ?.let { scores -> job.put("yuvFusionV2FrameQualityScores", frameQualityScoresToJson(scores)) }
-        saveJobJson(jobDir, job)
+        writeYuvFusionV2Metadata(jobDir, dryRun = dryRun, scoringResult = scoringResult)
     }
     return finalFile
 }
 
-private fun scoreYuvFusionV2Frames(jobDir: File): List<YuvFusionV2FrameQuality> =
-    loadFrameQualityInputs(jobDir).map { input ->
-        val sample = input.file?.let { file ->
-            runCatching { decodeV2LumaSample(file) }.getOrNull()
+private fun safeScoreYuvFusionV2Frames(jobDir: File): YuvFusionV2ScoringResult =
+    try {
+        scoreYuvFusionV2Frames(jobDir)
+    } catch (_: OutOfMemoryError) {
+        YuvFusionV2ScoringResult(
+            scores = emptyList(),
+            skipped = emptyList(),
+            scoringFailed = true
+        )
+    } catch (_: Exception) {
+        YuvFusionV2ScoringResult(
+            scores = emptyList(),
+            skipped = emptyList(),
+            scoringFailed = true
+        )
+    }
+
+private fun scoreYuvFusionV2Frames(jobDir: File): YuvFusionV2ScoringResult {
+    val scores = mutableListOf<YuvFusionV2FrameQuality>()
+    val skipped = mutableListOf<YuvFusionV2SkippedFrame>()
+    loadFrameQualityInputs(jobDir).forEach { input ->
+        val file = input.file
+        if (file == null) {
+            skipped += YuvFusionV2SkippedFrame(
+                frameIndex = input.frameIndex,
+                fileName = input.fileName,
+                reason = "FILE_MISSING"
+            )
+            return@forEach
+        }
+        val sample = try {
+            decodeV2LumaSample(file)
+        } catch (oom: OutOfMemoryError) {
+            throw oom
+        } catch (_: Exception) {
+            null
+        }
+        if (sample == null && !hasUsableMetadataScores(input.frameJson)) {
+            skipped += YuvFusionV2SkippedFrame(
+                frameIndex = input.frameIndex,
+                fileName = input.fileName,
+                reason = "DECODE_FAILED"
+            )
+            return@forEach
         }
         val sharpness = estimateSharpnessScore(input.frameJson, sample)
         val exposure = estimateExposureScore(input.frameJson, sample)
         val metadata = estimateMetadataScore(input.frameJson)
-        combineFrameQualityScores(
+        if (sharpness == null && exposure == null && metadata == null) {
+            skipped += YuvFusionV2SkippedFrame(
+                frameIndex = input.frameIndex,
+                fileName = input.fileName,
+                reason = "INSUFFICIENT_SIGNAL"
+            )
+            return@forEach
+        }
+        scores += combineFrameQualityScores(
             frameIndex = input.frameIndex,
             fileName = input.fileName,
             sharpnessScore = sharpness,
@@ -75,6 +131,12 @@ private fun scoreYuvFusionV2Frames(jobDir: File): List<YuvFusionV2FrameQuality> 
             metadataScore = metadata
         )
     }
+    return YuvFusionV2ScoringResult(
+        scores = scores,
+        skipped = skipped,
+        scoringFailed = false
+    )
+}
 
 private fun loadFrameQualityInputs(jobDir: File): List<YuvFusionV2FrameQualityInput> {
     val job = runCatching { loadJobJson(jobDir) }.getOrNull() ?: return emptyList()
@@ -99,6 +161,11 @@ private fun loadFrameQualityInputs(jobDir: File): List<YuvFusionV2FrameQualityIn
         }
     }
 }
+
+private fun hasUsableMetadataScores(frameJson: JSONObject): Boolean =
+    frameJson.optDoubleOrNull("qualityScore") != null ||
+        frameJson.optDoubleOrNull("sharpnessScore") != null ||
+        frameJson.optDoubleOrNull("exposureScore") != null
 
 private fun estimateSharpnessScore(
     frameJson: JSONObject,
@@ -210,6 +277,27 @@ private fun decodeV2LumaSample(file: File): YuvFusionV2LumaSample? {
     }
 }
 
+private fun writeYuvFusionV2Metadata(
+    jobDir: File,
+    dryRun: Boolean,
+    scoringResult: YuvFusionV2ScoringResult
+) {
+    val job = loadJobJson(jobDir)
+    job.put("experimentalFusionVersion", YUV_FUSION_V2_SKELETON_VERSION)
+        .put("v2SkeletonUsed", true)
+        .put("yuvFusionV2DryRun", dryRun)
+    if (scoringResult.scoringFailed) {
+        job.put("yuvFusionV2ScoringFailed", true)
+    }
+    if (scoringResult.scores.isNotEmpty()) {
+        job.put("yuvFusionV2FrameQualityScores", frameQualityScoresToJson(scoringResult.scores))
+    }
+    if (scoringResult.skipped.isNotEmpty()) {
+        job.put("yuvFusionV2SkippedFrames", skippedFramesToJson(scoringResult.skipped))
+    }
+    saveJobJson(jobDir, job)
+}
+
 private fun frameQualityScoresToJson(scores: List<YuvFusionV2FrameQuality>): JSONArray =
     JSONArray().apply {
         scores.forEach { score ->
@@ -221,6 +309,18 @@ private fun frameQualityScoresToJson(scores: List<YuvFusionV2FrameQuality>): JSO
                     .put("exposureScore", score.exposureScore ?: JSONObject.NULL)
                     .put("metadataScore", score.metadataScore ?: JSONObject.NULL)
                     .put("finalWeight", score.finalWeight)
+            )
+        }
+    }
+
+private fun skippedFramesToJson(skipped: List<YuvFusionV2SkippedFrame>): JSONArray =
+    JSONArray().apply {
+        skipped.forEach { frame ->
+            put(
+                JSONObject()
+                    .put("frameIndex", frame.frameIndex)
+                    .put("fileName", frame.fileName)
+                    .put("reason", frame.reason)
             )
         }
     }
