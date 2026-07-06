@@ -11,6 +11,7 @@ import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.TotalCaptureResult
@@ -516,6 +517,11 @@ fun captureYuvBurstColorWithMotion(
 
                 try {
                     image = r.acquireNextImage()
+                    receivedImages++
+
+                    if (image == null) {
+                        return@setOnImageAvailableListener
+                    }
 
                     if (savedFrames >= frameCount) {
                         image.close()
@@ -866,6 +872,7 @@ fun captureYuvBurstColorWithMotion(
                                                     request: CaptureRequest,
                                                     result: TotalCaptureResult
                                                 ) {
+                                                    completedResults++
                                                     Log.i(
                                                         "KeplerPhysicalRoute",
                                                         "capture completed selectedRoute=$zoomRoute actualRoute=$captureRoute " +
@@ -875,9 +882,33 @@ fun captureYuvBurstColorWithMotion(
                                                             "finalRequestZoom=$requestZoomRatio"
                                                     )
                                                 }
+
+                                                override fun onCaptureFailed(
+                                                    session: CameraCaptureSession,
+                                                    request: CaptureRequest,
+                                                    failure: CaptureFailure
+                                                ) {
+                                                    failedCaptures++
+                                                    finishError(
+                                                        message = "Color Burst 캡처 실패",
+                                                        source = "captureYuvBurstColorWithMotion.captureRequest.failed",
+                                                        failureType = "CaptureFailure",
+                                                        failureMessage = "reason=${failure.reason}, sequenceId=${failure.sequenceId}, frameNumber=${failure.frameNumber}, wasImageCaptured=${failure.wasImageCaptured()}"
+                                                    )
+                                                }
                                             },
                                             backgroundHandler
                                         )
+                                        backgroundHandler.postDelayed({
+                                            if (!finished.get() && savedFrames < frameCount) {
+                                                finishError(
+                                                    message = "YUV capture timeout: saved=$savedFrames/$frameCount, receivedImages=$receivedImages, completedResults=$completedResults, failedCaptures=$failedCaptures",
+                                                    source = "captureYuvBurstColorWithMotion.captureRequest.timeout",
+                                                    failureType = "CaptureTimeout",
+                                                    failureMessage = "No enough YUV frames before timeout"
+                                                )
+                                            }
+                                        }, 12_000L)
                                     } catch (e: Exception) {
                                         val templateFailure =
                                             e.message?.contains(
