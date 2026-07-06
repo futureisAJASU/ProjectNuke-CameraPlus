@@ -245,7 +245,7 @@ fun captureYuvBurstColorWithMotion(
 
     fun finishError(
         message: String,
-        source: String,
+        source: String = "captureYuvBurstColorWithMotion.legacy",
         throwable: Throwable? = null,
         failureType: String? = null,
         failureMessage: String? = null
@@ -378,16 +378,22 @@ fun captureYuvBurstColorWithMotion(
             Locale.US
         ).format(Date())
 
-        val burstDir = File(keplerDir, "KPL_YUV_FUSION_$burstTimestamp").apply {
+        val currentBurstDir = File(keplerDir, "KPL_YUV_FUSION_$burstTimestamp").apply {
             if (!exists()) {
                 val ok = mkdirs()
                 if (!ok && !exists()) {
-                    finishError("Color Fusion 초기화 실패: Burst 폴더 생성 실패\n$absolutePath")
+                    finishError(
+                        message = "Color Fusion 초기화 실패: Burst 폴더 생성 실패\n$absolutePath",
+                        source = "captureYuvBurstColorWithMotion.init.storage.burstDir",
+                        failureType = "StorageError",
+                        failureMessage = "Failed to create KPL_YUV_FUSION burst directory"
+                    )
                     return
                 }
             }
         }
 
+        burstDir = currentBurstDir
         val outputWidth = if (rotationDegrees == 90 || rotationDegrees == 270) yuvSize.height else yuvSize.width
         val outputHeight = if (rotationDegrees == 90 || rotationDegrees == 270) yuvSize.width else yuvSize.height
         val useMemoryBuffer = canUseYuvMemoryBuffer(
@@ -398,7 +404,8 @@ fun captureYuvBurstColorWithMotion(
         val estimatedBufferBytes =
             estimateYuvBufferBytes(yuvSize.width, yuvSize.height) * frameCount
 
-        val jobFile = File(burstDir, "job.json")
+        val currentJobFile = File(currentBurstDir, "job.json")
+        jobFile = currentJobFile
         var yuvCaptureRequestTemplate = "UNSELECTED"
         var yuvCaptureRequestTemplateFallbackUsed = false
         val yuvCaptureRequestTemplateFailures = mutableListOf<String>()
@@ -406,7 +413,7 @@ fun captureYuvBurstColorWithMotion(
         postStatus("Color Fusion 초기화 3/7: job.json 생성 중...")
 
         writeColorJobJson(
-            jobFile = jobFile,
+            jobFile = currentJobFile,
             status = "CAPTURING",
             cameraId = cameraId,
             width = yuvSize.width,
@@ -498,7 +505,7 @@ fun captureYuvBurstColorWithMotion(
                 "Rotation: ${rotationDegrees}도\n" +
                 "Frames: $frameCount\n" +
                 "Motion: $motionInfo\n" +
-                "Folder:\n${burstDir.absolutePath}"
+                "Folder:\n${currentBurstDir.absolutePath}"
         )
 
         reader.setOnImageAvailableListener(
@@ -523,8 +530,11 @@ fun captureYuvBurstColorWithMotion(
                             copyYuvFrameToMemory(image, frameIndex)
                         } catch (oom: OutOfMemoryError) {
                             finishError(
-                                "YUV memory buffer failed: OutOfMemoryError before frame " +
-                                    "${frameIndex + 1}/$frameCount"
+                                message = "YUV memory buffer failed before frame ${frameIndex + 1}/$frameCount",
+                                source = "captureYuvBurstColorWithMotion.imageReader.memoryBuffer.oom",
+                                throwable = oom,
+                                failureType = "CaptureRequestError",
+                                failureMessage = "OutOfMemoryError while copying YUV frame to memory buffer before frame ${frameIndex + 1}/$frameCount"
                             )
                             return@setOnImageAvailableListener
                         }
@@ -536,14 +546,14 @@ fun captureYuvBurstColorWithMotion(
                         postStatus("YUV buffered frame $savedFrames/$frameCount")
 
                         if (savedFrames >= frameCount) {
-                            val savedMotionFiles = saveMotionOnce(burstDir)
+                            val savedMotionFiles = saveMotionOnce(currentBurstDir)
                             val finalLogger = motionLogger
                             bufferedFrames.sortedBy { it.index }.forEachIndexed { flushIndex, frame ->
                                 val fileName =
                                     "frame_${frame.index.toString().padStart(2, '0')}_color.png"
                                 saveRotatedColorPngFromBufferedYuv(
                                     frame = frame,
-                                    outFile = File(burstDir, fileName),
+                                    outFile = File(currentBurstDir, fileName),
                                     rotationDegrees = rotationDegrees
                                 )
                                 savedFrameFiles.add(fileName)
@@ -551,7 +561,7 @@ fun captureYuvBurstColorWithMotion(
                             }
                             bufferedFrames.clear()
                             writeColorJobJson(
-                                jobFile = jobFile,
+                                jobFile = currentJobFile,
                                 status = "CAPTURE_COMPLETE",
                                 cameraId = cameraId,
                                 width = yuvSize.width,
@@ -591,18 +601,18 @@ fun captureYuvBurstColorWithMotion(
                             )
                             postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
                             finishSuccess(
-                                burstDir,
+                                currentBurstDir,
                                 "CAPTURE_COMPLETE: Color Burst + Motion complete\n" +
                                     "Frames: $savedFrames\n" +
                                     "Output: ${outputWidth}x${outputHeight}\n" +
-                                    "Folder:\n${burstDir.absolutePath}"
+                                    "Folder:\n${currentBurstDir.absolutePath}"
                             )
                         }
                         return@setOnImageAvailableListener
                     }
 
                     val fileName = "frame_${frameIndex.toString().padStart(2, '0')}_color.png"
-                    val outFile = File(burstDir, fileName)
+                    val outFile = File(currentBurstDir, fileName)
 
                     saveRotatedColorPngFromYuv(
                         image = image,
@@ -617,7 +627,7 @@ fun captureYuvBurstColorWithMotion(
                     val logger = motionLogger
 
                     writeColorJobJson(
-                        jobFile = jobFile,
+                        jobFile = currentJobFile,
                         status = "CAPTURING",
                         cameraId = cameraId,
                         width = yuvSize.width,
@@ -663,15 +673,15 @@ fun captureYuvBurstColorWithMotion(
                             "timestampNs: $imageTimestampNs\n" +
                             "gyro samples: ${logger?.gyroCount() ?: 0}\n" +
                             "rotation samples: ${logger?.rotationVectorCount() ?: 0}\n" +
-                            "폴더:\n${burstDir.absolutePath}"
+                            "폴더:\n${currentBurstDir.absolutePath}"
                     )
 
                     if (savedFrames >= frameCount) {
-                        val savedMotionFiles = saveMotionOnce(burstDir)
+                        val savedMotionFiles = saveMotionOnce(currentBurstDir)
                         val finalLogger = motionLogger
 
                         writeColorJobJson(
-                            jobFile = jobFile,
+                            jobFile = currentJobFile,
                             status = "CAPTURE_COMPLETE",
                             cameraId = cameraId,
                             width = yuvSize.width,
@@ -712,24 +722,33 @@ fun captureYuvBurstColorWithMotion(
 
                         postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
                         finishSuccess(
-                            burstDir,
+                            currentBurstDir,
                             "CAPTURE_COMPLETE: Color Burst + Motion 저장 완료\n" +
                                 "프레임: $savedFrames 장\n" +
                                 "출력: ${outputWidth}x${outputHeight}\n" +
                                 "rotation: ${rotationDegrees}도\n" +
                                 "gyro samples: ${finalLogger?.gyroCount() ?: 0}\n" +
                                 "rotation samples: ${finalLogger?.rotationVectorCount() ?: 0}\n" +
-                                "폴더:\n${burstDir.absolutePath}"
+                                "폴더:\n${currentBurstDir.absolutePath}"
                         )
                     }
                 } catch (oom: OutOfMemoryError) {
                     bufferedFrames.clear()
                     finishError(
-                        "YUV memory buffer failed: OutOfMemoryError while copying/flushing; " +
-                            "job directory and completed source frames kept."
+                        message = "YUV memory buffer failed while copying/flushing; job directory and completed source frames kept.",
+                        source = "captureYuvBurstColorWithMotion.imageReader.memoryBuffer.oom",
+                        throwable = oom,
+                        failureType = "CaptureRequestError",
+                        failureMessage = "OutOfMemoryError while copying or flushing buffered YUV frames"
                     )
                 } catch (e: Exception) {
-                    finishError("컬러 프레임 저장 실패\n${e.stackTraceToString()}")
+                    finishError(
+                        message = "컬러 프레임 저장 실패",
+                        source = "captureYuvBurstColorWithMotion.imageReader.save",
+                        throwable = e,
+                        failureType = "CaptureRequestError",
+                        failureMessage = e.message ?: "Failed while saving YUV color frame"
+                    )
                 } finally {
                     try { image?.close() } catch (_: Exception) {}
                 }
@@ -767,7 +786,7 @@ fun captureYuvBurstColorWithMotion(
                                             buildCenterCropRegion(characteristics, finalRequestZoom) != null
                                         val requestZoomRatio = finalRequestZoom
                                         writeColorJobJson(
-                                            jobFile = jobFile,
+                                            jobFile = currentJobFile,
                                             status = "CAPTURING",
                                             cameraId = cameraId,
                                             width = yuvSize.width,
@@ -824,7 +843,7 @@ fun captureYuvBurstColorWithMotion(
                                             builder.build()
                                         }
                                         updateYuvCaptureRequestTemplateMetadata(
-                                            jobFile = jobFile,
+                                            jobFile = currentJobFile,
                                             template = yuvCaptureRequestTemplate,
                                             fallbackUsed = yuvCaptureRequestTemplateFallbackUsed,
                                             failures = yuvCaptureRequestTemplateFailures
@@ -866,39 +885,73 @@ fun captureYuvBurstColorWithMotion(
                                             ) == true
                                         if (templateFailure) {
                                             finishError(
-                                                "PIPELINE_FAILED: ${e.message}\n" +
-                                                    "Failures: " +
-                                                    yuvCaptureRequestTemplateFailures.joinToString(" | ")
+                                                message = "PIPELINE_FAILED: ${e.message}",
+                                                source = "captureYuvBurstColorWithMotion.captureRequest.template",
+                                                throwable = e,
+                                                failureType = "CaptureRequestError",
+                                                failureMessage = yuvCaptureRequestTemplateFailures.joinToString(" | ").ifBlank {
+                                                    e.message ?: "YUV capture request template creation failed"
+                                                }
                                             )
                                         } else {
-                                            finishError("Color Burst 캡처 요청 실패\n${e.stackTraceToString()}")
+                                            finishError(
+                                                message = "Color Burst 캡처 요청 실패",
+                                                source = "captureYuvBurstColorWithMotion.captureRequest.submit",
+                                                throwable = e,
+                                                failureType = "CaptureRequestError",
+                                                failureMessage = e.message ?: "Capture request submission failed"
+                                            )
                                         }
                                     }
                             },
 
                             onFailed = { reason ->
-                                    finishError("Color Burst 세션 구성 실패: $reason")
+                                    finishError(
+                                        message = "Color Burst 세션 구성 실패: $reason",
+                                        source = "captureYuvBurstColorWithMotion.session.configure",
+                                        failureType = "SessionConfigurationFailed",
+                                        failureMessage = reason
+                                    )
                             }
                         )
                     } catch (e: Exception) {
-                        finishError("Color Burst 세션 생성 실패\n${e.stackTraceToString()}")
+                        finishError(
+                            message = "Color Burst 세션 생성 실패",
+                            source = "captureYuvBurstColorWithMotion.session.create",
+                            throwable = e,
+                            failureType = "SessionConfigurationFailed",
+                            failureMessage = e.message ?: "Failed to create capture session"
+                        )
                     }
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
-                    finishError("카메라 연결 해제됨")
+                    finishError(
+                        message = "카메라 연결 해제됨",
+                        source = "captureYuvBurstColorWithMotion.camera.disconnected",
+                        failureType = "CameraDisconnected",
+                        failureMessage = "CameraDevice disconnected during YUV capture"
+                    )
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
-                    finishError("카메라 오류: $error")
+                    finishError(
+                        message = "카메라 오류: $error",
+                        source = "captureYuvBurstColorWithMotion.camera.error",
+                        failureType = "CameraDeviceError",
+                        failureMessage = "CameraDevice onError($error)"
+                    )
                 }
             },
             backgroundHandler
         )
     } catch (e: Exception) {
         finishError(
-            "Color Fusion 초기화 실패\n" +
-                "원인:\n${e.stackTraceToString()}"
+            message = "Color Fusion 초기화 실패",
+            source = "captureYuvBurstColorWithMotion.init.catch",
+            throwable = e,
+            failureType = "CaptureRequestError",
+            failureMessage = e.message ?: "Unexpected initialization failure"
         )
     }
 }
