@@ -26,6 +26,29 @@ private data class LoadedColorFrame(
     val timestampNs: Long?
 )
 
+private fun recycleLoadedColorFrames(frames: List<LoadedColorFrame>) {
+    frames.forEach { frame ->
+        runCatching {
+            if (!frame.bitmap.isRecycled) {
+                frame.bitmap.recycle()
+            }
+        }
+    }
+}
+
+private inline fun <T> withLoadedColorFrames(
+    jobDir: File,
+    job: JSONObject,
+    block: (List<LoadedColorFrame>) -> T
+): T {
+    val frames = loadColorFrames(jobDir, job)
+    return try {
+        block(frames)
+    } finally {
+        recycleLoadedColorFrames(frames)
+    }
+}
+
 private data class GyroSampleForFusion(
     val timestampNs: Long,
     val magnitude: Double

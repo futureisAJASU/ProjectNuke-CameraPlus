@@ -21,6 +21,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.StatFs
 import android.util.Log
 import android.util.Size
 import android.view.Surface
@@ -39,6 +40,14 @@ private const val ENABLE_YUV_MEMORY_BURST_BUFFER = true
 private const val MAX_YUV_MEMORY_BUFFER_FRAMES = 6
 private const val MAX_YUV_MEMORY_BUFFER_BYTES = 160L * 1024L * 1024L
 private const val YUV_CAPTURE_LOG_TAG = "KeplerYuvCapture"
+private const val MIN_YUV_CAPTURE_TIMEOUT_MS = 12_000L
+private const val YUV_RGB_STORAGE_BYTES_PER_PIXEL_ESTIMATE = 4L
+
+private enum class YuvRgbMatrix {
+    BT601_FULL
+}
+
+private val DEFAULT_YUV_RGB_MATRIX = YuvRgbMatrix.BT601_FULL
 
 private data class YuvCaptureFailureSnapshot(
     val jobFile: File?,
@@ -106,9 +115,12 @@ private fun persistYuvCaptureFailure(
             .put("receivedImages", snapshot.receivedImages)
             .put("completedResults", snapshot.completedResults)
             .put("failedCaptures", snapshot.failedCaptures)
+            .put("yuvRgbMatrix", DEFAULT_YUV_RGB_MATRIX.name)
             .put("frames", framesArray)
             .put("updatedAt", System.currentTimeMillis())
         jobFile.writeText(job.toString(2))
+    }.onFailure { persistError ->
+        Log.w(YUV_CAPTURE_LOG_TAG, "Failed to persist YUV capture failure metadata", persistError)
     }
 }
 
@@ -229,6 +241,7 @@ fun captureYuvBurstColorWithMotion(
     fun cleanup() {
         if (!cleanupStarted.compareAndSet(false, true)) return
         try { imageReader?.setOnImageAvailableListener(null, null) } catch (_: Exception) {}
+        try { backgroundHandler.removeCallbacksAndMessages(null) } catch (_: Exception) {}
         try { captureSession?.abortCaptures() } catch (_: Exception) {}
         try { captureSession?.stopRepeating() } catch (_: Exception) {}
         try { captureSession?.close() } catch (_: Exception) {}
@@ -404,6 +417,7 @@ fun captureYuvBurstColorWithMotion(
         )
         val estimatedBufferBytes =
             estimateYuvBufferBytes(yuvSize.width, yuvSize.height) * frameCount
+        val captureTimeoutMs = computeYuvCaptureTimeoutMs(frameCount, resolutionMode)
 
         val currentJobFile = File(currentBurstDir, "job.json")
         jobFile = currentJobFile
@@ -482,6 +496,15 @@ fun captureYuvBurstColorWithMotion(
             )
         }
         postStatus("YUV capture: saved 0/$frameCount")
+        if (!ensureSufficientSpaceForYuvBurstPngs(currentBurstDir, frameCount, outputWidth, outputHeight)) {
+            finishError(
+                message = "YUV capture failed: insufficient free space for burst frame PNGs",
+                source = "captureYuvBurstColorWithMotion.storage.freeSpace",
+                failureType = "StorageError",
+                failureMessage = "Insufficient free space before saving YUV burst PNG frames"
+            )
+            return
+        }
         postStatus("YUV 캡처 중입니다. 기기를 움직이지 마세요.")
 
         postStatus("Color Fusion 초기화 5/7: 모션 센서 시작 중...")
@@ -908,7 +931,7 @@ fun captureYuvBurstColorWithMotion(
                                                     failureMessage = "No enough YUV frames before timeout"
                                                 )
                                             }
-                                        }, 12_000L)
+                                        }, captureTimeoutMs)
                                     } catch (e: Exception) {
                                         val templateFailure =
                                             e.message?.contains(
@@ -987,6 +1010,62 @@ fun captureYuvBurstColorWithMotion(
     }
 }
 
+private fun computeYuvCaptureTimeoutMs(
+    frameCount: Int,
+    resolutionMode: CaptureResolutionMode
+): Long {
+    val extraFrames = (frameCount - 6).coerceAtLeast(0)
+    val extraFrameMs = extraFrames * 1_000L
+    val resolutionExtraMs = when (resolutionMode) {
+        CaptureResolutionMode.MP12 -> 0L
+        CaptureResolutionMode.MP24_FUSION -> 4_000L
+        CaptureResolutionMode.MP50 -> 8_000L
+    }
+    return (MIN_YUV_CAPTURE_TIMEOUT_MS + extraFrameMs + resolutionExtraMs)
+        .coerceAtLeast(MIN_YUV_CAPTURE_TIMEOUT_MS)
+}
+
+private fun ensureSufficientSpaceForYuvBurstPngs(
+    burstDir: File,
+    frameCount: Int,
+    outputWidth: Int,
+    outputHeight: Int
+): Boolean {
+    return runCatching {
+        val statFs = StatFs(burstDir.absolutePath)
+        val availableBytes = statFs.availableBytes
+        val estimatedBytes =
+            outputWidth.toLong() * outputHeight.toLong() *
+                YUV_RGB_STORAGE_BYTES_PER_PIXEL_ESTIMATE * frameCount
+        availableBytes >= estimatedBytes
+    }.getOrDefault(true)
+}
+
+private fun writeBitmapToTempPng(bitmap: Bitmap, finalFile: File) {
+    val tempFile = File(finalFile.parentFile, "${finalFile.name}.tmp")
+    try {
+        FileOutputStream(tempFile).use { output ->
+            if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
+                throw IllegalStateException("Bitmap PNG compression returned false")
+            }
+            output.fd.sync()
+        }
+        if (finalFile.exists() && !finalFile.delete()) {
+            throw IllegalStateException("Failed to replace existing file: ${finalFile.name}")
+        }
+        if (!tempFile.renameTo(finalFile)) {
+            throw IllegalStateException("Failed to rename temp file to ${finalFile.name}")
+        }
+    } catch (t: Throwable) {
+        runCatching {
+            if (tempFile.exists()) {
+                tempFile.delete()
+            }
+        }
+        throw t
+    }
+}
+
 fun averageLatestYuvBurstColor(
     context: Context,
     onStatus: (String) -> Unit
@@ -1049,6 +1128,7 @@ fun averageLatestYuvBurstColor(
 
             val width = firstBitmap.width
             val height = firstBitmap.height
+            firstBitmap.recycle()
             val pixelCount = width * height
 
             val accR = IntArray(pixelCount)
@@ -1096,8 +1176,6 @@ fun averageLatestYuvBurstColor(
                         "사용 프레임: $usedFrames / ${framesArray.length()}"
                 )
             }
-
-            firstBitmap.recycle()
 
             if (usedFrames == 0) {
                 postStatus("사용 가능한 컬러 프레임이 없음")
@@ -1154,10 +1232,7 @@ fun saveRotatedColorPngFromYuv(
 ) {
     val bitmap = yuv420ToBitmap(image)
     val rotated = rotateBitmapIfNeeded(bitmap, rotationDegrees)
-
-    FileOutputStream(outFile).use { output ->
-        rotated.compress(Bitmap.CompressFormat.PNG, 100, output)
-    }
+    writeBitmapToTempPng(rotated, outFile)
 
     if (rotated !== bitmap) {
         rotated.recycle()
@@ -1173,11 +1248,20 @@ private fun saveRotatedColorPngFromBufferedYuv(
 ) {
     val bitmap = yuv420BufferToBitmap(frame)
     val rotated = rotateBitmapIfNeeded(bitmap, rotationDegrees)
-    FileOutputStream(outFile).use { output ->
-        rotated.compress(Bitmap.CompressFormat.PNG, 100, output)
-    }
+    writeBitmapToTempPng(rotated, outFile)
     if (rotated !== bitmap) rotated.recycle()
     bitmap.recycle()
+}
+
+private fun convertYuvToRgbBt601Full(
+    yValue: Int,
+    uValue: Int,
+    vValue: Int
+): Int {
+    val r = clampToByte((yValue + 1.402f * vValue).toInt())
+    val g = clampToByte((yValue - 0.344136f * uValue - 0.714136f * vValue).toInt())
+    val b = clampToByte((yValue + 1.772f * uValue).toInt())
+    return Color.rgb(r, g, b)
 }
 
 private fun yuv420BufferToBitmap(frame: BufferedYuvFrame): Bitmap {
@@ -1195,12 +1279,7 @@ private fun yuv420BufferToBitmap(frame: BufferedYuvFrame): Bitmap {
                 frame.v.safeGet(uvRow * frame.vRowStride + (x / 2) * frame.vPixelStride)
                     .toInt() and 0xFF
                 ) - 128
-            val r = clampToByte((yValue + 1.402f * vValue).toInt())
-            val g = clampToByte(
-                (yValue - 0.344136f * uValue - 0.714136f * vValue).toInt()
-            )
-            val b = clampToByte((yValue + 1.772f * uValue).toInt())
-            pixels[y * frame.width + x] = Color.rgb(r, g, b)
+            pixels[y * frame.width + x] = convertYuvToRgbBt601Full(yValue, uValue, vValue)
         }
     }
     return Bitmap.createBitmap(frame.width, frame.height, Bitmap.Config.ARGB_8888).apply {
@@ -1247,11 +1326,7 @@ fun yuv420ToBitmap(image: Image): Bitmap {
             val uValue = (uBuffer.safeGet(uIndex).toInt() and 0xFF) - 128
             val vValue = (vBuffer.safeGet(vIndex).toInt() and 0xFF) - 128
 
-            val r = clampToByte((yValue + 1.402f * vValue).toInt())
-            val g = clampToByte((yValue - 0.344136f * uValue - 0.714136f * vValue).toInt())
-            val b = clampToByte((yValue + 1.772f * uValue).toInt())
-
-            pixels[y * width + x] = Color.rgb(r, g, b)
+            pixels[y * width + x] = convertYuvToRgbBt601Full(yValue, uValue, vValue)
         }
     }
 
@@ -1579,6 +1654,7 @@ fun writeColorJobJson(
         .put("yuvDetailVersion", "YUV_LUMA_DETAIL_V0")
         .put("yuvSharpenVersion", "YUV_ADAPTIVE_LUMA_SHARPEN_V0")
         .put("yuvLookVersion", "YUV_NATURAL_NIGHT_LOOK_V0")
+        .put("yuvRgbMatrix", DEFAULT_YUV_RGB_MATRIX.name)
         .put(
             "timing",
             previousJob?.optJSONObject("timing") ?: JSONObject()
