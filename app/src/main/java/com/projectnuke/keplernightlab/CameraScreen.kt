@@ -499,6 +499,7 @@ fun MainCameraScreen(
                 )
                 return@Runnable
             }
+            pipelineGeneration++
             val timeoutStatus = "CAPTURE_TIMEOUT: Capture timeout. Preview recovered."
             status = timeoutStatus
             captureProgress = parseCaptureProgress(timeoutStatus, captureProgress)
