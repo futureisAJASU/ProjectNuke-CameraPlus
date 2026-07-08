@@ -57,6 +57,7 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -264,6 +265,7 @@ fun MainCameraScreen(
     var isPipelineBusy by remember { mutableStateOf(false) }
     var currentScreen by remember { mutableStateOf(MainScreen.CAMERA) }
     var captureProgress by remember { mutableStateOf(CaptureProgressState()) }
+    var pipelineGeneration by remember { mutableIntStateOf(0) }
 
     val selectedMode = "사진"
     var selectedResolution by remember {
@@ -474,11 +476,15 @@ fun MainCameraScreen(
             Log.i("KeplerPipelineState", "capture ignored: pipeline busy status=$status")
             return
         }
+        val localGeneration = ++pipelineGeneration
         status = startMessage
         isPipelineBusy = true
         isCapturing = true
         previewEnabled = false
-        Log.i("KeplerPipelineState", "pipeline start message=$startMessage requestedFrames=$requestedFrames")
+        Log.i(
+            "KeplerPipelineState",
+            "pipeline start generation=$localGeneration message=$startMessage requestedFrames=$requestedFrames"
+        )
         captureProgress = CaptureProgressState(
             stage = CaptureStage.PREPARING,
             message = "Preparing capture...",
@@ -486,6 +492,13 @@ fun MainCameraScreen(
             progressPercent = 0.05f
         )
         val watchdog = Runnable {
+            if (localGeneration != pipelineGeneration) {
+                Log.i(
+                    "KeplerPipelineState",
+                    "stale watchdog ignored generation=$localGeneration current=$pipelineGeneration"
+                )
+                return@Runnable
+            }
             val timeoutStatus = "CAPTURE_TIMEOUT: Capture timeout. Preview recovered."
             status = timeoutStatus
             captureProgress = parseCaptureProgress(timeoutStatus, captureProgress)
@@ -497,6 +510,13 @@ fun MainCameraScreen(
         mainHandler.postDelayed(watchdog, timeoutMillis)
 
         fun finishIfTerminal(newStatus: String) {
+            if (localGeneration != pipelineGeneration) {
+                Log.i(
+                    "KeplerPipelineState",
+                    "stale terminal ignored generation=$localGeneration current=$pipelineGeneration status=$newStatus"
+                )
+                return
+            }
             captureProgress = parseCaptureProgress(newStatus, captureProgress)
             if (isCaptureStageCompleteButPipelineStillRunning(newStatus)) {
                 isCapturing = false
@@ -523,6 +543,13 @@ fun MainCameraScreen(
 
                 mainHandler.postDelayed(
                     {
+                        if (localGeneration != pipelineGeneration) {
+                            Log.i(
+                                "KeplerPipelineState",
+                                "stale preview enable ignored generation=$localGeneration current=$pipelineGeneration"
+                            )
+                            return@postDelayed
+                        }
                         previewEnabled = true
                         Log.i("KeplerPipelineState", "preview re-enabled")
                     },
@@ -533,7 +560,14 @@ fun MainCameraScreen(
 
         mainHandler.postDelayed(
             {
-                job { newStatus ->
+                job jobCallback@{ newStatus ->
+                    if (localGeneration != pipelineGeneration) {
+                        Log.i(
+                            "KeplerPipelineState",
+                            "stale pipeline status ignored generation=$localGeneration current=$pipelineGeneration status=$newStatus"
+                        )
+                        return@jobCallback
+                    }
                     status = newStatus
                     finishIfTerminal(newStatus)
                 }
