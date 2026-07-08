@@ -73,6 +73,23 @@ private data class MergeResult(
     val comparedPixels: Long
 )
 
+private data class ClassicYuvProcessingPreflight(
+    val totalFrames: Int,
+    val enabledFrames: Int,
+    val existingFrameFiles: Int,
+    val missingFrameFiles: Int,
+    val decodeProbePassed: Int,
+    val decodeProbeFailed: Int
+)
+
+private data class ClassicYuvProcessingFailureCounts(
+    val totalFrames: Int,
+    val enabledFrames: Int,
+    val decodedUsableFrames: Int,
+    val sameSizeFrames: Int,
+    val compatibleFrames: Int
+)
+
 internal fun processClassicYuvFusionJob(
     jobDir: File,
     requestedParams: ClassicYuvFusionParams? = null,
@@ -85,6 +102,12 @@ internal fun processClassicYuvFusionJob(
     val params = (requestedParams ?: loadClassicYuvFusionParams(job)).clamped()
     var merged: Bitmap? = null
     var finalBitmap: Bitmap? = null
+    var preflight: ClassicYuvProcessingPreflight? = null
+    var decodedUsableFrameCount = 0
+    var sameSizeFrameCount = 0
+    var compatibleFrameCount = 0
+    var sameSizeFrameCountKnown = false
+    var compatibleFrameCountKnown = false
     try {
         fun markStage(stage: String, status: String) {
             job.put("currentPipelineStage", stage)
@@ -96,8 +119,12 @@ internal fun processClassicYuvFusionJob(
         }
 
         markStage("YUV_ALIGNING", "YUV 프레임을 정렬하는 중입니다.")
+        val preflightSummary = buildClassicYuvProcessingPreflight(jobDir, job)
+        preflight = preflightSummary
+        job.put("yuvProcessingPreflight", preflightSummary.toJson())
+        jobFile.writeText(job.toString(2))
         val candidateFrames = loadClassicFrames(jobDir, job)
-        val totalFrames = job.optJSONArray("frames")?.length() ?: 0
+        val totalFrames = preflightSummary.totalFrames
         val frames = candidateFrames.mapNotNull { frame ->
             try {
                 frame.thumbnail = decodeLumaThumbnail(frame.file)
@@ -111,7 +138,13 @@ internal fun processClassicYuvFusionJob(
                 null
             }
         }
-        if (frames.size < 2) error("Not enough enabled YUV frames to reprocess")
+        decodedUsableFrameCount = frames.size
+        if (frames.size < 2) {
+            error(
+                "Not enough enabled YUV frames to reprocess: " +
+                    "enabled=${preflight.enabledFrames}, total=${preflight.totalFrames}, usable=${frames.size}"
+            )
+        }
         val reference = selectClassicReference(frames)
         onStatus("Classic YUV fusion: selected reference frame ${reference.jsonIndex + 1}")
 
@@ -151,9 +184,18 @@ internal fun processClassicYuvFusionJob(
 
         val dimensions = decodeImageDimensions(reference.file)
         val sameSizeFrames = frames.filter { decodeImageDimensions(it.file) == dimensions }
+        sameSizeFrameCount = sameSizeFrames.size
+        sameSizeFrameCountKnown = true
         val acceptedFrames = sameSizeFrames.filter { it === reference || it.alignmentUsed }
         val compatibleFrames = if (acceptedFrames.size >= 2) acceptedFrames else sameSizeFrames.take(2)
-        if (compatibleFrames.size < 2) error("Not enough same-size YUV frames to fuse")
+        compatibleFrameCount = compatibleFrames.size
+        compatibleFrameCountKnown = true
+        if (compatibleFrames.size < 2) {
+            error(
+                "Not enough same-size YUV frames to fuse: " +
+                    "compatible=${compatibleFrames.size}, sameSize=${sameSizeFrames.size}, decoded=${frames.size}"
+            )
+        }
         val activeReference = compatibleFrames.find { it === reference } ?: compatibleFrames.first()
         activeReference.isReference = true
         compatibleFrames.forEach { frame ->
@@ -324,14 +366,41 @@ internal fun processClassicYuvFusionJob(
         onStatus("처리가 완료되었습니다.")
         return finalFile
     } catch (oom: OutOfMemoryError) {
-        recordClassicFailure(jobFile, job, "OOM_FAILED_KEEPING_CACHE", "OutOfMemoryError")
+        val failurePreflight = preflight ?: buildClassicYuvProcessingPreflight(jobDir, job)
+        recordClassicFailure(
+            jobFile = jobFile,
+            job = job,
+            status = "OOM_FAILED_KEEPING_CACHE",
+            reason = "OutOfMemoryError",
+            throwable = oom,
+            failureCounts = resolveClassicFailureCounts(
+                preflight = failurePreflight,
+                decodedUsableFrameCount = decodedUsableFrameCount,
+                sameSizeFrameCount = sameSizeFrameCount,
+                compatibleFrameCount = compatibleFrameCount,
+                sameSizeFrameCountKnown = sameSizeFrameCountKnown,
+                compatibleFrameCountKnown = compatibleFrameCountKnown
+            ),
+            preflight = failurePreflight
+        )
         throw IllegalStateException("Classic YUV fusion failed: OutOfMemoryError; cache kept", oom)
     } catch (e: Exception) {
+        val failurePreflight = preflight ?: buildClassicYuvProcessingPreflight(jobDir, job)
         recordClassicFailure(
             jobFile,
             job,
             "CLASSIC_YUV_FUSION_V1_FAILED_KEEPING_CACHE",
-            "${e.javaClass.simpleName}: ${e.message}"
+            e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName,
+            e,
+            resolveClassicFailureCounts(
+                preflight = failurePreflight,
+                decodedUsableFrameCount = decodedUsableFrameCount,
+                sameSizeFrameCount = sameSizeFrameCount,
+                compatibleFrameCount = compatibleFrameCount,
+                sameSizeFrameCountKnown = sameSizeFrameCountKnown,
+                compatibleFrameCountKnown = compatibleFrameCountKnown
+            ),
+            preflight = failurePreflight
         )
         throw e
     } finally {
@@ -988,19 +1057,146 @@ private fun decodeImageDimensions(file: File): Pair<Int, Int> {
     return options.outWidth to options.outHeight
 }
 
+private fun buildClassicYuvProcessingPreflight(
+    jobDir: File,
+    job: JSONObject
+): ClassicYuvProcessingPreflight {
+    val frames = job.optJSONArray("frames")
+    if (frames == null) {
+        return ClassicYuvProcessingPreflight(
+            totalFrames = 0,
+            enabledFrames = 0,
+            existingFrameFiles = 0,
+            missingFrameFiles = 0,
+            decodeProbePassed = 0,
+            decodeProbeFailed = 0
+        )
+    }
+
+    var enabledFrames = 0
+    var existingFrameFiles = 0
+    var missingFrameFiles = 0
+    var decodeProbePassed = 0
+    var decodeProbeFailed = 0
+
+    repeat(frames.length()) { index ->
+        val frame = frames.optJSONObject(index) ?: return@repeat
+        if (!frame.optBoolean("enabled", true) || frame.optBoolean("excludedByUser", false)) {
+            return@repeat
+        }
+        enabledFrames++
+        val fileName = frame.optString("file")
+        if (fileName.isBlank()) {
+            missingFrameFiles++
+            return@repeat
+        }
+        val file = File(jobDir, fileName)
+        if (!file.isFile) {
+            missingFrameFiles++
+            return@repeat
+        }
+        existingFrameFiles++
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.absolutePath, bounds)
+        if (bounds.outWidth > 0 && bounds.outHeight > 0) {
+            decodeProbePassed++
+        } else {
+            decodeProbeFailed++
+        }
+    }
+
+    return ClassicYuvProcessingPreflight(
+        totalFrames = frames.length(),
+        enabledFrames = enabledFrames,
+        existingFrameFiles = existingFrameFiles,
+        missingFrameFiles = missingFrameFiles,
+        decodeProbePassed = decodeProbePassed,
+        decodeProbeFailed = decodeProbeFailed
+    )
+}
+
+private fun ClassicYuvProcessingPreflight.toJson(): JSONObject =
+    JSONObject()
+        .put("totalFrames", totalFrames)
+        .put("enabledFrames", enabledFrames)
+        .put("existingFrameFiles", existingFrameFiles)
+        .put("missingFrameFiles", missingFrameFiles)
+        .put("decodeProbePassed", decodeProbePassed)
+        .put("decodeProbeFailed", decodeProbeFailed)
+
+private fun resolveClassicFailureCounts(
+    preflight: ClassicYuvProcessingPreflight,
+    decodedUsableFrameCount: Int,
+    sameSizeFrameCount: Int,
+    compatibleFrameCount: Int,
+    sameSizeFrameCountKnown: Boolean,
+    compatibleFrameCountKnown: Boolean
+): ClassicYuvProcessingFailureCounts {
+    val resolvedSameSizeFrameCount =
+        if (sameSizeFrameCountKnown) sameSizeFrameCount else decodedUsableFrameCount
+    val resolvedCompatibleFrameCount =
+        if (compatibleFrameCountKnown) compatibleFrameCount else resolvedSameSizeFrameCount
+    return ClassicYuvProcessingFailureCounts(
+        totalFrames = preflight.totalFrames,
+        enabledFrames = preflight.enabledFrames,
+        decodedUsableFrames = decodedUsableFrameCount,
+        sameSizeFrames = resolvedSameSizeFrameCount,
+        compatibleFrames = resolvedCompatibleFrameCount
+    )
+}
+
 private fun recordClassicFailure(
     jobFile: File,
     job: JSONObject,
     status: String,
-    reason: String
+    reason: String,
+    throwable: Throwable? = null,
+    failureCounts: ClassicYuvProcessingFailureCounts? = null,
+    preflight: ClassicYuvProcessingPreflight? = null
 ) {
     runCatching {
-        job.put("processStatus", status)
+        job.put("currentPipelineStage", "PIPELINE_FAILED")
+            .put("processStatus", "PIPELINE_FAILED")
+            .put("pipelineFailed", true)
+            .put("pipelineFailureStatusCode", status)
+            .put("pipelineFailureSource", "processClassicYuvFusionJob")
+            .put("pipelineFailureType", throwable?.javaClass?.name ?: "Unknown")
+            .put("pipelineFailureMessage", formatClassicFailureMessage(throwable, reason))
+            .put("pipelineFailureStackTrace", throwable?.stackTraceToString() ?: "")
+            .put("processFailureReason", reason)
             .put("fusionEngine", "classic_yuv_v1")
             .put("fusionVersion", CLASSIC_FUSION_VERSION)
-            .put("processFailureReason", reason)
             .put("processedAt", System.currentTimeMillis())
+        preflight?.let { job.put("yuvProcessingPreflight", it.toJson()) }
+        failureCounts?.let {
+            job.put("yuvProcessingTotalFrames", it.totalFrames)
+                .put("yuvProcessingEnabledFrames", it.enabledFrames)
+                .put("yuvProcessingDecodedUsableFrames", it.decodedUsableFrames)
+                .put("yuvProcessingSameSizeFrames", it.sameSizeFrames)
+                .put("yuvProcessingCompatibleFrames", it.compatibleFrames)
+        }
         jobFile.writeText(job.toString(2))
+    }
+}
+
+private fun formatClassicFailureMessage(throwable: Throwable?, reason: String): String {
+    if (throwable == null) return reason
+    return when (throwable) {
+        is OutOfMemoryError -> {
+            if (throwable.message.isNullOrBlank()) {
+                "OutOfMemoryError"
+            } else {
+                "OutOfMemoryError: ${throwable.message}"
+            }
+        }
+        else -> {
+            val message = throwable.message?.takeIf { it.isNotBlank() }
+            if (message.isNullOrBlank()) {
+                "${throwable.javaClass.simpleName}: $reason"
+            } else {
+                "${throwable.javaClass.simpleName}: $message"
+            }
+        }
     }
 }
 

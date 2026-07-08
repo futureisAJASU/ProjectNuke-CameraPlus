@@ -16,10 +16,16 @@ private const val V2_QUALITY_MAX_SAMPLE_DIMENSION = 320
 private const val V2_NEUTRAL_SCORE = 0.5
 private const val V2_NEUTRAL_WEIGHT = 1.0
 
+internal class YuvFusionV2DryRunClassicFusionFailedException(
+    message: String,
+    cause: Throwable
+) : RuntimeException(message, cause)
+
 private val V2_OWNED_METADATA_KEYS = listOf(
     "experimentalFusionVersion",
     "v2SkeletonUsed",
     "yuvFusionV2DryRun",
+    "yuvFusionV2ScoringRan",
     "yuvFusionV2FrameQualityScores",
     "yuvFusionV2SkippedFrames",
     "yuvFusionV2ScoringFailed",
@@ -29,7 +35,12 @@ private val V2_OWNED_METADATA_KEYS = listOf(
     "yuvFusionV2WeightedMergeAttempted",
     "yuvFusionV2WeightedMergeUsed",
     "yuvFusionV2FallbackToV1",
-    "yuvFusionV2FallbackReason"
+    "yuvFusionV2FallbackReason",
+    "yuvFusionV2DryRunCalledClassicFusion",
+    "yuvFusionV2ClassicFusionFailed",
+    "yuvFusionV2ClassicFusionFailureType",
+    "yuvFusionV2ClassicFusionFailureMessage",
+    "yuvFusionV2ClassicFusionFailureStackTrace"
 )
 
 internal data class YuvFusionV2FrameQuality(
@@ -95,7 +106,13 @@ private data class YuvFusionV2MetadataWrite(
     val weightedMergeAttempted: Boolean,
     val weightedMergeUsed: Boolean,
     val fallbackToV1: Boolean,
-    val fallbackReason: String?
+    val fallbackReason: String?,
+    val scoringRan: Boolean = true,
+    val dryRunCalledClassicFusion: Boolean = false,
+    val classicFusionFailed: Boolean = false,
+    val classicFusionFailureType: String? = null,
+    val classicFusionFailureMessage: String? = null,
+    val classicFusionFailureStackTrace: String? = null
 )
 
 internal fun processYuvFusionJobV2(
@@ -115,26 +132,48 @@ internal fun processYuvFusionJobV2(
         }
 
     if (dryRun) {
-        val finalFile = processClassicYuvFusionJob(
-            jobDir = jobDir,
-            onStatus = onStatus,
-            requestedParams = requestedParams
+        val metadataBase = YuvFusionV2MetadataWrite(
+            dryRun = true,
+            scoringResult = scoringResult,
+            mergePlan = mergePlan,
+            weightedMergeAttempted = false,
+            weightedMergeUsed = false,
+            fallbackToV1 = false,
+            fallbackReason = null,
+            scoringRan = true,
+            dryRunCalledClassicFusion = true
         )
-        runCatching {
-            writeYuvFusionV2Metadata(
+        return try {
+            val finalFile = processClassicYuvFusionJob(
                 jobDir = jobDir,
-                metadata = YuvFusionV2MetadataWrite(
-                    dryRun = true,
-                    scoringResult = scoringResult,
-                    mergePlan = mergePlan,
-                    weightedMergeAttempted = false,
-                    weightedMergeUsed = false,
-                    fallbackToV1 = false,
-                    fallbackReason = null
+                onStatus = onStatus,
+                requestedParams = requestedParams
+            )
+            runCatching {
+                writeYuvFusionV2Metadata(
+                    jobDir = jobDir,
+                    metadata = metadataBase
                 )
+            }
+            finalFile
+        } catch (t: Throwable) {
+            val failureMessage = t.message?.takeIf { it.isNotBlank() } ?: t.javaClass.simpleName
+            runCatching {
+                writeYuvFusionV2Metadata(
+                    jobDir = jobDir,
+                    metadata = metadataBase.copy(
+                        classicFusionFailed = true,
+                        classicFusionFailureType = t.javaClass.name,
+                        classicFusionFailureMessage = failureMessage,
+                        classicFusionFailureStackTrace = t.stackTraceToString()
+                    )
+                )
+            }
+            throw YuvFusionV2DryRunClassicFusionFailedException(
+                "YUV Fusion V2 dry-run classic fusion failed: ${t.javaClass.simpleName}: $failureMessage",
+                t
             )
         }
-        return finalFile
     }
 
     val externalWeights = mergePlanToExternalFrameWeights(mergePlan)
@@ -546,12 +585,24 @@ private fun writeYuvFusionV2Metadata(
     job.put("experimentalFusionVersion", experimentalVersion)
         .put("v2SkeletonUsed", metadata.dryRun || !metadata.weightedMergeUsed)
         .put("yuvFusionV2DryRun", metadata.dryRun)
+        .put("yuvFusionV2ScoringRan", metadata.scoringRan)
         .put("yuvFusionV2ScoringFailed", metadata.scoringResult.scoringFailed)
         .put("yuvFusionV2MergePlanEmpty", metadata.mergePlan.empty)
         .put("yuvFusionV2MergePlanReason", metadata.mergePlan.reason)
         .put("yuvFusionV2WeightedMergeAttempted", metadata.weightedMergeAttempted)
         .put("yuvFusionV2WeightedMergeUsed", metadata.weightedMergeUsed)
         .put("yuvFusionV2FallbackToV1", metadata.fallbackToV1)
+        .put("yuvFusionV2DryRunCalledClassicFusion", metadata.dryRunCalledClassicFusion)
+        .put("yuvFusionV2ClassicFusionFailed", metadata.classicFusionFailed)
+    metadata.classicFusionFailureType?.let { type ->
+        job.put("yuvFusionV2ClassicFusionFailureType", type)
+    }
+    metadata.classicFusionFailureMessage?.let { message ->
+        job.put("yuvFusionV2ClassicFusionFailureMessage", message)
+    }
+    metadata.classicFusionFailureStackTrace?.let { stackTrace ->
+        job.put("yuvFusionV2ClassicFusionFailureStackTrace", stackTrace)
+    }
     metadata.fallbackReason?.let { reason ->
         job.put("yuvFusionV2FallbackReason", reason)
     }

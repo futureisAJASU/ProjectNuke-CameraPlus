@@ -54,6 +54,15 @@ private data class GyroSampleForFusion(
     val magnitude: Double
 )
 
+private fun Throwable.shortMessage(): String {
+    val message = message?.takeIf { it.isNotBlank() }
+    return if (message == null) {
+        javaClass.simpleName
+    } else {
+        "${javaClass.simpleName}: $message"
+    }
+}
+
 fun processLatestNightFusionV02(
     context: Context,
     onStatus: (String) -> Unit
@@ -85,13 +94,13 @@ fun processLatestNightFusionV02(
                     .put("pipelineFailed", true)
                     .put("pipelineFailureSource", "processLatestNightFusionV02")
                     .put("pipelineFailureType", e.javaClass.name)
-                    .put("pipelineFailureMessage", e.message ?: "")
+                    .put("pipelineFailureMessage", e.shortMessage())
                     .put("pipelineFailureStackTrace", e.stackTraceToString())
                     .put("updatedAt", System.currentTimeMillis())
                 saveJobJson(targetDir, job)
             }
             postStatus(
-                "PIPELINE_FAILED: YUV Night Fusion failed; cache kept. See logcat/job.json for details."
+                "PIPELINE_FAILED: YUV Night Fusion failed: ${e.shortMessage()}; cache kept. See logcat/job.json for details."
             )
         } finally {
             workerThread.quitSafely()
@@ -134,7 +143,7 @@ fun processNightFusionJobV02Sync(
                 dryRun = false
             )
         } catch (t: Throwable) {
-            onStatus("YUV Fusion V2 failed; falling back to classic V1: ${t.javaClass.simpleName}")
+            onStatus("YUV Fusion V2 failed; falling back to classic V1: ${t.shortMessage()}")
             processClassicYuvFusionJob(jobDir, onStatus = onStatus, requestedParams = requestedParams)
         }
         ENABLE_YUV_FUSION_V2_DRY_RUN -> try {
@@ -144,8 +153,10 @@ fun processNightFusionJobV02Sync(
                 requestedParams = requestedParams,
                 dryRun = true
             )
+        } catch (t: YuvFusionV2DryRunClassicFusionFailedException) {
+            throw t
         } catch (t: Throwable) {
-            onStatus("YUV Fusion V2 dry-run failed; falling back to classic V1: ${t.javaClass.simpleName}")
+            onStatus("YUV Fusion V2 dry-run failed; falling back to classic V1: ${t.shortMessage()}")
             processClassicYuvFusionJob(jobDir, onStatus = onStatus, requestedParams = requestedParams)
         }
         else -> processClassicYuvFusionJob(jobDir, onStatus = onStatus, requestedParams = requestedParams)
