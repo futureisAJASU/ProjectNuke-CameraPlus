@@ -24,7 +24,13 @@ app/.cxx/
 *.ap_
 
 # Logs
-*.log
+/*.log
+/*build-log*.txt
+/*capture*_test*.txt
+/*fusion_test*.txt
+/*pipeline_busy_test*.txt
+/*physical_dump*.txt
+/*yuv_only_after_statefix*.txt
 
 # Kepler generated camera data
 captures/
