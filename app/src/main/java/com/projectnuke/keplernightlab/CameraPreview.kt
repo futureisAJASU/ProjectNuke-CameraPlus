@@ -41,9 +41,6 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 
-// Galaxy S24 temporary preview rotation override. Try 0/90/180/270 only while sensor/display transform is being verified.
-private const val PREVIEW_ROTATION_FIX_DEGREES = 0f
-
 @Composable
 fun Camera2Preview(
     modifier: Modifier = Modifier,
@@ -924,8 +921,8 @@ private class CameraPreviewController(
             TAG,
             "configureTransform view=${viewWidth}x$viewHeight previewSize=${previewSize.width}x${previewSize.height} " +
                 "sensorOrientation=$sensorOrientation displayRotation=$displayRotation relativeRotation=$relativeRotation " +
-                "swapDimensions=$swapDimensions scaleX=$scaleX scaleY=$scaleY finalScale=$finalScale " +
-                "rotationFix=$PREVIEW_ROTATION_FIX_DEGREES"
+                "displayDegrees=$displayDegrees swapDimensions=$swapDimensions " +
+                "scaleX=$scaleX scaleY=$scaleY finalScale=$finalScale"
         )
 
         val bufferRect = RectF(
@@ -947,7 +944,6 @@ private class CameraPreviewController(
                 else -> 0f
             }
             postRotate(displayCorrection, centerX, centerY)
-            postRotate(PREVIEW_ROTATION_FIX_DEGREES, centerX, centerY)
         }
 
         textureView.setTransform(matrix)
