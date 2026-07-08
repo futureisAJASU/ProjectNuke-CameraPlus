@@ -2,8 +2,11 @@ package com.projectnuke.keplernightlab
 
 import android.content.Context
 import android.os.Environment
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -58,40 +61,44 @@ suspend fun reprocessKeplerGalleryJob(
     outputSettings: OutputSettings,
     frameSelection: Set<Int>?,
     onProgress: (String) -> Unit
-): Result<KeplerReprocessResult> {
+): Result<KeplerReprocessResult> = withContext(Dispatchers.IO) {
+    suspend fun postProgress(message: String) {
+        withContext(Dispatchers.Main) { onProgress(message) }
+    }
+
     val target = runCatching { requireReprocessSafeJobDirectory(context, jobDir) }
-        .getOrElse { return Result.failure(it) }
+        .getOrElse { return@withContext Result.failure(it) }
     val capability = detectReprocessCapability(context, target)
     if (!capability.canReprocess) {
         writeReprocessFailure(target, capability.reason)
-        return Result.failure(IllegalStateException(capability.reason))
+        return@withContext Result.failure(IllegalStateException(capability.reason))
     }
 
-    onProgress("원본 프레임 확인 중…")
+    postProgress("원본 프레임 확인 중…")
     val job = loadJobJsonSafe(target)
     val kind = detectJobKind(target, job)
     val reviewItems = loadFrameReviewItems(context, target).getOrElse {
         writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
-        return Result.failure(it)
+        return@withContext Result.failure(it)
     }
     val resolvedSelection = resolveFrameSelection(target, kind, reviewItems, frameSelection).getOrElse {
         writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
-        return Result.failure(it)
+        return@withContext Result.failure(it)
     }
     if (resolvedSelection.size < requiredSelectedFrameCount(kind)) {
         val message = "선택한 원본 프레임이 부족하여 다시 합성할 수 없습니다."
         writeReprocessFailure(target, message)
-        return Result.failure(IllegalStateException(message))
+        return@withContext Result.failure(IllegalStateException(message))
     }
     val selectionMode = resolveSelectionMode(job, frameSelection)
-    onProgress("프레임 선택 적용 중…")
+    postProgress("프레임 선택 적용 중…")
     saveFrameSelection(
         jobDir = target,
         mode = selectionMode,
         frames = applyFrameSelectionToItems(reviewItems, resolvedSelection, selectionMode)
     ).getOrElse {
         writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
-        return Result.failure(it)
+        return@withContext Result.failure(it)
     }
 
     val beforeFinals = finalOutputCandidates(target, loadJobJsonSafe(target))
@@ -100,50 +107,48 @@ suspend fun reprocessKeplerGalleryJob(
 
     val pipelineResult = when (capability.jobKind) {
         ReprocessJobKind.RAW_FUSION ->
-            awaitRawReprocess(context, target, outputSettings, resolvedSelection, onProgress)
+            awaitRawReprocess(context, target, outputSettings, resolvedSelection, ::postProgress)
         ReprocessJobKind.YUV_FUSION ->
-            awaitYuvReprocess(context, target, outputSettings, resolvedSelection, onProgress)
+            awaitYuvReprocess(context, target, outputSettings, resolvedSelection, ::postProgress)
         ReprocessJobKind.COLOR_BURST ->
             Result.failure(UnsupportedOperationException("ColorBurst 다시 합성은 아직 지원되지 않습니다."))
         ReprocessJobKind.UNSUPPORTED ->
             Result.failure(UnsupportedOperationException("지원하지 않는 작업 유형입니다."))
     }
 
-    return pipelineResult.fold(
-        onSuccess = {
-            onProgress("갤러리 정보 갱신 중…")
-            val updatedJob = loadJobJsonSafe(target)
-            val finalFile = resolveReprocessFinalOutput(target, updatedJob)
-            val previewFile = finalFile
-            val afterBytes = finalOutputCandidates(target, updatedJob).filter { it.isFile }.sumOf { it.length() }
-            val bytesWritten = (afterBytes - beforeBytes).coerceAtLeast(finalFile?.length() ?: 0L)
-            writeReprocessSuccess(
+    if (pipelineResult.isSuccess) {
+        postProgress("갤러리 정보 갱신 중…")
+        val updatedJob = loadJobJsonSafe(target)
+        val finalFile = resolveReprocessFinalOutput(target, updatedJob)
+        val previewFile = finalFile
+        val afterBytes = finalOutputCandidates(target, updatedJob).filter { it.isFile }.sumOf { it.length() }
+        val bytesWritten = (afterBytes - beforeBytes).coerceAtLeast(finalFile?.length() ?: 0L)
+        writeReprocessSuccess(
+            jobDir = target,
+            jobKind = capability.jobKind,
+            sourceFrameCount = resolvedSelection.size,
+            finalOutputFile = finalFile,
+            previewFile = previewFile,
+            selectionMode = selectionMode,
+            includedFrameIndices = resolvedSelection
+        )
+        deleteBackups(backups)
+        Result.success(
+            KeplerReprocessResult(
                 jobDir = target,
                 jobKind = capability.jobKind,
-                sourceFrameCount = resolvedSelection.size,
                 finalOutputFile = finalFile,
                 previewFile = previewFile,
-                selectionMode = selectionMode,
-                includedFrameIndices = resolvedSelection
+                bytesWritten = bytesWritten,
+                warnings = emptyList()
             )
-            deleteBackups(backups)
-            Result.success(
-                KeplerReprocessResult(
-                    jobDir = target,
-                    jobKind = capability.jobKind,
-                    finalOutputFile = finalFile,
-                    previewFile = previewFile,
-                    bytesWritten = bytesWritten,
-                    warnings = emptyList()
-                )
-            )
-        },
-        onFailure = { error ->
-            restoreBackups(backups)
-            writeReprocessFailure(target, "${error.javaClass.simpleName}: ${error.message}")
-            Result.failure(error)
-        }
-    )
+        )
+    } else {
+        val error = pipelineResult.exceptionOrNull() ?: IllegalStateException("Unknown reprocess failure")
+        restoreBackups(backups)
+        writeReprocessFailure(target, "${error.javaClass.simpleName}: ${error.message}")
+        Result.failure(error)
+    }
 }
 
 fun detectReprocessCapability(context: Context, jobDir: File): ReprocessCapability {
@@ -216,12 +221,20 @@ private suspend fun awaitRawReprocess(
     jobDir: File,
     outputSettings: OutputSettings,
     frameSelection: Set<Int>,
-    onProgress: (String) -> Unit
+    postProgress: suspend (String) -> Unit
 ): Result<Unit> = suspendCancellableCoroutine { continuation ->
     var lastStatus = ""
     reprocessRawJob(context, jobDir, outputSettings, frameSelection) { status ->
         lastStatus = status
-        onProgress(if (status.contains("Exporting", ignoreCase = true)) "최종 사진 저장 중…" else "RAW 합성 중…")
+        CoroutineScope(continuation.context).launch {
+            postProgress(
+                if (status.contains("Exporting", ignoreCase = true)) {
+                    "최종 사진 저장 중…"
+                } else {
+                    "RAW 합성 중…"
+                }
+            )
+        }
         if (!continuation.isActive) return@reprocessRawJob
         when {
             status.startsWith("RAW reprocess complete") -> continuation.resume(Result.success(Unit))
@@ -241,12 +254,20 @@ private suspend fun awaitYuvReprocess(
     jobDir: File,
     outputSettings: OutputSettings,
     frameSelection: Set<Int>,
-    onProgress: (String) -> Unit
+    postProgress: suspend (String) -> Unit
 ): Result<Unit> = suspendCancellableCoroutine { continuation ->
     var lastStatus = ""
     reprocessYuvJob(context, jobDir, outputSettings, selectedFrameIndices = frameSelection) { status ->
         lastStatus = status
-        onProgress(if (status.contains("export", ignoreCase = true)) "최종 사진 저장 중…" else "YUV 합성 중…")
+        CoroutineScope(continuation.context).launch {
+            postProgress(
+                if (status.contains("export", ignoreCase = true)) {
+                    "최종 사진 저장 중…"
+                } else {
+                    "YUV 합성 중…"
+                }
+            )
+        }
         if (!continuation.isActive) return@reprocessYuvJob
         when {
             status.startsWith("PIPELINE_COMPLETE: YUV reprocess") -> continuation.resume(Result.success(Unit))
@@ -451,7 +472,7 @@ private fun putReprocessAvailability(
 private fun nowIso8601(): String =
     SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US).format(Date())
 
-private fun resolveFrameSelection(
+private suspend fun resolveFrameSelection(
     jobDir: File,
     kind: ReprocessJobKind,
     frames: List<KeplerFrameReviewItem>,
@@ -469,7 +490,7 @@ private fun resolveFrameSelection(
         .toSet()
     if (persisted.isNotEmpty()) return@runCatching persisted
 
-    val recommendation = runBlocking { RuleBasedFrameSelectionAdvisor().recommend(null, frames) }
+    val recommendation = RuleBasedFrameSelectionAdvisor().recommend(null, frames)
     val recommended = recommendation.includedFrameIndices
         .filter { index -> frames.any { it.index == index && it.file.isFile && it.file.length() > 0L } }
         .toSet()
