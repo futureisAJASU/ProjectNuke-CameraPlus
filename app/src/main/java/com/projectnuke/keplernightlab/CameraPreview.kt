@@ -329,7 +329,10 @@ private class CameraPreviewController(
 
         try {
             val characteristics = cameraManager.getCameraCharacteristics(cameraId)
-            cameraCharacteristics = characteristics
+            if (!storeCameraCharacteristics(localGeneration, characteristics)) {
+                thread.quitSafely()
+                return
+            }
             val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
             val aeStep = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
             onAeCapabilitiesChangedProvider().invoke(
@@ -338,7 +341,10 @@ private class CameraPreviewController(
                 aeStep?.toFloat() ?: 0f
             )
             val previewSize = choosePreviewSize(characteristics)
-            currentPreviewSize = previewSize
+            if (!storeCurrentPreviewSize(localGeneration, previewSize)) {
+                thread.quitSafely()
+                return
+            }
 
             val surfaceTexture = textureView.surfaceTexture
             if (surfaceTexture == null) {
@@ -354,7 +360,10 @@ private class CameraPreviewController(
                 runCatching { surface.release() }
                 return
             }
-            previewSurface = surface
+            if (!storePreviewSurface(localGeneration, surface)) {
+                runCatching { surface.release() }
+                return
+            }
 
             cameraManager.openCamera(
                 cameraId,
@@ -365,7 +374,11 @@ private class CameraPreviewController(
                             runCatching { camera.close() }
                             return
                         }
-                        cameraDevice = camera
+                        if (!storeCameraDevice(localGeneration, camera)) {
+                            Log.w(TAG, "stale onOpened dropped generation=$localGeneration")
+                            runCatching { camera.close() }
+                            return
+                        }
                         createPreviewSession(camera, surface, characteristics, localGeneration, textureView)
                     }
 
@@ -439,10 +452,12 @@ private class CameraPreviewController(
                 textureView = textureView,
                 sessionMode = "physicalOutput",
                 onFailure = {
-                    latestZoomRatio = 3.0f
                     Log.w(
                         "KeplerPhysicalRoute",
-                        "physical output failed; fallback=normalOutput previewZoomRatio=$latestZoomRatio"
+                        "physical output failed; fallback=normalOutput previousZoomRatio=$latestZoomRatio " +
+                            "selectedLensSlot=$latestSelectedLensSlot selectedThreeXSource=$latestSelectedThreeXSource " +
+                            "actualLensSource=$latestActualLensSource cameraId=$cameraId " +
+                            "physicalCameraId=$physicalCameraId"
                     )
                     createNormalPreviewSession(
                         camera = camera,
@@ -467,7 +482,13 @@ private class CameraPreviewController(
                     "physicalCameraId=$physicalCameraId exception=${error.javaClass.simpleName}:${error.message}",
                 error
             )
-            latestZoomRatio = 3.0f
+            Log.w(
+                "KeplerPhysicalRoute",
+                "physical output create failed; fallback=normalOutput previousZoomRatio=$latestZoomRatio " +
+                    "selectedLensSlot=$latestSelectedLensSlot selectedThreeXSource=$latestSelectedThreeXSource " +
+                    "actualLensSource=$latestActualLensSource cameraId=$cameraId " +
+                    "physicalCameraId=$physicalCameraId"
+            )
             createNormalPreviewSession(
                 camera = camera,
                 surface = surface,
@@ -520,7 +541,11 @@ private class CameraPreviewController(
                     runCatching { session.close() }
                     return
                 }
-                captureSession = session
+                if (!storeCaptureSession(localGeneration, session)) {
+                    Log.w(TAG, "stale onConfigured dropped generation=$localGeneration")
+                    runCatching { session.close() }
+                    return
+                }
                 Log.i(
                     "KeplerPhysicalRoute",
                     "session configured mode=$sessionMode cameraId=$cameraId " +
@@ -618,7 +643,7 @@ private class CameraPreviewController(
                         afMode = CaptureRequest.CONTROL_AF_MODE_AUTO,
                         afTrigger = CaptureRequest.CONTROL_AF_TRIGGER_START
                     ),
-                    null,
+                    activePhysicalCaptureCallback,
                     handler
                 )
                 Log.d(TAG, "AF trigger sent point=${newState.point} metering=$meteringMode")
@@ -810,6 +835,51 @@ private class CameraPreviewController(
 
     private fun isActiveLocked(localGeneration: Int): Boolean {
         return started && generation == localGeneration
+    }
+
+    private fun storeCameraCharacteristics(
+        localGeneration: Int,
+        characteristics: CameraCharacteristics
+    ): Boolean = synchronized(lock) {
+        if (!isActiveLocked(localGeneration)) return false
+        cameraCharacteristics = characteristics
+        true
+    }
+
+    private fun storeCurrentPreviewSize(
+        localGeneration: Int,
+        previewSize: Size
+    ): Boolean = synchronized(lock) {
+        if (!isActiveLocked(localGeneration)) return false
+        currentPreviewSize = previewSize
+        true
+    }
+
+    private fun storePreviewSurface(
+        localGeneration: Int,
+        surface: Surface
+    ): Boolean = synchronized(lock) {
+        if (!isActiveLocked(localGeneration)) return false
+        previewSurface = surface
+        true
+    }
+
+    private fun storeCameraDevice(
+        localGeneration: Int,
+        camera: CameraDevice
+    ): Boolean = synchronized(lock) {
+        if (!isActiveLocked(localGeneration)) return false
+        cameraDevice = camera
+        true
+    }
+
+    private fun storeCaptureSession(
+        localGeneration: Int,
+        session: CameraCaptureSession
+    ): Boolean = synchronized(lock) {
+        if (!isActiveLocked(localGeneration)) return false
+        captureSession = session
+        true
     }
 
     private fun configureTransform(
