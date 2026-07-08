@@ -11,6 +11,7 @@ import android.util.Log
 import android.util.Size
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.roundToInt
 
 data class PhysicalCameraCandidate(
     val physicalCameraId: String,
@@ -438,8 +439,8 @@ fun buildCenterCropRegionForPixelMode(
         ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
         ?: return CropRegionSelection(null, if (maxActiveArray != null) "MAXIMUM_RESOLUTION" else "NORMAL")
 
-    val cropWidth = (activeArray.width() / zoomRatio).toInt().coerceAtLeast(1)
-    val cropHeight = (activeArray.height() / zoomRatio).toInt().coerceAtLeast(1)
+    val cropWidth = (activeArray.width() / zoomRatio).roundToInt().coerceAtLeast(1)
+    val cropHeight = (activeArray.height() / zoomRatio).roundToInt().coerceAtLeast(1)
     val left = activeArray.left + (activeArray.width() - cropWidth) / 2
     val top = activeArray.top + (activeArray.height() - cropHeight) / 2
 

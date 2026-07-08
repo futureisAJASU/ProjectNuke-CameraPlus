@@ -624,7 +624,7 @@ private class CameraPreviewController(
         val lockChanged = previousState.locked != newState.locked
         val evChanged = previousState.exposureCompensationIndex != newState.exposureCompensationIndex
         val aeRegions = buildAeMeteringRegions(characteristics, zoom, meteringMode, newState.point)
-        val cropRegion = buildCenterCropRegion(characteristics, zoom)
+        val cropRegion = buildMeteringCropRegion(characteristics, zoom)
 
         runCatching {
             if ((pointChanged || forceTrigger) && newState.point != null) {
@@ -753,7 +753,7 @@ private class CameraPreviewController(
         meteringMode: MeteringMode,
         touchPoint: NormalizedPoint?
     ): Array<MeteringRectangle> {
-        val cropRegion = buildCenterCropRegion(characteristics, zoomRatio)
+        val cropRegion = buildMeteringCropRegion(characteristics, zoomRatio)
         return when (meteringMode) {
             MeteringMode.AVERAGE -> emptyArray()
             MeteringMode.CENTER_WEIGHTED -> {
@@ -796,7 +796,7 @@ private class CameraPreviewController(
         weight: Int
     ): MeteringRectangle? {
         val safePoint = point ?: return null
-        val cropRegion = buildCenterCropRegion(characteristics, zoomRatio)
+        val cropRegion = buildMeteringCropRegion(characteristics, zoomRatio)
         val regionWidth = max(48, (cropRegion.width() * fraction).roundToInt())
         val regionHeight = max(48, (cropRegion.height() * fraction).roundToInt())
         val centerX = cropRegion.left + (cropRegion.width() * safePoint.x.coerceIn(0f, 1f)).roundToInt()
@@ -812,18 +812,13 @@ private class CameraPreviewController(
         return MeteringRectangle(rect, weight.coerceIn(0, MeteringRectangle.METERING_WEIGHT_MAX))
     }
 
-    private fun buildCenterCropRegion(
+    private fun buildMeteringCropRegion(
         characteristics: CameraCharacteristics,
         zoomRatio: Float
     ): Rect {
-        val activeArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-            ?: return Rect(0, 0, 1, 1)
-        val safeZoom = max(1f, zoomRatio)
-        val cropWidth = max(1, (activeArray.width() / safeZoom).roundToInt())
-        val cropHeight = max(1, (activeArray.height() / safeZoom).roundToInt())
-        val left = activeArray.left + (activeArray.width() - cropWidth) / 2
-        val top = activeArray.top + (activeArray.height() - cropHeight) / 2
-        return Rect(left, top, left + cropWidth, top + cropHeight)
+        return buildCenterCropRegion(characteristics, zoomRatio)
+            ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            ?: Rect(0, 0, 1, 1)
     }
 
     private fun isActive(localGeneration: Int): Boolean = synchronized(lock) {
