@@ -8,6 +8,7 @@ import android.os.Looper
 import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
+import java.util.concurrent.CancellationException
 import java.util.Date
 import java.util.Locale
 
@@ -30,6 +31,7 @@ fun captureProcessExportNightFusion(
     autoMaxFrames: Int = 8,
     manualFrames: Int = 4,
     framePlanReason: String = "Default",
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
@@ -37,6 +39,7 @@ fun captureProcessExportNightFusion(
         mainHandler.post { onStatus(message) }
     }
 
+    cancellation.throwIfCancelled()
     post("YUV capture: saved 0/$frameCount")
     captureYuvBurstColorWithMotion(
         context = context,
@@ -56,17 +59,33 @@ fun captureProcessExportNightFusion(
         manualFrames = manualFrames,
         framePlanReason = framePlanReason,
         onComplete = { jobDir ->
+            try {
+                cancellation.throwIfCancelled()
+            } catch (_: CancellationException) {
+                post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
+                return@captureYuvBurstColorWithMotion
+            }
             val workerThread = HandlerThread("KeplerCaptureProcessExportThread").apply { start() }
             Handler(workerThread.looper).post {
                 try {
+                    cancellation.throwIfCancelled()
                     post("Processing Night Fusion...")
-                    val finalFile = processNightFusionJobV02Sync(jobDir, onStatus = { post(it) })
+                    cancellation.throwIfCancelled()
+                    val finalFile = processNightFusionJobV02Sync(
+                        jobDir,
+                        onStatus = { post(it) },
+                        cancellation = cancellation
+                    )
+                    cancellation.throwIfCancelled()
 
                     val requestedOutputFormat = requestedOutputFormatForSetting(finalOutputFormat)
+                    cancellation.throwIfCancelled()
                     post("Exporting ${requestedOutputFormat.label}...")
+                    cancellation.throwIfCancelled()
                     val bitmap = BitmapFactory.decodeFile(finalFile.absolutePath)
                         ?: error("Could not decode final Night Fusion image.")
                     val displayNameBase = "Kepler_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}"
+                    cancellation.throwIfCancelled()
                     val export = exportNightFusionBitmapToGallery(
                         context = context,
                         bitmap = bitmap,
@@ -86,7 +105,9 @@ fun captureProcessExportNightFusion(
                         return@post
                     }
 
+                    cancellation.throwIfCancelled()
                     post("Verifying gallery output...")
+                    cancellation.throwIfCancelled()
                     val verified = verifyGalleryExport(context, export.uriString)
                     updateExportMetadata(
                         jobDir = jobDir,
@@ -107,7 +128,9 @@ fun captureProcessExportNightFusion(
                         return@post
                     }
 
+                    cancellation.throwIfCancelled()
                     post("Cleanup...")
+                    cancellation.throwIfCancelled()
                     val cleanup = cleanupNightFusionJobAfterVerifiedExport(
                         jobDir = jobDir,
                         policy = cleanupPolicy,
@@ -122,6 +145,8 @@ fun captureProcessExportNightFusion(
                     } else {
                         post("PIPELINE_COMPLETE: Saved ${export.formatUsed.label} to Gallery: $album\nCleanup complete. Deleted ${cleanup.deletedFiles} files.")
                     }
+                } catch (_: CancellationException) {
+                    post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 } catch (e: Exception) {
                     post("PIPELINE_FAILED: Night Fusion pipeline failed; keeping cache.\n${e.stackTraceToString()}")
                 } finally {

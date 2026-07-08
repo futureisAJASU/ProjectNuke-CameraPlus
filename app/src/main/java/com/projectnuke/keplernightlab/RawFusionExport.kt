@@ -10,6 +10,7 @@ import android.util.Log
 import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
+import java.util.concurrent.CancellationException
 import java.util.Date
 import java.util.Locale
 
@@ -78,10 +79,12 @@ fun captureProcessExportRawNightFusion(
     routeFallbackReason: String? = null,
     focusAeState: FocusAeState = FocusAeState(),
     rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ) {
     val main = Handler(Looper.getMainLooper())
     fun post(message: String) = main.post { onStatus(message) }
+    cancellation.throwIfCancelled()
     post("RAW 캡처 중입니다. 기기를 움직이지 마세요. saved 0/$frameCount, images 0/$frameCount, results 0/$frameCount")
     captureRawBurstForFusion(
         context = context,
@@ -99,16 +102,24 @@ fun captureProcessExportRawNightFusion(
         rawSpeedMode = rawSpeedMode,
         onStatus = { post(it) },
         onComplete = { jobDir ->
+            try {
+                cancellation.throwIfCancelled()
+            } catch (_: CancellationException) {
+                post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
+                return@captureRawBurstForFusion
+            }
             Log.i("KeplerRawPipeline", "PROCESSING_STARTED jobDirAbsolutePath=${jobDir.absolutePath}")
             post("캡처가 완료되었습니다.")
             val thread = HandlerThread("KeplerRawFusionPipelineThread").apply { start() }
             Handler(thread.looper).post {
                 try {
+                    cancellation.throwIfCancelled()
                     val process = processRawFusionJob(
                         context = context,
                         jobDir = jobDir,
                         saveNativeMp24DebugPng = finalOutputFormat.isDebugPng && rawSpeedMode == RawSpeedMode.QUALITY
                     ) { post(it) }
+                    cancellation.throwIfCancelled()
                     if (!process.success || !process.hasExportableBitmapSource()) {
                         updateExportFailure(
                             jobDir = jobDir,
@@ -137,6 +148,7 @@ fun captureProcessExportRawNightFusion(
                     val previewPrepareStartedAt = System.currentTimeMillis()
                     var exportBitmap: Bitmap? = null
                     val result = try {
+                        cancellation.throwIfCancelled()
                         val loaded = process.loadExportBitmap()
                         exportBitmap = loaded.bitmap
                         val nativePreviewPrepareMs = System.currentTimeMillis() - previewPrepareStartedAt
@@ -152,6 +164,7 @@ fun captureProcessExportRawNightFusion(
                         )
                         post("결과를 저장하는 중입니다.")
                         updateRawNativeQualityDiagnostics(jobDir, loaded.bitmap)
+                        cancellation.throwIfCancelled()
                         exportNightFusionBitmapToGallery(
                             context = context,
                             bitmap = loaded.bitmap,
@@ -179,6 +192,7 @@ fun captureProcessExportRawNightFusion(
                         return@post
                     }
                     post("Verifying gallery export...")
+                    cancellation.throwIfCancelled()
                     if (!verifyGalleryExport(context, result.uriString)) {
                         updateExportFailure(
                             jobDir = jobDir,
@@ -189,6 +203,7 @@ fun captureProcessExportRawNightFusion(
                         return@post
                     }
                     val rawSidecarResult = if (finalOutputFormat.shouldExportRawSidecar) {
+                        cancellation.throwIfCancelled()
                         exportRawSidecarsToPublicStorage(
                             context = context,
                             jobDir = jobDir,
@@ -206,6 +221,7 @@ fun captureProcessExportRawNightFusion(
                     } else {
                         null
                     }
+                    cancellation.throwIfCancelled()
                     updateExportMetadata(
                         jobDir = jobDir,
                         export = result,
@@ -233,6 +249,8 @@ fun captureProcessExportRawNightFusion(
                                 "RAW cache kept for reprocessing."
                         )
                     }
+                } catch (_: CancellationException) {
+                    post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 } catch (oom: OutOfMemoryError) {
                     runCatching {
                         updateExportFailure(

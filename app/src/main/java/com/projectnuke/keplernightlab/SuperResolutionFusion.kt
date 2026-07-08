@@ -14,6 +14,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
+import java.util.concurrent.CancellationException
 import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
@@ -339,12 +340,14 @@ fun captureProcessExportSuperResolutionFusion(
     autoMaxFrames: Int,
     manualFrames: Int,
     framePlanReason: String,
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
     fun post(message: String) = mainHandler.post { onStatus(message) }
     val captureFrames = frameCount.coerceIn(MIN_FUSION_FRAMES, 6)
 
+    cancellation.throwIfCancelled()
     post("24M Fusion: capturing 12MP burst...")
     captureYuvBurstColorWithMotion(
         context = context,
@@ -361,11 +364,20 @@ fun captureProcessExportSuperResolutionFusion(
         manualFrames = manualFrames,
         framePlanReason = framePlanReason,
         onComplete = { sourceJobDir ->
+            try {
+                cancellation.throwIfCancelled()
+            } catch (_: CancellationException) {
+                post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
+                return@captureYuvBurstColorWithMotion
+            }
             val workerThread = HandlerThread("KeplerSuperResolutionThread").apply { start() }
             Handler(workerThread.looper).post {
                 try {
+                    cancellation.throwIfCancelled()
                     val sourceFrames = readColorBurstFrameFiles(sourceJobDir)
+                    cancellation.throwIfCancelled()
                     val outputDir = createSuperResolutionJobDirectory(context)
+                    cancellation.throwIfCancelled()
                     val result = runSuperResolutionFusion(
                         SuperResolutionFusionRequest(
                             context = context,
@@ -376,12 +388,14 @@ fun captureProcessExportSuperResolutionFusion(
                             status = { post(it) }
                         )
                     )
+                    cancellation.throwIfCancelled()
                     val outputFile = result.outputFile
                     if (outputFile == null || !outputFile.exists()) {
                         post("PIPELINE_FAILED: 24M Fusion failed. ${result.message}")
                         return@post
                     }
 
+                    cancellation.throwIfCancelled()
                     val bitmap = BitmapFactory.decodeFile(outputFile.absolutePath)
                         ?: error("Could not decode 24M Fusion output.")
                     val requestedFormat = requestedOutputFormatForSetting(finalOutputFormat)
@@ -391,6 +405,7 @@ fun captureProcessExportSuperResolutionFusion(
                         SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                     }"
                     val export = try {
+                        cancellation.throwIfCancelled()
                         exportNightFusionBitmapToGallery(
                             context = context,
                             bitmap = bitmap,
@@ -411,6 +426,7 @@ fun captureProcessExportSuperResolutionFusion(
                         return@post
                     }
 
+                    cancellation.throwIfCancelled()
                     val verified = verifyGalleryExport(context, export.uriString)
                     updateExportMetadata(
                         jobDir = outputDir,
@@ -430,12 +446,15 @@ fun captureProcessExportSuperResolutionFusion(
                         return@post
                     }
 
+                    cancellation.throwIfCancelled()
                     post(
                         "PIPELINE_COMPLETE: 24M Fusion complete " +
                             "${result.outputWidth}x${result.outputHeight}, " +
                             "used ${result.usedFrameCount}/${result.inputFrameCount} frames, " +
                             "fallback=${result.fallbackUsed}."
                     )
+                } catch (_: CancellationException) {
+                    post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 } catch (error: Exception) {
                     post(
                         "PIPELINE_FAILED: 24M Fusion failed. " +

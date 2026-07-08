@@ -80,6 +80,7 @@ import kotlinx.coroutines.delay
 import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
+import java.util.concurrent.CancellationException
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -469,7 +470,7 @@ fun MainCameraScreen(
         startMessage: String,
         requestedFrames: Int = 0,
         timeoutMillis: Long = 120_000L,
-        job: ((String) -> Unit) -> Unit
+        job: (KeplerPipelineCancellationToken, (String) -> Unit) -> Unit
     ) {
         if (isPipelineBusy) {
             status = "Pipeline busy: current fusion/export is still running."
@@ -477,6 +478,7 @@ fun MainCameraScreen(
             return
         }
         val localGeneration = ++pipelineGeneration
+        val cancellationToken = KeplerPipelineCancellationToken()
         status = startMessage
         isPipelineBusy = true
         isCapturing = true
@@ -499,6 +501,7 @@ fun MainCameraScreen(
                 )
                 return@Runnable
             }
+            cancellationToken.cancel()
             pipelineGeneration++
             val timeoutStatus = "CAPTURE_TIMEOUT: Capture timeout. Preview recovered."
             status = timeoutStatus
@@ -561,16 +564,19 @@ fun MainCameraScreen(
 
         mainHandler.postDelayed(
             {
-                job jobCallback@{ newStatus ->
-                    if (localGeneration != pipelineGeneration) {
-                        Log.i(
-                            "KeplerPipelineState",
-                            "stale pipeline status ignored generation=$localGeneration current=$pipelineGeneration status=$newStatus"
-                        )
-                        return@jobCallback
+                try {
+                    job(cancellationToken) jobCallback@{ newStatus ->
+                        if (localGeneration != pipelineGeneration) {
+                            Log.i(
+                                "KeplerPipelineState",
+                                "stale pipeline status ignored generation=$localGeneration current=$pipelineGeneration status=$newStatus"
+                            )
+                            return@jobCallback
+                        }
+                        status = newStatus
+                        finishIfTerminal(newStatus)
                     }
-                    status = newStatus
-                    finishIfTerminal(newStatus)
+                } catch (_: CancellationException) {
                 }
             },
             250L
@@ -779,7 +785,7 @@ fun MainCameraScreen(
                                 } else {
                                     60_000L
                                 }
-                            ) { callback ->
+                            ) { cancellation, callback ->
                                 startCapturePipeline(
                                     CapturePipelineRequest(
                                         context = context,
@@ -789,7 +795,8 @@ fun MainCameraScreen(
                                         resolutionPlan = clickResult.resolutionPlan,
                                         finalOutputFormat = finalOutputFormat,
                                         focusAeState = focusAeState,
-                                        rawSpeedMode = rawSpeedMode
+                                        rawSpeedMode = rawSpeedMode,
+                                        cancellation = cancellation
                                     ),
                                     onStatus = callback
                                 )
@@ -816,7 +823,8 @@ fun MainCameraScreen(
                     }
                 },
                 onRaw = {
-                    runCameraJob("RAW DNG 촬영 준비 중...", requestedFrames = 1) { callback ->
+                    runCameraJob("RAW DNG 촬영 준비 중...", requestedFrames = 1) { cancellation, callback ->
+                        cancellation.throwIfCancelled()
                         captureSingleRawDng(
                             context = context,
                             cameraId = LEGACY_DEBUG_CAMERA_ID,
@@ -825,7 +833,8 @@ fun MainCameraScreen(
                     }
                 },
                 onRawBurst = {
-                    runCameraJob("RAW Burst 촬영 준비 중...", requestedFrames = 4) { callback ->
+                    runCameraJob("RAW Burst 촬영 준비 중...", requestedFrames = 4) { cancellation, callback ->
+                        cancellation.throwIfCancelled()
                         captureRawBurstDng(
                             context = context,
                             cameraId = LEGACY_DEBUG_CAMERA_ID,
@@ -899,7 +908,8 @@ fun MainCameraScreen(
                 },
                 onRaw = {
                     currentScreen = MainScreen.CAMERA
-                    runCameraJob("RAW DNG capture preparing...") { callback ->
+                    runCameraJob("RAW DNG capture preparing...") { cancellation, callback ->
+                        cancellation.throwIfCancelled()
                         captureSingleRawDng(
                             context = context,
                             cameraId = LEGACY_DEBUG_CAMERA_ID,
@@ -909,7 +919,8 @@ fun MainCameraScreen(
                 },
                 onRawBurst = {
                     currentScreen = MainScreen.CAMERA
-                    runCameraJob("RAW Burst capture preparing...") { callback ->
+                    runCameraJob("RAW Burst capture preparing...") { cancellation, callback ->
+                        cancellation.throwIfCancelled()
                         captureRawBurstDng(
                             context = context,
                             cameraId = LEGACY_DEBUG_CAMERA_ID,
@@ -940,7 +951,8 @@ fun MainCameraScreen(
                                 mainCapability.raw50Reason
                         return@test50
                     }
-                    runCameraJob("Test 50M RAW Capture: cameraId=${mainSelection.cameraId}", requestedFrames = 1) { callback ->
+                    runCameraJob("Test 50M RAW Capture: cameraId=${mainSelection.cameraId}", requestedFrames = 1) { cancellation, callback ->
+                        cancellation.throwIfCancelled()
                         captureRawBurstForFusion(
                             context = context,
                             cameraId = mainSelection.cameraId,
@@ -983,7 +995,8 @@ fun MainCameraScreen(
                     runCameraJob(
                         "Test 50M YUV/JPEG Capture: cameraId=${mainSelection.cameraId}",
                         requestedFrames = 1
-                    ) { callback ->
+                    ) { cancellation, callback ->
+                        cancellation.throwIfCancelled()
                         capture50MpProcessedTest(
                             context = context,
                             cameraId = mainSelection.cameraId,

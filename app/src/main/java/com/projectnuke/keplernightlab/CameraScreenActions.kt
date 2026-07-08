@@ -303,6 +303,7 @@ internal fun startCapturePipeline(
             autoMaxFrames = request.prepared.settings.autoMaxFrames,
             manualFrames = request.prepared.settings.manualFrames,
             framePlanReason = request.prepared.framePlan.reason,
+            cancellation = request.cancellation,
             onStatus = loggedStatus
         )
     } else if (request.pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
@@ -325,6 +326,7 @@ internal fun startCapturePipeline(
             routeFallbackReason = fallbackReason,
             focusAeState = request.focusAeState,
             rawSpeedMode = request.rawSpeedMode,
+            cancellation = request.cancellation,
             onStatus = loggedStatus
         )
     } else {
@@ -347,6 +349,7 @@ internal fun startCapturePipeline(
             autoMaxFrames = request.prepared.settings.autoMaxFrames,
             manualFrames = request.prepared.settings.manualFrames,
             framePlanReason = request.prepared.framePlan.reason,
+            cancellation = request.cancellation,
             onStatus = loggedStatus
         )
     }

@@ -12,6 +12,7 @@ import android.util.Log
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.util.concurrent.CancellationException
 import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.sqrt
@@ -132,34 +133,66 @@ private const val ENABLE_YUV_FUSION_V2_DRY_RUN = true
 fun processNightFusionJobV02Sync(
     jobDir: File,
     onStatus: (String) -> Unit,
-    requestedParams: ClassicYuvFusionParams? = null
+    requestedParams: ClassicYuvFusionParams? = null,
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
 ): File {
+    cancellation.throwIfCancelled()
     return when {
         ENABLE_YUV_FUSION_V2 -> try {
+            cancellation.throwIfCancelled()
             processYuvFusionJobV2(
                 jobDir = jobDir,
                 onStatus = onStatus,
                 requestedParams = requestedParams,
-                dryRun = false
+                dryRun = false,
+                cancellation = cancellation
             )
         } catch (t: Throwable) {
+            cancellation.throwIfCancelled()
             onStatus("YUV Fusion V2 failed; falling back to classic V1: ${t.shortMessage()}")
-            processClassicYuvFusionJob(jobDir, onStatus = onStatus, requestedParams = requestedParams)
+            val finalFile = processClassicYuvFusionJob(
+                jobDir,
+                onStatus = onStatus,
+                requestedParams = requestedParams,
+                cancellation = cancellation
+            )
+            cancellation.throwIfCancelled()
+            finalFile
         }
         ENABLE_YUV_FUSION_V2_DRY_RUN -> try {
+            cancellation.throwIfCancelled()
             processYuvFusionJobV2(
                 jobDir = jobDir,
                 onStatus = onStatus,
                 requestedParams = requestedParams,
-                dryRun = true
+                dryRun = true,
+                cancellation = cancellation
             )
         } catch (t: YuvFusionV2DryRunClassicFusionFailedException) {
             throw t
         } catch (t: Throwable) {
+            cancellation.throwIfCancelled()
             onStatus("YUV Fusion V2 dry-run failed; falling back to classic V1: ${t.shortMessage()}")
-            processClassicYuvFusionJob(jobDir, onStatus = onStatus, requestedParams = requestedParams)
+            val finalFile = processClassicYuvFusionJob(
+                jobDir,
+                onStatus = onStatus,
+                requestedParams = requestedParams,
+                cancellation = cancellation
+            )
+            cancellation.throwIfCancelled()
+            finalFile
         }
-        else -> processClassicYuvFusionJob(jobDir, onStatus = onStatus, requestedParams = requestedParams)
+        else -> {
+            cancellation.throwIfCancelled()
+            val finalFile = processClassicYuvFusionJob(
+                jobDir,
+                onStatus = onStatus,
+                requestedParams = requestedParams,
+                cancellation = cancellation
+            )
+            cancellation.throwIfCancelled()
+            finalFile
+        }
     }
 }
 

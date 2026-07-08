@@ -91,7 +91,8 @@ internal data class CapturePipelineRequest(
     val resolutionPlan: ResolutionCapturePlan,
     val finalOutputFormat: FinalOutputFormat,
     val focusAeState: FocusAeState,
-    val rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED
+    val rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
+    val cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
 )
 
 internal data class CameraPreviewPaneState(
