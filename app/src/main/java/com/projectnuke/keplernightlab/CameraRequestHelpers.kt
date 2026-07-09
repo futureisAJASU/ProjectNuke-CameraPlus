@@ -85,7 +85,12 @@ fun CaptureRequest.Builder.applyZoomAndFocusAe(
     set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, exposureIndex)
     set(CaptureRequest.CONTROL_AE_LOCK, focusAeState.locked)
 
-    val region = buildFocusAeMeteringRectangle(characteristics, zoomRatio, focusAeState.point)
+    val region = buildFocusAeMeteringRectangle(
+        characteristics = characteristics,
+        zoomApplication = zoomApplication,
+        point = focusAeState.point,
+        useMaximumResolutionActiveArray = useMaximumResolutionActiveArray
+    )
     if (region != null) {
         set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
         set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
@@ -95,12 +100,21 @@ fun CaptureRequest.Builder.applyZoomAndFocusAe(
 
 fun buildFocusAeMeteringRectangle(
     characteristics: CameraCharacteristics,
-    zoomRatio: Float,
-    point: NormalizedPoint?
+    zoomApplication: Camera2ZoomApplication,
+    point: NormalizedPoint?,
+    useMaximumResolutionActiveArray: Boolean = false
 ): MeteringRectangle? {
     if (point == null) return null
     val active = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return null
-    val crop = buildCenterCropRegion(characteristics, zoomRatio) ?: active
+    val crop = if (zoomApplication.usedControlZoomRatio) {
+        active
+    } else {
+        buildCenterCropRegionForPixelMode(
+            characteristics = characteristics,
+            zoomRatio = zoomApplication.appliedZoomRatio,
+            useMaximumResolutionActiveArray = useMaximumResolutionActiveArray
+        ).region ?: active
+    }
     val x = (crop.left + crop.width() * point.x.coerceIn(0f, 1f)).roundToInt()
     val y = (crop.top + crop.height() * point.y.coerceIn(0f, 1f)).roundToInt()
     val box = (minOf(crop.width(), crop.height()) * 0.10f).roundToInt().coerceAtLeast(16)
@@ -109,6 +123,11 @@ fun buildFocusAeMeteringRectangle(
         (y - box / 2).coerceIn(crop.top, crop.bottom - 1),
         (x + box / 2).coerceIn(crop.left + 1, crop.right),
         (y + box / 2).coerceIn(crop.top + 1, crop.bottom)
+    )
+    Log.d(
+        "KeplerMetering",
+        "metering mode=${if (zoomApplication.usedControlZoomRatio) "CONTROL_ZOOM_RATIO" else "SCALER_CROP_REGION"} " +
+            "zoom=${zoomApplication.appliedZoomRatio} point=$point region=$rect"
     )
     return MeteringRectangle(rect, MeteringRectangle.METERING_WEIGHT_MAX)
 }
