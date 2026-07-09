@@ -85,14 +85,17 @@ fun captureProcessExportNightFusion(
                     val bitmap = BitmapFactory.decodeFile(finalFile.absolutePath)
                         ?: error("Could not decode final Night Fusion image.")
                     val displayNameBase = "Kepler_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}"
-                    cancellation.throwIfCancelled()
-                    val export = exportNightFusionBitmapToGallery(
-                        context = context,
-                        bitmap = bitmap,
-                        displayNameBase = displayNameBase,
-                        requestedFormat = requestedOutputFormat
-                    )
-                    bitmap.recycle()
+                    val export = try {
+                        cancellation.throwIfCancelled()
+                        exportNightFusionBitmapToGallery(
+                            context = context,
+                            bitmap = bitmap,
+                            displayNameBase = displayNameBase,
+                            requestedFormat = requestedOutputFormat
+                        )
+                    } finally {
+                        bitmap.recycle()
+                    }
 
                     if (!export.success || export.uriString.isNullOrBlank()) {
                         updateExportFailure(

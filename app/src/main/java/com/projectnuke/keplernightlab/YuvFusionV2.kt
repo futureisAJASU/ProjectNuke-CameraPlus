@@ -5,6 +5,7 @@ import android.graphics.Color
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.CancellationException
 import kotlin.math.abs
 import kotlin.math.max
 
@@ -119,9 +120,12 @@ internal fun processYuvFusionJobV2(
     jobDir: File,
     onStatus: (String) -> Unit,
     requestedParams: ClassicYuvFusionParams? = null,
-    dryRun: Boolean = false
+    dryRun: Boolean = false,
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
 ): File {
+    cancellation.throwIfCancelled()
     val scoringResult = safeScoreYuvFusionV2Frames(jobDir)
+    cancellation.throwIfCancelled()
     val mergePlan = runCatching { buildYuvFusionV2MergePlan(scoringResult) }
         .getOrElse {
             YuvFusionV2MergePlan(
@@ -130,6 +134,7 @@ internal fun processYuvFusionJobV2(
                 reason = "MERGE_PLAN_FAILED"
             )
         }
+    cancellation.throwIfCancelled()
 
     if (dryRun) {
         val metadataBase = YuvFusionV2MetadataWrite(
@@ -144,11 +149,14 @@ internal fun processYuvFusionJobV2(
             dryRunCalledClassicFusion = true
         )
         return try {
+            cancellation.throwIfCancelled()
             val finalFile = processClassicYuvFusionJob(
                 jobDir = jobDir,
                 onStatus = onStatus,
-                requestedParams = requestedParams
+                requestedParams = requestedParams,
+                cancellation = cancellation
             )
+            cancellation.throwIfCancelled()
             runCatching {
                 writeYuvFusionV2Metadata(
                     jobDir = jobDir,
@@ -156,6 +164,8 @@ internal fun processYuvFusionJobV2(
                 )
             }
             finalFile
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (t: Throwable) {
             val failureMessage = t.message?.takeIf { it.isNotBlank() } ?: t.javaClass.simpleName
             runCatching {
@@ -178,11 +188,14 @@ internal fun processYuvFusionJobV2(
 
     val externalWeights = mergePlanToExternalFrameWeights(mergePlan)
     if (externalWeights == null) {
+        cancellation.throwIfCancelled()
         val finalFile = processClassicYuvFusionJob(
             jobDir = jobDir,
             onStatus = onStatus,
-            requestedParams = requestedParams
+            requestedParams = requestedParams,
+            cancellation = cancellation
         )
+        cancellation.throwIfCancelled()
         runCatching {
             writeYuvFusionV2Metadata(
                 jobDir = jobDir,
@@ -201,12 +214,15 @@ internal fun processYuvFusionJobV2(
     }
 
     return try {
+        cancellation.throwIfCancelled()
         val finalFile = processClassicYuvFusionJob(
             jobDir = jobDir,
             onStatus = onStatus,
             requestedParams = requestedParams,
-            externalFrameWeights = externalWeights
+            externalFrameWeights = externalWeights,
+            cancellation = cancellation
         )
+        cancellation.throwIfCancelled()
         runCatching {
             writeYuvFusionV2Metadata(
                 jobDir = jobDir,
@@ -223,11 +239,14 @@ internal fun processYuvFusionJobV2(
         }
         finalFile
     } catch (oom: OutOfMemoryError) {
+        cancellation.throwIfCancelled()
         val finalFile = processClassicYuvFusionJob(
             jobDir = jobDir,
             onStatus = onStatus,
-            requestedParams = requestedParams
+            requestedParams = requestedParams,
+            cancellation = cancellation
         )
+        cancellation.throwIfCancelled()
         runCatching {
             writeYuvFusionV2Metadata(
                 jobDir = jobDir,
@@ -243,12 +262,17 @@ internal fun processYuvFusionJobV2(
             )
         }
         finalFile
+    } catch (ce: CancellationException) {
+        throw ce
     } catch (t: Throwable) {
+        cancellation.throwIfCancelled()
         val finalFile = processClassicYuvFusionJob(
             jobDir = jobDir,
             onStatus = onStatus,
-            requestedParams = requestedParams
+            requestedParams = requestedParams,
+            cancellation = cancellation
         )
+        cancellation.throwIfCancelled()
         runCatching {
             writeYuvFusionV2Metadata(
                 jobDir = jobDir,

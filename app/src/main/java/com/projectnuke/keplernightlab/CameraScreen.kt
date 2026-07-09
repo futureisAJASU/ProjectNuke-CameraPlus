@@ -565,7 +565,7 @@ fun MainCameraScreen(
         mainHandler.postDelayed(
             {
                 try {
-                    job(cancellationToken) jobCallback@{ newStatus ->
+                    job(cancellationToken, jobCallback@{ newStatus ->
                         if (localGeneration != pipelineGeneration) {
                             Log.i(
                                 "KeplerPipelineState",
@@ -575,7 +575,7 @@ fun MainCameraScreen(
                         }
                         status = newStatus
                         finishIfTerminal(newStatus)
-                    }
+                    })
                 } catch (_: CancellationException) {
                 }
             },

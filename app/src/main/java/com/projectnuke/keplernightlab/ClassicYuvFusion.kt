@@ -10,6 +10,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.util.concurrent.CancellationException
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -94,8 +95,10 @@ internal fun processClassicYuvFusionJob(
     jobDir: File,
     requestedParams: ClassicYuvFusionParams? = null,
     externalFrameWeights: Map<Int, Float>? = null,
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ): File {
+    cancellation.throwIfCancelled()
     val processingStartedAt = System.currentTimeMillis()
     val jobFile = File(jobDir, "job.json")
     val job = JSONObject(jobFile.readText())
@@ -119,15 +122,21 @@ internal fun processClassicYuvFusionJob(
         }
 
         markStage("YUV_ALIGNING", "YUV 프레임을 정렬하는 중입니다.")
+        cancellation.throwIfCancelled()
         val preflightSummary = buildClassicYuvProcessingPreflight(jobDir, job)
+        cancellation.throwIfCancelled()
         preflight = preflightSummary
         job.put("yuvProcessingPreflight", preflightSummary.toJson())
         jobFile.writeText(job.toString(2))
+        cancellation.throwIfCancelled()
         val candidateFrames = loadClassicFrames(jobDir, job)
+        cancellation.throwIfCancelled()
         val totalFrames = preflightSummary.totalFrames
         val frames = candidateFrames.mapNotNull { frame ->
             try {
+                cancellation.throwIfCancelled()
                 frame.thumbnail = decodeLumaThumbnail(frame.file)
+                cancellation.throwIfCancelled()
                 frame
             } catch (oom: OutOfMemoryError) {
                 throw oom
@@ -153,6 +162,7 @@ internal fun processClassicYuvFusionJob(
         var fallbackAlignmentCount = 0
         var lowConfidenceAlignmentCount = 0
         frames.forEachIndexed { index, frame ->
+            cancellation.throwIfCancelled()
             onStatus("YUV 프레임을 정렬하는 중입니다.")
             if (frame === reference) {
                 frame.alignmentScore = 0f
@@ -213,6 +223,7 @@ internal fun processClassicYuvFusionJob(
 
         val alignDoneAt = System.currentTimeMillis()
         markStage("YUV_MERGING", "YUV 프레임을 합성하는 중입니다.")
+        cancellation.throwIfCancelled()
         val mergeResult = mergeClassicFrames(
             frames = compatibleFrames,
             reference = activeReference,
@@ -222,16 +233,21 @@ internal fun processClassicYuvFusionJob(
             externalFrameWeights = externalFrameWeights,
             onStatus = onStatus
         )
+        cancellation.throwIfCancelled()
         merged = mergeResult.bitmap
         val mergeDoneAt = System.currentTimeMillis()
         val averageFile = File(jobDir, "average_color_rotated.png")
+        cancellation.throwIfCancelled()
         saveClassicBitmap(merged, averageFile)
 
         markStage("YUV_DENOISE_SHARPEN", "노이즈와 선명도를 보정하는 중입니다.")
+        cancellation.throwIfCancelled()
         finalBitmap = finishClassicFusion(merged, params)
+        cancellation.throwIfCancelled()
         val lookDoneAt = System.currentTimeMillis()
         markStage("YUV_EXPORTING", "결과를 저장하는 중입니다.")
         val finalFile = File(jobDir, "sharpened_night_fusion.png")
+        cancellation.throwIfCancelled()
         saveClassicBitmap(finalBitmap, finalFile)
         val exportDoneAt = System.currentTimeMillis()
         val processingTimeMs = System.currentTimeMillis() - processingStartedAt
@@ -331,6 +347,7 @@ internal fun processClassicYuvFusionJob(
                 .put("yuvExternalFrameWeightsTarget", "NON_REFERENCE_FRAMES_ONLY")
         }
         val debugMetadataFailure = runCatching {
+            cancellation.throwIfCancelled()
             writeFusionDebugMetadata(
                 jobDir = jobDir,
                 job = job,
@@ -346,6 +363,7 @@ internal fun processClassicYuvFusionJob(
                 lowConfidenceAlignmentCount = lowConfidenceAlignmentCount
             )
         }.exceptionOrNull()
+        cancellation.throwIfCancelled()
         generateFusionDebugArtifacts(
             jobDir = jobDir,
             job = job,
@@ -361,8 +379,10 @@ internal fun processClassicYuvFusionJob(
                     "${debugMetadataFailure.javaClass.simpleName}: ${debugMetadataFailure.message}".take(240)
                 )
         }
+        cancellation.throwIfCancelled()
         File(jobDir, "yuv_debug.json").writeText(job.toString(2))
         jobFile.writeText(job.toString(2))
+        cancellation.throwIfCancelled()
         onStatus("처리가 완료되었습니다.")
         return finalFile
     } catch (oom: OutOfMemoryError) {
@@ -384,6 +404,8 @@ internal fun processClassicYuvFusionJob(
             preflight = failurePreflight
         )
         throw IllegalStateException("Classic YUV fusion failed: OutOfMemoryError; cache kept", oom)
+    } catch (ce: CancellationException) {
+        throw ce
     } catch (e: Exception) {
         val failurePreflight = preflight ?: buildClassicYuvProcessingPreflight(jobDir, job)
         recordClassicFailure(
