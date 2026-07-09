@@ -470,7 +470,7 @@ fun MainCameraScreen(
         startMessage: String,
         requestedFrames: Int = 0,
         timeoutMillis: Long = 120_000L,
-        job: (KeplerPipelineCancellationToken, (String) -> Unit) -> Unit
+        job: (KeplerPipelineCancellationToken, KeplerCaptureCancellationHandle, (String) -> Unit) -> Unit
     ) {
         if (isPipelineBusy) {
             status = "Pipeline busy: current fusion/export is still running."
@@ -479,6 +479,7 @@ fun MainCameraScreen(
         }
         val localGeneration = ++pipelineGeneration
         val cancellationToken = KeplerPipelineCancellationToken()
+        val captureCancellationHandle = KeplerCaptureCancellationHandle()
         status = startMessage
         isPipelineBusy = true
         isCapturing = true
@@ -502,6 +503,7 @@ fun MainCameraScreen(
                 return@Runnable
             }
             cancellationToken.cancel()
+            captureCancellationHandle.cancelCapture("watchdog timeout")
             pipelineGeneration++
             val timeoutStatus = "CAPTURE_TIMEOUT: Capture timeout. Preview recovered."
             status = timeoutStatus
@@ -565,7 +567,7 @@ fun MainCameraScreen(
         mainHandler.postDelayed(
             {
                 try {
-                    job(cancellationToken, jobCallback@{ newStatus ->
+                    job(cancellationToken, captureCancellationHandle, jobCallback@{ newStatus ->
                         if (localGeneration != pipelineGeneration) {
                             Log.i(
                                 "KeplerPipelineState",
@@ -785,7 +787,7 @@ fun MainCameraScreen(
                                 } else {
                                     60_000L
                                 }
-                            ) { cancellation, callback ->
+                            ) { cancellation, captureCancellation, callback ->
                                 startCapturePipeline(
                                     CapturePipelineRequest(
                                         context = context,
@@ -796,6 +798,7 @@ fun MainCameraScreen(
                                         finalOutputFormat = finalOutputFormat,
                                         focusAeState = focusAeState,
                                         rawSpeedMode = rawSpeedMode,
+                                        captureCancellationHandle = captureCancellation,
                                         cancellation = cancellation
                                     ),
                                     onStatus = callback
@@ -823,7 +826,7 @@ fun MainCameraScreen(
                     }
                 },
                 onRaw = {
-                    runCameraJob("RAW DNG 촬영 준비 중...", requestedFrames = 1) { cancellation, callback ->
+                    runCameraJob("RAW DNG 촬영 준비 중...", requestedFrames = 1) { cancellation, _, callback ->
                         cancellation.throwIfCancelled()
                         captureSingleRawDng(
                             context = context,
@@ -833,7 +836,7 @@ fun MainCameraScreen(
                     }
                 },
                 onRawBurst = {
-                    runCameraJob("RAW Burst 촬영 준비 중...", requestedFrames = 4) { cancellation, callback ->
+                    runCameraJob("RAW Burst 촬영 준비 중...", requestedFrames = 4) { cancellation, _, callback ->
                         cancellation.throwIfCancelled()
                         captureRawBurstDng(
                             context = context,
@@ -908,7 +911,7 @@ fun MainCameraScreen(
                 },
                 onRaw = {
                     currentScreen = MainScreen.CAMERA
-                    runCameraJob("RAW DNG capture preparing...") { cancellation, callback ->
+                    runCameraJob("RAW DNG capture preparing...") { cancellation, _, callback ->
                         cancellation.throwIfCancelled()
                         captureSingleRawDng(
                             context = context,
@@ -919,7 +922,7 @@ fun MainCameraScreen(
                 },
                 onRawBurst = {
                     currentScreen = MainScreen.CAMERA
-                    runCameraJob("RAW Burst capture preparing...") { cancellation, callback ->
+                    runCameraJob("RAW Burst capture preparing...") { cancellation, _, callback ->
                         cancellation.throwIfCancelled()
                         captureRawBurstDng(
                             context = context,
@@ -951,7 +954,7 @@ fun MainCameraScreen(
                                 mainCapability.raw50Reason
                         return@test50
                     }
-                    runCameraJob("Test 50M RAW Capture: cameraId=${mainSelection.cameraId}", requestedFrames = 1) { cancellation, callback ->
+                    runCameraJob("Test 50M RAW Capture: cameraId=${mainSelection.cameraId}", requestedFrames = 1) { cancellation, captureCancellation, callback ->
                         cancellation.throwIfCancelled()
                         captureRawBurstForFusion(
                             context = context,
@@ -961,6 +964,7 @@ fun MainCameraScreen(
                             zoomRatio = 1.0f,
                             requestedUiZoomRatio = 1.0f,
                             focusAeState = focusAeState,
+                            captureCancellationHandle = captureCancellation,
                             onStatus = callback,
                             onComplete = { jobDir ->
                                 val job = JSONObject(File(jobDir, "job.json").readText())
@@ -995,7 +999,7 @@ fun MainCameraScreen(
                     runCameraJob(
                         "Test 50M YUV/JPEG Capture: cameraId=${mainSelection.cameraId}",
                         requestedFrames = 1
-                    ) { cancellation, callback ->
+                    ) { cancellation, _, callback ->
                         cancellation.throwIfCancelled()
                         capture50MpProcessedTest(
                             context = context,

@@ -195,6 +195,7 @@ fun captureYuvBurstColorWithMotion(
     autoMaxFrames: Int = 8,
     manualFrames: Int = 4,
     framePlanReason: String = "Default",
+    captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     onComplete: (File) -> Unit = {},
     onError: (String) -> Unit = {},
     onStatus: (String) -> Unit
@@ -249,6 +250,11 @@ fun captureYuvBurstColorWithMotion(
         try { cameraDevice?.close() } catch (_: Exception) {}
         try { motionLogger?.stop() } catch (_: Exception) {}
         try { backgroundThread.quitSafely() } catch (_: Exception) {}
+    }
+
+    captureCancellationHandle.registerCleanupAction {
+        finished.set(true)
+        cleanup()
     }
 
     fun finish(message: String) {

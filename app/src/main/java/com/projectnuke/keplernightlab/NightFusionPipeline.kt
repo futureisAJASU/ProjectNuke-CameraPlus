@@ -31,6 +31,7 @@ fun captureProcessExportNightFusion(
     autoMaxFrames: Int = 8,
     manualFrames: Int = 4,
     framePlanReason: String = "Default",
+    captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ) {
@@ -58,6 +59,7 @@ fun captureProcessExportNightFusion(
         autoMaxFrames = autoMaxFrames,
         manualFrames = manualFrames,
         framePlanReason = framePlanReason,
+        captureCancellationHandle = captureCancellationHandle,
         onComplete = { jobDir ->
             try {
                 cancellation.throwIfCancelled()

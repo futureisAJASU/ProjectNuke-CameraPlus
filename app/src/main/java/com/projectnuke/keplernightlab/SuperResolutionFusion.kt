@@ -340,6 +340,7 @@ fun captureProcessExportSuperResolutionFusion(
     autoMaxFrames: Int,
     manualFrames: Int,
     framePlanReason: String,
+    captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ) {
@@ -363,6 +364,7 @@ fun captureProcessExportSuperResolutionFusion(
         autoMaxFrames = autoMaxFrames,
         manualFrames = manualFrames,
         framePlanReason = framePlanReason,
+        captureCancellationHandle = captureCancellationHandle,
         onComplete = { sourceJobDir ->
             try {
                 cancellation.throwIfCancelled()

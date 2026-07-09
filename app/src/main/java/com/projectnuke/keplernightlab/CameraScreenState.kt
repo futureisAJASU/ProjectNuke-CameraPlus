@@ -92,6 +92,7 @@ internal data class CapturePipelineRequest(
     val finalOutputFormat: FinalOutputFormat,
     val focusAeState: FocusAeState,
     val rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
+    val captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     val cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
 )
 

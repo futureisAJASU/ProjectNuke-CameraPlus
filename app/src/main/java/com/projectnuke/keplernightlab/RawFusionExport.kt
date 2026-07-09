@@ -79,6 +79,7 @@ fun captureProcessExportRawNightFusion(
     routeFallbackReason: String? = null,
     focusAeState: FocusAeState = FocusAeState(),
     rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
+    captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ) {
@@ -100,6 +101,7 @@ fun captureProcessExportRawNightFusion(
         routeFallbackReason = routeFallbackReason,
         focusAeState = focusAeState,
         rawSpeedMode = rawSpeedMode,
+        captureCancellationHandle = captureCancellationHandle,
         onStatus = { post(it) },
         onComplete = { jobDir ->
             try {

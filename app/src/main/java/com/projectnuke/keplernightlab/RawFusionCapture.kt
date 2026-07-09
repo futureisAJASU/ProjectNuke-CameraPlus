@@ -98,6 +98,7 @@ fun captureRawBurstForFusion(
     routeFallbackReason: String? = null,
     focusAeState: FocusAeState = FocusAeState(),
     rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
+    captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     onStatus: (String) -> Unit,
     onComplete: (File) -> Unit,
     onError: (String) -> Unit
@@ -149,6 +150,11 @@ fun captureRawBurstForFusion(
         try { cameraDevice?.close() } catch (_: Exception) {}
         try { motionLogger?.stop() } catch (_: Exception) {}
         try { thread.quitSafely() } catch (_: Exception) {}
+    }
+
+    captureCancellationHandle.registerCleanupAction {
+        finished.set(true)
+        cleanup()
     }
 
     fun writeJobStatus(jobFile: File?, baseJob: JSONObject?, status: String, error: String? = null) {

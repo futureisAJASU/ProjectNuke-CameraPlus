@@ -105,7 +105,20 @@ fun buildFocusAeMeteringRectangle(
     useMaximumResolutionActiveArray: Boolean = false
 ): MeteringRectangle? {
     if (point == null) return null
-    val active = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return null
+    val activeSource = if (
+        zoomApplication.usedControlZoomRatio &&
+        useMaximumResolutionActiveArray &&
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+    ) {
+        "MAXIMUM_RESOLUTION"
+    } else {
+        "NORMAL"
+    }
+    val active = if (activeSource == "MAXIMUM_RESOLUTION") {
+        characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE_MAXIMUM_RESOLUTION)
+    } else {
+        characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+    } ?: return null
     val crop = if (zoomApplication.usedControlZoomRatio) {
         active
     } else {
@@ -127,7 +140,7 @@ fun buildFocusAeMeteringRectangle(
     Log.d(
         "KeplerMetering",
         "metering mode=${if (zoomApplication.usedControlZoomRatio) "CONTROL_ZOOM_RATIO" else "SCALER_CROP_REGION"} " +
-            "zoom=${zoomApplication.appliedZoomRatio} point=$point region=$rect"
+            "activeArray=$activeSource zoom=${zoomApplication.appliedZoomRatio} point=$point region=$rect"
     )
     return MeteringRectangle(rect, MeteringRectangle.METERING_WEIGHT_MAX)
 }

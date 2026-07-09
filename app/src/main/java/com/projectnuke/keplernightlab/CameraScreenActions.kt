@@ -303,6 +303,7 @@ internal fun startCapturePipeline(
             autoMaxFrames = request.prepared.settings.autoMaxFrames,
             manualFrames = request.prepared.settings.manualFrames,
             framePlanReason = request.prepared.framePlan.reason,
+            captureCancellationHandle = request.captureCancellationHandle,
             cancellation = request.cancellation,
             onStatus = loggedStatus
         )
@@ -326,6 +327,7 @@ internal fun startCapturePipeline(
             routeFallbackReason = fallbackReason,
             focusAeState = request.focusAeState,
             rawSpeedMode = request.rawSpeedMode,
+            captureCancellationHandle = request.captureCancellationHandle,
             cancellation = request.cancellation,
             onStatus = loggedStatus
         )
@@ -349,6 +351,7 @@ internal fun startCapturePipeline(
             autoMaxFrames = request.prepared.settings.autoMaxFrames,
             manualFrames = request.prepared.settings.manualFrames,
             framePlanReason = request.prepared.framePlan.reason,
+            captureCancellationHandle = request.captureCancellationHandle,
             cancellation = request.cancellation,
             onStatus = loggedStatus
         )
