@@ -140,6 +140,8 @@ internal fun processClassicYuvFusionJob(
                 frame
             } catch (oom: OutOfMemoryError) {
                 throw oom
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: Exception) {
                 val frameJson = job.optJSONArray("frames")?.optJSONObject(frame.jsonIndex)
                 frameJson?.put("alignmentUsed", false)
