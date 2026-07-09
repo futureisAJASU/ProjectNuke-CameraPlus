@@ -57,8 +57,9 @@ open class KeplerCaptureCancellationHandle {
     }
 
     private fun runCleanup() {
+        val action = cleanupAction.getAndSet(null) ?: return
         if (!cleanupRan.compareAndSet(false, true)) return
-        cleanupAction.getAndSet(null)?.invoke()
+        action.invoke()
     }
 }
 
