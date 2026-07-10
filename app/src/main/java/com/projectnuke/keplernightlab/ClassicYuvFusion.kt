@@ -233,10 +233,11 @@ internal fun processClassicYuvFusionJob(
             height = dimensions.second,
             params = params,
             externalFrameWeights = externalFrameWeights,
+            cancellation = cancellation,
             onStatus = onStatus
         )
-        cancellation.throwIfCancelled()
         merged = mergeResult.bitmap
+        cancellation.throwIfCancelled()
         val mergeDoneAt = System.currentTimeMillis()
         val averageFile = File(jobDir, "average_color_rotated.png")
         cancellation.throwIfCancelled()
@@ -244,7 +245,7 @@ internal fun processClassicYuvFusionJob(
 
         markStage("YUV_DENOISE_SHARPEN", "노이즈와 선명도를 보정하는 중입니다.")
         cancellation.throwIfCancelled()
-        finalBitmap = finishClassicFusion(merged, params)
+        finalBitmap = finishClassicFusion(merged, params, cancellation)
         cancellation.throwIfCancelled()
         val lookDoneAt = System.currentTimeMillis()
         markStage("YUV_EXPORTING", "결과를 저장하는 중입니다.")
@@ -617,18 +618,24 @@ private fun mergeClassicFrames(
     height: Int,
     params: ClassicYuvFusionParams,
     externalFrameWeights: Map<Int, Float>? = null,
+    cancellation: KeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ): MergeResult {
-    val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-    val decoders = frames.associateWith {
-        BitmapRegionDecoder.newInstance(it.file.absolutePath, false)
-    }
+    var output: Bitmap? = null
+    var outputReturned = false
+    val decoders = linkedMapOf<ClassicFrame, BitmapRegionDecoder>()
     var rejectedPixels = 0L
     var comparedPixels = 0L
     val reportedMergeFrames = mutableSetOf<Int>()
     try {
+        frames.forEach { frame ->
+            cancellation.throwIfCancelled()
+            decoders[frame] = BitmapRegionDecoder.newInstance(frame.file.absolutePath, false)
+        }
+        output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         var tileTop = 0
         while (tileTop < height) {
+            cancellation.throwIfCancelled()
             val tileBottom = min(height, tileTop + CLASSIC_FUSION_TILE_ROWS)
             val tileHeight = tileBottom - tileTop
             val pixelCount = width * tileHeight
@@ -636,9 +643,13 @@ private fun mergeClassicFrames(
                 Rect(0, tileTop, width, tileBottom),
                 BitmapFactory.Options()
             ) ?: error("Could not decode reference tile")
-            val referencePixels = IntArray(pixelCount)
-            referenceBitmap.getPixels(referencePixels, 0, width, 0, 0, width, tileHeight)
-            referenceBitmap.recycle()
+            val referencePixels = try {
+                IntArray(pixelCount).also {
+                    referenceBitmap.getPixels(it, 0, width, 0, 0, width, tileHeight)
+                }
+            } finally {
+                referenceBitmap.recycle()
+            }
 
             val sumR = FloatArray(pixelCount)
             val sumG = FloatArray(pixelCount)
@@ -653,6 +664,7 @@ private fun mergeClassicFrames(
             }
 
             frames.forEachIndexed { frameIndex, frame ->
+                cancellation.throwIfCancelled()
                 if (frame === reference) return@forEachIndexed
                 if (reportedMergeFrames.add(frame.jsonIndex)) {
                     onStatus("Classic YUV fusion: merging frame ${frameIndex + 1}/${frames.size}...")
@@ -665,13 +677,17 @@ private fun mergeClassicFrames(
                 val region = Rect(sourceLeft, sourceTop, sourceRight, sourceBottom)
                 val frameBitmap = decoders.getValue(frame).decodeRegion(region, BitmapFactory.Options())
                     ?: return@forEachIndexed
-                val frameWidth = frameBitmap.width
-                val frameHeight = frameBitmap.height
-                val framePixels = IntArray(frameWidth * frameHeight)
-                frameBitmap.getPixels(
-                    framePixels, 0, frameWidth, 0, 0, frameWidth, frameHeight
-                )
-                frameBitmap.recycle()
+                val (frameWidth, frameHeight, framePixels) = try {
+                    val frameWidth = frameBitmap.width
+                    val frameHeight = frameBitmap.height
+                    val framePixels = IntArray(frameWidth * frameHeight)
+                    frameBitmap.getPixels(
+                        framePixels, 0, frameWidth, 0, 0, frameWidth, frameHeight
+                    )
+                    Triple(frameWidth, frameHeight, framePixels)
+                } finally {
+                    frameBitmap.recycle()
+                }
 
                 val alignmentWeight = alignmentWeight(
                     frame.alignmentScore,
@@ -687,6 +703,7 @@ private fun mergeClassicFrames(
                 val outputStartY = max(tileTop, -frame.alignDy)
                 val outputEndY = min(tileBottom, height - frame.alignDy)
                 for (y in outputStartY until outputEndY) {
+                    if ((y and 31) == 0) cancellation.throwIfCancelled()
                     val tileY = y - tileTop
                     val sourceY = y + frame.alignDy - sourceTop
                     for (x in outputStartX until outputEndX) {
@@ -710,6 +727,7 @@ private fun mergeClassicFrames(
 
             val outputPixels = IntArray(pixelCount)
             for (pixel in 0 until pixelCount) {
+                if ((pixel and 4095) == 0) cancellation.throwIfCancelled()
                 val weight = sumW[pixel].coerceAtLeast(0.001f)
                 outputPixels[pixel] = Color.rgb(
                     (sumR[pixel] / weight).roundToInt().coerceIn(0, 255),
@@ -717,13 +735,16 @@ private fun mergeClassicFrames(
                     (sumB[pixel] / weight).roundToInt().coerceIn(0, 255)
                 )
             }
+            cancellation.throwIfCancelled()
             output.setPixels(outputPixels, 0, width, 0, tileTop, width, tileHeight)
             tileTop = tileBottom
         }
+        outputReturned = true
+        return MergeResult(requireNotNull(output), rejectedPixels, comparedPixels)
     } finally {
         decoders.values.forEach { it.recycle() }
+        if (!outputReturned) output?.recycle()
     }
-    return MergeResult(output, rejectedPixels, comparedPixels)
 }
 
 private fun resolveExternalFrameWeight(
@@ -750,7 +771,11 @@ private fun ghostWeight(lumaDifference: Float, params: ClassicYuvFusionParams): 
     return (1f - normalized).pow(3).coerceAtLeast(params.ghostWeight)
 }
 
-private fun finishClassicFusion(source: Bitmap, params: ClassicYuvFusionParams): Bitmap {
+private fun finishClassicFusion(
+    source: Bitmap,
+    params: ClassicYuvFusionParams,
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
+): Bitmap {
     val width = source.width
     val height = source.height
     val outputBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
@@ -761,8 +786,10 @@ private fun finishClassicFusion(source: Bitmap, params: ClassicYuvFusionParams):
             params.highlightRollOff * lifted.pow(2) * (1f - lifted)
         return (rolled.coerceIn(0f, 1f) * 255f).roundToInt().coerceIn(0, 255)
     }
+    try {
     var tileTop = 0
     while (tileTop < height) {
+        cancellation.throwIfCancelled()
         val tileBottom = min(height, tileTop + CLASSIC_FUSION_TILE_ROWS)
         val sourceTop = max(0, tileTop - 1)
         val sourceBottom = min(height, tileBottom + 1)
@@ -776,6 +803,7 @@ private fun finishClassicFusion(source: Bitmap, params: ClassicYuvFusionParams):
             return sourcePixels[(safeY - sourceTop) * width + safeX]
         }
         for (y in tileTop until tileBottom) {
+            if ((y and 31) == 0) cancellation.throwIfCancelled()
             for (x in 0 until width) {
                 val center = at(x, y)
                 var lumaSum = 0f
@@ -814,12 +842,17 @@ private fun finishClassicFusion(source: Bitmap, params: ClassicYuvFusionParams):
                 )
             }
         }
+        cancellation.throwIfCancelled()
         outputBitmap.setPixels(
             outputPixels, 0, width, 0, tileTop, width, tileBottom - tileTop
         )
         tileTop = tileBottom
     }
     return outputBitmap
+    } catch (t: Throwable) {
+        outputBitmap.recycle()
+        throw t
+    }
 }
 
 private fun updateAlignmentMetadata(

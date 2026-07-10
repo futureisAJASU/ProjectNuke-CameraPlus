@@ -5,6 +5,7 @@ import android.graphics.Color
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.CancellationException
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -89,10 +90,12 @@ internal fun runClassicRawFusionMerge(
     blackLevelEstimate: BlackLevelEstimate,
     mergedRawFile: File,
     alignmentFile: File,
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ): ClassicRawFusionResult {
     val startedAt = System.currentTimeMillis()
     return try {
+        cancellation.throwIfCancelled()
         onStatus("Classic RAW fusion: loading frames...")
         val frames = preparedFrames.inputs.mapIndexed { index, input ->
             ClassicRawFrame(index, input)
@@ -107,6 +110,7 @@ internal fun runClassicRawFusionMerge(
         onStatus("Classic RAW fusion: building alignment proxies...")
         frames.toList().forEach { frame ->
             try {
+                cancellation.throwIfCancelled()
                 frame.proxy = buildRawProxy(frame.input.file, sensor, blackLevelEstimate)
             } catch (oom: OutOfMemoryError) {
                 throw oom
@@ -128,6 +132,7 @@ internal fun runClassicRawFusionMerge(
         var fallbackAlignmentCount = 0
         var lowConfidenceAlignmentCount = 0
         frames.forEachIndexed { index, frame ->
+            cancellation.throwIfCancelled()
             onStatus("Classic RAW fusion: aligning frame ${index + 1}/${frames.size}...")
             frame.exposureScale = (refExposure / exposureProduct(frame.input.meta))
                 .coerceIn(0.5f, 2.0f)
@@ -141,7 +146,10 @@ internal fun runClassicRawFusionMerge(
                 frame.alignmentUsed = true
                 frame.globalWeight = CLASSIC_RAW_REFERENCE_WEIGHT
             } else {
+                // Native alignment cannot stop mid-call; check on both boundaries.
+                cancellation.throwIfCancelled()
                 val alignment = estimateRawTranslation(refProxy, requireNotNull(frame.proxy))
+                cancellation.throwIfCancelled()
                 frame.dx = (alignment.dx * refProxy.sampleStep).roundToInt()
                 frame.dy = (alignment.dy * refProxy.sampleStep).roundToInt()
                 frame.integerDx = alignment.integerDx * refProxy.sampleStep
@@ -176,6 +184,7 @@ internal fun runClassicRawFusionMerge(
             sensor = sensor,
             blackLevelEstimate = blackLevelEstimate,
             mergedRawFile = mergedRawFile,
+            cancellation = cancellation,
             onStatus = onStatus
         )
         val nativeMergeMs = System.currentTimeMillis() - mergeStartedAt
@@ -250,6 +259,8 @@ internal fun runClassicRawFusionMerge(
             debugMetadata = debug,
             errorMessage = null
         )
+    } catch (ce: CancellationException) {
+        throw ce
     } catch (oom: OutOfMemoryError) {
         job.put("processStatus", "OOM_FAILED_KEEPING_CACHE")
             .put("rawFusionEngine", "classic_raw_v1")
@@ -444,6 +455,7 @@ private fun mergeClassicRawTiles(
     sensor: RawFusionSensorData,
     blackLevelEstimate: BlackLevelEstimate,
     mergedRawFile: File,
+    cancellation: KeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ): RawMergeStats {
     var rejected = 0L
@@ -461,10 +473,12 @@ private fun mergeClassicRawTiles(
         BufferedOutputStream(FileOutputStream(mergedRawFile)).use { output ->
             var tileTop = 0
             while (tileTop < sensor.height) {
+                cancellation.throwIfCancelled()
                 val tileRows = min(CLASSIC_RAW_TILE_ROWS, sensor.height - tileTop)
                 acc.fill(0f, 0, sensor.width * tileRows)
                 weights.fill(0f, 0, sensor.width * tileRows)
                 for (row in 0 until tileRows) {
+                    if ((row and 15) == 0) cancellation.throwIfCancelled()
                     readRawRow(
                         frameInputs.getValue(reference),
                         sensor.width,
@@ -474,16 +488,19 @@ private fun mergeClassicRawTiles(
                 }
 
                 frames.forEachIndexed { frameIndex, frame ->
+                    cancellation.throwIfCancelled()
                     onStatus("Classic RAW fusion: merging RAW tiles ${frameIndex + 1}/${frames.size}")
                     val raf = frameInputs.getValue(frame)
                     val rowBuffer = sourceRows.getValue(frame)
                     val globalWeight = frame.globalWeight
                     for (row in 0 until tileRows) {
+                        if ((row and 15) == 0) cancellation.throwIfCancelled()
                         val y = tileTop + row
                         val sourceY = y + frame.dy
                         if (sourceY !in 0 until sensor.height) continue
                         readRawRow(raf, sensor.width, sourceY, rowBuffer)
                         for (x in 0 until sensor.width) {
+                            if ((x and 1023) == 0) cancellation.throwIfCancelled()
                             val sourceX = x + frame.dx
                             if (sourceX !in 0 until sensor.width) continue
                             val index = row * sensor.width + x
@@ -520,8 +537,10 @@ private fun mergeClassicRawTiles(
                     }
                 }
                 for (row in 0 until tileRows) {
+                    if ((row and 15) == 0) cancellation.throwIfCancelled()
                     var out = 0
                     for (x in 0 until sensor.width) {
+                        if ((x and 1023) == 0) cancellation.throwIfCancelled()
                         val index = row * sensor.width + x
                         val value = (acc[index] / weights[index].coerceAtLeast(0.001f))
                             .roundToInt()

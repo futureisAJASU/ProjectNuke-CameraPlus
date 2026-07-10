@@ -30,10 +30,23 @@ internal fun createRoutedStillCaptureSession(
     requestedCaptureZoomRatio: Float,
     selectedRoute: ThreeXSourceMode,
     handler: Handler,
+    pipelineName: String,
+    isFinished: () -> Boolean,
     onConfigured: (CameraCaptureSession, PhysicalCaptureRoute) -> Unit,
     onFailed: (String) -> Unit
 ) {
+    fun logLateCallback(callback: String) {
+        Log.d(
+            "KeplerCaptureCancel",
+            "pipeline=$pipelineName callback=$callback late=true finished=${isFinished()}"
+        )
+    }
+
     fun createNormalOutput(reason: String, route: PhysicalCaptureRoute) {
+        if (isFinished()) {
+            logLateCallback("createNormalOutput")
+            return
+        }
         val path = when (route) {
             PhysicalCaptureRoute.NORMAL -> "normal"
             PhysicalCaptureRoute.PHYSICAL_FAILED_CROP_FALLBACK -> "cropFallback"
@@ -51,6 +64,11 @@ internal fun createRoutedStillCaptureSession(
                 listOf(surface),
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
+                        if (isFinished()) {
+                            logLateCallback("normal.onConfigured")
+                            session.close()
+                            return
+                        }
                         Log.i(
                             "KeplerPhysicalRoute",
                             "capture normal output configured path=$path cameraId=$cameraId " +
@@ -62,6 +80,10 @@ internal fun createRoutedStillCaptureSession(
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
                         session.close()
+                        if (isFinished()) {
+                            logLateCallback("normal.onConfigureFailed")
+                            return
+                        }
                         onFailed("Normal capture fallback session configuration failed")
                     }
                 },
@@ -91,6 +113,11 @@ internal fun createRoutedStillCaptureSession(
                 { command -> handler.post(command) },
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
+                        if (isFinished()) {
+                            logLateCallback("physical.onConfigured")
+                            session.close()
+                            return
+                        }
                         Log.i(
                             "KeplerPhysicalRoute",
                             "capture physical output configured path=physical cameraId=$cameraId " +
@@ -103,6 +130,10 @@ internal fun createRoutedStillCaptureSession(
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
                         session.close()
+                        if (isFinished()) {
+                            logLateCallback("physical.onConfigureFailed")
+                            return
+                        }
                         Log.e(
                             "KeplerPhysicalRoute",
                             "capture physical output failed cameraId=$cameraId " +
@@ -117,6 +148,10 @@ internal fun createRoutedStillCaptureSession(
             )
         )
     } catch (error: Exception) {
+        if (isFinished()) {
+            logLateCallback("physical.create")
+            return
+        }
         Log.e(
             "KeplerPhysicalRoute",
             "capture physical output create failed cameraId=$cameraId " +

@@ -252,6 +252,13 @@ fun captureYuvBurstColorWithMotion(
         try { backgroundThread.quitSafely() } catch (_: Exception) {}
     }
 
+    fun logLateCameraCallback(callback: String) {
+        Log.d(
+            "KeplerCaptureCancel",
+            "pipeline=YUV callback=$callback late=true finished=${finished.get()} cleanupStarted=${cleanupStarted.get()}"
+        )
+    }
+
     captureCancellationHandle.registerCleanupAction {
         finished.set(true)
         cleanup()
@@ -797,7 +804,17 @@ fun captureYuvBurstColorWithMotion(
             cameraId,
             object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
+                    if (finished.get()) {
+                        logLateCameraCallback("CameraDevice.onOpened.beforeAssign")
+                        camera.close()
+                        return
+                    }
                     cameraDevice = camera
+                    if (finished.get()) {
+                        logLateCameraCallback("CameraDevice.onOpened.afterAssign")
+                        camera.close()
+                        return
+                    }
                     postStatus("카메라 열림. Color Burst 세션 생성 중...")
 
                     try {
@@ -810,8 +827,20 @@ fun captureYuvBurstColorWithMotion(
                             requestedCaptureZoomRatio = zoomRatio,
                             selectedRoute = zoomRoute,
                             handler = backgroundHandler,
+                            pipelineName = "YUV",
+                            isFinished = { finished.get() },
                             onConfigured = { session, captureRoute ->
+                                    if (finished.get()) {
+                                        logLateCameraCallback("CameraCaptureSession.onConfigured.beforeAssign")
+                                        session.close()
+                                        return@createRoutedStillCaptureSession
+                                    }
                                     captureSession = session
+                                    if (finished.get()) {
+                                        logLateCameraCallback("CameraCaptureSession.onConfigured.afterAssign")
+                                        session.close()
+                                        return@createRoutedStillCaptureSession
+                                    }
                                     postStatus("Color Fusion 초기화 7/7: 세션 준비 완료. $frameCount 장 촬영 중...")
 
                                     try {
@@ -966,6 +995,10 @@ fun captureYuvBurstColorWithMotion(
                             },
 
                             onFailed = { reason ->
+                                    if (finished.get()) {
+                                        logLateCameraCallback("CameraCaptureSession.onConfigureFailed")
+                                        return@createRoutedStillCaptureSession
+                                    }
                                     finishError(
                                         message = "Color Burst 세션 구성 실패: $reason",
                                         source = "captureYuvBurstColorWithMotion.session.configure",
@@ -986,6 +1019,11 @@ fun captureYuvBurstColorWithMotion(
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
+                    camera.close()
+                    if (finished.get()) {
+                        logLateCameraCallback("CameraDevice.onDisconnected")
+                        return
+                    }
                     finishError(
                         message = "카메라 연결 해제됨",
                         source = "captureYuvBurstColorWithMotion.camera.disconnected",
@@ -995,6 +1033,11 @@ fun captureYuvBurstColorWithMotion(
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
+                    camera.close()
+                    if (finished.get()) {
+                        logLateCameraCallback("CameraDevice.onError")
+                        return
+                    }
                     finishError(
                         message = "카메라 오류: $error",
                         source = "captureYuvBurstColorWithMotion.camera.error",

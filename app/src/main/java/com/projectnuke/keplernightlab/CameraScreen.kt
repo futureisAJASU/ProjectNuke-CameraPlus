@@ -55,6 +55,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -81,6 +82,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
 import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -267,6 +269,21 @@ fun MainCameraScreen(
     var currentScreen by remember { mutableStateOf(MainScreen.CAMERA) }
     var captureProgress by remember { mutableStateOf(CaptureProgressState()) }
     var pipelineGeneration by remember { mutableIntStateOf(0) }
+    val activeCancellationToken = remember { AtomicReference<KeplerPipelineCancellationToken?>(null) }
+    val activeCaptureCancellation = remember { AtomicReference<KeplerCaptureCancellationHandle?>(null) }
+    val activeWatchdog = remember { AtomicReference<Runnable?>(null) }
+    val activeJobStart = remember { AtomicReference<Runnable?>(null) }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            pipelineGeneration++
+            activeCancellationToken.getAndSet(null)?.cancel()
+            activeCaptureCancellation.getAndSet(null)?.cancelCapture("camera screen disposed")
+            activeWatchdog.getAndSet(null)?.let(mainHandler::removeCallbacks)
+            activeJobStart.getAndSet(null)?.let(mainHandler::removeCallbacks)
+            Log.i("KeplerPipelineState", "camera screen disposed; active pipeline cancelled")
+        }
+    }
 
     val selectedMode = "사진"
     var selectedResolution by remember {
@@ -480,6 +497,8 @@ fun MainCameraScreen(
         val localGeneration = ++pipelineGeneration
         val cancellationToken = KeplerPipelineCancellationToken()
         val captureCancellationHandle = KeplerCaptureCancellationHandle()
+        activeCancellationToken.set(cancellationToken)
+        activeCaptureCancellation.set(captureCancellationHandle)
         status = startMessage
         isPipelineBusy = true
         isCapturing = true
@@ -504,6 +523,9 @@ fun MainCameraScreen(
             }
             cancellationToken.cancel()
             captureCancellationHandle.cancelCapture("watchdog timeout")
+            activeCancellationToken.compareAndSet(cancellationToken, null)
+            activeCaptureCancellation.compareAndSet(captureCancellationHandle, null)
+            activeWatchdog.set(null)
             pipelineGeneration++
             val timeoutStatus = "CAPTURE_TIMEOUT: Capture timeout. Preview recovered."
             status = timeoutStatus
@@ -513,6 +535,7 @@ fun MainCameraScreen(
             previewEnabled = true
             Log.i("KeplerPipelineState", "pipeline timeout; preview re-enabled")
         }
+        activeWatchdog.set(watchdog)
         mainHandler.postDelayed(watchdog, timeoutMillis)
 
         fun finishIfTerminal(newStatus: String) {
@@ -542,6 +565,9 @@ fun MainCameraScreen(
                         newStatus.contains("EXPORT_COMPLETE", ignoreCase = true) ||
                         lower.contains("saved to gallery")
                 mainHandler.removeCallbacks(watchdog)
+                activeWatchdog.compareAndSet(watchdog, null)
+                activeCancellationToken.compareAndSet(cancellationToken, null)
+                activeCaptureCancellation.compareAndSet(captureCancellationHandle, null)
                 isPipelineBusy = false
                 isCapturing = false
                 refreshLatestResult(showPreview = terminalSuccess)
@@ -564,8 +590,15 @@ fun MainCameraScreen(
             }
         }
 
-        mainHandler.postDelayed(
-            {
+        val jobStart = Runnable {
+                activeJobStart.set(null)
+                if (localGeneration != pipelineGeneration || cancellationToken.isCancelled) {
+                    Log.i(
+                        "KeplerPipelineState",
+                        "stale job start ignored generation=$localGeneration current=$pipelineGeneration"
+                    )
+                    return@Runnable
+                }
                 try {
                     job(cancellationToken, captureCancellationHandle, jobCallback@{ newStatus ->
                         if (localGeneration != pipelineGeneration) {
@@ -580,9 +613,9 @@ fun MainCameraScreen(
                     })
                 } catch (_: CancellationException) {
                 }
-            },
-            250L
-        )
+        }
+        activeJobStart.set(jobStart)
+        mainHandler.postDelayed(jobStart, 250L)
     }
 
     Box(

@@ -35,6 +35,7 @@ import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.max
@@ -150,6 +151,13 @@ fun captureRawBurstForFusion(
         try { cameraDevice?.close() } catch (_: Exception) {}
         try { motionLogger?.stop() } catch (_: Exception) {}
         try { thread.quitSafely() } catch (_: Exception) {}
+    }
+
+    fun logLateCameraCallback(callback: String) {
+        Log.d(
+            "KeplerCaptureCancel",
+            "pipeline=RAW callback=$callback late=true finished=${finished.get()} cleanupStarted=${cleanupStarted.get()}"
+        )
     }
 
     captureCancellationHandle.registerCleanupAction {
@@ -690,7 +698,17 @@ fun captureRawBurstForFusion(
             cameraId,
             object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
+                    if (finished.get()) {
+                        logLateCameraCallback("CameraDevice.onOpened.beforeAssign")
+                        camera.close()
+                        return
+                    }
                     cameraDevice = camera
+                    if (finished.get()) {
+                        logLateCameraCallback("CameraDevice.onOpened.afterAssign")
+                        camera.close()
+                        return
+                    }
                     createRoutedStillCaptureSession(
                         camera = camera,
                         surface = imageReader.surface,
@@ -700,9 +718,21 @@ fun captureRawBurstForFusion(
                         requestedCaptureZoomRatio = zoomRatio,
                         selectedRoute = zoomRoute,
                         handler = handler,
+                        pipelineName = "RAW",
+                        isFinished = { finished.get() },
                         onConfigured = { configured, captureRoute ->
+                            if (finished.get()) {
+                                logLateCameraCallback("CameraCaptureSession.onConfigured.beforeAssign")
+                                configured.close()
+                                return@createRoutedStillCaptureSession
+                            }
                             try {
                                 session = configured
+                                if (finished.get()) {
+                                    logLateCameraCallback("CameraCaptureSession.onConfigured.afterAssign")
+                                    configured.close()
+                                    return@createRoutedStillCaptureSession
+                                }
                                 updateFinalRouteMetadata(captureRoute)
                                 val requestZoomRatio = captureRoute.finalRequestZoomRatio(zoomRatio)
                                 val requests = List(requestedFrames) {
@@ -807,6 +837,10 @@ fun captureRawBurstForFusion(
                             }
                             },
                         onFailed = { reason ->
+                            if (finished.get()) {
+                                logLateCameraCallback("CameraCaptureSession.onConfigureFailed")
+                                return@createRoutedStillCaptureSession
+                            }
                             finishError(
                                 "CAPTURE_FAILED",
                                 "PIPELINE_FAILED: RAW fusion session configure failed: $reason"
@@ -816,10 +850,20 @@ fun captureRawBurstForFusion(
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
+                    camera.close()
+                    if (finished.get()) {
+                        logLateCameraCallback("CameraDevice.onDisconnected")
+                        return
+                    }
                     finishError("CAPTURE_FAILED", "PIPELINE_FAILED: RAW fusion camera disconnected")
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
+                    camera.close()
+                    if (finished.get()) {
+                        logLateCameraCallback("CameraDevice.onError")
+                        return
+                    }
                     finishError("CAPTURE_FAILED", "PIPELINE_FAILED: RAW fusion camera error: $error")
                 }
             },
@@ -834,18 +878,25 @@ fun captureRawBurstForFusion(
 }
 
 private object RawFusionExportCoordinator {
-    fun export(context: RawFusionExportContext): RawFusionProcessResult {
+    fun export(
+        context: RawFusionExportContext,
+        cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
+    ): RawFusionProcessResult {
+        cancellation.throwIfCancelled()
         return if (
             context.outputMode == CaptureResolutionMode.MP24_FUSION &&
             context.highResolutionRaw
         ) {
-            exportNativeMp24(context)
+            exportNativeMp24(context, cancellation)
         } else {
-            exportStandardBitmap(context)
+            exportStandardBitmap(context, cancellation)
         }
     }
 
-    private fun exportNativeMp24(context: RawFusionExportContext): RawFusionProcessResult {
+    private fun exportNativeMp24(
+        context: RawFusionExportContext,
+        cancellation: KeplerPipelineCancellation
+    ): RawFusionProcessResult {
         val nativeRgbaFile = File(context.files.jobDir, "raw_fusion_24mp.rgba")
         val nativeMetadataFile = File(
             context.files.jobDir,
@@ -856,6 +907,8 @@ private object RawFusionExportCoordinator {
         val nativeIspStartedAt = System.currentTimeMillis()
         Log.i(RAW_PIPELINE_LOG_TAG, "NATIVE_ISP_STARTED jobDirAbsolutePath=${context.files.jobDir.absolutePath}")
         context.onStatus("Native RAW ISP 렌더링 중입니다.")
+        // Native ISP cannot stop mid-call; cancellation is checked at call boundaries.
+        cancellation.throwIfCancelled()
         val postprocessStatus = runCatching {
             NativeRawEngine.processRaw16ToRgbOutput(
                 mergedRawPath = context.files.mergedRawFile.absolutePath,
@@ -871,6 +924,7 @@ private object RawFusionExportCoordinator {
                 outputMetadataJsonPath = nativeMetadataFile.absolutePath
             )
         }.getOrElse { "ERROR: ${it.javaClass.simpleName}: ${it.message}" }
+        cancellation.throwIfCancelled()
         val expectedRgbaBytes = outputWidth.toLong() * outputHeight.toLong() * 4L
         val nativePostprocessUsed = postprocessStatus.startsWith("OK:") &&
             nativeRgbaFile.exists() &&
@@ -1013,7 +1067,10 @@ private object RawFusionExportCoordinator {
         )
     }
 
-    private fun exportStandardNativeRawIsp(context: RawFusionExportContext): RawFusionProcessResult {
+    private fun exportStandardNativeRawIsp(
+        context: RawFusionExportContext,
+        cancellation: KeplerPipelineCancellation
+    ): RawFusionProcessResult {
         val targetSize = chooseRawDemosaicTarget(
             context.sensor.width,
             context.sensor.height,
@@ -1043,6 +1100,8 @@ private object RawFusionExportCoordinator {
         val nativeIspStartedAt = System.currentTimeMillis()
         Log.i(RAW_PIPELINE_LOG_TAG, "NATIVE_ISP_STARTED jobDirAbsolutePath=${context.files.jobDir.absolutePath}")
         context.onStatus("Native RAW ISP 렌더링 중입니다.")
+        // Native ISP cannot stop mid-call; cancellation is checked at call boundaries.
+        cancellation.throwIfCancelled()
         val status = runCatching {
             NativeRawEngine.processRaw16ToRgbOutputV2(
                 mergedRawPath = context.files.mergedRawFile.absolutePath,
@@ -1061,6 +1120,7 @@ private object RawFusionExportCoordinator {
                 outputMergedLinearDebugRgbaPath = mergedLinearDebugRgbaFile.absolutePath
             )
         }.getOrElse { "ERROR: ${it.javaClass.simpleName}: ${it.message}" }
+        cancellation.throwIfCancelled()
         val expectedBytes = outputWidth.toLong() * outputHeight.toLong() * 4L
         val nativeOk = status.startsWith("OK:") &&
             nativeRgbaFile.exists() &&
@@ -1173,8 +1233,13 @@ private object RawFusionExportCoordinator {
         )
     }
 
-    private fun exportStandardBitmap(context: RawFusionExportContext): RawFusionProcessResult {
-        val nativeResult = exportStandardNativeRawIsp(context)
+    private fun exportStandardBitmap(
+        context: RawFusionExportContext,
+        cancellation: KeplerPipelineCancellation
+    ): RawFusionProcessResult {
+        cancellation.throwIfCancelled()
+        val nativeResult = exportStandardNativeRawIsp(context, cancellation)
+        cancellation.throwIfCancelled()
         if (nativeResult.success) return nativeResult
         if (!ENABLE_KOTLIN_RAW_RENDER_FALLBACK) return nativeResult
 
@@ -1491,11 +1556,14 @@ fun processRawFusionJob(
     context: Context,
     jobDir: File,
     saveNativeMp24DebugPng: Boolean = SAVE_NATIVE_MP24_DEBUG_PNG_DEFAULT,
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ): RawFusionProcessResult {
     val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
     return try {
+        cancellation.throwIfCancelled()
         val job = JSONObject(jobFile.readText())
+        cancellation.throwIfCancelled()
         val frames = job.getJSONArray("frames")
         val width = job.getInt("rawWidth")
         val height = job.getInt("rawHeight")
@@ -1515,12 +1583,14 @@ fun processRawFusionJob(
         jobFile.writeText(job.toString(2))
         val highResolutionRaw = pixelCountLong >= HIGH_RES_RAW_MIN_PIXELS
         val preparedFrames = prepareRawFusionFrames(jobDir, job, frames, pixelCount)
+        cancellation.throwIfCancelled()
         val frameInputs = preparedFrames.inputs
         val frameMeta = preparedFrames.metadata
         val requestedFrames = preparedFrames.requestedFrames
 
         onStatus("RAW 프레임을 정렬하는 중입니다.")
         val fallbackSample = if (needsRawBlackLevelFallback(job, frameMeta)) {
+            cancellation.throwIfCancelled()
             readRaw16(frameInputs.first().file, min(pixelCount, 4096))
         } else {
             null
@@ -1529,6 +1599,7 @@ fun processRawFusionJob(
         val blackLevel = blackLevelEstimate.value
         val cfa = job.optInt("cfaPattern", 0)
         val mergePreparation = prepareRawMergeInputs(jobDir, frameInputs)
+        cancellation.throwIfCancelled()
         val exposureScales = mergePreparation.exposureScales
         val frameWeights = mergePreparation.frameWeights
         val referenceSelection = chooseRawReferenceFrame(
@@ -1560,8 +1631,10 @@ fun processRawFusionJob(
             blackLevelEstimate = blackLevelEstimate,
             mergedRawFile = mergedRawFile,
             alignmentFile = alignmentFile,
+            cancellation = cancellation,
             onStatus = onStatus
         )
+        cancellation.throwIfCancelled()
         val classicMergedOk = classicMerge.success &&
             mergedRawFile.exists() &&
             mergedRawFile.length() >= pixelCount * 2L &&
@@ -1585,6 +1658,7 @@ fun processRawFusionJob(
         val outputMode = CaptureResolutionMode.entries.firstOrNull { it.name == job.optString("outputResolutionMode") }
             ?: CaptureResolutionMode.entries.firstOrNull { it.label == job.optString("resolutionMode") }
             ?: CaptureResolutionMode.MP12
+        cancellation.throwIfCancelled()
         val exportResult = RawFusionExportCoordinator.export(
             RawFusionExportContext(
                 files = files,
@@ -1607,8 +1681,10 @@ fun processRawFusionJob(
                 highResolutionRaw = highResolutionRaw,
                 saveNativeMp24DebugPng = saveNativeMp24DebugPng,
                 onStatus = onStatus
-            )
+            ),
+            cancellation
         )
+        cancellation.throwIfCancelled()
         runCatching {
             val updated = JSONObject(jobFile.readText())
             val pipelineStartedAt = updated.optLong("rawCaptureStartedAt", 0L)
@@ -1618,6 +1694,8 @@ fun processRawFusionJob(
             jobFile.writeText(updated.toString(2))
         }
         exportResult
+    } catch (ce: CancellationException) {
+        throw ce
     } catch (oom: OutOfMemoryError) {
         runCatching {
             val job = if (jobFile.exists()) JSONObject(jobFile.readText()) else JSONObject()

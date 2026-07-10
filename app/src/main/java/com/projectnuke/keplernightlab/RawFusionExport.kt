@@ -119,7 +119,8 @@ fun captureProcessExportRawNightFusion(
                     val process = processRawFusionJob(
                         context = context,
                         jobDir = jobDir,
-                        saveNativeMp24DebugPng = finalOutputFormat.isDebugPng && rawSpeedMode == RawSpeedMode.QUALITY
+                        saveNativeMp24DebugPng = finalOutputFormat.isDebugPng && rawSpeedMode == RawSpeedMode.QUALITY,
+                        cancellation = cancellation
                     ) { post(it) }
                     cancellation.throwIfCancelled()
                     if (!process.success || !process.hasExportableBitmapSource()) {

@@ -816,6 +816,13 @@ private class CameraPreviewController(
         characteristics: CameraCharacteristics,
         zoomRatio: Float
     ): Rect {
+        val usesControlZoomRatio =
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) != null
+        if (usesControlZoomRatio) {
+            return characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                ?: Rect(0, 0, 1, 1)
+        }
         return buildCenterCropRegion(characteristics, zoomRatio)
             ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
             ?: Rect(0, 0, 1, 1)

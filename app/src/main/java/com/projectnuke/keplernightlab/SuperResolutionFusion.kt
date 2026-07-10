@@ -82,6 +82,7 @@ data class SuperResolutionFusionRequest(
     val targetMegapixels: Double = targetPolicy.defaultTargetMegapixels,
     val maxFrames: Int = 6,
     val tileSinkFactory: ((File) -> SuperResolutionTileSink)? = null,
+    val cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     val status: (String) -> Unit
 )
 
@@ -177,6 +178,7 @@ private data class DecodedRegion(
 fun runSuperResolutionFusion(
     request: SuperResolutionFusionRequest
 ): SuperResolutionFusionResult {
+    request.cancellation.throwIfCancelled()
     require(request.targetPolicy.sourceMode == request.sourceMode) {
         "Target policy sourceMode must match request sourceMode."
     }
@@ -206,7 +208,9 @@ fun runSuperResolutionFusion(
     return try {
         val statusLabel = superResolutionStatusLabel(request)
         request.status("$statusLabel: aligning frames...")
+        request.cancellation.throwIfCancelled()
         val analyzedFrames = analyzeFrames(inputFiles)
+        request.cancellation.throwIfCancelled()
         if (analyzedFrames.isEmpty()) {
             return failedSuperResolutionResult(
                 request = request,
@@ -216,9 +220,11 @@ fun runSuperResolutionFusion(
         }
 
         val reference = chooseFirstSharpFrame(analyzedFrames)
+        request.cancellation.throwIfCancelled()
         val sourceMegapixels = megapixels(reference.sourceWidth, reference.sourceHeight)
         val resolvedTargetMegapixels = resolveTargetMegapixels(request, sourceMegapixels)
         shifts = estimateFrameShifts(analyzedFrames, reference)
+        request.cancellation.throwIfCancelled()
         val acceptedFrames = analyzedFrames.filter { frame ->
             shifts.firstOrNull { it.index == frame.index }?.accepted == true
         }
@@ -288,7 +294,8 @@ fun runSuperResolutionFusion(
             reference = reference,
             outputWidth = dimensions.first,
             outputHeight = dimensions.second,
-            sink = tileSink
+            sink = tileSink,
+            cancellation = request.cancellation
         )
         val actualOutputMegapixels = megapixels(dimensions.first, dimensions.second)
         val result = SuperResolutionFusionResult(
@@ -309,6 +316,8 @@ fun runSuperResolutionFusion(
         )
         writeSuperResolutionJob(request, result, "COMPLETE", null)
         result
+    } catch (ce: CancellationException) {
+        throw ce
     } catch (oom: OutOfMemoryError) {
         failedSuperResolutionResult(
             request = request,
@@ -387,6 +396,7 @@ fun captureProcessExportSuperResolutionFusion(
                             outputDir = outputDir,
                             sourceMode = SuperResolutionSourceMode.BINNED_12MP_YUV,
                             maxFrames = captureFrames,
+                            cancellation = cancellation,
                             status = { post(it) }
                         )
                     )
@@ -695,7 +705,8 @@ private fun fuseFramesTiled(
     reference: LumaFrame,
     outputWidth: Int,
     outputHeight: Int,
-    sink: SuperResolutionTileSink
+    sink: SuperResolutionTileSink,
+    cancellation: KeplerPipelineCancellation
 ): File {
     val scaleX = outputWidth.toFloat() / reference.sourceWidth
     val scaleY = outputHeight.toFloat() / reference.sourceHeight
@@ -706,8 +717,15 @@ private fun fuseFramesTiled(
         .maxOfOrNull { max(abs(it.dx), abs(it.dy)) }
         ?: 0f
     val sourceHalo = ceil(maximumAcceptedShift).toInt() + BILINEAR_HALO_RADIUS
-    val decoders = frames.associate { frame ->
-        frame.index to BitmapRegionDecoder.newInstance(frame.file.absolutePath, false)
+    val decoders = linkedMapOf<Int, BitmapRegionDecoder>()
+    try {
+        frames.forEach { frame ->
+            cancellation.throwIfCancelled()
+            decoders[frame.index] = BitmapRegionDecoder.newInstance(frame.file.absolutePath, false)
+        }
+    } catch (t: Throwable) {
+        decoders.values.forEach { runCatching { it.recycle() } }
+        throw t
     }
 
     var finished = false
@@ -716,9 +734,11 @@ private fun fuseFramesTiled(
         val orderedFrames = frames.sortedBy { if (it.index == reference.index) 0 else 1 }
         var tileY = 0
         while (tileY < outputHeight) {
+            cancellation.throwIfCancelled()
             val tileHeight = minOf(FUSION_TILE_HEIGHT, outputHeight - tileY)
             var tileX = 0
             while (tileX < outputWidth) {
+                cancellation.throwIfCancelled()
                 val tileWidth = minOf(FUSION_TILE_WIDTH, outputWidth - tileX)
                 val pixelCount = tileWidth * tileHeight
                 val accumR = FloatArray(pixelCount)
@@ -728,6 +748,7 @@ private fun fuseFramesTiled(
                 val referenceLuma = FloatArray(pixelCount)
 
                 orderedFrames.forEach { frame ->
+                    cancellation.throwIfCancelled()
                     val shift = shiftByIndex.getValue(frame.index)
                     val region = decodeTileRegion(
                         decoder = decoders.getValue(frame.index),
@@ -766,11 +787,13 @@ private fun fuseFramesTiled(
                     accumB = accumB,
                     weights = weights
                 )
+                cancellation.throwIfCancelled()
                 sink.writeTile(tileX, tileY, tileWidth, tileHeight, outputPixels)
                 tileX += tileWidth
             }
             tileY += tileHeight
         }
+        cancellation.throwIfCancelled()
         return sink.finish().also { finished = true }
     } finally {
         decoders.values.forEach { decoder -> runCatching { decoder.recycle() } }
