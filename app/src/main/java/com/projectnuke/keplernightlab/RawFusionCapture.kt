@@ -939,10 +939,12 @@ private object RawFusionExportCoordinator {
                 "nativePostprocessRgbaFile=${nativeRgbaFile.absolutePath}"
         )
         val nativePostprocessMetadata = if (nativePostprocessUsed) {
+            cancellation.throwIfCancelled()
             runCatching { JSONObject(nativeMetadataFile.readText()) }.getOrNull()
         } else {
             null
         }
+        cancellation.throwIfCancelled()
         if (!nativePostprocessUsed) {
             val failed = applyNativeMergeMetadata(
                 target = JSONObject(context.job.toString()),
@@ -1057,6 +1059,7 @@ private object RawFusionExportCoordinator {
             .put("sensorOrientation", context.job.opt("sensorOrientation") ?: JSONObject.NULL)
             .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
             .put("processedAt", System.currentTimeMillis())
+        cancellation.throwIfCancelled()
         context.files.jobFile.writeText(updated.toString(2))
         return RawFusionProcessResult(
             success = true,
@@ -1226,7 +1229,6 @@ private object RawFusionExportCoordinator {
             .put("processedAt", System.currentTimeMillis())
         cancellation.throwIfCancelled()
         context.files.jobFile.writeText(updated.toString(2))
-        cancellation.throwIfCancelled()
         return RawFusionProcessResult(
             success = true,
             mergedRawFile = context.files.mergedRawFile,
@@ -1246,8 +1248,8 @@ private object RawFusionExportCoordinator {
     ): RawFusionProcessResult {
         cancellation.throwIfCancelled()
         val nativeResult = exportStandardNativeRawIsp(context, cancellation)
-        cancellation.throwIfCancelled()
         if (nativeResult.success) return nativeResult
+        cancellation.throwIfCancelled()
         if (!ENABLE_KOTLIN_RAW_RENDER_FALLBACK) return nativeResult
 
         val previewFile = File(context.files.jobDir, "raw_fusion_preview.png")
@@ -1691,7 +1693,7 @@ fun processRawFusionJob(
             ),
             cancellation
         )
-        cancellation.throwIfCancelled()
+        if (!exportResult.success) cancellation.throwIfCancelled()
         runCatching {
             val updated = JSONObject(jobFile.readText())
             val pipelineStartedAt = updated.optLong("rawCaptureStartedAt", 0L)
@@ -1700,7 +1702,6 @@ fun processRawFusionJob(
             updated.put("totalPipelineMs", System.currentTimeMillis() - pipelineStartedAt)
             jobFile.writeText(updated.toString(2))
         }
-        cancellation.throwIfCancelled()
         exportResult
     } catch (ce: CancellationException) {
         throw ce
