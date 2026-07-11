@@ -930,6 +930,7 @@ private object RawFusionExportCoordinator {
             nativeRgbaFile.exists() &&
             nativeRgbaFile.length() == expectedRgbaBytes &&
             nativeMetadataFile.exists()
+        cancellation.throwIfCancelled()
         val nativeIspRenderMs = System.currentTimeMillis() - nativeIspStartedAt
         Log.i(RAW_PIPELINE_LOG_TAG, "NATIVE_ISP_COMPLETE jobDirAbsolutePath=${context.files.jobDir.absolutePath} nativeIspRenderMs=$nativeIspRenderMs")
         Log.i(
@@ -974,8 +975,11 @@ private object RawFusionExportCoordinator {
             var nativeBitmap: Bitmap? = null
             try {
                 context.onStatus("결과를 저장하는 중입니다.")
+                cancellation.throwIfCancelled()
                 nativeBitmap = loadRawRgbaBitmap(nativeRgbaFile, outputWidth, outputHeight)
+                cancellation.throwIfCancelled()
                 saveRawFusionPng(nativeBitmap, finalFile)
+                cancellation.throwIfCancelled()
                 nativeMp24DebugPngWritten = true
             } finally {
                 nativeBitmap?.takeUnless { it.isRecycled }?.recycle()
@@ -1152,6 +1156,7 @@ private object RawFusionExportCoordinator {
             context.onStatus("PIPELINE_FAILED: Native RAW ISP failed; RAW cache kept. $status")
             return RawFusionProcessResult(false, context.files.mergedRawFile, null, null, null, "Native RAW ISP failed: $status")
         }
+        cancellation.throwIfCancelled()
         val debug = runCatching { JSONObject(renderDebugFile.readText()) }.getOrNull()
         val nativeWarnings = debug?.optJSONArray("renderWarnings") ?: JSONArray()
         Log.i(
@@ -1219,7 +1224,9 @@ private object RawFusionExportCoordinator {
             .put("sensorOrientation", context.job.opt("sensorOrientation") ?: JSONObject.NULL)
             .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
             .put("processedAt", System.currentTimeMillis())
+        cancellation.throwIfCancelled()
         context.files.jobFile.writeText(updated.toString(2))
+        cancellation.throwIfCancelled()
         return RawFusionProcessResult(
             success = true,
             mergedRawFile = context.files.mergedRawFile,

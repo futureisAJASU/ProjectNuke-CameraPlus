@@ -111,7 +111,7 @@ internal fun runClassicRawFusionMerge(
         frames.toList().forEach { frame ->
             try {
                 cancellation.throwIfCancelled()
-                frame.proxy = buildRawProxy(frame.input.file, sensor, blackLevelEstimate)
+                frame.proxy = buildRawProxy(frame.input.file, sensor, blackLevelEstimate, cancellation)
             } catch (oom: OutOfMemoryError) {
                 throw oom
             } catch (ce: CancellationException) {
@@ -221,7 +221,7 @@ internal fun runClassicRawFusionMerge(
         alignmentFile.writeText(debug.toString(2))
         cancellation.throwIfCancelled()
         // Debug preview generation is optional; cancellation is checked around it.
-        writeRawFusionDebugPreviews(jobDir, reference, mergedRawFile, sensor, blackLevelEstimate, job)
+        writeRawFusionDebugPreviews(jobDir, reference, mergedRawFile, sensor, blackLevelEstimate, job, cancellation)
         cancellation.throwIfCancelled()
 
         job.put("rawFusionEngine", "classic_raw_v1")
@@ -306,7 +306,8 @@ private data class RawMergeStats(
 private fun buildRawProxy(
     file: File,
     sensor: RawFusionSensorData,
-    blackLevelEstimate: BlackLevelEstimate
+    blackLevelEstimate: BlackLevelEstimate,
+    cancellation: KeplerPipelineCancellation
 ): RawProxy {
     val step = generateSequence(1) { it * 2 }
         .first { max(sensor.width / it, sensor.height / it) <= CLASSIC_RAW_PROXY_MAX_DIMENSION }
@@ -314,10 +315,12 @@ private fun buildRawProxy(
     val proxyHeight = max(1, sensor.height / step)
     val luma = ByteArray(proxyWidth * proxyHeight)
     val row = ShortArray(sensor.width)
+    cancellation.throwIfCancelled()
     RandomAccessFile(file, "r").use { input ->
         var out = 0
         var y = 0
         while (y < sensor.height && out < luma.size) {
+            if ((y and (step * 31)) == 0) cancellation.throwIfCancelled()
             readRawRow(input, sensor.width, y, row)
             var x = greenAlignedRawX(sensor.cfa, y, 0)
             var col = 0
@@ -335,6 +338,7 @@ private fun buildRawProxy(
             y += step
         }
     }
+    cancellation.throwIfCancelled()
     val mean = luma.fold(0L) { sum, value -> sum + (value.toInt() and 0xFF) }
         .toFloat() / luma.size.coerceAtLeast(1)
     return RawProxy(proxyWidth, proxyHeight, step, luma, mean)
@@ -663,33 +667,50 @@ private fun writeRawFusionDebugPreviews(
     mergedRawFile: File,
     sensor: RawFusionSensorData,
     blackLevelEstimate: BlackLevelEstimate,
-    job: JSONObject
+    job: JSONObject,
+    cancellation: KeplerPipelineCancellation
 ) {
-    runCatching {
+    var refBitmap: Bitmap? = null
+    var fusedBitmap: Bitmap? = null
+    var referenceBitmap: Bitmap? = null
+    var compare: Bitmap? = null
+    try {
+        cancellation.throwIfCancelled()
         val refProxy = requireNotNull(reference.proxy)
-        val refBitmap = rawProxyToBitmap(refProxy)
-        saveClassicRawPng(refBitmap, File(jobDir, "raw_reference_preview.png"))
-        refBitmap.recycle()
-        val mergedProxy = buildRawProxy(mergedRawFile, sensor, BlackLevelEstimate(0, "merged_raw_zero"))
-        val fusedBitmap = rawProxyToBitmap(mergedProxy)
-        saveClassicRawPng(fusedBitmap, File(jobDir, "raw_fused_classic_v1_preview.png"))
-        val compare = Bitmap.createBitmap(fusedBitmap.width * 2, fusedBitmap.height, Bitmap.Config.ARGB_8888)
-        val referenceBitmap = rawProxyToBitmap(refProxy)
-        val canvas = android.graphics.Canvas(compare)
-        canvas.drawBitmap(referenceBitmap, 0f, 0f, null)
-        canvas.drawBitmap(fusedBitmap, fusedBitmap.width.toFloat(), 0f, null)
-        saveClassicRawPng(compare, File(jobDir, "raw_compare_reference_vs_fused.png"))
-        referenceBitmap.recycle()
-        compare.recycle()
-        fusedBitmap.recycle()
+        refBitmap = rawProxyToBitmap(refProxy)
+        saveClassicRawPng(refBitmap!!, File(jobDir, "raw_reference_preview.png"))
+        val mergedProxy = buildRawProxy(
+            mergedRawFile,
+            sensor,
+            BlackLevelEstimate(0, "merged_raw_zero"),
+            cancellation
+        )
+        cancellation.throwIfCancelled()
+        fusedBitmap = rawProxyToBitmap(mergedProxy)
+        saveClassicRawPng(fusedBitmap!!, File(jobDir, "raw_fused_classic_v1_preview.png"))
+        cancellation.throwIfCancelled()
+        compare = Bitmap.createBitmap(fusedBitmap.width * 2, fusedBitmap.height, Bitmap.Config.ARGB_8888)
+        referenceBitmap = rawProxyToBitmap(refProxy)
+        val canvas = android.graphics.Canvas(compare!!)
+        canvas.drawBitmap(referenceBitmap!!, 0f, 0f, null)
+        canvas.drawBitmap(fusedBitmap!!, fusedBitmap!!.width.toFloat(), 0f, null)
+        saveClassicRawPng(compare!!, File(jobDir, "raw_compare_reference_vs_fused.png"))
+        cancellation.throwIfCancelled()
         job.put("rawReferencePreviewFile", "raw_reference_preview.png")
             .put("rawFusedPreviewFile", "raw_fused_classic_v1_preview.png")
             .put("rawComparePreviewFile", "raw_compare_reference_vs_fused.png")
             .put("rawDebugArtifactStatus", "COMPLETE")
             .remove("rawDebugArtifactError")
-    }.onFailure { error ->
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (error: Exception) {
         job.put("rawDebugArtifactStatus", "FAILED")
             .put("rawDebugArtifactError", "${error.javaClass.simpleName}: ${error.message}".take(240))
+    } finally {
+        refBitmap?.takeUnless { it.isRecycled }?.recycle()
+        fusedBitmap?.takeUnless { it.isRecycled }?.recycle()
+        referenceBitmap?.takeUnless { it.isRecycled }?.recycle()
+        compare?.takeUnless { it.isRecycled }?.recycle()
     }
 }
 
