@@ -179,6 +179,7 @@ fun runSuperResolutionFusion(
     request: SuperResolutionFusionRequest
 ): SuperResolutionFusionResult {
     request.cancellation.throwIfCancelled()
+    request.cancellation.throwIfCancelled()
     require(request.targetPolicy.sourceMode == request.sourceMode) {
         "Target policy sourceMode must match request sourceMode."
     }
@@ -209,7 +210,7 @@ fun runSuperResolutionFusion(
         val statusLabel = superResolutionStatusLabel(request)
         request.status("$statusLabel: aligning frames...")
         request.cancellation.throwIfCancelled()
-        val analyzedFrames = analyzeFrames(inputFiles)
+        val analyzedFrames = analyzeFrames(inputFiles, request.cancellation)
         request.cancellation.throwIfCancelled()
         if (analyzedFrames.isEmpty()) {
             return failedSuperResolutionResult(
@@ -223,7 +224,7 @@ fun runSuperResolutionFusion(
         request.cancellation.throwIfCancelled()
         val sourceMegapixels = megapixels(reference.sourceWidth, reference.sourceHeight)
         val resolvedTargetMegapixels = resolveTargetMegapixels(request, sourceMegapixels)
-        shifts = estimateFrameShifts(analyzedFrames, reference)
+        shifts = estimateFrameShifts(analyzedFrames, reference, request.cancellation)
         request.cancellation.throwIfCancelled()
         val acceptedFrames = analyzedFrames.filter { frame ->
             shifts.firstOrNull { it.index == frame.index }?.accepted == true
@@ -484,10 +485,15 @@ fun captureProcessExportSuperResolutionFusion(
     )
 }
 
-private fun analyzeFrames(files: List<File>): List<LumaFrame> {
+private fun analyzeFrames(
+    files: List<File>,
+    cancellation: KeplerPipelineCancellation
+): List<LumaFrame> {
     val bounds = files.mapIndexedNotNull { index, file ->
+        cancellation.throwIfCancelled()
         val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.absolutePath, options)
+        cancellation.throwIfCancelled()
         if (options.outWidth > 0 && options.outHeight > 0) {
             Triple(index, options.outWidth, options.outHeight)
         } else {
@@ -499,6 +505,7 @@ private fun analyzeFrames(files: List<File>): List<LumaFrame> {
     val proxyHeight = max(1, (first.third * (proxyWidth.toDouble() / first.second)).roundToInt())
 
     return bounds.mapNotNull { (index, width, height) ->
+        cancellation.throwIfCancelled()
         if (width != first.second || height != first.third) return@mapNotNull null
         decodeLumaFrame(
             index = index,
@@ -506,7 +513,8 @@ private fun analyzeFrames(files: List<File>): List<LumaFrame> {
             sourceWidth = width,
             sourceHeight = height,
             proxyWidth = proxyWidth,
-            proxyHeight = proxyHeight
+            proxyHeight = proxyHeight,
+            cancellation = cancellation
         )
     }
 }
@@ -517,10 +525,12 @@ private fun decodeLumaFrame(
     sourceWidth: Int,
     sourceHeight: Int,
     proxyWidth: Int,
-    proxyHeight: Int
+    proxyHeight: Int,
+    cancellation: KeplerPipelineCancellation
 ): LumaFrame? {
     var sampleSize = 1
     while (sourceWidth / (sampleSize * 2) >= proxyWidth) sampleSize *= 2
+    cancellation.throwIfCancelled()
     val decoded = BitmapFactory.decodeFile(
         file.absolutePath,
         BitmapFactory.Options().apply {
@@ -528,6 +538,7 @@ private fun decodeLumaFrame(
             inPreferredConfig = Bitmap.Config.ARGB_8888
         }
     ) ?: return null
+    cancellation.throwIfCancelled()
     val proxy = if (decoded.width == proxyWidth && decoded.height == proxyHeight) {
         decoded
     } else {
@@ -540,6 +551,7 @@ private fun decodeLumaFrame(
         proxy.getPixels(pixels, 0, proxyWidth, 0, 0, proxyWidth, proxyHeight)
         val luma = ByteArray(pixels.size)
         pixels.forEachIndexed { pixelIndex, color ->
+            if ((pixelIndex and 4095) == 0) cancellation.throwIfCancelled()
             luma[pixelIndex] = rgbLuma(
                 color shr 16 and 0xff,
                 color shr 8 and 0xff,
@@ -554,7 +566,10 @@ private fun decodeLumaFrame(
             proxyWidth = proxyWidth,
             proxyHeight = proxyHeight,
             luma = luma,
-            sharpness = calculateSharpness(luma, proxyWidth, proxyHeight)
+            sharpness = run {
+                cancellation.throwIfCancelled()
+                calculateSharpness(luma, proxyWidth, proxyHeight)
+            }
         )
     } finally {
         proxy.recycle()
@@ -583,15 +598,17 @@ private fun chooseFirstSharpFrame(frames: List<LumaFrame>): LumaFrame {
 
 private fun estimateFrameShifts(
     frames: List<LumaFrame>,
-    reference: LumaFrame
+    reference: LumaFrame,
+    cancellation: KeplerPipelineCancellation
 ): List<FrameShift> {
     val proxyToSourceX = reference.sourceWidth.toFloat() / reference.proxyWidth
     val proxyToSourceY = reference.sourceHeight.toFloat() / reference.proxyHeight
     return frames.map { frame ->
+        cancellation.throwIfCancelled()
         if (frame.index == reference.index) {
             FrameShift(frame.index, 0f, 0f, 0f, true)
         } else {
-            val estimate = estimateTranslation(reference, frame)
+            val estimate = estimateTranslation(reference, frame, cancellation)
             val dx = estimate.dx * proxyToSourceX
             val dy = estimate.dy * proxyToSourceY
             val maxSourceShift = max(reference.sourceWidth, reference.sourceHeight) * 0.07f
@@ -608,13 +625,18 @@ private fun estimateFrameShifts(
     }
 }
 
-private fun estimateTranslation(reference: LumaFrame, frame: LumaFrame): AlignmentEstimate {
+private fun estimateTranslation(
+    reference: LumaFrame,
+    frame: LumaFrame,
+    cancellation: KeplerPipelineCancellation
+): AlignmentEstimate {
     var bestDx = 0
     var bestDy = 0
     var bestScore = Float.MAX_VALUE
     for (dy in -ALIGNMENT_SEARCH_RADIUS..ALIGNMENT_SEARCH_RADIUS step 2) {
+        cancellation.throwIfCancelled()
         for (dx in -ALIGNMENT_SEARCH_RADIUS..ALIGNMENT_SEARCH_RADIUS step 2) {
-            val score = alignmentSad(reference, frame, dx, dy, 4)
+            val score = alignmentSad(reference, frame, dx, dy, 4, cancellation)
             if (score < bestScore) {
                 bestScore = score
                 bestDx = dx
@@ -623,8 +645,9 @@ private fun estimateTranslation(reference: LumaFrame, frame: LumaFrame): Alignme
         }
     }
     for (dy in bestDy - 2..bestDy + 2) {
+        cancellation.throwIfCancelled()
         for (dx in bestDx - 2..bestDx + 2) {
-            val score = alignmentSad(reference, frame, dx, dy, 2)
+            val score = alignmentSad(reference, frame, dx, dy, 2, cancellation)
             if (score < bestScore) {
                 bestScore = score
                 bestDx = dx
@@ -633,11 +656,11 @@ private fun estimateTranslation(reference: LumaFrame, frame: LumaFrame): Alignme
         }
     }
 
-    val center = alignmentSad(reference, frame, bestDx, bestDy, 2)
-    val left = alignmentSad(reference, frame, bestDx - 1, bestDy, 2)
-    val right = alignmentSad(reference, frame, bestDx + 1, bestDy, 2)
-    val up = alignmentSad(reference, frame, bestDx, bestDy - 1, 2)
-    val down = alignmentSad(reference, frame, bestDx, bestDy + 1, 2)
+    val center = alignmentSad(reference, frame, bestDx, bestDy, 2, cancellation)
+    val left = alignmentSad(reference, frame, bestDx - 1, bestDy, 2, cancellation)
+    val right = alignmentSad(reference, frame, bestDx + 1, bestDy, 2, cancellation)
+    val up = alignmentSad(reference, frame, bestDx, bestDy - 1, 2, cancellation)
+    val down = alignmentSad(reference, frame, bestDx, bestDy + 1, 2, cancellation)
     return AlignmentEstimate(
         dx = bestDx + parabolicOffset(left, center, right),
         dy = bestDy + parabolicOffset(up, center, down),
@@ -650,7 +673,8 @@ private fun alignmentSad(
     frame: LumaFrame,
     dx: Int,
     dy: Int,
-    stride: Int
+    stride: Int,
+    cancellation: KeplerPipelineCancellation
 ): Float {
     val width = reference.proxyWidth
     val height = reference.proxyHeight
@@ -665,6 +689,7 @@ private fun alignmentSad(
     var sum = 0L
     var count = 0
     for (y in startY until endY step stride) {
+        if ((y and 31) == 0) cancellation.throwIfCancelled()
         val referenceRow = y * width
         val frameRow = (y + dy) * width
         for (x in startX until endX step stride) {
@@ -718,19 +743,13 @@ private fun fuseFramesTiled(
         ?: 0f
     val sourceHalo = ceil(maximumAcceptedShift).toInt() + BILINEAR_HALO_RADIUS
     val decoders = linkedMapOf<Int, BitmapRegionDecoder>()
+    var finished = false
     try {
         frames.forEach { frame ->
             cancellation.throwIfCancelled()
             decoders[frame.index] = BitmapRegionDecoder.newInstance(frame.file.absolutePath, false)
         }
-    } catch (t: Throwable) {
-        decoders.values.forEach { runCatching { it.recycle() } }
-        throw t
-    }
-
-    var finished = false
-    sink.begin(outputWidth, outputHeight)
-    try {
+        sink.begin(outputWidth, outputHeight)
         val orderedFrames = frames.sortedBy { if (it.index == reference.index) 0 else 1 }
         var tileY = 0
         while (tileY < outputHeight) {
@@ -949,7 +968,10 @@ private fun bilinearChannel(
     return (top * (1f - fy) + bottom * fy).roundToInt().coerceIn(0, 255)
 }
 
-private fun applyMildUnsharpInPlace(bitmap: Bitmap) {
+private fun applyMildUnsharpInPlace(
+    bitmap: Bitmap,
+    cancellation: KeplerPipelineCancellation
+) {
     if (bitmap.width < 3 || bitmap.height < 3) return
     val width = bitmap.width
     var previous = IntArray(width)
@@ -959,6 +981,7 @@ private fun applyMildUnsharpInPlace(bitmap: Bitmap) {
     bitmap.getPixels(next, 0, width, 0, 1, width, 1)
 
     for (y in 0 until bitmap.height) {
+        if ((y and 31) == 0) cancellation.throwIfCancelled()
         val following = if (y + 1 < bitmap.height) next else current
         val output = current.copyOf()
         if (y in 1 until bitmap.height - 1) {
@@ -1019,6 +1042,7 @@ private fun runSingleFrameFallback(
         )
     }
     request.status("${superResolutionStatusLabel(request)}: writing output...")
+    request.cancellation.throwIfCancelled()
     val source = BitmapFactory.decodeFile(reference.file.absolutePath)
         ?: return failedSuperResolutionResult(
             request,
@@ -1026,20 +1050,25 @@ private fun runSingleFrameFallback(
             "Fallback reference decode failed.",
             shifts
         )
-    val output = Bitmap.createScaledBitmap(source, targetWidth, targetHeight, true)
-    if (output !== source) source.recycle()
+    request.cancellation.throwIfCancelled()
+    var output: Bitmap? = null
     return try {
-        applyMildUnsharpInPlace(output)
+        request.cancellation.throwIfCancelled()
+        output = Bitmap.createScaledBitmap(source, targetWidth, targetHeight, true)
+        request.cancellation.throwIfCancelled()
+        applyMildUnsharpInPlace(output!!, request.cancellation)
         val outputFile = File(
             request.outputDir,
             superResolutionOutputFileName(targetMegapixels)
         )
-        saveJpeg(output, outputFile)
-        val actualOutputMegapixels = megapixels(output.width, output.height)
+        request.cancellation.throwIfCancelled()
+        saveJpeg(output!!, outputFile)
+        request.cancellation.throwIfCancelled()
+        val actualOutputMegapixels = megapixels(output!!.width, output!!.height)
         val result = SuperResolutionFusionResult(
             outputFile = outputFile,
-            outputWidth = output.width,
-            outputHeight = output.height,
+            outputWidth = output!!.width,
+            outputHeight = output!!.height,
             inputFrameCount = request.inputFrameFiles.size,
             usedFrameCount = 1,
             fallbackUsed = true,
@@ -1052,10 +1081,12 @@ private fun runSingleFrameFallback(
             rawInputUsed = request.sourceMode == SuperResolutionSourceMode.FULLRES_50MP_RAW,
             message = reason
         )
+        request.cancellation.throwIfCancelled()
         writeSuperResolutionJob(request, result, "COMPLETE", reason)
         result
     } finally {
-        output.recycle()
+        output?.takeUnless { it.isRecycled }?.recycle()
+        if (output !== source) source.takeUnless { it.isRecycled }?.recycle()
     }
 }
 
