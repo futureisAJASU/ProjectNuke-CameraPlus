@@ -578,7 +578,7 @@ fun captureSingleRawDng(
             ?.maxByOrNull { it.width * it.height }
 
         if (rawSize == null) {
-            postStatus("RAW_SENSOR 출력 크기를 찾지 못함")
+            postStatus("PIPELINE_FAILED: RAW_SENSOR 출력 크기를 찾지 못함")
             cleanup()
             return
         }
@@ -613,7 +613,7 @@ fun captureSingleRawDng(
                 try {
                     val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
                     if (picturesDir == null) {
-                        postStatus("DNG 저장 실패: Pictures 폴더가 null임")
+                        postStatus("PIPELINE_FAILED: DNG 저장 실패: Pictures 폴더가 null임")
                         return
                     }
 

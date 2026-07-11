@@ -1493,9 +1493,9 @@ fun CaptureProgressRow(
         CaptureStage.VERIFYING -> "결과를 저장하는 중입니다."
         CaptureStage.CLEANING -> "결과를 저장하는 중입니다."
         CaptureStage.COMPLETE -> "처리가 완료되었습니다."
-        CaptureStage.FAILED -> "Failed"
-        CaptureStage.CANCELLED -> "Cancelled"
-        CaptureStage.TIMEOUT -> "Timeout"
+        CaptureStage.FAILED -> "처리하지 못했습니다."
+        CaptureStage.CANCELLED -> "취소되었습니다."
+        CaptureStage.TIMEOUT -> "처리 시간이 초과되었습니다."
     }
     val frameText = if (captureProgress.requestedFrames > 0) {
         "${captureProgress.savedFrames} / ${captureProgress.requestedFrames}"
