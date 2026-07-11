@@ -10,6 +10,8 @@ class CaptureProgressTest {
         listOf(
             "CAPTURE_COMPLETE: capture stage complete",
             "CAPTURE_COMPLETE_PARTIAL: saved 3/6",
+            "캡처가 완료되었습니다.",
+            "처리가 완료되었습니다.",
             "YUV Fusion V2 failed; falling back to classic V1",
             "YUV Fusion V2 dry-run failed; falling back to classic V1",
             "Motion 저장 실패, 컬러 프레임은 유지",
@@ -53,5 +55,15 @@ class CaptureProgressTest {
             "PROCESS_FAILED: merge failed",
             "EXPORT_FAILED: verification failed"
         ).forEach { assertTrue(it, parseCaptureProgress(it, fallback).stage == CaptureStage.FAILED) }
+    }
+
+    @Test
+    fun cancellationParsesAsTerminalCancelled() {
+        val parsed = parseCaptureProgress(
+            "PIPELINE_CANCELLED: user cancelled",
+            CaptureProgressState(stage = CaptureStage.PROCESSING)
+        )
+        assertTrue(parsed.stage == CaptureStage.CANCELLED)
+        assertTrue(parsed.progressPercent == 1f)
     }
 }

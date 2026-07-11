@@ -1693,6 +1693,7 @@ fun processRawFusionJob(
             updated.put("totalPipelineMs", System.currentTimeMillis() - pipelineStartedAt)
             jobFile.writeText(updated.toString(2))
         }
+        cancellation.throwIfCancelled()
         exportResult
     } catch (ce: CancellationException) {
         throw ce

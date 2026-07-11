@@ -114,6 +114,8 @@ internal fun runClassicRawFusionMerge(
                 frame.proxy = buildRawProxy(frame.input.file, sensor, blackLevelEstimate)
             } catch (oom: OutOfMemoryError) {
                 throw oom
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: Exception) {
                 frame.skipReason = "${e.javaClass.simpleName}: ${e.message}"
                 frames.remove(frame)
@@ -187,6 +189,7 @@ internal fun runClassicRawFusionMerge(
             cancellation = cancellation,
             onStatus = onStatus
         )
+        cancellation.throwIfCancelled()
         val nativeMergeMs = System.currentTimeMillis() - mergeStartedAt
         Log.i("KeplerRawPipeline", "MERGE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} nativeMergeMs=$nativeMergeMs")
         onStatus("Native RAW ISP 렌더링 중입니다.")
@@ -214,8 +217,12 @@ internal fun runClassicRawFusionMerge(
             .put("mergeWeightMapFile", JSONObject.NULL)
             .put("mergeRejectMapAvailable", false)
             .put("mergeRejectMapFile", JSONObject.NULL)
+        cancellation.throwIfCancelled()
         alignmentFile.writeText(debug.toString(2))
+        cancellation.throwIfCancelled()
+        // Debug preview generation is optional; cancellation is checked around it.
         writeRawFusionDebugPreviews(jobDir, reference, mergedRawFile, sensor, blackLevelEstimate, job)
+        cancellation.throwIfCancelled()
 
         job.put("rawFusionEngine", "classic_raw_v1")
             .put("rawFusionVersion", CLASSIC_RAW_FUSION_VERSION)
@@ -462,7 +469,7 @@ private fun mergeClassicRawTiles(
     var downweighted = 0L
     var compared = 0L
     val whiteRange = (sensor.whiteLevel - sensor.blackLevel).coerceAtLeast(1)
-    val frameInputs = frames.associateWith { RandomAccessFile(it.input.file, "r") }
+    val frameInputs = linkedMapOf<ClassicRawFrame, RandomAccessFile>()
     val sourceRows = frames.associateWith { ShortArray(sensor.width) }
     val refRows = Array(CLASSIC_RAW_TILE_ROWS) { ShortArray(sensor.width) }
     val acc = FloatArray(sensor.width * CLASSIC_RAW_TILE_ROWS)
@@ -470,6 +477,10 @@ private fun mergeClassicRawTiles(
     val outRow = ByteArray(sensor.width * 2)
 
     try {
+        frames.forEach { frame ->
+            cancellation.throwIfCancelled()
+            frameInputs[frame] = RandomAccessFile(frame.input.file, "r")
+        }
         BufferedOutputStream(FileOutputStream(mergedRawFile)).use { output ->
             var tileTop = 0
             while (tileTop < sensor.height) {
