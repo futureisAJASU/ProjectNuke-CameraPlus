@@ -176,6 +176,7 @@ fun parseCaptureProgress(
                 normalized.startsWith("CAPTURE_FAILED", ignoreCase = true) ||
                 normalized.startsWith("PROCESS_FAILED", ignoreCase = true) ||
                 normalized.startsWith("EXPORT_FAILED", ignoreCase = true) -> CaptureStage.FAILED
+        normalized.startsWith("PIPELINE_CANCELLED", ignoreCase = true) -> CaptureStage.CANCELLED
         normalized.startsWith("PIPELINE_COMPLETE", ignoreCase = true) ||
                 normalized.startsWith("EXPORT_COMPLETE", ignoreCase = true) -> CaptureStage.COMPLETE
         lower.contains("cleanup") || lower.contains("cleaning") -> CaptureStage.CLEANING
@@ -235,6 +236,7 @@ fun parseCaptureProgress(
         CaptureStage.CLEANING -> 0.97f
         CaptureStage.COMPLETE,
         CaptureStage.FAILED,
+        CaptureStage.CANCELLED,
         CaptureStage.TIMEOUT -> 1f
     }.coerceIn(0f, 1f)
 
@@ -1492,6 +1494,7 @@ fun CaptureProgressRow(
         CaptureStage.CLEANING -> "결과를 저장하는 중입니다."
         CaptureStage.COMPLETE -> "처리가 완료되었습니다."
         CaptureStage.FAILED -> "Failed"
+        CaptureStage.CANCELLED -> "Cancelled"
         CaptureStage.TIMEOUT -> "Timeout"
     }
     val frameText = if (captureProgress.requestedFrames > 0) {

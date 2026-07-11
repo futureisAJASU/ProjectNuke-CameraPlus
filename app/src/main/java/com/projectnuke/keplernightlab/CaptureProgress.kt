@@ -11,6 +11,7 @@ enum class CaptureStage {
     CLEANING,
     COMPLETE,
     FAILED,
+    CANCELLED,
     TIMEOUT
 }
 

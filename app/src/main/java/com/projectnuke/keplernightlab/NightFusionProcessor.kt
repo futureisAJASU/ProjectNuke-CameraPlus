@@ -81,7 +81,7 @@ fun processLatestNightFusionV02(
         try {
             jobDir = findLatestColorBurstJobDir(context)
                 ?: run {
-                    postStatus("YUV Night Fusion failed: no YUV fusion job found.")
+                    postStatus("PIPELINE_FAILED: No YUV fusion job found.")
                     return@post
                 }
             processNightFusionJobV02Sync(jobDir, onStatus = { postStatus(it) })

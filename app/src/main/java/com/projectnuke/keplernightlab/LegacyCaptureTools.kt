@@ -926,7 +926,6 @@ fun captureRawBurstDng(
             }
 
             if (savedFrames >= frameCount) {
-                successfulCompletion = true
                 writeBurstJobJson(
                     jobFile = jobFile,
                     status = "CAPTURE_COMPLETE",
@@ -937,6 +936,7 @@ fun captureRawBurstDng(
                     savedFrames = savedFrames,
                     frameFiles = savedFrameFiles
                 )
+                successfulCompletion = true
 
                 finish(
                     "RAW Burst 저장 완료\n" +
