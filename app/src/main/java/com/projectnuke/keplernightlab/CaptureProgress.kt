@@ -25,14 +25,17 @@ data class CaptureProgressState(
 )
 
 fun isCaptureStageCompleteButPipelineStillRunning(status: String): Boolean {
-    return status.contains("CAPTURE_COMPLETE", ignoreCase = true) &&
-        !status.contains("PIPELINE_COMPLETE", ignoreCase = true)
+    val normalized = status.trimStart()
+    return (normalized.startsWith("CAPTURE_COMPLETE", ignoreCase = true) ||
+        normalized.startsWith("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true)) &&
+        !normalized.startsWith("PIPELINE_COMPLETE", ignoreCase = true)
 }
 
 fun isTerminalStatus(status: String): Boolean {
-    if (status.contains("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true)) return false
-    if (status.contains("CAPTURE_COMPLETE", ignoreCase = true)) return false
-    if (status.contains("RAW capture sequence done", ignoreCase = true)) return false
+    val normalized = status.trimStart()
+    if (normalized.startsWith("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true)) return false
+    if (normalized.startsWith("CAPTURE_COMPLETE", ignoreCase = true)) return false
+    if (normalized.startsWith("RAW capture sequence done", ignoreCase = true)) return false
 
     val terminalPrefixes = listOf(
         "PIPELINE_COMPLETE",
@@ -43,7 +46,8 @@ fun isTerminalStatus(status: String): Boolean {
         "EXPORT_FAILED",
         "CAPTURE_TIMEOUT",
         "PROCESS_TIMEOUT",
-        "EXPORT_TIMEOUT"
+        "EXPORT_TIMEOUT",
+        "PIPELINE_CANCELLED"
     )
-    return terminalPrefixes.any { status.trimStart().startsWith(it, ignoreCase = true) }
+    return terminalPrefixes.any { normalized.startsWith(it, ignoreCase = true) }
 }

@@ -167,27 +167,24 @@ fun parseCaptureProgress(
     fallback: CaptureProgressState
 ): CaptureProgressState {
     val lower = text.lowercase()
+    val normalized = text.trimStart()
     val stage = when {
-        text.contains("CAPTURE_TIMEOUT", ignoreCase = true) ||
-                text.contains("PROCESS_TIMEOUT", ignoreCase = true) ||
-                text.contains("EXPORT_TIMEOUT", ignoreCase = true) ||
-                lower.contains("timeout") -> CaptureStage.TIMEOUT
-        text.contains("PIPELINE_FAILED", ignoreCase = true) ||
-                lower.contains("failed") ||
-                text.contains("실패") ||
-                text.contains("오류") -> CaptureStage.FAILED
-        text.contains("PIPELINE_COMPLETE", ignoreCase = true) ||
-                text.contains("EXPORT_COMPLETE", ignoreCase = true) ||
-                text.contains("최종 완료") ||
-                text.contains("내보내기 완료") ||
-                lower.contains("saved to gallery") -> CaptureStage.COMPLETE
+        normalized.startsWith("CAPTURE_TIMEOUT", ignoreCase = true) ||
+                normalized.startsWith("PROCESS_TIMEOUT", ignoreCase = true) ||
+                normalized.startsWith("EXPORT_TIMEOUT", ignoreCase = true) -> CaptureStage.TIMEOUT
+        normalized.startsWith("PIPELINE_FAILED", ignoreCase = true) ||
+                normalized.startsWith("CAPTURE_FAILED", ignoreCase = true) ||
+                normalized.startsWith("PROCESS_FAILED", ignoreCase = true) ||
+                normalized.startsWith("EXPORT_FAILED", ignoreCase = true) -> CaptureStage.FAILED
+        normalized.startsWith("PIPELINE_COMPLETE", ignoreCase = true) ||
+                normalized.startsWith("EXPORT_COMPLETE", ignoreCase = true) -> CaptureStage.COMPLETE
         lower.contains("cleanup") || lower.contains("cleaning") -> CaptureStage.CLEANING
         lower.contains("verifying") || lower.contains("verification") -> CaptureStage.VERIFYING
         text.contains("결과 미리보기") ||
                 lower.contains("exporting") || lower.contains("export ") || lower.contains("tone/export") -> CaptureStage.EXPORTING
         lower.contains("demosaic") || text.contains("렌더링") -> CaptureStage.DEMOSAICING
-        text.contains("CAPTURE_COMPLETE", ignoreCase = true) ||
-                text.contains("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true) ||
+        normalized.startsWith("CAPTURE_COMPLETE", ignoreCase = true) ||
+                normalized.startsWith("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true) ||
                 text.contains("Classic RAW fusion:", ignoreCase = true) ||
                 text.contains("Classic YUV fusion:", ignoreCase = true) ||
                 text.contains("처리하는 중") ||
@@ -559,11 +556,9 @@ fun MainCameraScreen(
                 return
             }
             if (isTerminalStatus(newStatus)) {
-                val lower = newStatus.lowercase()
                 val terminalSuccess =
-                    newStatus.contains("PIPELINE_COMPLETE", ignoreCase = true) ||
-                        newStatus.contains("EXPORT_COMPLETE", ignoreCase = true) ||
-                        lower.contains("saved to gallery")
+                    newStatus.trimStart().startsWith("PIPELINE_COMPLETE", ignoreCase = true) ||
+                        newStatus.trimStart().startsWith("EXPORT_COMPLETE", ignoreCase = true)
                 mainHandler.removeCallbacks(watchdog)
                 activeWatchdog.compareAndSet(watchdog, null)
                 activeCancellationToken.compareAndSet(cancellationToken, null)

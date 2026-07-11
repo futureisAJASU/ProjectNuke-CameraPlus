@@ -15,6 +15,7 @@ class CaptureProgressTest {
             "YUV Fusion V2 failed; falling back to classic V1",
             "Motion 저장 실패, 컬러 프레임은 유지",
             "RAW capture sequence done"
+            ,"YUV Fusion V2 failed; falling back to classic V1"
         ).forEach { assertFalse(it, isTerminalStatus(it)) }
     }
 
@@ -27,6 +28,7 @@ class CaptureProgressTest {
             "CAPTURE_FAILED: camera error",
             "CAPTURE_TIMEOUT: Capture timeout",
             "EXPORT_FAILED: verification failed"
+            ,"PIPELINE_CANCELLED: user cancelled"
         ).forEach { assertTrue(it, isTerminalStatus(it)) }
     }
 }

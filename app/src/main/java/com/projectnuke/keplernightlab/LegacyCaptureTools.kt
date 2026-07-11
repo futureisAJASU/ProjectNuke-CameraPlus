@@ -639,8 +639,9 @@ fun captureSingleRawDng(
                                 "${file.absolutePath}\n" +
                                 "크기: ${file.length() / 1024 / 1024} MB"
                     )
+                    postStatus("PIPELINE_COMPLETE: RAW DNG capture complete.")
                 } catch (e: Exception) {
-                    postStatus("DNG 저장 실패\n${e.stackTraceToString()}")
+                    postStatus("PIPELINE_FAILED: DNG 저장 실패\n${e.stackTraceToString()}")
                 } finally {
                     try { image.close() } catch (_: Exception) {}
                     cleanup()
@@ -658,7 +659,7 @@ fun captureSingleRawDng(
                     postStatus("RAW 이미지 수신 완료. CaptureResult 대기 중...")
                     trySaveDng()
                 } catch (e: Exception) {
-                    postStatus("RAW 이미지 수신 실패\n${e.stackTraceToString()}")
+                    postStatus("PIPELINE_FAILED: RAW 이미지 수신 실패\n${e.stackTraceToString()}")
                     cleanup()
                 }
             },
@@ -711,45 +712,45 @@ fun captureSingleRawDng(
                                                     request: CaptureRequest,
                                                     failure: android.hardware.camera2.CaptureFailure
                                                 ) {
-                                                    postStatus("RAW 캡처 실패: $failure")
+                                                    postStatus("PIPELINE_FAILED: RAW 캡처 실패: $failure")
                                                     cleanup()
                                                 }
                                             },
                                             backgroundHandler
                                         )
                                     } catch (e: Exception) {
-                                        postStatus("RAW 캡처 요청 실패\n${e.stackTraceToString()}")
+                                        postStatus("PIPELINE_FAILED: RAW 캡처 요청 실패\n${e.stackTraceToString()}")
                                         cleanup()
                                     }
                                 }
 
                                 override fun onConfigureFailed(session: CameraCaptureSession) {
-                                    postStatus("RAW 캡처 세션 구성 실패")
+                                    postStatus("PIPELINE_FAILED: RAW 캡처 세션 구성 실패")
                                     cleanup()
                                 }
                             },
                             backgroundHandler
                         )
                     } catch (e: Exception) {
-                        postStatus("RAW 세션 생성 실패\n${e.stackTraceToString()}")
+                        postStatus("PIPELINE_FAILED: RAW 세션 생성 실패\n${e.stackTraceToString()}")
                         cleanup()
                     }
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
-                    postStatus("카메라 연결 해제됨")
+                    postStatus("PIPELINE_FAILED: 카메라 연결 해제됨")
                     cleanup()
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
-                    postStatus("카메라 오류: $error")
+                    postStatus("PIPELINE_FAILED: 카메라 오류: $error")
                     cleanup()
                 }
             },
             backgroundHandler
         )
     } catch (e: Exception) {
-        postStatus("RAW 촬영 초기화 실패\n${e.stackTraceToString()}")
+        postStatus("PIPELINE_FAILED: RAW 촬영 초기화 실패\n${e.stackTraceToString()}")
         cleanup()
     }
 }
@@ -785,6 +786,7 @@ fun captureRawBurstDng(
     var receivedImages = 0
     var savedFrames = 0
     var finished = false
+    var successfulCompletion = false
 
     fun cleanup() {
         try { captureSession?.close() } catch (_: Exception) {}
@@ -797,7 +799,8 @@ fun captureRawBurstDng(
         if (finished) return
         finished = true
 
-        postStatus(message)
+        val prefix = if (successfulCompletion) "PIPELINE_COMPLETE: " else "PIPELINE_FAILED: "
+        postStatus(prefix + message)
 
         images.values.forEach { image ->
             try { image.close() } catch (_: Exception) {}
@@ -923,6 +926,7 @@ fun captureRawBurstDng(
             }
 
             if (savedFrames >= frameCount) {
+                successfulCompletion = true
                 writeBurstJobJson(
                     jobFile = jobFile,
                     status = "CAPTURE_COMPLETE",

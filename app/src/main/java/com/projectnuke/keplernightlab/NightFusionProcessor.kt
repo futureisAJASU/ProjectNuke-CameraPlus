@@ -85,6 +85,7 @@ fun processLatestNightFusionV02(
                     return@post
                 }
             processNightFusionJobV02Sync(jobDir, onStatus = { postStatus(it) })
+            postStatus("PIPELINE_COMPLETE: YUV Night Fusion processing complete.")
         } catch (e: Exception) {
             Log.e("KeplerYuvPipeline", "PIPELINE_FAILED in processLatestNightFusionV02", e)
             runCatching {

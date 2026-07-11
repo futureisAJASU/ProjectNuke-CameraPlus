@@ -22,6 +22,7 @@ app/.cxx/
 *.apk
 *.aab
 *.ap_
+*.bundle
 
 # Logs
 /*.log
