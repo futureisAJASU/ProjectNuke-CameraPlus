@@ -849,11 +849,7 @@ fun MainCameraScreen(
                     status = "최근 촬영 컬러 합성 시작..."
                     processLatestNightFusionV02(context) { newStatus ->
                         status = newStatus
-                        if (
-                            isTerminalStatus(newStatus) ||
-                            newStatus.contains("complete", ignoreCase = true) ||
-                            newStatus.contains("failed", ignoreCase = true)
-                        ) {
+                        if (isTerminalStatus(newStatus)) {
                             refreshLatestResult()
                         }
                     }

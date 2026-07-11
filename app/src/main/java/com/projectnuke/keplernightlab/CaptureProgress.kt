@@ -24,42 +24,26 @@ data class CaptureProgressState(
     val progressPercent: Float = 0f
 )
 
-private val zeroFailedCounterRegex = Regex("\\bfailed\\s+0\\b", RegexOption.IGNORE_CASE)
-
 fun isCaptureStageCompleteButPipelineStillRunning(status: String): Boolean {
     return status.contains("CAPTURE_COMPLETE", ignoreCase = true) &&
         !status.contains("PIPELINE_COMPLETE", ignoreCase = true)
 }
 
 fun isTerminalStatus(status: String): Boolean {
-    if (status.contains("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true)) {
-        return false
-    }
-    if (status.contains("CAPTURE_COMPLETE", ignoreCase = true)) {
-        return false
-    }
-    if (status.contains("RAW capture sequence done", ignoreCase = true)) {
-        return false
-    }
+    if (status.contains("CAPTURE_COMPLETE_PARTIAL", ignoreCase = true)) return false
+    if (status.contains("CAPTURE_COMPLETE", ignoreCase = true)) return false
+    if (status.contains("RAW capture sequence done", ignoreCase = true)) return false
 
-    val lower = status.lowercase()
-    val hasExplicitFailure = status.contains("PIPELINE_FAILED", ignoreCase = true) ||
-        status.contains("CAPTURE_FAILED", ignoreCase = true) ||
-        status.contains("PROCESS_FAILED", ignoreCase = true) ||
-        status.contains("EXPORT_FAILED", ignoreCase = true)
-    val hasGenericFailure = lower.contains("failed") && !zeroFailedCounterRegex.containsMatchIn(status)
-
-    return status.contains("PIPELINE_COMPLETE", ignoreCase = true) ||
-            status.contains("EXPORT_COMPLETE", ignoreCase = true) ||
-            hasExplicitFailure ||
-            status.contains("CAPTURE_TIMEOUT", ignoreCase = true) ||
-            status.contains("PROCESS_TIMEOUT", ignoreCase = true) ||
-            status.contains("EXPORT_TIMEOUT", ignoreCase = true) ||
-            lower.contains("saved to gallery") ||
-            hasGenericFailure ||
-            lower.contains("timeout") ||
-            status.contains("완료") ||
-            status.contains("실패") ||
-            status.contains("오류") ||
-            status.contains("연결 해제")
+    val terminalPrefixes = listOf(
+        "PIPELINE_COMPLETE",
+        "EXPORT_COMPLETE",
+        "PIPELINE_FAILED",
+        "CAPTURE_FAILED",
+        "PROCESS_FAILED",
+        "EXPORT_FAILED",
+        "CAPTURE_TIMEOUT",
+        "PROCESS_TIMEOUT",
+        "EXPORT_TIMEOUT"
+    )
+    return terminalPrefixes.any { status.trimStart().startsWith(it, ignoreCase = true) }
 }

@@ -111,7 +111,7 @@ fun captureProcessExportRawNightFusion(
                 return@captureRawBurstForFusion
             }
             Log.i("KeplerRawPipeline", "PROCESSING_STARTED jobDirAbsolutePath=${jobDir.absolutePath}")
-            post("캡처가 완료되었습니다.")
+            post("PROCESSING_STARTED: RAW capture complete; processing started.")
             val thread = HandlerThread("KeplerRawFusionPipelineThread").apply { start() }
             Handler(thread.looper).post {
                 try {
