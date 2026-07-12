@@ -179,7 +179,6 @@ fun runSuperResolutionFusion(
     request: SuperResolutionFusionRequest
 ): SuperResolutionFusionResult {
     request.cancellation.throwIfCancelled()
-    request.cancellation.throwIfCancelled()
     require(request.targetPolicy.sourceMode == request.sourceMode) {
         "Target policy sourceMode must match request sourceMode."
     }
@@ -538,17 +537,19 @@ private fun decodeLumaFrame(
             inPreferredConfig = Bitmap.Config.ARGB_8888
         }
     ) ?: return null
-    cancellation.throwIfCancelled()
-    val proxy = if (decoded.width == proxyWidth && decoded.height == proxyHeight) {
-        decoded
-    } else {
-        Bitmap.createScaledBitmap(decoded, proxyWidth, proxyHeight, true).also {
-            decoded.recycle()
-        }
-    }
+    var proxy: Bitmap? = null
     return try {
+        cancellation.throwIfCancelled()
+        proxy = if (decoded.width == proxyWidth && decoded.height == proxyHeight) {
+            decoded
+        } else {
+            Bitmap.createScaledBitmap(decoded, proxyWidth, proxyHeight, true).also {
+                decoded.recycle()
+            }
+        }
+        val activeProxy = proxy ?: error("Proxy bitmap was not created.")
         val pixels = IntArray(proxyWidth * proxyHeight)
-        proxy.getPixels(pixels, 0, proxyWidth, 0, 0, proxyWidth, proxyHeight)
+        activeProxy.getPixels(pixels, 0, proxyWidth, 0, 0, proxyWidth, proxyHeight)
         val luma = ByteArray(pixels.size)
         pixels.forEachIndexed { pixelIndex, color ->
             if ((pixelIndex and 4095) == 0) cancellation.throwIfCancelled()
@@ -572,7 +573,10 @@ private fun decodeLumaFrame(
             }
         )
     } finally {
-        proxy.recycle()
+        proxy?.takeUnless { it.isRecycled }?.recycle()
+        if (proxy !== decoded) {
+            decoded.takeUnless { it.isRecycled }?.recycle()
+        }
     }
 }
 
@@ -688,13 +692,14 @@ private fun alignmentSad(
 
     var sum = 0L
     var count = 0
+    var processedRows = 0
     for (y in startY until endY step stride) {
-        if ((y and 31) == 0) cancellation.throwIfCancelled()
+        if ((processedRows++ and 15) == 0) cancellation.throwIfCancelled()
         val referenceRow = y * width
         val frameRow = (y + dy) * width
         for (x in startX until endX step stride) {
             sum += abs(
-                unsigned(reference.luma[referenceRow + x]) -
+                unsigned(reference.luma[referenceRow + x]) - 
                     unsigned(frame.luma[frameRow + x + dx])
             )
             count++
@@ -749,6 +754,7 @@ private fun fuseFramesTiled(
             cancellation.throwIfCancelled()
             decoders[frame.index] = BitmapRegionDecoder.newInstance(frame.file.absolutePath, false)
         }
+        cancellation.throwIfCancelled()
         sink.begin(outputWidth, outputHeight)
         val orderedFrames = frames.sortedBy { if (it.index == reference.index) 0 else 1 }
         var tileY = 0
@@ -780,7 +786,8 @@ private fun fuseFramesTiled(
                         scaleX = scaleX,
                         scaleY = scaleY,
                         shift = shift,
-                        sourceHalo = sourceHalo
+                        sourceHalo = sourceHalo,
+                        cancellation = cancellation
                     )
                     accumulateTile(
                         region = region,
@@ -796,7 +803,8 @@ private fun fuseFramesTiled(
                         accumR = accumR,
                         accumG = accumG,
                         accumB = accumB,
-                        weights = weights
+                        weights = weights,
+                        cancellation = cancellation
                     )
                 }
 
@@ -804,7 +812,8 @@ private fun fuseFramesTiled(
                     accumR = accumR,
                     accumG = accumG,
                     accumB = accumB,
-                    weights = weights
+                    weights = weights,
+                    cancellation = cancellation
                 )
                 cancellation.throwIfCancelled()
                 sink.writeTile(tileX, tileY, tileWidth, tileHeight, outputPixels)
@@ -831,7 +840,8 @@ private fun decodeTileRegion(
     scaleX: Float,
     scaleY: Float,
     shift: FrameShift,
-    sourceHalo: Int
+    sourceHalo: Int,
+    cancellation: KeplerPipelineCancellation
 ): DecodedRegion {
     val firstSourceX = (outputTileX + 0.5f) / scaleX - 0.5f + shift.dx
     val lastSourceX =
@@ -847,13 +857,17 @@ private fun decodeTileRegion(
         .coerceIn(0, sourceHeight - 1)
     val bottom = ceil(max(firstSourceY, lastSourceY)).toInt().plus(sourceHalo + 1)
         .coerceIn(top + 1, sourceHeight)
+    cancellation.throwIfCancelled()
     val bitmap = decoder.decodeRegion(
         Rect(left, top, right, bottom),
         BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
     ) ?: error("Could not decode source strip.")
     return try {
+        cancellation.throwIfCancelled()
         val pixels = IntArray(bitmap.width * bitmap.height)
+        cancellation.throwIfCancelled()
         bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        cancellation.throwIfCancelled()
         DecodedRegion(left, top, bitmap.width, bitmap.height, pixels)
     } finally {
         bitmap.recycle()
@@ -874,7 +888,8 @@ private fun accumulateTile(
     accumR: FloatArray,
     accumG: FloatArray,
     accumB: FloatArray,
-    weights: FloatArray
+    weights: FloatArray,
+    cancellation: KeplerPipelineCancellation
 ) {
     val alignmentWeight = if (isReference) {
         1f
@@ -882,6 +897,7 @@ private fun accumulateTile(
         (1f - shift.score * 3f).coerceIn(0.35f, 1f)
     }
     for (localY in 0 until tileHeight) {
+        if ((localY and 15) == 0) cancellation.throwIfCancelled()
         val outputY = tileY + localY
         val sourceY = (outputY + 0.5f) / scaleY - 0.5f + shift.dy
         if (sourceY < region.top || sourceY > region.top + region.height - 1) continue
@@ -922,17 +938,23 @@ private fun normalizeTile(
     accumR: FloatArray,
     accumG: FloatArray,
     accumB: FloatArray,
-    weights: FloatArray
-): IntArray = IntArray(weights.size) { index ->
-    val weight = weights[index]
-    if (weight > 0f) {
-        val red = (accumR[index] / weight).roundToInt().coerceIn(0, 255)
-        val green = (accumG[index] / weight).roundToInt().coerceIn(0, 255)
-        val blue = (accumB[index] / weight).roundToInt().coerceIn(0, 255)
-        0xff000000.toInt() or (red shl 16) or (green shl 8) or blue
-    } else {
-        0xff000000.toInt()
+    weights: FloatArray,
+    cancellation: KeplerPipelineCancellation
+): IntArray {
+    val output = IntArray(weights.size)
+    for (index in weights.indices) {
+        if ((index and 4095) == 0) cancellation.throwIfCancelled()
+        val weight = weights[index]
+        output[index] = if (weight > 0f) {
+            val red = (accumR[index] / weight).roundToInt().coerceIn(0, 255)
+            val green = (accumG[index] / weight).roundToInt().coerceIn(0, 255)
+            val blue = (accumB[index] / weight).roundToInt().coerceIn(0, 255)
+            0xff000000.toInt() or (red shl 16) or (green shl 8) or blue
+        } else {
+            0xff000000.toInt()
+        }
     }
+    return output
 }
 
 private fun bilinearArgb(region: DecodedRegion, sourceX: Float, sourceY: Float): Int {
@@ -1050,7 +1072,6 @@ private fun runSingleFrameFallback(
             "Fallback reference decode failed.",
             shifts
         )
-    request.cancellation.throwIfCancelled()
     var output: Bitmap? = null
     return try {
         request.cancellation.throwIfCancelled()
@@ -1081,7 +1102,6 @@ private fun runSingleFrameFallback(
             rawInputUsed = request.sourceMode == SuperResolutionSourceMode.FULLRES_50MP_RAW,
             message = reason
         )
-        request.cancellation.throwIfCancelled()
         writeSuperResolutionJob(request, result, "COMPLETE", reason)
         result
     } finally {
