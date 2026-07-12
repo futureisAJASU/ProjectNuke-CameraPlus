@@ -66,4 +66,17 @@ class CaptureProgressTest {
         assertTrue(parsed.stage == CaptureStage.CANCELLED)
         assertTrue(parsed.progressPercent == 1f)
     }
+
+    @Test
+    fun timedOutJobAcceptsOnlyCommittedLateCompletion() {
+        assertFalse(shouldIgnoreCancelledPipelineStatus(true, "PIPELINE_COMPLETE_PARTIAL: Image saved"))
+        assertFalse(shouldIgnoreCancelledPipelineStatus(true, "PIPELINE_COMPLETE: Image saved"))
+        assertTrue(shouldIgnoreCancelledPipelineStatus(true, "PROCESSING: still working"))
+        assertTrue(shouldIgnoreCancelledPipelineStatus(true, "PIPELINE_FAILED: stale failure"))
+    }
+
+    @Test
+    fun activeJobStatusesRemainAccepted() {
+        assertFalse(shouldIgnoreCancelledPipelineStatus(false, "PROCESSING: still working"))
+    }
 }

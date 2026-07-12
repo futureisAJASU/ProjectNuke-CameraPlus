@@ -162,6 +162,12 @@ private val usedFramesRegex = Regex("Used\\s+(\\d+)\\s*/\\s*(\\d+)\\s+frames", R
 private val yuvSavedRegex = Regex("YUV capture:\\s*saved\\s+(\\d+)\\s*/\\s*(\\d+)", RegexOption.IGNORE_CASE)
 private val colorSavedRegex = Regex("Color frame saved\\s+(\\d+)\\s*/\\s*(\\d+)", RegexOption.IGNORE_CASE)
 
+internal fun isCommittedPipelineCompletionStatus(status: String): Boolean =
+    status.trimStart().startsWith("PIPELINE_COMPLETE", ignoreCase = true)
+
+internal fun shouldIgnoreCancelledPipelineStatus(cancelled: Boolean, status: String): Boolean =
+    cancelled && !isCommittedPipelineCompletionStatus(status)
+
 fun parseCaptureProgress(
     text: String,
     fallback: CaptureProgressState
@@ -268,6 +274,7 @@ fun MainCameraScreen(
     var currentScreen by remember { mutableStateOf(MainScreen.CAMERA) }
     var captureProgress by remember { mutableStateOf(CaptureProgressState()) }
     var pipelineGeneration by remember { mutableIntStateOf(0) }
+    var timedOutGeneration by remember { mutableIntStateOf(-1) }
     val activeCancellationToken = remember { AtomicReference<KeplerPipelineCancellationToken?>(null) }
     val activeCaptureCancellation = remember { AtomicReference<KeplerCaptureCancellationHandle?>(null) }
     val activeWatchdog = remember { AtomicReference<Runnable?>(null) }
@@ -280,6 +287,7 @@ fun MainCameraScreen(
             activeCaptureCancellation.getAndSet(null)?.cancelCapture("camera screen disposed")
             activeWatchdog.getAndSet(null)?.let(mainHandler::removeCallbacks)
             activeJobStart.getAndSet(null)?.let(mainHandler::removeCallbacks)
+            timedOutGeneration = -1
             Log.i("KeplerPipelineState", "camera screen disposed; active pipeline cancelled")
         }
     }
@@ -525,7 +533,7 @@ fun MainCameraScreen(
             activeCancellationToken.compareAndSet(cancellationToken, null)
             activeCaptureCancellation.compareAndSet(captureCancellationHandle, null)
             activeWatchdog.set(null)
-            pipelineGeneration++
+            timedOutGeneration = localGeneration
             val timeoutStatus = "CAPTURE_TIMEOUT: Capture timeout. Preview recovered."
             status = timeoutStatus
             captureProgress = parseCaptureProgress(timeoutStatus, captureProgress)
@@ -543,6 +551,10 @@ fun MainCameraScreen(
                     "KeplerPipelineState",
                     "stale terminal ignored generation=$localGeneration current=$pipelineGeneration status=$newStatus"
                 )
+                return
+            }
+            if (shouldIgnoreCancelledPipelineStatus(cancellationToken.isCancelled, newStatus)) {
+                Log.i("KeplerPipelineState", "post-timeout status ignored generation=$localGeneration status=$newStatus")
                 return
             }
             captureProgress = parseCaptureProgress(newStatus, captureProgress)
@@ -565,6 +577,7 @@ fun MainCameraScreen(
                 activeWatchdog.compareAndSet(watchdog, null)
                 activeCancellationToken.compareAndSet(cancellationToken, null)
                 activeCaptureCancellation.compareAndSet(captureCancellationHandle, null)
+                if (timedOutGeneration == localGeneration) timedOutGeneration = -1
                 isPipelineBusy = false
                 isCapturing = false
                 refreshLatestResult(showPreview = terminalSuccess)
@@ -603,6 +616,10 @@ fun MainCameraScreen(
                                 "KeplerPipelineState",
                                 "stale pipeline status ignored generation=$localGeneration current=$pipelineGeneration status=$newStatus"
                             )
+                            return@jobCallback
+                        }
+                        if (shouldIgnoreCancelledPipelineStatus(cancellationToken.isCancelled, newStatus)) {
+                            Log.i("KeplerPipelineState", "cancelled pipeline status ignored generation=$localGeneration status=$newStatus")
                             return@jobCallback
                         }
                         status = newStatus
