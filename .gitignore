@@ -1,4 +1,4 @@
-﻿# Gradle
+# Gradle
 .gradle/
 build/
 */build/
@@ -40,3 +40,6 @@ KeplerRawBurst/
 KeplerRawFusion/
 KeplerColorBurst/
 .processing/
+*.hprof
+hs_err_pid*.log
+replay_pid*.log
