@@ -165,8 +165,20 @@ private val colorSavedRegex = Regex("Color frame saved\\s+(\\d+)\\s*/\\s*(\\d+)"
 internal fun isCommittedPipelineCompletionStatus(status: String): Boolean =
     status.trimStart().startsWith("PIPELINE_COMPLETE", ignoreCase = true)
 
-internal fun shouldIgnoreCancelledPipelineStatus(cancelled: Boolean, status: String): Boolean =
-    cancelled && !isCommittedPipelineCompletionStatus(status)
+internal fun shouldIgnoreCancelledPipelineStatus(
+    cancelled: Boolean,
+    timedOutGeneration: Int,
+    localGeneration: Int,
+    pipelineGeneration: Int,
+    status: String
+): Boolean {
+    if (!cancelled) return false
+    val isLateCommittedCompletion =
+        timedOutGeneration == localGeneration &&
+            localGeneration == pipelineGeneration &&
+            isCommittedPipelineCompletionStatus(status)
+    return !isLateCommittedCompletion
+}
 
 fun parseCaptureProgress(
     text: String,
@@ -553,9 +565,17 @@ fun MainCameraScreen(
                 )
                 return
             }
-            if (shouldIgnoreCancelledPipelineStatus(cancellationToken.isCancelled, newStatus)) {
+            if (shouldIgnoreCancelledPipelineStatus(cancellationToken.isCancelled, timedOutGeneration, localGeneration, pipelineGeneration, newStatus)) {
                 Log.i("KeplerPipelineState", "post-timeout status ignored generation=$localGeneration status=$newStatus")
                 return
+            }
+            val acceptLateCompletion =
+                cancellationToken.isCancelled &&
+                    timedOutGeneration == localGeneration &&
+                    localGeneration == pipelineGeneration &&
+                    isCommittedPipelineCompletionStatus(newStatus)
+            if (acceptLateCompletion) {
+                timedOutGeneration = -1
             }
             captureProgress = parseCaptureProgress(newStatus, captureProgress)
             if (isCaptureStageCompleteButPipelineStillRunning(newStatus)) {
@@ -618,7 +638,7 @@ fun MainCameraScreen(
                             )
                             return@jobCallback
                         }
-                        if (shouldIgnoreCancelledPipelineStatus(cancellationToken.isCancelled, newStatus)) {
+                        if (shouldIgnoreCancelledPipelineStatus(cancellationToken.isCancelled, timedOutGeneration, localGeneration, pipelineGeneration, newStatus)) {
                             Log.i("KeplerPipelineState", "cancelled pipeline status ignored generation=$localGeneration status=$newStatus")
                             return@jobCallback
                         }

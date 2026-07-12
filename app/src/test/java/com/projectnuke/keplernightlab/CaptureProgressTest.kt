@@ -69,14 +69,67 @@ class CaptureProgressTest {
 
     @Test
     fun timedOutJobAcceptsOnlyCommittedLateCompletion() {
-        assertFalse(shouldIgnoreCancelledPipelineStatus(true, "PIPELINE_COMPLETE_PARTIAL: Image saved"))
-        assertFalse(shouldIgnoreCancelledPipelineStatus(true, "PIPELINE_COMPLETE: Image saved"))
-        assertTrue(shouldIgnoreCancelledPipelineStatus(true, "PROCESSING: still working"))
-        assertTrue(shouldIgnoreCancelledPipelineStatus(true, "PIPELINE_FAILED: stale failure"))
+        assertFalse(
+            shouldIgnoreCancelledPipelineStatus(
+                cancelled = true,
+                timedOutGeneration = 12,
+                localGeneration = 12,
+                pipelineGeneration = 12,
+                status = "PIPELINE_COMPLETE: Image saved"
+            )
+        )
+        assertTrue(
+            shouldIgnoreCancelledPipelineStatus(
+                cancelled = true,
+                timedOutGeneration = -1,
+                localGeneration = 12,
+                pipelineGeneration = 12,
+                status = "PIPELINE_COMPLETE: Image saved"
+            )
+        )
+        assertTrue(
+            shouldIgnoreCancelledPipelineStatus(
+                cancelled = true,
+                timedOutGeneration = 12,
+                localGeneration = 12,
+                pipelineGeneration = 13,
+                status = "PIPELINE_COMPLETE: Image saved"
+            )
+        )
     }
 
     @Test
-    fun activeJobStatusesRemainAccepted() {
-        assertFalse(shouldIgnoreCancelledPipelineStatus(false, "PROCESSING: still working"))
+    fun cancelledButNotTimedOutGenerationIsIgnored() {
+        assertTrue(
+            shouldIgnoreCancelledPipelineStatus(
+                cancelled = true,
+                timedOutGeneration = -1,
+                localGeneration = 12,
+                pipelineGeneration = 12,
+                status = "PROCESSING: still working"
+            )
+        )
+        assertTrue(
+            shouldIgnoreCancelledPipelineStatus(
+                cancelled = true,
+                timedOutGeneration = -1,
+                localGeneration = 12,
+                pipelineGeneration = 12,
+                status = "PIPELINE_FAILED: stale failure"
+            )
+        )
+    }
+
+    @Test
+    fun nonCancelledJobStatusesRemainAccepted() {
+        assertFalse(
+            shouldIgnoreCancelledPipelineStatus(
+                cancelled = false,
+                timedOutGeneration = -1,
+                localGeneration = 12,
+                pipelineGeneration = 12,
+                status = "PROCESSING: still working"
+            )
+        )
     }
 }
