@@ -166,7 +166,9 @@ fun updateExportMetadata(
     verified: Boolean,
     finalOutputFormat: FinalOutputFormat,
     rawSidecarResult: RawSidecarExportResult? = null,
-    rawSidecarIgnored: Boolean = false
+    rawSidecarIgnored: Boolean = false,
+    postExportCancellationRequested: Boolean = false,
+    postExportWorkSkipped: Boolean = false
 ) {
     val jobFile = File(jobDir, "job.json")
     val job = if (jobFile.exists()) JSONObject(jobFile.readText()) else JSONObject()
@@ -185,6 +187,9 @@ fun updateExportMetadata(
         .put("exportFormatUsed", export?.formatUsed?.label ?: JSONObject.NULL)
         .put("exportFallbackUsed", export?.fallbackUsed ?: false)
         .put("exportFileSizeBytes", export?.fileSizeBytes ?: 0L)
+        .put("galleryExportCommitted", export?.success == true && !export?.uriString.isNullOrBlank())
+        .put("postExportCancellationRequested", postExportCancellationRequested)
+        .put("postExportWorkSkipped", postExportWorkSkipped)
         .put("rawSidecarRequested", finalOutputFormat.shouldExportRawSidecar)
         .put("rawSidecarExportStatus", when {
             rawSidecarIgnored -> "UNAVAILABLE"
@@ -219,7 +224,8 @@ fun updateExportFailure(
     jobDir: File,
     error: String,
     finalOutputFormat: FinalOutputFormat,
-    rawSidecarIgnored: Boolean = false
+    rawSidecarIgnored: Boolean = false,
+    export: GalleryExportResult? = null
 ) {
     val jobFile = File(jobDir, "job.json")
     val job = if (jobFile.exists()) JSONObject(jobFile.readText()) else JSONObject()
@@ -228,6 +234,8 @@ fun updateExportFailure(
         .put("currentPipelineStage", "FAILED")
         .put("exportStatus", "FAILED")
         .put("exportVerified", false)
+        .put("galleryExportCommitted", export?.success == true && !export?.uriString.isNullOrBlank())
+        .put("exportUri", export?.uriString ?: JSONObject.NULL)
         .put("exportError", error)
         .put("rawSidecarRequested", finalOutputFormat.shouldExportRawSidecar)
         .put("rawSidecarExportStatus", if (rawSidecarIgnored) "UNAVAILABLE" else "SKIPPED")

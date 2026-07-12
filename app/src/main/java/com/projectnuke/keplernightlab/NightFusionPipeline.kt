@@ -104,15 +104,14 @@ fun captureProcessExportNightFusion(
                             jobDir = jobDir,
                             error = export.errorMessage ?: "Unknown export failure",
                             finalOutputFormat = finalOutputFormat,
-                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
+                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
+                            export = export
                         )
                         post("PIPELINE_FAILED: Export failed; keeping cache. ${export.errorMessage}")
                         return@post
                     }
 
-                    cancellation.throwIfCancelled()
                     post("Verifying gallery output...")
-                    cancellation.throwIfCancelled()
                     val verified = verifyGalleryExport(context, export.uriString)
                     updateExportMetadata(
                         jobDir = jobDir,
@@ -120,6 +119,8 @@ fun captureProcessExportNightFusion(
                         verified = verified,
                         finalOutputFormat = finalOutputFormat,
                         rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
+                        ,postExportCancellationRequested = cancellation.isCancelled,
+                        postExportWorkSkipped = cancellation.isCancelled
                     )
 
                     if (!verified) {
@@ -128,14 +129,20 @@ fun captureProcessExportNightFusion(
                             error = "Export verification failed",
                             finalOutputFormat = finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
+                            ,export = export
                         )
                         post("PIPELINE_FAILED: Export verification failed; keeping source frames.")
                         return@post
                     }
 
-                    cancellation.throwIfCancelled()
+                    if (cancellation.isCancelled) {
+                        updateExportMetadata(jobDir, export, true, finalOutputFormat,
+                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
+                            postExportCancellationRequested = true, postExportWorkSkipped = true)
+                        post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. Cache was kept.")
+                        return@post
+                    }
                     post("Cleanup...")
-                    cancellation.throwIfCancelled()
                     val cleanup = cleanupNightFusionJobAfterVerifiedExport(
                         jobDir = jobDir,
                         policy = cleanupPolicy,

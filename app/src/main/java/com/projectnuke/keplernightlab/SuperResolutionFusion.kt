@@ -400,7 +400,6 @@ fun captureProcessExportSuperResolutionFusion(
                             status = { post(it) }
                         )
                     )
-                    cancellation.throwIfCancelled()
                     val outputFile = result.outputFile
                     if (outputFile == null || !outputFile.exists()) {
                         post("PIPELINE_FAILED: 24M Fusion failed. ${result.message}")
@@ -438,7 +437,6 @@ fun captureProcessExportSuperResolutionFusion(
                         return@post
                     }
 
-                    cancellation.throwIfCancelled()
                     val verified = verifyGalleryExport(context, export.uriString)
                     updateExportMetadata(
                         jobDir = outputDir,
@@ -446,6 +444,8 @@ fun captureProcessExportSuperResolutionFusion(
                         verified = verified,
                         finalOutputFormat = finalOutputFormat,
                         rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
+                        ,postExportCancellationRequested = cancellation.isCancelled,
+                        postExportWorkSkipped = cancellation.isCancelled
                     )
                     if (!verified) {
                         updateExportFailure(
@@ -453,12 +453,19 @@ fun captureProcessExportSuperResolutionFusion(
                             error = "Export verification failed",
                             finalOutputFormat = finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
+                            ,export = export
                         )
                         post("PIPELINE_FAILED: 24M Fusion export verification failed.")
                         return@post
                     }
 
-                    cancellation.throwIfCancelled()
+                    if (cancellation.isCancelled) {
+                        updateExportMetadata(outputDir, export, true, finalOutputFormat,
+                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
+                            postExportCancellationRequested = true, postExportWorkSkipped = true)
+                        post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. Cache was kept.")
+                        return@post
+                    }
                     post(
                         "PIPELINE_COMPLETE: 24M Fusion complete " +
                             "${result.outputWidth}x${result.outputHeight}, " +
@@ -699,7 +706,7 @@ private fun alignmentSad(
         val frameRow = (y + dy) * width
         for (x in startX until endX step stride) {
             sum += abs(
-                unsigned(reference.luma[referenceRow + x]) - 
+                unsigned(reference.luma[referenceRow + x]) -
                     unsigned(frame.luma[frameRow + x + dx])
             )
             count++

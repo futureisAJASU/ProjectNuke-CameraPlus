@@ -122,7 +122,6 @@ fun captureProcessExportRawNightFusion(
                         saveNativeMp24DebugPng = finalOutputFormat.isDebugPng && rawSpeedMode == RawSpeedMode.QUALITY,
                         cancellation = cancellation
                     ) { post(it) }
-                    cancellation.throwIfCancelled()
                     if (!process.success || !process.hasExportableBitmapSource()) {
                         updateExportFailure(
                             jobDir = jobDir,
@@ -195,18 +194,34 @@ fun captureProcessExportRawNightFusion(
                         return@post
                     }
                     post("Verifying gallery export...")
-                    cancellation.throwIfCancelled()
-                    if (!verifyGalleryExport(context, result.uriString)) {
+                    val verified = verifyGalleryExport(context, result.uriString)
+                    updateExportMetadata(
+                        jobDir = jobDir,
+                        export = result,
+                        verified = verified,
+                        finalOutputFormat = finalOutputFormat,
+                        rawSidecarResult = null,
+                        postExportCancellationRequested = cancellation.isCancelled,
+                        postExportWorkSkipped = cancellation.isCancelled
+                    )
+                    if (!verified) {
                         updateExportFailure(
                             jobDir = jobDir,
                             error = "Export verification failed",
                             finalOutputFormat = finalOutputFormat
+                            ,export = result
                         )
                         post("PIPELINE_FAILED: RAW export verification failed; keeping RAW cache.")
                         return@post
                     }
+                    if (cancellation.isCancelled) {
+                        updateExportMetadata(jobDir, result, true, finalOutputFormat,
+                            rawSidecarResult = null, postExportCancellationRequested = true,
+                            postExportWorkSkipped = true)
+                        post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. RAW cache kept.")
+                        return@post
+                    }
                     val rawSidecarResult = if (finalOutputFormat.shouldExportRawSidecar) {
-                        cancellation.throwIfCancelled()
                         exportRawSidecarsToPublicStorage(
                             context = context,
                             jobDir = jobDir,
@@ -224,7 +239,6 @@ fun captureProcessExportRawNightFusion(
                     } else {
                         null
                     }
-                    cancellation.throwIfCancelled()
                     updateExportMetadata(
                         jobDir = jobDir,
                         export = result,
@@ -232,6 +246,13 @@ fun captureProcessExportRawNightFusion(
                         finalOutputFormat = finalOutputFormat,
                         rawSidecarResult = rawSidecarResult
                     )
+                    if (cancellation.isCancelled) {
+                        updateExportMetadata(jobDir, result, true, finalOutputFormat,
+                            rawSidecarResult = rawSidecarResult,
+                            postExportCancellationRequested = true, postExportWorkSkipped = true)
+                        post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. RAW cache kept.")
+                        return@post
+                    }
                     val rawSuffix = if (finalOutputFormat.shouldExportRawSidecar) {
                         " + RAW"
                     } else {
