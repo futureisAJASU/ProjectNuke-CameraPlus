@@ -179,16 +179,21 @@ fun exportRawSidecarsToPublicStorage(
 }
 
 fun queryMediaSize(context: Context, uri: Uri): Long {
-    context.contentResolver.query(
-        uri,
-        arrayOf(MediaStore.MediaColumns.SIZE),
-        null,
-        null,
-        null
-    )?.use { cursor ->
-        if (cursor.moveToFirst()) return cursor.getLong(0)
-    }
-    return context.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: 0L
+    val mediaSize = runCatching {
+        context.contentResolver.query(
+            uri,
+            arrayOf(MediaStore.MediaColumns.SIZE),
+            null,
+            null,
+            null
+        )?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getLong(0) else 0L
+        } ?: 0L
+    }.getOrDefault(0L)
+    if (mediaSize > 0L) return mediaSize
+    return runCatching {
+        context.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: 0L
+    }.getOrDefault(0L).coerceAtLeast(0L)
 }
 
 fun updateExportMetadata(
