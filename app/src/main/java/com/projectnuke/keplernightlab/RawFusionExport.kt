@@ -86,7 +86,7 @@ fun captureProcessExportRawNightFusion(
     val main = Handler(Looper.getMainLooper())
     fun post(message: String) = main.post { onStatus(message) }
     cancellation.throwIfCancelled()
-    post("RAW 캡처 중입?�다. 기기�??�직이지 마세?? saved 0/$frameCount, images 0/$frameCount, results 0/$frameCount")
+    post("RAW 캡처 중입니다. 기기를 움직이지 마세요. saved 0/$frameCount, images 0/$frameCount, results 0/$frameCount")
     captureRawBurstForFusion(
         context = context,
         cameraId = cameraId,
@@ -147,7 +147,7 @@ fun captureProcessExportRawNightFusion(
                         usedFrameCount < requestedFrames
                     )
                     val requestedOutputFormat = requestedOutputFormatForSetting(finalOutputFormat)
-                    post("결과 미리보기�?준비하??중입?�다.")
+                    post("결과 미리보기를 준비하는 중입니다.")
                     val previewPrepareStartedAt = System.currentTimeMillis()
                     var exportBitmap: Bitmap? = null
                     val result = try {
@@ -165,7 +165,7 @@ fun captureProcessExportRawNightFusion(
                             exportBitmapHeight = loaded.bitmap.height,
                             nativePreviewPrepareMs = nativePreviewPrepareMs
                         )
-                        post("결과�??�?�하??중입?�다.")
+                        post("결과를 저장하는 중입니다.")
                         updateRawNativeQualityDiagnostics(jobDir, loaded.bitmap)
                         cancellation.throwIfCancelled()
                         exportNightFusionBitmapToGallery(
@@ -272,7 +272,7 @@ fun captureProcessExportRawNightFusion(
                     val rawSidecarCount = rawSidecarResult?.exportedFiles?.size ?: 0
                     val rawSidecarError = rawSidecarResult?.errorMessage?.takeIf { it.isNotBlank() }
                     if (partialCapture || rawSidecarResult?.status == "PARTIAL" || rawSidecarResult?.status == "FAILED") {
-                        post("처리가 ?�료?�었?�니??")
+                        post("처리가 완료되었습니다.")
                         post(
                             "PIPELINE_COMPLETE_PARTIAL: Saved ${result.formatUsed.label}$rawSuffix. " +
                                 "Used $usedFrameCount/$requestedFrames frames. " +
@@ -281,7 +281,7 @@ fun captureProcessExportRawNightFusion(
                                 "RAW cache kept for reprocessing."
                         )
                     } else {
-                        post("처리가 ?�료?�었?�니??")
+                        post("처리가 완료되었습니다.")
                         post(
                             "PIPELINE_COMPLETE: Saved ${result.formatUsed.label}$rawSuffix. " +
                                 "Used $usedFrameCount/$requestedFrames frames.\n" +

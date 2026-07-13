@@ -419,20 +419,20 @@ private data class ReprocessBackup(
     val existingNames: Set<String> = emptySet()
 )
 
-private fun backupReprocessTransaction(jobDir: File, files: List<File>): Result<List<ReprocessBackup>> = runCatching {
+private fun backupReprocessTransaction(jobDir: File, files: List<File>): Result<List<ReprocessBackup>> {
     val root = File(jobDir, ".reprocess_backup_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}")
-    check(root.mkdirs()) { "Could not create reprocess backup directory." }
-    val metadata = File(jobDir, JOB_JSON_FILE_NAME)
-    check(metadata.isFile) { "job.json is required for rollback." }
-    val existingNames = jobDir.listFiles()?.filter { it.isFile }?.map { it.name }?.toSet().orEmpty()
-    (listOf(metadata) + files.filter { it.isFile }.map { it.canonicalFile }.distinctBy { it.path }).map { original ->
-        val backup = File(root, original.name)
-        original.copyTo(backup, overwrite = false)
-        check(backup.isFile && backup.length() == original.length()) { "Backup verification failed for ${original.name}" }
-        ReprocessBackup(original, backup, existingNames)
-    }
-}.onFailure {
-    jobDir.listFiles()?.filter { it.name.startsWith(".reprocess_backup_") }?.forEach { root ->
+    return runCatching {
+        check(root.mkdirs()) { "Could not create reprocess backup directory." }
+        val metadata = File(jobDir, JOB_JSON_FILE_NAME)
+        check(metadata.isFile) { "job.json is required for rollback." }
+        val existingNames = jobDir.listFiles()?.filter { it.isFile }?.map { it.name }?.toSet().orEmpty()
+        (listOf(metadata) + files.filter { it.isFile }.map { it.canonicalFile }.distinctBy { it.path }).map { original ->
+            val backup = File(root, original.name)
+            original.copyTo(backup, overwrite = false)
+            check(backup.isFile && backup.length() == original.length()) { "Backup verification failed for ${original.name}" }
+            ReprocessBackup(original, backup, existingNames)
+        }
+    }.onFailure {
         root.listFiles()?.forEach { it.delete() }
         root.delete()
     }
@@ -456,7 +456,11 @@ private fun deleteBackups(backups: List<ReprocessBackup>): Boolean {
 
 private fun isReprocessWorkerWritable(file: File): Boolean {
     val name = file.name.lowercase(Locale.US)
-    if (name.startsWith("frame_") && (name.endsWith(".raw16") || name.endsWith(".dng"))) return false
+    if (name.startsWith("frame_") && (
+            name.endsWith(".raw16") || name.endsWith(".dng") ||
+            name.endsWith(".yuv") || name.endsWith(".nv21") || name.endsWith(".yuv420") ||
+            name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg")
+        )) return false
     return true
 }
 

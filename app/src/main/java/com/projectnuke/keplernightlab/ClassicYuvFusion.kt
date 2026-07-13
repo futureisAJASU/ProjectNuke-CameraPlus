@@ -121,7 +121,7 @@ internal fun processClassicYuvFusionJob(
             onStatus(status)
         }
 
-        markStage("YUV_ALIGNING", "YUV ?�레?�을 ?�렬?�는 중입?�다.")
+        markStage("YUV_ALIGNING", "YUV 프레임을 정렬하는 중입니다.")
         cancellation.throwIfCancelled()
         val preflightSummary = buildClassicYuvProcessingPreflight(jobDir, job)
         cancellation.throwIfCancelled()
@@ -165,7 +165,7 @@ internal fun processClassicYuvFusionJob(
         var lowConfidenceAlignmentCount = 0
         frames.forEachIndexed { index, frame ->
             cancellation.throwIfCancelled()
-            onStatus("YUV ?�레?�을 ?�렬?�는 중입?�다.")
+            onStatus("YUV 프레임을 정렬하는 중입니다.")
             if (frame === reference) {
                 frame.alignmentScore = 0f
                 frame.alignmentUsed = true
@@ -224,7 +224,7 @@ internal fun processClassicYuvFusionJob(
         }
 
         val alignDoneAt = System.currentTimeMillis()
-        markStage("YUV_MERGING", "YUV ?�레?�을 ?�성?�는 중입?�다.")
+        markStage("YUV_MERGING", "YUV 프레임을 합성하는 중입니다.")
         cancellation.throwIfCancelled()
         val mergeResult = mergeClassicFrames(
             frames = compatibleFrames,
@@ -243,12 +243,12 @@ internal fun processClassicYuvFusionJob(
         cancellation.throwIfCancelled()
         saveClassicBitmap(merged, averageFile)
 
-        markStage("YUV_DENOISE_SHARPEN", "?�이즈�? ?�명?��? 보정?�는 중입?�다.")
+        markStage("YUV_DENOISE_SHARPEN", "노이즈와 선명도를 보정하는 중입니다.")
         cancellation.throwIfCancelled()
         finalBitmap = finishClassicFusion(merged, params, cancellation)
         cancellation.throwIfCancelled()
         val lookDoneAt = System.currentTimeMillis()
-        markStage("YUV_EXPORTING", "결과�??�?�하??중입?�다.")
+        markStage("YUV_EXPORTING", "결과를 저장하는 중입니다.")
         val finalFile = File(jobDir, "sharpened_night_fusion.png")
         cancellation.throwIfCancelled()
         saveClassicBitmap(finalBitmap, finalFile)
@@ -386,7 +386,7 @@ internal fun processClassicYuvFusionJob(
         File(jobDir, "yuv_debug.json").writeText(job.toString(2))
         saveJobJson(jobFile.parentFile ?: error("Job directory missing"), job)
         cancellation.throwIfCancelled()
-        onStatus("처리가 ?�료?�었?�니??")
+        onStatus("처리가 완료되었습니다.")
         return finalFile
     } catch (oom: OutOfMemoryError) {
         val failurePreflight = preflight ?: buildClassicYuvProcessingPreflight(jobDir, job)
