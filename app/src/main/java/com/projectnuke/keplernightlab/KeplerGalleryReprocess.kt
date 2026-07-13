@@ -96,7 +96,10 @@ suspend fun reprocessKeplerGalleryJob(
     val beforeFinals = finalOutputCandidates(target, job)
     // The worker may overwrite any existing artifact, including RAW/YUV fusion and
     // render-debug metadata. Snapshot every pre-existing file at transaction start.
-    val backups = backupReprocessTransaction(target, target.listFiles()?.filter { it.isFile }.orEmpty()).getOrElse {
+    val backups = backupReprocessTransaction(
+        target,
+        target.listFiles()?.filter { it.isFile && isReprocessWorkerWritable(it) }.orEmpty()
+    ).getOrElse {
         writeReprocessFailure(target, "Required reprocess backup failed: ${it.message}")
         return@withContext Result.failure(it)
     }
@@ -106,7 +109,7 @@ suspend fun reprocessKeplerGalleryJob(
         mode = selectionMode,
         frames = applyFrameSelectionToItems(reviewItems, resolvedSelection, selectionMode)
     ).getOrElse {
-        restoreBackups(target, backups)
+        restoreBackups(target, backups).getOrThrow()
         writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
         return@withContext Result.failure(it)
     }
@@ -157,7 +160,11 @@ suspend fun reprocessKeplerGalleryJob(
         )
     } else {
         val error = pipelineResult.exceptionOrNull() ?: IllegalStateException("Unknown reprocess failure")
-        restoreBackups(target, backups)
+        val rollback = restoreBackups(target, backups)
+        if (rollback.isFailure) {
+            writeReprocessFailure(target, "${error.javaClass.simpleName}: ${error.message}; rollback failed: ${rollback.exceptionOrNull()?.message}")
+            return@withContext Result.failure(rollback.exceptionOrNull() ?: error)
+        }
         writeReprocessFailure(target, "${error.javaClass.simpleName}: ${error.message}")
         Result.failure(error)
     }
@@ -418,7 +425,7 @@ private fun backupReprocessTransaction(jobDir: File, files: List<File>): Result<
     val metadata = File(jobDir, JOB_JSON_FILE_NAME)
     check(metadata.isFile) { "job.json is required for rollback." }
     val existingNames = jobDir.listFiles()?.filter { it.isFile }?.map { it.name }?.toSet().orEmpty()
-    (listOf(metadata) + files.filter { it.isFile }.distinct()).map { original ->
+    (listOf(metadata) + files.filter { it.isFile }.map { it.canonicalFile }.distinctBy { it.path }).map { original ->
         val backup = File(root, original.name)
         original.copyTo(backup, overwrite = false)
         check(backup.isFile && backup.length() == original.length()) { "Backup verification failed for ${original.name}" }
@@ -431,20 +438,26 @@ private fun backupReprocessTransaction(jobDir: File, files: List<File>): Result<
     }
 }
 
-private fun restoreBackups(jobDir: File, backups: List<ReprocessBackup>) {
+private fun restoreBackups(jobDir: File, backups: List<ReprocessBackup>): Result<Unit> = runCatching {
     val originalNames = backups.firstOrNull()?.existingNames.orEmpty()
     jobDir.listFiles()?.filter { it.isFile && it.name !in originalNames }?.forEach { runCatching { it.delete() } }
     backups.forEach { backup ->
-        runCatching {
-            if (backup.backup.isFile) backup.backup.copyTo(backup.original, overwrite = true)
-        }
+        check(backup.backup.isFile) { "Missing rollback backup: ${backup.original.name}" }
+        backup.backup.copyTo(backup.original, overwrite = true)
     }
-    deleteBackups(backups)
+    check(deleteBackups(backups)) { "Could not clean rollback backup directory." }
 }
 
-private fun deleteBackups(backups: List<ReprocessBackup>) {
-    backups.forEach { backup -> runCatching { backup.backup.delete() } }
-    backups.firstOrNull()?.backup?.parentFile?.let { root -> runCatching { root.delete() } }
+private fun deleteBackups(backups: List<ReprocessBackup>): Boolean {
+    val root = backups.firstOrNull()?.backup?.parentFile ?: return true
+    backups.forEach { backup -> if (backup.backup.exists() && !backup.backup.delete()) return false }
+    return !root.exists() || root.delete()
+}
+
+private fun isReprocessWorkerWritable(file: File): Boolean {
+    val name = file.name.lowercase(Locale.US)
+    if (name.startsWith("frame_") && (name.endsWith(".raw16") || name.endsWith(".dng"))) return false
+    return true
 }
 
 private fun writeReprocessSuccess(

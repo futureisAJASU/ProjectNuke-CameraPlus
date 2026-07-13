@@ -16,10 +16,7 @@ class KeplerJobMetadataTest {
     fun atomicWriteKeepsReadableMetadataAndAddsSchemaVersion() {
         val directory = Files.createTempDirectory("kepler-job-").toFile()
         try {
-            KeplerJobMetadata.atomicWrite(
-                File(directory, "job.json"),
-                JSONObject().put("status", "PROCESSING").toString()
-            )
+            KeplerJobMetadata.write(directory, JSONObject().put("status", "PROCESSING"))
             KeplerJobMetadata.update(directory) { it.put("status", "COMPLETE") }
 
             KeplerJobMetadata.update(directory) {
@@ -29,10 +26,18 @@ class KeplerJobMetadataTest {
                 it.remove("temporaryKey")
             }
 
+            val writers = (0 until 8).map { index ->
+                Thread {
+                    KeplerJobMetadata.update(directory) { it.put("independent_$index", index) }
+                }.also { it.start() }
+            }
+            writers.forEach { it.join() }
+
             val job = KeplerJobMetadata.read(directory)
             assertEquals("COMPLETE", job.getString("status"))
             assertFalse(job.has("temporaryKey"))
             assertTrue(job.getInt("schemaVersion") >= 1)
+            (0 until 8).forEach { index -> assertEquals(index, job.getInt("independent_$index")) }
         } finally {
             directory.deleteRecursively()
         }

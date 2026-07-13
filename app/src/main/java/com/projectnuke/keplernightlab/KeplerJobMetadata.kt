@@ -20,9 +20,11 @@ object KeplerJobMetadata {
         JSONObject(File(jobDir, JOB_JSON_FILE_NAME).readText())
     }
 
-    fun write(jobDir: File, job: JSONObject): JSONObject = update(jobDir) { current ->
-        current.keys().asSequence().toList().forEach { key -> current.remove(key) }
-        job.keys().forEach { key -> current.put(key, job.get(key)) }
+    fun write(jobDir: File, job: JSONObject): JSONObject = synchronized(lockFor(jobDir)) {
+        val replacement = JSONObject(job.toString())
+        replacement.put("schemaVersion", replacement.optInt("schemaVersion", KEPLER_JOB_SCHEMA_VERSION))
+        atomicWrite(File(jobDir, JOB_JSON_FILE_NAME), replacement.toString(2))
+        replacement
     }
 
     fun update(jobDir: File, mutate: (JSONObject) -> Unit): JSONObject = synchronized(lockFor(jobDir)) {
