@@ -226,13 +226,15 @@ fun captureProcessExportRawNightFusion(
                         exportRawSidecarsToPublicStorage(
                             context = context,
                             jobDir = jobDir,
-                            displayNameBase = "Kepler_RAW_${jobDir.name}"
+                            displayNameBase = "Kepler_RAW_${jobDir.name}",
+                            cancellation = cancellation
                         ).also { sidecars ->
                             if (sidecars.success) {
                                 if (sidecars.status == "PARTIAL") {
                                     post(
                                         "RAW sidecar export partial: " +
-                                            "${sidecars.exportedFiles.size} DNG files"
+                                            "${sidecars.exportedFiles.size} DNG files. " +
+                                            "${sidecars.errorMessage.orEmpty()}"
                                     )
                                 } else {
                                     post(
@@ -261,17 +263,21 @@ fun captureProcessExportRawNightFusion(
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. RAW cache kept.")
                         return@post
                     }
-                    val rawSuffix = if (finalOutputFormat.shouldExportRawSidecar) {
+                    val rawSuffix = if (rawSidecarResult?.status == "EXPORTED") {
                         " + RAW"
                     } else {
                         ""
                     }
-                    if (partialCapture) {
+                    val rawSidecarCount = rawSidecarResult?.exportedFiles?.size ?: 0
+                    val rawSidecarError = rawSidecarResult?.errorMessage?.takeIf { it.isNotBlank() }
+                    if (partialCapture || rawSidecarResult?.status == "PARTIAL" || rawSidecarResult?.status == "FAILED") {
                         post("처리가 완료되었습니다.")
                         post(
                             "PIPELINE_COMPLETE_PARTIAL: Saved ${result.formatUsed.label}$rawSuffix. " +
                                 "Used $usedFrameCount/$requestedFrames frames. " +
-                                "Partial fallback was used.\nRAW cache kept for reprocessing."
+                                "Exported $rawSidecarCount RAW sidecars. " +
+                                (rawSidecarError?.let { "Error: $it. " } ?: "") +
+                                "RAW cache kept for reprocessing."
                         )
                     } else {
                         post("처리가 완료되었습니다.")

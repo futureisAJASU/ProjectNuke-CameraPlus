@@ -421,7 +421,8 @@ fun captureProcessExportSuperResolutionFusion(
                             context = context,
                             bitmap = bitmap,
                             displayNameBase = displayName,
-                            requestedFormat = requestedFormat
+                            requestedFormat = requestedFormat,
+                            cancellation = cancellation
                         )
                     } finally {
                         bitmap.recycle()

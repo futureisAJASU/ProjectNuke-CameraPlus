@@ -104,7 +104,8 @@ fun exportRawSidecarsToPublicStorage(
     context: Context,
     jobDir: File,
     displayNameBase: String,
-    relativeRawPath: String = "Pictures/Kepler/RAW"
+    relativeRawPath: String = "Pictures/Kepler/RAW",
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
 ): RawSidecarExportResult {
     val dngFiles = jobDir.listFiles()
         ?.filter { it.isFile && it.extension.equals("dng", ignoreCase = true) }
@@ -115,47 +116,54 @@ fun exportRawSidecarsToPublicStorage(
     }
 
     val exported = mutableListOf<String>()
-    dngFiles.forEachIndexed { index, file ->
-        val exportName = "${displayNameBase}_${index.toString().padStart(2, '0')}.dng"
-        val result = insertPublicFile(
-            context = context,
-            displayName = exportName,
-            mimeType = "image/x-adobe-dng",
-            relativePath = relativeRawPath,
-            collectionUri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
-            cancellation = NoOpKeplerPipelineCancellation
-        ) { output ->
-            FileInputStream(file).use { input -> input.copyTo(output) }
-        } ?: insertPublicFile(
-            context = context,
-            displayName = exportName,
-            mimeType = "image/x-adobe-dng",
-            relativePath = "Download/Kepler/RAW",
-            collectionUri = MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-            cancellation = NoOpKeplerPipelineCancellation
-        ) { output ->
-            FileInputStream(file).use { input -> input.copyTo(output) }
-        }
+    try {
+        dngFiles.forEachIndexed { index, file ->
+            cancellation.throwIfCancelled()
+            val exportName = "${displayNameBase}_${index.toString().padStart(2, '0')}.dng"
+            val result = insertPublicFile(
+                context = context,
+                displayName = exportName,
+                mimeType = "image/x-adobe-dng",
+                relativePath = relativeRawPath,
+                collectionUri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                cancellation = cancellation
+            ) { output ->
+                FileInputStream(file).use { input -> input.copyTo(output) }
+            } ?: run {
+                cancellation.throwIfCancelled()
+                insertPublicFile(
+                    context = context,
+                    displayName = exportName,
+                    mimeType = "image/x-adobe-dng",
+                    relativePath = "Download/Kepler/RAW",
+                    collectionUri = MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    cancellation = cancellation
+                ) { output ->
+                    FileInputStream(file).use { input -> input.copyTo(output) }
+                }
+            }
 
-        if (result == null) {
-            val status = if (exported.isNotEmpty()) "PARTIAL" else "FAILED"
+            if (result == null) {
+                val status = if (exported.isNotEmpty()) "PARTIAL" else "FAILED"
+                return RawSidecarExportResult(
+                    success = exported.isNotEmpty(),
+                    exportedFiles = exported,
+                    errorMessage = "Failed exporting ${file.name}",
+                    status = status
+                )
+            }
+            exported += result.first.toString()
+        }
+    } catch (ce: CancellationException) {
+        if (exported.isNotEmpty()) {
             return RawSidecarExportResult(
-                success = exported.isNotEmpty(),
+                success = true,
                 exportedFiles = exported,
-                errorMessage = "Failed exporting ${file.name}",
-                status = status
+                errorMessage = "RAW sidecar export cancelled after partial commit",
+                status = "PARTIAL"
             )
         }
-        if (result.second < file.length().coerceAtLeast(1L)) {
-            val status = if (exported.isNotEmpty()) "PARTIAL" else "FAILED"
-            return RawSidecarExportResult(
-                success = exported.isNotEmpty(),
-                exportedFiles = exported,
-                errorMessage = "Export verification failed for ${file.name}",
-                status = status
-            )
-        }
-        exported += result.first.toString()
+        throw ce
     }
 
     return RawSidecarExportResult(true, exported, null, "EXPORTED")
@@ -345,7 +353,7 @@ private fun insertPublicFile(
             runCatching { resolver.delete(uri, null, null) }
             return null
         }
-        uri to queryMediaSize(context, uri)
+        uri to runCatching { queryMediaSize(context, uri) }.getOrDefault(0L)
     } catch (ce: CancellationException) {
         uri?.let { runCatching { resolver.delete(it, null, null) } }
         throw ce
