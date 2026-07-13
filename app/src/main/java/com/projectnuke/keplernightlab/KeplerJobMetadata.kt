@@ -33,6 +33,11 @@ object KeplerJobMetadata {
         job
     }
 
+    /** Applies a caller's prepared fields while holding the same read-modify-write lock. */
+    fun replace(jobDir: File, replacement: JSONObject): JSONObject = update(jobDir) { current ->
+        replacement.keys().forEach { key -> current.put(key, replacement.get(key)) }
+    }
+
     fun atomicWrite(file: File, text: String) {
         val parent = file.parentFile ?: error("job metadata parent missing")
         check(parent.exists() || parent.mkdirs()) { "Could not create ${parent.absolutePath}" }

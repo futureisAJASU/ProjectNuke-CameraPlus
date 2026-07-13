@@ -421,5 +421,5 @@ private fun updateCleanupMetadata(
         .put("cleanupPolicy", policy.name)
         .put("sourceFramesDeleted", sourceFramesDeleted)
         .put("cleanedAt", System.currentTimeMillis())
-    jobFile.writeText(job.toString(2))
+    KeplerJobMetadata.write(jobDir, job)
 }

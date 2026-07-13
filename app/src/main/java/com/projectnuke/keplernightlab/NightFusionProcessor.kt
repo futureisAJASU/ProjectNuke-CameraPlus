@@ -154,7 +154,7 @@ fun processNightFusionJobV02Sync(
                 dryRun = false,
                 cancellation = cancellation
             )
-        } catch (t: Throwable) {
+        } catch (t: Exception) {
             cancellation.throwIfCancelled()
             onStatus("YUV Fusion V2 failed; falling back to classic V1: ${t.shortMessage()}")
             val finalFile = processClassicYuvFusionJob(
@@ -177,7 +177,7 @@ fun processNightFusionJobV02Sync(
             )
         } catch (t: YuvFusionV2DryRunClassicFusionFailedException) {
             throw t
-        } catch (t: Throwable) {
+        } catch (t: Exception) {
             cancellation.throwIfCancelled()
             onStatus("YUV Fusion V2 dry-run failed; falling back to classic V1: ${t.shortMessage()}")
             val finalFile = processClassicYuvFusionJob(

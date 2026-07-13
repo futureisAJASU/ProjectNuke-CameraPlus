@@ -94,7 +94,11 @@ suspend fun reprocessKeplerGalleryJob(
     }
     val selectionMode = resolveSelectionMode(job, frameSelection)
     val beforeFinals = finalOutputCandidates(target, job)
-    val backups = backupReprocessTransaction(target, beforeFinals).getOrElse {
+    val requiredProcessingMetadata = listOf(
+        "alignment.json", "alignment_debug.json", "render_debug.json",
+        "raw_render_debug.json", "raw_fusion_alignment.json", "yuv_debug.json"
+    ).map { File(target, it) }
+    val backups = backupReprocessTransaction(target, beforeFinals + requiredProcessingMetadata).getOrElse {
         writeReprocessFailure(target, "Required reprocess backup failed: ${it.message}")
         return@withContext Result.failure(it)
     }
@@ -154,7 +158,7 @@ suspend fun reprocessKeplerGalleryJob(
         )
     } else {
         val error = pipelineResult.exceptionOrNull() ?: IllegalStateException("Unknown reprocess failure")
-        restoreBackups(backups)
+        restoreBackups(target, backups)
         writeReprocessFailure(target, "${error.javaClass.simpleName}: ${error.message}")
         Result.failure(error)
     }
@@ -416,9 +420,18 @@ private fun backupReprocessTransaction(jobDir: File, files: List<File>): Result<
         check(backup.isFile && backup.length() == original.length()) { "Backup verification failed for ${original.name}" }
         ReprocessBackup(original, backup)
     }
+}.onFailure {
+    jobDir.listFiles()?.filter { it.name.startsWith(".reprocess_backup_") }?.forEach { root ->
+        root.listFiles()?.forEach { it.delete() }
+        root.delete()
+    }
 }
 
-private fun restoreBackups(backups: List<ReprocessBackup>) {
+private fun restoreBackups(jobDir: File, backups: List<ReprocessBackup>) {
+    val originalNames = backups.map { it.original.name }.toSet()
+    jobDir.listFiles()?.filter { it.isFile && it.name !in originalNames &&
+        it.name != JOB_JSON_FILE_NAME && !isReprocessSourceFrame(it, detectJobKind(jobDir, loadJobJsonSafe(jobDir)))
+    }?.forEach { runCatching { it.delete() } }
     backups.forEach { backup ->
         runCatching {
             if (backup.backup.isFile) backup.backup.copyTo(backup.original, overwrite = true)

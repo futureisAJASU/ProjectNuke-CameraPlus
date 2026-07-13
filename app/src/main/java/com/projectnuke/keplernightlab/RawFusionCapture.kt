@@ -583,6 +583,21 @@ fun captureRawBurstForFusion(
             }
         }
 
+        fun evictEmergencyUnmatchedImages() {
+            val maxImages = if (highResolutionRaw) 4 else min(8, requestedFrames + 2)
+            if (imagesByTimestamp.size < maxImages - 1) return
+            imagesByTimestamp.keys
+                .filter { it !in resultsByTimestamp }
+                .minByOrNull { imageArrivalMillis[it] ?: Long.MIN_VALUE }
+                ?.let { timestamp ->
+                    imagesByTimestamp.remove(timestamp)?.let {
+                        droppedUnmatchedImages++
+                        runCatching { it.close() }
+                    }
+                    imageArrivalMillis.remove(timestamp)
+                }
+        }
+
         fun trySaveReadyFrames() {
             if (finished.get()) return
             closeUnmatchedImages()
@@ -606,11 +621,19 @@ fun captureRawBurstForFusion(
                     post("RAW saving frame ${index + 1}/$requestedFrames...")
                     val saveStartedAt = System.currentTimeMillis()
                     writeCompactRaw16(image, File(jobDir, raw16Name))
+                    var dngSaved = false
+                    var dngFailure: String? = null
                     if (shouldSaveDngSidecars) {
-                        FileOutputStream(File(jobDir, dngName)).use { output ->
-                            DngCreator(characteristics, result).use { creator ->
-                                creator.writeImage(output, image)
+                        try {
+                            FileOutputStream(File(jobDir, dngName)).use { output ->
+                                DngCreator(characteristics, result).use { creator ->
+                                    creator.writeImage(output, image)
+                                }
                             }
+                            dngSaved = true
+                        } catch (e: Exception) {
+                            dngFailure = "${e.javaClass.simpleName}: ${e.message}"
+                            post("RAW DNG sidecar failed; continuing with raw16 fusion.")
                         }
                     }
                     val dynamicBlackLevel = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
@@ -619,7 +642,13 @@ fun captureRawBurstForFusion(
                         JSONObject()
                             .put("index", index)
                             .put("raw16File", raw16Name)
-                            .put("dngFile", if (shouldSaveDngSidecars) dngName else JSONObject.NULL)
+                            .put("dngFile", if (dngSaved) dngName else JSONObject.NULL)
+                            .put("dngSidecarStatus", when {
+                                dngSaved -> "EXPORTED"
+                                dngFailure != null -> "FAILED"
+                                else -> "NOT_REQUESTED"
+                            })
+                            .put("dngSidecarError", dngFailure ?: JSONObject.NULL)
                             .put("timestampNs", timestamp)
                             .put("exposureTimeNs", result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: JSONObject.NULL)
                             .put("sensitivityIso", result.get(CaptureResult.SENSOR_SENSITIVITY) ?: JSONObject.NULL)
@@ -699,6 +728,7 @@ fun captureRawBurstForFusion(
             imagesByTimestamp.remove(image.timestamp)?.let { runCatching { it.close() } }
             imagesByTimestamp[image.timestamp] = image
             imageArrivalMillis[image.timestamp] = System.currentTimeMillis()
+            evictEmergencyUnmatchedImages()
             closeUnmatchedImages()
             postCaptureProgress()
             trySaveReadyFrames()
@@ -968,7 +998,7 @@ private object RawFusionExportCoordinator {
                 .put("nativeIspRenderMs", nativeIspRenderMs)
                 .put("alignmentStatus", context.nativeMerge.alignmentStatus)
                 .put("processedAt", System.currentTimeMillis())
-            context.files.jobFile.writeText(failed.toString(2))
+            KeplerJobMetadata.write(context.files.jobDir, failed)
             context.onStatus("RAW fusion native 24MP postprocess failed. RAW cache kept.")
             return RawFusionProcessResult(
                 false,
@@ -1070,7 +1100,7 @@ private object RawFusionExportCoordinator {
             .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
             .put("processedAt", System.currentTimeMillis())
         cancellation.throwIfCancelled()
-        context.files.jobFile.writeText(updated.toString(2))
+        KeplerJobMetadata.write(context.files.jobDir, updated)
         return RawFusionProcessResult(
             success = true,
             mergedRawFile = context.files.mergedRawFile,
@@ -1165,7 +1195,7 @@ private object RawFusionExportCoordinator {
                 .put("currentPipelineStage", "FAILED")
                 .put("nativeIspRenderMs", nativeIspRenderMs)
                 .put("processedAt", System.currentTimeMillis())
-            context.files.jobFile.writeText(failed.toString(2))
+            KeplerJobMetadata.write(context.files.jobDir, failed)
             context.onStatus("PIPELINE_FAILED: Native RAW ISP failed; RAW cache kept. $status")
             return RawFusionProcessResult(false, context.files.mergedRawFile, null, null, null, "Native RAW ISP failed: $status")
         }
@@ -1238,7 +1268,7 @@ private object RawFusionExportCoordinator {
             .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
             .put("processedAt", System.currentTimeMillis())
         cancellation.throwIfCancelled()
-        context.files.jobFile.writeText(updated.toString(2))
+        KeplerJobMetadata.write(context.files.jobDir, updated)
         return RawFusionProcessResult(
             success = true,
             mergedRawFile = context.files.mergedRawFile,
@@ -1551,7 +1581,7 @@ private object RawFusionExportCoordinator {
             .put("sensorOrientation", context.job.opt("sensorOrientation") ?: JSONObject.NULL)
             .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
             .put("processedAt", System.currentTimeMillis())
-        context.files.jobFile.writeText(updated.toString(2))
+        KeplerJobMetadata.write(context.files.jobDir, updated)
         return RawFusionProcessResult(
             true,
             context.files.mergedRawFile,
@@ -1599,7 +1629,7 @@ fun processRawFusionJob(
         )
         onStatus("RAW 프레임을 정렬하는 중입니다.")
         applyRawFusionMemoryMetadata(job, estimateRawFusionMemory(pixelCountLong))
-        jobFile.writeText(job.toString(2))
+        KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
         val highResolutionRaw = pixelCountLong >= HIGH_RES_RAW_MIN_PIXELS
         val preparedFrames = prepareRawFusionFrames(jobDir, job, frames, pixelCount)
         cancellation.throwIfCancelled()
@@ -1659,7 +1689,7 @@ fun processRawFusionJob(
             mergedRawFile.length() >= pixelCount * 2L &&
             alignmentFile.exists()
         if (!classicMergedOk) {
-            jobFile.writeText(job.toString(2))
+            KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
             onStatus("Classic RAW fusion failed. RAW cache kept.")
             return RawFusionProcessResult(
                 success = false,
@@ -1670,7 +1700,7 @@ fun processRawFusionJob(
                 errorMessage = classicMerge.errorMessage ?: "Classic RAW fusion failed"
             )
         }
-        jobFile.writeText(job.toString(2))
+        KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
 
         onStatus("Native RAW ISP 렌더링 중입니다.")
         onStatus("결과를 저장하는 중입니다.")
@@ -1710,7 +1740,7 @@ fun processRawFusionJob(
                 .takeIf { it > 0L }
                 ?: updated.optLong("createdAt", System.currentTimeMillis())
             updated.put("totalPipelineMs", System.currentTimeMillis() - pipelineStartedAt)
-            jobFile.writeText(updated.toString(2))
+            KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), updated)
         }
         exportResult
     } catch (ce: CancellationException) {
@@ -1722,7 +1752,7 @@ fun processRawFusionJob(
                 .put("currentPipelineStage", "FAILED")
                 .put("processError", "OutOfMemoryError")
                 .put("processedAt", System.currentTimeMillis())
-            jobFile.writeText(job.toString(2))
+            KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
         }
         onStatus("RAW fusion stopped: insufficient memory. RAW cache kept.")
         RawFusionProcessResult(false, null, null, null, null, "OutOfMemoryError: RAW cache kept")
@@ -2196,7 +2226,7 @@ private fun computeRawWhiteBalanceGains(source: Bitmap, cameraGains: FloatArray?
                 .put("rawRenderInputMetadataFile", renderInputMetadataFile.name)
                 .put("rawRenderDebugFile", renderDebugFile.name)
                 .put("processedAt", System.currentTimeMillis())
-            context.files.jobFile.writeText(failed.toString(2))
+            KeplerJobMetadata.write(context.files.jobDir, failed)
             context.onStatus("PIPELINE_FAILED: Native RAW ISP failed; RAW cache kept. $status")
             return RawFusionProcessResult(
                 success = false,
@@ -2256,7 +2286,7 @@ private fun computeRawWhiteBalanceGains(source: Bitmap, cameraGains: FloatArray?
             .put("sensorOrientation", context.job.opt("sensorOrientation") ?: JSONObject.NULL)
             .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
             .put("processedAt", System.currentTimeMillis())
-        context.files.jobFile.writeText(updated.toString(2))
+        KeplerJobMetadata.write(context.files.jobDir, updated)
         return RawFusionProcessResult(
             success = true,
             mergedRawFile = context.files.mergedRawFile,
@@ -2804,7 +2834,7 @@ internal fun loadRawRgbaBitmap(file: File, width: Int, height: Int): Bitmap {
             }
         }
         return bitmap
-    } catch (t: Throwable) {
+    } catch (t: Exception) {
         bitmap.takeUnless { it.isRecycled }?.recycle()
         throw t
     }

@@ -116,7 +116,7 @@ internal fun processClassicYuvFusionJob(
             job.put("currentPipelineStage", stage)
                 .put("processStatus", status)
                 .put("processingStartedAt", processingStartedAt)
-            jobFile.writeText(job.toString(2))
+            KeplerJobMetadata.write(jobDir, job)
             Log.i("KeplerYuvPipeline", "$stage: $status")
             onStatus(status)
         }
@@ -127,7 +127,7 @@ internal fun processClassicYuvFusionJob(
         cancellation.throwIfCancelled()
         preflight = preflightSummary
         job.put("yuvProcessingPreflight", preflightSummary.toJson())
-        jobFile.writeText(job.toString(2))
+        KeplerJobMetadata.write(jobDir, job)
         cancellation.throwIfCancelled()
         val candidateFrames = loadClassicFrames(jobDir, job)
         cancellation.throwIfCancelled()
@@ -384,7 +384,7 @@ internal fun processClassicYuvFusionJob(
         }
         cancellation.throwIfCancelled()
         File(jobDir, "yuv_debug.json").writeText(job.toString(2))
-        jobFile.writeText(job.toString(2))
+        KeplerJobMetadata.write(jobDir, job)
         cancellation.throwIfCancelled()
         onStatus("처리가 완료되었습니다.")
         return finalFile
@@ -849,7 +849,7 @@ private fun finishClassicFusion(
         tileTop = tileBottom
     }
     return outputBitmap
-    } catch (t: Throwable) {
+    } catch (t: Exception) {
         outputBitmap.recycle()
         throw t
     }
@@ -1232,7 +1232,7 @@ private fun recordClassicFailure(
                 .put("yuvProcessingSameSizeFrames", it.sameSizeFrames)
                 .put("yuvProcessingCompatibleFrames", it.compatibleFrames)
         }
-        jobFile.writeText(job.toString(2))
+        KeplerJobMetadata.write(jobDir, job)
     }
 }
 

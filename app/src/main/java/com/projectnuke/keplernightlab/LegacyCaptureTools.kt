@@ -1558,7 +1558,7 @@ fun averageLatestYuvBurstGray(
                 .put("averageUsedFrames", usedFrames)
                 .put("processedAt", System.currentTimeMillis())
 
-            jobFile.writeText(updatedJob.toString(2))
+            KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), updatedJob)
 
             postStatus(
                 "YUV 평균 합성 완료\n" +

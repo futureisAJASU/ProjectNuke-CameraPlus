@@ -79,7 +79,7 @@ fun loadJobJson(jobDir: File): JSONObject =
     KeplerJobMetadata.read(jobDir)
 
 fun saveJobJson(jobDir: File, job: JSONObject) {
-    KeplerJobMetadata.write(jobDir, job)
+    KeplerJobMetadata.replace(jobDir, job)
 }
 
 fun setFrameExcluded(jobDir: File, frameIndex: Int, excluded: Boolean) {
@@ -133,7 +133,10 @@ private const val STALE_JOB_RECOVERY_AGE_MILLIS = 15 * 60 * 1000L
 private fun recoverStaleInterruptedJob(directory: File) {
     val job = runCatching { KeplerJobMetadata.read(directory) }.getOrNull() ?: return
     val status = job.optString("status").uppercase()
-    if (status !in setOf("CAPTURING", "PROCESSING")) return
+    val processStatus = job.optString("processStatus").uppercase()
+    val pipelineStage = job.optString("currentPipelineStage").uppercase()
+    val active = setOf("CAPTURING", "PROCESSING")
+    if (status !in active && processStatus !in active && pipelineStage !in active) return
     val updatedAt = job.optLong("updatedAt", job.optLong("createdAt", 0L))
     if (updatedAt <= 0L || System.currentTimeMillis() - updatedAt < STALE_JOB_RECOVERY_AGE_MILLIS) return
     runCatching {

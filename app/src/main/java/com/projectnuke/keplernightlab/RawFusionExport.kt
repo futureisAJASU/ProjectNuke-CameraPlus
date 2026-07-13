@@ -487,7 +487,7 @@ private fun updateRawNativeQualityDiagnostics(jobDir: File, bitmap: Bitmap) {
                 "qualityDiagnosticNativeLimitedReason",
                 "Native RGBA path only exposes final display bitmap to Kotlin export stage."
             )
-        jobFile.writeText(job.toString(2))
+        KeplerJobMetadata.write(jobDir, job)
         referencePreview.recycle()
         finalPreview.recycle()
     }

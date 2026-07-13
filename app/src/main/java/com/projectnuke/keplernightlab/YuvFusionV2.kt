@@ -166,7 +166,7 @@ internal fun processYuvFusionJobV2(
             finalFile
         } catch (ce: CancellationException) {
             throw ce
-        } catch (t: Throwable) {
+        } catch (t: Exception) {
             val failureMessage = t.message?.takeIf { it.isNotBlank() } ?: t.javaClass.simpleName
             runCatching {
                 writeYuvFusionV2Metadata(
@@ -264,7 +264,7 @@ internal fun processYuvFusionJobV2(
         finalFile
     } catch (ce: CancellationException) {
         throw ce
-    } catch (t: Throwable) {
+        } catch (t: Exception) {
         cancellation.throwIfCancelled()
         val finalFile = processClassicYuvFusionJob(
             jobDir = jobDir,

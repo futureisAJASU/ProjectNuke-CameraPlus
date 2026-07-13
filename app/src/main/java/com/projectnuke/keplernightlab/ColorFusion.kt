@@ -119,7 +119,7 @@ private fun persistYuvCaptureFailure(
             .put("yuvRgbMatrix", DEFAULT_YUV_RGB_MATRIX.name)
             .put("frames", framesArray)
             .put("updatedAt", System.currentTimeMillis())
-        jobFile.writeText(job.toString(2))
+        KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
     }.onFailure { persistError ->
         Log.w(YUV_CAPTURE_LOG_TAG, "Failed to persist YUV capture failure metadata", persistError)
     }
@@ -1104,7 +1104,7 @@ private fun writeBitmapToTempPng(bitmap: Bitmap, finalFile: File) {
             output.fd.sync()
         }
         KeplerJobMetadata.atomicReplace(tempFile, finalFile)
-    } catch (t: Throwable) {
+    } catch (t: Exception) {
         runCatching {
             if (tempFile.exists()) {
                 tempFile.delete()
@@ -1257,7 +1257,7 @@ fun averageLatestYuvBurstColor(
                 .put("averageUsedFrames", usedFrames)
                 .put("processedAt", System.currentTimeMillis())
 
-            jobFile.writeText(updatedJob.toString(2))
+            KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), updatedJob)
 
             postStatus(
                 "컬러 평균 합성 완료\n" +
@@ -1589,7 +1589,7 @@ private fun updateYuvCaptureRequestTemplateMetadata(
             .put("yuvCaptureRequestTemplateFallbackUsed", fallbackUsed)
             .put("yuvCaptureRequestTemplateFailures", JSONArray(failures.take(6)))
             .put("updatedAt", System.currentTimeMillis())
-        jobFile.writeText(job.toString(2))
+        KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
     }
 }
 

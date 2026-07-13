@@ -82,6 +82,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Job
 import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
@@ -388,11 +389,19 @@ fun MainCameraScreen(
     var latestResult by remember { mutableStateOf<LatestKeplerResult?>(null) }
     var showResultPreview by remember { mutableStateOf(false) }
     val cameraScope = rememberCoroutineScope()
+    var refreshGeneration by remember { mutableIntStateOf(0) }
+    var refreshJob by remember { mutableStateOf<Job?>(null) }
 
     fun refreshLatestResult(showPreview: Boolean = false) {
-        cameraScope.launch {
+        val generation = ++refreshGeneration
+        refreshJob?.cancel()
+        refreshJob = cameraScope.launch {
             val (result, estimate) = withContext(Dispatchers.IO) {
                 loadLatestKeplerResultV2(context) to estimateLatestColorBurstScene(context)
+            }
+            if (generation != refreshGeneration) {
+                result.bitmap?.takeIf { !it.isRecycled }?.recycle()
+                return@launch
             }
             latestBitmap?.takeIf { it !== result.bitmap && !it.isRecycled }?.recycle()
             latestBitmap = result.bitmap
@@ -405,7 +414,11 @@ fun MainCameraScreen(
     }
 
     DisposableEffect(Unit) {
-        onDispose { latestBitmap?.takeIf { !it.isRecycled }?.recycle() }
+        onDispose {
+            ++refreshGeneration
+            refreshJob?.cancel()
+            latestBitmap?.takeIf { !it.isRecycled }?.recycle()
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -656,7 +669,7 @@ fun MainCameraScreen(
                         finishIfTerminal(newStatus)
                     })
                 } catch (_: CancellationException) {
-                } catch (t: Throwable) {
+                } catch (t: Exception) {
                     Log.e("KeplerPipelineState", "pipeline crashed generation=$localGeneration", t)
                     if (localGeneration == pipelineGeneration) {
                         finishIfTerminal("PIPELINE_FAILED: ${t.javaClass.simpleName}")
