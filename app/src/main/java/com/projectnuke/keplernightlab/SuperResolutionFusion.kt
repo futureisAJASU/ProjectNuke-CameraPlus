@@ -17,6 +17,7 @@ import java.text.SimpleDateFormat
 import java.util.concurrent.CancellationException
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -1207,7 +1208,7 @@ private fun writeSuperResolutionJob(
         .put("reason", reason ?: JSONObject.NULL)
         .put("failureMessage", if (status == "FAILED") result.message else JSONObject.NULL)
         .put("message", result.message)
-    File(request.outputDir, SUPER_RES_JOB_FILE).writeText(job.toString(2))
+    KeplerJobMetadata.write(request.outputDir, job)
 }
 
 private fun readColorBurstFrameFiles(jobDir: File): List<File> {
@@ -1229,16 +1230,23 @@ private fun createSuperResolutionJobDirectory(context: Context): File {
     val root = File(picturesDir, "KeplerSuperRes")
     check(root.exists() || root.mkdirs()) { "Could not create KeplerSuperRes directory." }
     val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-    return File(root, "KPL_SUPER_RES_$timestamp").also {
+    return File(root, "KPL_SUPER_RES_${timestamp}_${UUID.randomUUID().toString().take(8)}").also {
         check(it.exists() || it.mkdirs()) { "Could not create SuperRes job directory." }
     }
 }
 
 private fun saveJpeg(bitmap: Bitmap, outputFile: File, quality: Int = JPEG_QUALITY) {
-    FileOutputStream(outputFile).use { output ->
+    val temporary = File(outputFile.parentFile, ".${outputFile.name}.${System.nanoTime()}.tmp")
+    try {
+        FileOutputStream(temporary).use { output ->
         check(bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
             "JPEG encode failed."
         }
+            output.fd.sync()
+        }
+        KeplerJobMetadata.atomicReplace(temporary, outputFile)
+    } finally {
+        if (temporary.exists()) temporary.delete()
     }
 }
 

@@ -6,6 +6,10 @@
    See https://developer.android.com/about/versions/12/backup-restore
 -->
 <full-backup-content>
+    <exclude domain="external" path="Pictures/KeplerRawFusion" />
+    <exclude domain="external" path="Pictures/KeplerYuvFusion" />
+    <exclude domain="external" path="Pictures/KeplerColorBurst" />
+    <exclude domain="external" path="Pictures/KeplerSuperRes" />
     <!--
    <include domain="sharedpref" path="."/>
    <exclude domain="sharedpref" path="device.xml"/>

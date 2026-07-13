@@ -61,6 +61,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -78,6 +79,9 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
@@ -383,19 +387,25 @@ fun MainCameraScreen(
     var latestSummary by remember { mutableStateOf("최근 결과 없음") }
     var latestResult by remember { mutableStateOf<LatestKeplerResult?>(null) }
     var showResultPreview by remember { mutableStateOf(false) }
+    val cameraScope = rememberCoroutineScope()
 
     fun refreshLatestResult(showPreview: Boolean = false) {
-        val result = loadLatestKeplerResultV2(context)
-        latestBitmap?.takeIf { it !== result.bitmap && !it.isRecycled }?.recycle()
-        latestBitmap = result.bitmap
-        latestSummary = result.summary
-        latestResult = result
-        if (showPreview && result.fileName.isNotBlank()) {
-            showResultPreview = true
+        cameraScope.launch {
+            val (result, estimate) = withContext(Dispatchers.IO) {
+                loadLatestKeplerResultV2(context) to estimateLatestColorBurstScene(context)
+            }
+            latestBitmap?.takeIf { it !== result.bitmap && !it.isRecycled }?.recycle()
+            latestBitmap = result.bitmap
+            latestSummary = result.summary
+            latestResult = result
+            if (showPreview && result.fileName.isNotBlank()) showResultPreview = true
+            latestSceneLuma = estimate.meanLuma
+            latestMotionScore = estimate.motionScore
         }
-        val estimate = estimateLatestColorBurstScene(context)
-        latestSceneLuma = estimate.meanLuma
-        latestMotionScore = estimate.motionScore
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { latestBitmap?.takeIf { !it.isRecycled }?.recycle() }
     }
 
     LaunchedEffect(Unit) {
@@ -646,6 +656,11 @@ fun MainCameraScreen(
                         finishIfTerminal(newStatus)
                     })
                 } catch (_: CancellationException) {
+                } catch (t: Throwable) {
+                    Log.e("KeplerPipelineState", "pipeline crashed generation=$localGeneration", t)
+                    if (localGeneration == pipelineGeneration) {
+                        finishIfTerminal("PIPELINE_FAILED: ${t.javaClass.simpleName}")
+                    }
                 }
         }
         activeJobStart.set(jobStart)
@@ -880,12 +895,8 @@ fun MainCameraScreen(
                         Log.i("KeplerPipelineState", "average/reprocess ignored while busy status=$status")
                         return@average
                     }
-                    status = "최근 촬영 컬러 합성 시작..."
-                    processLatestNightFusionV02(context) { newStatus ->
-                        status = newStatus
-                        if (isTerminalStatus(newStatus)) {
-                            refreshLatestResult()
-                        }
+                    runCameraJob("최근 촬영 컬러 합성 시작...") { cancellation, _, callback ->
+                        processLatestNightFusionV02(context, cancellation) { callback(it) }
                     }
                 },
                 onRaw = {
@@ -2402,7 +2413,8 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
         val latestJobs = listOf(
             File(picturesDir, "KeplerYuvFusion") to "KPL_YUV_FUSION_",
             File(picturesDir, "KeplerColorBurst") to "KPL_COLOR_BURST_",
-            File(picturesDir, "KeplerRawFusion") to "KPL_RAW_FUSION_"
+            File(picturesDir, "KeplerRawFusion") to "KPL_RAW_FUSION_",
+            File(picturesDir, "KeplerSuperRes") to "KPL_SUPER_RES_"
         ).flatMap { (root, prefix) ->
             root.listFiles()
                 ?.filter { it.isDirectory && it.name.startsWith(prefix) && File(it, "job.json").exists() }
@@ -2496,18 +2508,24 @@ private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
     }
     val names = listOf(
         job.optString("finalFile", ""),
+        job.optString("outputFile", ""),
+        job.optString("galleryDisplayFile", ""),
         job.optString("previewFile", ""),
         job.optString("finalNightFusionFile", ""),
         "sharpened_night_fusion.png",
         "raw_fusion_final.png",
-        "average_color_rotated.png",
-        "compare_reference_vs_fused.png"
+        "average_color_rotated.png"
     )
     return names
         .asSequence()
         .filter { it.isNotBlank() && it != "null" }
         .map { File(jobDir, it) }
-        .firstOrNull { it.exists() && it.length() > 0L }
+        .firstOrNull {
+            it.exists() && it.length() > 0L &&
+                it.extension.lowercase() in setOf("jpg", "jpeg", "png", "heic", "webp") &&
+                !it.name.contains("compare", ignoreCase = true) &&
+                !it.name.contains("debug", ignoreCase = true)
+        }
 }
 
 private fun decodeNativeRgbaPreview(

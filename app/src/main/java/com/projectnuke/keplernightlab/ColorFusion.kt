@@ -33,6 +33,7 @@ import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 
@@ -369,7 +370,10 @@ fun captureYuvBurstColorWithMotion(
         var actualCaptureRoute: PhysicalCaptureRoute? = null
         fun actualPhysicalCameraId(): String? =
             if (actualCaptureRoute == PhysicalCaptureRoute.PHYSICAL) physicalCameraId else null
-        val rotationDegrees = calculateResultRotationDegrees(characteristics)
+        val rotationDegrees = calculateResultRotationDegrees(
+            characteristics,
+            context.display?.rotation ?: Surface.ROTATION_0
+        )
 
         postStatus("Color Fusion 초기화 2/7: 저장 폴더 준비 중...")
 
@@ -401,11 +405,11 @@ fun captureYuvBurstColorWithMotion(
         }
 
         val burstTimestamp = SimpleDateFormat(
-            "yyyyMMdd_HHmmss",
+            "yyyyMMdd_HHmmss_SSS",
             Locale.US
         ).format(Date())
 
-        val currentBurstDir = File(keplerDir, "KPL_YUV_FUSION_$burstTimestamp").apply {
+        val currentBurstDir = File(keplerDir, "KPL_YUV_FUSION_${burstTimestamp}_${UUID.randomUUID().toString().take(8)}").apply {
             if (!exists()) {
                 val ok = mkdirs()
                 if (!ok && !exists()) {
@@ -1087,11 +1091,11 @@ private fun ensureSufficientSpaceForYuvBurstPngs(
             outputWidth.toLong() * outputHeight.toLong() *
                 YUV_RGB_STORAGE_BYTES_PER_PIXEL_ESTIMATE * frameCount
         availableBytes >= estimatedBytes
-    }.getOrDefault(true)
+    }.getOrDefault(false)
 }
 
 private fun writeBitmapToTempPng(bitmap: Bitmap, finalFile: File) {
-    val tempFile = File(finalFile.parentFile, "${finalFile.name}.tmp")
+    val tempFile = File(finalFile.parentFile, ".${finalFile.name}.${System.nanoTime()}.tmp")
     try {
         FileOutputStream(tempFile).use { output ->
             if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
@@ -1099,12 +1103,7 @@ private fun writeBitmapToTempPng(bitmap: Bitmap, finalFile: File) {
             }
             output.fd.sync()
         }
-        if (finalFile.exists() && !finalFile.delete()) {
-            throw IllegalStateException("Failed to replace existing file: ${finalFile.name}")
-        }
-        if (!tempFile.renameTo(finalFile)) {
-            throw IllegalStateException("Failed to rename temp file to ${finalFile.name}")
-        }
+        KeplerJobMetadata.atomicReplace(tempFile, finalFile)
     } catch (t: Throwable) {
         runCatching {
             if (tempFile.exists()) {
@@ -1425,7 +1424,8 @@ fun rotateBitmapIfNeeded(
 }
 
 fun calculateResultRotationDegrees(
-    characteristics: CameraCharacteristics
+    characteristics: CameraCharacteristics,
+    displayRotation: Int = Surface.ROTATION_0
 ): Int {
     val sensorOrientation = characteristics.get(
         CameraCharacteristics.SENSOR_ORIENTATION
@@ -1435,10 +1435,16 @@ fun calculateResultRotationDegrees(
         CameraCharacteristics.LENS_FACING
     )
 
+    val displayDegrees = when (displayRotation) {
+        Surface.ROTATION_90 -> 90
+        Surface.ROTATION_180 -> 180
+        Surface.ROTATION_270 -> 270
+        else -> 0
+    }
     return if (lensFacing == CameraCharacteristics.LENS_FACING_FRONT) {
-        (360 - sensorOrientation) % 360
+        (sensorOrientation + displayDegrees) % 360
     } else {
-        sensorOrientation % 360
+        (sensorOrientation - displayDegrees + 360) % 360
     }
 }
 
@@ -1789,5 +1795,5 @@ fun writeColorJobJson(
         json.put("createdAt", oldCreatedAt)
     }
 
-    jobFile.writeText(json.toString(2))
+    KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), json)
 }

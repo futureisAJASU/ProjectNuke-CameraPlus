@@ -101,6 +101,7 @@ fun captureProcessExportRawNightFusion(
         routeFallbackReason = routeFallbackReason,
         focusAeState = focusAeState,
         rawSpeedMode = rawSpeedMode,
+        saveDngSidecars = finalOutputFormat.shouldExportRawSidecar,
         captureCancellationHandle = captureCancellationHandle,
         onStatus = { post(it) },
         onComplete = { jobDir ->
@@ -324,12 +325,14 @@ fun reprocessRawJob(
     jobDir: File,
     finalOutputFormat: FinalOutputFormat,
     selectedFrameIndices: Set<Int>? = null,
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ) {
     val main = Handler(Looper.getMainLooper())
     fun post(message: String) = main.post { onStatus(message) }
     val thread = HandlerThread("KeplerRawReprocessThread").apply { start() }
     Handler(thread.looper).post {
+        cancellation.throwIfCancelled()
         if (selectedFrameIndices != null) {
             applyExplicitFrameSelection(jobDir, selectedFrameIndices)
         }
@@ -351,7 +354,8 @@ fun reprocessRawJob(
             val process = processRawFusionJob(
                 context = context,
                 jobDir = jobDir,
-                saveNativeMp24DebugPng = finalOutputFormat.isDebugPng
+                saveNativeMp24DebugPng = finalOutputFormat.isDebugPng,
+                cancellation = cancellation
             ) { post(it) }
             if (!process.success || !process.hasExportableBitmapSource()) {
                 val reason = process.errorMessage ?: "RAW fusion process failed"
@@ -380,7 +384,8 @@ fun reprocessRawJob(
                     displayNameBase = "Kepler_RAW_REPROCESS_${
                         SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                     }",
-                    requestedFormat = requestedFormat
+                    requestedFormat = requestedFormat,
+                    cancellation = cancellation
                 )
             } finally {
                 exportBitmap?.takeUnless { it.isRecycled }?.recycle()
@@ -403,6 +408,8 @@ fun reprocessRawJob(
             )
             updateReprocessHistory(jobDir, enabledCount, totalCount - enabledCount, "SUCCESS")
             post("RAW reprocess complete: used $enabledCount frames; source frames kept.")
+        } catch (_: CancellationException) {
+            post("PIPELINE_CANCELLED: RAW reprocess cancelled; source frames kept.")
         } catch (oom: OutOfMemoryError) {
             updateReprocessHistory(jobDir, enabledCount, totalCount - enabledCount, "FAILED_OUT_OF_MEMORY")
             post("RAW reprocess failed: out of memory; source frames kept.")

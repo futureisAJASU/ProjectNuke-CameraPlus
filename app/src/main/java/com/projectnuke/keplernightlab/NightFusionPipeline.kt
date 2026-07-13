@@ -196,6 +196,7 @@ fun reprocessYuvJob(
     finalOutputFormat: FinalOutputFormat,
     selectedFrameIndices: Set<Int>? = null,
     fusionParams: ClassicYuvFusionParams? = null,
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
@@ -206,6 +207,7 @@ fun reprocessYuvJob(
         var totalFrames = 0
         var enabledFrames = 0
         try {
+            cancellation.throwIfCancelled()
             if (selectedFrameIndices != null) {
                 applyExplicitYuvFrameSelection(jobDir, selectedFrameIndices)
             }
@@ -238,7 +240,8 @@ fun reprocessYuvJob(
             val finalFile = processNightFusionJobV02Sync(
                 jobDir = jobDir,
                 onStatus = { post(it) },
-                requestedParams = fusionParams
+                requestedParams = fusionParams,
+                cancellation = cancellation
             )
             post("YUV reprocess: exporting...")
             val bitmap = BitmapFactory.decodeFile(finalFile.absolutePath)
@@ -251,7 +254,8 @@ fun reprocessYuvJob(
                     displayNameBase = "Kepler_YUV_REPROCESS_${
                         SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                     }",
-                    requestedFormat = requestedFormat
+                    requestedFormat = requestedFormat,
+                    cancellation = cancellation
                 )
             } finally {
                 bitmap.recycle()
@@ -275,6 +279,8 @@ fun reprocessYuvJob(
                 "PIPELINE_COMPLETE: YUV reprocess saved ${export.formatUsed.label}; " +
                     "used $enabledFrames/$totalFrames frames; cache kept."
             )
+        } catch (_: CancellationException) {
+            post("PIPELINE_CANCELLED: YUV reprocess cancelled; source frames kept.")
         } catch (e: Exception) {
             runCatching {
                 updateYuvReprocessHistory(

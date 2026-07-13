@@ -473,6 +473,10 @@ private class CameraPreviewController(
                 )
             )
         } catch (error: Exception) {
+            if (!isActive(localGeneration)) {
+                Log.d(TAG, "late physical preview failure ignored generation=$localGeneration")
+                return
+            }
             Log.e(
                 "KeplerPhysicalRoute",
                 "sessionMode=physicalOutput create failed cameraId=$cameraId " +

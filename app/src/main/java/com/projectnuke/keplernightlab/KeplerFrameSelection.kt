@@ -84,7 +84,7 @@ class RuleBasedFrameSelectionAdvisor : FrameSelectionAdvisor {
         val sorted = scored.sortedByDescending { it.second }
         val initialIncluded = sorted.filter { shouldKeepByRule(it.first, it.second) }.map { it.first.index }.toMutableSet()
         if (initialIncluded.isEmpty()) {
-            initialIncluded += sorted.take(maxOf(minimumKeep, validFrames.size)).map { it.first.index }
+            initialIncluded += sorted.take(minimumKeep).map { it.first.index }
         }
         if (initialIncluded.size < minimumKeep) {
             initialIncluded += sorted.take(minimumKeep).map { it.first.index }
@@ -123,6 +123,7 @@ class RuleBasedFrameSelectionAdvisor : FrameSelectionAdvisor {
     }
 }
 
+@Deprecated("Current implementation is rule-based, not AI. Use RuleBasedFrameSelectionAdvisor.")
 class AiFrameSelectionAdvisor(
     private val fallback: FrameSelectionAdvisor = RuleBasedFrameSelectionAdvisor()
 ) : FrameSelectionAdvisor {
@@ -132,7 +133,7 @@ class AiFrameSelectionAdvisor(
     ): FrameSelectionRecommendation {
         val base = fallback.recommend(job, frames)
         return base.copy(
-            mode = FrameSelectionMode.AI_RECOMMENDED,
+            mode = FrameSelectionMode.AUTO_RULE_BASED,
             summary = "AI 추천 자리표시자입니다. 현재는 규칙 기반 선택을 검토용으로만 제안합니다.",
             confidence = (base.confidence + 0.08f).coerceAtMost(0.75f)
         )

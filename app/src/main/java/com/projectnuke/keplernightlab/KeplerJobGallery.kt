@@ -76,10 +76,10 @@ data class KeplerGalleryFrame(
 }
 
 fun loadJobJson(jobDir: File): JSONObject =
-    JSONObject(File(jobDir, JOB_JSON_FILE_NAME).readText())
+    KeplerJobMetadata.read(jobDir)
 
 fun saveJobJson(jobDir: File, job: JSONObject) {
-    File(jobDir, JOB_JSON_FILE_NAME).writeText(job.toString(2))
+    KeplerJobMetadata.write(jobDir, job)
 }
 
 fun setFrameExcluded(jobDir: File, frameIndex: Int, excluded: Boolean) {
@@ -124,7 +124,27 @@ fun loadKeplerGalleryJobs(context: Context): List<KeplerGalleryJobSummary> {
         root.listFiles()
             ?.filter { it.isDirectory && matchesJobPrefix(root, it.name) }
             .orEmpty()
-    }.map(::readKeplerGalleryJob).sortedByDescending { it.createdAt }
+    }.onEach(::recoverStaleInterruptedJob).map(::readKeplerGalleryJob).sortedByDescending { it.createdAt }
+}
+
+private const val STALE_JOB_RECOVERY_AGE_MILLIS = 15 * 60 * 1000L
+
+/** Jobs have no live worker after process death; stale in-progress metadata must not remain active forever. */
+private fun recoverStaleInterruptedJob(directory: File) {
+    val job = runCatching { KeplerJobMetadata.read(directory) }.getOrNull() ?: return
+    val status = job.optString("status").uppercase()
+    if (status !in setOf("CAPTURING", "PROCESSING")) return
+    val updatedAt = job.optLong("updatedAt", job.optLong("createdAt", 0L))
+    if (updatedAt <= 0L || System.currentTimeMillis() - updatedAt < STALE_JOB_RECOVERY_AGE_MILLIS) return
+    runCatching {
+        KeplerJobMetadata.update(directory) {
+            it.put("status", "INTERRUPTED")
+                .put("processStatus", "INTERRUPTED")
+                .put("interruptedAt", System.currentTimeMillis())
+                .put("interruptionReason", "App process was not running when stale job was recovered.")
+                .put("updatedAt", System.currentTimeMillis())
+        }
+    }
 }
 
 data class KeplerGalleryStorageSummary(
@@ -232,7 +252,8 @@ private fun keplerGalleryRoots(context: Context): List<File> {
     return listOf(
         File(pictures, "KeplerRawFusion"),
         File(pictures, "KeplerYuvFusion"),
-        File(pictures, "KeplerColorBurst")
+        File(pictures, "KeplerColorBurst"),
+        File(pictures, "KeplerSuperRes")
     )
 }
 
@@ -241,7 +262,8 @@ private fun cleanupSafeRoots(context: Context): List<File> {
     return listOf(
         File(pictures, "KeplerRawFusion"),
         File(pictures, "KeplerYuvFusion"),
-        File(pictures, "KeplerColorBurst")
+        File(pictures, "KeplerColorBurst"),
+        File(pictures, "KeplerSuperRes")
     )
 }
 
@@ -258,6 +280,7 @@ private fun matchesJobPrefix(root: File, name: String): Boolean = when (root.nam
     "KeplerRawFusion" -> name.startsWith("KPL_RAW_FUSION_")
     "KeplerYuvFusion" -> name.startsWith("KPL_YUV_FUSION_")
     "KeplerColorBurst" -> name.startsWith("KPL_COLOR_BURST_")
+    "KeplerSuperRes" -> name.startsWith("KPL_SUPER_RES_")
     else -> false
 }
 
@@ -293,6 +316,8 @@ private fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
             "RAW_NIGHT_FUSION"
         rawType == "YUV_NIGHT_FUSION" || directory.name.startsWith("KPL_YUV_FUSION_") ->
             "YUV_NIGHT_FUSION"
+        rawType == "SUPER_RESOLUTION" || rawType == "SUPER_RESOLUTION_FUSION" || directory.name.startsWith("KPL_SUPER_RES_") ->
+            "SUPER_RESOLUTION"
         else -> "COLOR/YUV"
     }
     val exportExists = finalPreview != null ||
@@ -323,30 +348,46 @@ private fun computeKeplerJobStorage(
     job: JSONObject?,
     finalPreview: File?
 ): KeplerJobStorageInfo {
-    val files = directory.walkTopDown().filter { it.isFile }.toList()
-    val finalNames = setOfNotNull(
+    var totalBytes = 0L
+    var fileCount = 0
+    val encodedFinalNames = setOfNotNull(
         finalPreview?.name,
         job?.optString("galleryDisplayFile").orEmpty().ifBlank { null },
         job?.optString("finalNightFusionFile").orEmpty().ifBlank { null },
         job?.optString("finalFile").orEmpty().ifBlank { null },
-        job?.optString("outputFile").orEmpty().ifBlank { null },
+        job?.optString("outputFile").orEmpty().ifBlank { null }
+    )
+    val finalNames = if (encodedFinalNames.isNotEmpty()) encodedFinalNames else setOfNotNull(
         job?.optString("nativePostprocessRgbaFile").orEmpty().ifBlank { null }
     )
-    val finalBytes = files.filter { it.name in finalNames }.sumOf { it.length() }
-    val rawBytes = files.filter { isSourceFrame(it) }.sumOf { it.length() }
-    val debugBytes = files.filter { isDebugFile(it, finalNames) }.sumOf { it.length() }
-    val previewBytes = files.filter { isPreviewFile(it, finalNames) }.sumOf { it.length() }
-    val cacheBytes = files.filter { isCacheFile(it, finalNames) }.sumOf { it.length() }
-    val intermediateBytes = files.filter { isIntermediateFile(it, finalNames) }.sumOf { it.length() }
-    val totalBytes = files.sumOf { it.length() }
-    val cleanableBytes = files
-        .filter {
-            it.name != JOB_JSON_FILE_NAME &&
-                it.name !in finalNames &&
-                (isSourceFrame(it) || isDebugFile(it, finalNames) || isPreviewFile(it, finalNames) ||
-                    isCacheFile(it, finalNames) || isIntermediateFile(it, finalNames))
+    var finalBytes = 0L
+    var rawBytes = 0L
+    var debugBytes = 0L
+    var previewBytes = 0L
+    var cacheBytes = 0L
+    var intermediateBytes = 0L
+    var cleanableBytes = 0L
+    directory.walkTopDown().forEach { file ->
+        if (!file.isFile) return@forEach
+        val bytes = file.length()
+        totalBytes += bytes
+        fileCount++
+        val isFinal = file.name in finalNames
+        val source = isSourceFrame(file)
+        val debug = isDebugFile(file, finalNames)
+        val preview = isPreviewFile(file, finalNames)
+        val cache = isCacheFile(file, finalNames)
+        val intermediate = isIntermediateFile(file, finalNames)
+        if (isFinal) finalBytes += bytes
+        if (source) rawBytes += bytes
+        if (debug) debugBytes += bytes
+        if (preview) previewBytes += bytes
+        if (cache) cacheBytes += bytes
+        if (intermediate) intermediateBytes += bytes
+        if (file.name != JOB_JSON_FILE_NAME && !isFinal && (source || debug || preview || cache || intermediate)) {
+            cleanableBytes += bytes
         }
-        .sumOf { it.length() }
+    }
     return KeplerJobStorageInfo(
         totalJobBytes = totalBytes,
         totalJobSizeText = formatBytes(totalBytes),
@@ -358,7 +399,7 @@ private fun computeKeplerJobStorage(
         previewFilesBytes = previewBytes,
         cacheFilesBytes = cacheBytes,
         cleanableBytes = cleanableBytes,
-        fileCount = files.size
+        fileCount = fileCount
     )
 }
 
@@ -373,9 +414,10 @@ private fun maybePersistStorageMetadata(
         job.optInt("fileCount", -1) == storage.fileCount
     ) return
     runCatching {
-        putStorageMetadata(job, storage)
-            .put("storageScannedAt", System.currentTimeMillis())
-        saveJobJson(directory, job)
+        KeplerJobMetadata.update(directory) {
+            putStorageMetadata(it, storage)
+                .put("storageScannedAt", System.currentTimeMillis())
+        }
     }
 }
 
@@ -400,7 +442,6 @@ private fun finalFilesForCleanup(directory: File, job: JSONObject?): Set<File> {
         job?.optString("finalNightFusionFile").orEmpty().ifBlank { null },
         job?.optString("finalFile").orEmpty().ifBlank { null },
         job?.optString("outputFile").orEmpty().ifBlank { null },
-        job?.optString("nativePostprocessRgbaFile").orEmpty().ifBlank { null },
         resolveFinalPreview(directory, job)?.name
     )
     return names.mapNotNull { name -> File(directory, name).takeIf { it.isFile }?.canonicalFile }.toSet()
@@ -448,9 +489,9 @@ private fun isRequiredSourceOnlyMetadata(file: File): Boolean {
 private fun isDebugFile(file: File, finalNames: Set<String>): Boolean {
     val name = file.name.lowercase()
     if (file.name in finalNames) return false
-    return name.contains("debug") ||
+    return name in setOf("raw_render_debug.json", "fusion_debug.json", "yuv_debug.json", "alignment_debug.json") ||
+        name.contains("debug") ||
         name.contains("compare") ||
-        name.endsWith(".json") ||
         name.endsWith(".log")
 }
 
@@ -528,7 +569,6 @@ private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
     File(directory, explicit).takeIf { explicit.isNotBlank() && it.isFile && !isDebugPreviewFinalBlocked(it.name) }
         ?.let { return it }
     val keys = listOf(
-        "nativePostprocessRgbaFile",
         "finalNightFusionFile",
         "finalFile",
         "outputFile"
@@ -539,7 +579,7 @@ private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
             name.isNotBlank() &&
                 it.isFile &&
                 !isDebugPreviewFinalBlocked(it.name) &&
-                (it.extension.equals("png", true) || it.extension.equals("jpg", true) || it.extension.equals("jpeg", true) || it.extension.equals("rgba", true))
+                (it.extension.equals("png", true) || it.extension.equals("jpg", true) || it.extension.equals("jpeg", true) || it.extension.equals("heic", true) || it.extension.equals("webp", true))
         }
             ?.let { return it }
     }

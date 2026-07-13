@@ -33,6 +33,7 @@ import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.text.SimpleDateFormat
+import java.util.UUID
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.CancellationException
@@ -42,7 +43,6 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
 
-private const val SAVE_RAW_FUSION_DNG_SIDECARS = false
 private const val RAW_RENDER_VERSION = "native_raw_isp_v0.3"
 private const val RAW_RENDER_SHARPEN_AMOUNT = 0.12f
 private const val RAW_RENDER_DENOISE_STRENGTH = 0.35f
@@ -99,6 +99,7 @@ fun captureRawBurstForFusion(
     routeFallbackReason: String? = null,
     focusAeState: FocusAeState = FocusAeState(),
     rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
+    saveDngSidecars: Boolean = false,
     captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     onStatus: (String) -> Unit,
     onComplete: (File) -> Unit,
@@ -122,6 +123,7 @@ fun captureRawBurstForFusion(
     val finished = AtomicBoolean(false)
     val cleanupStarted = AtomicBoolean(false)
     val imagesByTimestamp = mutableMapOf<Long, Image>()
+    val imageArrivalMillis = mutableMapOf<Long, Long>()
     val resultsByTimestamp = mutableMapOf<Long, TotalCaptureResult>()
     val savedTimestamps = mutableSetOf<Long>()
     var failedCaptures = 0
@@ -143,6 +145,7 @@ fun captureRawBurstForFusion(
         runCatching { reader?.setOnImageAvailableListener(null, null) }
         imagesByTimestamp.values.forEach { runCatching { it.close() } }
         imagesByTimestamp.clear()
+        imageArrivalMillis.clear()
         resultsByTimestamp.clear()
         try { session?.abortCaptures() } catch (_: Exception) {}
         try { session?.stopRepeating() } catch (_: Exception) {}
@@ -193,7 +196,7 @@ fun captureRawBurstForFusion(
                 job.put("maxResolutionPixelModeFailure", maxResolutionPixelModeFailure)
             }
             if (error != null) job.put("failureReason", error)
-            jobFile.writeText(job.toString(2))
+            KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
         }
     }
 
@@ -212,14 +215,9 @@ fun captureRawBurstForFusion(
             null
         }
         if (frameClampReason != null) post(frameClampReason)
-        val saveDngSidecars = SAVE_RAW_FUSION_DNG_SIDECARS && !highResolutionRaw
-        val dngSidecarSkipReason = if (saveDngSidecars) {
-            null
-        } else if (!SAVE_RAW_FUSION_DNG_SIDECARS) {
-            "Per-frame DNG sidecars disabled by default for RAW Night Fusion; compact raw16 retained."
-        } else {
-            "v0 memory/storage policy: per-frame DNG disabled for 50MP-class high-resolution RAW; compact raw16 retained."
-        }
+        val shouldSaveDngSidecars = saveDngSidecars
+        val dngSidecarSkipReason = if (shouldSaveDngSidecars) null
+        else "Per-frame DNG sidecars not requested; compact raw16 retained."
         val native24RawUsed = resolutionMode == CaptureResolutionMode.MP24_FUSION &&
             rawPixelCount in 20_000_000L..30_000_000L
         val highResRawInputUsed = rawPixelCount >= HIGH_RES_RAW_MIN_PIXELS
@@ -274,8 +272,8 @@ fun captureRawBurstForFusion(
         val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
             ?: error("Pictures dir unavailable")
         val root = File(picturesDir, "KeplerRawFusion").apply { mkdirs() }
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val jobDir = File(root, "KPL_RAW_FUSION_$stamp").apply { mkdirs() }
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        val jobDir = File(root, "KPL_RAW_FUSION_${stamp}_${UUID.randomUUID().toString().take(8)}").apply { mkdirs() }
         val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
         val adbDebugHint = "adb shell ls -la '${jobDir.absolutePath}'"
         Log.i(RAW_PIPELINE_LOG_TAG, "jobDirAbsolutePath=${jobDir.absolutePath}")
@@ -393,7 +391,7 @@ fun captureRawBurstForFusion(
             .put("frameClampApplied", frameClampReason != null)
             .put("frameClampReason", frameClampReason ?: JSONObject.NULL)
             .put("highResRawFrameLimit", HIGH_RES_RAW_FRAME_LIMIT)
-            .put("dngSidecarSaved", saveDngSidecars)
+            .put("dngSidecarSaved", shouldSaveDngSidecars)
             .put("dngSidecarSkipReason", dngSidecarSkipReason ?: JSONObject.NULL)
             .put("rawSpeedMode", rawSpeedMode.name)
             .put("rawCaptureStartedAt", rawCaptureStartedAt)
@@ -413,7 +411,7 @@ fun captureRawBurstForFusion(
             .put("frames", frameObjects)
             .put("createdAt", System.currentTimeMillis())
             .put("notes", "True RAW fusion input. Stores RAW_SENSOR DNG backup plus compact raw16 per frame. TODO retry budget: targetFrames=8, maxAttempts=9 or 10, continue until target saved or maxAttempts/timeout.")
-        jobFile.writeText(baseJob.toString(2))
+        KeplerJobMetadata.write(jobDir, baseJob)
 
         fun updateFinalRouteMetadata(captureRoute: PhysicalCaptureRoute) {
             finalCaptureRoute = captureRoute
@@ -472,7 +470,13 @@ fun captureRawBurstForFusion(
         }
 
         val imageReader = try {
-            ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, requestedFrames + 2)
+            // RAW_SENSOR buffers are full-resolution allocations; cap pressure on 50MP-class devices.
+            val maxImages = if (highResolutionRaw) {
+                min(4, requestedFrames + 1)
+            } else {
+                min(8, requestedFrames + 2)
+            }
+            ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, maxImages)
         } catch (e: Exception) {
             val reason = "ImageReader failed for selected RAW plan ${rawSize.width}x${rawSize.height}: ${e.javaClass.simpleName}: ${e.message}"
             post("RAW selected resolution plan failed: $reason")
@@ -481,7 +485,7 @@ fun captureRawBurstForFusion(
                 .put("resolutionFallbackReason", reason)
                 .put("rawSizeFallbackReason", rawSelection.fallbackReason ?: reason)
                 .put("updatedAt", System.currentTimeMillis())
-            jobFile.writeText(failedJob.toString(2))
+            KeplerJobMetadata.write(jobDir, failedJob)
             throw e
         }
         reader = imageReader
@@ -547,7 +551,7 @@ fun captureRawBurstForFusion(
                 .put("rotationVectorFile", motionFiles?.second ?: JSONObject.NULL)
                 .put("capturedAt", System.currentTimeMillis())
             if (partial) completeJob.put("partialReason", partialReason)
-            jobFile.writeText(completeJob.toString(2))
+            KeplerJobMetadata.write(jobDir, completeJob)
             Log.i(RAW_PIPELINE_LOG_TAG, "CAPTURE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} savedFrames=$savedFrames/$requestedFrames partial=$partial droppedUnmatchedImages=$droppedUnmatchedImages")
             if (partial) {
                 post("CAPTURE_COMPLETE_PARTIAL: 캡처가 완료되었습니다. saved $savedFrames/$requestedFrames frames")
@@ -559,20 +563,23 @@ fun captureRawBurstForFusion(
         }
 
         fun closeUnmatchedImages(force: Boolean = false) {
-            val maxOpenImages = requestedFrames + 2
-            val pendingLimit = (maxOpenImages - 1).coerceAtLeast(1)
-            val excess = imagesByTimestamp.size - pendingLimit + 1
+            val pendingLimit = if (highResolutionRaw) 3 else min(7, requestedFrames + 1)
+            val now = System.currentTimeMillis()
             val stale = imagesByTimestamp.keys
                 .filter { timestamp ->
-                    force || (imagesByTimestamp.size >= pendingLimit && !resultsByTimestamp.containsKey(timestamp))
+                    force || (
+                        imagesByTimestamp.size > pendingLimit &&
+                            !resultsByTimestamp.containsKey(timestamp) &&
+                            now - (imageArrivalMillis[timestamp] ?: now) >= 2_000L
+                    )
                 }
                 .sorted()
-                .take(if (force) Int.MAX_VALUE else excess.coerceAtLeast(0))
             stale.forEach { timestamp ->
                 imagesByTimestamp.remove(timestamp)?.let {
                     droppedUnmatchedImages++
                     runCatching { it.close() }
                 }
+                imageArrivalMillis.remove(timestamp)
             }
         }
 
@@ -585,8 +592,10 @@ fun captureRawBurstForFusion(
             for (timestamp in ready) {
                 if (savedFrames >= requestedFrames || finished.get()) return
                 val image = imagesByTimestamp.remove(timestamp) ?: continue
+                imageArrivalMillis.remove(timestamp)
                 val result = resultsByTimestamp.remove(timestamp) ?: run {
                     imagesByTimestamp[timestamp] = image
+                    imageArrivalMillis[timestamp] = System.currentTimeMillis()
                     continue
                 }
                 savedTimestamps.add(timestamp)
@@ -597,7 +606,7 @@ fun captureRawBurstForFusion(
                     post("RAW saving frame ${index + 1}/$requestedFrames...")
                     val saveStartedAt = System.currentTimeMillis()
                     writeCompactRaw16(image, File(jobDir, raw16Name))
-                    if (saveDngSidecars) {
+                    if (shouldSaveDngSidecars) {
                         FileOutputStream(File(jobDir, dngName)).use { output ->
                             DngCreator(characteristics, result).use { creator ->
                                 creator.writeImage(output, image)
@@ -610,7 +619,7 @@ fun captureRawBurstForFusion(
                         JSONObject()
                             .put("index", index)
                             .put("raw16File", raw16Name)
-                            .put("dngFile", if (saveDngSidecars) dngName else JSONObject.NULL)
+                            .put("dngFile", if (shouldSaveDngSidecars) dngName else JSONObject.NULL)
                             .put("timestampNs", timestamp)
                             .put("exposureTimeNs", result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: JSONObject.NULL)
                             .put("sensitivityIso", result.get(CaptureResult.SENSOR_SENSITIVITY) ?: JSONObject.NULL)
@@ -689,6 +698,7 @@ fun captureRawBurstForFusion(
             }
             imagesByTimestamp.remove(image.timestamp)?.let { runCatching { it.close() } }
             imagesByTimestamp[image.timestamp] = image
+            imageArrivalMillis[image.timestamp] = System.currentTimeMillis()
             closeUnmatchedImages()
             postCaptureProgress()
             trySaveReadyFrames()

@@ -161,11 +161,16 @@ fun selectCameraForOptions(
     val candidates = findBackCameraCandidates(context)
 
     if (candidates.isEmpty()) {
+        val fallbackId = (context.getSystemService(Context.CAMERA_SERVICE) as CameraManager)
+            .cameraIdList
+            .firstOrNull { it == "0" }
+            ?: (context.getSystemService(Context.CAMERA_SERVICE) as CameraManager).cameraIdList.firstOrNull()
+            ?: error("No Camera2 camera IDs are available.")
         return CameraSelection(
-            cameraId = "0",
+            cameraId = fallbackId,
             effectiveZoomRatio = 1.0f,
             useCrop = false,
-            note = "No back camera candidate found; using cameraId=0 fallback.",
+            note = "No back camera candidate found; using available cameraId=$fallbackId fallback.",
             requestedLensSlot = options.lensSlot,
             requestedThreeXSourceMode = options.threeXSourceMode,
             actualLensSource = ActualLensSource.MAIN_1X,

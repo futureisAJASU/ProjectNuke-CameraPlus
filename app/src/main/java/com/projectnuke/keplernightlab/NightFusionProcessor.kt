@@ -66,6 +66,7 @@ private fun Throwable.shortMessage(): String {
 
 fun processLatestNightFusionV02(
     context: Context,
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
@@ -79,13 +80,17 @@ fun processLatestNightFusionV02(
     workerHandler.post {
         var jobDir: File? = null
         try {
+            cancellation.throwIfCancelled()
             jobDir = findLatestColorBurstJobDir(context)
                 ?: run {
                     postStatus("PIPELINE_FAILED: No YUV fusion job found.")
                     return@post
                 }
-            processNightFusionJobV02Sync(jobDir, onStatus = { postStatus(it) })
+            processNightFusionJobV02Sync(jobDir, onStatus = { postStatus(it) }, cancellation = cancellation)
+            cancellation.throwIfCancelled()
             postStatus("PIPELINE_COMPLETE: YUV Night Fusion processing complete.")
+        } catch (_: CancellationException) {
+            postStatus("PIPELINE_CANCELLED: YUV Night Fusion processing cancelled; cache kept.")
         } catch (e: Exception) {
             Log.e("KeplerYuvPipeline", "PIPELINE_FAILED in processLatestNightFusionV02", e)
             runCatching {
@@ -129,7 +134,8 @@ fun estimateLatestColorBurstScene(context: Context): LatestSceneEstimate {
 }
 
 private const val ENABLE_YUV_FUSION_V2 = false
-private const val ENABLE_YUV_FUSION_V2_DRY_RUN = true
+// Scoring-only V2 adds expensive work without producing output; keep it opt-in for debug builds.
+private const val ENABLE_YUV_FUSION_V2_DRY_RUN = false
 
 fun processNightFusionJobV02Sync(
     jobDir: File,

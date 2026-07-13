@@ -18,7 +18,7 @@ internal enum class PhysicalCaptureRoute {
 internal fun PhysicalCaptureRoute.finalRequestZoomRatio(normalZoomRatio: Float): Float = when (this) {
     PhysicalCaptureRoute.NORMAL -> normalZoomRatio
     PhysicalCaptureRoute.PHYSICAL -> 1.0f
-    PhysicalCaptureRoute.PHYSICAL_FAILED_CROP_FALLBACK -> 3.0f
+    PhysicalCaptureRoute.PHYSICAL_FAILED_CROP_FALLBACK -> normalZoomRatio
 }
 
 internal fun createRoutedStillCaptureSession(

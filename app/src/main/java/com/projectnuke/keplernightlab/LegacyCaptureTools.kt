@@ -1876,7 +1876,7 @@ fun writeBurstJobJson(
         json.put("createdAt", oldCreatedAt)
     }
 
-    jobFile.writeText(json.toString(2))
+    KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), json)
 }
 
 fun writeYuvJobJson(
@@ -1941,5 +1941,5 @@ fun writeYuvJobJson(
         json.put("createdAt", oldCreatedAt)
     }
 
-    jobFile.writeText(json.toString(2))
+    KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), json)
 }

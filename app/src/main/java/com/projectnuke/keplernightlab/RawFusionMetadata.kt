@@ -108,7 +108,7 @@ internal fun updateRawExportBitmapMetadata(
     nativePreviewPrepareMs: Long = 0L
 ) {
     val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
-    val job = if (jobFile.exists()) JSONObject(jobFile.readText()) else JSONObject()
+    val job = if (jobFile.exists()) KeplerJobMetadata.read(jobDir) else JSONObject()
     job.put("exportBitmapSource", source)
         .put("nativeRgbaDirectExportUsed", nativeRgbaDirectExportUsed)
         .put("nativeRgbaBitmapLoadedForExport", nativeRgbaBitmapLoadedForExport)
@@ -116,7 +116,7 @@ internal fun updateRawExportBitmapMetadata(
         .put("exportBitmapWidth", exportBitmapWidth)
         .put("exportBitmapHeight", exportBitmapHeight)
         .put("nativePreviewPrepareMs", nativePreviewPrepareMs)
-    jobFile.writeText(job.toString(2))
+    KeplerJobMetadata.write(jobDir, job)
     Log.i(
         "KeplerRawPipeline",
         "finalOutputSource=${job.optString("finalOutputSource")} exportBitmapSource=$source " +
