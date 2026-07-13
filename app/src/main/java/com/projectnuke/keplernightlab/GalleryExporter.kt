@@ -245,7 +245,7 @@ fun updateExportMetadata(
     if (pipelineStartedAt != null) {
         job.put("totalPipelineMs", System.currentTimeMillis() - pipelineStartedAt)
     }
-    KeplerJobMetadata.replace(jobDir, job)
+    saveJobJson(jobDir, job)
     Log.i(
         "KeplerRawPipeline",
         "PIPELINE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} processStatus=${job.optString("processStatus")} " +
@@ -277,7 +277,7 @@ fun updateExportFailure(
         .put("rawSidecarError", if (rawSidecarIgnored) "RAW sidecar unavailable for YUV pipeline." else JSONObject.NULL)
         .put("cleanupStatus", "SKIPPED")
         .put("exportedAt", System.currentTimeMillis())
-    KeplerJobMetadata.replace(jobDir, job)
+    saveJobJson(jobDir, job)
 }
 
 fun requestedOutputFormatForSetting(finalOutputFormat: FinalOutputFormat): OutputFormat = when {

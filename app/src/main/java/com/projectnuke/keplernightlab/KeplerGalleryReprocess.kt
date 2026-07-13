@@ -94,13 +94,9 @@ suspend fun reprocessKeplerGalleryJob(
     }
     val selectionMode = resolveSelectionMode(job, frameSelection)
     val beforeFinals = finalOutputCandidates(target, job)
-    val requiredProcessingMetadata = listOf(
-        "alignment.json", "alignment_debug.json", "render_debug.json",
-        "raw_fusion_debug.json", "raw_render_input_metadata.json",
-        "raw_render_debug.json", "raw_fusion_alignment.json",
-        "fusion_debug.json", "yuv_debug.json"
-    ).map { File(target, it) }
-    val backups = backupReprocessTransaction(target, beforeFinals + requiredProcessingMetadata).getOrElse {
+    // The worker may overwrite any existing artifact, including RAW/YUV fusion and
+    // render-debug metadata. Snapshot every pre-existing file at transaction start.
+    val backups = backupReprocessTransaction(target, target.listFiles()?.filter { it.isFile }.orEmpty()).getOrElse {
         writeReprocessFailure(target, "Required reprocess backup failed: ${it.message}")
         return@withContext Result.failure(it)
     }
@@ -110,6 +106,7 @@ suspend fun reprocessKeplerGalleryJob(
         mode = selectionMode,
         frames = applyFrameSelectionToItems(reviewItems, resolvedSelection, selectionMode)
     ).getOrElse {
+        restoreBackups(target, backups)
         writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
         return@withContext Result.failure(it)
     }
@@ -397,11 +394,11 @@ private fun finalOutputCandidates(jobDir: File, job: JSONObject): List<File> {
         job.optString("finalNightFusionFile"),
         job.optString("finalFile"),
         job.optString("outputFile"),
-        job.optString("nativePostprocessRgbaFile"),
         "raw_fusion_final.png",
         "sharpened_night_fusion.png"
     ).filter { it.isNotBlank() && it != "null" }.distinct()
     return names.map { File(jobDir, it) }
+        .filter { it.extension.lowercase(Locale.US) in setOf("png", "jpg", "jpeg", "heic", "webp") }
 }
 
 private fun resolveReprocessFinalOutput(jobDir: File, job: JSONObject): File? =

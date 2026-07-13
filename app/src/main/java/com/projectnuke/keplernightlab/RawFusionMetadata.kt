@@ -116,7 +116,7 @@ internal fun updateRawExportBitmapMetadata(
         .put("exportBitmapWidth", exportBitmapWidth)
         .put("exportBitmapHeight", exportBitmapHeight)
         .put("nativePreviewPrepareMs", nativePreviewPrepareMs)
-    KeplerJobMetadata.replace(jobDir, job)
+    saveJobJson(jobDir, job)
     Log.i(
         "KeplerRawPipeline",
         "finalOutputSource=${job.optString("finalOutputSource")} exportBitmapSource=$source " +

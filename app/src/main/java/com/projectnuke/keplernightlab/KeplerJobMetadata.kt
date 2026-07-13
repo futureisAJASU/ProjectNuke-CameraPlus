@@ -20,9 +20,9 @@ object KeplerJobMetadata {
         JSONObject(File(jobDir, JOB_JSON_FILE_NAME).readText())
     }
 
-    fun write(jobDir: File, job: JSONObject) = synchronized(lockFor(jobDir)) {
-        job.put("schemaVersion", job.optInt("schemaVersion", KEPLER_JOB_SCHEMA_VERSION))
-        atomicWrite(File(jobDir, JOB_JSON_FILE_NAME), job.toString(2))
+    fun write(jobDir: File, job: JSONObject): JSONObject = update(jobDir) { current ->
+        current.keys().asSequence().toList().forEach { key -> current.remove(key) }
+        job.keys().forEach { key -> current.put(key, job.get(key)) }
     }
 
     fun update(jobDir: File, mutate: (JSONObject) -> Unit): JSONObject = synchronized(lockFor(jobDir)) {
@@ -31,12 +31,6 @@ object KeplerJobMetadata {
         job.put("schemaVersion", job.optInt("schemaVersion", KEPLER_JOB_SCHEMA_VERSION))
         atomicWrite(File(jobDir, JOB_JSON_FILE_NAME), job.toString(2))
         job
-    }
-
-    /** Applies a caller's prepared fields while holding the same read-modify-write lock. */
-    fun replace(jobDir: File, replacement: JSONObject): JSONObject = update(jobDir) { current ->
-        current.keys().asSequence().toList().forEach { key -> current.remove(key) }
-        replacement.keys().forEach { key -> current.put(key, replacement.get(key)) }
     }
 
     fun atomicWrite(file: File, text: String) {

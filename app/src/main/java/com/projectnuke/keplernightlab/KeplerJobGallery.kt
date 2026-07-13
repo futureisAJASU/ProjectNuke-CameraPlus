@@ -79,7 +79,10 @@ fun loadJobJson(jobDir: File): JSONObject =
     KeplerJobMetadata.read(jobDir)
 
 fun saveJobJson(jobDir: File, job: JSONObject) {
-    KeplerJobMetadata.replace(jobDir, job)
+    KeplerJobMetadata.update(jobDir) { current ->
+        current.keys().asSequence().toList().forEach { key -> current.remove(key) }
+        job.keys().forEach { key -> current.put(key, job.get(key)) }
+    }
 }
 
 fun setFrameExcluded(jobDir: File, frameIndex: Int, excluded: Boolean) {
@@ -569,7 +572,7 @@ private fun JSONObject.optionalFloat(key: String): Float? {
 
 private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
     val explicit = job?.optString("galleryDisplayFile").orEmpty()
-    File(directory, explicit).takeIf { explicit.isNotBlank() && it.isFile && !isDebugPreviewFinalBlocked(it.name) }
+    File(directory, explicit).takeIf { explicit.isNotBlank() && it.isFile && isDisplayImageFile(it) && !isDebugPreviewFinalBlocked(it.name) }
         ?.let { return it }
     val keys = listOf(
         "finalNightFusionFile",
@@ -581,6 +584,7 @@ private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
         File(directory, name).takeIf {
             name.isNotBlank() &&
                 it.isFile &&
+                isDisplayImageFile(it) &&
                 !isDebugPreviewFinalBlocked(it.name) &&
                 (it.extension.equals("png", true) || it.extension.equals("jpg", true) || it.extension.equals("jpeg", true) || it.extension.equals("heic", true) || it.extension.equals("webp", true))
         }
@@ -588,13 +592,17 @@ private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
     }
     return directory.listFiles()
         ?.filter {
-            it.isFile &&
+                it.isFile &&
+                isDisplayImageFile(it) &&
                 it.extension.equals("png", true) &&
                 !isSourceFrame(it) &&
                 !isDebugPreviewFinalBlocked(it.name)
         }
         ?.maxByOrNull { it.lastModified() }
 }
+
+private fun isDisplayImageFile(file: File): Boolean =
+    file.extension.lowercase() in setOf("png", "jpg", "jpeg", "heic", "webp")
 
 private fun isDebugPreviewFinalBlocked(name: String): Boolean {
     val lower = name.lowercase()

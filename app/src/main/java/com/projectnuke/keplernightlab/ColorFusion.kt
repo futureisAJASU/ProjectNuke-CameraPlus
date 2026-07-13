@@ -1257,7 +1257,10 @@ fun averageLatestYuvBurstColor(
                 .put("averageUsedFrames", usedFrames)
                 .put("processedAt", System.currentTimeMillis())
 
-        KeplerJobMetadata.replace(jobFile.parentFile ?: error("Job directory missing"), updatedJob)
+        KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
+            current.keys().asSequence().toList().forEach { key -> current.remove(key) }
+            updatedJob.keys().forEach { key -> current.put(key, updatedJob.get(key)) }
+        }
 
             postStatus(
                 "컬러 평균 합성 완료\n" +
@@ -1589,7 +1592,10 @@ private fun updateYuvCaptureRequestTemplateMetadata(
             .put("yuvCaptureRequestTemplateFallbackUsed", fallbackUsed)
             .put("yuvCaptureRequestTemplateFailures", JSONArray(failures.take(6)))
             .put("updatedAt", System.currentTimeMillis())
-        KeplerJobMetadata.replace(jobFile.parentFile ?: error("Job directory missing"), job)
+        KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
+            current.keys().asSequence().toList().forEach { key -> current.remove(key) }
+            job.keys().forEach { key -> current.put(key, job.get(key)) }
+        }
     }
 }
 
