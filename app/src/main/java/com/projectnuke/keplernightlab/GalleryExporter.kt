@@ -83,11 +83,11 @@ fun verifyGalleryExport(
     uriString: String,
     minSizeBytes: Long = 50_000L
 ): Boolean {
-    if (uriString.isBlank()) return false
-    val uri = runCatching { Uri.parse(uriString) }.getOrNull() ?: return false
-    val size = queryMediaSize(context, uri)
-    if (size < minSizeBytes) return false
     return runCatching {
+        if (uriString.isBlank()) return@runCatching false
+        val uri = Uri.parse(uriString)
+        val size = queryMediaSize(context, uri)
+        if (size < minSizeBytes) return@runCatching false
         context.contentResolver.openInputStream(uri)?.use { input ->
             val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeStream(input, null, options)
@@ -153,6 +153,15 @@ fun exportRawSidecarsToPublicStorage(
                 )
             }
             exported += result.first.toString()
+            val verifiedSize = result.second
+            if (verifiedSize <= 0L || verifiedSize < file.length().coerceAtLeast(1L)) {
+                return RawSidecarExportResult(
+                    success = true,
+                    exportedFiles = exported,
+                    errorMessage = "Verification failed for ${file.name}: committed size=$verifiedSize sourceSize=${file.length()}",
+                    status = "PARTIAL"
+                )
+            }
         }
     } catch (ce: CancellationException) {
         if (exported.isNotEmpty()) {
