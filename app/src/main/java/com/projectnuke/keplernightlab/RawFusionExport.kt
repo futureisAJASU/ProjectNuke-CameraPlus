@@ -176,7 +176,8 @@ fun captureProcessExportRawNightFusion(
                                     Locale.US
                                 ).format(Date())
                             }",
-                            requestedFormat = requestedOutputFormat
+                            requestedFormat = requestedOutputFormat,
+                            cancellation = cancellation
                         )
                     } finally {
                         exportBitmap?.takeUnless { it.isRecycled }?.recycle()
@@ -228,10 +229,17 @@ fun captureProcessExportRawNightFusion(
                             displayNameBase = "Kepler_RAW_${jobDir.name}"
                         ).also { sidecars ->
                             if (sidecars.success) {
-                                post(
-                                    "Exported RAW sidecars: " +
-                                        "${sidecars.exportedFiles.size} DNG files"
-                                )
+                                if (sidecars.status == "PARTIAL") {
+                                    post(
+                                        "RAW sidecar export partial: " +
+                                            "${sidecars.exportedFiles.size} DNG files"
+                                    )
+                                } else {
+                                    post(
+                                        "Exported RAW sidecars: " +
+                                            "${sidecars.exportedFiles.size} DNG files"
+                                    )
+                                }
                             } else if (sidecars.errorMessage != null) {
                                 post("RAW sidecar export failed: ${sidecars.errorMessage}")
                             }

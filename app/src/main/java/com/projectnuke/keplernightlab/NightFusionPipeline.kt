@@ -93,7 +93,8 @@ fun captureProcessExportNightFusion(
                             context = context,
                             bitmap = bitmap,
                             displayNameBase = displayNameBase,
-                            requestedFormat = requestedOutputFormat
+                            requestedFormat = requestedOutputFormat,
+                            cancellation = cancellation
                         )
                     } finally {
                         bitmap.recycle()
@@ -146,8 +147,22 @@ fun captureProcessExportNightFusion(
                     val cleanup = cleanupNightFusionJobAfterVerifiedExport(
                         jobDir = jobDir,
                         policy = cleanupPolicy,
+                        cancellation = cancellation,
                         onStatus = { post(it) }
                     )
+                    if (cancellation.isCancelled) {
+                        updateExportMetadata(
+                            jobDir = jobDir,
+                            export = export,
+                            verified = true,
+                            finalOutputFormat = finalOutputFormat,
+                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
+                            postExportCancellationRequested = true,
+                            postExportWorkSkipped = true
+                        )
+                        post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. Cache was kept.")
+                        return@post
+                    }
                     val album = "Pictures/Kepler/${export.displayName}"
                     if (finalOutputFormat.shouldExportRawSidecar) {
                         post("RAW sidecar unavailable for YUV pipeline.")
@@ -312,6 +327,7 @@ private fun updateYuvReprocessHistory(
 fun cleanupNightFusionJobAfterVerifiedExport(
     jobDir: File,
     policy: CacheCleanupPolicy,
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ): CleanupResult {
     val jobFile = File(jobDir, "job.json")
@@ -350,7 +366,12 @@ fun cleanupNightFusionJobAfterVerifiedExport(
 
     var deleted = 0
     var freed = 0L
+    var cancelledDuringCleanup = cancellation.isCancelled
     deleteNames.forEach { name ->
+        if (cancellation.isCancelled) {
+            cancelledDuringCleanup = true
+            return@forEach
+        }
         val file = File(jobDir, name)
         if (file.exists() && file.canonicalPath.startsWith(jobDir.canonicalPath) && file.name != "job.json") {
             val size = file.length()
@@ -359,10 +380,17 @@ fun cleanupNightFusionJobAfterVerifiedExport(
                 freed += size
             }
         }
+        if (cancellation.isCancelled) {
+            cancelledDuringCleanup = true
+        }
     }
 
     val sourceDeleted = jobDir.listFiles()?.none { it.name.matches(Regex("frame_\\d+_color\\.png")) } ?: true
-    val status = if (sourceDeleted) "SOURCE_FRAMES_DELETED" else "PARTIAL_CLEANUP"
+    val status = when {
+        cancelledDuringCleanup -> "PARTIAL_CLEANUP"
+        sourceDeleted -> "SOURCE_FRAMES_DELETED"
+        else -> "PARTIAL_CLEANUP"
+    }
     updateCleanupMetadata(jobFile, policy, status, deleted, freed, sourceDeleted)
 
     return CleanupResult(

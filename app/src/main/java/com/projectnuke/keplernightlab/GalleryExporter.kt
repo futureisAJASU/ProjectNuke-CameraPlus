@@ -13,6 +13,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.io.OutputStream
+import java.util.concurrent.CancellationException
 
 data class GalleryExportResult(
     val success: Boolean,
@@ -28,7 +29,8 @@ data class GalleryExportResult(
 data class RawSidecarExportResult(
     val success: Boolean,
     val exportedFiles: List<String>,
-    val errorMessage: String?
+    val errorMessage: String?,
+    val status: String = if (success) "EXPORTED" else "FAILED"
 )
 
 fun exportNightFusionBitmapToGallery(
@@ -37,7 +39,8 @@ fun exportNightFusionBitmapToGallery(
     displayNameBase: String,
     requestedFormat: OutputFormat,
     relativeAlbumPath: String = "Pictures/Kepler",
-    quality: Int = 92
+    quality: Int = 92,
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
 ): GalleryExportResult {
     val attempts = when (requestedFormat) {
         OutputFormat.HEIF -> listOf(OutputFormat.HEIF, OutputFormat.JPEG, OutputFormat.PNG)
@@ -46,6 +49,7 @@ fun exportNightFusionBitmapToGallery(
     }
     val errors = mutableListOf<String>()
     attempts.forEach { format ->
+        cancellation.throwIfCancelled()
         val result = writeGalleryBitmap(
             context = context,
             bitmap = bitmap,
@@ -53,8 +57,12 @@ fun exportNightFusionBitmapToGallery(
             format = format,
             relativeAlbumPath = relativeAlbumPath,
             quality = quality,
-            fallbackUsed = format != requestedFormat
+            fallbackUsed = format != requestedFormat,
+            cancellation = cancellation
         )
+        if (!result.success) {
+            cancellation.throwIfCancelled()
+        }
         if (result.success) return result
         errors += "${format.label}: ${result.errorMessage}"
     }
@@ -103,7 +111,7 @@ fun exportRawSidecarsToPublicStorage(
         ?.sortedBy { it.name }
         .orEmpty()
     if (dngFiles.isEmpty()) {
-        return RawSidecarExportResult(false, emptyList(), "No DNG sidecars found")
+        return RawSidecarExportResult(false, emptyList(), "No DNG sidecars found", "FAILED")
     }
 
     val exported = mutableListOf<String>()
@@ -114,7 +122,8 @@ fun exportRawSidecarsToPublicStorage(
             displayName = exportName,
             mimeType = "image/x-adobe-dng",
             relativePath = relativeRawPath,
-            collectionUri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            collectionUri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+            cancellation = NoOpKeplerPipelineCancellation
         ) { output ->
             FileInputStream(file).use { input -> input.copyTo(output) }
         } ?: insertPublicFile(
@@ -122,29 +131,34 @@ fun exportRawSidecarsToPublicStorage(
             displayName = exportName,
             mimeType = "image/x-adobe-dng",
             relativePath = "Download/Kepler/RAW",
-            collectionUri = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+            collectionUri = MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+            cancellation = NoOpKeplerPipelineCancellation
         ) { output ->
             FileInputStream(file).use { input -> input.copyTo(output) }
         }
 
         if (result == null) {
+            val status = if (exported.isNotEmpty()) "PARTIAL" else "FAILED"
             return RawSidecarExportResult(
                 success = exported.isNotEmpty(),
                 exportedFiles = exported,
-                errorMessage = "Failed exporting ${file.name}"
+                errorMessage = "Failed exporting ${file.name}",
+                status = status
             )
         }
         if (result.second < file.length().coerceAtLeast(1L)) {
+            val status = if (exported.isNotEmpty()) "PARTIAL" else "FAILED"
             return RawSidecarExportResult(
                 success = exported.isNotEmpty(),
                 exportedFiles = exported,
-                errorMessage = "Export verification failed for ${file.name}"
+                errorMessage = "Export verification failed for ${file.name}",
+                status = status
             )
         }
         exported += result.first.toString()
     }
 
-    return RawSidecarExportResult(true, exported, null)
+    return RawSidecarExportResult(true, exported, null, "EXPORTED")
 }
 
 fun queryMediaSize(context: Context, uri: Uri): Long {
@@ -195,8 +209,7 @@ fun updateExportMetadata(
             rawSidecarIgnored -> "UNAVAILABLE"
             rawSidecarResult == null && finalOutputFormat.shouldExportRawSidecar -> "SKIPPED"
             rawSidecarResult == null -> "NOT_REQUESTED"
-            rawSidecarResult.success -> "EXPORTED"
-            else -> "FAILED"
+            else -> rawSidecarResult.status
         })
         .put("rawSidecarExportedFiles", JSONArray(rawSidecarResult?.exportedFiles ?: emptyList<String>()))
         .put("rawSidecarError", when {
@@ -258,14 +271,16 @@ private fun writeGalleryBitmap(
     format: OutputFormat,
     relativeAlbumPath: String,
     quality: Int,
-    fallbackUsed: Boolean
+    fallbackUsed: Boolean,
+    cancellation: KeplerPipelineCancellation
 ): GalleryExportResult {
     val inserted = insertPublicFile(
         context = context,
         displayName = displayName,
         mimeType = format.mimeType,
         relativePath = relativeAlbumPath,
-        collectionUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        collectionUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+        cancellation = cancellation
     ) { output ->
         val ok = when (format) {
             OutputFormat.HEIF -> writeHeifViaTempFile(context, bitmap, quality, output)
@@ -302,6 +317,7 @@ private fun insertPublicFile(
     mimeType: String,
     relativePath: String,
     collectionUri: Uri,
+    cancellation: KeplerPipelineCancellation,
     writer: (OutputStream) -> Unit
 ): Pair<Uri, Long>? {
     val resolver = context.contentResolver
@@ -314,15 +330,25 @@ private fun insertPublicFile(
     }
     var uri: Uri? = null
     return try {
+        cancellation.throwIfCancelled()
         uri = resolver.insert(collectionUri, values) ?: return null
+        cancellation.throwIfCancelled()
         resolver.openOutputStream(uri)?.use(writer) ?: error("openOutputStream returned null")
-        resolver.update(
+        cancellation.throwIfCancelled()
+        val updateCount = resolver.update(
             uri,
             ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) },
             null,
             null
         )
+        if (updateCount != 1) {
+            runCatching { resolver.delete(uri, null, null) }
+            return null
+        }
         uri to queryMediaSize(context, uri)
+    } catch (ce: CancellationException) {
+        uri?.let { runCatching { resolver.delete(it, null, null) } }
+        throw ce
     } catch (_: Exception) {
         uri?.let { runCatching { resolver.delete(it, null, null) } }
         null
