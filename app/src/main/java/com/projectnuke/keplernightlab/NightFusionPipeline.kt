@@ -5,6 +5,7 @@ import android.graphics.BitmapFactory
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import kotlinx.coroutines.CompletableDeferred
 import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
@@ -190,7 +191,7 @@ fun captureProcessExportNightFusion(
     )
 }
 
-fun reprocessYuvJob(
+internal fun reprocessYuvJob(
     context: Context,
     jobDir: File,
     finalOutputFormat: FinalOutputFormat,
@@ -198,14 +199,17 @@ fun reprocessYuvJob(
     fusionParams: ClassicYuvFusionParams? = null,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
-) {
+): ReprocessWorkerRun {
     val mainHandler = Handler(Looper.getMainLooper())
     fun post(message: String) = mainHandler.post { onStatus(message) }
+    val completion = CompletableDeferred<Unit>()
+    val result = CompletableDeferred<Result<Unit>>()
     val workerThread = HandlerThread("KeplerYuvReprocessThread").apply { start() }
     Handler(workerThread.looper).post {
         val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
         var totalFrames = 0
         var enabledFrames = 0
+        var terminalResult: Result<Unit> = Result.failure(IllegalStateException("YUV reprocess did not reach a terminal state."))
         try {
             cancellation.throwIfCancelled()
             if (selectedFrameIndices != null) {
@@ -232,6 +236,7 @@ fun reprocessYuvJob(
                     "FAILED_NOT_ENOUGH_ENABLED_FRAMES"
                 )
                 post("Not enough enabled YUV frames to reprocess")
+                terminalResult = Result.failure(IllegalStateException("Not enough enabled YUV frames to reprocess"))
                 return@post
             }
 
@@ -279,8 +284,17 @@ fun reprocessYuvJob(
                 "PIPELINE_COMPLETE: YUV reprocess saved ${export.formatUsed.label}; " +
                     "used $enabledFrames/$totalFrames frames; cache kept."
             )
-        } catch (_: CancellationException) {
+            terminalResult = Result.success(Unit)
+        } catch (_: kotlinx.coroutines.CancellationException) {
             post("PIPELINE_CANCELLED: YUV reprocess cancelled; source frames kept.")
+            terminalResult = Result.failure(IllegalStateException("YUV reprocess cancelled"))
+        } catch (oom: OutOfMemoryError) {
+            updateYuvReprocessHistory(
+                jobDir, enabledFrames, totalFrames - enabledFrames,
+                "FAILED_OUT_OF_MEMORY"
+            )
+            post("PIPELINE_FAILED: YUV reprocess failed; cache kept. out of memory")
+            terminalResult = Result.failure(oom)
         } catch (e: Exception) {
             runCatching {
                 updateYuvReprocessHistory(
@@ -291,10 +305,20 @@ fun reprocessYuvJob(
                 )
             }
             post("PIPELINE_FAILED: YUV reprocess failed; cache kept. ${e.message}")
+            terminalResult = Result.failure(e)
         } finally {
+            if (!result.isCompleted) {
+                result.complete(terminalResult)
+            }
             workerThread.quitSafely()
+            completion.complete(Unit)
         }
     }
+    return ReprocessWorkerRun(
+        result = result,
+        completion = completion,
+        cancel = { if (cancellation is KeplerPipelineCancellationToken) cancellation.cancel() }
+    )
 }
 
 private fun applyExplicitYuvFrameSelection(jobDir: File, selectedFrameIndices: Set<Int>) {

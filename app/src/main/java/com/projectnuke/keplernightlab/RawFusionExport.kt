@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
+import kotlinx.coroutines.CompletableDeferred
 import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
@@ -320,36 +321,41 @@ fun captureProcessExportRawNightFusion(
     )
 }
 
-fun reprocessRawJob(
+internal fun reprocessRawJob(
     context: Context,
     jobDir: File,
     finalOutputFormat: FinalOutputFormat,
     selectedFrameIndices: Set<Int>? = null,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
-) {
+): ReprocessWorkerRun {
     val main = Handler(Looper.getMainLooper())
     fun post(message: String) = main.post { onStatus(message) }
+    val completion = CompletableDeferred<Unit>()
+    val result = CompletableDeferred<Result<Unit>>()
     val thread = HandlerThread("KeplerRawReprocessThread").apply { start() }
     Handler(thread.looper).post {
-        cancellation.throwIfCancelled()
-        if (selectedFrameIndices != null) {
-            applyExplicitFrameSelection(jobDir, selectedFrameIndices)
-        }
-        val enabledCount = runCatching { getEnabledRawFrames(jobDir).size }.getOrDefault(0)
-        val totalCount = runCatching {
-            loadJobJson(jobDir).optJSONArray("frames")?.length() ?: 0
-        }.getOrDefault(0)
-        if (enabledCount < MIN_RAW_FUSION_FRAMES) {
-            updateReprocessHistory(
-                jobDir, enabledCount, totalCount - enabledCount,
-                "FAILED_NOT_ENOUGH_ENABLED_FRAMES"
-            )
-            post("Not enough enabled frames to reprocess")
-            thread.quitSafely()
-            return@post
-        }
+        var terminalResult: Result<Unit> = Result.failure(IllegalStateException("RAW reprocess did not reach a terminal state."))
+        var enabledCount = 0
+        var totalCount = 0
         try {
+            cancellation.throwIfCancelled()
+            if (selectedFrameIndices != null) {
+                applyExplicitFrameSelection(jobDir, selectedFrameIndices)
+            }
+            enabledCount = runCatching { getEnabledRawFrames(jobDir).size }.getOrDefault(0)
+            totalCount = runCatching {
+                loadJobJson(jobDir).optJSONArray("frames")?.length() ?: 0
+            }.getOrDefault(0)
+            if (enabledCount < MIN_RAW_FUSION_FRAMES) {
+                updateReprocessHistory(
+                    jobDir, enabledCount, totalCount - enabledCount,
+                    "FAILED_NOT_ENOUGH_ENABLED_FRAMES"
+                )
+                post("Not enough enabled frames to reprocess")
+                terminalResult = Result.failure(IllegalStateException("Not enough enabled frames to reprocess"))
+                return@post
+            }
             post("Reprocessing RAW: using $enabledCount/$totalCount frames")
             val process = processRawFusionJob(
                 context = context,
@@ -361,6 +367,7 @@ fun reprocessRawJob(
                 val reason = process.errorMessage ?: "RAW fusion process failed"
                 updateReprocessHistory(jobDir, enabledCount, totalCount - enabledCount, "FAILED: $reason")
                 post("RAW reprocess failed; source frames kept. $reason")
+                terminalResult = Result.failure(IllegalStateException(reason))
                 return@post
             }
             val requestedFormat = requestedOutputFormatForSetting(finalOutputFormat)
@@ -397,6 +404,7 @@ fun reprocessRawJob(
                 updateExportFailure(jobDir, reason, finalOutputFormat)
                 updateReprocessHistory(jobDir, enabledCount, totalCount - enabledCount, "FAILED: $reason")
                 post("RAW reprocess export failed; source frames kept. $reason")
+                terminalResult = Result.failure(IllegalStateException(reason))
                 return@post
             }
             updateExportMetadata(
@@ -408,23 +416,35 @@ fun reprocessRawJob(
             )
             updateReprocessHistory(jobDir, enabledCount, totalCount - enabledCount, "SUCCESS")
             post("RAW reprocess complete: used $enabledCount frames; source frames kept.")
-        } catch (_: CancellationException) {
+            terminalResult = Result.success(Unit)
+        } catch (_: kotlinx.coroutines.CancellationException) {
             post("PIPELINE_CANCELLED: RAW reprocess cancelled; source frames kept.")
+            terminalResult = Result.failure(IllegalStateException("RAW reprocess cancelled"))
         } catch (oom: OutOfMemoryError) {
             updateReprocessHistory(jobDir, enabledCount, totalCount - enabledCount, "FAILED_OUT_OF_MEMORY")
             post("RAW reprocess failed: out of memory; source frames kept.")
+            terminalResult = Result.failure(oom)
         } catch (e: Exception) {
             updateReprocessHistory(
                 jobDir, enabledCount, totalCount - enabledCount,
                 "FAILED: ${e.javaClass.simpleName}: ${e.message}"
             )
             post("RAW reprocess failed; source frames kept. ${e.javaClass.simpleName}: ${e.message}")
+            terminalResult = Result.failure(e)
         } finally {
+            if (!result.isCompleted) {
+                result.complete(terminalResult)
+            }
             thread.quitSafely()
+            completion.complete(Unit)
         }
     }
+    return ReprocessWorkerRun(
+        result = result,
+        completion = completion,
+        cancel = { if (cancellation is KeplerPipelineCancellationToken) cancellation.cancel() }
+    )
 }
-
 private fun applyExplicitFrameSelection(jobDir: File, selectedFrameIndices: Set<Int>) {
     val job = loadJobJson(jobDir)
     val frames = job.optJSONArray("frames") ?: return

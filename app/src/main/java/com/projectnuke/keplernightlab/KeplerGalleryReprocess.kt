@@ -2,12 +2,16 @@ package com.projectnuke.keplernightlab
 
 import android.content.Context
 import android.os.Environment
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -43,6 +47,17 @@ data class KeplerReprocessResult(
     val bytesWritten: Long,
     val warnings: List<String>
 )
+
+internal data class ReprocessWorkerRun(
+    val result: Deferred<Result<Unit>>,
+    val completion: Deferred<Unit>,
+    val cancel: () -> Unit
+)
+
+internal class ReprocessWorkerDidNotExitException(message: String) : IllegalStateException(message)
+
+private const val REPROCESS_TIMEOUT_MS = 10 * 60 * 1000L
+private const val REPROCESS_WORKER_EXIT_TIMEOUT_MS = 30_000L
 
 suspend fun reprocessKeplerGalleryJob(
     context: Context,
@@ -88,14 +103,12 @@ suspend fun reprocessKeplerGalleryJob(
         return@withContext Result.failure(it)
     }
     if (resolvedSelection.size < requiredSelectedFrameCount(kind)) {
-        val message = "선택한 원본 프레임이 부족하여 다시 합성할 수 없습니다."
+        val message = "선택한 원본 프레임이 부족합니다. 다시 합성할 수 없습니다."
         writeReprocessFailure(target, message)
         return@withContext Result.failure(IllegalStateException(message))
     }
     val selectionMode = resolveSelectionMode(job, frameSelection)
     val beforeFinals = finalOutputCandidates(target, job)
-    // The worker may overwrite any existing artifact, including RAW/YUV fusion and
-    // render-debug metadata. Snapshot every pre-existing file at transaction start.
     val backups = backupReprocessTransaction(
         target,
         target.listFiles()?.filter { it.isFile && isReprocessWorkerWritable(it) }.orEmpty()
@@ -109,29 +122,61 @@ suspend fun reprocessKeplerGalleryJob(
         mode = selectionMode,
         frames = applyFrameSelectionToItems(reviewItems, resolvedSelection, selectionMode)
     ).getOrElse {
-        restoreBackups(target, backups).getOrThrow()
+        val rollback = restoreBackups(target, backups)
+        if (rollback.isFailure) {
+            val rollbackError = rollback.exceptionOrNull() ?: IllegalStateException("Rollback failed")
+            writeReprocessFailure(
+                target,
+                "${it.javaClass.simpleName}: ${it.message}; rollback failed: ${rollbackError.message}"
+            )
+            return@withContext Result.failure(rollbackError)
+        }
         writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
         return@withContext Result.failure(it)
     }
 
     val beforeBytes = beforeFinals.filter { it.isFile }.sumOf { it.length() }
-
-    val pipelineResult = runCatching {
-        withTimeout(10 * 60 * 1000L) {
-            when (capability.jobKind) {
+    val progressScope = CoroutineScope(coroutineContext)
+    val worker = when (capability.jobKind) {
         ReprocessJobKind.RAW_FUSION ->
-            awaitRawReprocess(context, target, outputSettings, resolvedSelection, ::postProgress)
+            reprocessRawJob(
+                context,
+                target,
+                outputSettings,
+                resolvedSelection,
+                onStatus = { message -> progressScope.launch { postProgress(message) } }
+            )
         ReprocessJobKind.YUV_FUSION ->
-            awaitYuvReprocess(context, target, outputSettings, resolvedSelection, ::postProgress)
-        ReprocessJobKind.COLOR_BURST ->
-            Result.failure(UnsupportedOperationException("ColorBurst 다시 합성은 아직 지원되지 않습니다."))
-        ReprocessJobKind.UNSUPPORTED ->
-            Result.failure(UnsupportedOperationException("지원하지 않는 작업 유형입니다."))
-            }
+            reprocessYuvJob(
+                context,
+                target,
+                outputSettings,
+                resolvedSelection,
+                onStatus = { message -> progressScope.launch { postProgress(message) } }
+            )
+        ReprocessJobKind.COLOR_BURST -> {
+            val result = CompletableDeferred<Result<Unit>>()
+            val completion = CompletableDeferred<Unit>()
+            result.complete(Result.failure(UnsupportedOperationException("ColorBurst는 아직 다시 합성할 수 없습니다.")))
+            completion.complete(Unit)
+            ReprocessWorkerRun(result = result, completion = completion, cancel = {})
         }
-    }.getOrElse { Result.failure(it) }
+        ReprocessJobKind.UNSUPPORTED -> {
+            val result = CompletableDeferred<Result<Unit>>()
+            val completion = CompletableDeferred<Unit>()
+            result.complete(Result.failure(UnsupportedOperationException("지원하지 않는 작업 유형입니다.")))
+            completion.complete(Unit)
+            ReprocessWorkerRun(result = result, completion = completion, cancel = {})
+        }
+    }
 
-    if (pipelineResult.isSuccess) {
+    val pipelineResult = try {
+        withTimeoutOrNull(REPROCESS_TIMEOUT_MS) { worker.result.await() }
+    } catch (_: kotlinx.coroutines.CancellationException) {
+        null
+    }
+
+    if (pipelineResult?.isSuccess == true) {
         postProgress("갤러리 정보 갱신 중…")
         val updatedJob = loadJobJsonSafe(target)
         val finalFile = resolveReprocessFinalOutput(target, updatedJob)
@@ -148,7 +193,7 @@ suspend fun reprocessKeplerGalleryJob(
             includedFrameIndices = resolvedSelection
         )
         deleteBackups(backups)
-        Result.success(
+        return@withContext Result.success(
             KeplerReprocessResult(
                 jobDir = target,
                 jobKind = capability.jobKind,
@@ -158,18 +203,46 @@ suspend fun reprocessKeplerGalleryJob(
                 warnings = emptyList()
             )
         )
-    } else {
-        val error = pipelineResult.exceptionOrNull() ?: IllegalStateException("Unknown reprocess failure")
-        val rollback = restoreBackups(target, backups)
-        if (rollback.isFailure) {
-            writeReprocessFailure(target, "${error.javaClass.simpleName}: ${error.message}; rollback failed: ${rollback.exceptionOrNull()?.message}")
-            return@withContext Result.failure(rollback.exceptionOrNull() ?: error)
-        }
-        writeReprocessFailure(target, "${error.javaClass.simpleName}: ${error.message}")
-        Result.failure(error)
     }
+
+    val error = pipelineResult?.exceptionOrNull() ?: ReprocessWorkerDidNotExitException(
+        "Reprocess worker did not finish before timeout."
+    )
+    val rollbackResult = if (pipelineResult == null) {
+        cancelWorkerAndRollbackAfterCompletion(worker) { restoreBackups(target, backups) }
+    } else {
+        restoreBackups(target, backups)
+    }
+    if (rollbackResult.isFailure) {
+        val rollbackError = rollbackResult.exceptionOrNull()
+        if (rollbackError is ReprocessWorkerDidNotExitException) {
+            writeReprocessFailure(
+                target,
+                "${error.javaClass.simpleName}: ${error.message}; backups preserved because the worker did not exit in time."
+            )
+            return@withContext Result.failure(rollbackError)
+        }
+        writeReprocessFailure(
+            target,
+            "${error.javaClass.simpleName}: ${error.message}; rollback failed: ${rollbackError?.message}"
+        )
+        return@withContext Result.failure(rollbackError ?: error)
+    }
+    writeReprocessFailure(target, "${error.javaClass.simpleName}: ${error.message}")
+    Result.failure(error)
 }
 
+internal suspend fun cancelWorkerAndRollbackAfterCompletion(
+    worker: ReprocessWorkerRun,
+    rollback: suspend () -> Result<Unit>
+): Result<Unit> = withContext(NonCancellable) {
+    worker.cancel()
+    if (withTimeoutOrNull(REPROCESS_WORKER_EXIT_TIMEOUT_MS) { worker.completion.await() } == null) {
+        Result.failure(ReprocessWorkerDidNotExitException("Reprocess worker did not exit before rollback timeout."))
+    } else {
+        rollback()
+    }
+}
 fun detectReprocessCapability(context: Context, jobDir: File): ReprocessCapability {
     val target = runCatching { requireReprocessSafeJobDirectory(context, jobDir) }.getOrNull()
         ?: return ReprocessCapability(
@@ -232,79 +305,6 @@ fun detectReprocessCapability(context: Context, jobDir: File): ReprocessCapabili
             finalOutputExists = finalExists,
             sourceFramesAvailable = sourceAvailable
         )
-    }
-}
-
-private suspend fun awaitRawReprocess(
-    context: Context,
-    jobDir: File,
-    outputSettings: OutputSettings,
-    frameSelection: Set<Int>,
-    postProgress: suspend (String) -> Unit
-): Result<Unit> = suspendCancellableCoroutine { continuation ->
-    var lastStatus = ""
-    val cancellation = KeplerPipelineCancellationToken()
-    val progressScope = CoroutineScope(continuation.context)
-    reprocessRawJob(context, jobDir, outputSettings, frameSelection, cancellation) { status ->
-        lastStatus = status
-        progressScope.launch {
-            postProgress(
-                if (status.contains("Exporting", ignoreCase = true)) {
-                    "최종 사진 저장 중…"
-                } else {
-                    "RAW 합성 중…"
-                }
-            )
-        }
-        if (!continuation.isActive) return@reprocessRawJob
-        when {
-            status.startsWith("RAW reprocess complete") -> continuation.resume(Result.success(Unit))
-            status.startsWith("RAW reprocess failed") ||
-                status.startsWith("RAW reprocess export failed") ||
-                status.startsWith("PIPELINE_CANCELLED") ||
-                status.startsWith("Not enough enabled frames") ->
-                continuation.resume(Result.failure(IllegalStateException(status)))
-        }
-    }
-    continuation.invokeOnCancellation {
-        cancellation.cancel()
-        if (lastStatus.isNotBlank()) writeReprocessFailure(jobDir, "취소됨: $lastStatus")
-    }
-}
-
-private suspend fun awaitYuvReprocess(
-    context: Context,
-    jobDir: File,
-    outputSettings: OutputSettings,
-    frameSelection: Set<Int>,
-    postProgress: suspend (String) -> Unit
-): Result<Unit> = suspendCancellableCoroutine { continuation ->
-    var lastStatus = ""
-    val cancellation = KeplerPipelineCancellationToken()
-    val progressScope = CoroutineScope(continuation.context)
-    reprocessYuvJob(context, jobDir, outputSettings, selectedFrameIndices = frameSelection, cancellation = cancellation) { status ->
-        lastStatus = status
-        progressScope.launch {
-            postProgress(
-                if (status.contains("export", ignoreCase = true)) {
-                    "최종 사진 저장 중…"
-                } else {
-                    "YUV 합성 중…"
-                }
-            )
-        }
-        if (!continuation.isActive) return@reprocessYuvJob
-        when {
-            status.startsWith("PIPELINE_COMPLETE: YUV reprocess") -> continuation.resume(Result.success(Unit))
-            status.startsWith("PIPELINE_FAILED: YUV reprocess") ||
-                status.startsWith("PIPELINE_CANCELLED") ||
-                status.startsWith("Not enough enabled YUV frames") ->
-                continuation.resume(Result.failure(IllegalStateException(status)))
-        }
-    }
-    continuation.invokeOnCancellation {
-        cancellation.cancel()
-        if (lastStatus.isNotBlank()) writeReprocessFailure(jobDir, "취소됨: $lastStatus")
     }
 }
 
@@ -413,32 +413,37 @@ private fun resolveReprocessFinalOutput(jobDir: File, job: JSONObject): File? =
         .filter { it.isFile && it.length() > 0L }
         .maxByOrNull { it.lastModified() }
 
-private data class ReprocessBackup(
+internal data class ReprocessBackup(
     val original: File,
     val backup: File,
     val existingNames: Set<String> = emptySet()
 )
 
-private fun backupReprocessTransaction(jobDir: File, files: List<File>): Result<List<ReprocessBackup>> {
+internal fun backupReprocessTransaction(jobDir: File, files: List<File>): Result<List<ReprocessBackup>> {
     val root = File(jobDir, ".reprocess_backup_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}")
     return runCatching {
         check(root.mkdirs()) { "Could not create reprocess backup directory." }
         val metadata = File(jobDir, JOB_JSON_FILE_NAME)
         check(metadata.isFile) { "job.json is required for rollback." }
         val existingNames = jobDir.listFiles()?.filter { it.isFile }?.map { it.name }?.toSet().orEmpty()
-        (listOf(metadata) + files.filter { it.isFile }.map { it.canonicalFile }.distinctBy { it.path }).map { original ->
+        (files + metadata)
+            .asSequence()
+            .filter { it.isFile }
+            .map { it.canonicalFile }
+            .distinctBy { it.path }
+            .map { original ->
             val backup = File(root, original.name)
             original.copyTo(backup, overwrite = false)
             check(backup.isFile && backup.length() == original.length()) { "Backup verification failed for ${original.name}" }
             ReprocessBackup(original, backup, existingNames)
-        }
+        }.toList()
     }.onFailure {
         root.listFiles()?.forEach { it.delete() }
         root.delete()
     }
 }
 
-private fun restoreBackups(jobDir: File, backups: List<ReprocessBackup>): Result<Unit> = runCatching {
+internal fun restoreBackups(jobDir: File, backups: List<ReprocessBackup>): Result<Unit> = runCatching {
     val originalNames = backups.firstOrNull()?.existingNames.orEmpty()
     jobDir.listFiles()?.filter { it.isFile && it.name !in originalNames }?.forEach { runCatching { it.delete() } }
     backups.forEach { backup ->
@@ -448,7 +453,7 @@ private fun restoreBackups(jobDir: File, backups: List<ReprocessBackup>): Result
     check(deleteBackups(backups)) { "Could not clean rollback backup directory." }
 }
 
-private fun deleteBackups(backups: List<ReprocessBackup>): Boolean {
+internal fun deleteBackups(backups: List<ReprocessBackup>): Boolean {
     val root = backups.firstOrNull()?.backup?.parentFile ?: return true
     backups.forEach { backup -> if (backup.backup.exists() && !backup.backup.delete()) return false }
     return !root.exists() || root.delete()

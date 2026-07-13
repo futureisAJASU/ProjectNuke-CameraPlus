@@ -2510,15 +2510,6 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
 }
 
 private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
-    if (
-        job.optBoolean("nativeRawIspUsed", false) &&
-        job.optString("finalOutputSource") == "native_rgba"
-    ) {
-        val nativeName = job.optString("nativePostprocessRgbaFile", "")
-        File(jobDir, nativeName).takeIf {
-            nativeName.isNotBlank() && it.exists() && it.length() > 0L
-        }?.let { return it }
-    }
     val names = listOf(
         job.optString("finalFile", ""),
         job.optString("outputFile", ""),
@@ -2533,6 +2524,7 @@ private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
         .asSequence()
         .filter { it.isNotBlank() && it != "null" }
         .map { File(jobDir, it) }
+        .filter { it.extension.lowercase() in setOf("png", "jpg", "jpeg", "heic", "webp") }
         .firstOrNull {
             it.exists() && it.length() > 0L &&
                 it.extension.lowercase() in setOf("jpg", "jpeg", "png", "heic", "webp") &&

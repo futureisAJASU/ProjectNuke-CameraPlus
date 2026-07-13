@@ -138,7 +138,10 @@ private fun recoverStaleInterruptedJob(directory: File) {
     val status = job.optString("status").uppercase()
     val processStatus = job.optString("processStatus").uppercase()
     val pipelineStage = job.optString("currentPipelineStage").uppercase()
-    val active = setOf("CAPTURING", "PROCESSING")
+    val active = setOf(
+        "CAPTURING", "PROCESSING", "YUV_ALIGNING", "YUV_MERGING",
+        "YUV_DENOISE_SHARPEN", "YUV_EXPORTING"
+    )
     if (status !in active && processStatus !in active && pipelineStage !in active) return
     val updatedAt = job.optLong("updatedAt", job.optLong("createdAt", 0L))
     if (updatedAt <= 0L || System.currentTimeMillis() - updatedAt < STALE_JOB_RECOVERY_AGE_MILLIS) return

@@ -101,7 +101,7 @@ fun capture50MpProcessedTest(
             .put(if (isJpeg) "jpegHeight" else "yuvHeight", selection.size.height)
             .put("outputFile", outputName)
             .put("createdAt", System.currentTimeMillis())
-        jobFile.writeText(job.toString(2))
+        KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
 
         reader = ImageReader.newInstance(
             selection.size.width,
@@ -123,7 +123,11 @@ fun capture50MpProcessedTest(
                 job?.put("status", "CAPTURE_COMPLETE")
                     ?.put("fileSizeBytes", output.length())
                     ?.put("updatedAt", System.currentTimeMillis())
-                jobFile.writeText(job.toString(2))
+                KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
+                    current.put("status", "CAPTURE_COMPLETE")
+                        .put("fileSizeBytes", output.length())
+                        .put("updatedAt", System.currentTimeMillis())
+                }
                 post(
                     "PIPELINE_COMPLETE: Test 50M ${if (isJpeg) "JPEG" else "YUV"} Capture success. " +
                         "cameraId=$cameraId, size=${selection.size.width}x${selection.size.height}, " +
