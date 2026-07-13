@@ -64,7 +64,15 @@ fun capture50MpProcessedTest(
         job?.put("status", "CAPTURE_FAILED")
             ?.put("failureReason", message)
             ?.put("updatedAt", System.currentTimeMillis())
-        runCatching { jobFile?.writeText(job?.toString(2).orEmpty()) }
+        runCatching {
+            jobFile?.parentFile?.let { dir ->
+                KeplerJobMetadata.update(dir) { current ->
+                    current.put("status", "CAPTURE_FAILED")
+                        .put("failureReason", message)
+                        .put("updatedAt", System.currentTimeMillis())
+                }
+            }
+        }
         post("PIPELINE_FAILED: Test 50M YUV/JPEG Capture failed. $message")
         mainHandler.post { onError(message) }
         cleanup()
@@ -164,7 +172,11 @@ fun capture50MpProcessedTest(
                                                 CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION
                                             )
                                             job?.put("sensorPixelModeUsed", true)
-                                            jobFile?.writeText(job?.toString(2).orEmpty())
+                                            jobFile?.parentFile?.let { dir ->
+                                                KeplerJobMetadata.update(dir) { current ->
+                                                    current.put("sensorPixelModeUsed", true)
+                                                }
+                                            }
                                         }
                                     }.build()
                                     configured.capture(

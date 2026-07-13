@@ -44,15 +44,14 @@ class KeplerGalleryReprocessProtocolTest {
             source.writeText("original")
             val backups = backupReprocessTransaction(directory, listOf(source)).getOrThrow()
 
-            val workerCompletion = CompletableDeferred<Unit>()
+            val workerCompletion = CompletableDeferred<ReprocessWorkerOutcome>()
             val cancelRequested = CompletableDeferred<Unit>()
             val rollbackStarted = CompletableDeferred<Unit>()
 
             val result = async {
                 cancelWorkerAndRollbackAfterCompletion(
                     ReprocessWorkerRun(
-                        result = CompletableDeferred<Result<Unit>>(),
-                        completion = workerCompletion,
+                        terminal = workerCompletion,
                         cancel = { cancelRequested.complete(Unit) }
                     )
                 ) {
@@ -65,7 +64,7 @@ class KeplerGalleryReprocessProtocolTest {
             assertTrue(cancelRequested.isCompleted)
             assertFalse(rollbackStarted.isCompleted)
 
-            workerCompletion.complete(Unit)
+            workerCompletion.complete(ReprocessWorkerOutcome(Result.failure(IllegalStateException("cancelled")), false))
             assertTrue(result.await().isSuccess)
             assertTrue(rollbackStarted.isCompleted)
             assertEquals("original", source.readText())
@@ -83,14 +82,13 @@ class KeplerGalleryReprocessProtocolTest {
             source.writeText("original")
             val backups = backupReprocessTransaction(directory, listOf(source)).getOrThrow()
 
-            val workerCompletion = CompletableDeferred<Unit>()
+            val workerCompletion = CompletableDeferred<ReprocessWorkerOutcome>()
             val cancelRequested = CompletableDeferred<Unit>()
 
             val result = async {
                 cancelWorkerAndRollbackAfterCompletion(
                     ReprocessWorkerRun(
-                        result = CompletableDeferred<Result<Unit>>(),
-                        completion = workerCompletion,
+                        terminal = workerCompletion,
                         cancel = { cancelRequested.complete(Unit) }
                     )
                 ) {
@@ -105,7 +103,7 @@ class KeplerGalleryReprocessProtocolTest {
             assertEquals("late", source.readText())
             assertFalse(result.isCompleted)
 
-            workerCompletion.complete(Unit)
+            workerCompletion.complete(ReprocessWorkerOutcome(Result.failure(IllegalStateException("cancelled")), false))
             assertTrue(result.await().isSuccess)
             assertEquals("original", source.readText())
         } finally {

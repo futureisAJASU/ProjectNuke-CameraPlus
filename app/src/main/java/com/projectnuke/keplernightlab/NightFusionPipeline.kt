@@ -202,14 +202,14 @@ internal fun reprocessYuvJob(
 ): ReprocessWorkerRun {
     val mainHandler = Handler(Looper.getMainLooper())
     fun post(message: String) = mainHandler.post { onStatus(message) }
-    val completion = CompletableDeferred<Unit>()
-    val result = CompletableDeferred<Result<Unit>>()
+    val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
     val workerThread = HandlerThread("KeplerYuvReprocessThread").apply { start() }
     Handler(workerThread.looper).post {
         val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
         var totalFrames = 0
         var enabledFrames = 0
         var terminalResult: Result<Unit> = Result.failure(IllegalStateException("YUV reprocess did not reach a terminal state."))
+        var publicExportCommitted = false
         try {
             cancellation.throwIfCancelled()
             if (selectedFrameIndices != null) {
@@ -277,6 +277,7 @@ internal fun reprocessYuvJob(
                 finalOutputFormat = finalOutputFormat,
                 rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
             )
+            publicExportCommitted = true
             updateYuvReprocessHistory(
                 jobDir, enabledFrames, totalFrames - enabledFrames, "SUCCESS"
             )
@@ -307,17 +308,13 @@ internal fun reprocessYuvJob(
             post("PIPELINE_FAILED: YUV reprocess failed; cache kept. ${e.message}")
             terminalResult = Result.failure(e)
         } finally {
-            if (!result.isCompleted) {
-                result.complete(terminalResult)
-            }
             workerThread.quitSafely()
-            completion.complete(Unit)
+            terminal.complete(ReprocessWorkerOutcome(terminalResult, publicExportCommitted))
         }
     }
     return ReprocessWorkerRun(
-        result = result,
-        completion = completion,
-        cancel = { if (cancellation is KeplerPipelineCancellationToken) cancellation.cancel() }
+        terminal = terminal,
+        cancel = { (cancellation as? KeplerPipelineCancellationToken)?.cancel() }
     )
 }
 

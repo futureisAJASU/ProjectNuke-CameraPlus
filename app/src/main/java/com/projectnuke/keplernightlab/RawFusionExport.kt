@@ -331,11 +331,11 @@ internal fun reprocessRawJob(
 ): ReprocessWorkerRun {
     val main = Handler(Looper.getMainLooper())
     fun post(message: String) = main.post { onStatus(message) }
-    val completion = CompletableDeferred<Unit>()
-    val result = CompletableDeferred<Result<Unit>>()
+    val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
     val thread = HandlerThread("KeplerRawReprocessThread").apply { start() }
     Handler(thread.looper).post {
         var terminalResult: Result<Unit> = Result.failure(IllegalStateException("RAW reprocess did not reach a terminal state."))
+        var publicExportCommitted = false
         var enabledCount = 0
         var totalCount = 0
         try {
@@ -414,6 +414,7 @@ internal fun reprocessRawJob(
                 finalOutputFormat = finalOutputFormat,
                 rawSidecarResult = null
             )
+            publicExportCommitted = true
             updateReprocessHistory(jobDir, enabledCount, totalCount - enabledCount, "SUCCESS")
             post("RAW reprocess complete: used $enabledCount frames; source frames kept.")
             terminalResult = Result.success(Unit)
@@ -432,17 +433,13 @@ internal fun reprocessRawJob(
             post("RAW reprocess failed; source frames kept. ${e.javaClass.simpleName}: ${e.message}")
             terminalResult = Result.failure(e)
         } finally {
-            if (!result.isCompleted) {
-                result.complete(terminalResult)
-            }
             thread.quitSafely()
-            completion.complete(Unit)
+            terminal.complete(ReprocessWorkerOutcome(terminalResult, publicExportCommitted))
         }
     }
     return ReprocessWorkerRun(
-        result = result,
-        completion = completion,
-        cancel = { if (cancellation is KeplerPipelineCancellationToken) cancellation.cancel() }
+        terminal = terminal,
+        cancel = { (cancellation as? KeplerPipelineCancellationToken)?.cancel() }
     )
 }
 private fun applyExplicitFrameSelection(jobDir: File, selectedFrameIndices: Set<Int>) {

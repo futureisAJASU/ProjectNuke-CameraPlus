@@ -49,9 +49,13 @@ data class KeplerReprocessResult(
 )
 
 internal data class ReprocessWorkerRun(
-    val result: Deferred<Result<Unit>>,
-    val completion: Deferred<Unit>,
+    val terminal: Deferred<ReprocessWorkerOutcome>,
     val cancel: () -> Unit
+)
+
+internal data class ReprocessWorkerOutcome(
+    val result: Result<Unit>,
+    val publicExportCommitted: Boolean
 )
 
 internal class ReprocessWorkerDidNotExitException(message: String) : IllegalStateException(message)
@@ -137,6 +141,7 @@ suspend fun reprocessKeplerGalleryJob(
 
     val beforeBytes = beforeFinals.filter { it.isFile }.sumOf { it.length() }
     val progressScope = CoroutineScope(coroutineContext)
+    val cancellation = KeplerPipelineCancellationToken()
     val worker = when (capability.jobKind) {
         ReprocessJobKind.RAW_FUSION ->
             reprocessRawJob(
@@ -144,6 +149,7 @@ suspend fun reprocessKeplerGalleryJob(
                 target,
                 outputSettings,
                 resolvedSelection,
+                cancellation = cancellation,
                 onStatus = { message -> progressScope.launch { postProgress(message) } }
             )
         ReprocessJobKind.YUV_FUSION ->
@@ -152,6 +158,7 @@ suspend fun reprocessKeplerGalleryJob(
                 target,
                 outputSettings,
                 resolvedSelection,
+                cancellation = cancellation,
                 onStatus = { message -> progressScope.launch { postProgress(message) } }
             )
         ReprocessJobKind.COLOR_BURST -> {
@@ -159,24 +166,33 @@ suspend fun reprocessKeplerGalleryJob(
             val completion = CompletableDeferred<Unit>()
             result.complete(Result.failure(UnsupportedOperationException("ColorBurst는 아직 다시 합성할 수 없습니다.")))
             completion.complete(Unit)
-            ReprocessWorkerRun(result = result, completion = completion, cancel = {})
+            ReprocessWorkerRun(terminal = CompletableDeferred<ReprocessWorkerOutcome>().apply {
+                complete(ReprocessWorkerOutcome(result.getCompleted(), false))
+            }, cancel = {})
         }
         ReprocessJobKind.UNSUPPORTED -> {
             val result = CompletableDeferred<Result<Unit>>()
             val completion = CompletableDeferred<Unit>()
             result.complete(Result.failure(UnsupportedOperationException("지원하지 않는 작업 유형입니다.")))
             completion.complete(Unit)
-            ReprocessWorkerRun(result = result, completion = completion, cancel = {})
+            ReprocessWorkerRun(terminal = CompletableDeferred<ReprocessWorkerOutcome>().apply {
+                complete(ReprocessWorkerOutcome(result.getCompleted(), false))
+            }, cancel = {})
         }
     }
 
-    val pipelineResult = try {
-        withTimeoutOrNull(REPROCESS_TIMEOUT_MS) { worker.result.await() }
-    } catch (_: kotlinx.coroutines.CancellationException) {
-        null
+    val pipelineOutcome = try {
+        withTimeoutOrNull(REPROCESS_TIMEOUT_MS) { worker.terminal.await() }
+    } catch (callerCancellation: kotlinx.coroutines.CancellationException) {
+        val cleanup = cancelWorkerAndRollbackAfterCompletion(worker) { restoreBackups(target, backups) }
+        if (cleanup.isFailure && cleanup.exceptionOrNull() !is ReprocessWorkerDidNotExitException) {
+            writeReprocessFailure(target, "Caller cancellation cleanup failed: ${cleanup.exceptionOrNull()?.message}")
+        }
+        throw callerCancellation
     }
+    val pipelineResult = pipelineOutcome?.result
 
-    if (pipelineResult?.isSuccess == true) {
+    if (pipelineOutcome?.publicExportCommitted == true || pipelineResult?.isSuccess == true) {
         postProgress("갤러리 정보 갱신 중…")
         val updatedJob = loadJobJsonSafe(target)
         val finalFile = resolveReprocessFinalOutput(target, updatedJob)
@@ -208,7 +224,7 @@ suspend fun reprocessKeplerGalleryJob(
     val error = pipelineResult?.exceptionOrNull() ?: ReprocessWorkerDidNotExitException(
         "Reprocess worker did not finish before timeout."
     )
-    val rollbackResult = if (pipelineResult == null) {
+    val rollbackResult = if (pipelineOutcome == null) {
         cancelWorkerAndRollbackAfterCompletion(worker) { restoreBackups(target, backups) }
     } else {
         restoreBackups(target, backups)
@@ -237,8 +253,11 @@ internal suspend fun cancelWorkerAndRollbackAfterCompletion(
     rollback: suspend () -> Result<Unit>
 ): Result<Unit> = withContext(NonCancellable) {
     worker.cancel()
-    if (withTimeoutOrNull(REPROCESS_WORKER_EXIT_TIMEOUT_MS) { worker.completion.await() } == null) {
+    val outcome = withTimeoutOrNull(REPROCESS_WORKER_EXIT_TIMEOUT_MS) { worker.terminal.await() }
+    if (outcome == null) {
         Result.failure(ReprocessWorkerDidNotExitException("Reprocess worker did not exit before rollback timeout."))
+    } else if (outcome.publicExportCommitted || outcome.result.isSuccess) {
+        Result.success(Unit)
     } else {
         rollback()
     }
