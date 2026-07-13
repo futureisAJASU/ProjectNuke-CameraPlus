@@ -421,5 +421,5 @@ private fun updateCleanupMetadata(
         .put("cleanupPolicy", policy.name)
         .put("sourceFramesDeleted", sourceFramesDeleted)
         .put("cleanedAt", System.currentTimeMillis())
-    KeplerJobMetadata.write(jobDir, job)
+    KeplerJobMetadata.replace(jobFile.parentFile ?: error("Job directory missing"), job)
 }

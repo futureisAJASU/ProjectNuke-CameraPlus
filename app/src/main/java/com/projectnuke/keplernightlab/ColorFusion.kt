@@ -1104,7 +1104,7 @@ private fun writeBitmapToTempPng(bitmap: Bitmap, finalFile: File) {
             output.fd.sync()
         }
         KeplerJobMetadata.atomicReplace(tempFile, finalFile)
-    } catch (t: Exception) {
+    } catch (t: Throwable) {
         runCatching {
             if (tempFile.exists()) {
                 tempFile.delete()
@@ -1257,7 +1257,7 @@ fun averageLatestYuvBurstColor(
                 .put("averageUsedFrames", usedFrames)
                 .put("processedAt", System.currentTimeMillis())
 
-            KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), updatedJob)
+        KeplerJobMetadata.replace(jobFile.parentFile ?: error("Job directory missing"), updatedJob)
 
             postStatus(
                 "컬러 평균 합성 완료\n" +
@@ -1589,7 +1589,7 @@ private fun updateYuvCaptureRequestTemplateMetadata(
             .put("yuvCaptureRequestTemplateFallbackUsed", fallbackUsed)
             .put("yuvCaptureRequestTemplateFailures", JSONArray(failures.take(6)))
             .put("updatedAt", System.currentTimeMillis())
-        KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
+        KeplerJobMetadata.replace(jobFile.parentFile ?: error("Job directory missing"), job)
     }
 }
 

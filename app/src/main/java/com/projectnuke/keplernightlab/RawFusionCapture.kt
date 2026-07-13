@@ -583,9 +583,8 @@ fun captureRawBurstForFusion(
             }
         }
 
-        fun evictEmergencyUnmatchedImages() {
-            val maxImages = if (highResolutionRaw) 4 else min(8, requestedFrames + 2)
-            if (imagesByTimestamp.size < maxImages - 1) return
+        fun evictEmergencyUnmatchedImages(readerCapacity: Int) {
+            if (imagesByTimestamp.size < readerCapacity) return
             imagesByTimestamp.keys
                 .filter { it !in resultsByTimestamp }
                 .minByOrNull { imageArrivalMillis[it] ?: Long.MIN_VALUE }
@@ -624,14 +623,20 @@ fun captureRawBurstForFusion(
                     var dngSaved = false
                     var dngFailure: String? = null
                     if (shouldSaveDngSidecars) {
+                        val dngFile = File(jobDir, dngName)
+                        val dngTemp = File(jobDir, ".${dngName}.${System.nanoTime()}.tmp")
                         try {
-                            FileOutputStream(File(jobDir, dngName)).use { output ->
+                            FileOutputStream(dngTemp).use { output ->
                                 DngCreator(characteristics, result).use { creator ->
                                     creator.writeImage(output, image)
                                 }
                             }
+                            check(dngTemp.length() > 0L) { "DNG output was empty" }
+                            KeplerJobMetadata.atomicReplace(dngTemp, dngFile)
                             dngSaved = true
                         } catch (e: Exception) {
+                            runCatching { dngTemp.delete() }
+                            runCatching { dngFile.delete() }
                             dngFailure = "${e.javaClass.simpleName}: ${e.message}"
                             post("RAW DNG sidecar failed; continuing with raw16 fusion.")
                         }
@@ -706,6 +711,7 @@ fun captureRawBurstForFusion(
 
         imageReader.setOnImageAvailableListener({ r ->
             if (finished.get()) return@setOnImageAvailableListener
+            evictEmergencyUnmatchedImages(imageReader.maxImages)
             val image = try {
                 r.acquireNextImage()
             } catch (e: Exception) {
@@ -728,7 +734,7 @@ fun captureRawBurstForFusion(
             imagesByTimestamp.remove(image.timestamp)?.let { runCatching { it.close() } }
             imagesByTimestamp[image.timestamp] = image
             imageArrivalMillis[image.timestamp] = System.currentTimeMillis()
-            evictEmergencyUnmatchedImages()
+            evictEmergencyUnmatchedImages(imageReader.maxImages)
             closeUnmatchedImages()
             postCaptureProgress()
             trySaveReadyFrames()
@@ -2834,7 +2840,7 @@ internal fun loadRawRgbaBitmap(file: File, width: Int, height: Int): Bitmap {
             }
         }
         return bitmap
-    } catch (t: Exception) {
+    } catch (t: Throwable) {
         bitmap.takeUnless { it.isRecycled }?.recycle()
         throw t
     }

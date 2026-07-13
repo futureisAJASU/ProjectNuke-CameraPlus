@@ -96,7 +96,9 @@ suspend fun reprocessKeplerGalleryJob(
     val beforeFinals = finalOutputCandidates(target, job)
     val requiredProcessingMetadata = listOf(
         "alignment.json", "alignment_debug.json", "render_debug.json",
-        "raw_render_debug.json", "raw_fusion_alignment.json", "yuv_debug.json"
+        "raw_fusion_debug.json", "raw_render_input_metadata.json",
+        "raw_render_debug.json", "raw_fusion_alignment.json",
+        "fusion_debug.json", "yuv_debug.json"
     ).map { File(target, it) }
     val backups = backupReprocessTransaction(target, beforeFinals + requiredProcessingMetadata).getOrElse {
         writeReprocessFailure(target, "Required reprocess backup failed: ${it.message}")
@@ -407,18 +409,23 @@ private fun resolveReprocessFinalOutput(jobDir: File, job: JSONObject): File? =
         .filter { it.isFile && it.length() > 0L }
         .maxByOrNull { it.lastModified() }
 
-private data class ReprocessBackup(val original: File, val backup: File)
+private data class ReprocessBackup(
+    val original: File,
+    val backup: File,
+    val existingNames: Set<String> = emptySet()
+)
 
 private fun backupReprocessTransaction(jobDir: File, files: List<File>): Result<List<ReprocessBackup>> = runCatching {
     val root = File(jobDir, ".reprocess_backup_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}")
     check(root.mkdirs()) { "Could not create reprocess backup directory." }
     val metadata = File(jobDir, JOB_JSON_FILE_NAME)
     check(metadata.isFile) { "job.json is required for rollback." }
+    val existingNames = jobDir.listFiles()?.filter { it.isFile }?.map { it.name }?.toSet().orEmpty()
     (listOf(metadata) + files.filter { it.isFile }.distinct()).map { original ->
         val backup = File(root, original.name)
         original.copyTo(backup, overwrite = false)
         check(backup.isFile && backup.length() == original.length()) { "Backup verification failed for ${original.name}" }
-        ReprocessBackup(original, backup)
+        ReprocessBackup(original, backup, existingNames)
     }
 }.onFailure {
     jobDir.listFiles()?.filter { it.name.startsWith(".reprocess_backup_") }?.forEach { root ->
@@ -428,10 +435,8 @@ private fun backupReprocessTransaction(jobDir: File, files: List<File>): Result<
 }
 
 private fun restoreBackups(jobDir: File, backups: List<ReprocessBackup>) {
-    val originalNames = backups.map { it.original.name }.toSet()
-    jobDir.listFiles()?.filter { it.isFile && it.name !in originalNames &&
-        it.name != JOB_JSON_FILE_NAME && !isReprocessSourceFrame(it, detectJobKind(jobDir, loadJobJsonSafe(jobDir)))
-    }?.forEach { runCatching { it.delete() } }
+    val originalNames = backups.firstOrNull()?.existingNames.orEmpty()
+    jobDir.listFiles()?.filter { it.isFile && it.name !in originalNames }?.forEach { runCatching { it.delete() } }
     backups.forEach { backup ->
         runCatching {
             if (backup.backup.isFile) backup.backup.copyTo(backup.original, overwrite = true)

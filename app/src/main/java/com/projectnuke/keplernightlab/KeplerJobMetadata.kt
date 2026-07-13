@@ -35,6 +35,7 @@ object KeplerJobMetadata {
 
     /** Applies a caller's prepared fields while holding the same read-modify-write lock. */
     fun replace(jobDir: File, replacement: JSONObject): JSONObject = update(jobDir) { current ->
+        current.keys().asSequence().toList().forEach { key -> current.remove(key) }
         replacement.keys().forEach { key -> current.put(key, replacement.get(key)) }
     }
 
