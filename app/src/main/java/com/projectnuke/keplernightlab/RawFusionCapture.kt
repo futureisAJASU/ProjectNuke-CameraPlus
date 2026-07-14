@@ -1612,6 +1612,7 @@ fun processRawFusionJob(
     jobDir: File,
     saveNativeMp24DebugPng: Boolean = SAVE_NATIVE_MP24_DEBUG_PNG_DEFAULT,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
+    metadataPolicy: ReprocessMetadataPolicy = ReprocessMetadataPolicy.NORMAL,
     onStatus: (String) -> Unit
 ): RawFusionProcessResult {
     val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
@@ -1735,6 +1736,7 @@ fun processRawFusionJob(
                 outputMode = outputMode,
                 highResolutionRaw = highResolutionRaw,
                 saveNativeMp24DebugPng = saveNativeMp24DebugPng,
+                metadataPolicy = metadataPolicy,
                 onStatus = onStatus
             ),
             cancellation

@@ -121,7 +121,8 @@ internal fun processYuvFusionJobV2(
     onStatus: (String) -> Unit,
     requestedParams: ClassicYuvFusionParams? = null,
     dryRun: Boolean = false,
-    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
+    metadataPolicy: ReprocessMetadataPolicy = ReprocessMetadataPolicy.NORMAL
 ): File {
     cancellation.throwIfCancelled()
     val scoringResult = safeScoreYuvFusionV2Frames(jobDir)
@@ -154,7 +155,8 @@ internal fun processYuvFusionJobV2(
                 jobDir = jobDir,
                 onStatus = onStatus,
                 requestedParams = requestedParams,
-                cancellation = cancellation
+                cancellation = cancellation,
+                metadataPolicy = metadataPolicy
             )
             cancellation.throwIfCancelled()
             runCatching {
@@ -192,8 +194,9 @@ internal fun processYuvFusionJobV2(
         val finalFile = processClassicYuvFusionJob(
             jobDir = jobDir,
             onStatus = onStatus,
-            requestedParams = requestedParams,
-            cancellation = cancellation
+                requestedParams = requestedParams,
+                cancellation = cancellation,
+                metadataPolicy = metadataPolicy
         )
         cancellation.throwIfCancelled()
         runCatching {

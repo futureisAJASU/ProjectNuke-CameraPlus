@@ -4,6 +4,11 @@ import android.util.Size
 import org.json.JSONObject
 import java.io.File
 
+enum class ReprocessMetadataPolicy {
+    NORMAL,
+    REPROCESS_PROGRESS_ONLY
+}
+
 data class RawFusionProcessResult(
     val success: Boolean,
     val mergedRawFile: File?,
@@ -83,6 +88,7 @@ internal data class RawFusionExportContext(
     val outputMode: CaptureResolutionMode,
     val highResolutionRaw: Boolean,
     val saveNativeMp24DebugPng: Boolean,
+    val metadataPolicy: ReprocessMetadataPolicy = ReprocessMetadataPolicy.NORMAL,
     val onStatus: (String) -> Unit
 )
 

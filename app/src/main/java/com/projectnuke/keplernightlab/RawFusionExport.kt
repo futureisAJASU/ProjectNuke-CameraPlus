@@ -362,6 +362,7 @@ internal fun reprocessRawJob(
                 jobDir = jobDir,
                 saveNativeMp24DebugPng = finalOutputFormat.isDebugPng,
                 cancellation = cancellation
+                , metadataPolicy = ReprocessMetadataPolicy.REPROCESS_PROGRESS_ONLY
             ) { post(it) }
             currentOutputFile = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
             currentPreviewFile = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L }
@@ -446,8 +447,8 @@ internal fun reprocessRawJob(
     )
 }
 private fun applyExplicitFrameSelection(jobDir: File, selectedFrameIndices: Set<Int>) {
-    val job = loadJobJson(jobDir)
-    val frames = job.optJSONArray("frames") ?: return
+    KeplerJobMetadata.update(jobDir) { job ->
+    val frames = job.optJSONArray("frames") ?: return@update
     repeat(frames.length()) { position ->
         val frame = frames.optJSONObject(position) ?: return@repeat
         val index = frame.optInt("index", position)
@@ -458,7 +459,7 @@ private fun applyExplicitFrameSelection(jobDir: File, selectedFrameIndices: Set<
     }
     job.put("includedFrameIndices", org.json.JSONArray(selectedFrameIndices.sorted()))
         .put("frameSelectionUpdatedAt", System.currentTimeMillis())
-    saveJobJson(jobDir, job)
+    }
 }
 
 private fun updateRawNativeQualityDiagnostics(jobDir: File, bitmap: Bitmap) {

@@ -245,7 +245,8 @@ internal fun reprocessYuvJob(
                 jobDir = jobDir,
                 onStatus = { post(it) },
                 requestedParams = fusionParams,
-                cancellation = cancellation
+                cancellation = cancellation,
+                metadataPolicy = ReprocessMetadataPolicy.REPROCESS_PROGRESS_ONLY
             )
             finalOutputFile = finalFile.takeIf { it.isFile && it.length() > 0L }
             post("YUV reprocess: exporting...")
@@ -314,8 +315,8 @@ internal fun reprocessYuvJob(
 }
 
 private fun applyExplicitYuvFrameSelection(jobDir: File, selectedFrameIndices: Set<Int>) {
-    val job = loadJobJson(jobDir)
-    val frames = job.optJSONArray("frames") ?: return
+    KeplerJobMetadata.update(jobDir) { job ->
+    val frames = job.optJSONArray("frames") ?: return@update
     repeat(frames.length()) { position ->
         val frame = frames.optJSONObject(position) ?: return@repeat
         val index = frame.optInt("index", position)
@@ -326,7 +327,7 @@ private fun applyExplicitYuvFrameSelection(jobDir: File, selectedFrameIndices: S
     }
     job.put("includedFrameIndices", org.json.JSONArray(selectedFrameIndices.sorted()))
         .put("frameSelectionUpdatedAt", System.currentTimeMillis())
-    saveJobJson(jobDir, job)
+    }
 }
 
 fun cleanupNightFusionJobAfterVerifiedExport(

@@ -96,6 +96,7 @@ internal fun processClassicYuvFusionJob(
     requestedParams: ClassicYuvFusionParams? = null,
     externalFrameWeights: Map<Int, Float>? = null,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
+    metadataPolicy: ReprocessMetadataPolicy = ReprocessMetadataPolicy.NORMAL,
     onStatus: (String) -> Unit
 ): File {
     cancellation.throwIfCancelled()
@@ -116,7 +117,15 @@ internal fun processClassicYuvFusionJob(
             job.put("currentPipelineStage", stage)
                 .put("processStatus", status)
                 .put("processingStartedAt", processingStartedAt)
-            KeplerJobMetadata.write(jobDir, job)
+            if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+                KeplerJobMetadata.write(jobDir, job)
+            } else {
+                KeplerJobMetadata.update(jobDir) { current ->
+                    current.put("currentPipelineStage", stage)
+                        .put("processStatus", status)
+                        .put("processingStartedAt", processingStartedAt)
+                }
+            }
             Log.i("KeplerYuvPipeline", "$stage: $status")
             onStatus(status)
         }

@@ -167,7 +167,7 @@ fun saveFrameSelection(
     mode: FrameSelectionMode,
     frames: List<KeplerFrameReviewItem>
 ): Result<Unit> = runCatching {
-    val job = loadJobJson(jobDir)
+    KeplerJobMetadata.update(jobDir) { job ->
     val included = frames.filter { it.included }.map { it.index }.sorted()
     job.put("frameSelectionMode", mode.name)
         .put("frameSelectionUpdatedAt", isoNow())
@@ -207,7 +207,7 @@ fun saveFrameSelection(
     }
     job.put("frameSelectionFrames", frameSelectionFrames)
         .put("updatedAt", System.currentTimeMillis())
-    saveJobJson(jobDir, job)
+    }
 }
 
 internal fun persistedIncludedFrameIndices(job: JSONObject): Set<Int> =

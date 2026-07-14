@@ -141,7 +141,8 @@ fun processNightFusionJobV02Sync(
     jobDir: File,
     onStatus: (String) -> Unit,
     requestedParams: ClassicYuvFusionParams? = null,
-    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
+    metadataPolicy: ReprocessMetadataPolicy = ReprocessMetadataPolicy.NORMAL
 ): File {
     cancellation.throwIfCancelled()
     return when {
@@ -152,7 +153,8 @@ fun processNightFusionJobV02Sync(
                 onStatus = onStatus,
                 requestedParams = requestedParams,
                 dryRun = false,
-                cancellation = cancellation
+                cancellation = cancellation,
+                metadataPolicy = metadataPolicy
             )
         } catch (t: Exception) {
             cancellation.throwIfCancelled()
@@ -161,7 +163,8 @@ fun processNightFusionJobV02Sync(
                 jobDir,
                 onStatus = onStatus,
                 requestedParams = requestedParams,
-                cancellation = cancellation
+                cancellation = cancellation,
+                metadataPolicy = metadataPolicy
             )
             cancellation.throwIfCancelled()
             finalFile
@@ -184,7 +187,8 @@ fun processNightFusionJobV02Sync(
                 jobDir,
                 onStatus = onStatus,
                 requestedParams = requestedParams,
-                cancellation = cancellation
+                cancellation = cancellation,
+                metadataPolicy = metadataPolicy
             )
             cancellation.throwIfCancelled()
             finalFile
@@ -195,7 +199,8 @@ fun processNightFusionJobV02Sync(
                 jobDir,
                 onStatus = onStatus,
                 requestedParams = requestedParams,
-                cancellation = cancellation
+                cancellation = cancellation,
+                metadataPolicy = metadataPolicy
             )
             cancellation.throwIfCancelled()
             finalFile
