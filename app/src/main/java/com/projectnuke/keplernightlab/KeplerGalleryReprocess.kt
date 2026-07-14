@@ -155,6 +155,10 @@ suspend fun reprocessKeplerGalleryJob(
             )
             return@withContext Result.failure(rollbackError)
         }
+        if (!deleteBackups(backups)) {
+            writeReprocessFailure(target, "Frame-selection rollback completed but backup cleanup failed.")
+            return@withContext Result.failure(IllegalStateException("Frame-selection rollback backup cleanup failed."))
+        }
         writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
         return@withContext Result.failure(it)
     }
@@ -181,23 +185,13 @@ suspend fun reprocessKeplerGalleryJob(
                 cancellation = cancellation,
                 onStatus = { message -> progressScope.launch { postProgress(message) } }
             )
-        ReprocessJobKind.COLOR_BURST -> {
-            val result = CompletableDeferred<Result<Unit>>()
-            val completion = CompletableDeferred<Unit>()
-            result.complete(Result.failure(UnsupportedOperationException("ColorBurst는 아직 다시 합성할 수 없습니다.")))
-            completion.complete(Unit)
-            ReprocessWorkerRun(terminal = CompletableDeferred<ReprocessWorkerOutcome>().apply {
-                complete(ReprocessWorkerOutcome(Result.failure(UnsupportedOperationException()), false))
-            }, cancel = {})
-        }
-        ReprocessJobKind.UNSUPPORTED -> {
-            val result = CompletableDeferred<Result<Unit>>()
-            val completion = CompletableDeferred<Unit>()
-            result.complete(Result.failure(UnsupportedOperationException("지원하지 않는 작업 유형입니다.")))
-            completion.complete(Unit)
-            ReprocessWorkerRun(terminal = CompletableDeferred<ReprocessWorkerOutcome>().apply {
-                complete(ReprocessWorkerOutcome(Result.failure(UnsupportedOperationException()), false))
-            }, cancel = {})
+        ReprocessJobKind.COLOR_BURST, ReprocessJobKind.UNSUPPORTED -> {
+            ReprocessWorkerRun(
+                terminal = CompletableDeferred<ReprocessWorkerOutcome>().apply {
+                    complete(ReprocessWorkerOutcome(Result.failure(UnsupportedOperationException("Reprocess job is unsupported.")), false))
+                },
+                cancel = {}
+            )
         }
     }
 
@@ -284,7 +278,11 @@ private fun finalizeTerminalOutcome(
             if (!deleteBackups(backups)) {
                 return Result.failure(IllegalStateException("Rollback completed but backup cleanup failed."))
             }
-            writeReprocessFailure(jobDir, "${error.javaClass.simpleName}: ${error.message}")
+            if (outcome.disposition == ReprocessTerminalDisposition.CANCELLED) {
+                writeReprocessCancelled(jobDir, error.message)
+            } else {
+                writeReprocessFailure(jobDir, "${error.javaClass.simpleName}: ${error.message}")
+            }
             Result.failure(error)
         },
         onFailure = { rollbackError ->
@@ -304,17 +302,16 @@ private fun finalizeReprocessOutcome(
     outcome: ReprocessWorkerOutcome,
     backups: List<ReprocessBackup>
 ): Result<KeplerReprocessResult> = runCatching {
-    val job = loadJobJsonSafe(jobDir)
     val finalFile = outcome.finalOutputFile?.takeIf { it.isFile && it.length() > 0L }
-        ?: resolveReprocessFinalOutput(jobDir, job)
     val previewFile = outcome.previewFile?.takeIf { it.isFile && it.length() > 0L } ?: finalFile
     if (outcome.result.isSuccess && finalFile?.isFile != true) {
         restoreBackups(jobDir, backups).getOrThrow()
         throw IllegalStateException("Reprocess completed without a final output file.")
     }
-    val bytes = outcome.bytesWritten.takeIf { it > 0L } ?: (finalFile?.length() ?: 0L).coerceAtLeast(
-        finalOutputCandidates(jobDir, job).filter { it.isFile }.sumOf { it.length() } - beforeBytes
-    )
+    val bytes = outcome.bytesWritten.takeIf { it > 0L }
+        ?: outcome.export?.fileSizeBytes?.takeIf { it > 0L }
+        ?: finalFile?.length()
+        ?: 0L
     if (outcome.result.isSuccess) {
         writeReprocessSuccess(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices)
     } else {
@@ -615,6 +612,17 @@ private fun writeReprocessFailure(jobDir: File, error: String) {
     KeplerJobMetadata.update(jobDir) {
         it.put("reprocessStatus", "FAILED")
             .put("reprocessError", error)
+            .put("reprocessAt", nowIso8601())
+    }
+}
+
+private fun writeReprocessCancelled(jobDir: File, error: String?) {
+    KeplerJobMetadata.update(jobDir) {
+        it.put("status", "CANCELLED")
+            .put("processStatus", "CANCELLED")
+            .put("currentPipelineStage", "CANCELLED")
+            .put("reprocessStatus", "CANCELLED")
+            .put("reprocessError", error ?: "Reprocess cancelled")
             .put("reprocessAt", nowIso8601())
     }
 }

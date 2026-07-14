@@ -337,6 +337,7 @@ internal fun reprocessRawJob(
         var terminalResult: Result<Unit> = Result.failure(IllegalStateException("RAW reprocess did not reach a terminal state."))
         var publicExportCommitted = false
         var committedExport: GalleryExportResult? = null
+        var terminalDisposition = ReprocessTerminalDisposition.UNCOMMITTED_FAILURE
         var currentOutputFile: File? = null
         var currentPreviewFile: File? = null
         var enabledCount = 0
@@ -404,6 +405,7 @@ internal fun reprocessRawJob(
             if (!export.success || export.uriString.isNullOrBlank() ||
                 !verifyGalleryExport(context, export.uriString)
             ) {
+                if (publicExportCommitted) terminalDisposition = ReprocessTerminalDisposition.COMMITTED_PARTIAL
                 val reason = export.errorMessage ?: "Export or verification failed"
                 post("RAW reprocess export failed; source frames kept. $reason")
                 terminalResult = Result.failure(IllegalStateException(reason))
@@ -411,9 +413,11 @@ internal fun reprocessRawJob(
             }
             post("RAW reprocess complete: used $enabledCount frames; source frames kept.")
             terminalResult = Result.success(Unit)
+            terminalDisposition = ReprocessTerminalDisposition.VERIFIED_SUCCESS
         } catch (_: kotlinx.coroutines.CancellationException) {
             post("PIPELINE_CANCELLED: RAW reprocess cancelled; source frames kept.")
             terminalResult = Result.failure(IllegalStateException("RAW reprocess cancelled"))
+            terminalDisposition = ReprocessTerminalDisposition.CANCELLED
         } catch (oom: OutOfMemoryError) {
             post("RAW reprocess failed: out of memory; source frames kept.")
             terminalResult = Result.failure(oom)
@@ -430,11 +434,7 @@ internal fun reprocessRawJob(
                     finalOutputFile = currentOutputFile,
                     previewFile = currentPreviewFile ?: currentOutputFile,
                     bytesWritten = currentOutputFile?.length() ?: 0L,
-                    disposition = when {
-                        publicExportCommitted && terminalResult.isFailure -> ReprocessTerminalDisposition.COMMITTED_PARTIAL
-                        terminalResult.isSuccess -> ReprocessTerminalDisposition.VERIFIED_SUCCESS
-                        else -> ReprocessTerminalDisposition.UNCOMMITTED_FAILURE
-                    },
+                    disposition = terminalDisposition,
                     terminalError = terminalResult.exceptionOrNull()
                 )
             )
@@ -459,23 +459,6 @@ private fun applyExplicitFrameSelection(jobDir: File, selectedFrameIndices: Set<
     job.put("includedFrameIndices", org.json.JSONArray(selectedFrameIndices.sorted()))
         .put("frameSelectionUpdatedAt", System.currentTimeMillis())
     saveJobJson(jobDir, job)
-}
-
-private fun updateReprocessHistory(
-    jobDir: File,
-    usedFrameCount: Int,
-    excludedFrameCount: Int,
-    status: String
-) {
-    runCatching {
-        val job = loadJobJson(jobDir)
-        job.put("reprocessCount", job.optInt("reprocessCount", 0) + 1)
-            .put("lastReprocessedAt", System.currentTimeMillis())
-            .put("lastReprocessUsedFrameCount", usedFrameCount)
-            .put("lastReprocessExcludedFrameCount", excludedFrameCount)
-            .put("lastReprocessStatus", status)
-        saveJobJson(jobDir, job)
-    }
 }
 
 private fun updateRawNativeQualityDiagnostics(jobDir: File, bitmap: Bitmap) {

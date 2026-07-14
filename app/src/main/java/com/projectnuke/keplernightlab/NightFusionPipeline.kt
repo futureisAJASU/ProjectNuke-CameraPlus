@@ -211,6 +211,7 @@ internal fun reprocessYuvJob(
         var terminalResult: Result<Unit> = Result.failure(IllegalStateException("YUV reprocess did not reach a terminal state."))
         var publicExportCommitted = false
         var committedExport: GalleryExportResult? = null
+        var terminalDisposition = ReprocessTerminalDisposition.UNCOMMITTED_FAILURE
         var finalOutputFile: File? = null
         try {
             cancellation.throwIfCancelled()
@@ -270,15 +271,20 @@ internal fun reprocessYuvJob(
             publicExportCommitted = true
             committedExport = export
             val verified = verifyGalleryExport(context, export.uriString)
-            if (!verified) error("YUV export verification failed")
+            if (!verified) {
+                terminalDisposition = ReprocessTerminalDisposition.COMMITTED_PARTIAL
+                error("YUV export verification failed")
+            }
             post(
                 "PIPELINE_COMPLETE: YUV reprocess saved ${export.formatUsed.label}; " +
                     "used $enabledFrames/$totalFrames frames; cache kept."
             )
             terminalResult = Result.success(Unit)
+            terminalDisposition = ReprocessTerminalDisposition.VERIFIED_SUCCESS
         } catch (_: kotlinx.coroutines.CancellationException) {
             post("PIPELINE_CANCELLED: YUV reprocess cancelled; source frames kept.")
             terminalResult = Result.failure(IllegalStateException("YUV reprocess cancelled"))
+            terminalDisposition = ReprocessTerminalDisposition.CANCELLED
         } catch (oom: OutOfMemoryError) {
             post("PIPELINE_FAILED: YUV reprocess failed; cache kept. out of memory")
             terminalResult = Result.failure(oom)
@@ -295,11 +301,7 @@ internal fun reprocessYuvJob(
                     finalOutputFile = finalOutputFile,
                     previewFile = finalOutputFile,
                     bytesWritten = finalOutputFile?.length() ?: 0L,
-                    disposition = when {
-                        publicExportCommitted && terminalResult.isFailure -> ReprocessTerminalDisposition.COMMITTED_PARTIAL
-                        terminalResult.isSuccess -> ReprocessTerminalDisposition.VERIFIED_SUCCESS
-                        else -> ReprocessTerminalDisposition.UNCOMMITTED_FAILURE
-                    },
+                    disposition = terminalDisposition,
                     terminalError = terminalResult.exceptionOrNull()
                 )
             )
@@ -324,23 +326,6 @@ private fun applyExplicitYuvFrameSelection(jobDir: File, selectedFrameIndices: S
     }
     job.put("includedFrameIndices", org.json.JSONArray(selectedFrameIndices.sorted()))
         .put("frameSelectionUpdatedAt", System.currentTimeMillis())
-    saveJobJson(jobDir, job)
-}
-
-private fun updateYuvReprocessHistory(
-    jobDir: File,
-    usedFrameCount: Int,
-    excludedFrameCount: Int,
-    status: String
-) {
-    val job = loadJobJson(jobDir)
-    job.put("usedFrameCount", usedFrameCount)
-        .put("excludedFrameCount", excludedFrameCount)
-        .put("reprocessCount", job.optInt("reprocessCount", 0) + 1)
-        .put("lastReprocessedAt", System.currentTimeMillis())
-        .put("lastReprocessUsedFrameCount", usedFrameCount)
-        .put("lastReprocessExcludedFrameCount", excludedFrameCount)
-        .put("lastReprocessStatus", status)
     saveJobJson(jobDir, job)
 }
 
