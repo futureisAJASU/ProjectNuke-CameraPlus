@@ -412,6 +412,17 @@ internal fun reprocessRawJob(
                 terminalResult = Result.failure(IllegalStateException(reason))
                 return@post
             }
+            // Verified committed export may have no local preview when the export format leaves
+            // no in-job PNG (HEIF/JPEG). Materialize a bounded current-operation preview so the
+            // gallery can display this reprocess without reusing an older preview.
+            if (currentPreviewFile == null && publicExportCommitted && exportBitmap != null && !exportBitmap.isRecycled) {
+                currentPreviewFile = try {
+                    writeBoundedReprocessPreview(jobDir, exportBitmap)
+                } catch (previewError: Exception) {
+                    post("RAW reprocess preview write failed: ${previewError.message}")
+                    null
+                }
+            }
             post("RAW reprocess complete: used $enabledCount frames; source frames kept.")
             terminalResult = Result.success(Unit)
             terminalDisposition = ReprocessTerminalDisposition.VERIFIED_SUCCESS
