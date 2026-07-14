@@ -336,6 +336,7 @@ internal fun reprocessRawJob(
     Handler(thread.looper).post {
         var terminalResult: Result<Unit> = Result.failure(IllegalStateException("RAW reprocess did not reach a terminal state."))
         var publicExportCommitted = false
+        var committedExport: GalleryExportResult? = null
         var enabledCount = 0
         var totalCount = 0
         try {
@@ -397,6 +398,10 @@ internal fun reprocessRawJob(
             } finally {
                 exportBitmap?.takeUnless { it.isRecycled }?.recycle()
             }
+            if (export.success && !export.uriString.isNullOrBlank()) {
+                publicExportCommitted = true
+                committedExport = export
+            }
             if (!export.success || export.uriString.isNullOrBlank() ||
                 !verifyGalleryExport(context, export.uriString)
             ) {
@@ -414,7 +419,6 @@ internal fun reprocessRawJob(
                 finalOutputFormat = finalOutputFormat,
                 rawSidecarResult = null
             )
-            publicExportCommitted = true
             updateReprocessHistory(jobDir, enabledCount, totalCount - enabledCount, "SUCCESS")
             post("RAW reprocess complete: used $enabledCount frames; source frames kept.")
             terminalResult = Result.success(Unit)
@@ -434,7 +438,7 @@ internal fun reprocessRawJob(
             terminalResult = Result.failure(e)
         } finally {
             thread.quitSafely()
-            terminal.complete(ReprocessWorkerOutcome(terminalResult, publicExportCommitted))
+            terminal.complete(ReprocessWorkerOutcome(terminalResult, publicExportCommitted, committedExport))
         }
     }
     return ReprocessWorkerRun(

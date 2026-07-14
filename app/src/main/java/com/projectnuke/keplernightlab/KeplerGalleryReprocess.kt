@@ -55,7 +55,8 @@ internal data class ReprocessWorkerRun(
 
 internal data class ReprocessWorkerOutcome(
     val result: Result<Unit>,
-    val publicExportCommitted: Boolean
+    val publicExportCommitted: Boolean,
+    val export: GalleryExportResult? = null
 )
 
 internal class ReprocessWorkerDidNotExitException(message: String) : IllegalStateException(message)
@@ -185,6 +186,11 @@ suspend fun reprocessKeplerGalleryJob(
         withTimeoutOrNull(REPROCESS_TIMEOUT_MS) { worker.terminal.await() }
     } catch (callerCancellation: kotlinx.coroutines.CancellationException) {
         val cleanup = cancelWorkerAndRollbackAfterCompletion(worker) { restoreBackups(target, backups) }
+        cleanup.getOrNull()?.let { outcome ->
+            if (outcome.result.isSuccess || outcome.publicExportCommitted) {
+                deleteBackups(backups)
+            }
+        }
         if (cleanup.isFailure && cleanup.exceptionOrNull() !is ReprocessWorkerDidNotExitException) {
             writeReprocessFailure(target, "Caller cancellation cleanup failed: ${cleanup.exceptionOrNull()?.message}")
         }
@@ -199,6 +205,14 @@ suspend fun reprocessKeplerGalleryJob(
         val previewFile = finalFile
         val afterBytes = finalOutputCandidates(target, updatedJob).filter { it.isFile }.sumOf { it.length() }
         val bytesWritten = (afterBytes - beforeBytes).coerceAtLeast(finalFile?.length() ?: 0L)
+        if (pipelineOutcome?.result?.isFailure == true && pipelineOutcome.export != null) {
+            updateExportMetadata(
+                jobDir = target,
+                export = pipelineOutcome.export,
+                verified = false,
+                finalOutputFormat = outputSettings
+            )
+        }
         writeReprocessSuccess(
             jobDir = target,
             jobKind = capability.jobKind,
@@ -227,7 +241,20 @@ suspend fun reprocessKeplerGalleryJob(
     val rollbackResult = if (pipelineOutcome == null) {
         cancelWorkerAndRollbackAfterCompletion(worker) { restoreBackups(target, backups) }
     } else {
-        restoreBackups(target, backups)
+        restoreBackups(target, backups).map { pipelineOutcome }
+    }
+    val completedAfterTimeout = rollbackResult.getOrNull()
+    if (completedAfterTimeout != null &&
+        (completedAfterTimeout.result.isSuccess || completedAfterTimeout.publicExportCommitted)
+    ) {
+        if (completedAfterTimeout.result.isFailure && completedAfterTimeout.export != null) {
+            updateExportMetadata(target, completedAfterTimeout.export, false, outputSettings)
+        }
+        deleteBackups(backups)
+        return@withContext Result.success(
+            KeplerReprocessResult(target, capability.jobKind, null, null, 0L,
+                if (completedAfterTimeout.result.isFailure) listOf("Public export committed; metadata finalization incomplete") else emptyList())
+        )
     }
     if (rollbackResult.isFailure) {
         val rollbackError = rollbackResult.exceptionOrNull()
@@ -251,15 +278,15 @@ suspend fun reprocessKeplerGalleryJob(
 internal suspend fun cancelWorkerAndRollbackAfterCompletion(
     worker: ReprocessWorkerRun,
     rollback: suspend () -> Result<Unit>
-): Result<Unit> = withContext(NonCancellable) {
+): Result<ReprocessWorkerOutcome> = withContext(NonCancellable) {
     worker.cancel()
     val outcome = withTimeoutOrNull(REPROCESS_WORKER_EXIT_TIMEOUT_MS) { worker.terminal.await() }
     if (outcome == null) {
         Result.failure(ReprocessWorkerDidNotExitException("Reprocess worker did not exit before rollback timeout."))
     } else if (outcome.publicExportCommitted || outcome.result.isSuccess) {
-        Result.success(Unit)
+        Result.success(outcome)
     } else {
-        rollback()
+        rollback().map { outcome }
     }
 }
 fun detectReprocessCapability(context: Context, jobDir: File): ReprocessCapability {

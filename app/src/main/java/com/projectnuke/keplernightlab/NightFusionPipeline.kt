@@ -210,6 +210,7 @@ internal fun reprocessYuvJob(
         var enabledFrames = 0
         var terminalResult: Result<Unit> = Result.failure(IllegalStateException("YUV reprocess did not reach a terminal state."))
         var publicExportCommitted = false
+        var committedExport: GalleryExportResult? = null
         try {
             cancellation.throwIfCancelled()
             if (selectedFrameIndices != null) {
@@ -268,6 +269,8 @@ internal fun reprocessYuvJob(
             if (!export.success || export.uriString.isNullOrBlank()) {
                 error(export.errorMessage ?: "YUV export failed")
             }
+            publicExportCommitted = true
+            committedExport = export
             val verified = verifyGalleryExport(context, export.uriString)
             if (!verified) error("YUV export verification failed")
             updateExportMetadata(
@@ -277,7 +280,6 @@ internal fun reprocessYuvJob(
                 finalOutputFormat = finalOutputFormat,
                 rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
             )
-            publicExportCommitted = true
             updateYuvReprocessHistory(
                 jobDir, enabledFrames, totalFrames - enabledFrames, "SUCCESS"
             )
@@ -309,7 +311,7 @@ internal fun reprocessYuvJob(
             terminalResult = Result.failure(e)
         } finally {
             workerThread.quitSafely()
-            terminal.complete(ReprocessWorkerOutcome(terminalResult, publicExportCommitted))
+            terminal.complete(ReprocessWorkerOutcome(terminalResult, publicExportCommitted, committedExport))
         }
     }
     return ReprocessWorkerRun(
