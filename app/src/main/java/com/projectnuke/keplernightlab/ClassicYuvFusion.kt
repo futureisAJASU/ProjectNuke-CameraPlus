@@ -136,7 +136,17 @@ internal fun processClassicYuvFusionJob(
         cancellation.throwIfCancelled()
         preflight = preflightSummary
         job.put("yuvProcessingPreflight", preflightSummary.toJson())
-        saveJobJson(jobFile.parentFile ?: error("Job directory missing"), job)
+        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            saveJobJson(jobFile.parentFile ?: error("Job directory missing"), job)
+        } else {
+            KeplerJobMetadata.update(jobDir) { current ->
+                current.put("averageColorFile", job.optString("averageColorFile"))
+                    .put("finalNightFusionFile", job.optString("finalNightFusionFile"))
+                    .put("finalFile", job.optString("finalFile"))
+                    .put("finalOutputSource", job.optString("finalOutputSource"))
+                    .put("yuvQualityDiagnosticHints", job.optJSONArray("yuvQualityDiagnosticHints") ?: JSONArray())
+            }
+        }
         cancellation.throwIfCancelled()
         val candidateFrames = loadClassicFrames(jobDir, job)
         cancellation.throwIfCancelled()
@@ -414,6 +424,7 @@ internal fun processClassicYuvFusionJob(
                 compatibleFrameCountKnown = compatibleFrameCountKnown
             ),
             preflight = failurePreflight
+            , metadataPolicy = metadataPolicy
         )
         throw IllegalStateException("Classic YUV fusion failed: OutOfMemoryError; cache kept", oom)
     } catch (ce: CancellationException) {
@@ -435,6 +446,7 @@ internal fun processClassicYuvFusionJob(
                 compatibleFrameCountKnown = compatibleFrameCountKnown
             ),
             preflight = failurePreflight
+            , metadataPolicy = metadataPolicy
         )
         throw e
     } finally {
@@ -1218,7 +1230,8 @@ private fun recordClassicFailure(
     reason: String,
     throwable: Throwable? = null,
     failureCounts: ClassicYuvProcessingFailureCounts? = null,
-    preflight: ClassicYuvProcessingPreflight? = null
+    preflight: ClassicYuvProcessingPreflight? = null,
+    metadataPolicy: ReprocessMetadataPolicy = ReprocessMetadataPolicy.NORMAL
 ) {
     runCatching {
         job.put("currentPipelineStage", "PIPELINE_FAILED")
@@ -1241,7 +1254,15 @@ private fun recordClassicFailure(
                 .put("yuvProcessingSameSizeFrames", it.sameSizeFrames)
                 .put("yuvProcessingCompatibleFrames", it.compatibleFrames)
         }
-        saveJobJson(jobFile.parentFile ?: error("Job directory missing"), job)
+        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            saveJobJson(jobFile.parentFile ?: error("Job directory missing"), job)
+        } else {
+            KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
+                current.put("debugArtifactStatus", job.optString("debugArtifactStatus"))
+                    .put("debugArtifactError", job.optString("debugArtifactError"))
+                    .put("yuvProcessingPreflight", job.optJSONObject("yuvProcessingPreflight") ?: JSONObject.NULL)
+            }
+        }
     }
 }
 

@@ -1616,6 +1616,19 @@ fun processRawFusionJob(
     onStatus: (String) -> Unit
 ): RawFusionProcessResult {
     val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
+    fun persistProcessingMetadata(job: JSONObject) {
+        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            KeplerJobMetadata.write(jobDir, job)
+        } else {
+            KeplerJobMetadata.update(jobDir) { current ->
+                listOf(
+                    "processingStartedAt", "userCanMoveDevice", "rawFusionMemoryEstimateBytes",
+                    "nativePostprocessStatus", "nativePostprocessRgbaFile", "rawRenderDebugFile",
+                    "rawFusionDebugFile", "totalPipelineMs"
+                ).forEach { key -> if (job.has(key)) current.put(key, job.get(key)) }
+            }
+        }
+    }
     return try {
         cancellation.throwIfCancelled()
         val job = JSONObject(jobFile.readText())
@@ -1636,7 +1649,7 @@ fun processRawFusionJob(
         )
         onStatus("RAW 프레임을 정렬하는 중입니다.")
         applyRawFusionMemoryMetadata(job, estimateRawFusionMemory(pixelCountLong))
-        KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
+        persistProcessingMetadata(job)
         val highResolutionRaw = pixelCountLong >= HIGH_RES_RAW_MIN_PIXELS
         val preparedFrames = prepareRawFusionFrames(jobDir, job, frames, pixelCount)
         cancellation.throwIfCancelled()
@@ -1696,7 +1709,7 @@ fun processRawFusionJob(
             mergedRawFile.length() >= pixelCount * 2L &&
             alignmentFile.exists()
         if (!classicMergedOk) {
-            KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
+            persistProcessingMetadata(job)
             onStatus("Classic RAW fusion failed. RAW cache kept.")
             return RawFusionProcessResult(
                 success = false,
@@ -1707,7 +1720,7 @@ fun processRawFusionJob(
                 errorMessage = classicMerge.errorMessage ?: "Classic RAW fusion failed"
             )
         }
-        KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
+        persistProcessingMetadata(job)
 
         onStatus("Native RAW ISP 렌더링 중입니다.")
         onStatus("결과를 저장하는 중입니다.")
@@ -1748,7 +1761,7 @@ fun processRawFusionJob(
                 .takeIf { it > 0L }
                 ?: updated.optLong("createdAt", System.currentTimeMillis())
             updated.put("totalPipelineMs", System.currentTimeMillis() - pipelineStartedAt)
-            KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), updated)
+            persistProcessingMetadata(updated)
         }
         exportResult
     } catch (ce: CancellationException) {
@@ -1760,7 +1773,14 @@ fun processRawFusionJob(
                 .put("currentPipelineStage", "FAILED")
                 .put("processError", "OutOfMemoryError")
                 .put("processedAt", System.currentTimeMillis())
-            KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
+            if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+                KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
+            } else {
+                KeplerJobMetadata.update(jobDir) { current ->
+                    current.put("processingStartedAt", job.optLong("processingStartedAt", 0L))
+                        .put("processedAt", job.optLong("processedAt", 0L))
+                }
+            }
         }
         onStatus("RAW fusion stopped: insufficient memory. RAW cache kept.")
         RawFusionProcessResult(false, null, null, null, null, "OutOfMemoryError: RAW cache kept")
