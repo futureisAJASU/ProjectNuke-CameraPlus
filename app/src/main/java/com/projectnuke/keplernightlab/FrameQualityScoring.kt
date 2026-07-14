@@ -71,6 +71,7 @@ fun analyzeKeplerFrameQuality(
             var recommendedCount = 0
             var scoreSum = 0.0
 
+            val frameMetrics = mutableMapOf<Int, InternalFrameQualityMetrics>()
             repeat(frames.length()) { position ->
                 post("Analyzing frame ${position + 1}/${frames.length()}...")
                 val frame = frames.optJSONObject(position) ?: return@repeat
@@ -81,6 +82,7 @@ fun analyzeKeplerFrameQuality(
                 } catch (e: Exception) {
                     suspectMetrics(scoringBackend, "${e.javaClass.simpleName}: ${e.message}")
                 }
+                frameMetrics[position] = metrics
                 writeMetrics(frame, metrics)
                 labelCounts[metrics.qualityLabel] =
                     labelCounts.getOrDefault(metrics.qualityLabel, 0) + 1
@@ -92,22 +94,26 @@ fun analyzeKeplerFrameQuality(
             val good = labelCounts.getOrDefault("GOOD", 0)
             val ok = labelCounts.getOrDefault("OK", 0)
             val suspect = total - good - ok
-            job.put("qualityScored", true)
-                .put("qualityScoredAt", System.currentTimeMillis())
-                .put("qualityScoringVersion", QUALITY_SCORING_VERSION)
-                .put("qualityScoringBackend", scoringBackend)
-                .put(
-                    "qualitySummary",
-                    JSONObject()
-                        .put("totalFrames", total)
-                        .put("goodFrames", good)
-                        .put("okFrames", ok)
-                        .put("suspectFrames", suspect)
-                        .put("recommendedExcludeFrames", recommendedCount)
-                        .put("averageQualityScore", if (total > 0) scoreSum / total else 0.0)
-                )
-                .put("updatedAt", System.currentTimeMillis())
-            saveJobJson(jobDir, job)
+            val qualitySummary = JSONObject()
+                .put("totalFrames", total)
+                .put("goodFrames", good)
+                .put("okFrames", ok)
+                .put("suspectFrames", suspect)
+                .put("recommendedExcludeFrames", recommendedCount)
+                .put("averageQualityScore", if (total > 0) scoreSum / total else 0.0)
+            KeplerJobMetadata.update(jobDir) { j ->
+                val currentFrames = j.optJSONArray("frames") ?: JSONArray()
+                frameMetrics.forEach { (position, metrics) ->
+                    val currentFrame = currentFrames.optJSONObject(position) ?: return@forEach
+                    writeMetrics(currentFrame, metrics)
+                }
+                j.put("qualityScored", true)
+                    .put("qualityScoredAt", System.currentTimeMillis())
+                    .put("qualityScoringVersion", QUALITY_SCORING_VERSION)
+                    .put("qualityScoringBackend", scoringBackend)
+                    .put("qualitySummary", qualitySummary)
+                    .put("updatedAt", System.currentTimeMillis())
+            }
             post("Frame quality analysis complete: $total frames, $recommendedCount recommended exclude.")
         } catch (oom: OutOfMemoryError) {
             post("Frame quality analysis failed: OutOfMemoryError; job cache kept.")

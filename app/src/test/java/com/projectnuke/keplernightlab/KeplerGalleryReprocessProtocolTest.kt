@@ -49,12 +49,12 @@ class KeplerGalleryReprocessProtocolTest {
             val rollbackStarted = CompletableDeferred<Unit>()
 
             val result = async {
-                cancelWorkerAndRollbackAfterCompletion(
+                cancelWorkerAndAwaitTerminal(
                     ReprocessWorkerRun(
                         terminal = workerCompletion,
                         cancel = { cancelRequested.complete(Unit) }
                     )
-                ) {
+                ).let { _ ->
                     rollbackStarted.complete(Unit)
                     restoreBackups(directory, backups)
                 }
@@ -86,12 +86,12 @@ class KeplerGalleryReprocessProtocolTest {
             val cancelRequested = CompletableDeferred<Unit>()
 
             val result = async {
-                cancelWorkerAndRollbackAfterCompletion(
+                cancelWorkerAndAwaitTerminal(
                     ReprocessWorkerRun(
                         terminal = workerCompletion,
                         cancel = { cancelRequested.complete(Unit) }
                     )
-                ) {
+                ).let { _ ->
                     restoreBackups(directory, backups)
                 }
             }

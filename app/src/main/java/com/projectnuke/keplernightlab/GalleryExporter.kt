@@ -206,52 +206,59 @@ fun updateExportMetadata(
     postExportCancellationRequested: Boolean = false,
     postExportWorkSkipped: Boolean = false
 ) {
-    val jobFile = File(jobDir, "job.json")
-    val job = if (jobFile.exists()) JSONObject(jobFile.readText()) else JSONObject()
-    job.put("finalOutputFormatSetting", finalOutputFormat.name)
-        .put("currentPipelineStage", if (verified) "COMPLETE" else "PROCESSING")
-        .put("exportStatus", when {
-            export == null -> "FAILED"
-            verified -> "EXPORTED"
-            else -> "EXPORT_UNVERIFIED"
-        })
-        .put("exportVerified", verified)
-        .put("exportUri", export?.uriString ?: JSONObject.NULL)
-        .put("exportDisplayName", export?.displayName ?: JSONObject.NULL)
-        .put("exportMimeType", export?.mimeType ?: JSONObject.NULL)
-        .put("exportFormatRequested", requestedOutputFormatForSetting(finalOutputFormat).label)
-        .put("exportFormatUsed", export?.formatUsed?.label ?: JSONObject.NULL)
-        .put("exportFallbackUsed", export?.fallbackUsed ?: false)
-        .put("exportFileSizeBytes", export?.fileSizeBytes ?: 0L)
-        .put("galleryExportCommitted", export?.success == true && !export?.uriString.isNullOrBlank())
-        .put("postExportCancellationRequested", postExportCancellationRequested)
-        .put("postExportWorkSkipped", postExportWorkSkipped)
-        .put("rawSidecarRequested", finalOutputFormat.shouldExportRawSidecar)
-        .put("rawSidecarExportStatus", when {
-            rawSidecarIgnored -> "UNAVAILABLE"
-            rawSidecarResult == null && finalOutputFormat.shouldExportRawSidecar -> "SKIPPED"
-            rawSidecarResult == null -> "NOT_REQUESTED"
-            else -> rawSidecarResult.status
-        })
-        .put("rawSidecarExportedFiles", JSONArray(rawSidecarResult?.exportedFiles ?: emptyList<String>()))
-        .put("rawSidecarError", when {
-            rawSidecarIgnored -> "RAW sidecar unavailable for YUV pipeline."
-            else -> rawSidecarResult?.errorMessage ?: JSONObject.NULL
-        })
-        .put("exportedAt", System.currentTimeMillis())
-    val pipelineStartedAt = job.optLong("rawCaptureStartedAt", 0L)
-        .takeIf { it > 0L }
-        ?: job.optLong("createdAt", 0L).takeIf { it > 0L }
-    if (pipelineStartedAt != null) {
-        job.put("totalPipelineMs", System.currentTimeMillis() - pipelineStartedAt)
+    lateinit var pipelineStatusForLog: String
+    lateinit var finalOutputSourceForLog: String
+    lateinit var nativePostprocessRgbaFileForLog: String
+    lateinit var rawRenderDebugFileForLog: String
+    KeplerJobMetadata.update(jobDir) { job ->
+        job.put("finalOutputFormatSetting", finalOutputFormat.name)
+            .put("currentPipelineStage", if (verified) "COMPLETE" else "PROCESSING")
+            .put("exportStatus", when {
+                export == null -> "FAILED"
+                verified -> "EXPORTED"
+                else -> "EXPORT_UNVERIFIED"
+            })
+            .put("exportVerified", verified)
+            .put("exportUri", export?.uriString ?: JSONObject.NULL)
+            .put("exportDisplayName", export?.displayName ?: JSONObject.NULL)
+            .put("exportMimeType", export?.mimeType ?: JSONObject.NULL)
+            .put("exportFormatRequested", requestedOutputFormatForSetting(finalOutputFormat).label)
+            .put("exportFormatUsed", export?.formatUsed?.label ?: JSONObject.NULL)
+            .put("exportFallbackUsed", export?.fallbackUsed ?: false)
+            .put("exportFileSizeBytes", export?.fileSizeBytes ?: 0L)
+            .put("galleryExportCommitted", export?.success == true && !export?.uriString.isNullOrBlank())
+            .put("postExportCancellationRequested", postExportCancellationRequested)
+            .put("postExportWorkSkipped", postExportWorkSkipped)
+            .put("rawSidecarRequested", finalOutputFormat.shouldExportRawSidecar)
+            .put("rawSidecarExportStatus", when {
+                rawSidecarIgnored -> "UNAVAILABLE"
+                rawSidecarResult == null && finalOutputFormat.shouldExportRawSidecar -> "SKIPPED"
+                rawSidecarResult == null -> "NOT_REQUESTED"
+                else -> rawSidecarResult.status
+            })
+            .put("rawSidecarExportedFiles", JSONArray(rawSidecarResult?.exportedFiles ?: emptyList<String>()))
+            .put("rawSidecarError", when {
+                rawSidecarIgnored -> "RAW sidecar unavailable for YUV pipeline."
+                else -> rawSidecarResult?.errorMessage ?: JSONObject.NULL
+            })
+            .put("exportedAt", System.currentTimeMillis())
+        val existingPipelineStartedAt = job.optLong("rawCaptureStartedAt", 0L)
+            .takeIf { it > 0L }
+            ?: job.optLong("createdAt", 0L).takeIf { it > 0L } ?: 0L
+        if (existingPipelineStartedAt > 0L) {
+            job.put("totalPipelineMs", System.currentTimeMillis() - existingPipelineStartedAt)
+        }
+        pipelineStatusForLog = job.optString("processStatus")
+        finalOutputSourceForLog = job.optString("finalOutputSource")
+        nativePostprocessRgbaFileForLog = job.optString("nativePostprocessRgbaFile")
+        rawRenderDebugFileForLog = job.optString("rawRenderDebugFile")
     }
-    saveJobJson(jobDir, job)
     Log.i(
         "KeplerRawPipeline",
-        "PIPELINE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} processStatus=${job.optString("processStatus")} " +
-            "finalOutputSource=${job.optString("finalOutputSource")} " +
-            "nativePostprocessRgbaFile=${job.optString("nativePostprocessRgbaFile")} " +
-            "rawRenderDebugFile=${job.optString("rawRenderDebugFile")}"
+        "PIPELINE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} processStatus=$pipelineStatusForLog " +
+            "finalOutputSource=$finalOutputSourceForLog " +
+            "nativePostprocessRgbaFile=$nativePostprocessRgbaFileForLog " +
+            "rawRenderDebugFile=$rawRenderDebugFileForLog"
     )
 }
 
@@ -262,22 +269,21 @@ fun updateExportFailure(
     rawSidecarIgnored: Boolean = false,
     export: GalleryExportResult? = null
 ) {
-    val jobFile = File(jobDir, "job.json")
-    val job = if (jobFile.exists()) JSONObject(jobFile.readText()) else JSONObject()
-    job.put("finalOutputFormatSetting", finalOutputFormat.name)
-        .put("processStatus", "EXPORT_FAILED_KEEPING_CACHE")
-        .put("currentPipelineStage", "FAILED")
-        .put("exportStatus", "FAILED")
-        .put("exportVerified", false)
-        .put("galleryExportCommitted", export?.success == true && !export?.uriString.isNullOrBlank())
-        .put("exportUri", export?.uriString ?: JSONObject.NULL)
-        .put("exportError", error)
-        .put("rawSidecarRequested", finalOutputFormat.shouldExportRawSidecar)
-        .put("rawSidecarExportStatus", if (rawSidecarIgnored) "UNAVAILABLE" else "SKIPPED")
-        .put("rawSidecarError", if (rawSidecarIgnored) "RAW sidecar unavailable for YUV pipeline." else JSONObject.NULL)
-        .put("cleanupStatus", "SKIPPED")
-        .put("exportedAt", System.currentTimeMillis())
-    saveJobJson(jobDir, job)
+    KeplerJobMetadata.update(jobDir) { job ->
+        job.put("finalOutputFormatSetting", finalOutputFormat.name)
+            .put("processStatus", "EXPORT_FAILED_KEEPING_CACHE")
+            .put("currentPipelineStage", "FAILED")
+            .put("exportStatus", "FAILED")
+            .put("exportVerified", false)
+            .put("galleryExportCommitted", export?.success == true && !export?.uriString.isNullOrBlank())
+            .put("exportUri", export?.uriString ?: JSONObject.NULL)
+            .put("exportError", error)
+            .put("rawSidecarRequested", finalOutputFormat.shouldExportRawSidecar)
+            .put("rawSidecarExportStatus", if (rawSidecarIgnored) "UNAVAILABLE" else "SKIPPED")
+            .put("rawSidecarError", if (rawSidecarIgnored) "RAW sidecar unavailable for YUV pipeline." else JSONObject.NULL)
+            .put("cleanupStatus", "SKIPPED")
+            .put("exportedAt", System.currentTimeMillis())
+    }
 }
 
 fun requestedOutputFormatForSetting(finalOutputFormat: FinalOutputFormat): OutputFormat = when {

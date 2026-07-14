@@ -83,21 +83,22 @@ fun saveJobJson(jobDir: File, job: JSONObject) {
 }
 
 fun setFrameExcluded(jobDir: File, frameIndex: Int, excluded: Boolean) {
-    val job = loadJobJson(jobDir)
-    val frames = job.getJSONArray("frames")
-    var found = false
-    repeat(frames.length()) { position ->
-        val frame = frames.getJSONObject(position)
-        if (frame.optInt("index", position) == frameIndex) {
-            frame.put("enabled", !excluded)
-                .put("excludedByUser", excluded)
-                .put("excludeReason", if (excluded) "USER_EXCLUDED" else JSONObject.NULL)
-            found = true
+    require(!isReprocessQuarantined(jobDir)) { "Cannot modify frames of a quarantined reprocess job." }
+    KeplerJobMetadata.update(jobDir) { job ->
+        val frames = job.getJSONArray("frames")
+        var found = false
+        repeat(frames.length()) { position ->
+            val frame = frames.getJSONObject(position)
+            if (frame.optInt("index", position) == frameIndex) {
+                frame.put("enabled", !excluded)
+                    .put("excludedByUser", excluded)
+                    .put("excludeReason", if (excluded) "USER_EXCLUDED" else JSONObject.NULL)
+                found = true
+            }
         }
+        require(found) { "Frame index $frameIndex not found." }
+        job.put("updatedAt", System.currentTimeMillis())
     }
-    require(found) { "Frame index $frameIndex not found." }
-    job.put("updatedAt", System.currentTimeMillis())
-    saveJobJson(jobDir, job)
 }
 
 fun getEnabledRawFrames(jobDir: File): List<JSONObject> {
@@ -124,14 +125,17 @@ fun loadKeplerGalleryJobs(context: Context): List<KeplerGalleryJobSummary> {
         root.listFiles()
             ?.filter { it.isDirectory && matchesJobPrefix(root, it.name) }
             .orEmpty()
-    }.onEach(::recoverStaleInterruptedJob).map(::readKeplerGalleryJob).sortedByDescending { it.createdAt }
+    }.onEach {
+        recoverValidatedQuarantine(it)
+        recoverStaleInterruptedJob(it)
+    }.map(::readKeplerGalleryJob).sortedByDescending { it.createdAt }
 }
 
 private const val STALE_JOB_RECOVERY_AGE_MILLIS = 15 * 60 * 1000L
 
 /** Jobs have no live worker after process death; stale in-progress metadata must not remain active forever. */
 private fun recoverStaleInterruptedJob(directory: File) {
-    if (KeplerJobMetadata.isOperationActive(directory)) return
+    if (isReprocessQuarantined(directory)) return
     val job = runCatching { KeplerJobMetadata.read(directory) }.getOrNull() ?: return
     val status = job.optString("status").uppercase()
     val processStatus = job.optString("processStatus").uppercase()
@@ -143,7 +147,8 @@ private fun recoverStaleInterruptedJob(directory: File) {
     if (status !in active && processStatus !in active && pipelineStage !in active) return
     val updatedAt = job.optLong("updatedAt", job.optLong("createdAt", 0L))
     if (updatedAt <= 0L || System.currentTimeMillis() - updatedAt < STALE_JOB_RECOVERY_AGE_MILLIS) return
-    runCatching {
+    val lease = KeplerJobMetadata.acquireOperation(directory) ?: return
+    try {
         KeplerJobMetadata.update(directory) {
             it.put("status", "INTERRUPTED")
                 .put("processStatus", "INTERRUPTED")
@@ -152,6 +157,8 @@ private fun recoverStaleInterruptedJob(directory: File) {
                 .put("interruptionReason", "App process was not running when stale job was recovered.")
                 .put("updatedAt", System.currentTimeMillis())
         }
+    } finally {
+        lease.release()
     }
 }
 
@@ -188,7 +195,9 @@ fun deleteKeplerGalleryJob(context: Context, jobDirectory: File): Result<Unit> =
     val lease = KeplerJobMetadata.acquireOperation(target) ?: error("Job mutation is in progress.")
     try {
         require(target.isDirectory) { "Job directory no longer exists." }
+        require(!isReprocessQuarantined(target)) { "Reprocess quarantined job cannot be deleted; it retains pending transaction evidence." }
         check(target.deleteRecursively()) { "Failed to delete ${target.name}." }
+        KeplerJobMetadata.removeLockEntry(target)
     } finally {
         lease.release()
     }
@@ -202,6 +211,9 @@ fun cleanupKeplerGalleryJob(
     val target = requireCleanupSafeJobDirectory(context, jobDirectory)
     val lease = KeplerJobMetadata.acquireOperation(target) ?: error("Job mutation is in progress.")
     try {
+        if (isReprocessQuarantined(target)) {
+            throw IllegalStateException("Reprocess quarantined job cannot be cleaned; it retains pending transaction evidence.")
+        }
     val before = folderSizeBytes(target)
     val job = File(target, JOB_JSON_FILE_NAME).takeIf { it.isFile }?.let { file ->
         runCatching { JSONObject(file.readText()) }.getOrNull()
@@ -240,20 +252,21 @@ fun cleanupKeplerGalleryJob(
         finalFiles.any { it.isFile }
     }
     val metadataWarning = runCatching {
-        val updated = computeKeplerJobStorage(target, job, finalFiles.firstOrNull())
-        job.put("cleanupApplied", true)
-            .put("cleanupType", cleanupType.name)
-            .put("cleanupAt", System.currentTimeMillis())
-            .put("bytesFreed", before - after)
-            .put("remainingJobBytes", after)
-            .put("sourceFramesAvailable", sourceAvailable)
-            .put("finalOutputAvailable", finalOutputAvailable)
-            .put("debugFilesAvailable", debugAvailable)
-            .put("canReprocess", sourceAvailable)
-            .put("galleryDisplayUnavailable", cleanupType == KeplerJobCleanupType.SOURCE_ONLY)
-            .put("galleryVisible", cleanupType != KeplerJobCleanupType.SOURCE_ONLY)
-        putStorageMetadata(job, updated)
-        saveJobJson(target, job)
+        KeplerJobMetadata.update(target) { j ->
+            val updated = computeKeplerJobStorage(target, j, finalFiles.firstOrNull())
+            j.put("cleanupApplied", true)
+                .put("cleanupType", cleanupType.name)
+                .put("cleanupAt", System.currentTimeMillis())
+                .put("bytesFreed", before - after)
+                .put("remainingJobBytes", after)
+                .put("sourceFramesAvailable", sourceAvailable)
+                .put("finalOutputAvailable", finalOutputAvailable)
+                .put("debugFilesAvailable", debugAvailable)
+                .put("canReprocess", sourceAvailable)
+                .put("galleryDisplayUnavailable", cleanupType == KeplerJobCleanupType.SOURCE_ONLY)
+                .put("galleryVisible", cleanupType != KeplerJobCleanupType.SOURCE_ONLY)
+            putStorageMetadata(j, updated)
+        }
     }.exceptionOrNull()?.let { "${it.javaClass.simpleName}: ${it.message}" }
     KeplerJobCleanupResult(
         bytesFreed = before - after,
@@ -427,6 +440,7 @@ private fun maybePersistStorageMetadata(
     storage: KeplerJobStorageInfo
 ) {
     if (job == null) return
+    if (isReprocessQuarantined(directory)) return
     if (
         job.optLong("totalJobBytes", -1L) == storage.totalJobBytes &&
         job.optInt("fileCount", -1) == storage.fileCount

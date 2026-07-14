@@ -2435,8 +2435,18 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
         }.sortedByDescending { it.lastModified() }
 
         val latest = latestJobs.firstNotNullOfOrNull { jobDir ->
+            if (isReprocessQuarantined(jobDir)) return@firstNotNullOfOrNull null
             val job = runCatching { JSONObject(File(jobDir, "job.json").readText()) }.getOrNull()
                 ?: return@firstNotNullOfOrNull null
+            if (job.optBoolean("galleryDisplayUnavailable", false) ||
+                (job.optBoolean("galleryExportCommitted", false) &&
+                    job.optBoolean("finalOutputAvailable", false).not())
+            ) return@firstNotNullOfOrNull null
+            if (!job.optBoolean("galleryVisible", true)) return@firstNotNullOfOrNull null
+            val status = job.optString("status").uppercase()
+            if (status in setOf("CAPTURING", "PROCESSING", "YUV_ALIGNING", "YUV_MERGING", "YUV_DENOISE_SHARPEN", "YUV_EXPORTING")) {
+                return@firstNotNullOfOrNull null
+            }
             val file = chooseLatestResultFile(jobDir, job) ?: return@firstNotNullOfOrNull null
             Triple(jobDir, job, file)
         }
@@ -2447,66 +2457,71 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
         val previewFile = latest.third
         val outputWidth = job.optInt("outputWidth", 0).takeIf { it > 0 }
         val outputHeight = job.optInt("outputHeight", 0).takeIf { it > 0 }
-        val bitmap = if (
-            previewFile.extension.equals("rgba", ignoreCase = true) &&
-            outputWidth != null &&
-            outputHeight != null
-        ) {
-            decodeNativeRgbaPreview(previewFile, outputWidth, outputHeight)
-        } else {
-            decodeLatestResultPreview(previewFile)
+        var decoded: Bitmap? = null
+        try {
+            decoded = if (
+                previewFile.extension.equals("rgba", ignoreCase = true) &&
+                outputWidth != null &&
+                outputHeight != null
+            ) {
+                decodeNativeRgbaPreview(previewFile, outputWidth, outputHeight)
+            } else {
+                decodeLatestResultPreview(previewFile)
+            }
+            val bitmap = decoded
+            decoded = null
+            val jobType = job.optString("jobType", latestJobDir.parentFile?.name.orEmpty())
+            val fusionEngine = listOf(
+                job.optString("fusionEngine", ""),
+                job.optString("rawFusionEngine", ""),
+                job.optString("fusionVersion", ""),
+                job.optString("rawFusionVersion", "")
+            ).firstOrNull { it.isNotBlank() }.orEmpty()
+            val usedFrames = job.optInt("usedFrameCount", job.optInt("savedFrames", 0))
+            val requestedFrames = job.optInt("requestedFrames", 0)
+            val summary = buildString {
+                append("status=")
+                append(job.optString("status", "unknown"))
+                append(", frames=")
+                append(job.optInt("savedFrames", 0))
+                append(", export=")
+                append(job.optString("exportStatus", "not_exported"))
+                append(" ")
+                append(job.optString("exportFormatUsed", ""))
+                append(" verified=")
+                append(job.optBoolean("exportVerified", false))
+                append(", output=")
+                append(job.optString("finalOutputFormatSetting", ""))
+                append(", public=")
+                append(job.optString("exportDisplayName", "").ifBlank { "none" })
+                append(", rawSidecar=")
+                append(job.optString("rawSidecarExportStatus", "NOT_REQUESTED"))
+                append(", cleanup=")
+                append(job.optString("cleanupStatus", "none"))
+                append(", job=")
+                append(latestJobDir.name)
+                append(", file=")
+                append(previewFile.name)
+                append(", source=")
+                append(job.optString("finalOutputSource", "bitmap"))
+            }
+            LatestKeplerResult(
+                bitmap = bitmap,
+                summary = summary,
+                jobType = jobType,
+                fusionEngine = fusionEngine,
+                usedFrames = usedFrames,
+                requestedFrames = requestedFrames,
+                outputWidth = outputWidth,
+                outputHeight = outputHeight,
+                fileName = previewFile.name,
+                jobName = latestJobDir.name,
+                filePath = previewFile.absolutePath
+            )
+        } catch (e: Exception) {
+            decoded?.takeIf { !it.isRecycled }?.recycle()
+            LatestKeplerResult(null, "Latest result load failed: ${e.javaClass.simpleName}")
         }
-        val jobType = job.optString("jobType", latestJobDir.parentFile?.name.orEmpty())
-        val fusionEngine = listOf(
-            job.optString("fusionEngine", ""),
-            job.optString("rawFusionEngine", ""),
-            job.optString("fusionVersion", ""),
-            job.optString("rawFusionVersion", "")
-        ).firstOrNull { it.isNotBlank() }.orEmpty()
-        val usedFrames = job.optInt("usedFrameCount", job.optInt("savedFrames", 0))
-        val requestedFrames = job.optInt("requestedFrames", 0)
-        val summary = buildString {
-            append("status=")
-            append(job.optString("status", "unknown"))
-            append(", frames=")
-            append(job.optInt("savedFrames", 0))
-            append(", export=")
-            append(job.optString("exportStatus", "not_exported"))
-            append(" ")
-            append(job.optString("exportFormatUsed", ""))
-            append(" verified=")
-            append(job.optBoolean("exportVerified", false))
-            append(", output=")
-            append(job.optString("finalOutputFormatSetting", ""))
-            append(", public=")
-            append(job.optString("exportDisplayName", "").ifBlank { "none" })
-            append(", rawSidecar=")
-            append(job.optString("rawSidecarExportStatus", "NOT_REQUESTED"))
-            append(", cleanup=")
-            append(job.optString("cleanupStatus", "none"))
-            append(", job=")
-            append(latestJobDir.name)
-            append(", file=")
-            append(previewFile.name)
-            append(", source=")
-            append(job.optString("finalOutputSource", "bitmap"))
-        }
-        LatestKeplerResult(
-            bitmap = bitmap,
-            summary = summary,
-            jobType = jobType,
-            fusionEngine = fusionEngine,
-            usedFrames = usedFrames,
-            requestedFrames = requestedFrames,
-            outputWidth = outputWidth,
-            outputHeight = outputHeight,
-            fileName = previewFile.name,
-            jobName = latestJobDir.name,
-            filePath = previewFile.absolutePath
-        )
-    } catch (e: Exception) {
-        LatestKeplerResult(null, "Latest result load failed: ${e.javaClass.simpleName}")
-    }
 }
 
 private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {

@@ -1,5 +1,6 @@
 package com.projectnuke.keplernightlab
 
+import org.json.JSONException
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -9,6 +10,11 @@ import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
 
 private const val KEPLER_JOB_SCHEMA_VERSION = 1
+
+/** Thrown when job metadata is missing or unreadable. */
+sealed class KeplerJobMetadataException(message: String, cause: Throwable? = null) : Exception(message, cause)
+class KeplerJobMetadataMissing(jobDir: File) : KeplerJobMetadataException("Job metadata missing in ${jobDir.absolutePath}")
+class KeplerJobMetadataCorrupt(jobDir: File, cause: Throwable? = null) : KeplerJobMetadataException("Job metadata corrupt in ${jobDir.absolutePath}", cause)
 
 /** Serializes each job's read-modify-write updates and never truncates a valid job.json. */
 object KeplerJobMetadata {
@@ -29,10 +35,29 @@ object KeplerJobMetadata {
         operationLeases.remove(lease.key, lease)
     }
 
-    fun read(jobDir: File): JSONObject = synchronized(lockFor(jobDir)) {
-        JSONObject(File(jobDir, JOB_JSON_FILE_NAME).readText())
+    /** Removes the lock entry for a permanently deleted job directory. Safe to call after successful deletion. */
+    fun removeLockEntry(jobDir: File) {
+        val key = jobDir.canonicalPath
+        locks.remove(key)
     }
 
+    /** Reads job metadata. Throws [KeplerJobMetadataMissing] if the file does not exist, [KeplerJobMetadataCorrupt] if parse fails. */
+    fun read(jobDir: File): JSONObject = synchronized(lockFor(jobDir)) {
+        val file = File(jobDir, JOB_JSON_FILE_NAME)
+        if (!file.isFile) throw KeplerJobMetadataMissing(jobDir)
+        try {
+            JSONObject(file.readText())
+        } catch (parseFailure: JSONException) {
+            throw KeplerJobMetadataCorrupt(jobDir, parseFailure)
+        } catch (ioFailure: Exception) {
+            throw KeplerJobMetadataCorrupt(jobDir, ioFailure)
+        }
+    }
+
+    /**
+     * Full replacement write. Use only for initial creation or intentional full replacement
+     * of the entire metadata object. For partial updates use [update].
+     */
     fun write(jobDir: File, job: JSONObject): JSONObject = synchronized(lockFor(jobDir)) {
         val replacement = JSONObject(job.toString())
         replacement.put("schemaVersion", replacement.optInt("schemaVersion", KEPLER_JOB_SCHEMA_VERSION))
@@ -40,8 +65,21 @@ object KeplerJobMetadata {
         replacement
     }
 
+    /**
+     * Narrow locked read-modify-write. The [mutate] lambda receives the current metadata and may
+     * modify it in place. Only the modified keys are saved back; unrelated concurrent keys are
+     * preserved. Use [removeKey] inside the lambda to remove keys.
+     */
     fun update(jobDir: File, mutate: (JSONObject) -> Unit): JSONObject = synchronized(lockFor(jobDir)) {
-        val job = JSONObject(File(jobDir, JOB_JSON_FILE_NAME).readText())
+        val file = File(jobDir, JOB_JSON_FILE_NAME)
+        if (!file.isFile) throw KeplerJobMetadataMissing(jobDir)
+        val job = try {
+            JSONObject(file.readText())
+        } catch (parseFailure: JSONException) {
+            throw KeplerJobMetadataCorrupt(jobDir, parseFailure)
+        } catch (ioFailure: Exception) {
+            throw KeplerJobMetadataCorrupt(jobDir, ioFailure)
+        }
         mutate(job)
         job.put("schemaVersion", job.optInt("schemaVersion", KEPLER_JOB_SCHEMA_VERSION))
         atomicWrite(File(jobDir, JOB_JSON_FILE_NAME), job.toString(2))

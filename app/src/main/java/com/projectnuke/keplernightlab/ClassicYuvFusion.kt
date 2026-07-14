@@ -137,7 +137,11 @@ internal fun processClassicYuvFusionJob(
         preflight = preflightSummary
         job.put("yuvProcessingPreflight", preflightSummary.toJson())
         if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            saveJobJson(jobFile.parentFile ?: error("Job directory missing"), job)
+            KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
+                current.put("yuvProcessingPreflight", preflightSummary.toJson())
+                    .put("processingStartedAt", job.optLong("processingStartedAt"))
+                    .put("yuvProcessingPolicy", metadataPolicy.name)
+            }
         } else {
             KeplerJobMetadata.update(jobDir) { current ->
                 current.put("yuvProcessingPreflight", preflightSummary.toJson())
@@ -402,7 +406,14 @@ internal fun processClassicYuvFusionJob(
         cancellation.throwIfCancelled()
         File(jobDir, "yuv_debug.json").writeText(job.toString(2))
         if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            saveJobJson(jobFile.parentFile ?: error("Job directory missing"), job)
+            KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
+                listOf(
+                    "yuvProcessingPreflight", "processingStartedAt", "debugArtifactStatus",
+                    "debugArtifactError", "yuvProcessingTotalFrames", "yuvProcessingEnabledFrames",
+                    "yuvProcessingDecodedUsableFrames", "yuvProcessingSameSizeFrames",
+                    "yuvProcessingCompatibleFrames"
+                ).forEach { key -> if (job.has(key)) current.put(key, job.get(key)) }
+            }
         } else {
             KeplerJobMetadata.update(jobDir) { current ->
                 listOf(
@@ -1264,7 +1275,11 @@ private fun recordClassicFailure(
                 .put("yuvProcessingCompatibleFrames", it.compatibleFrames)
         }
         if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            saveJobJson(jobFile.parentFile ?: error("Job directory missing"), job)
+            KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
+                current.put("debugArtifactStatus", job.optString("debugArtifactStatus"))
+                    .put("debugArtifactError", job.optString("debugArtifactError"))
+                    .put("yuvProcessingPreflight", job.optJSONObject("yuvProcessingPreflight") ?: JSONObject.NULL)
+            }
         } else {
             KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
                 current.put("debugArtifactStatus", job.optString("debugArtifactStatus"))

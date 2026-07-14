@@ -926,7 +926,15 @@ fun captureRawBurstForFusion(
 private object RawFusionExportCoordinator {
     private fun persistExportProgress(context: RawFusionExportContext, metadata: JSONObject) {
         if (context.metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            KeplerJobMetadata.write(context.files.jobDir, metadata)
+            KeplerJobMetadata.update(context.files.jobDir) { current ->
+                listOf(
+                    "nativePostprocessStatus", "nativePostprocessRgbaFile", "nativePostprocessMetadataFile",
+                    "nativeIspRenderMs", "nativeMp24DebugPngRequested", "nativeMp24DebugPngWritten",
+                    "nativeMp24DebugPngSkipReason", "mergedRawFile", "alignmentFile", "processingNotes",
+                    "outputWidth", "outputHeight", "partialCapture", "usedFrameCount", "requestedFrames",
+                    "savedFrames", "captureCompleteness", "nativePostprocessRequired", "nativePostprocessUsed"
+                ).forEach { key -> if (metadata.has(key)) current.put(key, metadata.get(key)) }
+            }
         } else {
             KeplerJobMetadata.update(context.files.jobDir) { current ->
                 listOf(
@@ -1634,7 +1642,13 @@ fun processRawFusionJob(
     val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
     fun persistProcessingMetadata(job: JSONObject) {
         if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            KeplerJobMetadata.write(jobDir, job)
+            KeplerJobMetadata.update(jobDir) { current ->
+                listOf(
+                    "processingStartedAt", "userCanMoveDevice", "rawFusionMemoryEstimateBytes",
+                    "nativePostprocessStatus", "nativePostprocessRgbaFile", "rawRenderDebugFile",
+                    "rawFusionDebugFile", "totalPipelineMs", "processStatus", "currentPipelineStage"
+                ).forEach { key -> if (job.has(key)) current.put(key, job.get(key)) }
+            }
         } else {
             KeplerJobMetadata.update(jobDir) { current ->
                 listOf(
@@ -1784,17 +1798,16 @@ fun processRawFusionJob(
         throw ce
     } catch (oom: OutOfMemoryError) {
         runCatching {
-            val job = if (jobFile.exists()) JSONObject(jobFile.readText()) else JSONObject()
-            job.put("processStatus", "OOM_FAILED_KEEPING_CACHE")
-                .put("currentPipelineStage", "FAILED")
-                .put("processError", "OutOfMemoryError")
-                .put("processedAt", System.currentTimeMillis())
             if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-                KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
+                KeplerJobMetadata.update(jobDir) { current ->
+                    current.put("processStatus", "OOM_FAILED_KEEPING_CACHE")
+                        .put("currentPipelineStage", "FAILED")
+                        .put("processError", "OutOfMemoryError")
+                        .put("processedAt", System.currentTimeMillis())
+                }
             } else {
                 KeplerJobMetadata.update(jobDir) { current ->
-                    current.put("processingStartedAt", job.optLong("processingStartedAt", 0L))
-                        .put("processedAt", job.optLong("processedAt", 0L))
+                    current.put("processedAt", System.currentTimeMillis())
                 }
             }
         }

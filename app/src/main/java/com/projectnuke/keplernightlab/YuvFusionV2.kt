@@ -611,7 +611,22 @@ private fun writeYuvFusionV2Metadata(
     metadata: YuvFusionV2MetadataWrite,
     metadataPolicy: ReprocessMetadataPolicy
 ) {
-    val job = loadJobJson(jobDir)
+    if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+        KeplerJobMetadata.update(jobDir) { job ->
+            applyYuvFusionV2Metadata(job, metadata)
+        }
+    } else {
+        val local = JSONObject()
+        applyYuvFusionV2Metadata(local, metadata)
+        KeplerJobMetadata.update(jobDir) { current ->
+            V2_OWNED_METADATA_KEYS.forEach { key ->
+                if (local.has(key)) current.put(key, local.get(key)) else current.remove(key)
+            }
+        }
+    }
+}
+
+private fun applyYuvFusionV2Metadata(job: JSONObject, metadata: YuvFusionV2MetadataWrite) {
     clearYuvFusionV2Metadata(job)
     val experimentalVersion = when {
         metadata.dryRun -> YUV_FUSION_V2_DRY_RUN_VERSION
@@ -657,15 +672,6 @@ private fun writeYuvFusionV2Metadata(
     }
     if (metadata.mergePlan.weights.isNotEmpty()) {
         job.put("yuvFusionV2MergePlanPreview", mergePlanPreviewToJson(metadata.mergePlan.weights))
-    }
-    if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-        saveJobJson(jobDir, job)
-    } else {
-        KeplerJobMetadata.update(jobDir) { current ->
-            V2_OWNED_METADATA_KEYS.forEach { key ->
-                if (job.has(key)) current.put(key, job.get(key)) else current.remove(key)
-            }
-        }
     }
 }
 

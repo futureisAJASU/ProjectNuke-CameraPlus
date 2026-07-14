@@ -415,12 +415,13 @@ private fun updateCleanupMetadata(
     freedBytes: Long,
     sourceFramesDeleted: Boolean
 ) {
-    val job = JSONObject(jobFile.readText())
-    job.put("cleanupStatus", cleanupStatus)
-        .put("cleanupDeletedFiles", deletedFiles)
-        .put("cleanupFreedBytes", freedBytes)
-        .put("cleanupPolicy", policy.name)
-        .put("sourceFramesDeleted", sourceFramesDeleted)
-        .put("cleanedAt", System.currentTimeMillis())
-    saveJobJson(jobFile.parentFile ?: error("Job directory missing"), job)
+    val jobDir = jobFile.parentFile ?: error("Job directory missing")
+    KeplerJobMetadata.update(jobDir) { job ->
+        job.put("cleanupStatus", cleanupStatus)
+            .put("cleanupDeletedFiles", deletedFiles)
+            .put("cleanupFreedBytes", freedBytes)
+            .put("cleanupPolicy", policy.name)
+            .put("sourceFramesDeleted", sourceFramesDeleted)
+            .put("cleanedAt", System.currentTimeMillis())
+    }
 }

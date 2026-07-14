@@ -396,9 +396,12 @@ internal fun reprocessRawJob(
                     requestedFormat = requestedFormat,
                     cancellation = cancellation
                 )
-            } finally {
+            } catch (exportError: Throwable) {
                 exportBitmap?.takeUnless { it.isRecycled }?.recycle()
+                exportBitmap = null
+                throw exportError
             }
+            try {
             if (export.success && !export.uriString.isNullOrBlank()) {
                 publicExportCommitted = true
                 committedExport = export
@@ -414,8 +417,9 @@ internal fun reprocessRawJob(
             }
             // Verified committed export may have no local preview when the export format leaves
             // no in-job PNG (HEIF/JPEG). Materialize a bounded current-operation preview so the
-            // gallery can display this reprocess without reusing an older preview.
-            if (currentPreviewFile == null && publicExportCommitted && exportBitmap != null && !exportBitmap.isRecycled) {
+            // gallery can display this reprocess without reusing an older preview. Must be created
+            // before recycling exportBitmap.
+            if (currentPreviewFile == null && publicExportCommitted) {
                 currentPreviewFile = try {
                     writeBoundedReprocessPreview(jobDir, exportBitmap)
                 } catch (previewError: Exception) {
@@ -426,6 +430,9 @@ internal fun reprocessRawJob(
             post("RAW reprocess complete: used $enabledCount frames; source frames kept.")
             terminalResult = Result.success(Unit)
             terminalDisposition = ReprocessTerminalDisposition.VERIFIED_SUCCESS
+            } finally {
+                exportBitmap?.takeUnless { it.isRecycled }?.recycle()
+            }
         } catch (_: kotlinx.coroutines.CancellationException) {
             post("PIPELINE_CANCELLED: RAW reprocess cancelled; source frames kept.")
             terminalResult = Result.failure(IllegalStateException("RAW reprocess cancelled"))
@@ -476,35 +483,37 @@ private fun applyExplicitFrameSelection(jobDir: File, selectedFrameIndices: Set<
 
 private fun updateRawNativeQualityDiagnostics(jobDir: File, bitmap: Bitmap) {
     runCatching {
-        val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
-        val job = JSONObject(jobFile.readText())
         val finalPreview = saveBoundedDiagnosticPreview(bitmap, File(jobDir, "final_preview.png"))
         val referencePreview = finalPreview.copy(Bitmap.Config.ARGB_8888, false)
-        saveBoundedDiagnosticPreview(referencePreview, File(jobDir, "reference_single_preview.png"))
-        saveBoundedDiagnosticPreview(finalPreview, File(jobDir, "fused_before_denoise_preview.png"))
-        saveBoundedDiagnosticPreview(finalPreview, File(jobDir, "fused_after_denoise_no_sharpen_preview.png"))
-        writeFusionQualityDiagnostics(
-            job = job,
-            jobDir = jobDir,
-            prefix = "raw",
-            reference = referencePreview,
-            fused = finalPreview,
-            denoised = finalPreview,
-            finalImage = finalPreview,
-            compareFileName = "compare_reference_vs_final.png"
-        )
-        job.put("referenceSinglePreviewFile", "reference_single_preview.png")
-            .put("fusedBeforeDenoisePreviewFile", "fused_before_denoise_preview.png")
-            .put("fusedAfterDenoiseNoSharpenPreviewFile", "fused_after_denoise_no_sharpen_preview.png")
-            .put("finalPreviewFile", "final_preview.png")
-            .put("compareReferenceVsFinalFile", "compare_reference_vs_final.png")
-            .put("qualityDiagnosticNativeLimited", true)
-            .put(
-                "qualityDiagnosticNativeLimitedReason",
-                "Native RGBA path only exposes final display bitmap to Kotlin export stage."
-            )
-        saveJobJson(jobDir, job)
-        referencePreview.recycle()
-        finalPreview.recycle()
+        try {
+            saveBoundedDiagnosticPreview(referencePreview, File(jobDir, "reference_single_preview.png"))
+            saveBoundedDiagnosticPreview(finalPreview, File(jobDir, "fused_before_denoise_preview.png"))
+            saveBoundedDiagnosticPreview(finalPreview, File(jobDir, "fused_after_denoise_no_sharpen_preview.png"))
+            KeplerJobMetadata.update(jobDir) { job ->
+                writeFusionQualityDiagnostics(
+                    job = job,
+                    jobDir = jobDir,
+                    prefix = "raw",
+                    reference = referencePreview,
+                    fused = finalPreview,
+                    denoised = finalPreview,
+                    finalImage = finalPreview,
+                    compareFileName = "compare_reference_vs_final.png"
+                )
+                job.put("referenceSinglePreviewFile", "reference_single_preview.png")
+                    .put("fusedBeforeDenoisePreviewFile", "fused_before_denoise_preview.png")
+                    .put("fusedAfterDenoiseNoSharpenPreviewFile", "fused_after_denoise_no_sharpen_preview.png")
+                    .put("finalPreviewFile", "final_preview.png")
+                    .put("compareReferenceVsFinalFile", "compare_reference_vs_final.png")
+                    .put("qualityDiagnosticNativeLimited", true)
+                    .put(
+                        "qualityDiagnosticNativeLimitedReason",
+                        "Native RGBA path only exposes final display bitmap to Kotlin export stage."
+                    )
+            }
+        } finally {
+            referencePreview.recycle()
+            finalPreview.recycle()
+        }
     }
 }

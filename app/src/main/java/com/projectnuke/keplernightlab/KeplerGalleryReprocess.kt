@@ -128,7 +128,10 @@ suspend fun reprocessKeplerGalleryJob(
     }
 
     postProgress("원본 프레임 확인 중…")
-    val job = loadJobJsonSafe(target)
+    val job = try { KeplerJobMetadata.read(target) } catch (metadataError: KeplerJobMetadataException) {
+        writeReprocessFailure(target, "${metadataError.javaClass.simpleName}: ${metadataError.message}")
+        return@withContext Result.failure(metadataError)
+    }
     val kind = detectJobKind(target, job)
     val reviewItems = loadFrameReviewItems(context, target).getOrElse {
         writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
@@ -157,21 +160,36 @@ suspend fun reprocessKeplerGalleryJob(
         mode = selectionMode,
         frames = applyFrameSelectionToItems(reviewItems, resolvedSelection, selectionMode)
     ).getOrElse {
+        val frameSelectionError = it
         val rollback = restoreBackups(target, backups)
         if (rollback.isFailure) {
             val rollbackError = rollback.exceptionOrNull() ?: IllegalStateException("Rollback failed")
-            writeReprocessFailure(
-                target,
-                "${it.javaClass.simpleName}: ${it.message}; rollback failed: ${rollbackError.message}"
-            )
+            writeQuarantineMarker(backups)
+            try {
+                writeReprocessFailure(
+                    target,
+                    "${frameSelectionError.javaClass.simpleName}: ${frameSelectionError.message}; rollback failed: ${rollbackError.message}"
+                )
+            } catch (_: Exception) { /* quarantine already persisted */ }
+            releaseOperationLease = false
             return@withContext Result.failure(rollbackError)
         }
-        if (!deleteBackups(backups)) {
-            writeReprocessFailure(target, "Frame-selection rollback completed but backup cleanup failed.")
-            return@withContext Result.failure(IllegalStateException("Frame-selection rollback backup cleanup failed."))
+        try {
+            writeReprocessFailure(target, "${frameSelectionError.javaClass.simpleName}: ${frameSelectionError.message}")
+        } catch (metadataFailure: Exception) {
+            writeQuarantineMarker(backups)
+            releaseOperationLease = false
+            return@withContext Result.failure(metadataFailure)
         }
-        writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
-        return@withContext Result.failure(it)
+        removeQuarantineMarker(backups)
+        if (!deleteBackups(backups)) {
+            try {
+                KeplerJobMetadata.update(target) {
+                    it.put("reprocessWarning", "Frame-selection rollback backup cleanup failed.")
+                }
+            } catch (_: Exception) { /* rollback already safe; warning best-effort */ }
+        }
+        return@withContext Result.failure(frameSelectionError)
     }
 
     val progressScope = CoroutineScope(coroutineContext)
@@ -215,27 +233,43 @@ suspend fun reprocessKeplerGalleryJob(
                 resolvedSelection, Result.success(outcome), backups
             )
         }
-        // Caller cancellation already propagated: release the operation lease only when finalization
-        // reached a safe terminal state. QUARANTINED leaves the job quarantined and the lease held.
         releaseOperationLease = cancellationFinalization?.let { it.state == ReprocessFinalizationState.COMMITTED || it.state == ReprocessFinalizationState.ROLLED_BACK } ?: false
-        if (cancellationFinalization == null && cleanup.isFailure && cleanup.exceptionOrNull() !is ReprocessWorkerDidNotExitException) {
-            writeReprocessFailure(target, "Caller cancellation cleanup failed: ${cleanup.exceptionOrNull()?.message}")
-        }
-        if (cleanup.exceptionOrNull() is ReprocessWorkerDidNotExitException || cancellationFinalization == null) {
-            // Worker did not exit (or never finalized) before the caller cancellation propagated.
-            // The lease stays held; finalize once the exited worker reports a terminal disposition,
-            // and release only if that late finalization safely commits or rolls back.
+        if (cleanup.exceptionOrNull() is ReprocessWorkerDidNotExitException) {
+            writeQuarantineMarker(backups)
+            try {
+                writeReprocessFailure(target, "Reprocess worker did not exit; job quarantined.")
+            } catch (_: Exception) { /* quarantine is already persisted; metadata is best-effort */ }
+            // Late completion may still finalize safely if the worker eventually exits.
             worker.terminal.invokeOnCompletion {
                 CoroutineScope(Dispatchers.IO).launch {
-                    worker.terminal.await().let { outcome ->
-                        val late = finalizeTerminalOutcome(
-                            target, capability.jobKind, outputSettings, selectionMode,
-                            resolvedSelection, Result.success(outcome), backups
-                        )
-                        if (late.state == ReprocessFinalizationState.COMMITTED || late.state == ReprocessFinalizationState.ROLLED_BACK) {
-                            operationLease.release()
+                    runCatching {
+                        worker.terminal.await().let { outcome ->
+                            val late = finalizeTerminalOutcome(
+                                target, capability.jobKind, outputSettings, selectionMode,
+                                resolvedSelection, Result.success(outcome), backups
+                            )
+                            if (late.state == ReprocessFinalizationState.COMMITTED || late.state == ReprocessFinalizationState.ROLLED_BACK) {
+                                operationLease.release()
+                            }
                         }
-                    }
+                    }.onFailure { /* late finalization failure; retain quarantine and backups */ }
+                }
+            }
+        } else if (cancellationFinalization == null) {
+            writeReprocessFailure(target, "Caller cancellation cleanup failed: ${cleanup.exceptionOrNull()?.message}")
+            worker.terminal.invokeOnCompletion {
+                CoroutineScope(Dispatchers.IO).launch {
+                    runCatching {
+                        worker.terminal.await().let { outcome ->
+                            val late = finalizeTerminalOutcome(
+                                target, capability.jobKind, outputSettings, selectionMode,
+                                resolvedSelection, Result.success(outcome), backups
+                            )
+                            if (late.state == ReprocessFinalizationState.COMMITTED || late.state == ReprocessFinalizationState.ROLLED_BACK) {
+                                operationLease.release()
+                            }
+                        }
+                    }.onFailure { /* late finalization failure; retain quarantine and backups */ }
                 }
             }
         }
@@ -257,15 +291,17 @@ suspend fun reprocessKeplerGalleryJob(
     if (finalization.state == ReprocessFinalizationState.QUARANTINED) {
         worker.terminal.invokeOnCompletion {
             CoroutineScope(Dispatchers.IO).launch {
-                worker.terminal.await().let { outcome ->
-                    val late = finalizeTerminalOutcome(
-                        target, capability.jobKind, outputSettings, selectionMode,
-                        resolvedSelection, Result.success(outcome), backups
-                    )
-                    if (late.state == ReprocessFinalizationState.COMMITTED || late.state == ReprocessFinalizationState.ROLLED_BACK) {
-                        operationLease.release()
+                runCatching {
+                    worker.terminal.await().let { outcome ->
+                        val late = finalizeTerminalOutcome(
+                            target, capability.jobKind, outputSettings, selectionMode,
+                            resolvedSelection, Result.success(outcome), backups
+                        )
+                        if (late.state == ReprocessFinalizationState.COMMITTED || late.state == ReprocessFinalizationState.ROLLED_BACK) {
+                            operationLease.release()
+                        }
                     }
-                }
+                }.onFailure { /* late finalization failure; retain quarantine and backups */ }
             }
         }
     }
@@ -328,6 +364,7 @@ private fun finalizeTerminalOutcome(
                     Result.failure(metadataError)
                 )
             }
+            removeQuarantineMarker(backups)
             val cleanupSuccess = deleteBackups(backups)
             if (!cleanupSuccess) {
                 try {
@@ -336,7 +373,6 @@ private fun finalizeTerminalOutcome(
                     }
                 } catch (_: Exception) { /* roll back already safe; warning best-effort */ }
             }
-            removeQuarantineMarker(backups)
             ReprocessFinalizationResult(ReprocessFinalizationState.ROLLED_BACK, Result.failure(error))
         },
         onFailure = { rollbackError ->
@@ -359,13 +395,17 @@ private fun finalizeReprocessOutcome(
     val finalFile = outcome.finalOutputFile?.takeIf { it.isFile && it.length() > 0L }
     val previewFile = outcome.previewFile?.takeIf { it.isFile && it.length() > 0L } ?: finalFile
     if (outcome.result.isSuccess && !outcome.publicExportCommitted && finalFile?.isFile != true) {
-        // Committed neither the public export nor a local final output. Roll back to the prior state.
-        return try {
-            restoreBackups(jobDir, backups).getOrThrow()
-            Result.failure(IllegalStateException("Reprocess completed without a final output file."))
-        } catch (rollbackError: Exception) {
-            writeQuarantineMarker(backups)
-            Result.failure(rollbackError)
+        // Committed neither the public export nor a local final output. If a preview was produced
+        // by this operation, use it as the gallery display/thumbnail so the previous result is
+        // not mistaken for the current one. Otherwise roll back to the prior state.
+        if (previewFile == null || previewFile == finalFile) {
+            return try {
+                restoreBackups(jobDir, backups).getOrThrow()
+                Result.failure(IllegalStateException("Reprocess completed without a final output file."))
+            } catch (rollbackError: Exception) {
+                writeQuarantineMarker(backups)
+                Result.failure(rollbackError)
+            }
         }
     }
     val bytes = outcome.bytesWritten.takeIf { it > 0L }
@@ -391,7 +431,9 @@ private fun finalizeReprocessOutcome(
         writeQuarantineMarker(backups)
         return Result.failure(metadataFailure)
     }
-    // Backups are only deleted once terminal metadata has succeeded.
+    // Remove the quarantine marker before deleting backup files so the cleanup ordering never
+    // leaves a stale marker in a root whose backup files have already been removed.
+    removeQuarantineMarker(backups)
     val cleanupSuccess = deleteBackups(backups)
     if (!cleanupSuccess) {
         try {
@@ -400,7 +442,6 @@ private fun finalizeReprocessOutcome(
             }
         } catch (_: Exception) { /* commit already safe; warning is best-effort */ }
     }
-    removeQuarantineMarker(backups)
     return Result.success(
         KeplerReprocessResult(jobDir, jobKind, displayFile, previewFile, bytes,
             listOfNotNull(
@@ -422,19 +463,6 @@ internal suspend fun cancelWorkerAndAwaitTerminal(
     }
 }
 
-/**
- * Cancels the reprocess worker, waits for its terminal outcome, then runs [rollback] only after the
- * worker has reported completion. Rollback never starts while the worker is still mutating job files.
- */
-internal suspend fun cancelWorkerAndRollbackAfterCompletion(
-    worker: ReprocessWorkerRun,
-    rollback: suspend () -> Result<Unit>
-): Result<Unit> = withContext(NonCancellable) {
-    worker.cancel()
-    worker.terminal.await()
-    rollback()
-}
-
 /** Writes a bounded preview for this reprocess operation. Never reuses an older preview. */
 internal fun writeBoundedReprocessPreview(jobDir: File, source: Bitmap): File {
     val maxDimension = REPROCESS_PREVIEW_MAX_DIMENSION.coerceAtLeast(1)
@@ -445,9 +473,16 @@ internal fun writeBoundedReprocessPreview(jobDir: File, source: Bitmap): File {
         Bitmap.createScaledBitmap(source, width, height, true)
     } else source
     val preview = File(jobDir, "$REPROCESS_PREVIEW_PREFIX${System.currentTimeMillis()}.png")
-    File(preview.parentFile, ".${preview.name}.${System.nanoTime()}.tmp").use { temp ->
+    val temp = File(preview.parentFile, ".${preview.name}.${System.nanoTime()}.tmp")
+    try {
         temp.write { output -> check(scaled.compress(Bitmap.CompressFormat.PNG, 92, output)) { "Reprocess preview compress failed." } }
         KeplerJobMetadata.atomicReplace(temp, preview)
+    } catch (compressFailure: Exception) {
+        if (temp.exists()) runCatching { temp.delete() }
+        throw compressFailure
+    } finally {
+        if (temp.exists()) runCatching { temp.delete() }
+        if (scaled !== source && !scaled.isRecycled) scaled.recycle()
     }
     return preview.takeIf { it.isFile && it.length() > 0L } ?: error("Reprocess preview write produced no file.")
 }
@@ -492,6 +527,30 @@ internal fun isReprocessQuarantined(jobDir: File): Boolean {
     return false
 }
 
+/**
+ * Safe process-restart recovery for validated quarantined transactions. Called from
+ * [loadKeplerGalleryJobs] for every job directory. If the quarantine marker exists but the
+ * backup directory is empty (all backups were already deleted or the transaction completed
+ * safely before the crash), the stale marker and empty backup root are removed so the job is
+ * no longer treated as quarantined. If the backup directory still contains backup files, the
+ * quarantine is preserved — manual intervention or a new reprocess is required.
+ */
+internal fun recoverValidatedQuarantine(jobDir: File) {
+    if (KeplerJobMetadata.isOperationActive(jobDir)) return
+    jobDir.listFiles()?.forEach { child ->
+        if (child.isDirectory && child.name.startsWith(".reprocess_backup_")) {
+            val marker = File(child, REPROCESS_QUARANTINE_MARKER)
+            if (!marker.exists()) return@forEach
+            val remaining = child.listFiles()?.toList().orEmpty()
+            val hasBackupFiles = remaining.any { it.isFile && it.name != REPROCESS_QUARANTINE_MARKER }
+            if (!hasBackupFiles) {
+                marker.delete()
+                if (child.exists()) child.delete()
+            }
+        }
+    }
+}
+
 fun detectReprocessCapability(context: Context, jobDir: File): ReprocessCapability {
     val target = runCatching { requireReprocessSafeJobDirectory(context, jobDir) }.getOrNull()
         ?: return ReprocessCapability(
@@ -502,7 +561,31 @@ fun detectReprocessCapability(context: Context, jobDir: File): ReprocessCapabili
             finalOutputExists = false,
             sourceFramesAvailable = false
         )
-    val job = loadJobJsonSafe(target)
+    if (isReprocessQuarantined(target)) {
+        return ReprocessCapability(
+            canReprocess = false,
+            jobKind = ReprocessJobKind.UNSUPPORTED,
+            reason = "다시 합성을 진행할 수 없습니다. 이 작업은 격리되었습니다.",
+            sourceFrameCount = 0,
+            finalOutputExists = false,
+            sourceFramesAvailable = false
+        )
+    }
+    val job = try {
+        KeplerJobMetadata.read(target)
+    } catch (metadataError: KeplerJobMetadataException) {
+        return ReprocessCapability(
+            canReprocess = false,
+            jobKind = ReprocessJobKind.UNSUPPORTED,
+            reason = when (metadataError) {
+                is KeplerJobMetadataMissing -> "Job metadata is missing."
+                is KeplerJobMetadataCorrupt -> "Job metadata is corrupt and cannot be read."
+            },
+            sourceFrameCount = 0,
+            finalOutputExists = false,
+            sourceFramesAvailable = false
+        )
+    }
     val kind = detectJobKind(target, job)
     val finalExists = finalOutputCandidates(target, job).any { it.isFile && it.length() > 0L }
     val sourceCount = countActualSourceFrames(target, job, kind)
@@ -667,24 +750,100 @@ internal data class ReprocessBackup(
     val originalLength: Long = backup.length()
 )
 
+private const val REPROCESS_TX_MANIFEST_FILE = "manifest.json"
+
+/**
+ * Transaction manifest recording the job state before the reprocess. Records which relative paths
+ * existed before the transaction, which were backed up (mutable outputs/metadata only — never
+ * immutable source frames), and which paths were newly created by the transaction.
+ */
+internal data class ReprocessTransactionManifest(
+    val transactionId: String,
+    val createdAt: Long,
+    val preExistingPaths: Set<String>,
+    val backedUpPaths: Set<String>,
+    val newlyCreatedPaths: MutableSet<String> = mutableSetOf()
+) {
+    fun isPreExisting(relativePath: String): Boolean = relativePath in preExistingPaths
+    fun isBackedUp(relativePath: String): Boolean = relativePath in backedUpPaths
+    fun isNewlyCreated(relativePath: String): Boolean = relativePath in newlyCreatedPaths
+
+    fun recordNewlyCreated(relativePath: String) {
+        if (relativePath !in preExistingPaths && relativePath !in backedUpPaths) {
+            newlyCreatedPaths.add(relativePath)
+        }
+    }
+
+    fun toJson(): JSONObject = JSONObject()
+        .put("transactionId", transactionId)
+        .put("createdAt", createdAt)
+        .put("preExistingPaths", JSONArray(preExistingPaths.sorted()))
+        .put("backedUpPaths", JSONArray(backedUpPaths.sorted()))
+        .put("newlyCreatedPaths", JSONArray(newlyCreatedPaths.sorted()))
+
+    companion object {
+        fun fromJson(json: JSONObject): ReprocessTransactionManifest = ReprocessTransactionManifest(
+            transactionId = json.optString("transactionId"),
+            createdAt = json.optLong("createdAt"),
+            preExistingPaths = json.optJSONArray("preExistingPaths")?.toStringSet().orEmpty(),
+            backedUpPaths = json.optJSONArray("backedUpPaths")?.toStringSet().orEmpty(),
+            newlyCreatedPaths = (json.optJSONArray("newlyCreatedPaths")?.toStringSet().orEmpty()).toMutableSet()
+        )
+
+        private fun JSONArray?.toStringSet(): Set<String> = buildSet {
+            if (this@toStringSet == null) return@buildSet
+            repeat(length()) { i -> add(optString(i)) }
+        }
+    }
+}
+
+internal data class ReprocessTransaction(
+    val transactionId: String,
+    val backupRoot: File,
+    val manifest: ReprocessTransactionManifest,
+    val backups: List<ReprocessBackup>
+)
+
+/** True if the file is an immutable source frame that must never be backed up by reprocess transactions. */
+private fun isImmutableSourceFrame(file: File): Boolean {
+    val name = file.name.lowercase(Locale.US)
+    if (!name.startsWith("frame_")) return false
+    return name.endsWith(".raw16") || name.endsWith(".dng") ||
+        name.endsWith(".yuv") || name.endsWith(".nv21") || name.endsWith(".yuv420")
+}
+
+/** True if the file is a mutable output or metadata that the reprocess worker may overwrite. */
+internal fun isReprocessWorkerWritable(file: File): Boolean = !isImmutableSourceFrame(file)
+
 internal fun backupReprocessTransaction(jobDir: File, files: List<File>): Result<List<ReprocessBackup>> {
-    val root = File(jobDir, ".reprocess_backup_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}")
+    val transactionId = "${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}"
+    val root = File(jobDir, ".reprocess_backup_$transactionId")
     return runCatching {
         check(root.mkdirs()) { "Could not create reprocess backup directory." }
         val metadata = File(jobDir, JOB_JSON_FILE_NAME)
         check(metadata.isFile) { "job.json is required for rollback." }
-        val existingNames = jobDir.listFiles()?.filter { it.isFile }?.map { it.name }?.toSet().orEmpty()
-        (files + metadata)
+        val preExistingNames = jobDir.listFiles()?.filter { it.isFile }?.map { it.name }?.toSet().orEmpty()
+        val filesToBackup = (files + metadata)
             .asSequence()
             .filter { it.isFile }
             .map { it.canonicalFile }
             .distinctBy { it.path }
-            .map { original ->
+            .filter { isReprocessWorkerWritable(it) }
+            .toList()
+        val backups = filesToBackup.map { original ->
             val backup = File(root, original.name)
             original.copyTo(backup, overwrite = false)
             check(backup.isFile && backup.length() == original.length()) { "Backup verification failed for ${original.name}" }
-            ReprocessBackup(original, backup, existingNames, original.length())
-        }.toList()
+            ReprocessBackup(original, backup, preExistingNames, original.length())
+        }
+        val manifest = ReprocessTransactionManifest(
+            transactionId = transactionId,
+            createdAt = System.currentTimeMillis(),
+            preExistingPaths = preExistingNames,
+            backedUpPaths = backups.map { it.original.name }.toSet()
+        )
+        KeplerJobMetadata.atomicWrite(File(root, REPROCESS_TX_MANIFEST_FILE), manifest.toJson().toString(2))
+        backups
     }.onFailure {
         root.listFiles()?.forEach { it.delete() }
         root.delete()
@@ -692,20 +851,32 @@ internal fun backupReprocessTransaction(jobDir: File, files: List<File>): Result
 }
 
 internal fun restoreBackups(jobDir: File, backups: List<ReprocessBackup>): Result<Unit> = runCatching {
+    val root = backups.firstOrNull()?.backup?.parentFile
+    if (root == null || !root.isDirectory) return@runCatching
+    val manifestFile = File(root, REPROCESS_TX_MANIFEST_FILE)
+    val manifest = if (manifestFile.isFile) {
+        runCatching { ReprocessTransactionManifest.fromJson(JSONObject(manifestFile.readText())) }.getOrNull()
+    } else null
     backups.forEach { backup ->
         check(backup.backup.isFile) { "Missing rollback backup: ${backup.original.name}" }
         check(backup.backup.length() == backup.originalLength) {
             "Invalid rollback backup: ${backup.original.name}"
         }
     }
-    val originalNames = backups.firstOrNull()?.existingNames.orEmpty()
-    jobDir.listFiles()?.filter { it.isFile && it.name !in originalNames }?.forEach { runCatching { it.delete() } }
+    val preExisting = manifest?.preExistingPaths ?: backups.firstOrNull()?.existingNames.orEmpty()
+    val backupNames = backups.map { it.original.name }.toSet()
+    val backupRootName = root.name
+    jobDir.listFiles()?.filter { it.isFile && it.name !in preExisting && it.name !in backupNames && it.name != backupRootName }?.forEach { runCatching { it.delete() } }
     backups.forEach { backup ->
-        val temp = File(backup.original.parentFile, ".${backup.original.name}.${System.nanoTime()}.restore")
+        val target = backup.original
+        if (target.isFile && target.length() == backup.backup.length()) {
+            return@forEach
+        }
+        val temp = File(target.parentFile, ".${target.name}.${System.nanoTime()}.restore")
         try {
             backup.backup.copyTo(temp, overwrite = false)
-            check(temp.length() == backup.backup.length()) { "Rollback temp verification failed: ${backup.original.name}" }
-            KeplerJobMetadata.atomicReplace(temp, backup.original)
+            check(temp.length() == backup.backup.length()) { "Rollback temp verification failed: ${target.name}" }
+            KeplerJobMetadata.atomicReplace(temp, target)
         } finally {
             if (temp.exists()) temp.delete()
         }
@@ -714,18 +885,11 @@ internal fun restoreBackups(jobDir: File, backups: List<ReprocessBackup>): Resul
 
 internal fun deleteBackups(backups: List<ReprocessBackup>): Boolean {
     val root = backups.firstOrNull()?.backup?.parentFile ?: return true
+    removeQuarantineMarker(backups)
     backups.forEach { backup -> if (backup.backup.exists() && !backup.backup.delete()) return false }
+    val manifest = File(root, REPROCESS_TX_MANIFEST_FILE)
+    if (manifest.exists() && !manifest.delete()) return false
     return !root.exists() || root.delete()
-}
-
-private fun isReprocessWorkerWritable(file: File): Boolean {
-    val name = file.name.lowercase(Locale.US)
-    if (name.startsWith("frame_") && (
-            name.endsWith(".raw16") || name.endsWith(".dng") ||
-            name.endsWith(".yuv") || name.endsWith(".nv21") || name.endsWith(".yuv420") ||
-            name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg")
-        )) return false
-    return true
 }
 
 private fun writeReprocessSuccess(
@@ -776,9 +940,16 @@ private fun writeReprocessSuccess(
         job.put("galleryDisplayFile", it.name)
             .put("galleryThumbnailFile", previewFile?.name ?: it.name)
     } ?: run {
-        job.remove("galleryDisplayFile")
-        job.remove("galleryThumbnailFile")
-        job.remove("galleryDisplaySource")
+        val previewName = previewFile?.takeIf { it.isFile }?.name
+        if (previewName != null) {
+            job.put("galleryDisplayFile", previewName)
+                .put("galleryThumbnailFile", previewName)
+                .remove("galleryDisplaySource")
+        } else {
+            job.remove("galleryDisplayFile")
+            job.remove("galleryThumbnailFile")
+            job.remove("galleryDisplaySource")
+        }
     }
     putReprocessAvailability(jobDir, job, sourceFrameCount, finalOutputFile)
     recordReprocessTerminalMetadata(job, "COMPLETE", null)
@@ -841,9 +1012,18 @@ private fun writeReprocessPartial(
         .put("exportFileSizeBytes", export?.fileSizeBytes ?: 0L)
     finalOutputFile?.let { job.put("galleryDisplayFile", it.name).put("galleryThumbnailFile", previewFile?.name ?: it.name) }
         ?: run {
-            job.remove("galleryDisplayFile")
-            job.remove("galleryThumbnailFile")
-            job.remove("galleryDisplaySource")
+            val previewName = previewFile?.takeIf { it.isFile }?.name
+            if (previewName != null) {
+                job.put("galleryDisplayFile", previewName)
+                    .put("galleryThumbnailFile", previewName)
+                    .put("galleryVisible", true)
+                    .put("galleryDisplayUnavailable", false)
+                    .remove("galleryDisplaySource")
+            } else {
+                job.remove("galleryDisplayFile")
+                job.remove("galleryThumbnailFile")
+                job.remove("galleryDisplaySource")
+            }
         }
     putReprocessAvailability(jobDir, job, sourceFrameCount, finalOutputFile)
     recordReprocessTerminalMetadata(job, "PARTIAL", error ?: "Public export committed but worker verification failed")

@@ -167,6 +167,7 @@ fun saveFrameSelection(
     mode: FrameSelectionMode,
     frames: List<KeplerFrameReviewItem>
 ): Result<Unit> = runCatching {
+    require(!isReprocessQuarantined(jobDir)) { "Cannot save frame selection for a quarantined reprocess job." }
     KeplerJobMetadata.update(jobDir) { job ->
     val included = frames.filter { it.included }.map { it.index }.sorted()
     job.put("frameSelectionMode", mode.name)

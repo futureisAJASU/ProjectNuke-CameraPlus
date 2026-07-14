@@ -1552,13 +1552,12 @@ fun averageLatestYuvBurstGray(
 
             bitmap.recycle()
 
-            val updatedJob = JSONObject(job.toString())
-                .put("processStatus", "AVERAGE_GRAY_COMPLETE")
-                .put("averageGrayFile", outFile.name)
-                .put("averageUsedFrames", usedFrames)
-                .put("processedAt", System.currentTimeMillis())
-
-            saveJobJson(jobFile.parentFile ?: error("Job directory missing"), updatedJob)
+            KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { job ->
+                job.put("processStatus", "AVERAGE_GRAY_COMPLETE")
+                    .put("averageGrayFile", outFile.name)
+                    .put("averageUsedFrames", usedFrames)
+                    .put("processedAt", System.currentTimeMillis())
+            }
 
             postStatus(
                 "YUV 평균 합성 완료\n" +

@@ -95,16 +95,16 @@ fun processLatestNightFusionV02(
             Log.e("KeplerYuvPipeline", "PIPELINE_FAILED in processLatestNightFusionV02", e)
             runCatching {
                 val targetDir = jobDir ?: findLatestColorBurstJobDir(context) ?: return@runCatching
-                val job = loadJobJson(targetDir)
-                job.put("currentPipelineStage", "PIPELINE_FAILED")
-                    .put("processStatus", "PIPELINE_FAILED")
-                    .put("pipelineFailed", true)
-                    .put("pipelineFailureSource", "processLatestNightFusionV02")
-                    .put("pipelineFailureType", e.javaClass.name)
-                    .put("pipelineFailureMessage", e.shortMessage())
-                    .put("pipelineFailureStackTrace", e.stackTraceToString())
-                    .put("updatedAt", System.currentTimeMillis())
-                saveJobJson(targetDir, job)
+                KeplerJobMetadata.update(targetDir) { job ->
+                    job.put("currentPipelineStage", "PIPELINE_FAILED")
+                        .put("processStatus", "PIPELINE_FAILED")
+                        .put("pipelineFailed", true)
+                        .put("pipelineFailureSource", "processLatestNightFusionV02")
+                        .put("pipelineFailureType", e.javaClass.name)
+                        .put("pipelineFailureMessage", e.shortMessage())
+                        .put("pipelineFailureStackTrace", e.stackTraceToString())
+                        .put("updatedAt", System.currentTimeMillis())
+                }
             }
             postStatus(
                 "PIPELINE_FAILED: YUV Night Fusion failed: ${e.shortMessage()}; cache kept. See logcat/job.json for details."
