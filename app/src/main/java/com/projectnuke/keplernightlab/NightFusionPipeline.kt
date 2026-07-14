@@ -211,6 +211,7 @@ internal fun reprocessYuvJob(
         var terminalResult: Result<Unit> = Result.failure(IllegalStateException("YUV reprocess did not reach a terminal state."))
         var publicExportCommitted = false
         var committedExport: GalleryExportResult? = null
+        var finalOutputFile: File? = null
         try {
             cancellation.throwIfCancelled()
             if (selectedFrameIndices != null) {
@@ -249,6 +250,7 @@ internal fun reprocessYuvJob(
                 requestedParams = fusionParams,
                 cancellation = cancellation
             )
+            finalOutputFile = finalFile.takeIf { it.isFile && it.length() > 0L }
             post("YUV reprocess: exporting...")
             val bitmap = BitmapFactory.decodeFile(finalFile.absolutePath)
                 ?: error("Could not decode reprocessed YUV image.")
@@ -311,7 +313,16 @@ internal fun reprocessYuvJob(
             terminalResult = Result.failure(e)
         } finally {
             workerThread.quitSafely()
-            terminal.complete(ReprocessWorkerOutcome(terminalResult, publicExportCommitted, committedExport))
+            terminal.complete(
+                ReprocessWorkerOutcome(
+                    result = terminalResult,
+                    publicExportCommitted = publicExportCommitted,
+                    export = committedExport,
+                    finalOutputFile = finalOutputFile,
+                    previewFile = finalOutputFile,
+                    bytesWritten = finalOutputFile?.length() ?: 0L
+                )
+            )
         }
     }
     return ReprocessWorkerRun(

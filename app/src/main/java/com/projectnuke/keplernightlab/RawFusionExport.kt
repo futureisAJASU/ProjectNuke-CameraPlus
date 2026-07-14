@@ -438,7 +438,17 @@ internal fun reprocessRawJob(
             terminalResult = Result.failure(e)
         } finally {
             thread.quitSafely()
-            terminal.complete(ReprocessWorkerOutcome(terminalResult, publicExportCommitted, committedExport))
+            val finalOutput = File(jobDir, "raw_fusion_final.png").takeIf { it.isFile && it.length() > 0L }
+            terminal.complete(
+                ReprocessWorkerOutcome(
+                    result = terminalResult,
+                    publicExportCommitted = publicExportCommitted,
+                    export = committedExport,
+                    finalOutputFile = finalOutput,
+                    previewFile = finalOutput,
+                    bytesWritten = finalOutput?.length() ?: 0L
+                )
+            )
         }
     }
     return ReprocessWorkerRun(

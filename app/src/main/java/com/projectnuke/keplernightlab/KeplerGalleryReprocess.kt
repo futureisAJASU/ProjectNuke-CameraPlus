@@ -193,15 +193,27 @@ suspend fun reprocessKeplerGalleryJob(
     } catch (callerCancellation: kotlinx.coroutines.CancellationException) {
         val cleanup = cancelWorkerAndRollbackAfterCompletion(worker) { restoreBackups(target, backups) }
         cleanup.getOrNull()?.let { outcome ->
-            if (outcome.result.isSuccess || outcome.publicExportCommitted) {
-                finalizeReprocessOutcome(
-                    target, capability.jobKind, outputSettings, beforeBytes, selectionMode,
-                    resolvedSelection, outcome, backups
-                )
-            }
+            finalizeTerminalOutcome(
+                target, capability.jobKind, outputSettings, beforeBytes, selectionMode,
+                resolvedSelection, Result.success(outcome), backups
+            )
         }
         if (cleanup.isFailure && cleanup.exceptionOrNull() !is ReprocessWorkerDidNotExitException) {
             writeReprocessFailure(target, "Caller cancellation cleanup failed: ${cleanup.exceptionOrNull()?.message}")
+        }
+        if (cleanup.exceptionOrNull() is ReprocessWorkerDidNotExitException) {
+            releaseOperationLease = false
+            worker.terminal.invokeOnCompletion {
+                CoroutineScope(Dispatchers.IO).launch {
+                    worker.terminal.await().let { outcome ->
+                        finalizeTerminalOutcome(
+                            target, capability.jobKind, outputSettings, beforeBytes, selectionMode,
+                            resolvedSelection, Result.success(outcome), backups
+                        )
+                    }
+                    operationLease.release()
+                }
+            }
         }
         throw callerCancellation
     }
@@ -216,7 +228,17 @@ suspend fun reprocessKeplerGalleryJob(
     )
     if (finalization.exceptionOrNull() is ReprocessWorkerDidNotExitException) {
         releaseOperationLease = false
-        worker.terminal.invokeOnCompletion { operationLease.release() }
+        worker.terminal.invokeOnCompletion {
+            CoroutineScope(Dispatchers.IO).launch {
+                worker.terminal.await().let { outcome ->
+                    finalizeTerminalOutcome(
+                        target, capability.jobKind, outputSettings, beforeBytes, selectionMode,
+                        resolvedSelection, Result.success(outcome), backups
+                    )
+                }
+                operationLease.release()
+            }
+        }
     }
     return@withContext finalization
     val pipelineResult = pipelineOutcome?.result
@@ -374,16 +396,14 @@ private fun finalizeReprocessOutcome(
 
 internal suspend fun cancelWorkerAndRollbackAfterCompletion(
     worker: ReprocessWorkerRun,
-    rollback: suspend () -> Result<Unit>
+    @Suppress("UNUSED_PARAMETER") rollback: suspend () -> Result<Unit>
 ): Result<ReprocessWorkerOutcome> = withContext(NonCancellable) {
     worker.cancel()
     val outcome = withTimeoutOrNull(REPROCESS_WORKER_EXIT_TIMEOUT_MS) { worker.terminal.await() }
     if (outcome == null) {
         Result.failure(ReprocessWorkerDidNotExitException("Reprocess worker did not exit before rollback timeout."))
-    } else if (outcome.publicExportCommitted || outcome.result.isSuccess) {
-        Result.success(outcome)
     } else {
-        rollback().map { outcome }
+        Result.success(outcome)
     }
 }
 fun detectReprocessCapability(context: Context, jobDir: File): ReprocessCapability {
