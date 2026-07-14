@@ -61,13 +61,14 @@ internal enum class ReprocessTerminalDisposition {
 internal data class ReprocessWorkerOutcome(
     val result: Result<Unit>,
     val publicExportCommitted: Boolean,
+    val exportVerified: Boolean = false,
     val export: GalleryExportResult? = null,
     val finalOutputFile: File? = null,
     val previewFile: File? = null,
     val bytesWritten: Long = 0L,
     val disposition: ReprocessTerminalDisposition = when {
-        publicExportCommitted && result.isFailure -> ReprocessTerminalDisposition.COMMITTED_PARTIAL
-        result.isSuccess -> ReprocessTerminalDisposition.VERIFIED_SUCCESS
+        publicExportCommitted && !exportVerified -> ReprocessTerminalDisposition.COMMITTED_PARTIAL
+        result.isSuccess && exportVerified -> ReprocessTerminalDisposition.VERIFIED_SUCCESS
         else -> ReprocessTerminalDisposition.UNCOMMITTED_FAILURE
     },
     val terminalError: Throwable? = result.exceptionOrNull()
@@ -309,9 +310,9 @@ private fun finalizeReprocessOutcome(
         ?: finalFile?.length()
         ?: 0L
     if (outcome.result.isSuccess && (finalFile != null || outcome.publicExportCommitted)) {
-        writeReprocessSuccess(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices, outcome.export, outputSettings)
+        writeReprocessSuccess(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices, outcome.export, outcome.exportVerified, outputSettings)
     } else {
-        writeReprocessPartial(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices, outcome.result.exceptionOrNull()?.message, outcome.export, outputSettings)
+        writeReprocessPartial(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices, outcome.result.exceptionOrNull()?.message, outcome.export, outcome.exportVerified, outputSettings)
     }
     check(deleteBackups(backups)) { "Could not clean reprocess backups after metadata finalization." }
     KeplerReprocessResult(jobDir, jobKind, finalFile, previewFile, bytes,
@@ -574,6 +575,7 @@ private fun writeReprocessSuccess(
     selectionMode: FrameSelectionMode,
     includedFrameIndices: Set<Int>,
     export: GalleryExportResult?,
+    exportVerified: Boolean,
     outputSettings: FinalOutputFormat
 ) {
     KeplerJobMetadata.update(jobDir) { job ->
@@ -597,7 +599,7 @@ private fun writeReprocessSuccess(
         .put("canReprocess", sourceFrameCount > 0)
         .put("finalOutputFormatSetting", outputSettings.name)
         .put("exportStatus", if (export == null) "NOT_EXPORTED" else "EXPORTED")
-        .put("exportVerified", export != null)
+        .put("exportVerified", exportVerified)
         .put("galleryExportCommitted", export?.success == true && !export.uriString.isNullOrBlank())
         .put("exportUri", export?.uriString ?: JSONObject.NULL)
         .put("exportDisplayName", export?.displayName ?: JSONObject.NULL)
@@ -646,6 +648,7 @@ private fun writeReprocessPartial(
     includedFrameIndices: Set<Int>,
     error: String?,
     export: GalleryExportResult?,
+    exportVerified: Boolean,
     outputSettings: FinalOutputFormat
 ) {
     KeplerJobMetadata.update(jobDir) { job ->
@@ -664,7 +667,7 @@ private fun writeReprocessPartial(
         .put("galleryDisplayUnavailable", finalOutputFile?.isFile != true)
         .put("finalOutputFormatSetting", outputSettings.name)
         .put("exportStatus", "EXPORT_UNVERIFIED")
-        .put("exportVerified", false)
+        .put("exportVerified", exportVerified)
         .put("galleryExportCommitted", export?.success == true && !export?.uriString.isNullOrBlank())
         .put("exportUri", export?.uriString ?: JSONObject.NULL)
         .put("exportDisplayName", export?.displayName ?: JSONObject.NULL)

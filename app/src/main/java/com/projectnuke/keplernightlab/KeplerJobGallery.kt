@@ -583,6 +583,10 @@ private fun JSONObject.optionalFloat(key: String): Float? {
 }
 
 private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
+    if (job?.optBoolean("galleryDisplayUnavailable", false) == true ||
+        (job?.optBoolean("galleryExportCommitted", false) == true &&
+            job.optBoolean("finalOutputAvailable", false).not())
+    ) return null
     val explicit = job?.optString("galleryDisplayFile").orEmpty()
     File(directory, explicit).takeIf { explicit.isNotBlank() && it.isFile && isDisplayImageFile(it) && !isDebugPreviewFinalBlocked(it.name) }
         ?.let { return it }

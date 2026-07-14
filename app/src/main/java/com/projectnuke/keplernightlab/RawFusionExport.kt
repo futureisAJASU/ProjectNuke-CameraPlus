@@ -431,6 +431,7 @@ internal fun reprocessRawJob(
                 ReprocessWorkerOutcome(
                     result = terminalResult,
                     publicExportCommitted = publicExportCommitted,
+                    exportVerified = terminalDisposition == ReprocessTerminalDisposition.VERIFIED_SUCCESS,
                     export = committedExport,
                     finalOutputFile = currentOutputFile,
                     previewFile = currentPreviewFile ?: currentOutputFile,

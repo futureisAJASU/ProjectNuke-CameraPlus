@@ -107,20 +107,18 @@ internal fun updateRawExportBitmapMetadata(
     exportBitmapHeight: Int,
     nativePreviewPrepareMs: Long = 0L
 ) {
-    val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
-    val job = if (jobFile.exists()) KeplerJobMetadata.read(jobDir) else JSONObject()
-    job.put("exportBitmapSource", source)
-        .put("nativeRgbaDirectExportUsed", nativeRgbaDirectExportUsed)
-        .put("nativeRgbaBitmapLoadedForExport", nativeRgbaBitmapLoadedForExport)
-        .put("finalPngDecodeSkippedForExport", finalPngDecodeSkippedForExport)
-        .put("exportBitmapWidth", exportBitmapWidth)
-        .put("exportBitmapHeight", exportBitmapHeight)
-        .put("nativePreviewPrepareMs", nativePreviewPrepareMs)
-    saveJobJson(jobDir, job)
+    val values = mapOf<String, Any?>(
+        "exportBitmapSource" to source,
+        "nativeRgbaDirectExportUsed" to nativeRgbaDirectExportUsed,
+        "nativeRgbaBitmapLoadedForExport" to nativeRgbaBitmapLoadedForExport,
+        "finalPngDecodeSkippedForExport" to finalPngDecodeSkippedForExport,
+        "exportBitmapWidth" to exportBitmapWidth,
+        "exportBitmapHeight" to exportBitmapHeight,
+        "nativePreviewPrepareMs" to nativePreviewPrepareMs
+    )
+    KeplerJobMetadata.update(jobDir) { job -> values.forEach { (key, value) -> job.put(key, value) } }
     Log.i(
         "KeplerRawPipeline",
-        "finalOutputSource=${job.optString("finalOutputSource")} exportBitmapSource=$source " +
-            "nativePostprocessRgbaFile=${job.optString("nativePostprocessRgbaFile")} " +
-            "rawRenderDebugFile=${job.optString("rawRenderDebugFile")}"
+        "exportBitmapSource=$source exportBitmapWidth=$exportBitmapWidth exportBitmapHeight=$exportBitmapHeight"
     )
 }

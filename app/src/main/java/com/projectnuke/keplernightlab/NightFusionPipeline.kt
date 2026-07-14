@@ -298,6 +298,7 @@ internal fun reprocessYuvJob(
                 ReprocessWorkerOutcome(
                     result = terminalResult,
                     publicExportCommitted = publicExportCommitted,
+                    exportVerified = terminalDisposition == ReprocessTerminalDisposition.VERIFIED_SUCCESS,
                     export = committedExport,
                     finalOutputFile = finalOutputFile,
                     previewFile = finalOutputFile,
