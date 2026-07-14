@@ -132,7 +132,6 @@ suspend fun reprocessKeplerGalleryJob(
         return@withContext Result.failure(IllegalStateException(message))
     }
     val selectionMode = resolveSelectionMode(job, frameSelection)
-    val beforeFinals = finalOutputCandidates(target, job)
     val backups = backupReprocessTransaction(
         target,
         target.listFiles()?.filter { it.isFile && isReprocessWorkerWritable(it) }.orEmpty()
@@ -163,7 +162,6 @@ suspend fun reprocessKeplerGalleryJob(
         return@withContext Result.failure(it)
     }
 
-    val beforeBytes = beforeFinals.filter { it.isFile }.sumOf { it.length() }
     val progressScope = CoroutineScope(coroutineContext)
     val cancellation = KeplerPipelineCancellationToken()
     val worker = when (capability.jobKind) {
@@ -201,7 +199,7 @@ suspend fun reprocessKeplerGalleryJob(
         val cleanup = cancelWorkerAndAwaitTerminal(worker)
         cleanup.getOrNull()?.let { outcome ->
             finalizeTerminalOutcome(
-                target, capability.jobKind, outputSettings, beforeBytes, selectionMode,
+                target, capability.jobKind, outputSettings, selectionMode,
                 resolvedSelection, Result.success(outcome), backups
             )
         }
@@ -214,7 +212,7 @@ suspend fun reprocessKeplerGalleryJob(
                 CoroutineScope(Dispatchers.IO).launch {
                     worker.terminal.await().let { outcome ->
                         finalizeTerminalOutcome(
-                            target, capability.jobKind, outputSettings, beforeBytes, selectionMode,
+                            target, capability.jobKind, outputSettings, selectionMode,
                             resolvedSelection, Result.success(outcome), backups
                         )
                     }
@@ -230,7 +228,7 @@ suspend fun reprocessKeplerGalleryJob(
         Result.success(pipelineOutcome)
     }
     val finalization = finalizeTerminalOutcome(
-        target, capability.jobKind, outputSettings, beforeBytes, selectionMode,
+        target, capability.jobKind, outputSettings, selectionMode,
         resolvedSelection, terminalOutcome, backups
     )
     if (finalization.exceptionOrNull() is ReprocessWorkerDidNotExitException) {
@@ -239,7 +237,7 @@ suspend fun reprocessKeplerGalleryJob(
             CoroutineScope(Dispatchers.IO).launch {
                 worker.terminal.await().let { outcome ->
                     finalizeTerminalOutcome(
-                        target, capability.jobKind, outputSettings, beforeBytes, selectionMode,
+                        target, capability.jobKind, outputSettings, selectionMode,
                         resolvedSelection, Result.success(outcome), backups
                     )
                 }
@@ -257,7 +255,6 @@ private fun finalizeTerminalOutcome(
     jobDir: File,
     jobKind: ReprocessJobKind,
     outputSettings: FinalOutputFormat,
-    beforeBytes: Long,
     selectionMode: FrameSelectionMode,
     includedFrameIndices: Set<Int>,
     terminal: Result<ReprocessWorkerOutcome>,
@@ -269,7 +266,7 @@ private fun finalizeTerminalOutcome(
         outcome.publicExportCommitted
     ) {
         return finalizeReprocessOutcome(
-            jobDir, jobKind, outputSettings, beforeBytes, selectionMode, includedFrameIndices, outcome, backups
+            jobDir, jobKind, outputSettings, selectionMode, includedFrameIndices, outcome, backups
         )
     }
     val error = outcome.terminalError ?: IllegalStateException("Reprocess worker failed.")
@@ -296,7 +293,6 @@ private fun finalizeReprocessOutcome(
     jobDir: File,
     jobKind: ReprocessJobKind,
     outputSettings: FinalOutputFormat,
-    beforeBytes: Long,
     selectionMode: FrameSelectionMode,
     includedFrameIndices: Set<Int>,
     outcome: ReprocessWorkerOutcome,
@@ -313,7 +309,7 @@ private fun finalizeReprocessOutcome(
         ?: finalFile?.length()
         ?: 0L
     if (outcome.result.isSuccess) {
-        writeReprocessSuccess(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices)
+        writeReprocessSuccess(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices, outcome.export, outputSettings)
     } else {
         writeReprocessPartial(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices, outcome.result.exceptionOrNull()?.message, outcome.export, outputSettings)
     }
@@ -576,7 +572,9 @@ private fun writeReprocessSuccess(
     finalOutputFile: File?,
     previewFile: File?,
     selectionMode: FrameSelectionMode,
-    includedFrameIndices: Set<Int>
+    includedFrameIndices: Set<Int>,
+    export: GalleryExportResult?,
+    outputSettings: FinalOutputFormat
 ) {
     KeplerJobMetadata.update(jobDir) { job ->
     job.put("status", "COMPLETE")
@@ -597,6 +595,16 @@ private fun writeReprocessSuccess(
         .put("galleryVisible", true)
         .put("galleryDisplayUnavailable", false)
         .put("canReprocess", sourceFrameCount > 0)
+        .put("finalOutputFormatSetting", outputSettings.name)
+        .put("exportStatus", if (export == null) "NOT_EXPORTED" else "EXPORTED")
+        .put("exportVerified", export != null)
+        .put("galleryExportCommitted", export?.success == true && !export.uriString.isNullOrBlank())
+        .put("exportUri", export?.uriString ?: JSONObject.NULL)
+        .put("exportDisplayName", export?.displayName ?: JSONObject.NULL)
+        .put("exportMimeType", export?.mimeType ?: JSONObject.NULL)
+        .put("exportFileSizeBytes", export?.fileSizeBytes ?: 0L)
+        .put("reprocessError", JSONObject.NULL)
+        .put("reprocessWarning", JSONObject.NULL)
     if (job.optString("cleanupType") == "SOURCE_ONLY") {
         job.put("cleanupType", "REPROCESSED_FROM_SOURCE_ONLY")
     }
