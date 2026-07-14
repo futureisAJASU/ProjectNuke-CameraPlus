@@ -176,7 +176,8 @@ fun processNightFusionJobV02Sync(
                 onStatus = onStatus,
                 requestedParams = requestedParams,
                 dryRun = true,
-                cancellation = cancellation
+                cancellation = cancellation,
+                metadataPolicy = metadataPolicy
             )
         } catch (t: YuvFusionV2DryRunClassicFusionFailedException) {
             throw t

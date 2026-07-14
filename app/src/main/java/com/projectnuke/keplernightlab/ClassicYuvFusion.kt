@@ -140,11 +140,9 @@ internal fun processClassicYuvFusionJob(
             saveJobJson(jobFile.parentFile ?: error("Job directory missing"), job)
         } else {
             KeplerJobMetadata.update(jobDir) { current ->
-                current.put("averageColorFile", job.optString("averageColorFile"))
-                    .put("finalNightFusionFile", job.optString("finalNightFusionFile"))
-                    .put("finalFile", job.optString("finalFile"))
-                    .put("finalOutputSource", job.optString("finalOutputSource"))
-                    .put("yuvQualityDiagnosticHints", job.optJSONArray("yuvQualityDiagnosticHints") ?: JSONArray())
+                current.put("yuvProcessingPreflight", preflightSummary.toJson())
+                    .put("processingStartedAt", job.optLong("processingStartedAt"))
+                    .put("yuvProcessingPolicy", metadataPolicy.name)
             }
         }
         cancellation.throwIfCancelled()
@@ -403,7 +401,18 @@ internal fun processClassicYuvFusionJob(
         }
         cancellation.throwIfCancelled()
         File(jobDir, "yuv_debug.json").writeText(job.toString(2))
-        saveJobJson(jobFile.parentFile ?: error("Job directory missing"), job)
+        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            saveJobJson(jobFile.parentFile ?: error("Job directory missing"), job)
+        } else {
+            KeplerJobMetadata.update(jobDir) { current ->
+                listOf(
+                    "yuvProcessingPreflight", "processingStartedAt", "debugArtifactStatus",
+                    "debugArtifactError", "yuvProcessingTotalFrames", "yuvProcessingEnabledFrames",
+                    "yuvProcessingDecodedUsableFrames", "yuvProcessingSameSizeFrames",
+                    "yuvProcessingCompatibleFrames"
+                ).forEach { key -> if (job.has(key)) current.put(key, job.get(key)) }
+            }
+        }
         cancellation.throwIfCancelled()
         onStatus("처리가 완료되었습니다.")
         return finalFile

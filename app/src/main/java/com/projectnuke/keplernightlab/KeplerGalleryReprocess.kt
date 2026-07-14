@@ -300,7 +300,7 @@ private fun finalizeReprocessOutcome(
 ): Result<KeplerReprocessResult> = runCatching {
     val finalFile = outcome.finalOutputFile?.takeIf { it.isFile && it.length() > 0L }
     val previewFile = outcome.previewFile?.takeIf { it.isFile && it.length() > 0L } ?: finalFile
-    if (outcome.result.isSuccess && finalFile?.isFile != true) {
+    if (outcome.result.isSuccess && !outcome.publicExportCommitted && finalFile?.isFile != true) {
         restoreBackups(jobDir, backups).getOrThrow()
         throw IllegalStateException("Reprocess completed without a final output file.")
     }
@@ -308,7 +308,7 @@ private fun finalizeReprocessOutcome(
         ?: outcome.export?.fileSizeBytes?.takeIf { it > 0L }
         ?: finalFile?.length()
         ?: 0L
-    if (outcome.result.isSuccess) {
+    if (outcome.result.isSuccess && (finalFile != null || outcome.publicExportCommitted)) {
         writeReprocessSuccess(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices, outcome.export, outputSettings)
     } else {
         writeReprocessPartial(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices, outcome.result.exceptionOrNull()?.message, outcome.export, outputSettings)
@@ -611,6 +611,10 @@ private fun writeReprocessSuccess(
     finalOutputFile?.let {
         job.put("galleryDisplayFile", it.name)
             .put("galleryThumbnailFile", previewFile?.name ?: it.name)
+    } ?: run {
+        job.remove("galleryDisplayFile")
+        job.remove("galleryThumbnailFile")
+        job.remove("galleryDisplaySource")
     }
     putReprocessAvailability(jobDir, job, sourceFrameCount, finalOutputFile)
     }
@@ -626,10 +630,7 @@ private fun writeReprocessFailure(jobDir: File, error: String) {
 
 private fun writeReprocessCancelled(jobDir: File, error: String?) {
     KeplerJobMetadata.update(jobDir) {
-        it.put("status", "CANCELLED")
-            .put("processStatus", "CANCELLED")
-            .put("currentPipelineStage", "CANCELLED")
-            .put("reprocessStatus", "CANCELLED")
+        it.put("reprocessStatus", "CANCELLED")
             .put("reprocessError", error ?: "Reprocess cancelled")
             .put("reprocessAt", nowIso8601())
     }
@@ -670,6 +671,11 @@ private fun writeReprocessPartial(
         .put("exportMimeType", export?.mimeType ?: JSONObject.NULL)
         .put("exportFileSizeBytes", export?.fileSizeBytes ?: 0L)
     finalOutputFile?.let { job.put("galleryDisplayFile", it.name).put("galleryThumbnailFile", previewFile?.name ?: it.name) }
+        ?: run {
+            job.remove("galleryDisplayFile")
+            job.remove("galleryThumbnailFile")
+            job.remove("galleryDisplaySource")
+        }
     putReprocessAvailability(jobDir, job, sourceFrameCount, finalOutputFile)
     }
 }

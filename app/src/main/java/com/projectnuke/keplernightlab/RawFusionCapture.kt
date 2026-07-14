@@ -924,6 +924,22 @@ fun captureRawBurstForFusion(
 }
 
 private object RawFusionExportCoordinator {
+    private fun persistExportProgress(context: RawFusionExportContext, metadata: JSONObject) {
+        if (context.metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            KeplerJobMetadata.write(context.files.jobDir, metadata)
+        } else {
+            KeplerJobMetadata.update(context.files.jobDir) { current ->
+                listOf(
+                    "nativePostprocessStatus", "nativePostprocessRgbaFile", "nativePostprocessMetadataFile",
+                    "nativeIspRenderMs", "nativeMp24DebugPngRequested", "nativeMp24DebugPngWritten",
+                    "nativeMp24DebugPngSkipReason", "mergedRawFile", "alignmentFile", "processingNotes",
+                    "outputWidth", "outputHeight", "partialCapture", "usedFrameCount", "requestedFrames",
+                    "savedFrames", "captureCompleteness", "nativePostprocessRequired", "nativePostprocessUsed"
+                ).forEach { key -> if (metadata.has(key)) current.put(key, metadata.get(key)) }
+            }
+        }
+    }
+
     fun export(
         context: RawFusionExportContext,
         cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
@@ -1004,7 +1020,7 @@ private object RawFusionExportCoordinator {
                 .put("nativeIspRenderMs", nativeIspRenderMs)
                 .put("alignmentStatus", context.nativeMerge.alignmentStatus)
                 .put("processedAt", System.currentTimeMillis())
-            KeplerJobMetadata.write(context.files.jobDir, failed)
+            persistExportProgress(context, failed)
             context.onStatus("RAW fusion native 24MP postprocess failed. RAW cache kept.")
             return RawFusionProcessResult(
                 false,
@@ -1106,7 +1122,7 @@ private object RawFusionExportCoordinator {
             .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
             .put("processedAt", System.currentTimeMillis())
         cancellation.throwIfCancelled()
-        KeplerJobMetadata.write(context.files.jobDir, updated)
+        persistExportProgress(context, updated)
         return RawFusionProcessResult(
             success = true,
             mergedRawFile = context.files.mergedRawFile,
@@ -1201,7 +1217,7 @@ private object RawFusionExportCoordinator {
                 .put("currentPipelineStage", "FAILED")
                 .put("nativeIspRenderMs", nativeIspRenderMs)
                 .put("processedAt", System.currentTimeMillis())
-            KeplerJobMetadata.write(context.files.jobDir, failed)
+            persistExportProgress(context, failed)
             context.onStatus("PIPELINE_FAILED: Native RAW ISP failed; RAW cache kept. $status")
             return RawFusionProcessResult(false, context.files.mergedRawFile, null, null, null, "Native RAW ISP failed: $status")
         }
@@ -1274,7 +1290,7 @@ private object RawFusionExportCoordinator {
             .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
             .put("processedAt", System.currentTimeMillis())
         cancellation.throwIfCancelled()
-        KeplerJobMetadata.write(context.files.jobDir, updated)
+        persistExportProgress(context, updated)
         return RawFusionProcessResult(
             success = true,
             mergedRawFile = context.files.mergedRawFile,
@@ -1587,7 +1603,7 @@ private object RawFusionExportCoordinator {
             .put("sensorOrientation", context.job.opt("sensorOrientation") ?: JSONObject.NULL)
             .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
             .put("processedAt", System.currentTimeMillis())
-        KeplerJobMetadata.write(context.files.jobDir, updated)
+        persistExportProgress(context, updated)
         return RawFusionProcessResult(
             true,
             context.files.mergedRawFile,

@@ -162,7 +162,8 @@ internal fun processYuvFusionJobV2(
             runCatching {
                 writeYuvFusionV2Metadata(
                     jobDir = jobDir,
-                    metadata = metadataBase
+                    metadata = metadataBase,
+                    metadataPolicy = metadataPolicy
                 )
             }
             finalFile
@@ -178,7 +179,8 @@ internal fun processYuvFusionJobV2(
                         classicFusionFailureType = t.javaClass.name,
                         classicFusionFailureMessage = failureMessage,
                         classicFusionFailureStackTrace = t.stackTraceToString()
-                    )
+                    ),
+                    metadataPolicy = metadataPolicy
                 )
             }
             throw YuvFusionV2DryRunClassicFusionFailedException(
@@ -210,7 +212,8 @@ internal fun processYuvFusionJobV2(
                     weightedMergeUsed = false,
                     fallbackToV1 = true,
                     fallbackReason = mergePlan.reason
-                )
+                ),
+                metadataPolicy = metadataPolicy
             )
         }
         return finalFile
@@ -223,7 +226,8 @@ internal fun processYuvFusionJobV2(
             onStatus = onStatus,
             requestedParams = requestedParams,
             externalFrameWeights = externalWeights,
-            cancellation = cancellation
+            cancellation = cancellation,
+            metadataPolicy = metadataPolicy
         )
         cancellation.throwIfCancelled()
         runCatching {
@@ -237,7 +241,8 @@ internal fun processYuvFusionJobV2(
                     weightedMergeUsed = true,
                     fallbackToV1 = false,
                     fallbackReason = null
-                )
+                ),
+                metadataPolicy = metadataPolicy
             )
         }
         finalFile
@@ -247,7 +252,8 @@ internal fun processYuvFusionJobV2(
             jobDir = jobDir,
             onStatus = onStatus,
             requestedParams = requestedParams,
-            cancellation = cancellation
+            cancellation = cancellation,
+            metadataPolicy = metadataPolicy
         )
         cancellation.throwIfCancelled()
         runCatching {
@@ -261,7 +267,8 @@ internal fun processYuvFusionJobV2(
                     weightedMergeUsed = false,
                     fallbackToV1 = true,
                     fallbackReason = "OutOfMemoryError"
-                )
+                ),
+                metadataPolicy = metadataPolicy
             )
         }
         finalFile
@@ -273,7 +280,8 @@ internal fun processYuvFusionJobV2(
             jobDir = jobDir,
             onStatus = onStatus,
             requestedParams = requestedParams,
-            cancellation = cancellation
+            cancellation = cancellation,
+            metadataPolicy = metadataPolicy
         )
         cancellation.throwIfCancelled()
         runCatching {
@@ -287,7 +295,8 @@ internal fun processYuvFusionJobV2(
                     weightedMergeUsed = false,
                     fallbackToV1 = true,
                     fallbackReason = "${t.javaClass.simpleName}: ${t.message}".take(120)
-                )
+                ),
+                metadataPolicy = metadataPolicy
             )
         }
         finalFile
@@ -599,7 +608,8 @@ private fun clearYuvFusionV2Metadata(job: JSONObject) {
 
 private fun writeYuvFusionV2Metadata(
     jobDir: File,
-    metadata: YuvFusionV2MetadataWrite
+    metadata: YuvFusionV2MetadataWrite,
+    metadataPolicy: ReprocessMetadataPolicy
 ) {
     val job = loadJobJson(jobDir)
     clearYuvFusionV2Metadata(job)
@@ -648,7 +658,15 @@ private fun writeYuvFusionV2Metadata(
     if (metadata.mergePlan.weights.isNotEmpty()) {
         job.put("yuvFusionV2MergePlanPreview", mergePlanPreviewToJson(metadata.mergePlan.weights))
     }
-    saveJobJson(jobDir, job)
+    if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+        saveJobJson(jobDir, job)
+    } else {
+        KeplerJobMetadata.update(jobDir) { current ->
+            V2_OWNED_METADATA_KEYS.forEach { key ->
+                if (job.has(key)) current.put(key, job.get(key)) else current.remove(key)
+            }
+        }
+    }
 }
 
 private fun frameQualityScoresToJson(scores: List<YuvFusionV2FrameQuality>): JSONArray =
