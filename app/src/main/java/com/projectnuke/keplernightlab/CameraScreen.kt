@@ -80,6 +80,9 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Job
@@ -396,10 +399,10 @@ fun MainCameraScreen(
         val generation = ++refreshGeneration
         refreshJob?.cancel()
         refreshJob = cameraScope.launch {
-            val (result, estimate) = withContext(Dispatchers.IO) {
+            val (result, estimate) = withContext(Dispatchers.IO + NonCancellable) {
                 loadLatestKeplerResultV2(context) to estimateLatestColorBurstScene(context)
             }
-            if (generation != refreshGeneration) {
+            if (!currentCoroutineContext().isActive || generation != refreshGeneration) {
                 result.bitmap?.takeIf { !it.isRecycled }?.recycle()
                 return@launch
             }
@@ -2438,13 +2441,16 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
             if (isReprocessQuarantined(jobDir)) return@firstNotNullOfOrNull null
             val job = runCatching { JSONObject(File(jobDir, "job.json").readText()) }.getOrNull()
                 ?: return@firstNotNullOfOrNull null
-            if (job.optBoolean("galleryDisplayUnavailable", false) ||
-                (job.optBoolean("galleryExportCommitted", false) &&
-                    job.optBoolean("finalOutputAvailable", false).not())
+            val hasCurrentPreview = hasCurrentPreviewFile(jobDir, job)
+            if (!hasCurrentPreview &&
+                (job.optBoolean("galleryDisplayUnavailable", false) ||
+                    (job.optBoolean("galleryExportCommitted", false) &&
+                        !job.optBoolean("finalOutputAvailable", false)))
             ) return@firstNotNullOfOrNull null
-            if (!job.optBoolean("galleryVisible", true)) return@firstNotNullOfOrNull null
-            val status = job.optString("status").uppercase()
-            if (status in setOf("CAPTURING", "PROCESSING", "YUV_ALIGNING", "YUV_MERGING", "YUV_DENOISE_SHARPEN", "YUV_EXPORTING")) {
+            if (!job.optBoolean("galleryVisible", true) && !hasCurrentPreview) {
+                return@firstNotNullOfOrNull null
+            }
+            if (KeplerJobMetadata.isOperationActive(jobDir) || isKeplerJobActive(job)) {
                 return@firstNotNullOfOrNull null
             }
             val file = chooseLatestResultFile(jobDir, job) ?: return@firstNotNullOfOrNull null
@@ -2469,7 +2475,6 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
                 decodeLatestResultPreview(previewFile)
             }
             val bitmap = decoded
-            decoded = null
             val jobType = job.optString("jobType", latestJobDir.parentFile?.name.orEmpty())
             val fusionEngine = listOf(
                 job.optString("fusionEngine", ""),
@@ -2505,7 +2510,7 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
                 append(", source=")
                 append(job.optString("finalOutputSource", "bitmap"))
             }
-            LatestKeplerResult(
+            val result = LatestKeplerResult(
                 bitmap = bitmap,
                 summary = summary,
                 jobType = jobType,
@@ -2518,18 +2523,37 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
                 jobName = latestJobDir.name,
                 filePath = previewFile.absolutePath
             )
+            decoded = null
+            result
         } catch (e: Exception) {
             decoded?.takeIf { !it.isRecycled }?.recycle()
             LatestKeplerResult(null, "Latest result load failed: ${e.javaClass.simpleName}")
         }
+    } catch (e: Exception) {
+        LatestKeplerResult(null, "Latest result load failed: ${e.javaClass.simpleName}")
+    }
 }
 
 private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
+    val currentNames = listOf(
+        job.optString("galleryDisplayFile", ""),
+        job.optString("galleryThumbnailFile", ""),
+        job.optString("previewFile", "")
+    )
+    val current = currentNames.asSequence()
+        .filter { it.isNotBlank() && it != "null" }
+        .map { File(jobDir, it) }
+        .firstOrNull(::isCurrentPreviewFile)
+    if (current != null) return current
+
+    if (job.optBoolean("galleryDisplayUnavailable", false) ||
+        (job.optBoolean("galleryExportCommitted", false) &&
+            !job.optBoolean("finalOutputAvailable", false))
+    ) return null
+
     val names = listOf(
         job.optString("finalFile", ""),
         job.optString("outputFile", ""),
-        job.optString("galleryDisplayFile", ""),
-        job.optString("previewFile", ""),
         job.optString("finalNightFusionFile", ""),
         "sharpened_night_fusion.png",
         "raw_fusion_final.png",
@@ -2541,11 +2565,37 @@ private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
         .map { File(jobDir, it) }
         .filter { it.extension.lowercase() in setOf("png", "jpg", "jpeg", "heic", "webp") }
         .firstOrNull {
-            it.exists() && it.length() > 0L &&
+            isCurrentPreviewFile(it) &&
                 it.extension.lowercase() in setOf("jpg", "jpeg", "png", "heic", "webp") &&
                 !it.name.contains("compare", ignoreCase = true) &&
                 !it.name.contains("debug", ignoreCase = true)
         }
+}
+
+private fun hasCurrentPreviewFile(jobDir: File, job: JSONObject): Boolean =
+    listOf(
+        job.optString("galleryDisplayFile", ""),
+        job.optString("galleryThumbnailFile", ""),
+        job.optString("previewFile", "")
+    ).asSequence()
+        .filter { it.isNotBlank() && it != "null" }
+        .map { File(jobDir, it) }
+        .any(::isCurrentPreviewFile)
+
+private fun isCurrentPreviewFile(file: File): Boolean =
+    file.isFile && file.length() > 0L &&
+        file.extension.lowercase() in setOf("rgba", "jpg", "jpeg", "png", "heic", "webp") &&
+        !file.name.contains("compare", ignoreCase = true) &&
+        !file.name.contains("debug", ignoreCase = true)
+
+private fun isKeplerJobActive(job: JSONObject): Boolean {
+    val activeStates = setOf(
+        "CAPTURING", "PROCESSING", "YUV_ALIGNING", "YUV_MERGING",
+        "YUV_DENOISE_SHARPEN", "YUV_EXPORTING", "RAW_ALIGNING", "RAW_MERGING",
+        "RAW_EXPORTING", "EXPORTING", "REPROCESSING", "FINALIZING"
+    )
+    return listOf("status", "processStatus", "currentPipelineStage")
+        .any { job.optString(it).uppercase() in activeStates }
 }
 
 private fun decodeNativeRgbaPreview(

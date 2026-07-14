@@ -597,13 +597,20 @@ private fun JSONObject.optionalFloat(key: String): Float? {
 }
 
 private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
+    val currentNames = listOf(
+        job?.optString("galleryDisplayFile").orEmpty(),
+        job?.optString("galleryThumbnailFile").orEmpty(),
+        job?.optString("previewFile").orEmpty()
+    )
+    currentNames.asSequence()
+        .filter { it.isNotBlank() && it != "null" }
+        .map { File(directory, it) }
+        .firstOrNull { it.isFile && isDisplayImageFile(it) && !isDebugPreviewFinalBlocked(it.name) }
+        ?.let { return it }
     if (job?.optBoolean("galleryDisplayUnavailable", false) == true ||
         (job?.optBoolean("galleryExportCommitted", false) == true &&
             job.optBoolean("finalOutputAvailable", false).not())
     ) return null
-    val explicit = job?.optString("galleryDisplayFile").orEmpty()
-    File(directory, explicit).takeIf { explicit.isNotBlank() && it.isFile && isDisplayImageFile(it) && !isDebugPreviewFinalBlocked(it.name) }
-        ?.let { return it }
     val keys = listOf(
         "finalNightFusionFile",
         "finalFile",
