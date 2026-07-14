@@ -76,6 +76,12 @@ internal data class ReprocessWorkerOutcome(
 
 internal class ReprocessWorkerDidNotExitException(message: String) : IllegalStateException(message)
 
+internal enum class ReprocessFinalizationState { COMMITTED, ROLLED_BACK, QUARANTINED }
+internal data class ReprocessFinalizationResult(
+    val state: ReprocessFinalizationState,
+    val result: Result<KeplerReprocessResult>
+)
+
 private const val REPROCESS_TIMEOUT_MS = 10 * 60 * 1000L
 private const val REPROCESS_WORKER_EXIT_TIMEOUT_MS = 30_000L
 
@@ -212,12 +218,12 @@ suspend fun reprocessKeplerGalleryJob(
             worker.terminal.invokeOnCompletion {
                 CoroutineScope(Dispatchers.IO).launch {
                     worker.terminal.await().let { outcome ->
-                        finalizeTerminalOutcome(
+                        val late = finalizeTerminalOutcome(
                             target, capability.jobKind, outputSettings, selectionMode,
                             resolvedSelection, Result.success(outcome), backups
                         )
+                        if (late.state != ReprocessFinalizationState.QUARANTINED) operationLease.release()
                     }
-                    operationLease.release()
                 }
             }
         }
@@ -232,21 +238,21 @@ suspend fun reprocessKeplerGalleryJob(
         target, capability.jobKind, outputSettings, selectionMode,
         resolvedSelection, terminalOutcome, backups
     )
-    if (finalization.exceptionOrNull() is ReprocessWorkerDidNotExitException) {
+    if (finalization.state == ReprocessFinalizationState.QUARANTINED) {
         releaseOperationLease = false
         worker.terminal.invokeOnCompletion {
             CoroutineScope(Dispatchers.IO).launch {
                 worker.terminal.await().let { outcome ->
-                    finalizeTerminalOutcome(
+                    val late = finalizeTerminalOutcome(
                         target, capability.jobKind, outputSettings, selectionMode,
                         resolvedSelection, Result.success(outcome), backups
                     )
+                    if (late.state != ReprocessFinalizationState.QUARANTINED) operationLease.release()
                 }
-                operationLease.release()
             }
         }
     }
-    return@withContext finalization
+    return@withContext finalization.result
     } finally {
         if (releaseOperationLease) operationLease.release()
     }
@@ -260,32 +266,37 @@ private fun finalizeTerminalOutcome(
     includedFrameIndices: Set<Int>,
     terminal: Result<ReprocessWorkerOutcome>,
     backups: List<ReprocessBackup>
-): Result<KeplerReprocessResult> {
-    val outcome = terminal.getOrElse { return Result.failure(it) }
+): ReprocessFinalizationResult {
+    val outcome = terminal.getOrElse {
+        return ReprocessFinalizationResult(ReprocessFinalizationState.QUARANTINED, Result.failure(it))
+    }
     if (outcome.disposition == ReprocessTerminalDisposition.VERIFIED_SUCCESS ||
         outcome.disposition == ReprocessTerminalDisposition.COMMITTED_PARTIAL ||
         outcome.publicExportCommitted
     ) {
-        return finalizeReprocessOutcome(
+        val result = finalizeReprocessOutcome(
             jobDir, jobKind, outputSettings, selectionMode, includedFrameIndices, outcome, backups
+        )
+        return ReprocessFinalizationResult(
+            if (result.isSuccess) ReprocessFinalizationState.COMMITTED else ReprocessFinalizationState.QUARANTINED,
+            result
         )
     }
     val error = outcome.terminalError ?: IllegalStateException("Reprocess worker failed.")
     return restoreBackups(jobDir, backups).fold(
         onSuccess = {
             if (!deleteBackups(backups)) {
-                return Result.failure(IllegalStateException("Rollback completed but backup cleanup failed."))
+                // Rollback is safe; retain a cleanup warning without quarantining the restored job.
             }
             if (outcome.disposition == ReprocessTerminalDisposition.CANCELLED) {
                 writeReprocessCancelled(jobDir, error.message)
             } else {
                 writeReprocessFailure(jobDir, "${error.javaClass.simpleName}: ${error.message}")
             }
-            Result.failure(error)
+            ReprocessFinalizationResult(ReprocessFinalizationState.ROLLED_BACK, Result.failure(error))
         },
         onFailure = { rollbackError ->
-            writeReprocessFailure(jobDir, "${error.javaClass.simpleName}: ${error.message}; rollback failed: ${rollbackError.message}")
-            Result.failure(rollbackError)
+            ReprocessFinalizationResult(ReprocessFinalizationState.QUARANTINED, Result.failure(rollbackError))
         }
     )
 }
@@ -309,14 +320,17 @@ private fun finalizeReprocessOutcome(
         ?: outcome.export?.fileSizeBytes?.takeIf { it > 0L }
         ?: finalFile?.length()
         ?: 0L
-    if (outcome.result.isSuccess && (finalFile != null || outcome.publicExportCommitted)) {
+    if (outcome.result.isSuccess && outcome.exportVerified && (finalFile != null || outcome.publicExportCommitted)) {
         writeReprocessSuccess(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices, outcome.export, outcome.exportVerified, outputSettings)
     } else {
         writeReprocessPartial(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices, outcome.result.exceptionOrNull()?.message, outcome.export, outcome.exportVerified, outputSettings)
     }
-    check(deleteBackups(backups)) { "Could not clean reprocess backups after metadata finalization." }
+    val cleanupWarning = if (deleteBackups(backups)) null else "Reprocess backup cleanup failed after safe commit."
     KeplerReprocessResult(jobDir, jobKind, finalFile, previewFile, bytes,
-        if (outcome.result.isSuccess) emptyList() else listOf("Public export committed; reprocess verification incomplete"))
+        listOfNotNull(
+            cleanupWarning,
+            if (outcome.result.isSuccess && outcome.exportVerified) null else "Public export committed; reprocess verification incomplete"
+        ))
 }.fold({ Result.success(it) }, { Result.failure(it) })
 
 internal suspend fun cancelWorkerAndAwaitTerminal(
