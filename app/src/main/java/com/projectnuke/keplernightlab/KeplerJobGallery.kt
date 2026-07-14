@@ -131,6 +131,7 @@ private const val STALE_JOB_RECOVERY_AGE_MILLIS = 15 * 60 * 1000L
 
 /** Jobs have no live worker after process death; stale in-progress metadata must not remain active forever. */
 private fun recoverStaleInterruptedJob(directory: File) {
+    if (KeplerJobMetadata.isOperationActive(directory)) return
     val job = runCatching { KeplerJobMetadata.read(directory) }.getOrNull() ?: return
     val status = job.optString("status").uppercase()
     val processStatus = job.optString("processStatus").uppercase()
@@ -184,9 +185,13 @@ fun summarizeKeplerGalleryStorage(jobs: List<KeplerGalleryJobSummary>): KeplerGa
 
 fun deleteKeplerGalleryJob(context: Context, jobDirectory: File): Result<Unit> = runCatching {
     val target = requireCleanupSafeJobDirectory(context, jobDirectory)
-    check(!KeplerJobMetadata.isOperationActive(target)) { "Job mutation is in progress." }
-    require(target.isDirectory) { "Job directory no longer exists." }
-    check(target.deleteRecursively()) { "Failed to delete ${target.name}." }
+    val lease = KeplerJobMetadata.acquireOperation(target) ?: error("Job mutation is in progress.")
+    try {
+        require(target.isDirectory) { "Job directory no longer exists." }
+        check(target.deleteRecursively()) { "Failed to delete ${target.name}." }
+    } finally {
+        lease.release()
+    }
 }
 
 fun cleanupKeplerGalleryJob(
@@ -195,7 +200,8 @@ fun cleanupKeplerGalleryJob(
     cleanupType: KeplerJobCleanupType
 ): Result<KeplerJobCleanupResult> = runCatching {
     val target = requireCleanupSafeJobDirectory(context, jobDirectory)
-    check(!KeplerJobMetadata.isOperationActive(target)) { "Job mutation is in progress." }
+    val lease = KeplerJobMetadata.acquireOperation(target) ?: error("Job mutation is in progress.")
+    try {
     val before = folderSizeBytes(target)
     val job = File(target, JOB_JSON_FILE_NAME).takeIf { it.isFile }?.let { file ->
         runCatching { JSONObject(file.readText()) }.getOrNull()
@@ -254,6 +260,9 @@ fun cleanupKeplerGalleryJob(
         failedPaths = failed,
         metadataWarning = metadataWarning
     )
+    } finally {
+        lease.release()
+    }
 }
 
 private fun keplerGalleryRoots(context: Context): List<File> {

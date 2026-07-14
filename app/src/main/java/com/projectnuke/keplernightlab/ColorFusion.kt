@@ -1258,8 +1258,10 @@ fun averageLatestYuvBurstColor(
                 .put("processedAt", System.currentTimeMillis())
 
         KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
-            current.keys().asSequence().toList().forEach { key -> current.remove(key) }
-            updatedJob.keys().forEach { key -> current.put(key, updatedJob.get(key)) }
+            current.put("processStatus", updatedJob.get("processStatus"))
+                .put("averageColorFile", updatedJob.get("averageColorFile"))
+                .put("averageUsedFrames", updatedJob.get("averageUsedFrames"))
+                .put("processedAt", updatedJob.get("processedAt"))
         }
 
             postStatus(
@@ -1587,14 +1589,11 @@ private fun updateYuvCaptureRequestTemplateMetadata(
     failures: List<String>
 ) {
     runCatching {
-        val job = if (jobFile.isFile) JSONObject(jobFile.readText()) else JSONObject()
-        job.put("yuvCaptureRequestTemplate", template)
-            .put("yuvCaptureRequestTemplateFallbackUsed", fallbackUsed)
-            .put("yuvCaptureRequestTemplateFailures", JSONArray(failures.take(6)))
-            .put("updatedAt", System.currentTimeMillis())
         KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
-            current.keys().asSequence().toList().forEach { key -> current.remove(key) }
-            job.keys().forEach { key -> current.put(key, job.get(key)) }
+            current.put("yuvCaptureRequestTemplate", template)
+                .put("yuvCaptureRequestTemplateFallbackUsed", fallbackUsed)
+                .put("yuvCaptureRequestTemplateFailures", JSONArray(failures.take(6)))
+                .put("updatedAt", System.currentTimeMillis())
         }
     }
 }

@@ -7,25 +7,27 @@ import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
 
 private const val KEPLER_JOB_SCHEMA_VERSION = 1
 
 /** Serializes each job's read-modify-write updates and never truncates a valid job.json. */
 object KeplerJobMetadata {
     private val locks = ConcurrentHashMap<String, Any>()
-    private val operationLocks = ConcurrentHashMap<String, AtomicBoolean>()
+    private val operationLeases = ConcurrentHashMap<String, JobOperationLease>()
 
     private fun lockFor(jobDir: File): Any = locks.getOrPut(jobDir.canonicalPath) { Any() }
 
-    fun tryAcquireOperation(jobDir: File): Boolean =
-        operationLocks.getOrPut(jobDir.canonicalPath) { AtomicBoolean(false) }.compareAndSet(false, true)
-
-    fun releaseOperation(jobDir: File) {
-        operationLocks[jobDir.canonicalPath]?.set(false)
+    fun acquireOperation(jobDir: File): JobOperationLease? {
+        val key = jobDir.canonicalPath
+        val lease = JobOperationLease(key)
+        return if (operationLeases.putIfAbsent(key, lease) == null) lease else null
     }
 
-    fun isOperationActive(jobDir: File): Boolean = operationLocks[jobDir.canonicalPath]?.get() == true
+    fun isOperationActive(jobDir: File): Boolean = operationLeases.containsKey(jobDir.canonicalPath)
+
+    internal fun releaseOperation(lease: JobOperationLease) {
+        operationLeases.remove(lease.key, lease)
+    }
 
     fun read(jobDir: File): JSONObject = synchronized(lockFor(jobDir)) {
         JSONObject(File(jobDir, JOB_JSON_FILE_NAME).readText())
@@ -66,6 +68,17 @@ object KeplerJobMetadata {
             Files.move(temp.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
         } catch (_: AtomicMoveNotSupportedException) {
             Files.move(temp.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        }
+    }
+}
+
+class JobOperationLease internal constructor(internal val key: String) {
+    @Volatile private var released = false
+
+    fun release() {
+        if (!released) {
+            released = true
+            KeplerJobMetadata.releaseOperation(this)
         }
     }
 }

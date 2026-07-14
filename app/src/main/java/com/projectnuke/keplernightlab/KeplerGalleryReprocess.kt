@@ -54,7 +54,10 @@ internal data class ReprocessWorkerRun(
 internal data class ReprocessWorkerOutcome(
     val result: Result<Unit>,
     val publicExportCommitted: Boolean,
-    val export: GalleryExportResult? = null
+    val export: GalleryExportResult? = null,
+    val finalOutputFile: File? = null,
+    val previewFile: File? = null,
+    val bytesWritten: Long = 0L
 )
 
 internal class ReprocessWorkerDidNotExitException(message: String) : IllegalStateException(message)
@@ -88,9 +91,10 @@ suspend fun reprocessKeplerGalleryJob(
 
     val target = runCatching { requireReprocessSafeJobDirectory(context, jobDir) }
         .getOrElse { return@withContext Result.failure(it) }
-    if (!KeplerJobMetadata.tryAcquireOperation(target)) {
+    val operationLease = KeplerJobMetadata.acquireOperation(target) ?: run {
         return@withContext Result.failure(IllegalStateException("A job mutation is already in progress."))
     }
+    var releaseOperationLease = true
     try {
     val capability = detectReprocessCapability(context, target)
     if (!capability.canReprocess) {
@@ -206,10 +210,15 @@ suspend fun reprocessKeplerGalleryJob(
     } else {
         Result.success(pipelineOutcome)
     }
-    return@withContext finalizeTerminalOutcome(
+    val finalization = finalizeTerminalOutcome(
         target, capability.jobKind, outputSettings, beforeBytes, selectionMode,
         resolvedSelection, terminalOutcome, backups
     )
+    if (finalization.exceptionOrNull() is ReprocessWorkerDidNotExitException) {
+        releaseOperationLease = false
+        worker.terminal.invokeOnCompletion { operationLease.release() }
+    }
+    return@withContext finalization
     val pipelineResult = pipelineOutcome?.result
 
     if (pipelineOutcome?.publicExportCommitted == true || pipelineResult?.isSuccess == true) {
@@ -296,7 +305,7 @@ suspend fun reprocessKeplerGalleryJob(
     writeReprocessFailure(target, "${error.javaClass.simpleName}: ${error.message}")
     Result.failure(error)
     } finally {
-        KeplerJobMetadata.releaseOperation(target)
+        if (releaseOperationLease) operationLease.release()
     }
 }
 
@@ -319,6 +328,9 @@ private fun finalizeTerminalOutcome(
     val error = outcome.result.exceptionOrNull() ?: IllegalStateException("Reprocess worker failed.")
     return restoreBackups(jobDir, backups).fold(
         onSuccess = {
+            if (!deleteBackups(backups)) {
+                return Result.failure(IllegalStateException("Rollback completed but backup cleanup failed."))
+            }
             writeReprocessFailure(jobDir, "${error.javaClass.simpleName}: ${error.message}")
             Result.failure(error)
         },
@@ -340,15 +352,16 @@ private fun finalizeReprocessOutcome(
     backups: List<ReprocessBackup>
 ): Result<KeplerReprocessResult> = runCatching {
     val job = loadJobJsonSafe(jobDir)
-    val finalFile = resolveReprocessFinalOutput(jobDir, job)
-    val previewFile = finalOutputCandidates(jobDir, job).filter { it.isFile && it != finalFile }
-        .maxByOrNull { it.lastModified() } ?: finalFile
+    val finalFile = outcome.finalOutputFile?.takeIf { it.isFile && it.length() > 0L }
+        ?: resolveReprocessFinalOutput(jobDir, job)
+    val previewFile = outcome.previewFile?.takeIf { it.isFile && it.length() > 0L } ?: finalFile
     if (outcome.result.isSuccess && finalFile?.isFile != true) {
         restoreBackups(jobDir, backups).getOrThrow()
         throw IllegalStateException("Reprocess completed without a final output file.")
     }
-    val bytes = (finalOutputCandidates(jobDir, job).filter { it.isFile }.sumOf { it.length() } - beforeBytes)
-        .coerceAtLeast(finalFile?.length() ?: 0L)
+    val bytes = outcome.bytesWritten.takeIf { it > 0L } ?: (finalFile?.length() ?: 0L).coerceAtLeast(
+        finalOutputCandidates(jobDir, job).filter { it.isFile }.sumOf { it.length() } - beforeBytes
+    )
     if (outcome.result.isSuccess) {
         writeReprocessSuccess(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices)
     } else {
@@ -526,11 +539,10 @@ internal fun loadJobJsonSafe(jobDir: File): JSONObject =
 
 private fun finalOutputCandidates(jobDir: File, job: JSONObject): List<File> {
     val names = listOf(
-        job.optString("galleryDisplayFile"),
-        job.optString("galleryThumbnailFile"),
         job.optString("finalNightFusionFile"),
         job.optString("finalFile"),
         job.optString("outputFile"),
+        job.optString("galleryDisplayFile"),
         "raw_fusion_final.png",
         "sharpened_night_fusion.png"
     ).filter { it.isNotBlank() && it != "null" }.distinct()
@@ -540,13 +552,13 @@ private fun finalOutputCandidates(jobDir: File, job: JSONObject): List<File> {
 
 private fun resolveReprocessFinalOutput(jobDir: File, job: JSONObject): File? =
     finalOutputCandidates(jobDir, job)
-        .filter { it.isFile && it.length() > 0L }
-        .maxByOrNull { it.lastModified() }
+        .firstOrNull { it.isFile && it.length() > 0L }
 
 internal data class ReprocessBackup(
     val original: File,
     val backup: File,
-    val existingNames: Set<String> = emptySet()
+    val existingNames: Set<String> = emptySet(),
+    val originalLength: Long = backup.length()
 )
 
 internal fun backupReprocessTransaction(jobDir: File, files: List<File>): Result<List<ReprocessBackup>> {
@@ -565,7 +577,7 @@ internal fun backupReprocessTransaction(jobDir: File, files: List<File>): Result
             val backup = File(root, original.name)
             original.copyTo(backup, overwrite = false)
             check(backup.isFile && backup.length() == original.length()) { "Backup verification failed for ${original.name}" }
-            ReprocessBackup(original, backup, existingNames)
+            ReprocessBackup(original, backup, existingNames, original.length())
         }.toList()
     }.onFailure {
         root.listFiles()?.forEach { it.delete() }
@@ -574,13 +586,24 @@ internal fun backupReprocessTransaction(jobDir: File, files: List<File>): Result
 }
 
 internal fun restoreBackups(jobDir: File, backups: List<ReprocessBackup>): Result<Unit> = runCatching {
+    backups.forEach { backup ->
+        check(backup.backup.isFile) { "Missing rollback backup: ${backup.original.name}" }
+        check(backup.backup.length() == backup.originalLength) {
+            "Invalid rollback backup: ${backup.original.name}"
+        }
+    }
     val originalNames = backups.firstOrNull()?.existingNames.orEmpty()
     jobDir.listFiles()?.filter { it.isFile && it.name !in originalNames }?.forEach { runCatching { it.delete() } }
     backups.forEach { backup ->
-        check(backup.backup.isFile) { "Missing rollback backup: ${backup.original.name}" }
-        backup.backup.copyTo(backup.original, overwrite = true)
+        val temp = File(backup.original.parentFile, ".${backup.original.name}.${System.nanoTime()}.restore")
+        try {
+            backup.backup.copyTo(temp, overwrite = false)
+            check(temp.length() == backup.backup.length()) { "Rollback temp verification failed: ${backup.original.name}" }
+            KeplerJobMetadata.atomicReplace(temp, backup.original)
+        } finally {
+            if (temp.exists()) temp.delete()
+        }
     }
-    check(deleteBackups(backups)) { "Could not clean rollback backup directory." }
 }
 
 internal fun deleteBackups(backups: List<ReprocessBackup>): Boolean {
