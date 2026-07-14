@@ -233,10 +233,6 @@ internal fun reprocessYuvJob(
                 }
             }
             if (enabledFrames < 2) {
-                updateYuvReprocessHistory(
-                    jobDir, enabledFrames, totalFrames - enabledFrames,
-                    "FAILED_NOT_ENOUGH_ENABLED_FRAMES"
-                )
                 post("Not enough enabled YUV frames to reprocess")
                 terminalResult = Result.failure(IllegalStateException("Not enough enabled YUV frames to reprocess"))
                 return@post
@@ -275,16 +271,6 @@ internal fun reprocessYuvJob(
             committedExport = export
             val verified = verifyGalleryExport(context, export.uriString)
             if (!verified) error("YUV export verification failed")
-            updateExportMetadata(
-                jobDir = jobDir,
-                export = export,
-                verified = true,
-                finalOutputFormat = finalOutputFormat,
-                rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
-            )
-            updateYuvReprocessHistory(
-                jobDir, enabledFrames, totalFrames - enabledFrames, "SUCCESS"
-            )
             post(
                 "PIPELINE_COMPLETE: YUV reprocess saved ${export.formatUsed.label}; " +
                     "used $enabledFrames/$totalFrames frames; cache kept."
@@ -294,21 +280,9 @@ internal fun reprocessYuvJob(
             post("PIPELINE_CANCELLED: YUV reprocess cancelled; source frames kept.")
             terminalResult = Result.failure(IllegalStateException("YUV reprocess cancelled"))
         } catch (oom: OutOfMemoryError) {
-            updateYuvReprocessHistory(
-                jobDir, enabledFrames, totalFrames - enabledFrames,
-                "FAILED_OUT_OF_MEMORY"
-            )
             post("PIPELINE_FAILED: YUV reprocess failed; cache kept. out of memory")
             terminalResult = Result.failure(oom)
         } catch (e: Exception) {
-            runCatching {
-                updateYuvReprocessHistory(
-                    jobDir,
-                    enabledFrames,
-                    (totalFrames - enabledFrames).coerceAtLeast(0),
-                    "FAILED: ${e.javaClass.simpleName}: ${e.message}"
-                )
-            }
             post("PIPELINE_FAILED: YUV reprocess failed; cache kept. ${e.message}")
             terminalResult = Result.failure(e)
         } finally {
@@ -320,7 +294,13 @@ internal fun reprocessYuvJob(
                     export = committedExport,
                     finalOutputFile = finalOutputFile,
                     previewFile = finalOutputFile,
-                    bytesWritten = finalOutputFile?.length() ?: 0L
+                    bytesWritten = finalOutputFile?.length() ?: 0L,
+                    disposition = when {
+                        publicExportCommitted && terminalResult.isFailure -> ReprocessTerminalDisposition.COMMITTED_PARTIAL
+                        terminalResult.isSuccess -> ReprocessTerminalDisposition.VERIFIED_SUCCESS
+                        else -> ReprocessTerminalDisposition.UNCOMMITTED_FAILURE
+                    },
+                    terminalError = terminalResult.exceptionOrNull()
                 )
             )
         }

@@ -337,6 +337,8 @@ internal fun reprocessRawJob(
         var terminalResult: Result<Unit> = Result.failure(IllegalStateException("RAW reprocess did not reach a terminal state."))
         var publicExportCommitted = false
         var committedExport: GalleryExportResult? = null
+        var currentOutputFile: File? = null
+        var currentPreviewFile: File? = null
         var enabledCount = 0
         var totalCount = 0
         try {
@@ -349,10 +351,6 @@ internal fun reprocessRawJob(
                 loadJobJson(jobDir).optJSONArray("frames")?.length() ?: 0
             }.getOrDefault(0)
             if (enabledCount < MIN_RAW_FUSION_FRAMES) {
-                updateReprocessHistory(
-                    jobDir, enabledCount, totalCount - enabledCount,
-                    "FAILED_NOT_ENOUGH_ENABLED_FRAMES"
-                )
                 post("Not enough enabled frames to reprocess")
                 terminalResult = Result.failure(IllegalStateException("Not enough enabled frames to reprocess"))
                 return@post
@@ -364,9 +362,10 @@ internal fun reprocessRawJob(
                 saveNativeMp24DebugPng = finalOutputFormat.isDebugPng,
                 cancellation = cancellation
             ) { post(it) }
+            currentOutputFile = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
+            currentPreviewFile = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L }
             if (!process.success || !process.hasExportableBitmapSource()) {
                 val reason = process.errorMessage ?: "RAW fusion process failed"
-                updateReprocessHistory(jobDir, enabledCount, totalCount - enabledCount, "FAILED: $reason")
                 post("RAW reprocess failed; source frames kept. $reason")
                 terminalResult = Result.failure(IllegalStateException(reason))
                 return@post
@@ -406,47 +405,37 @@ internal fun reprocessRawJob(
                 !verifyGalleryExport(context, export.uriString)
             ) {
                 val reason = export.errorMessage ?: "Export or verification failed"
-                updateExportFailure(jobDir, reason, finalOutputFormat)
-                updateReprocessHistory(jobDir, enabledCount, totalCount - enabledCount, "FAILED: $reason")
                 post("RAW reprocess export failed; source frames kept. $reason")
                 terminalResult = Result.failure(IllegalStateException(reason))
                 return@post
             }
-            updateExportMetadata(
-                jobDir = jobDir,
-                export = export,
-                verified = true,
-                finalOutputFormat = finalOutputFormat,
-                rawSidecarResult = null
-            )
-            updateReprocessHistory(jobDir, enabledCount, totalCount - enabledCount, "SUCCESS")
             post("RAW reprocess complete: used $enabledCount frames; source frames kept.")
             terminalResult = Result.success(Unit)
         } catch (_: kotlinx.coroutines.CancellationException) {
             post("PIPELINE_CANCELLED: RAW reprocess cancelled; source frames kept.")
             terminalResult = Result.failure(IllegalStateException("RAW reprocess cancelled"))
         } catch (oom: OutOfMemoryError) {
-            updateReprocessHistory(jobDir, enabledCount, totalCount - enabledCount, "FAILED_OUT_OF_MEMORY")
             post("RAW reprocess failed: out of memory; source frames kept.")
             terminalResult = Result.failure(oom)
         } catch (e: Exception) {
-            updateReprocessHistory(
-                jobDir, enabledCount, totalCount - enabledCount,
-                "FAILED: ${e.javaClass.simpleName}: ${e.message}"
-            )
             post("RAW reprocess failed; source frames kept. ${e.javaClass.simpleName}: ${e.message}")
             terminalResult = Result.failure(e)
         } finally {
             thread.quitSafely()
-            val finalOutput = File(jobDir, "raw_fusion_final.png").takeIf { it.isFile && it.length() > 0L }
             terminal.complete(
                 ReprocessWorkerOutcome(
                     result = terminalResult,
                     publicExportCommitted = publicExportCommitted,
                     export = committedExport,
-                    finalOutputFile = finalOutput,
-                    previewFile = finalOutput,
-                    bytesWritten = finalOutput?.length() ?: 0L
+                    finalOutputFile = currentOutputFile,
+                    previewFile = currentPreviewFile ?: currentOutputFile,
+                    bytesWritten = currentOutputFile?.length() ?: 0L,
+                    disposition = when {
+                        publicExportCommitted && terminalResult.isFailure -> ReprocessTerminalDisposition.COMMITTED_PARTIAL
+                        terminalResult.isSuccess -> ReprocessTerminalDisposition.VERIFIED_SUCCESS
+                        else -> ReprocessTerminalDisposition.UNCOMMITTED_FAILURE
+                    },
+                    terminalError = terminalResult.exceptionOrNull()
                 )
             )
         }
