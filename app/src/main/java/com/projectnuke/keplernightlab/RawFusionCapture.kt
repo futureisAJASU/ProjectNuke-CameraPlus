@@ -634,12 +634,11 @@ fun captureRawBurstForFusion(
                             check(dngTemp.length() > 0L) { "DNG output was empty" }
                             KeplerJobMetadata.atomicReplace(dngTemp, dngFile)
                             dngSaved = true
-                        } catch (e: Throwable) {
+                        } catch (e: Exception) {
                             dngFailure = "${e.javaClass.simpleName}: ${e.message}"
                             post("RAW DNG sidecar failed; continuing with raw16 fusion.")
                         } finally {
                             runCatching { if (dngTemp.exists()) dngTemp.delete() }
-                            if (!dngSaved) runCatching { if (dngFile.exists()) dngFile.delete() }
                         }
                     }
                     val dynamicBlackLevel = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)

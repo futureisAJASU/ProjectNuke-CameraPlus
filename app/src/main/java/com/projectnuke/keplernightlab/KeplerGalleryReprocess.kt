@@ -7,9 +7,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
@@ -90,6 +88,10 @@ suspend fun reprocessKeplerGalleryJob(
 
     val target = runCatching { requireReprocessSafeJobDirectory(context, jobDir) }
         .getOrElse { return@withContext Result.failure(it) }
+    if (!KeplerJobMetadata.tryAcquireOperation(target)) {
+        return@withContext Result.failure(IllegalStateException("A job mutation is already in progress."))
+    }
+    try {
     val capability = detectReprocessCapability(context, target)
     if (!capability.canReprocess) {
         writeReprocessFailure(target, capability.reason)
@@ -199,6 +201,15 @@ suspend fun reprocessKeplerGalleryJob(
         }
         throw callerCancellation
     }
+    val terminalOutcome = if (pipelineOutcome == null) {
+        cancelWorkerAndRollbackAfterCompletion(worker) { restoreBackups(target, backups) }
+    } else {
+        Result.success(pipelineOutcome)
+    }
+    return@withContext finalizeTerminalOutcome(
+        target, capability.jobKind, outputSettings, beforeBytes, selectionMode,
+        resolvedSelection, terminalOutcome, backups
+    )
     val pipelineResult = pipelineOutcome?.result
 
     if (pipelineOutcome?.publicExportCommitted == true || pipelineResult?.isSuccess == true) {
@@ -226,7 +237,8 @@ suspend fun reprocessKeplerGalleryJob(
         if (pipelineOutcome?.result?.isFailure == true) {
             writeReprocessPartial(
                 target, capability.jobKind, resolvedSelection.size, finalFile, previewFile,
-                selectionMode, resolvedSelection, pipelineOutcome.result.exceptionOrNull()?.message
+                selectionMode, resolvedSelection, pipelineOutcome.result.exceptionOrNull()?.message,
+                pipelineOutcome.export, outputSettings
             )
         } else writeReprocessSuccess(
             jobDir = target,
@@ -283,6 +295,38 @@ suspend fun reprocessKeplerGalleryJob(
     }
     writeReprocessFailure(target, "${error.javaClass.simpleName}: ${error.message}")
     Result.failure(error)
+    } finally {
+        KeplerJobMetadata.releaseOperation(target)
+    }
+}
+
+private fun finalizeTerminalOutcome(
+    jobDir: File,
+    jobKind: ReprocessJobKind,
+    outputSettings: FinalOutputFormat,
+    beforeBytes: Long,
+    selectionMode: FrameSelectionMode,
+    includedFrameIndices: Set<Int>,
+    terminal: Result<ReprocessWorkerOutcome>,
+    backups: List<ReprocessBackup>
+): Result<KeplerReprocessResult> {
+    val outcome = terminal.getOrElse { return Result.failure(it) }
+    if (outcome.publicExportCommitted || outcome.result.isSuccess) {
+        return finalizeReprocessOutcome(
+            jobDir, jobKind, outputSettings, beforeBytes, selectionMode, includedFrameIndices, outcome, backups
+        )
+    }
+    val error = outcome.result.exceptionOrNull() ?: IllegalStateException("Reprocess worker failed.")
+    return restoreBackups(jobDir, backups).fold(
+        onSuccess = {
+            writeReprocessFailure(jobDir, "${error.javaClass.simpleName}: ${error.message}")
+            Result.failure(error)
+        },
+        onFailure = { rollbackError ->
+            writeReprocessFailure(jobDir, "${error.javaClass.simpleName}: ${error.message}; rollback failed: ${rollbackError.message}")
+            Result.failure(rollbackError)
+        }
+    )
 }
 
 private fun finalizeReprocessOutcome(
@@ -299,14 +343,16 @@ private fun finalizeReprocessOutcome(
     val finalFile = resolveReprocessFinalOutput(jobDir, job)
     val previewFile = finalOutputCandidates(jobDir, job).filter { it.isFile && it != finalFile }
         .maxByOrNull { it.lastModified() } ?: finalFile
-    check(outcome.result.isFailure || finalFile?.isFile == true) { "Reprocess completed without a final output file." }
+    if (outcome.result.isSuccess && finalFile?.isFile != true) {
+        restoreBackups(jobDir, backups).getOrThrow()
+        throw IllegalStateException("Reprocess completed without a final output file.")
+    }
     val bytes = (finalOutputCandidates(jobDir, job).filter { it.isFile }.sumOf { it.length() } - beforeBytes)
         .coerceAtLeast(finalFile?.length() ?: 0L)
     if (outcome.result.isSuccess) {
         writeReprocessSuccess(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices)
     } else {
-        updateExportMetadata(jobDir, outcome.export, false, outputSettings)
-        writeReprocessPartial(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices, outcome.result.exceptionOrNull()?.message)
+        writeReprocessPartial(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices, outcome.result.exceptionOrNull()?.message, outcome.export, outputSettings)
     }
     check(deleteBackups(backups)) { "Could not clean reprocess backups after metadata finalization." }
     KeplerReprocessResult(jobDir, jobKind, finalFile, previewFile, bytes,
@@ -562,8 +608,10 @@ private fun writeReprocessSuccess(
     selectionMode: FrameSelectionMode,
     includedFrameIndices: Set<Int>
 ) {
-    val job = loadJobJsonSafe(jobDir)
-    job.put("processStatus", "REPROCESS_COMPLETE")
+    KeplerJobMetadata.update(jobDir) { job ->
+    job.put("status", "COMPLETE")
+        .put("processStatus", "REPROCESS_COMPLETE")
+        .put("currentPipelineStage", "COMPLETE")
         .put("reprocessStatus", "COMPLETE")
         .put("reprocessAt", nowIso8601())
         .put("reprocessEngine", when (jobKind) {
@@ -587,15 +635,15 @@ private fun writeReprocessSuccess(
             .put("galleryThumbnailFile", previewFile?.name ?: it.name)
     }
     putReprocessAvailability(jobDir, job, sourceFrameCount, finalOutputFile)
-    saveJobJson(jobDir, job)
+    }
 }
 
 private fun writeReprocessFailure(jobDir: File, error: String) {
-    val job = loadJobJsonSafe(jobDir)
-    job.put("reprocessStatus", "FAILED")
-        .put("reprocessError", error)
-        .put("reprocessAt", nowIso8601())
-    saveJobJson(jobDir, job)
+    KeplerJobMetadata.update(jobDir) {
+        it.put("reprocessStatus", "FAILED")
+            .put("reprocessError", error)
+            .put("reprocessAt", nowIso8601())
+    }
 }
 
 private fun writeReprocessPartial(
@@ -606,10 +654,14 @@ private fun writeReprocessPartial(
     previewFile: File?,
     selectionMode: FrameSelectionMode,
     includedFrameIndices: Set<Int>,
-    error: String?
+    error: String?,
+    export: GalleryExportResult?,
+    outputSettings: FinalOutputFormat
 ) {
-    val job = loadJobJsonSafe(jobDir)
+    KeplerJobMetadata.update(jobDir) { job ->
     job.put("processStatus", "REPROCESS_PARTIAL")
+        .put("status", "PARTIAL")
+        .put("currentPipelineStage", "PARTIAL")
         .put("reprocessStatus", "PARTIAL")
         .put("reprocessAt", nowIso8601())
         .put("reprocessEngine", jobKind.name)
@@ -620,9 +672,17 @@ private fun writeReprocessPartial(
         .put("finalOutputAvailable", finalOutputFile?.isFile == true)
         .put("galleryVisible", finalOutputFile?.isFile == true)
         .put("galleryDisplayUnavailable", finalOutputFile?.isFile != true)
+        .put("finalOutputFormatSetting", outputSettings.name)
+        .put("exportStatus", "EXPORT_UNVERIFIED")
+        .put("exportVerified", false)
+        .put("galleryExportCommitted", export?.success == true && !export?.uriString.isNullOrBlank())
+        .put("exportUri", export?.uriString ?: JSONObject.NULL)
+        .put("exportDisplayName", export?.displayName ?: JSONObject.NULL)
+        .put("exportMimeType", export?.mimeType ?: JSONObject.NULL)
+        .put("exportFileSizeBytes", export?.fileSizeBytes ?: 0L)
     finalOutputFile?.let { job.put("galleryDisplayFile", it.name).put("galleryThumbnailFile", previewFile?.name ?: it.name) }
     putReprocessAvailability(jobDir, job, sourceFrameCount, finalOutputFile)
-    saveJobJson(jobDir, job)
+    }
 }
 
 private fun putReprocessAvailability(

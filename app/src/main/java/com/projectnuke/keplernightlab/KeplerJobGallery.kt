@@ -79,10 +79,7 @@ fun loadJobJson(jobDir: File): JSONObject =
     KeplerJobMetadata.read(jobDir)
 
 fun saveJobJson(jobDir: File, job: JSONObject) {
-    KeplerJobMetadata.update(jobDir) { current ->
-        current.keys().asSequence().toList().forEach { key -> current.remove(key) }
-        job.keys().forEach { key -> current.put(key, job.get(key)) }
-    }
+    KeplerJobMetadata.write(jobDir, job)
 }
 
 fun setFrameExcluded(jobDir: File, frameIndex: Int, excluded: Boolean) {
@@ -149,6 +146,7 @@ private fun recoverStaleInterruptedJob(directory: File) {
         KeplerJobMetadata.update(directory) {
             it.put("status", "INTERRUPTED")
                 .put("processStatus", "INTERRUPTED")
+                .put("currentPipelineStage", "INTERRUPTED")
                 .put("interruptedAt", System.currentTimeMillis())
                 .put("interruptionReason", "App process was not running when stale job was recovered.")
                 .put("updatedAt", System.currentTimeMillis())
@@ -186,6 +184,7 @@ fun summarizeKeplerGalleryStorage(jobs: List<KeplerGalleryJobSummary>): KeplerGa
 
 fun deleteKeplerGalleryJob(context: Context, jobDirectory: File): Result<Unit> = runCatching {
     val target = requireCleanupSafeJobDirectory(context, jobDirectory)
+    check(!KeplerJobMetadata.isOperationActive(target)) { "Job mutation is in progress." }
     require(target.isDirectory) { "Job directory no longer exists." }
     check(target.deleteRecursively()) { "Failed to delete ${target.name}." }
 }
@@ -196,6 +195,7 @@ fun cleanupKeplerGalleryJob(
     cleanupType: KeplerJobCleanupType
 ): Result<KeplerJobCleanupResult> = runCatching {
     val target = requireCleanupSafeJobDirectory(context, jobDirectory)
+    check(!KeplerJobMetadata.isOperationActive(target)) { "Job mutation is in progress." }
     val before = folderSizeBytes(target)
     val job = File(target, JOB_JSON_FILE_NAME).takeIf { it.isFile }?.let { file ->
         runCatching { JSONObject(file.readText()) }.getOrNull()

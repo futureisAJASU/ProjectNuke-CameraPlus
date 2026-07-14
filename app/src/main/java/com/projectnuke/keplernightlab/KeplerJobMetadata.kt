@@ -7,14 +7,25 @@ import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 private const val KEPLER_JOB_SCHEMA_VERSION = 1
 
 /** Serializes each job's read-modify-write updates and never truncates a valid job.json. */
 object KeplerJobMetadata {
     private val locks = ConcurrentHashMap<String, Any>()
+    private val operationLocks = ConcurrentHashMap<String, AtomicBoolean>()
 
     private fun lockFor(jobDir: File): Any = locks.getOrPut(jobDir.canonicalPath) { Any() }
+
+    fun tryAcquireOperation(jobDir: File): Boolean =
+        operationLocks.getOrPut(jobDir.canonicalPath) { AtomicBoolean(false) }.compareAndSet(false, true)
+
+    fun releaseOperation(jobDir: File) {
+        operationLocks[jobDir.canonicalPath]?.set(false)
+    }
+
+    fun isOperationActive(jobDir: File): Boolean = operationLocks[jobDir.canonicalPath]?.get() == true
 
     fun read(jobDir: File): JSONObject = synchronized(lockFor(jobDir)) {
         JSONObject(File(jobDir, JOB_JSON_FILE_NAME).readText())

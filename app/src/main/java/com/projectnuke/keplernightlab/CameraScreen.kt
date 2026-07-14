@@ -2546,22 +2546,27 @@ private fun decodeNativeRgbaPreview(
     val outWidth = max(1, width / scale)
     val outHeight = max(1, height / scale)
     val bitmap = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
-    val row = ByteArray(width * 4)
-    RandomAccessFile(file, "r").use { input ->
-        for (y in 0 until outHeight) {
-            val sourceY = min(height - 1, y * scale)
-            input.seek((sourceY.toLong() * width.toLong()) * 4L)
-            input.readFully(row)
-            for (x in 0 until outWidth) {
-                val sourceX = min(width - 1, x * scale)
-                val p = sourceX * 4
-                val r = row[p].toInt() and 0xFF
-                val g = row[p + 1].toInt() and 0xFF
-                val b = row[p + 2].toInt() and 0xFF
-                val a = row[p + 3].toInt() and 0xFF
-                bitmap.setPixel(x, y, android.graphics.Color.argb(a, r, g, b))
+    try {
+        val row = ByteArray(width * 4)
+        RandomAccessFile(file, "r").use { input ->
+            for (y in 0 until outHeight) {
+                val sourceY = min(height - 1, y * scale)
+                input.seek((sourceY.toLong() * width.toLong()) * 4L)
+                input.readFully(row)
+                for (x in 0 until outWidth) {
+                    val sourceX = min(width - 1, x * scale)
+                    val p = sourceX * 4
+                    val r = row[p].toInt() and 0xFF
+                    val g = row[p + 1].toInt() and 0xFF
+                    val b = row[p + 2].toInt() and 0xFF
+                    val a = row[p + 3].toInt() and 0xFF
+                    bitmap.setPixel(x, y, android.graphics.Color.argb(a, r, g, b))
+                }
             }
         }
+    } catch (t: Throwable) {
+        bitmap.recycle()
+        throw t
     }
     return bitmap
 }
