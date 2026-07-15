@@ -612,7 +612,7 @@ private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
             job.optBoolean("finalOutputAvailable", false).not())
 ) return null
     // Prevent fallback scanning for reprocessed jobs
-    if (job?.has("reprocess") == true) {
+    if (job?.has("reprocessStatus") == true || job?.has("reprocessCount") == true || job?.has("reprocessAt") == true) {
         return null
     }
     val keys = listOf(

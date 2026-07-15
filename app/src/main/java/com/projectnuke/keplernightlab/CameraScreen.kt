@@ -84,10 +84,9 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-
-private val refreshLock = Any()
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.sync.Mutex
 import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
@@ -96,6 +95,13 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+
+fun isAllowedPreviewExtension(fileName: String): Boolean {
+    return when (val ext = fileName.substringAfterLast('.', "").lowercase()) {
+        "png", "jpg", "jpeg", "heic", "webp" -> true
+        else -> false
+    }
+}
 
 data class LatestKeplerResult(
     val bitmap: Bitmap?,
@@ -188,6 +194,21 @@ internal fun shouldIgnoreCancelledPipelineStatus(
             localGeneration == pipelineGeneration &&
             isCommittedPipelineCompletionStatus(status)
     return !isLateCommittedCompletion
+}
+
+private fun isDebugPreviewFinalBlocked(name: String): Boolean {
+    val lower = name.lowercase()
+    return lower in setOf(
+        "raw_reference_preview.png",
+        "raw_fused_classic_v1_preview.png",
+        "raw_compare_reference_vs_fused.png",
+        "reference_frame.png",
+        "fused_classic_yuv_v1.png",
+        "compare_reference_vs_fused.png",
+        "yuv_reference_preview.png",
+        "yuv_fused_preview.png",
+        "yuv_compare_reference_vs_fused.png"
+    )
 }
 
 fun parseCaptureProgress(
@@ -389,54 +410,66 @@ fun MainCameraScreen(
         logLongReport("KeplerCameraDump", buildFullCameraDumpReport(context))
     }
 
-    var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
+var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var latestSummary by remember { mutableStateOf("최근 결과 없음") }
     var latestResult by remember { mutableStateOf<LatestKeplerResult?>(null) }
     var showResultPreview by remember { mutableStateOf(false) }
+    val refreshMutex = remember { Mutex() }
     val cameraScope = rememberCoroutineScope()
-val refreshMutex = remember { kotlinx.coroutines.Mutex() }
     var refreshGeneration by remember { mutableIntStateOf(0) }
     var refreshJob by remember { mutableStateOf<Job?>(null) }
 
-fun refreshLatestResult(showPreview: Boolean = false) {
-    synchronized(refreshLock) {
-        val generation = ++refreshGeneration
-        refreshJob?.cancel()
-        refreshJob = cameraScope.launch {
-            // Load result & estimate on IO dispatcher
-            val (result, estimate) = withContext(Dispatchers.IO) {
-                loadLatestKeplerResultV2(context) to estimateLatestColorBurstScene(context)
-            }
-            // Cancellation check
-            if (!currentCoroutineContext().isActive || generation != refreshGeneration) {
-                result.bitmap?.takeIf { !it.isRecycled }?.recycle()
-                return@launch
-            }
-            // Bitmap handling with adoption logic
-            val loadedBitmap = result.bitmap
-            val adopted = showPreview && isAllowedPreviewExtension(result.fileName) && !isDebugPreviewFinalBlocked(result.fileName)
+    fun refreshLatestResult(showPreview: Boolean = false) {
+        cameraScope.launch {
+            refreshMutex.lock()
             try {
-                // Recycle previous bitmap if different
-                if (latestBitmap !== loadedBitmap && !latestBitmap.isRecycled) {
-                    latestBitmap.recycle()
-                }
-                latestBitmap = loadedBitmap
-                if (adopted) {
-                    showResultPreview = true
+                val generation = ++refreshGeneration
+                refreshJob?.cancel()
+                refreshJob = cameraScope.launch {
+                    // Load result & estimate on IO dispatcher
+                    val (result, estimate) = withContext(Dispatchers.IO) {
+                        loadLatestKeplerResultV2(context) to estimateLatestColorBurstScene(context)
+                    }
+                    // Cancellation check
+                    if (!currentCoroutineContext().isActive || generation != refreshGeneration) {
+                        result.bitmap?.takeIf { !it.isRecycled }?.recycle()
+                        return@launch
+                    }
+                    // Bitmap handling with adoption logic
+                    val loadedBitmap = result.bitmap
+                    val isAllowed = isAllowedPreviewExtension(result.fileName) && !isDebugPreviewFinalBlocked(result.fileName)
+                    // Always adopt for thumbnail if bitmap is valid
+                    val adoptedForThumbnail = loadedBitmap != null && !loadedBitmap.isRecycled && isAllowed
+                    // For preview card, only if showPreview and allowed
+                    val adoptedForPreview = showPreview && isAllowed
+                    try {
+                        if (adoptedForThumbnail) {
+                            val oldBitmap = latestBitmap
+                            if (oldBitmap != null && !oldBitmap.isRecycled && oldBitmap !== loadedBitmap) {
+                                oldBitmap.recycle()
+                            }
+                            latestBitmap = loadedBitmap
+                        } else {
+                            loadedBitmap?.recycle()
+                        }
+                        // Update UI fields
+                        latestSummary = result.summary
+                        latestResult = result
+                        latestSceneLuma = estimate.meanLuma
+                        latestMotionScore = estimate.motionScore
+                        if (adoptedForPreview) {
+                            showResultPreview = true
+                        }
+                    } finally {
+                        // If we didn't adopt for thumbnail, ensure bitmap recycled (already handled)
+                        // No extra action needed
+                    }
                 }
             } finally {
-                if (!adopted && !loadedBitmap.isRecycled) {
-                    loadedBitmap.recycle()
-                }
+                refreshMutex.unlock()
             }
-            // Update UI fields
-            latestSummary = result.summary
-            latestResult = result
-            latestSceneLuma = estimate.meanLuma
-            latestMotionScore = estimate.motionScore
         }
     }
-}
 
     DisposableEffect(Unit) {
         onDispose {
@@ -906,26 +939,7 @@ fun refreshLatestResult(showPreview: Boolean = false) {
                                     120_000L
                                 } else {
                                     60_000L
-}
-private fun isAllowedPreviewExtension(filename: String): Boolean {
-    val lower = filename.lowercase()
-    return lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".heic") || lower.endsWith(".webp")
-}
-
-private fun isDebugPreviewFinalBlocked(name: String): Boolean {
-    val lower = name.lowercase()
-    return lower in setOf(
-        "raw_reference_preview.png",
-        "raw_fused_classic_v1_preview.png",
-        "raw_compare_reference_vs_fused.png",
-        "reference_frame.png",
-        "fused_classic_yuv_v1.png",
-        "compare_reference_vs_fused.png",
-        "yuv_reference_preview.png",
-        "yuv_fused_preview.png",
-        "yuv_compare_reference_vs_fused.png"
-    )
-}
+                                }
                             ) { cancellation, captureCancellation, callback ->
                                 startCapturePipeline(
                                     CapturePipelineRequest(
