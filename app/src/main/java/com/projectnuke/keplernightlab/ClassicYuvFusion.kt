@@ -1,4 +1,4 @@
-package com.projectnuke.keplernightlab
+﻿package com.projectnuke.keplernightlab
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -104,9 +104,18 @@ internal fun processClassicYuvFusionJob(
     val jobFile = File(jobDir, "job.json")
     val job = JSONObject(jobFile.readText())
     val params = (requestedParams ?: loadClassicYuvFusionParams(job)).clamped()
-    val userCanMoveDevice = job.optBoolean("userCanMoveDevice", true)
-    initializeClassicYuvRunMetadata(job, params, processingStartedAt)
+    initializeClassicYuvRunMetadata(job, params, processingStartedAt, metadataPolicy)
     resetClassicFrameMetadataForCurrentRun(jobDir, job)
+
+    // Initialize external-weight metadata from current invocation before processing
+    if (externalFrameWeights != null && externalFrameWeights.isNotEmpty()) {
+        job.put("yuvExternalFrameWeightsUsed", true)
+            .put("yuvExternalFrameWeightsTarget", "NON_REFERENCE_FRAMES_ONLY")
+    } else {
+        job.put("yuvExternalFrameWeightsUsed", false)
+        job.remove("yuvExternalFrameWeightsTarget")
+    }
+
     var merged: Bitmap? = null
     var finalBitmap: Bitmap? = null
     var preflight: ClassicYuvProcessingPreflight? = null
@@ -116,6 +125,9 @@ internal fun processClassicYuvFusionJob(
     var sameSizeFrameCountKnown = false
     var compatibleFrameCountKnown = false
     var frames: List<ClassicFrame> = emptyList()
+    var nativeAlignmentUsed = false
+    var fallbackAlignmentCount = 0
+    var lowConfidenceAlignmentCount = 0
     try {
         fun markStage(stage: String, status: String) {
             job.put("currentPipelineStage", stage)
@@ -131,7 +143,7 @@ internal fun processClassicYuvFusionJob(
             onStatus(status)
         }
 
-        markStage("YUV_ALIGNING", "YUV 프레임을 정렬하는 중입니다.")
+        markStage("YUV_ALIGNING", "YUV ?꾨젅?꾩쓣 ?뺣젹?섎뒗 以묒엯?덈떎.")
         cancellation.throwIfCancelled()
         val preflightSummary = buildClassicYuvProcessingPreflight(jobDir, job)
         cancellation.throwIfCancelled()
@@ -175,12 +187,9 @@ internal fun processClassicYuvFusionJob(
         onStatus("Classic YUV fusion: selected reference frame ${reference.jsonIndex + 1}")
 
         val referenceThumbnail = requireNotNull(reference.thumbnail)
-        var nativeAlignmentUsed = false
-        var fallbackAlignmentCount = 0
-        var lowConfidenceAlignmentCount = 0
         frames.forEachIndexed { index, frame ->
             cancellation.throwIfCancelled()
-            onStatus("YUV 프레임을 정렬하는 중입니다.")
+            onStatus("YUV ?꾨젅?꾩쓣 ?뺣젹?섎뒗 以묒엯?덈떎.")
             if (frame === reference) {
                 frame.alignmentScore = 0f
                 frame.alignmentUsed = true
@@ -239,7 +248,7 @@ internal fun processClassicYuvFusionJob(
         }
 
         val alignDoneAt = System.currentTimeMillis()
-        markStage("YUV_MERGING", "YUV 프레임을 합성하는 중입니다.")
+        markStage("YUV_MERGING", "YUV ?꾨젅?꾩쓣 ?⑹꽦?섎뒗 以묒엯?덈떎.")
         cancellation.throwIfCancelled()
         val mergeResult = mergeClassicFrames(
             frames = compatibleFrames,
@@ -258,12 +267,12 @@ internal fun processClassicYuvFusionJob(
         cancellation.throwIfCancelled()
         saveClassicBitmap(merged, averageFile)
 
-        markStage("YUV_DENOISE_SHARPEN", "노이즈와 선명도를 보정하는 중입니다.")
+        markStage("YUV_DENOISE_SHARPEN", "?몄씠利덉? ?좊챸?꾨? 蹂댁젙?섎뒗 以묒엯?덈떎.")
         cancellation.throwIfCancelled()
         finalBitmap = finishClassicFusion(merged, params, cancellation)
         cancellation.throwIfCancelled()
         val lookDoneAt = System.currentTimeMillis()
-        markStage("YUV_EXPORTING", "결과를 저장하는 중입니다.")
+        markStage("YUV_EXPORTING", "寃곌낵瑜???ν븯??以묒엯?덈떎.")
         val finalFile = File(jobDir, "sharpened_night_fusion.png")
         cancellation.throwIfCancelled()
         saveClassicBitmap(finalBitmap, finalFile)
@@ -409,10 +418,12 @@ internal fun processClassicYuvFusionJob(
             metadataPolicy = metadataPolicy
         )
         cancellation.throwIfCancelled()
-        onStatus("처리가 완료되었습니다.")
+        onStatus("泥섎━媛 ?꾨즺?섏뿀?듬땲??")
         return finalFile
-    } catch (oom: OutOfMemoryError) {
+} catch (oom: OutOfMemoryError) {
         val failurePreflight = preflight ?: buildClassicYuvProcessingPreflight(jobDir, job)
+        val excludedFrameCount = countExcludedFrames(job)
+        val skippedFrameCount = (failurePreflight.enabledFrames - excludedFrameCount - frames.size).coerceAtLeast(0)
         recordClassicFailure(
             jobFile = jobFile,
             job = job,
@@ -430,13 +441,24 @@ internal fun processClassicYuvFusionJob(
             preflight = failurePreflight,
             params = params,
             processingStartedAt = processingStartedAt,
-            metadataPolicy = metadataPolicy
+            metadataPolicy = metadataPolicy,
+            nativeAlignmentUsed = nativeAlignmentUsed,
+            fallbackAlignmentCount = fallbackAlignmentCount,
+            lowConfidenceAlignmentCount = lowConfidenceAlignmentCount,
+            externalFrameWeights = externalFrameWeights,
+            referenceFrameIndex = if (frames.isNotEmpty()) frames.first().jsonIndex else null,
+            usedFrameCount = frames.size,
+            acceptedFrameCount = frames.size,
+            excludedFrameCount = excludedFrameCount,
+            skippedFrameCount = skippedFrameCount
         )
         throw IllegalStateException("Classic YUV fusion failed: OutOfMemoryError; cache kept", oom)
     } catch (ce: CancellationException) {
         throw ce
-    } catch (e: Exception) {
+} catch (e: Exception) {
         val failurePreflight = preflight ?: buildClassicYuvProcessingPreflight(jobDir, job)
+        val excludedFrameCount = countExcludedFrames(job)
+        val skippedFrameCount = (failurePreflight.enabledFrames - excludedFrameCount - frames.size).coerceAtLeast(0)
         recordClassicFailure(
             jobFile,
             job,
@@ -454,7 +476,16 @@ internal fun processClassicYuvFusionJob(
             preflight = failurePreflight,
             params = params,
             processingStartedAt = processingStartedAt,
-            metadataPolicy = metadataPolicy
+            metadataPolicy = metadataPolicy,
+            nativeAlignmentUsed = nativeAlignmentUsed,
+            fallbackAlignmentCount = fallbackAlignmentCount,
+            lowConfidenceAlignmentCount = lowConfidenceAlignmentCount,
+            externalFrameWeights = externalFrameWeights,
+            referenceFrameIndex = if (frames.isNotEmpty()) frames.first().jsonIndex else null,
+            usedFrameCount = frames.size,
+            acceptedFrameCount = frames.size,
+            excludedFrameCount = excludedFrameCount,
+            skippedFrameCount = skippedFrameCount
         )
         throw e
     } finally {
@@ -887,7 +918,8 @@ private fun finishClassicFusion(
 private fun initializeClassicYuvRunMetadata(
     job: JSONObject,
     params: ClassicYuvFusionParams,
-    processingStartedAt: Long
+    processingStartedAt: Long,
+    metadataPolicy: ReprocessMetadataPolicy
 ) {
     classicYuvRunScopedKeys.forEach(job::remove)
     job.put("jobType", "YUV_NIGHT_FUSION")
@@ -906,7 +938,7 @@ private fun initializeClassicYuvRunMetadata(
         .put("yuvSharpenVersion", "YUV_ADAPTIVE_LUMA_SHARPEN_V0")
         .put("yuvLookVersion", "YUV_NATURAL_NIGHT_LOOK_V0")
         .put("processingStartedAt", processingStartedAt)
-        .put("yuvProcessingPolicy", "NORMAL")
+        .put("yuvProcessingPolicy", metadataPolicy.name)
 }
 
 /** Resets current-run alignment/fusion fields for every enabled, non-excluded frame. */
@@ -941,7 +973,7 @@ private fun clearClassicFrameAlignmentOnDecodeFailure(jobDir: File, frameJson: J
     val frameFile = File(jobDir, fileName)
     val alignmentFailureReason = if (fileName.isBlank() || !frameFile.isFile) "MISSING_FILE" else reason
     val fusionSkipReason = if (fileName.isBlank() || !frameFile.isFile) "MISSING_FILE" else "DECODE_FAILED"
-    
+
     frameJson.put("alignmentUsed", false)
         .put("fusionUsed", false)
         .put("alignmentFailureReason", alignmentFailureReason)
@@ -1022,12 +1054,12 @@ private fun mergeClassicFrameAlignmentIntoLockedJob(
 
         repeat(lockedFrames.length()) { index ->
             val lockedFrame = lockedFrames.optJSONObject(index) ?: return@repeat
-            
+
             // Skip metadata writes for frames that are disabled or user-excluded in the locked copy
             if (!lockedFrame.optBoolean("enabled", true) || lockedFrame.optBoolean("excludedByUser", false)) {
                 return@repeat
             }
-            
+
             val file = lockedFrame.optString("file")
             val idx = lockedFrame.optInt("index", index)
             val key = idx to file
@@ -1383,7 +1415,22 @@ private fun recordClassicFailure(
     preflight: ClassicYuvProcessingPreflight? = null,
     params: ClassicYuvFusionParams,
     processingStartedAt: Long,
-    metadataPolicy: ReprocessMetadataPolicy = ReprocessMetadataPolicy.NORMAL
+    metadataPolicy: ReprocessMetadataPolicy = ReprocessMetadataPolicy.NORMAL,
+    nativeAlignmentUsed: Boolean = false,
+    fallbackAlignmentCount: Int = 0,
+    lowConfidenceAlignmentCount: Int = 0,
+    externalFrameWeights: Map<Int, Float>? = null,
+    referenceFrameIndex: Int? = null,
+    usedFrameCount: Int = 0,
+    acceptedFrameCount: Int = 0,
+    rejectedFrameCount: Int = 0,
+    excludedFrameCount: Int = 0,
+    skippedFrameCount: Int = 0,
+    ghostRejectedPixelRatio: Double = 0.0,
+    outputWidth: Int = 0,
+    outputHeight: Int = 0,
+    yuvWidth: Int = 0,
+    yuvHeight: Int = 0
 ) {
     runCatching {
         val now = System.currentTimeMillis()
@@ -1409,6 +1456,54 @@ private fun recordClassicFailure(
         .put("processingTimeMs", now - processingStartedAt)
         .put("timing", JSONObject().put("totalPipelineMs", now - processingStartedAt))
         .put("yuvProcessingPolicy", metadataPolicy.name)
+        // Persist current-run alignment state
+        .put("nativeAlignmentAvailable", NativeFusionAlignment.isAvailable())
+        .put("nativeAlignmentUsed", nativeAlignmentUsed)
+        .put("alignmentVersion", if (nativeAlignmentUsed) "native_subpixel_v1" else "kotlin_integer_v1")
+        .put("yuvAlignVersion", "YUV_GLOBAL_SHIFT_V0")
+        .put("yuvMergeVersion", "YUV_TEMPORAL_GHOST_V0")
+        .put("yuvDenoiseVersion", "YUV_LUMA_CHROMA_EDGE_AWARE_V0")
+        .put("yuvDetailVersion", "YUV_LUMA_DETAIL_V0")
+        .put("yuvSharpenVersion", "YUV_ADAPTIVE_LUMA_SHARPEN_V0")
+        .put("yuvLookVersion", "YUV_NATURAL_NIGHT_LOOK_V0")
+        .put("fallbackAlignmentCount", fallbackAlignmentCount)
+        .put("lowConfidenceAlignmentCount", lowConfidenceAlignmentCount)
+        // Persist current-run frame counts
+        .put("usedFrameCount", usedFrameCount)
+        .put("acceptedFrameCount", acceptedFrameCount)
+        .put("rejectedFrameCount", rejectedFrameCount)
+        .put("excludedFrameCount", excludedFrameCount)
+        .put("skippedFrameCount", skippedFrameCount)
+        // Persist current-run reference frame index
+        .also { referenceFrameIndex?.let { it2 -> it.put("referenceFrameIndex", it2).put("yuvReferenceFrameIndex", it2) } }
+        // Persist ghost suppression metrics
+        .put("ghostSuppressionUsed", true)
+        .put("ghostSuppressionEnabled", true)
+        .put("ghostRejectedPixelRatio", ghostRejectedPixelRatio)
+        .put("rejectedGhostSampleRatio", ghostRejectedPixelRatio)
+        // Persist output and YUV dimensions
+        .put("outputWidth", outputWidth)
+        .put("outputHeight", outputHeight)
+        .put("yuvWidth", yuvWidth)
+        .put("yuvHeight", yuvHeight)
+        // Initialize duplicated config metadata from current clamped params
+        .put("lumaDenoiseStrength", params.denoiseStrength.toDouble())
+        .put("chromaDenoiseStrength", params.denoiseStrength.toDouble())
+        .put("lowLightChromaBoost", true)
+        .put("adaptiveSharpenUsed", true)
+        .put("blackPoint", 0.018)
+        .put("contrastCurve", "mild_s_curve")
+        .put("saturationBoost", params.saturationBoost.toDouble())
+        .put("vibranceBoost", 0.04)
+        .put("localContrastAmount", params.localContrastAmount.toDouble())
+        // Persist current external-weight state
+        if (externalFrameWeights != null && externalFrameWeights.isNotEmpty()) {
+            job.put("yuvExternalFrameWeightsUsed", true)
+                .put("yuvExternalFrameWeightsTarget", "NON_REFERENCE_FRAMES_ONLY")
+        } else {
+            job.put("yuvExternalFrameWeightsUsed", false)
+            job.remove("yuvExternalFrameWeightsTarget")
+        }
         preflight?.let { job.put("yuvProcessingPreflight", it.toJson()) }
         failureCounts?.let {
             job.put("yuvProcessingTotalFrames", it.totalFrames)
@@ -1438,7 +1533,18 @@ private val classicYuvRunScopedKeys: Set<String> = setOf(
         "fusedClassicPresetFile", "comparisonDebugFile", "yuvComparePreviewFile",
         "yuvCompareReferenceVsFinalFile",
         "nativeAlignmentUsed", "fallbackAlignmentCount", "lowConfidenceAlignmentCount",
-        "yuvExternalFrameWeightsUsed", "yuvProcessingPolicy"
+        "usedFrameCount", "acceptedFrameCount", "rejectedFrameCount", "excludedFrameCount", "skippedFrameCount",
+        "referenceFrameIndex", "yuvReferenceFrameIndex",
+        "ghostSuppressionUsed", "ghostSuppressionEnabled", "ghostRejectedPixelRatio", "rejectedGhostSampleRatio",
+        "outputWidth", "outputHeight", "yuvWidth", "yuvHeight",
+        "averageColorFile", "finalNightFusionFile", "finalFile", "finalOutputSource",
+        "galleryDisplayFile", "galleryThumbnailFile", "galleryDisplaySource",
+        "isDebugPreviewUsedAsFinal", "yuvFusionLooksWorseHint", "yuvQualityDiagnosticHints",
+        "lumaDenoiseStrength", "chromaDenoiseStrength", "lowLightChromaBoost", "adaptiveSharpenUsed",
+        "blackPoint", "contrastCurve", "saturationBoost", "vibranceBoost", "localContrastAmount",
+        "processedAt", "processingNotes",
+        "yuvExternalFrameWeightsUsed", "yuvExternalFrameWeightsTarget",
+        "yuvProcessingPolicy"
     )
 
 // Final progress keys for REPROCESS_PROGRESS_ONLY: active progress minus terminal state (stage/status)
@@ -1509,6 +1615,27 @@ private val classicYuvStaleFinalOutputKeys: Set<String> = setOf(
         "isDebugPreviewUsedAsFinal"
     )
 
+// Classic run-produced result and diagnostic fields (written on NORMAL success/failure).
+// On NORMAL failure: write current values that exist; remove absent keys from this set.
+private val classicYuvRunResultKeys: Set<String> = setOf(
+        "nativeAlignmentUsed", "fallbackAlignmentCount", "lowConfidenceAlignmentCount",
+        "usedFrameCount", "acceptedFrameCount", "rejectedFrameCount", "excludedFrameCount", "skippedFrameCount",
+        "referenceFrameIndex", "yuvReferenceFrameIndex",
+        "ghostSuppressionUsed", "ghostSuppressionEnabled", "ghostRejectedPixelRatio", "rejectedGhostSampleRatio",
+        "outputWidth", "outputHeight", "yuvWidth", "yuvHeight",
+        "processingTimeMs", "processedAt",
+        "lumaDenoiseStrength", "chromaDenoiseStrength", "lowLightChromaBoost", "adaptiveSharpenUsed",
+        "blackPoint", "contrastCurve", "saturationBoost", "vibranceBoost", "localContrastAmount",
+        "yuvExternalFrameWeightsUsed", "yuvExternalFrameWeightsTarget",
+        "alignmentVersion", "yuvAlignVersion", "yuvMergeVersion", "yuvDenoiseVersion",
+        "yuvDetailVersion", "yuvSharpenVersion", "yuvLookVersion",
+        "fusionEngine", "fusionVersion", "yuvFusionVersion", "fusionParamsVersion",
+        "fusionPresetName", "fusionParams", "nativeAlignmentAvailable",
+        "yuvProcessingPreflight", "yuvProcessingPolicy", "yuvProcessingTotalFrames",
+        "yuvProcessingEnabledFrames", "yuvProcessingDecodedUsableFrames",
+        "yuvProcessingSameSizeFrames", "yuvProcessingCompatibleFrames"
+    )
+
 // Classic-owned per-frame alignment/fusion fields to merge into locked frames array
 private val classicYuvPerFrameAlignmentFields: Set<String> = setOf(
     "alignDx", "alignDy", "alignIntegerDx", "alignIntegerDy", "alignSubpixelDx", "alignSubpixelDy",
@@ -1532,7 +1659,7 @@ private fun persistClassicYuvSuccess(
         classicYuvFinalProgressKeys
     }
     val failureKeysToClear = classicYuvFailureTerminalKeys
-    
+
     KeplerJobMetadata.update(jobDir) { current ->
         // Write owned keys that are present in job; remove absent owned keys
         keysToWrite.forEach { key ->
@@ -1556,11 +1683,11 @@ private fun persistClassicYuvFailure(
         mergeClassicFrameAlignmentIntoLockedJob(jobDir, job)
     }
     val keysToWrite = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-        classicYuvFailureOwnedKeys
+        classicYuvRunResultKeys
     } else {
         classicYuvFinalProgressKeys
     }
-    
+
     KeplerJobMetadata.update(jobDir) { current ->
         // Write owned keys that are present in job; remove absent owned keys
         keysToWrite.forEach { key ->
