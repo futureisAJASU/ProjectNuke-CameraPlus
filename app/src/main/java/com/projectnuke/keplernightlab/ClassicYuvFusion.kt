@@ -241,8 +241,6 @@ internal fun processClassicYuvFusionJob(
         markStage("YUV_MERGING", "YUV 프레임을 합성하는 중입니다.")
         cancellation.throwIfCancelled()
         val mergeResult = mergeClassicFrames(
-            job = job,
-            jobDir = jobDir,
             frames = compatibleFrames,
             reference = activeReference,
             width = dimensions.first,
@@ -426,7 +424,6 @@ internal fun processClassicYuvFusionJob(
             ),
             preflight = failurePreflight,
             params = params,
-            userCanMoveDevice = userCanMoveDevice,
             processingStartedAt = processingStartedAt,
             metadataPolicy = metadataPolicy
         )
@@ -451,7 +448,6 @@ internal fun processClassicYuvFusionJob(
             ),
             preflight = failurePreflight,
             params = params,
-            userCanMoveDevice = userCanMoveDevice,
             processingStartedAt = processingStartedAt,
             metadataPolicy = metadataPolicy
         )
@@ -640,8 +636,6 @@ private fun alignmentMad(
 }
 
 private fun mergeClassicFrames(
-    job: JSONObject,
-    jobDir: File,
     frames: List<ClassicFrame>,
     reference: ClassicFrame,
     width: Int,
@@ -696,16 +690,6 @@ private fun mergeClassicFrames(
     frames.forEachIndexed { frameIndex, frame ->
         cancellation.throwIfCancelled()
         if (frame === reference) return@forEachIndexed
-        
-        // Skip frames whose current locked metadata is disabled or excludedByUser=true
-        val lockedFrame = job.optJSONArray("frames")?.optJSONObject(frame.jsonIndex)
-        if (lockedFrame != null && (
-            !lockedFrame.getBoolean("enabled") ||
-            lockedFrame.optBoolean("excludedByUser", false)
-        )) {
-            return@forEachIndexed
-        }
-        
         if (reportedMergeFrames.add(frame.jsonIndex)) {
             onStatus("Classic YUV fusion: merging frame ${frameIndex + 1}/${frames.size}...")
         }
@@ -1032,6 +1016,12 @@ private fun mergeClassicFrameAlignmentIntoLockedJob(
 
         repeat(lockedFrames.length()) { index ->
             val lockedFrame = lockedFrames.optJSONObject(index) ?: return@repeat
+            
+            // Skip metadata writes for frames that are disabled or user-excluded in the locked copy
+            if (!lockedFrame.optBoolean("enabled", true) || lockedFrame.optBoolean("excludedByUser", false)) {
+                return@repeat
+            }
+            
             val file = lockedFrame.optString("file")
             val idx = lockedFrame.optInt("index", index)
             val key = idx to file
@@ -1386,7 +1376,6 @@ private fun recordClassicFailure(
     failureCounts: ClassicYuvProcessingFailureCounts? = null,
     preflight: ClassicYuvProcessingPreflight? = null,
     params: ClassicYuvFusionParams,
-    userCanMoveDevice: Boolean,
     processingStartedAt: Long,
     metadataPolicy: ReprocessMetadataPolicy = ReprocessMetadataPolicy.NORMAL
 ) {
