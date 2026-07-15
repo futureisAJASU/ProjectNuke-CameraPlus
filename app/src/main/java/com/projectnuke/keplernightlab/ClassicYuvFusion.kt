@@ -112,6 +112,7 @@ internal fun processClassicYuvFusionJob(
     var compatibleFrameCount = 0
     var sameSizeFrameCountKnown = false
     var compatibleFrameCountKnown = false
+    var frames: List<ClassicFrame> = emptyList()
     try {
         fun markStage(stage: String, status: String) {
             job.put("currentPipelineStage", stage)
@@ -141,7 +142,7 @@ internal fun processClassicYuvFusionJob(
         val candidateFrames = loadClassicFrames(jobDir, job)
         cancellation.throwIfCancelled()
         val totalFrames = preflightSummary.totalFrames
-        val frames = candidateFrames.mapNotNull { frame ->
+        frames = candidateFrames.mapNotNull { frame ->
             try {
                 cancellation.throwIfCancelled()
                 frame.thumbnail = decodeLumaThumbnail(frame.file)
@@ -396,7 +397,9 @@ internal fun processClassicYuvFusionJob(
         persistClassicYuvSuccess(
             jobDir = jobDir,
             job = job,
-            metadataPolicy = metadataPolicy
+            metadataPolicy = metadataPolicy,
+            frames = compatibleFrames,
+            params = params
         )
         cancellation.throwIfCancelled()
         onStatus("처리가 완료되었습니다.")
@@ -896,6 +899,37 @@ private fun updateAlignmentMetadata(
         .put("fusionSkipReason", skipReason ?: JSONObject.NULL)
 }
 
+/** Merges Classic-owned per-frame alignment fields into the job's frames array by index/file,
+ *  preserving unrelated fields such as user exclusion, selection state, quality scores, etc. */
+private fun mergeClassicFrameAlignmentIntoJob(
+    job: JSONObject,
+    frames: List<ClassicFrame>,
+    params: ClassicYuvFusionParams
+) {
+    val sourceFrames = job.optJSONArray("frames") ?: return
+    val frameMap = frames.associateBy { it.jsonIndex }
+    repeat(sourceFrames.length()) { index ->
+        val source = sourceFrames.optJSONObject(index) ?: return@repeat
+        val frame = frameMap[index]
+        if (frame == null) return@repeat
+        source.put("alignDx", frame.alignDx)
+            .put("alignDy", frame.alignDy)
+            .put("alignIntegerDx", frame.alignIntegerDx)
+            .put("alignIntegerDy", frame.alignIntegerDy)
+            .put("alignSubpixelDx", frame.alignSubpixelDx.toDouble())
+            .put("alignSubpixelDy", frame.alignSubpixelDy.toDouble())
+            .put("alignmentScore", frame.alignmentScore.toDouble())
+            .put("alignmentConfidence", frame.alignmentConfidence.toDouble())
+            .put("alignmentBackend", frame.alignmentBackend)
+            .put("alignmentUsedSubpixel", frame.alignmentUsedSubpixel)
+            .put("alignmentFallbackUsed", frame.alignmentFallbackUsed)
+            .put("alignmentUsed", frame.alignmentUsed)
+            .put("globalWeight", globalWeightFor(frame, params).toDouble())
+            .put("fusionUsed", frame.alignmentUsed)
+            .put("fusionSkipReason", if (frame.alignmentUsed) JSONObject.NULL else "LOW_ALIGNMENT_CONFIDENCE")
+    }
+}
+
 private fun writeFusionDebugMetadata(
     jobDir: File,
     job: JSONObject,
@@ -1264,7 +1298,8 @@ private const val CLASSIC_YUV_PROGRESS_KEYS =
 
 private val classicYuvProgressKeys: Set<String> = CLASSIC_YUV_PROGRESS_KEYS.split(',').toSet()
 
-private val classicYuvSuccessNormalKeys: Set<String> = setOf(
+// Classic-owned keys that should be present on NORMAL success (all terminal + progress + diagnostic)
+private val classicYuvSuccessOwnedKeys: Set<String> = setOf(
     "jobType", "currentPipelineStage", "userCanMoveDevice", "processingStartedAt", "processStatus",
     "fusionEngine", "fusionVersion", "yuvFusionVersion", "fusionParamsVersion", "fusionPresetName",
     "fusionParams", "nativeAlignmentAvailable", "nativeAlignmentUsed", "alignmentVersion",
@@ -1289,7 +1324,8 @@ private val classicYuvSuccessNormalKeys: Set<String> = setOf(
     "yuvCompareReferenceVsFinalFile"
 )
 
-private val classicYuvFailureNormalKeys: Set<String> = setOf(
+// Classic-owned keys that should be present on NORMAL failure (terminal failure + progress + diagnostic)
+private val classicYuvFailureOwnedKeys: Set<String> = setOf(
     "currentPipelineStage", "processStatus", "pipelineFailed", "pipelineFailureStatusCode",
     "pipelineFailureSource", "pipelineFailureType", "pipelineFailureMessage", "pipelineFailureStackTrace",
     "processFailureReason", "fusionEngine", "fusionVersion", "processedAt",
@@ -1298,33 +1334,93 @@ private val classicYuvFailureNormalKeys: Set<String> = setOf(
     "processingStartedAt", "debugArtifactStatus", "debugArtifactError", "timing", "processingTimeMs"
 )
 
+// Keys that are opposite-type: failure keys to clear on success, success keys to clear on failure
+private val classicYuvFailureTerminalKeys: Set<String> = setOf(
+    "pipelineFailed", "pipelineFailureStatusCode", "pipelineFailureSource",
+    "pipelineFailureType", "pipelineFailureMessage", "pipelineFailureStackTrace", "processFailureReason"
+)
+
+private val classicYuvSuccessTerminalKeys: Set<String> = setOf(
+    "jobType", "userCanMoveDevice", "fusionEngine", "fusionVersion", "yuvFusionVersion",
+    "fusionParamsVersion", "fusionPresetName", "fusionParams", "nativeAlignmentAvailable",
+    "nativeAlignmentUsed", "alignmentVersion", "yuvAlignVersion", "yuvMergeVersion",
+    "yuvDenoiseVersion", "yuvDetailVersion", "yuvSharpenVersion", "yuvLookVersion",
+    "fallbackAlignmentCount", "lowConfidenceAlignmentCount", "usedFrameCount", "acceptedFrameCount",
+    "rejectedFrameCount", "excludedFrameCount", "skippedFrameCount", "referenceFrameIndex",
+    "yuvReferenceFrameIndex", "ghostSuppressionUsed", "ghostSuppressionEnabled",
+    "ghostRejectedPixelRatio", "rejectedGhostSampleRatio", "averageColorFile", "finalNightFusionFile",
+    "finalFile", "finalOutputSource", "galleryDisplayFile", "galleryThumbnailFile", "galleryDisplaySource",
+    "isDebugPreviewUsedAsFinal", "yuvFusionLooksWorseHint", "yuvQualityDiagnosticHints",
+    "outputWidth", "outputHeight", "frameCount", "yuvWidth", "yuvHeight",
+    "lumaDenoiseStrength", "chromaDenoiseStrength", "lowLightChromaBoost", "adaptiveSharpenUsed",
+    "blackPoint", "contrastCurve", "saturationBoost", "vibranceBoost", "localContrastAmount",
+    "processedAt", "processingNotes",
+    "yuvExternalFrameWeightsUsed", "yuvExternalFrameWeightsTarget",
+    "referenceFrameDebugFile", "yuvReferencePreviewFile", "fusedClassicDebugFile", "yuvFusedPreviewFile",
+    "yuvFusedBeforeDenoisePreviewFile", "yuvFusedAfterDenoiseNoSharpenPreviewFile", "yuvFinalPreviewFile",
+    "fusedClassicPresetFile", "comparisonDebugFile", "yuvComparePreviewFile",
+    "yuvCompareReferenceVsFinalFile"
+)
+
 private fun persistClassicYuvSuccess(
     jobDir: File,
     job: JSONObject,
-    metadataPolicy: ReprocessMetadataPolicy
+    metadataPolicy: ReprocessMetadataPolicy,
+    frames: List<ClassicFrame> = emptyList(),
+    params: ClassicYuvFusionParams? = null
 ) {
-    val keys = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-        classicYuvSuccessNormalKeys
+    // Merge per-frame alignment data into job's frames array for NORMAL
+    if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+        params?.let { mergeClassicFrameAlignmentIntoJob(job, frames, it) }
+    }
+    val keysToWrite = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+        classicYuvSuccessOwnedKeys
     } else {
         classicYuvProgressKeys
     }
+    val failureKeysToClear = classicYuvFailureTerminalKeys
+    val successKeysToClear = classicYuvSuccessTerminalKeys // not cleared on success, but for symmetry
+    
     KeplerJobMetadata.update(jobDir) { current ->
-        keys.forEach { key -> if (job.has(key)) current.put(key, job.get(key)) }
+        // Write owned keys that are present in job
+        keysToWrite.forEach { key ->
+            if (job.has(key)) current.put(key, job.get(key))
+            else if (key in keysToWrite) current.remove(key) // remove stale owned key
+        }
+        // On NORMAL success, clear any stale failure-terminal keys
+        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            failureKeysToClear.forEach { current.remove(it) }
+        }
     }
 }
 
 private fun persistClassicYuvFailure(
     jobDir: File,
     job: JSONObject,
-    metadataPolicy: ReprocessMetadataPolicy
+    metadataPolicy: ReprocessMetadataPolicy,
+    frames: List<ClassicFrame> = emptyList(),
+    params: ClassicYuvFusionParams? = null
 ) {
-    val keys = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-        classicYuvFailureNormalKeys
+    // Merge per-frame alignment data into job's frames array for NORMAL
+    if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+        params?.let { mergeClassicFrameAlignmentIntoJob(job, frames, it) }
+    }
+    val keysToWrite = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+        classicYuvFailureOwnedKeys
     } else {
         classicYuvProgressKeys
     }
+    
     KeplerJobMetadata.update(jobDir) { current ->
-        keys.forEach { key -> if (job.has(key)) current.put(key, job.get(key)) }
+        // Write owned keys that are present in job
+        keysToWrite.forEach { key ->
+            if (job.has(key)) current.put(key, job.get(key))
+            else if (key in keysToWrite) current.remove(key) // remove stale owned key
+        }
+        // On NORMAL failure, clear any stale success/gallery/output keys
+        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            classicYuvSuccessTerminalKeys.forEach { current.remove(it) }
+        }
     }
 }
 
