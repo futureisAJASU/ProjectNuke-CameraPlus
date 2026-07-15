@@ -145,6 +145,8 @@ internal fun processClassicYuvFusionJob(
         frames = candidateFrames.mapNotNull { frame ->
             try {
                 cancellation.throwIfCancelled()
+                val frameJson = job.optJSONArray("frames")?.optJSONObject(frame.jsonIndex)
+                frameJson?.let { resetClassicFrameAlignmentFields(it) }
                 frame.thumbnail = decodeLumaThumbnail(frame.file)
                 cancellation.throwIfCancelled()
                 frame
@@ -154,8 +156,7 @@ internal fun processClassicYuvFusionJob(
                 throw ce
             } catch (e: Exception) {
                 val frameJson = job.optJSONArray("frames")?.optJSONObject(frame.jsonIndex)
-                frameJson?.put("alignmentUsed", false)
-                    ?.put("alignmentFailureReason", "${e.javaClass.simpleName}: ${e.message}")
+                frameJson?.let { clearClassicFrameAlignmentOnDecodeFailure(it, "${e.javaClass.simpleName}: ${e.message}") }
                 null
             }
         }
@@ -871,6 +872,25 @@ private fun finishClassicFusion(
     }
 }
 
+/** Resets all Classic-owned per-frame alignment/fusion fields before a new processing run. */
+private fun resetClassicFrameAlignmentFields(frameJson: JSONObject) {
+    classicYuvPerFrameAlignmentFields.forEach { field ->
+        frameJson.remove(field)
+    }
+}
+
+/** Clears stale alignment data on decode failure and sets the current failure reason. */
+private fun clearClassicFrameAlignmentOnDecodeFailure(frameJson: JSONObject, reason: String) {
+    classicYuvPerFrameAlignmentFields.forEach { field ->
+        frameJson.remove(field)
+    }
+    frameJson.put("alignmentUsed", false)
+        .put("fusionUsed", false)
+        .put("alignmentFailureReason", reason)
+        .put("fusionSkipReason", "DECODE_FAILED")
+}
+
+/** Updates alignment metadata and clears stale failure reason on success. */
 private fun updateAlignmentMetadata(
     job: JSONObject,
     frame: ClassicFrame,
@@ -895,12 +915,15 @@ private fun updateAlignmentMetadata(
         .put("globalWeight", globalWeight.toDouble())
         .put("fusionUsed", used)
         .put("fusionSkipReason", skipReason ?: JSONObject.NULL)
+        .remove("alignmentFailureReason") // clear stale failure reason on success
 }
 
 /** Merges Classic-owned per-frame alignment/fusion fields into the LOCKED job.json's frames array
- *  by stable identity (JSON index field + file name). Copies only Classic alignment/fusion fields;
- *  preserves exclusion, selection, quality, and unrelated frame metadata.
- *  Merges ALL frames that have alignment data in the local job, including rejected and decode-failed frames. */
+ *  by stable identity (JSON index field + file name), with unique-file fallback.
+ *  Copies only Classic alignment/fusion fields; preserves exclusion, selection, quality,
+ *  and unrelated frame metadata.
+ *  Merges ALL frames that have alignment data in the local job, including rejected and decode-failed frames.
+ *  For touched frames, also removes absent Classic-owned fields. */
 private fun mergeClassicFrameAlignmentIntoLockedJob(
     jobDir: File,
     localJob: JSONObject
@@ -908,12 +931,14 @@ private fun mergeClassicFrameAlignmentIntoLockedJob(
     // Build a map of local frames by stable identity: (index, file) -> frame JSON from local job
     val localFrames = localJob.optJSONArray("frames") ?: return
     val localFrameMap = mutableMapOf<Pair<Int, String>, JSONObject>()
+    val localFrameByFile = mutableMapOf<String, JSONObject>()
     repeat(localFrames.length()) { index ->
         val frameJson = localFrames.optJSONObject(index) ?: return@repeat
         val file = frameJson.optString("file")
         val idx = frameJson.optInt("index", index)
         if (file.isNotBlank()) {
             localFrameMap[idx to file] = frameJson
+            localFrameByFile[file] = frameJson
         }
     }
 
@@ -927,13 +952,17 @@ private fun mergeClassicFrameAlignmentIntoLockedJob(
             val key = idx to file
             if (file.isBlank()) return@repeat
 
-            val localFrame = localFrameMap[key]
+            val localFrame = localFrameMap[key] ?: localFrameByFile[file]
             if (localFrame == null) return@repeat
 
             // Copy only Classic-owned alignment/fusion fields; preserve everything else
+            // For touched frames, also remove absent Classic-owned fields
+            val touched = true
             classicYuvPerFrameAlignmentFields.forEach { field ->
                 if (localFrame.has(field)) {
                     lockedFrame.put(field, localFrame.get(field))
+                } else if (touched) {
+                    lockedFrame.remove(field)
                 }
             }
         }
@@ -1360,8 +1389,9 @@ private val classicYuvFailureTerminalKeys: Set<String> = setOf(
 )
 
 // Narrow set of stale final/output/gallery fields to clear on NORMAL failure.
+// Preserves identity, diagnostic, and current-run fields.
 private val classicYuvStaleFinalOutputKeys: Set<String> = setOf(
-    "jobType", "userCanMoveDevice", "yuvFusionVersion", "fusionParamsVersion", "fusionPresetName",
+    "userCanMoveDevice", "yuvFusionVersion", "fusionParamsVersion", "fusionPresetName",
     "fusionParams", "nativeAlignmentAvailable", "nativeAlignmentUsed", "alignmentVersion",
     "yuvAlignVersion", "yuvMergeVersion", "yuvDenoiseVersion", "yuvDetailVersion", "yuvSharpenVersion",
     "yuvLookVersion", "fallbackAlignmentCount", "lowConfidenceAlignmentCount", "usedFrameCount",
@@ -1373,7 +1403,7 @@ private val classicYuvStaleFinalOutputKeys: Set<String> = setOf(
     "outputWidth", "outputHeight", "frameCount", "yuvWidth", "yuvHeight",
     "lumaDenoiseStrength", "chromaDenoiseStrength", "lowLightChromaBoost", "adaptiveSharpenUsed",
     "blackPoint", "contrastCurve", "saturationBoost", "vibranceBoost", "localContrastAmount",
-    "processedAt", "processingNotes",
+    "processingNotes",
     "yuvExternalFrameWeightsUsed", "yuvExternalFrameWeightsTarget",
     "referenceFrameDebugFile", "yuvReferencePreviewFile", "fusedClassicDebugFile", "yuvFusedPreviewFile",
     "yuvFusedBeforeDenoisePreviewFile", "yuvFusedAfterDenoiseNoSharpenPreviewFile", "yuvFinalPreviewFile",
