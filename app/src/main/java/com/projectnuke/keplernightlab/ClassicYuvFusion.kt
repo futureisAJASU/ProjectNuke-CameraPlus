@@ -157,10 +157,10 @@ internal fun processClassicYuvFusionJob(
                 throw oom
             } catch (ce: CancellationException) {
                 throw ce
-            } catch (e: Exception) {
-                val frameJson = job.optJSONArray("frames")?.optJSONObject(frame.jsonIndex)
-                frameJson?.let { clearClassicFrameAlignmentOnDecodeFailure(it, "${e.javaClass.simpleName}: ${e.message}") }
-                null
+        } catch (e: Exception) {
+            val frameJson = job.optJSONArray("frames")?.optJSONObject(frame.jsonIndex)
+            frameJson?.let { clearClassicFrameAlignmentOnDecodeFailure(jobDir, it, frame.file.name, "${e.javaClass.simpleName}: ${e.message}") }
+            null
             }
         }
         decodedUsableFrameCount = frames.size
@@ -241,6 +241,8 @@ internal fun processClassicYuvFusionJob(
         markStage("YUV_MERGING", "YUV 프레임을 합성하는 중입니다.")
         cancellation.throwIfCancelled()
         val mergeResult = mergeClassicFrames(
+            job = job,
+            jobDir = jobDir,
             frames = compatibleFrames,
             reference = activeReference,
             width = dimensions.first,
@@ -638,6 +640,8 @@ private fun alignmentMad(
 }
 
 private fun mergeClassicFrames(
+    job: JSONObject,
+    jobDir: File,
     frames: List<ClassicFrame>,
     reference: ClassicFrame,
     width: Int,
@@ -689,20 +693,30 @@ private fun mergeClassicFrames(
                 sumW[pixel] = params.referenceWeight
             }
 
-            frames.forEachIndexed { frameIndex, frame ->
-                cancellation.throwIfCancelled()
-                if (frame === reference) return@forEachIndexed
-                if (reportedMergeFrames.add(frame.jsonIndex)) {
-                    onStatus("Classic YUV fusion: merging frame ${frameIndex + 1}/${frames.size}...")
-                }
-                val sourceLeft = max(0, frame.alignDx)
-                val sourceTop = max(0, tileTop + frame.alignDy)
-                val sourceRight = min(width, width + frame.alignDx)
-                val sourceBottom = min(height, tileBottom + frame.alignDy)
-                if (sourceRight <= sourceLeft || sourceBottom <= sourceTop) return@forEachIndexed
-                val region = Rect(sourceLeft, sourceTop, sourceRight, sourceBottom)
-                val frameBitmap = decoders.getValue(frame).decodeRegion(region, BitmapFactory.Options())
-                    ?: return@forEachIndexed
+    frames.forEachIndexed { frameIndex, frame ->
+        cancellation.throwIfCancelled()
+        if (frame === reference) return@forEachIndexed
+        
+        // Skip frames whose current locked metadata is disabled or excludedByUser=true
+        val lockedFrame = job.optJSONArray("frames")?.optJSONObject(frame.jsonIndex)
+        if (lockedFrame != null && (
+            !lockedFrame.getBoolean("enabled") ||
+            lockedFrame.optBoolean("excludedByUser", false)
+        )) {
+            return@forEachIndexed
+        }
+        
+        if (reportedMergeFrames.add(frame.jsonIndex)) {
+            onStatus("Classic YUV fusion: merging frame ${frameIndex + 1}/${frames.size}...")
+        }
+        val sourceLeft = max(0, frame.alignDx)
+        val sourceTop = max(0, tileTop + frame.alignDy)
+        val sourceRight = min(width, width + frame.alignDx)
+        val sourceBottom = min(height, tileBottom + frame.alignDy)
+        if (sourceRight <= sourceLeft || sourceBottom <= sourceTop) return@forEachIndexed
+        val region = Rect(sourceLeft, sourceTop, sourceRight, sourceBottom)
+        val frameBitmap = decoders.getValue(frame).decodeRegion(region, BitmapFactory.Options())
+            ?: return@forEachIndexed
                 val (frameWidth, frameHeight, framePixels) = try {
                     val frameWidth = frameBitmap.width
                     val frameHeight = frameBitmap.height
@@ -916,7 +930,7 @@ private fun resetClassicFrameMetadataForCurrentRun(jobDir: File, job: JSONObject
         resetClassicFrameAlignmentFields(frame)
         val fileName = frame.optString("file")
         if (fileName.isBlank() || !File(jobDir, fileName).isFile) {
-            clearClassicFrameAlignmentOnDecodeFailure(frame, "MISSING_FILE")
+            clearClassicFrameAlignmentOnDecodeFailure(jobDir, frame, fileName, "MISSING_FILE")
         }
     }
 }
@@ -929,14 +943,19 @@ private fun resetClassicFrameAlignmentFields(frameJson: JSONObject) {
 }
 
 /** Clears stale alignment data on decode failure and sets the current failure reason. */
-private fun clearClassicFrameAlignmentOnDecodeFailure(frameJson: JSONObject, reason: String) {
+private fun clearClassicFrameAlignmentOnDecodeFailure(jobDir: File, frameJson: JSONObject, fileName: String, reason: String) {
     classicYuvPerFrameAlignmentFields.forEach { field ->
         frameJson.remove(field)
     }
+    // Determine the appropriate failure reason based on the decode failure
+    val frameFile = File(jobDir, fileName)
+    val alignmentFailureReason = if (fileName.isBlank() || !frameFile.isFile) "MISSING_FILE" else reason
+    val fusionSkipReason = if (fileName.isBlank() || !frameFile.isFile) "MISSING_FILE" else "DECODE_FAILED"
+    
     frameJson.put("alignmentUsed", false)
         .put("fusionUsed", false)
-        .put("alignmentFailureReason", reason)
-        .put("fusionSkipReason", "DECODE_FAILED")
+        .put("alignmentFailureReason", alignmentFailureReason)
+        .put("fusionSkipReason", fusionSkipReason)
 }
 
 /** Updates alignment metadata and clears stale failure reason on success. */
@@ -1388,7 +1407,8 @@ private fun recordClassicFailure(
             .put("fusionParamsVersion", CLASSIC_YUV_FUSION_PARAMS_VERSION)
             .put("fusionPresetName", params.presetName)
             .put("fusionParams", params.toJson())
-            .put("userCanMoveDevice", userCanMoveDevice)
+            // On NORMAL failure, persist userCanMoveDevice=true as the current terminal state
+        .put("userCanMoveDevice", true)
             .put("processedAt", now)
             .put("processingStartedAt", processingStartedAt)
             .put("processingTimeMs", now - processingStartedAt)
@@ -1490,9 +1510,10 @@ private val classicYuvFailureTerminalKeys: Set<String> = setOf(
 // Narrow set of stale final/output/gallery fields to clear on NORMAL failure.
 // Preserves identity, diagnostic, current-run fields, timing, counters, params, algorithm versions.
 private val classicYuvStaleFinalOutputKeys: Set<String> = setOf(
-    "averageColorFile", "finalNightFusionFile", "finalFile", "finalOutputSource",
-    "galleryDisplayFile", "galleryThumbnailFile"
-)
+        "averageColorFile", "finalNightFusionFile", "finalFile", "finalOutputSource",
+        "galleryDisplayFile", "galleryThumbnailFile", "galleryDisplaySource",
+        "isDebugPreviewUsedAsFinal"
+    )
 
 // Classic-owned per-frame alignment/fusion fields to merge into locked frames array
 private val classicYuvPerFrameAlignmentFields: Set<String> = setOf(
