@@ -80,11 +80,9 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -420,33 +418,42 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var refreshGeneration by remember { mutableIntStateOf(0) }
     var refreshJob by remember { mutableStateOf<Job?>(null) }
 
-    suspend fun refreshLatestResult(showPreview: Boolean = false) {
-        refreshMutex.withLock {
-            val generation = ++refreshGeneration
-            refreshJob?.cancel()
-            refreshJob = cameraScope.launch {
+    fun refreshLatestResult(showPreview: Boolean = false) {
+        val generation = ++refreshGeneration
+        refreshJob?.cancel()
+        refreshJob = cameraScope.launch {
+            refreshMutex.withLock {
                 var ownedBitmap: Bitmap? = null
+                var result: LatestKeplerResult? = null
+                var estimate: LatestSceneEstimate? = null
                 try {
-                    val (result, estimate) = withContext(Dispatchers.IO) {
-                        loadLatestKeplerResultV2(context) to estimateLatestColorBurstScene(context)
+                    val loaded = withContext(Dispatchers.IO) {
+                        val r = loadLatestKeplerResultV2(context)
+                        val isAllowed = isAllowedPreviewExtension(r.fileName) && !isDebugPreviewFinalBlocked(r.fileName)
+                        if (r.bitmap != null && !r.bitmap!!.isRecycled && isAllowed) {
+                            ownedBitmap = r.bitmap
+                        } else {
+                            r.bitmap?.recycle()
+                        }
+                        val e = estimateLatestColorBurstScene(context)
+                        Triple(r, e, isAllowed)
                     }
-                    if (!currentCoroutineContext().isActive || generation != refreshGeneration) {
-                        result.bitmap?.takeIf { !it.isRecycled }?.recycle()
+                    result = loaded.first
+                    estimate = loaded.second
+                    val isAllowed = loaded.third
+
+                    if (currentCoroutineContext()[Job]?.isActive != true || generation != refreshGeneration) {
+                        ownedBitmap?.takeIf { !it.isRecycled }?.recycle()
                         return@launch
                     }
-                    val isAllowed = isAllowedPreviewExtension(result.fileName) && !isDebugPreviewFinalBlocked(result.fileName)
-                    if (result.bitmap != null && !result.bitmap!!.isRecycled && isAllowed) {
-                        ownedBitmap = result.bitmap
-                    } else {
-                        result.bitmap?.recycle()
-                    }
+
                     if (ownedBitmap != null) {
                         val oldBitmap = latestBitmap
                         if (oldBitmap != null && !oldBitmap.isRecycled && oldBitmap !== ownedBitmap) {
                             oldBitmap.recycle()
                         }
                         latestBitmap = ownedBitmap
-                        latestResult = result.copy(bitmap = ownedBitmap)
+                        latestResult = result!!.copy(bitmap = ownedBitmap)
                         ownedBitmap = null
                     } else {
                         val oldBitmap = latestBitmap
@@ -454,11 +461,11 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
                             oldBitmap.recycle()
                         }
                         latestBitmap = null
-                        latestResult = result.copy(bitmap = null)
+                        latestResult = result!!.copy(bitmap = null)
                     }
-                    latestSummary = result.summary
-                    latestSceneLuma = estimate.meanLuma
-                    latestMotionScore = estimate.motionScore
+                    latestSummary = result!!.summary
+                    latestSceneLuma = estimate!!.meanLuma
+                    latestMotionScore = estimate!!.motionScore
                     if (showPreview && isAllowed) {
                         showResultPreview = true
                     }
@@ -482,7 +489,7 @@ DisposableEffect(Unit) {
 
 LaunchedEffect(Unit) {
         Log.d("KeplerSmoke", "CameraScreen mounted")
-        cameraScope.launch { refreshLatestResult() }
+        refreshLatestResult()
     }
 
     LaunchedEffect(isPipelineBusy) {
@@ -675,14 +682,14 @@ LaunchedEffect(Unit) {
                 val terminalSuccess =
                     newStatus.trimStart().startsWith("PIPELINE_COMPLETE", ignoreCase = true) ||
                         newStatus.trimStart().startsWith("EXPORT_COMPLETE", ignoreCase = true)
-                mainHandler.removeCallbacks(watchdog)
+mainHandler.removeCallbacks(watchdog)
                 activeWatchdog.compareAndSet(watchdog, null)
                 activeCancellationToken.compareAndSet(cancellationToken, null)
                 activeCaptureCancellation.compareAndSet(captureCancellationHandle, null)
                 if (timedOutGeneration == localGeneration) timedOutGeneration = -1
-isPipelineBusy = false
+                isPipelineBusy = false
                 isCapturing = false
-                cameraScope.launch { refreshLatestResult(showPreview = terminalSuccess) }
+                refreshLatestResult(showPreview = terminalSuccess)
                 Log.i("KeplerPipelineState", "pipeline final terminalSuccess=$terminalSuccess status=$newStatus")
 
                 mainHandler.postDelayed(
