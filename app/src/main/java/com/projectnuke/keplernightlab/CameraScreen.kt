@@ -2679,16 +2679,6 @@ private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
         }
 }
 
-private fun hasCurrentPreviewFile(jobDir: File, job: JSONObject): Boolean =
-    listOf(
-        job.optString("galleryDisplayFile", ""),
-        job.optString("galleryThumbnailFile", ""),
-        job.optString("previewFile", "")
-    ).asSequence()
-        .filter { it.isNotBlank() && it != "null" }
-        .map { File(jobDir, it) }
-        .any(::isCurrentPreviewFile)
-
 private fun isCurrentPreviewFile(file: File): Boolean =
     file.isFile && file.length() > 0L &&
         file.extension.lowercase() in setOf("jpg", "jpeg", "png", "heic", "webp") &&

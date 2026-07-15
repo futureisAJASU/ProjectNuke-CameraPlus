@@ -117,14 +117,10 @@ internal fun processClassicYuvFusionJob(
             job.put("currentPipelineStage", stage)
                 .put("processStatus", status)
                 .put("processingStartedAt", processingStartedAt)
-            if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-                KeplerJobMetadata.write(jobDir, job)
-            } else {
-                KeplerJobMetadata.update(jobDir) { current ->
-                    current.put("currentPipelineStage", stage)
-                        .put("processStatus", status)
-                        .put("processingStartedAt", processingStartedAt)
-                }
+            KeplerJobMetadata.update(jobDir) { current ->
+                current.put("currentPipelineStage", stage)
+                    .put("processStatus", status)
+                    .put("processingStartedAt", processingStartedAt)
             }
             Log.i("KeplerYuvPipeline", "$stage: $status")
             onStatus(status)
@@ -136,18 +132,10 @@ internal fun processClassicYuvFusionJob(
         cancellation.throwIfCancelled()
         preflight = preflightSummary
         job.put("yuvProcessingPreflight", preflightSummary.toJson())
-        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
-                current.put("yuvProcessingPreflight", preflightSummary.toJson())
-                    .put("processingStartedAt", job.optLong("processingStartedAt"))
-                    .put("yuvProcessingPolicy", metadataPolicy.name)
-            }
-        } else {
-            KeplerJobMetadata.update(jobDir) { current ->
-                current.put("yuvProcessingPreflight", preflightSummary.toJson())
-                    .put("processingStartedAt", job.optLong("processingStartedAt"))
-                    .put("yuvProcessingPolicy", metadataPolicy.name)
-            }
+        KeplerJobMetadata.update(jobDir) { current ->
+            current.put("yuvProcessingPreflight", preflightSummary.toJson())
+                .put("processingStartedAt", job.optLong("processingStartedAt"))
+                .put("yuvProcessingPolicy", metadataPolicy.name)
         }
         cancellation.throwIfCancelled()
         val candidateFrames = loadClassicFrames(jobDir, job)
@@ -405,25 +393,11 @@ internal fun processClassicYuvFusionJob(
         }
         cancellation.throwIfCancelled()
         File(jobDir, "yuv_debug.json").writeText(job.toString(2))
-        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
-                listOf(
-                    "yuvProcessingPreflight", "processingStartedAt", "debugArtifactStatus",
-                    "debugArtifactError", "yuvProcessingTotalFrames", "yuvProcessingEnabledFrames",
-                    "yuvProcessingDecodedUsableFrames", "yuvProcessingSameSizeFrames",
-                    "yuvProcessingCompatibleFrames"
-                ).forEach { key -> if (job.has(key)) current.put(key, job.get(key)) }
-            }
-        } else {
-            KeplerJobMetadata.update(jobDir) { current ->
-                listOf(
-                    "yuvProcessingPreflight", "processingStartedAt", "debugArtifactStatus",
-                    "debugArtifactError", "yuvProcessingTotalFrames", "yuvProcessingEnabledFrames",
-                    "yuvProcessingDecodedUsableFrames", "yuvProcessingSameSizeFrames",
-                    "yuvProcessingCompatibleFrames"
-                ).forEach { key -> if (job.has(key)) current.put(key, job.get(key)) }
-            }
-        }
+        persistClassicYuvSuccess(
+            jobDir = jobDir,
+            job = job,
+            metadataPolicy = metadataPolicy
+        )
         cancellation.throwIfCancelled()
         onStatus("처리가 완료되었습니다.")
         return finalFile
@@ -1274,19 +1248,83 @@ private fun recordClassicFailure(
                 .put("yuvProcessingSameSizeFrames", it.sameSizeFrames)
                 .put("yuvProcessingCompatibleFrames", it.compatibleFrames)
         }
-        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
-                current.put("debugArtifactStatus", job.optString("debugArtifactStatus"))
-                    .put("debugArtifactError", job.optString("debugArtifactError"))
-                    .put("yuvProcessingPreflight", job.optJSONObject("yuvProcessingPreflight") ?: JSONObject.NULL)
-            }
-        } else {
-            KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
-                current.put("debugArtifactStatus", job.optString("debugArtifactStatus"))
-                    .put("debugArtifactError", job.optString("debugArtifactError"))
-                    .put("yuvProcessingPreflight", job.optJSONObject("yuvProcessingPreflight") ?: JSONObject.NULL)
-            }
-        }
+        persistClassicYuvFailure(
+            jobDir = jobFile.parentFile ?: error("Job directory missing"),
+            job = job,
+            metadataPolicy = metadataPolicy
+        )
+    }
+}
+
+private const val CLASSIC_YUV_PROGRESS_KEYS =
+    "currentPipelineStage,processStatus,processingStartedAt,yuvProcessingPreflight,yuvProcessingPolicy," +
+        "yuvProcessingTotalFrames,yuvProcessingEnabledFrames,yuvProcessingDecodedUsableFrames," +
+        "yuvProcessingSameSizeFrames,yuvProcessingCompatibleFrames,timing,processingTimeMs," +
+        "debugArtifactStatus,debugArtifactError,fusionDebugFile,yuvDebugFile,fusionAlignmentSummary"
+
+private val classicYuvProgressKeys: Set<String> = CLASSIC_YUV_PROGRESS_KEYS.split(',').toSet()
+
+private val classicYuvSuccessNormalKeys: Set<String> = setOf(
+    "jobType", "currentPipelineStage", "userCanMoveDevice", "processingStartedAt", "processStatus",
+    "fusionEngine", "fusionVersion", "yuvFusionVersion", "fusionParamsVersion", "fusionPresetName",
+    "fusionParams", "nativeAlignmentAvailable", "nativeAlignmentUsed", "alignmentVersion",
+    "yuvAlignVersion", "yuvMergeVersion", "yuvDenoiseVersion", "yuvDetailVersion", "yuvSharpenVersion",
+    "yuvLookVersion", "fallbackAlignmentCount", "lowConfidenceAlignmentCount",
+    "usedFrameCount", "acceptedFrameCount", "rejectedFrameCount", "excludedFrameCount", "skippedFrameCount",
+    "referenceFrameIndex", "yuvReferenceFrameIndex", "ghostSuppressionUsed", "ghostSuppressionEnabled",
+    "ghostRejectedPixelRatio", "rejectedGhostSampleRatio", "averageColorFile", "finalNightFusionFile",
+    "finalFile", "finalOutputSource", "galleryDisplayFile", "galleryThumbnailFile", "galleryDisplaySource",
+    "isDebugPreviewUsedAsFinal", "yuvFusionLooksWorseHint", "yuvQualityDiagnosticHints",
+    "processingTimeMs", "outputWidth", "outputHeight", "frameCount", "yuvWidth", "yuvHeight",
+    "lumaDenoiseStrength", "chromaDenoiseStrength", "lowLightChromaBoost", "adaptiveSharpenUsed",
+    "blackPoint", "contrastCurve", "saturationBoost", "vibranceBoost", "localContrastAmount",
+    "timing", "processedAt", "processingNotes",
+    "yuvProcessingPreflight", "yuvProcessingPolicy", "yuvProcessingTotalFrames", "yuvProcessingEnabledFrames",
+    "yuvProcessingDecodedUsableFrames", "yuvProcessingSameSizeFrames", "yuvProcessingCompatibleFrames",
+    "yuvExternalFrameWeightsUsed", "yuvExternalFrameWeightsTarget",
+    "debugArtifactStatus", "debugArtifactError", "fusionDebugFile", "yuvDebugFile", "fusionAlignmentSummary",
+    "referenceFrameDebugFile", "yuvReferencePreviewFile", "fusedClassicDebugFile", "yuvFusedPreviewFile",
+    "yuvFusedBeforeDenoisePreviewFile", "yuvFusedAfterDenoiseNoSharpenPreviewFile", "yuvFinalPreviewFile",
+    "fusedClassicPresetFile", "comparisonDebugFile", "yuvComparePreviewFile",
+    "yuvCompareReferenceVsFinalFile"
+)
+
+private val classicYuvFailureNormalKeys: Set<String> = setOf(
+    "currentPipelineStage", "processStatus", "pipelineFailed", "pipelineFailureStatusCode",
+    "pipelineFailureSource", "pipelineFailureType", "pipelineFailureMessage", "pipelineFailureStackTrace",
+    "processFailureReason", "fusionEngine", "fusionVersion", "processedAt",
+    "yuvProcessingPreflight", "yuvProcessingPolicy", "yuvProcessingTotalFrames", "yuvProcessingEnabledFrames",
+    "yuvProcessingDecodedUsableFrames", "yuvProcessingSameSizeFrames", "yuvProcessingCompatibleFrames",
+    "processingStartedAt", "debugArtifactStatus", "debugArtifactError", "timing", "processingTimeMs"
+)
+
+private fun persistClassicYuvSuccess(
+    jobDir: File,
+    job: JSONObject,
+    metadataPolicy: ReprocessMetadataPolicy
+) {
+    val keys = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+        classicYuvSuccessNormalKeys
+    } else {
+        classicYuvProgressKeys
+    }
+    KeplerJobMetadata.update(jobDir) { current ->
+        keys.forEach { key -> if (job.has(key)) current.put(key, job.get(key)) }
+    }
+}
+
+private fun persistClassicYuvFailure(
+    jobDir: File,
+    job: JSONObject,
+    metadataPolicy: ReprocessMetadataPolicy
+) {
+    val keys = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+        classicYuvFailureNormalKeys
+    } else {
+        classicYuvProgressKeys
+    }
+    KeplerJobMetadata.update(jobDir) { current ->
+        keys.forEach { key -> if (job.has(key)) current.put(key, job.get(key)) }
     }
 }
 
