@@ -397,9 +397,7 @@ internal fun processClassicYuvFusionJob(
         persistClassicYuvSuccess(
             jobDir = jobDir,
             job = job,
-            metadataPolicy = metadataPolicy,
-            frames = frames,
-            params = params
+            metadataPolicy = metadataPolicy
         )
         cancellation.throwIfCancelled()
         onStatus("처리가 완료되었습니다.")
@@ -900,50 +898,45 @@ private fun updateAlignmentMetadata(
 }
 
 /** Merges Classic-owned per-frame alignment/fusion fields into the LOCKED job.json's frames array
- *  by stable identity (index + file name). Copies only Classic alignment/fusion fields;
+ *  by stable identity (JSON index field + file name). Copies only Classic alignment/fusion fields;
  *  preserves exclusion, selection, quality, and unrelated frame metadata.
  *  Merges ALL frames that have alignment data in the local job, including rejected and decode-failed frames. */
 private fun mergeClassicFrameAlignmentIntoLockedJob(
     jobDir: File,
-    localJob: JSONObject,
-    frames: List<ClassicFrame>,
-    params: ClassicYuvFusionParams
+    localJob: JSONObject
 ) {
-    // Read the locked job.json to get the current frames array
-    val lockedJob = KeplerJobMetadata.read(jobDir)
-    val lockedFrames = lockedJob.optJSONArray("frames") ?: return
-
     // Build a map of local frames by stable identity: (index, file) -> frame JSON from local job
     val localFrames = localJob.optJSONArray("frames") ?: return
     val localFrameMap = mutableMapOf<Pair<Int, String>, JSONObject>()
     repeat(localFrames.length()) { index ->
         val frameJson = localFrames.optJSONObject(index) ?: return@repeat
         val file = frameJson.optString("file")
+        val idx = frameJson.optInt("index", index)
         if (file.isNotBlank()) {
-            localFrameMap[index to file] = frameJson
+            localFrameMap[idx to file] = frameJson
         }
     }
 
-    // Merge into locked frames by stable identity
-    repeat(lockedFrames.length()) { index ->
-        val lockedFrame = lockedFrames.optJSONObject(index) ?: return@repeat
-        val file = lockedFrame.optString("file")
-        val key = index to file
+    // Merge into locked frames by stable identity, inside the update lock
+    KeplerJobMetadata.update(jobDir) { current ->
+        val lockedFrames = current.optJSONArray("frames") ?: return@update
+        repeat(lockedFrames.length()) { index ->
+            val lockedFrame = lockedFrames.optJSONObject(index) ?: return@repeat
+            val file = lockedFrame.optString("file")
+            val idx = lockedFrame.optInt("index", index)
+            val key = idx to file
+            if (file.isBlank()) return@repeat
 
-        val localFrame = localFrameMap[key]
-        if (localFrame == null) return@repeat
+            val localFrame = localFrameMap[key]
+            if (localFrame == null) return@repeat
 
-        // Copy only Classic-owned alignment/fusion fields; preserve everything else
-        classicYuvPerFrameAlignmentFields.forEach { field ->
-            if (localFrame.has(field)) {
-                lockedFrame.put(field, localFrame.get(field))
+            // Copy only Classic-owned alignment/fusion fields; preserve everything else
+            classicYuvPerFrameAlignmentFields.forEach { field ->
+                if (localFrame.has(field)) {
+                    lockedFrame.put(field, localFrame.get(field))
+                }
             }
         }
-    }
-
-    // Write back the merged frames array
-    KeplerJobMetadata.update(jobDir) { current ->
-        current.put("frames", lockedFrames)
     }
 }
 
@@ -1366,14 +1359,14 @@ private val classicYuvFailureTerminalKeys: Set<String> = setOf(
     "pipelineFailureType", "pipelineFailureMessage", "pipelineFailureStackTrace", "processFailureReason"
 )
 
-private val classicYuvSuccessTerminalKeys: Set<String> = setOf(
-    "jobType", "userCanMoveDevice", "fusionEngine", "fusionVersion", "yuvFusionVersion",
-    "fusionParamsVersion", "fusionPresetName", "fusionParams", "nativeAlignmentAvailable",
-    "nativeAlignmentUsed", "alignmentVersion", "yuvAlignVersion", "yuvMergeVersion",
-    "yuvDenoiseVersion", "yuvDetailVersion", "yuvSharpenVersion", "yuvLookVersion",
-    "fallbackAlignmentCount", "lowConfidenceAlignmentCount", "usedFrameCount", "acceptedFrameCount",
-    "rejectedFrameCount", "excludedFrameCount", "skippedFrameCount", "referenceFrameIndex",
-    "yuvReferenceFrameIndex", "ghostSuppressionUsed", "ghostSuppressionEnabled",
+// Narrow set of stale final/output/gallery fields to clear on NORMAL failure.
+private val classicYuvStaleFinalOutputKeys: Set<String> = setOf(
+    "jobType", "userCanMoveDevice", "yuvFusionVersion", "fusionParamsVersion", "fusionPresetName",
+    "fusionParams", "nativeAlignmentAvailable", "nativeAlignmentUsed", "alignmentVersion",
+    "yuvAlignVersion", "yuvMergeVersion", "yuvDenoiseVersion", "yuvDetailVersion", "yuvSharpenVersion",
+    "yuvLookVersion", "fallbackAlignmentCount", "lowConfidenceAlignmentCount", "usedFrameCount",
+    "acceptedFrameCount", "rejectedFrameCount", "excludedFrameCount", "skippedFrameCount",
+    "referenceFrameIndex", "yuvReferenceFrameIndex", "ghostSuppressionUsed", "ghostSuppressionEnabled",
     "ghostRejectedPixelRatio", "rejectedGhostSampleRatio", "averageColorFile", "finalNightFusionFile",
     "finalFile", "finalOutputSource", "galleryDisplayFile", "galleryThumbnailFile", "galleryDisplaySource",
     "isDebugPreviewUsedAsFinal", "yuvFusionLooksWorseHint", "yuvQualityDiagnosticHints",
@@ -1399,13 +1392,11 @@ private val classicYuvPerFrameAlignmentFields: Set<String> = setOf(
 private fun persistClassicYuvSuccess(
     jobDir: File,
     job: JSONObject,
-    metadataPolicy: ReprocessMetadataPolicy,
-    frames: List<ClassicFrame> = emptyList(),
-    params: ClassicYuvFusionParams? = null
+    metadataPolicy: ReprocessMetadataPolicy
 ) {
     // Merge per-frame alignment data into locked job's frames array for NORMAL
     if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-        params?.let { mergeClassicFrameAlignmentIntoLockedJob(jobDir, job, frames, it) }
+        mergeClassicFrameAlignmentIntoLockedJob(jobDir, job)
     }
     val keysToWrite = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
         classicYuvSuccessOwnedKeys
@@ -1430,13 +1421,11 @@ private fun persistClassicYuvSuccess(
 private fun persistClassicYuvFailure(
     jobDir: File,
     job: JSONObject,
-    metadataPolicy: ReprocessMetadataPolicy,
-    frames: List<ClassicFrame> = emptyList(),
-    params: ClassicYuvFusionParams? = null
+    metadataPolicy: ReprocessMetadataPolicy
 ) {
     // Merge per-frame alignment data into locked job's frames array for NORMAL
     if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-        params?.let { mergeClassicFrameAlignmentIntoLockedJob(jobDir, job, frames, it) }
+        mergeClassicFrameAlignmentIntoLockedJob(jobDir, job)
     }
     val keysToWrite = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
         classicYuvFailureOwnedKeys
@@ -1452,7 +1441,7 @@ private fun persistClassicYuvFailure(
         }
         // On NORMAL failure, clear only stale final/gallery/output keys; KEEP failure diagnostics
         if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            classicYuvSuccessTerminalKeys.forEach { current.remove(it) }
+            classicYuvStaleFinalOutputKeys.forEach { current.remove(it) }
         }
     }
 }
