@@ -87,6 +87,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
@@ -419,69 +420,69 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var refreshGeneration by remember { mutableIntStateOf(0) }
     var refreshJob by remember { mutableStateOf<Job?>(null) }
 
-    fun refreshLatestResult(showPreview: Boolean = false) {
-        cameraScope.launch {
-            refreshMutex.lock()
-            try {
-                val generation = ++refreshGeneration
-                refreshJob?.cancel()
-                refreshJob = cameraScope.launch {
-                    // Load result & estimate on IO dispatcher
+    suspend fun refreshLatestResult(showPreview: Boolean = false) {
+        refreshMutex.withLock {
+            val generation = ++refreshGeneration
+            refreshJob?.cancel()
+            refreshJob = cameraScope.launch {
+                var ownedBitmap: Bitmap? = null
+                try {
                     val (result, estimate) = withContext(Dispatchers.IO) {
                         loadLatestKeplerResultV2(context) to estimateLatestColorBurstScene(context)
                     }
-                    // Cancellation check
                     if (!currentCoroutineContext().isActive || generation != refreshGeneration) {
                         result.bitmap?.takeIf { !it.isRecycled }?.recycle()
                         return@launch
                     }
-                    // Bitmap handling with adoption logic
-                    val loadedBitmap = result.bitmap
                     val isAllowed = isAllowedPreviewExtension(result.fileName) && !isDebugPreviewFinalBlocked(result.fileName)
-                    // Always adopt for thumbnail if bitmap is valid
-                    val adoptedForThumbnail = loadedBitmap != null && !loadedBitmap.isRecycled && isAllowed
-                    // For preview card, only if showPreview and allowed
-                    val adoptedForPreview = showPreview && isAllowed
-                    try {
-                        if (adoptedForThumbnail) {
-                            val oldBitmap = latestBitmap
-                            if (oldBitmap != null && !oldBitmap.isRecycled && oldBitmap !== loadedBitmap) {
-                                oldBitmap.recycle()
-                            }
-                            latestBitmap = loadedBitmap
-                        } else {
-                            loadedBitmap?.recycle()
-                        }
-                        // Update UI fields
-                        latestSummary = result.summary
-                        latestResult = result
-                        latestSceneLuma = estimate.meanLuma
-                        latestMotionScore = estimate.motionScore
-                        if (adoptedForPreview) {
-                            showResultPreview = true
-                        }
-                    } finally {
-                        // If we didn't adopt for thumbnail, ensure bitmap recycled (already handled)
-                        // No extra action needed
+                    if (result.bitmap != null && !result.bitmap!!.isRecycled && isAllowed) {
+                        ownedBitmap = result.bitmap
+                    } else {
+                        result.bitmap?.recycle()
                     }
+                    if (ownedBitmap != null) {
+                        val oldBitmap = latestBitmap
+                        if (oldBitmap != null && !oldBitmap.isRecycled && oldBitmap !== ownedBitmap) {
+                            oldBitmap.recycle()
+                        }
+                        latestBitmap = ownedBitmap
+                        latestResult = result.copy(bitmap = ownedBitmap)
+                        ownedBitmap = null
+                    } else {
+                        val oldBitmap = latestBitmap
+                        if (oldBitmap != null && !oldBitmap.isRecycled) {
+                            oldBitmap.recycle()
+                        }
+                        latestBitmap = null
+                        latestResult = result.copy(bitmap = null)
+                    }
+                    latestSummary = result.summary
+                    latestSceneLuma = estimate.meanLuma
+                    latestMotionScore = estimate.motionScore
+                    if (showPreview && isAllowed) {
+                        showResultPreview = true
+                    }
+                } finally {
+                    ownedBitmap?.takeIf { !it.isRecycled }?.recycle()
                 }
-            } finally {
-                refreshMutex.unlock()
             }
         }
     }
 
-    DisposableEffect(Unit) {
+DisposableEffect(Unit) {
         onDispose {
             ++refreshGeneration
             refreshJob?.cancel()
             latestBitmap?.takeIf { !it.isRecycled }?.recycle()
+            latestBitmap = null
+            latestResult = null
+            showResultPreview = false
         }
     }
 
-    LaunchedEffect(Unit) {
+LaunchedEffect(Unit) {
         Log.d("KeplerSmoke", "CameraScreen mounted")
-        refreshLatestResult()
+        cameraScope.launch { refreshLatestResult() }
     }
 
     LaunchedEffect(isPipelineBusy) {
@@ -679,9 +680,9 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
                 activeCancellationToken.compareAndSet(cancellationToken, null)
                 activeCaptureCancellation.compareAndSet(captureCancellationHandle, null)
                 if (timedOutGeneration == localGeneration) timedOutGeneration = -1
-                isPipelineBusy = false
+isPipelineBusy = false
                 isCapturing = false
-                refreshLatestResult(showPreview = terminalSuccess)
+                cameraScope.launch { refreshLatestResult(showPreview = terminalSuccess) }
                 Log.i("KeplerPipelineState", "pipeline final terminalSuccess=$terminalSuccess status=$newStatus")
 
                 mainHandler.postDelayed(
@@ -993,8 +994,11 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
                 },
                 onClear = {
                     val deleted = deleteKeplerCache(context)
+                    latestBitmap?.takeIf { !it.isRecycled }?.recycle()
                     latestBitmap = null
+                    latestResult = null
                     latestSummary = "최근 결과 없음"
+                    showResultPreview = false
                     status = "캐시 삭제 완료 ($deleted)"
                 },
                 onThumbnail = {
@@ -2606,6 +2610,10 @@ private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
             !job.optBoolean("finalOutputAvailable", false))
     ) return null
 
+    // Block hard-coded fallback for reprocessed jobs; keep only for legacy never-reprocessed jobs
+    val isReprocessed = job.has("reprocessStatus") || job.has("reprocessCount") || job.has("reprocessAt")
+    if (isReprocessed) return null
+
     val names = listOf(
         job.optString("finalFile", ""),
         job.optString("outputFile", ""),
@@ -2639,7 +2647,7 @@ private fun hasCurrentPreviewFile(jobDir: File, job: JSONObject): Boolean =
 
 private fun isCurrentPreviewFile(file: File): Boolean =
     file.isFile && file.length() > 0L &&
-        file.extension.lowercase() in setOf("rgba", "jpg", "jpeg", "png", "heic", "webp") &&
+        file.extension.lowercase() in setOf("jpg", "jpeg", "png", "heic", "webp") &&
         !file.name.contains("compare", ignoreCase = true) &&
         !file.name.contains("debug", ignoreCase = true)
 

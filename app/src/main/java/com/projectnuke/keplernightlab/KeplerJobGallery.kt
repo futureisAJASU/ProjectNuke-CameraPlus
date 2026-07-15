@@ -631,11 +631,10 @@ private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
         }
             ?.let { return it }
     }
-    return directory.listFiles()
+return directory.listFiles()
         ?.filter {
                 it.isFile &&
                 isDisplayImageFile(it) &&
-                it.extension.equals("png", true) &&
                 !isSourceFrame(it) &&
                 !isDebugPreviewFinalBlocked(it.name)
         }
