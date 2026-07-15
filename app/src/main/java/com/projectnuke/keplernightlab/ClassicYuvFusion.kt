@@ -104,6 +104,9 @@ internal fun processClassicYuvFusionJob(
     val jobFile = File(jobDir, "job.json")
     val job = JSONObject(jobFile.readText())
     val params = (requestedParams ?: loadClassicYuvFusionParams(job)).clamped()
+    val userCanMoveDevice = job.optBoolean("userCanMoveDevice", true)
+    initializeClassicYuvRunMetadata(job, params, processingStartedAt)
+    resetClassicFrameMetadataForCurrentRun(jobDir, job)
     var merged: Bitmap? = null
     var finalBitmap: Bitmap? = null
     var preflight: ClassicYuvProcessingPreflight? = null
@@ -419,8 +422,11 @@ internal fun processClassicYuvFusionJob(
                 sameSizeFrameCountKnown = sameSizeFrameCountKnown,
                 compatibleFrameCountKnown = compatibleFrameCountKnown
             ),
-            preflight = failurePreflight
-            , metadataPolicy = metadataPolicy
+            preflight = failurePreflight,
+            params = params,
+            userCanMoveDevice = userCanMoveDevice,
+            processingStartedAt = processingStartedAt,
+            metadataPolicy = metadataPolicy
         )
         throw IllegalStateException("Classic YUV fusion failed: OutOfMemoryError; cache kept", oom)
     } catch (ce: CancellationException) {
@@ -441,8 +447,11 @@ internal fun processClassicYuvFusionJob(
                 sameSizeFrameCountKnown = sameSizeFrameCountKnown,
                 compatibleFrameCountKnown = compatibleFrameCountKnown
             ),
-            preflight = failurePreflight
-            , metadataPolicy = metadataPolicy
+            preflight = failurePreflight,
+            params = params,
+            userCanMoveDevice = userCanMoveDevice,
+            processingStartedAt = processingStartedAt,
+            metadataPolicy = metadataPolicy
         )
         throw e
     } finally {
@@ -872,6 +881,46 @@ private fun finishClassicFusion(
     }
 }
 
+private fun initializeClassicYuvRunMetadata(
+    job: JSONObject,
+    params: ClassicYuvFusionParams,
+    processingStartedAt: Long
+) {
+    classicYuvRunScopedKeys.forEach(job::remove)
+    job.put("jobType", "YUV_NIGHT_FUSION")
+        .put("fusionEngine", "classic_yuv_v1")
+        .put("fusionVersion", CLASSIC_FUSION_VERSION)
+        .put("yuvFusionVersion", "YUV_NIGHT_FUSION_V0")
+        .put("fusionParamsVersion", CLASSIC_YUV_FUSION_PARAMS_VERSION)
+        .put("fusionPresetName", params.presetName)
+        .put("fusionParams", params.toJson())
+        .put("nativeAlignmentAvailable", NativeFusionAlignment.isAvailable())
+        .put("alignmentVersion", "kotlin_integer_v1")
+        .put("yuvAlignVersion", "YUV_GLOBAL_SHIFT_V0")
+        .put("yuvMergeVersion", "YUV_TEMPORAL_GHOST_V0")
+        .put("yuvDenoiseVersion", "YUV_LUMA_CHROMA_EDGE_AWARE_V0")
+        .put("yuvDetailVersion", "YUV_LUMA_DETAIL_V0")
+        .put("yuvSharpenVersion", "YUV_ADAPTIVE_LUMA_SHARPEN_V0")
+        .put("yuvLookVersion", "YUV_NATURAL_NIGHT_LOOK_V0")
+        .put("processingStartedAt", processingStartedAt)
+}
+
+/** Resets current-run alignment/fusion fields for every enabled, non-excluded frame. */
+private fun resetClassicFrameMetadataForCurrentRun(jobDir: File, job: JSONObject) {
+    val frames = job.optJSONArray("frames") ?: return
+    repeat(frames.length()) { index ->
+        val frame = frames.optJSONObject(index) ?: return@repeat
+        if (!frame.optBoolean("enabled", true) || frame.optBoolean("excludedByUser", false)) {
+            return@repeat
+        }
+        resetClassicFrameAlignmentFields(frame)
+        val fileName = frame.optString("file")
+        if (fileName.isBlank() || !File(jobDir, fileName).isFile) {
+            clearClassicFrameAlignmentOnDecodeFailure(frame, "MISSING_FILE")
+        }
+    }
+}
+
 /** Resets all Classic-owned per-frame alignment/fusion fields before a new processing run. */
 private fun resetClassicFrameAlignmentFields(frameJson: JSONObject) {
     classicYuvPerFrameAlignmentFields.forEach { field ->
@@ -935,10 +984,13 @@ private fun mergeClassicFrameAlignmentIntoLockedJob(
     val localFrameByFile = mutableMapOf<String, JSONObject>()
     repeat(localFrames.length()) { index ->
         val frameJson = localFrames.optJSONObject(index) ?: return@repeat
+        if (!frameJson.optBoolean("enabled", true) || frameJson.optBoolean("excludedByUser", false)) {
+            return@repeat
+        }
         val file = frameJson.optString("file")
         val idx = frameJson.optInt("index", index)
+        localFrameMap[idx to file] = frameJson
         if (file.isNotBlank()) {
-            localFrameMap[idx to file] = frameJson
             localFileCount[file] = localFileCount.getOrDefault(file, 0) + 1
             if (localFileCount[file] == 1) localFrameByFile[file] = frameJson
         }
@@ -950,6 +1002,9 @@ private fun mergeClassicFrameAlignmentIntoLockedJob(
         val lockedFileCount = mutableMapOf<String, Int>()
         repeat(lockedFrames.length()) { index ->
             val lockedFrame = lockedFrames.optJSONObject(index) ?: return@repeat
+            if (!lockedFrame.optBoolean("enabled", true) || lockedFrame.optBoolean("excludedByUser", false)) {
+                return@repeat
+            }
             val file = lockedFrame.optString("file")
             if (file.isNotBlank()) {
                 lockedFileCount[file] = lockedFileCount.getOrDefault(file, 0) + 1
@@ -961,11 +1016,11 @@ private fun mergeClassicFrameAlignmentIntoLockedJob(
             val file = lockedFrame.optString("file")
             val idx = lockedFrame.optInt("index", index)
             val key = idx to file
-            if (file.isBlank()) return@repeat
-
             // Exact (index, file) match first
             val localFrame = localFrameMap[key]
-                ?: if (localFileCount[file] == 1 && lockedFileCount[file] == 1) localFrameByFile[file] else null
+                ?: if (file.isNotBlank() && localFileCount[file] == 1 && lockedFileCount[file] == 1) {
+                    localFrameByFile[file]
+                } else null
             if (localFrame == null) return@repeat
 
             // Copy only Classic-owned alignment/fusion fields; preserve everything else
@@ -1311,6 +1366,9 @@ private fun recordClassicFailure(
     throwable: Throwable? = null,
     failureCounts: ClassicYuvProcessingFailureCounts? = null,
     preflight: ClassicYuvProcessingPreflight? = null,
+    params: ClassicYuvFusionParams,
+    userCanMoveDevice: Boolean,
+    processingStartedAt: Long,
     metadataPolicy: ReprocessMetadataPolicy = ReprocessMetadataPolicy.NORMAL
 ) {
     runCatching {
@@ -1328,12 +1386,13 @@ private fun recordClassicFailure(
             .put("fusionVersion", CLASSIC_FUSION_VERSION)
             .put("yuvFusionVersion", "YUV_NIGHT_FUSION_V0")
             .put("fusionParamsVersion", CLASSIC_YUV_FUSION_PARAMS_VERSION)
-            .put("fusionPresetName", job.optString("fusionPresetName", "default"))
-            .put("fusionParams", job.optJSONObject("fusionParams") ?: JSONObject())
-            .put("userCanMoveDevice", true)
+            .put("fusionPresetName", params.presetName)
+            .put("fusionParams", params.toJson())
+            .put("userCanMoveDevice", userCanMoveDevice)
             .put("processedAt", now)
-            .put("processingTimeMs", now - job.optLong("processingStartedAt", now))
-            .put("timing", (job.optJSONObject("timing") ?: JSONObject()).put("totalPipelineMs", now - job.optLong("createdAt", now)))
+            .put("processingStartedAt", processingStartedAt)
+            .put("processingTimeMs", now - processingStartedAt)
+            .put("timing", JSONObject().put("totalPipelineMs", now - processingStartedAt))
         preflight?.let { job.put("yuvProcessingPreflight", it.toJson()) }
         failureCounts?.let {
             job.put("yuvProcessingTotalFrames", it.totalFrames)
@@ -1357,6 +1416,16 @@ private const val CLASSIC_YUV_ACTIVE_PROGRESS_KEYS =
         "debugArtifactStatus,debugArtifactError,fusionDebugFile,yuvDebugFile,fusionAlignmentSummary"
 
 private val classicYuvActiveProgressKeys: Set<String> = CLASSIC_YUV_ACTIVE_PROGRESS_KEYS.split(',').toSet()
+
+private val classicYuvRunScopedKeys: Set<String> = setOf(
+    "timing", "processingTimeMs", "debugArtifactStatus", "debugArtifactError",
+    "fusionDebugFile", "yuvDebugFile", "fusionAlignmentSummary",
+    "referenceFrameDebugFile", "yuvReferencePreviewFile", "fusedClassicDebugFile",
+    "yuvFusedPreviewFile", "yuvFusedBeforeDenoisePreviewFile",
+    "yuvFusedAfterDenoiseNoSharpenPreviewFile", "yuvFinalPreviewFile",
+    "fusedClassicPresetFile", "comparisonDebugFile", "yuvComparePreviewFile",
+    "yuvCompareReferenceVsFinalFile"
+)
 
 // Final progress keys for REPROCESS_PROGRESS_ONLY: active progress minus terminal state (stage/status)
 private const val CLASSIC_YUV_FINAL_PROGRESS_KEYS =
@@ -1397,10 +1466,19 @@ private val classicYuvSuccessOwnedKeys: Set<String> = setOf(
 private val classicYuvFailureOwnedKeys: Set<String> = setOf(
     "currentPipelineStage", "processStatus", "pipelineFailed", "pipelineFailureStatusCode",
     "pipelineFailureSource", "pipelineFailureType", "pipelineFailureMessage", "pipelineFailureStackTrace",
-    "processFailureReason", "fusionEngine", "fusionVersion", "processedAt",
+    "processFailureReason", "fusionEngine", "fusionVersion", "yuvFusionVersion",
+    "fusionParamsVersion", "fusionPresetName", "fusionParams", "userCanMoveDevice",
+    "nativeAlignmentAvailable", "nativeAlignmentUsed", "alignmentVersion",
+    "yuvAlignVersion", "yuvMergeVersion", "yuvDenoiseVersion", "yuvDetailVersion",
+    "yuvSharpenVersion", "yuvLookVersion", "processedAt",
     "yuvProcessingPreflight", "yuvProcessingPolicy", "yuvProcessingTotalFrames", "yuvProcessingEnabledFrames",
     "yuvProcessingDecodedUsableFrames", "yuvProcessingSameSizeFrames", "yuvProcessingCompatibleFrames",
-    "processingStartedAt", "debugArtifactStatus", "debugArtifactError", "timing", "processingTimeMs"
+    "processingStartedAt", "debugArtifactStatus", "debugArtifactError", "timing", "processingTimeMs",
+    "fusionDebugFile", "yuvDebugFile", "fusionAlignmentSummary", "referenceFrameDebugFile",
+    "yuvReferencePreviewFile", "fusedClassicDebugFile", "yuvFusedPreviewFile",
+    "yuvFusedBeforeDenoisePreviewFile", "yuvFusedAfterDenoiseNoSharpenPreviewFile",
+    "yuvFinalPreviewFile", "fusedClassicPresetFile", "comparisonDebugFile",
+    "yuvComparePreviewFile", "yuvCompareReferenceVsFinalFile"
 )
 
 // Keys that are opposite-type: failure keys to clear on success, success keys to clear on failure
@@ -1413,12 +1491,7 @@ private val classicYuvFailureTerminalKeys: Set<String> = setOf(
 // Preserves identity, diagnostic, current-run fields, timing, counters, params, algorithm versions.
 private val classicYuvStaleFinalOutputKeys: Set<String> = setOf(
     "averageColorFile", "finalNightFusionFile", "finalFile", "finalOutputSource",
-    "galleryDisplayFile", "galleryThumbnailFile", "galleryDisplaySource",
-    "isDebugPreviewUsedAsFinal", "yuvFusionLooksWorseHint", "yuvQualityDiagnosticHints",
-    "referenceFrameDebugFile", "yuvReferencePreviewFile", "fusedClassicDebugFile", "yuvFusedPreviewFile",
-    "yuvFusedBeforeDenoisePreviewFile", "yuvFusedAfterDenoiseNoSharpenPreviewFile", "yuvFinalPreviewFile",
-    "fusedClassicPresetFile", "comparisonDebugFile", "yuvComparePreviewFile",
-    "yuvCompareReferenceVsFinalFile"
+    "galleryDisplayFile", "galleryThumbnailFile"
 )
 
 // Classic-owned per-frame alignment/fusion fields to merge into locked frames array
