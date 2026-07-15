@@ -426,6 +426,7 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
                 var ownedBitmap: Bitmap? = null
                 var result: LatestKeplerResult? = null
                 var estimate: LatestSceneEstimate? = null
+                var adopted = false
                 try {
                     val loaded = withContext(Dispatchers.IO) {
                         val r = loadLatestKeplerResultV2(context)
@@ -455,6 +456,7 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
                         latestBitmap = ownedBitmap
                         latestResult = result!!.copy(bitmap = ownedBitmap)
                         ownedBitmap = null
+                        adopted = true
                     } else {
                         val oldBitmap = latestBitmap
                         if (oldBitmap != null && !oldBitmap.isRecycled) {
@@ -466,8 +468,10 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
                     latestSummary = result!!.summary
                     latestSceneLuma = estimate!!.meanLuma
                     latestMotionScore = estimate!!.motionScore
-                    if (showPreview && isAllowed) {
+                    if (showPreview && adopted) {
                         showResultPreview = true
+                    } else if (!adopted) {
+                        showResultPreview = false
                     }
                 } finally {
                     ownedBitmap?.takeIf { !it.isRecycled }?.recycle()
@@ -2507,28 +2511,68 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
             if (isReprocessQuarantined(jobDir)) return@firstNotNullOfOrNull null
             val job = runCatching { JSONObject(File(jobDir, "job.json").readText()) }.getOrNull()
                 ?: return@firstNotNullOfOrNull null
-            val hasCurrentPreview = hasCurrentPreviewFile(jobDir, job)
-            if (!hasCurrentPreview &&
-                (job.optBoolean("galleryDisplayUnavailable", false) ||
-                    (job.optBoolean("galleryExportCommitted", false) &&
-                        !job.optBoolean("finalOutputAvailable", false)))
-            ) return@firstNotNullOfOrNull null
-            if (!job.optBoolean("galleryVisible", true) && !hasCurrentPreview) {
-                return@firstNotNullOfOrNull null
-            }
             if (KeplerJobMetadata.isOperationActive(jobDir) || isKeplerJobActive(job)) {
                 return@firstNotNullOfOrNull null
             }
-            val file = chooseLatestResultFile(jobDir, job) ?: return@firstNotNullOfOrNull null
-            Triple(jobDir, job, file)
+            Pair(jobDir, job)
         }
             ?: return LatestKeplerResult(null, "No Kepler jobs found")
 
         val latestJobDir = latest.first
         val job = latest.second
-        val previewFile = latest.third
+        val previewFile = chooseLatestResultFile(latestJobDir, job)
         val outputWidth = job.optInt("outputWidth", 0).takeIf { it > 0 }
         val outputHeight = job.optInt("outputHeight", 0).takeIf { it > 0 }
+        val jobType = job.optString("jobType", latestJobDir.parentFile?.name.orEmpty())
+        val fusionEngine = listOf(
+            job.optString("fusionEngine", ""),
+            job.optString("rawFusionEngine", ""),
+            job.optString("fusionVersion", ""),
+            job.optString("rawFusionVersion", "")
+        ).firstOrNull { it.isNotBlank() }.orEmpty()
+        val usedFrames = job.optInt("usedFrameCount", job.optInt("savedFrames", 0))
+        val requestedFrames = job.optInt("requestedFrames", 0)
+
+        if (previewFile == null) {
+            val summary = buildString {
+                append("status=")
+                append(job.optString("status", "unknown"))
+                append(", frames=")
+                append(job.optInt("savedFrames", 0))
+                append(", export=")
+                append(job.optString("exportStatus", "not_exported"))
+                append(" ")
+                append(job.optString("exportFormatUsed", ""))
+                append(" verified=")
+                append(job.optBoolean("exportVerified", false))
+                append(", output=")
+                append(job.optString("finalOutputFormatSetting", ""))
+                append(", public=")
+                append(job.optString("exportDisplayName", "").ifBlank { "none" })
+                append(", rawSidecar=")
+                append(job.optString("rawSidecarExportStatus", "NOT_REQUESTED"))
+                append(", cleanup=")
+                append(job.optString("cleanupStatus", "none"))
+                append(", job=")
+                append(latestJobDir.name)
+                append(", file=none, source=")
+                append(job.optString("finalOutputSource", "bitmap"))
+            }
+            return LatestKeplerResult(
+                bitmap = null,
+                summary = summary,
+                jobType = jobType,
+                fusionEngine = fusionEngine,
+                usedFrames = usedFrames,
+                requestedFrames = requestedFrames,
+                outputWidth = outputWidth,
+                outputHeight = outputHeight,
+                fileName = "",
+                jobName = latestJobDir.name,
+                filePath = ""
+            )
+        }
+
         var decoded: Bitmap? = null
         try {
             decoded = if (
@@ -2541,15 +2585,6 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
                 decodeLatestResultPreview(previewFile)
             }
             val bitmap = decoded
-            val jobType = job.optString("jobType", latestJobDir.parentFile?.name.orEmpty())
-            val fusionEngine = listOf(
-                job.optString("fusionEngine", ""),
-                job.optString("rawFusionEngine", ""),
-                job.optString("fusionVersion", ""),
-                job.optString("rawFusionVersion", "")
-            ).firstOrNull { it.isNotBlank() }.orEmpty()
-            val usedFrames = job.optInt("usedFrameCount", job.optInt("savedFrames", 0))
-            val requestedFrames = job.optInt("requestedFrames", 0)
             val summary = buildString {
                 append("status=")
                 append(job.optString("status", "unknown"))
