@@ -418,6 +418,19 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var refreshGeneration by remember { mutableIntStateOf(0) }
     var refreshJob by remember { mutableStateOf<Job?>(null) }
 
+    fun clearLatestResultState() {
+        ++refreshGeneration
+        refreshJob?.cancel()
+        refreshJob = null
+        latestBitmap?.takeIf { !it.isRecycled }?.recycle()
+        latestBitmap = null
+        latestResult = null
+        latestSummary = "최근 결과 없음"
+        showResultPreview = false
+        latestSceneLuma = null
+        latestMotionScore = null
+    }
+
     fun refreshLatestResult(showPreview: Boolean = false) {
         val generation = ++refreshGeneration
         refreshJob?.cancel()
@@ -437,11 +450,10 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
                             r.bitmap?.recycle()
                         }
                         val e = estimateLatestColorBurstScene(context)
-                        Triple(r, e, isAllowed)
+                        Pair(r, e)
                     }
                     result = loaded.first
                     estimate = loaded.second
-                    val isAllowed = loaded.third
 
                     if (currentCoroutineContext()[Job]?.isActive != true || generation != refreshGeneration) {
                         ownedBitmap?.takeIf { !it.isRecycled }?.recycle()
@@ -480,14 +492,9 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
         }
     }
 
-DisposableEffect(Unit) {
+    DisposableEffect(Unit) {
         onDispose {
-            ++refreshGeneration
-            refreshJob?.cancel()
-            latestBitmap?.takeIf { !it.isRecycled }?.recycle()
-            latestBitmap = null
-            latestResult = null
-            showResultPreview = false
+            clearLatestResultState()
         }
     }
 
@@ -1005,11 +1012,7 @@ mainHandler.removeCallbacks(watchdog)
                 },
                 onClear = {
                     val deleted = deleteKeplerCache(context)
-                    latestBitmap?.takeIf { !it.isRecycled }?.recycle()
-                    latestBitmap = null
-                    latestResult = null
-                    latestSummary = "최근 결과 없음"
-                    showResultPreview = false
+                    clearLatestResultState()
                     status = "캐시 삭제 완료 ($deleted)"
                 },
                 onThumbnail = {
@@ -1196,8 +1199,7 @@ mainHandler.removeCallbacks(watchdog)
                 },
                 onClearCache = {
                     val deleted = deleteKeplerCache(context)
-                    latestBitmap = null
-                    latestSummary = "최근 결과 없음"
+                    clearLatestResultState()
                     status = "캐시 삭제 완료 ($deleted)"
                     currentScreen = MainScreen.CAMERA
                 }
