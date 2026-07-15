@@ -124,7 +124,8 @@ internal fun processClassicYuvFusionJob(
             KeplerJobMetadata.update(jobDir) { current ->
                 current.put("currentPipelineStage", stage)
                     .put("processStatus", status)
-                    .put("processingStartedAt", processingStartedAt)
+        .put("processingStartedAt", processingStartedAt)
+        .put("yuvProcessingPolicy", metadataPolicy.name)
             }
             Log.i("KeplerYuvPipeline", "$stage: $status")
             onStatus(status)
@@ -359,10 +360,14 @@ internal fun processClassicYuvFusionJob(
                 "Classic YUV Fusion v1: integer translation alignment, robust local weights, " +
                     "ghost suppression, mild chroma denoise, tone, and sharpen."
             )
-        if (externalFrameWeights != null && externalFrameWeights.isNotEmpty()) {
-            job.put("yuvExternalFrameWeightsUsed", true)
-                .put("yuvExternalFrameWeightsTarget", "NON_REFERENCE_FRAMES_ONLY")
-        }
+    // Set or remove external-weight metadata based on the current run
+    if (externalFrameWeights != null && externalFrameWeights.isNotEmpty()) {
+        job.put("yuvExternalFrameWeightsUsed", true)
+        .put("yuvExternalFrameWeightsTarget", "NON_REFERENCE_FRAMES_ONLY")
+    } else {
+        job.put("yuvExternalFrameWeightsUsed", false)
+        job.remove("yuvExternalFrameWeightsTarget")
+    }
         val debugMetadataFailure = runCatching {
             cancellation.throwIfCancelled()
             writeFusionDebugMetadata(
@@ -901,6 +906,7 @@ private fun initializeClassicYuvRunMetadata(
         .put("yuvSharpenVersion", "YUV_ADAPTIVE_LUMA_SHARPEN_V0")
         .put("yuvLookVersion", "YUV_NATURAL_NIGHT_LOOK_V0")
         .put("processingStartedAt", processingStartedAt)
+        .put("yuvProcessingPolicy", "NORMAL")
 }
 
 /** Resets current-run alignment/fusion fields for every enabled, non-excluded frame. */
@@ -1390,18 +1396,19 @@ private fun recordClassicFailure(
             .put("pipelineFailureMessage", formatClassicFailureMessage(throwable, reason))
             .put("pipelineFailureStackTrace", throwable?.stackTraceToString() ?: "")
             .put("processFailureReason", reason)
-            .put("fusionEngine", "classic_yuv_v1")
-            .put("fusionVersion", CLASSIC_FUSION_VERSION)
-            .put("yuvFusionVersion", "YUV_NIGHT_FUSION_V0")
-            .put("fusionParamsVersion", CLASSIC_YUV_FUSION_PARAMS_VERSION)
-            .put("fusionPresetName", params.presetName)
-            .put("fusionParams", params.toJson())
-            // On NORMAL failure, persist userCanMoveDevice=true as the current terminal state
+        .put("fusionEngine", "classic_yuv_v1")
+        .put("fusionVersion", CLASSIC_FUSION_VERSION)
+        .put("yuvFusionVersion", "YUV_NIGHT_FUSION_V0")
+        .put("fusionParamsVersion", CLASSIC_YUV_FUSION_PARAMS_VERSION)
+        .put("fusionPresetName", params.presetName)
+        .put("fusionParams", params.toJson())
+        // On NORMAL failure, persist userCanMoveDevice=true as the current terminal state
         .put("userCanMoveDevice", true)
-            .put("processedAt", now)
-            .put("processingStartedAt", processingStartedAt)
-            .put("processingTimeMs", now - processingStartedAt)
-            .put("timing", JSONObject().put("totalPipelineMs", now - processingStartedAt))
+        .put("processedAt", now)
+        .put("processingStartedAt", processingStartedAt)
+        .put("processingTimeMs", now - processingStartedAt)
+        .put("timing", JSONObject().put("totalPipelineMs", now - processingStartedAt))
+        .put("yuvProcessingPolicy", metadataPolicy.name)
         preflight?.let { job.put("yuvProcessingPreflight", it.toJson()) }
         failureCounts?.let {
             job.put("yuvProcessingTotalFrames", it.totalFrames)
@@ -1418,23 +1425,21 @@ private fun recordClassicFailure(
     }
 }
 
-private const val CLASSIC_YUV_ACTIVE_PROGRESS_KEYS =
-    "currentPipelineStage,processStatus,processingStartedAt,yuvProcessingPreflight,yuvProcessingPolicy," +
-        "yuvProcessingTotalFrames,yuvProcessingEnabledFrames,yuvProcessingDecodedUsableFrames," +
-        "yuvProcessingSameSizeFrames,yuvProcessingCompatibleFrames,timing,processingTimeMs," +
-        "debugArtifactStatus,debugArtifactError,fusionDebugFile,yuvDebugFile,fusionAlignmentSummary"
 
-private val classicYuvActiveProgressKeys: Set<String> = CLASSIC_YUV_ACTIVE_PROGRESS_KEYS.split(',').toSet()
+
+
 
 private val classicYuvRunScopedKeys: Set<String> = setOf(
-    "timing", "processingTimeMs", "debugArtifactStatus", "debugArtifactError",
-    "fusionDebugFile", "yuvDebugFile", "fusionAlignmentSummary",
-    "referenceFrameDebugFile", "yuvReferencePreviewFile", "fusedClassicDebugFile",
-    "yuvFusedPreviewFile", "yuvFusedBeforeDenoisePreviewFile",
-    "yuvFusedAfterDenoiseNoSharpenPreviewFile", "yuvFinalPreviewFile",
-    "fusedClassicPresetFile", "comparisonDebugFile", "yuvComparePreviewFile",
-    "yuvCompareReferenceVsFinalFile"
-)
+        "timing", "processingTimeMs", "debugArtifactStatus", "debugArtifactError",
+        "fusionDebugFile", "yuvDebugFile", "fusionAlignmentSummary",
+        "referenceFrameDebugFile", "yuvReferencePreviewFile", "fusedClassicDebugFile",
+        "yuvFusedPreviewFile", "yuvFusedBeforeDenoisePreviewFile",
+        "yuvFusedAfterDenoiseNoSharpenPreviewFile", "yuvFinalPreviewFile",
+        "fusedClassicPresetFile", "comparisonDebugFile", "yuvComparePreviewFile",
+        "yuvCompareReferenceVsFinalFile",
+        "nativeAlignmentUsed", "fallbackAlignmentCount", "lowConfidenceAlignmentCount",
+        "yuvExternalFrameWeightsUsed", "yuvProcessingPolicy"
+    )
 
 // Final progress keys for REPROCESS_PROGRESS_ONLY: active progress minus terminal state (stage/status)
 private const val CLASSIC_YUV_FINAL_PROGRESS_KEYS =
