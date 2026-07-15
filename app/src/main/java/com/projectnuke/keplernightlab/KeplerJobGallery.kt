@@ -610,7 +610,11 @@ private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
     if (job?.optBoolean("galleryDisplayUnavailable", false) == true ||
         (job?.optBoolean("galleryExportCommitted", false) == true &&
             job.optBoolean("finalOutputAvailable", false).not())
-    ) return null
+) return null
+    // Prevent fallback scanning for reprocessed jobs
+    if (job?.has("reprocess") == true) {
+        return null
+    }
     val keys = listOf(
         "finalNightFusionFile",
         "finalFile",

@@ -84,6 +84,8 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+
+private val refreshLock = Any()
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Job
 import org.json.JSONObject
@@ -392,29 +394,49 @@ fun MainCameraScreen(
     var latestResult by remember { mutableStateOf<LatestKeplerResult?>(null) }
     var showResultPreview by remember { mutableStateOf(false) }
     val cameraScope = rememberCoroutineScope()
+val refreshMutex = remember { kotlinx.coroutines.Mutex() }
     var refreshGeneration by remember { mutableIntStateOf(0) }
     var refreshJob by remember { mutableStateOf<Job?>(null) }
 
-    fun refreshLatestResult(showPreview: Boolean = false) {
+fun refreshLatestResult(showPreview: Boolean = false) {
+    synchronized(refreshLock) {
         val generation = ++refreshGeneration
         refreshJob?.cancel()
         refreshJob = cameraScope.launch {
-            val (result, estimate) = withContext(Dispatchers.IO + NonCancellable) {
+            // Load result & estimate on IO dispatcher
+            val (result, estimate) = withContext(Dispatchers.IO) {
                 loadLatestKeplerResultV2(context) to estimateLatestColorBurstScene(context)
             }
+            // Cancellation check
             if (!currentCoroutineContext().isActive || generation != refreshGeneration) {
                 result.bitmap?.takeIf { !it.isRecycled }?.recycle()
                 return@launch
             }
-            latestBitmap?.takeIf { it !== result.bitmap && !it.isRecycled }?.recycle()
-            latestBitmap = result.bitmap
+            // Bitmap handling with adoption logic
+            val loadedBitmap = result.bitmap
+            val adopted = showPreview && isAllowedPreviewExtension(result.fileName) && !isDebugPreviewFinalBlocked(result.fileName)
+            try {
+                // Recycle previous bitmap if different
+                if (latestBitmap !== loadedBitmap && !latestBitmap.isRecycled) {
+                    latestBitmap.recycle()
+                }
+                latestBitmap = loadedBitmap
+                if (adopted) {
+                    showResultPreview = true
+                }
+            } finally {
+                if (!adopted && !loadedBitmap.isRecycled) {
+                    loadedBitmap.recycle()
+                }
+            }
+            // Update UI fields
             latestSummary = result.summary
             latestResult = result
-            if (showPreview && result.fileName.isNotBlank()) showResultPreview = true
             latestSceneLuma = estimate.meanLuma
             latestMotionScore = estimate.motionScore
         }
     }
+}
 
     DisposableEffect(Unit) {
         onDispose {
@@ -884,7 +906,26 @@ fun MainCameraScreen(
                                     120_000L
                                 } else {
                                     60_000L
-                                }
+}
+private fun isAllowedPreviewExtension(filename: String): Boolean {
+    val lower = filename.lowercase()
+    return lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".heic") || lower.endsWith(".webp")
+}
+
+private fun isDebugPreviewFinalBlocked(name: String): Boolean {
+    val lower = name.lowercase()
+    return lower in setOf(
+        "raw_reference_preview.png",
+        "raw_fused_classic_v1_preview.png",
+        "raw_compare_reference_vs_fused.png",
+        "reference_frame.png",
+        "fused_classic_yuv_v1.png",
+        "compare_reference_vs_fused.png",
+        "yuv_reference_preview.png",
+        "yuv_fused_preview.png",
+        "yuv_compare_reference_vs_fused.png"
+    )
+}
                             ) { cancellation, captureCancellation, callback ->
                                 startCapturePipeline(
                                     CapturePipelineRequest(
