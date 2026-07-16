@@ -1640,29 +1640,114 @@ fun processRawFusionJob(
     onStatus: (String) -> Unit
 ): RawFusionProcessResult {
     val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
-    fun persistProcessingMetadata(job: JSONObject) {
-        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            KeplerJobMetadata.update(jobDir) { current ->
-                listOf(
-                    "processingStartedAt", "userCanMoveDevice", "rawFusionMemoryEstimateBytes",
-                    "nativePostprocessStatus", "nativePostprocessRgbaFile", "rawRenderDebugFile",
-                    "rawFusionDebugFile", "totalPipelineMs", "processStatus", "currentPipelineStage"
-                ).forEach { key -> if (job.has(key)) current.put(key, job.get(key)) }
-            }
-        } else {
-            KeplerJobMetadata.update(jobDir) { current ->
-                listOf(
-                    "processingStartedAt", "userCanMoveDevice", "rawFusionMemoryEstimateBytes",
-                    "nativePostprocessStatus", "nativePostprocessRgbaFile", "rawRenderDebugFile",
-                    "rawFusionDebugFile", "totalPipelineMs"
-                ).forEach { key -> if (job.has(key)) current.put(key, job.get(key)) }
+
+    /**
+     * Keys owned by [processRawFusionJob]'s current run when in `NORMAL` mode: progress,
+     * diagnostics, memory estimates, timing, current stage/status, and `userCanMoveDevice`.
+     * These keys belong exclusively to the current RAW processing stage and must be cleared when
+     * the current run does not produce them, so stale previous-run values never survive.
+     */
+    val ownedNormalKeys: Set<String> = RAW_FUSION_PROGRESS_KEYS +
+        RAW_FUSION_NATIVE_DIAGNOSTIC_KEYS +
+        RAW_FUSION_PROCESSOR_ERROR_KEYS +
+        RAW_FUSION_NORMAL_FAILURE_TERMINAL_KEYS +
+        setOf("userCanMoveDevice")
+
+    /**
+     * Keys owned by the run in `REPROCESS_PROGRESS_ONLY` mode: progress and diagnostics only.
+     * NEVER includes terminal status/stage, `userCanMoveDevice`, gallery, export, final-output,
+     * committed-export, or public-result fields, in accordance with the progress policy. The
+     * non-terminal processor-error field (`processError`) is included because it does not flip
+     * a terminal status key and is explicitly attributed to the current reprocess attempt.
+     */
+    val ownedReprocessKeys: Set<String> = RAW_FUSION_PROGRESS_KEYS +
+        RAW_FUSION_NATIVE_DIAGNOSTIC_KEYS +
+        RAW_FUSION_PROCESSOR_ERROR_KEYS
+
+    val ownedKeys: Set<String> = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+        ownedNormalKeys
+    } else {
+        ownedReprocessKeys
+    }
+
+    /**
+     * Persistence helper bound to the owned-key set for the current policy. For each owned key,
+     * copies the current-run value into the locked metadata if the current-run `jobLocal`
+     * contains it, or removes it from the locked metadata if the current run did not produce a
+     * value — so stale previous-run owned values never survive. Every mutation happens inside a
+     * single [KeplerJobMetadata.update] so unrelated capture/frame/selection/quality/identity
+     * fields are preserved without a full-object replacement.
+     */
+    fun persistProcessingMetadata(jobLocal: JSONObject) {
+        KeplerJobMetadata.update(jobDir) { current ->
+            ownedKeys.forEach { key ->
+                if (jobLocal.has(key)) {
+                    current.put(key, jobLocal.get(key))
+                } else {
+                    current.remove(key)
+                }
             }
         }
     }
+
+    /**
+     * Shared current-run RAW processing failure metadata. Records the normative NORMAL-failure
+     * shape (terminal stage/status + error + processedAt + current progress/diagnostics) and the
+     * reprocess-failure shape (only progress/diagnostics + non-terminal `processError`), both
+     * inside one [KeplerJobMetadata.update]. OOM and ordinary `Exception` failures share this
+     * helper so they always apply consistent metadata ownership.
+     */
+    fun persistRawFusionFailureMetadata(
+        processStatus: String,
+        failureMessage: String,
+        currentProgressJob: JSONObject
+    ) {
+        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            val local = JSONObject(currentProgressJob.toString())
+                .put("currentPipelineStage", "FAILED")
+                .put("processStatus", processStatus)
+                .put("processError", failureMessage)
+                .put("rawFusionProcessingPolicy", metadataPolicy.name)
+            KeplerJobMetadata.update(jobDir) { current ->
+                ownedNormalKeys.forEach { key ->
+                    if (local.has(key)) {
+                        current.put(key, local.get(key))
+                    } else {
+                        current.remove(key)
+                    }
+                }
+            }
+        } else {
+            val local = JSONObject(currentProgressJob.toString())
+                .put("processError", failureMessage)
+                .put("rawFusionProcessingPolicy", metadataPolicy.name)
+            KeplerJobMetadata.update(jobDir) { current ->
+                ownedReprocessKeys.forEach { key ->
+                    if (local.has(key)) {
+                        current.put(key, local.get(key))
+                    } else {
+                        current.remove(key)
+                    }
+                }
+            }
+        }
+    }
+
     return try {
         cancellation.throwIfCancelled()
         val job = JSONObject(jobFile.readText())
         cancellation.throwIfCancelled()
+
+        // Initial current-run RAW processing metadata ownership pass:
+        // Remove stale previous-run values for every owned progress and diagnostic field BEFORE
+        // building the current run's values. The native postprocess/RGBA/debug file references
+        // and memory estimate/timing fields are included so a previous run's artifacts cannot
+        // survive this run unless the current run re-emits them into `jobLocal`.
+        RAW_FUSION_PROGRESS_KEYS.forEach(job::remove)
+        RAW_FUSION_NATIVE_DIAGNOSTIC_KEYS.forEach(job::remove)
+        RAW_FUSION_PROCESSOR_ERROR_KEYS.forEach(job::remove)
+        job.put("rawFusionProcessingPolicy", metadataPolicy.name)
+
         val frames = job.getJSONArray("frames")
         val width = job.getInt("rawWidth")
         val height = job.getInt("rawHeight")
@@ -1739,7 +1824,13 @@ fun processRawFusionJob(
             mergedRawFile.length() >= pixelCount * 2L &&
             alignmentFile.exists()
         if (!classicMergedOk) {
-            persistProcessingMetadata(job)
+            val failureMessage = classicMerge.errorMessage ?: "Classic RAW fusion failed"
+            job.put("processedAt", System.currentTimeMillis())
+            persistRawFusionFailureMetadata(
+                processStatus = "CLASSIC_RAW_FUSION_FAILED_KEEPING_CACHE",
+                failureMessage = failureMessage,
+                currentProgressJob = job
+            )
             onStatus("Classic RAW fusion failed. RAW cache kept.")
             return RawFusionProcessResult(
                 success = false,
@@ -1747,7 +1838,7 @@ fun processRawFusionJob(
                 mergedDngFile = null,
                 previewPngFile = null,
                 finalPngFile = null,
-                errorMessage = classicMerge.errorMessage ?: "Classic RAW fusion failed"
+                errorMessage = failureMessage
             )
         }
         persistProcessingMetadata(job)
@@ -1791,30 +1882,41 @@ fun processRawFusionJob(
                 .takeIf { it > 0L }
                 ?: updated.optLong("createdAt", System.currentTimeMillis())
             updated.put("totalPipelineMs", System.currentTimeMillis() - pipelineStartedAt)
+            updated.put("rawFusionProcessingPolicy", metadataPolicy.name)
             persistProcessingMetadata(updated)
         }
         exportResult
     } catch (ce: CancellationException) {
+        // Cancellation propagates unchanged: never converted into a processor terminal failure
+        // and never causes a metadata write from this processor.
         throw ce
     } catch (oom: OutOfMemoryError) {
         runCatching {
-            if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-                KeplerJobMetadata.update(jobDir) { current ->
-                    current.put("processStatus", "OOM_FAILED_KEEPING_CACHE")
-                        .put("currentPipelineStage", "FAILED")
-                        .put("processError", "OutOfMemoryError")
-                        .put("processedAt", System.currentTimeMillis())
-                }
-            } else {
-                KeplerJobMetadata.update(jobDir) { current ->
-                    current.put("processedAt", System.currentTimeMillis())
-                }
-            }
+            val local = JSONObject()
+                .put("processedAt", System.currentTimeMillis())
+                .put("rawFusionProcessingPolicy", metadataPolicy.name)
+            persistRawFusionFailureMetadata(
+                processStatus = "OOM_FAILED_KEEPING_CACHE",
+                failureMessage = "OutOfMemoryError",
+                currentProgressJob = local
+            )
         }
         onStatus("RAW fusion stopped: insufficient memory. RAW cache kept.")
         RawFusionProcessResult(false, null, null, null, null, "OutOfMemoryError: RAW cache kept")
     } catch (e: Exception) {
-        RawFusionProcessResult(false, null, null, null, null, "${e.javaClass.simpleName}: ${e.message}")
+        // Do not return failure without recording the current NORMAL/reprocess failure metadata.
+        val failureMessage = "${e.javaClass.simpleName}: ${e.message}"
+        runCatching {
+            val local = JSONObject()
+                .put("processedAt", System.currentTimeMillis())
+                .put("rawFusionProcessingPolicy", metadataPolicy.name)
+            persistRawFusionFailureMetadata(
+                processStatus = "FAILED_KEEPING_CACHE",
+                failureMessage = failureMessage,
+                currentProgressJob = local
+            )
+        }
+        RawFusionProcessResult(false, null, null, null, null, failureMessage)
     }
 }
 
