@@ -157,11 +157,15 @@ internal fun processClassicYuvFusionJob(
         preflight = preflightSummary
         job.put("yuvProcessingPreflight", preflightSummary.toJson())
             .put("frameCount", preflightSummary.totalFrames)
+            .put("yuvProcessingTotalFrames", preflightSummary.totalFrames)
+            .put("yuvProcessingEnabledFrames", preflightSummary.enabledFrames)
         KeplerJobMetadata.update(jobDir) { current ->
             current.put("yuvProcessingPreflight", preflightSummary.toJson())
                 .put("processingStartedAt", job.optLong("processingStartedAt"))
                 .put("yuvProcessingPolicy", metadataPolicy.name)
                 .put("frameCount", preflightSummary.totalFrames)
+                .put("yuvProcessingTotalFrames", preflightSummary.totalFrames)
+                .put("yuvProcessingEnabledFrames", preflightSummary.enabledFrames)
         }
         cancellation.throwIfCancelled()
         val candidateFrames = loadClassicFrames(jobDir, job)
@@ -186,6 +190,10 @@ internal fun processClassicYuvFusionJob(
             }
         }
         decodedUsableFrameCount = frames.size
+        job.put("yuvProcessingDecodedUsableFrames", decodedUsableFrameCount)
+        KeplerJobMetadata.update(jobDir) { current ->
+            current.put("yuvProcessingDecodedUsableFrames", decodedUsableFrameCount)
+        }
         if (frames.size < 2) {
             error(
                 "Not enough enabled YUV frames to reprocess: " +
@@ -232,10 +240,18 @@ internal fun processClassicYuvFusionJob(
         val sameSizeFrames = frames.filter { decodeImageDimensions(it.file) == dimensions!! }
         sameSizeFrameCount = sameSizeFrames.size
         sameSizeFrameCountKnown = true
+        job.put("yuvProcessingSameSizeFrames", sameSizeFrameCount)
+        KeplerJobMetadata.update(jobDir) { current ->
+            current.put("yuvProcessingSameSizeFrames", sameSizeFrameCount)
+        }
         val acceptedFrames = sameSizeFrames.filter { it === reference || it.alignmentUsed }
         val compatibleFrames = if (acceptedFrames.size >= 2) acceptedFrames else sameSizeFrames.take(2)
         compatibleFrameCount = compatibleFrames.size
         compatibleFrameCountKnown = true
+        job.put("yuvProcessingCompatibleFrames", compatibleFrameCount)
+        KeplerJobMetadata.update(jobDir) { current ->
+            current.put("yuvProcessingCompatibleFrames", compatibleFrameCount)
+        }
         if (compatibleFrames.size < 2) {
             error(
                 "Not enough same-size YUV frames to fuse: " +
@@ -1554,12 +1570,20 @@ private fun recordClassicFailure(
             job.remove("yuvExternalFrameWeightsTarget")
         }
         preflight?.let { job.put("yuvProcessingPreflight", it.toJson()) }
-        failureCounts?.let {
-            job.put("yuvProcessingTotalFrames", it.totalFrames)
-                .put("yuvProcessingEnabledFrames", it.enabledFrames)
-                .put("yuvProcessingDecodedUsableFrames", it.decodedUsableFrames)
-            it.sameSizeFrames?.let { job.put("yuvProcessingSameSizeFrames", it) }
-            it.compatibleFrames?.let { job.put("yuvProcessingCompatibleFrames", it) }
+        failureCounts?.let { fc ->
+            job.put("yuvProcessingTotalFrames", fc.totalFrames)
+                .put("yuvProcessingEnabledFrames", fc.enabledFrames)
+                .put("yuvProcessingDecodedUsableFrames", fc.decodedUsableFrames)
+            if (fc.sameSizeFrames != null) {
+                job.put("yuvProcessingSameSizeFrames", fc.sameSizeFrames)
+            } else {
+                job.remove("yuvProcessingSameSizeFrames")
+            }
+            if (fc.compatibleFrames != null) {
+                job.put("yuvProcessingCompatibleFrames", fc.compatibleFrames)
+            } else {
+                job.remove("yuvProcessingCompatibleFrames")
+            }
         }
         persistClassicYuvFailure(
             jobDir = jobFile.parentFile ?: error("Job directory missing"),
