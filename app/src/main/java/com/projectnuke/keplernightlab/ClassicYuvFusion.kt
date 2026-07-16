@@ -87,8 +87,8 @@ private data class ClassicYuvProcessingFailureCounts(
     val totalFrames: Int,
     val enabledFrames: Int,
     val decodedUsableFrames: Int,
-    val sameSizeFrames: Int,
-    val compatibleFrames: Int
+    val sameSizeFrames: Int?,
+    val compatibleFrames: Int?
 )
 
 internal fun processClassicYuvFusionJob(
@@ -442,10 +442,12 @@ internal fun processClassicYuvFusionJob(
         val skippedFrameCount = if (compatibleFrameCountKnown) {
             (failurePreflight.enabledFrames - compatibleFrameCount).coerceAtLeast(0)
         } else null
-        val ghostSuppressionUsed = mergeResult != null
-        val ghostSuppressionEnabled = mergeResult != null
-        val ghostRejectedPixelRatio = if (mergeResult != null && mergeResult.comparedPixels > 0L) {
-            mergeResult.rejectedPixels.toDouble() / mergeResult.comparedPixels
+        val ghostRejectedPixelRatio = if (mergeResult != null) {
+            if (mergeResult.comparedPixels > 0L) {
+                mergeResult.rejectedPixels.toDouble() / mergeResult.comparedPixels
+            } else {
+                0.0
+            }
         } else null
         recordClassicFailure(
             jobFile = jobFile,
@@ -479,9 +481,7 @@ internal fun processClassicYuvFusionJob(
             outputWidth = dimensions?.first,
             outputHeight = dimensions?.second,
             yuvWidth = dimensions?.first,
-            yuvHeight = dimensions?.second,
-            ghostSuppressionUsed = ghostSuppressionUsed,
-            ghostSuppressionEnabled = ghostSuppressionEnabled
+            yuvHeight = dimensions?.second
         )
         throw IllegalStateException("Classic YUV fusion failed: OutOfMemoryError; cache kept", oom)
     } catch (ce: CancellationException) {
@@ -497,10 +497,12 @@ internal fun processClassicYuvFusionJob(
         val skippedFrameCount = if (compatibleFrameCountKnown) {
             (failurePreflight.enabledFrames - compatibleFrameCount).coerceAtLeast(0)
         } else null
-        val ghostSuppressionUsed = mergeResult != null
-        val ghostSuppressionEnabled = mergeResult != null
-        val ghostRejectedPixelRatio = if (mergeResult != null && mergeResult.comparedPixels > 0L) {
-            mergeResult.rejectedPixels.toDouble() / mergeResult.comparedPixels
+        val ghostRejectedPixelRatio = if (mergeResult != null) {
+            if (mergeResult.comparedPixels > 0L) {
+                mergeResult.rejectedPixels.toDouble() / mergeResult.comparedPixels
+            } else {
+                0.0
+            }
         } else null
         recordClassicFailure(
             jobFile,
@@ -534,9 +536,7 @@ internal fun processClassicYuvFusionJob(
             outputWidth = dimensions?.first,
             outputHeight = dimensions?.second,
             yuvWidth = dimensions?.first,
-            yuvHeight = dimensions?.second,
-            ghostSuppressionUsed = ghostSuppressionUsed,
-            ghostSuppressionEnabled = ghostSuppressionEnabled
+            yuvHeight = dimensions?.second
         )
         throw e
     } finally {
@@ -1443,16 +1443,12 @@ private fun resolveClassicFailureCounts(
     sameSizeFrameCountKnown: Boolean,
     compatibleFrameCountKnown: Boolean
 ): ClassicYuvProcessingFailureCounts {
-    val resolvedSameSizeFrameCount =
-        if (sameSizeFrameCountKnown) sameSizeFrameCount else decodedUsableFrameCount
-    val resolvedCompatibleFrameCount =
-        if (compatibleFrameCountKnown) compatibleFrameCount else resolvedSameSizeFrameCount
     return ClassicYuvProcessingFailureCounts(
         totalFrames = preflight.totalFrames,
         enabledFrames = preflight.enabledFrames,
         decodedUsableFrames = decodedUsableFrameCount,
-        sameSizeFrames = resolvedSameSizeFrameCount,
-        compatibleFrames = resolvedCompatibleFrameCount
+        sameSizeFrames = if (sameSizeFrameCountKnown) sameSizeFrameCount else null,
+        compatibleFrames = if (compatibleFrameCountKnown) compatibleFrameCount else null
     )
 }
 
@@ -1481,9 +1477,7 @@ private fun recordClassicFailure(
     outputWidth: Int? = null,
     outputHeight: Int? = null,
     yuvWidth: Int? = null,
-    yuvHeight: Int? = null,
-    ghostSuppressionUsed: Boolean? = null,
-    ghostSuppressionEnabled: Boolean? = null
+    yuvHeight: Int? = null
 ) {
     runCatching {
         val now = System.currentTimeMillis()
@@ -1564,8 +1558,8 @@ private fun recordClassicFailure(
             job.put("yuvProcessingTotalFrames", it.totalFrames)
                 .put("yuvProcessingEnabledFrames", it.enabledFrames)
                 .put("yuvProcessingDecodedUsableFrames", it.decodedUsableFrames)
-                .put("yuvProcessingSameSizeFrames", it.sameSizeFrames)
-                .put("yuvProcessingCompatibleFrames", it.compatibleFrames)
+            it.sameSizeFrames?.let { job.put("yuvProcessingSameSizeFrames", it) }
+            it.compatibleFrames?.let { job.put("yuvProcessingCompatibleFrames", it) }
         }
         persistClassicYuvFailure(
             jobDir = jobFile.parentFile ?: error("Job directory missing"),
