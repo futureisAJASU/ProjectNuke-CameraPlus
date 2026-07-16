@@ -156,10 +156,12 @@ internal fun processClassicYuvFusionJob(
         cancellation.throwIfCancelled()
         preflight = preflightSummary
         job.put("yuvProcessingPreflight", preflightSummary.toJson())
+            .put("frameCount", preflightSummary.totalFrames)
         KeplerJobMetadata.update(jobDir) { current ->
             current.put("yuvProcessingPreflight", preflightSummary.toJson())
                 .put("processingStartedAt", job.optLong("processingStartedAt"))
                 .put("yuvProcessingPolicy", metadataPolicy.name)
+                .put("frameCount", preflightSummary.totalFrames)
         }
         cancellation.throwIfCancelled()
         val candidateFrames = loadClassicFrames(jobDir, job)
@@ -432,8 +434,19 @@ internal fun processClassicYuvFusionJob(
 } catch (oom: OutOfMemoryError) {
         val failurePreflight = preflight ?: buildClassicYuvProcessingPreflight(jobDir, job)
         val excludedFrameCount = countExcludedFrames(job)
-        val fusedFrameCount = if (compatibleFrameCountKnown) compatibleFrameCount else frames.size
-        val skippedFrameCount = (totalFrames - excludedFrameCount - fusedFrameCount).coerceAtLeast(0)
+        val usedFrameCount = if (compatibleFrameCountKnown) compatibleFrameCount else null
+        val acceptedFrameCount = if (compatibleFrameCountKnown) compatibleFrameCount else null
+        val rejectedFrameCount = if (sameSizeFrameCountKnown && compatibleFrameCountKnown) {
+            (sameSizeFrameCount - compatibleFrameCount).coerceAtLeast(0)
+        } else null
+        val skippedFrameCount = if (compatibleFrameCountKnown) {
+            (failurePreflight.enabledFrames - compatibleFrameCount).coerceAtLeast(0)
+        } else null
+        val ghostSuppressionUsed = mergeResult != null
+        val ghostSuppressionEnabled = mergeResult != null
+        val ghostRejectedPixelRatio = if (mergeResult != null && mergeResult.comparedPixels > 0L) {
+            mergeResult.rejectedPixels.toDouble() / mergeResult.comparedPixels
+        } else null
         recordClassicFailure(
             jobFile = jobFile,
             job = job,
@@ -457,15 +470,18 @@ internal fun processClassicYuvFusionJob(
             lowConfidenceAlignmentCount = lowConfidenceAlignmentCount,
             externalFrameWeights = externalFrameWeights,
             referenceFrameIndex = activeReferenceIndex ?: referenceIndex,
-            usedFrameCount = fusedFrameCount,
-            acceptedFrameCount = fusedFrameCount,
+            usedFrameCount = usedFrameCount,
+            acceptedFrameCount = acceptedFrameCount,
+            rejectedFrameCount = rejectedFrameCount,
             excludedFrameCount = excludedFrameCount,
             skippedFrameCount = skippedFrameCount,
-            ghostRejectedPixelRatio = rejectedRatio,
+            ghostRejectedPixelRatio = ghostRejectedPixelRatio,
             outputWidth = dimensions?.first,
             outputHeight = dimensions?.second,
             yuvWidth = dimensions?.first,
-            yuvHeight = dimensions?.second
+            yuvHeight = dimensions?.second,
+            ghostSuppressionUsed = ghostSuppressionUsed,
+            ghostSuppressionEnabled = ghostSuppressionEnabled
         )
         throw IllegalStateException("Classic YUV fusion failed: OutOfMemoryError; cache kept", oom)
     } catch (ce: CancellationException) {
@@ -473,8 +489,19 @@ internal fun processClassicYuvFusionJob(
     } catch (e: Exception) {
         val failurePreflight = preflight ?: buildClassicYuvProcessingPreflight(jobDir, job)
         val excludedFrameCount = countExcludedFrames(job)
-        val fusedFrameCount = if (compatibleFrameCountKnown) compatibleFrameCount else frames.size
-        val skippedFrameCount = (totalFrames - excludedFrameCount - fusedFrameCount).coerceAtLeast(0)
+        val usedFrameCount = if (compatibleFrameCountKnown) compatibleFrameCount else null
+        val acceptedFrameCount = if (compatibleFrameCountKnown) compatibleFrameCount else null
+        val rejectedFrameCount = if (sameSizeFrameCountKnown && compatibleFrameCountKnown) {
+            (sameSizeFrameCount - compatibleFrameCount).coerceAtLeast(0)
+        } else null
+        val skippedFrameCount = if (compatibleFrameCountKnown) {
+            (failurePreflight.enabledFrames - compatibleFrameCount).coerceAtLeast(0)
+        } else null
+        val ghostSuppressionUsed = mergeResult != null
+        val ghostSuppressionEnabled = mergeResult != null
+        val ghostRejectedPixelRatio = if (mergeResult != null && mergeResult.comparedPixels > 0L) {
+            mergeResult.rejectedPixels.toDouble() / mergeResult.comparedPixels
+        } else null
         recordClassicFailure(
             jobFile,
             job,
@@ -498,15 +525,18 @@ internal fun processClassicYuvFusionJob(
             lowConfidenceAlignmentCount = lowConfidenceAlignmentCount,
             externalFrameWeights = externalFrameWeights,
             referenceFrameIndex = activeReferenceIndex ?: referenceIndex,
-            usedFrameCount = fusedFrameCount,
-            acceptedFrameCount = fusedFrameCount,
+            usedFrameCount = usedFrameCount,
+            acceptedFrameCount = acceptedFrameCount,
+            rejectedFrameCount = rejectedFrameCount,
             excludedFrameCount = excludedFrameCount,
             skippedFrameCount = skippedFrameCount,
-            ghostRejectedPixelRatio = rejectedRatio,
+            ghostRejectedPixelRatio = ghostRejectedPixelRatio,
             outputWidth = dimensions?.first,
             outputHeight = dimensions?.second,
             yuvWidth = dimensions?.first,
-            yuvHeight = dimensions?.second
+            yuvHeight = dimensions?.second,
+            ghostSuppressionUsed = ghostSuppressionUsed,
+            ghostSuppressionEnabled = ghostSuppressionEnabled
         )
         throw e
     } finally {
@@ -1499,10 +1529,13 @@ private fun recordClassicFailure(
         skippedFrameCount?.let { job.put("skippedFrameCount", it) }
         // Persist current-run reference frame index
         referenceFrameIndex?.let { job.put("referenceFrameIndex", it).put("yuvReferenceFrameIndex", it) }
-        // Persist ghost suppression metrics (only when known)
-        ghostSuppressionUsed?.let { job.put("ghostSuppressionUsed", it) }
-        ghostSuppressionEnabled?.let { job.put("ghostSuppressionEnabled", it) }
-        ghostRejectedPixelRatio?.let { job.put("ghostRejectedPixelRatio", it).put("rejectedGhostSampleRatio", it) }
+        // Persist ghost suppression metrics (only when merge completed)
+        ghostRejectedPixelRatio?.let {
+            job.put("ghostSuppressionUsed", true)
+                .put("ghostSuppressionEnabled", true)
+                .put("ghostRejectedPixelRatio", it)
+                .put("rejectedGhostSampleRatio", it)
+        }
         // Persist output and YUV dimensions (only when known)
         outputWidth?.let { job.put("outputWidth", it) }
         outputHeight?.let { job.put("outputHeight", it) }
@@ -1566,7 +1599,7 @@ private val classicYuvRunScopedKeys: Set<String> = setOf(
         "blackPoint", "contrastCurve", "saturationBoost", "vibranceBoost", "localContrastAmount",
         "processedAt", "processingNotes",
         "yuvExternalFrameWeightsUsed", "yuvExternalFrameWeightsTarget",
-        "yuvProcessingPolicy"
+        "yuvProcessingPolicy", "frameCount"
     )
 
 // Final progress keys for REPROCESS_PROGRESS_ONLY: active progress minus terminal state (stage/status)
@@ -1606,7 +1639,7 @@ private val classicYuvSuccessOwnedKeys: Set<String> = setOf(
 
 // Classic-owned keys that should be present on NORMAL failure (terminal failure + progress + diagnostic)
 private val classicYuvFailureOwnedKeys: Set<String> = setOf(
-    "currentPipelineStage", "processStatus", "pipelineFailed", "pipelineFailureStatusCode",
+    "jobType", "currentPipelineStage", "processStatus", "pipelineFailed", "pipelineFailureStatusCode",
     "pipelineFailureSource", "pipelineFailureType", "pipelineFailureMessage", "pipelineFailureStackTrace",
     "processFailureReason", "fusionEngine", "fusionVersion", "yuvFusionVersion",
     "fusionParamsVersion", "fusionPresetName", "fusionParams", "userCanMoveDevice",
