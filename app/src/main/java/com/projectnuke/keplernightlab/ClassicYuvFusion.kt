@@ -1,4 +1,4 @@
-﻿package com.projectnuke.keplernightlab
+package com.projectnuke.keplernightlab
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
