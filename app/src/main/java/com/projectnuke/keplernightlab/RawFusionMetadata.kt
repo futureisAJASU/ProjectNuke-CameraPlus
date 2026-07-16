@@ -33,10 +33,17 @@ internal val RAW_FUSION_PROGRESS_KEYS: Set<String> = setOf(
     "memoryEstimateUpdatedAt",
     "totalPipelineMs",
     "processedAt",
+    "rawFusionProcessedAt",
+    "rawFusionProcessingTimeMs",
     "nativePostprocessStatus",
     "nativePostprocessRgbaFile",
+    "nativePostprocessMetadataFile",
     "rawRenderDebugFile",
-    "rawFusionDebugFile"
+    "rawFusionDebugFile",
+    "rawRenderInputMetadataFile",
+    "nativeAlignMs",
+    "nativeMergeMs",
+    "nativeIspRenderMs"
 )
 
 /**
@@ -55,17 +62,21 @@ internal val RAW_FUSION_NATIVE_DIAGNOSTIC_KEYS: Set<String> = setOf(
     "rawFusionDebugFile",
     "rawReferenceDebugFile",
     "rawMergedLinearDebugFile",
-    "rawFinalRenderDebugFile"
+    "rawFinalRenderDebugFile",
+    "rawRenderInputMetadataFile"
 )
 
 /**
- * NON-terminal processor-error fields owned by `processRawFusionJob`. `processError` is written
- * by the run's failure metadata but does not flip the terminal `processStatus` /
- * `currentPipelineStage` values; it is therefore safe to attribute to the current run even in
- * `REPROCESS_PROGRESS_ONLY` failure, where terminal status keys are intentionally NOT written.
+ * Current-run processor-error fields owned by `processRawFusionJob`. `processError` and the
+ * explicit RAW processor failure type/message fields are written by the run's failure metadata
+ * but do not flip the terminal `processStatus` / `currentPipelineStage` values; they are
+ * therefore safe to attribute to the current run even in `REPROCESS_PROGRESS_ONLY` failure,
+ * where terminal status keys are intentionally NOT written.
  */
 internal val RAW_FUSION_PROCESSOR_ERROR_KEYS: Set<String> = setOf(
-    "processError"
+    "processError",
+    "rawProcessorFailureType",
+    "rawProcessorFailureMessage"
 )
 
 /**

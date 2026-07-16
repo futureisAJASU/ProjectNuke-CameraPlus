@@ -1657,8 +1657,8 @@ fun processRawFusionJob(
      * Keys owned by the run in `REPROCESS_PROGRESS_ONLY` mode: progress and diagnostics only.
      * NEVER includes terminal status/stage, `userCanMoveDevice`, gallery, export, final-output,
      * committed-export, or public-result fields, in accordance with the progress policy. The
-     * non-terminal processor-error field (`processError`) is included because it does not flip
-     * a terminal status key and is explicitly attributed to the current reprocess attempt.
+     * non-terminal processor-error fields are included because they do not flip a terminal status
+     * key and are explicitly attributed to the current reprocess attempt.
      */
     val ownedReprocessKeys: Set<String> = RAW_FUSION_PROGRESS_KEYS +
         RAW_FUSION_NATIVE_DIAGNOSTIC_KEYS +
@@ -1691,47 +1691,74 @@ fun processRawFusionJob(
     }
 
     /**
-     * Shared current-run RAW processing failure metadata. Records the normative NORMAL-failure
-     * shape (terminal stage/status + error + processedAt + current progress/diagnostics) and the
-     * reprocess-failure shape (only progress/diagnostics + non-terminal `processError`), both
-     * inside one [KeplerJobMetadata.update]. OOM and ordinary `Exception` failures share this
-     * helper so they always apply consistent metadata ownership.
+     * Builds a minimal failure overlay for the current run. Does NOT clone the full job.
+     * For NORMAL: adds terminal stage, terminal status, processedAt, failure type/message, policy, userCanMoveDevice.
+     * For REPROCESS: adds only non-terminal processor error fields and policy.
+     */
+    fun buildFailureOverlay(
+        processStatus: String,
+        failureMessage: String,
+        failureType: String
+    ): JSONObject {
+        return if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            JSONObject()
+                .put("currentPipelineStage", "FAILED")
+                .put("processStatus", processStatus)
+                .put("rawProcessorFailureType", failureType)
+                .put("rawProcessorFailureMessage", failureMessage)
+                .put("processError", failureMessage)
+                .put("processedAt", System.currentTimeMillis())
+                .put("userCanMoveDevice", true)
+                .put("rawFusionProcessingPolicy", metadataPolicy.name)
+        } else {
+            JSONObject()
+                .put("rawProcessorFailureType", failureType)
+                .put("rawProcessorFailureMessage", failureMessage)
+                .put("processError", failureMessage)
+                .put("rawFusionProcessingPolicy", metadataPolicy.name)
+        }
+    }
+
+    /**
+     * Persists current-run failure metadata in a single update. Applies owned keys from
+     * currentProgressJob (so stale owned values are removed), then overlays the failure fields.
+     * Does not stringify the full job. Logs any secondary metadata persistence failure but
+     * preserves the original processing error for the caller.
      */
     fun persistRawFusionFailureMetadata(
         processStatus: String,
         failureMessage: String,
+        failureType: String,
         currentProgressJob: JSONObject
     ) {
-        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            val local = JSONObject(currentProgressJob.toString())
-                .put("currentPipelineStage", "FAILED")
-                .put("processStatus", processStatus)
-                .put("processError", failureMessage)
-                .put("rawFusionProcessingPolicy", metadataPolicy.name)
+        val overlay = buildFailureOverlay(processStatus, failureMessage, failureType)
+        runCatching {
             KeplerJobMetadata.update(jobDir) { current ->
-                ownedNormalKeys.forEach { key ->
-                    if (local.has(key)) {
-                        current.put(key, local.get(key))
+                // First, apply owned keys from current run (copy if present, remove if absent)
+                ownedKeys.forEach { key ->
+                    if (currentProgressJob.has(key)) {
+                        current.put(key, currentProgressJob.get(key))
                     } else {
                         current.remove(key)
                     }
                 }
-            }
-        } else {
-            val local = JSONObject(currentProgressJob.toString())
-                .put("processError", failureMessage)
-                .put("rawFusionProcessingPolicy", metadataPolicy.name)
-            KeplerJobMetadata.update(jobDir) { current ->
-                ownedReprocessKeys.forEach { key ->
-                    if (local.has(key)) {
-                        current.put(key, local.get(key))
-                    } else {
-                        current.remove(key)
-                    }
+                // Then overlay failure fields
+                overlay.keys().forEach { key ->
+                    current.put(key, overlay.get(key))
                 }
             }
+        }.onFailure { metadataWriteError ->
+            Log.e(
+                RAW_PIPELINE_LOG_TAG,
+                "Failed to persist RAW fusion failure metadata: ${metadataWriteError.message}",
+                metadataWriteError
+            )
         }
     }
+
+    // Holder for current-run job metadata — assigned after read + initial reset, reused in all
+    // failure paths so we never construct failure metadata from an empty JSONObject.
+    var currentRunJob: JSONObject? = null
 
     return try {
         cancellation.throwIfCancelled()
@@ -1748,6 +1775,12 @@ fun processRawFusionJob(
         RAW_FUSION_PROCESSOR_ERROR_KEYS.forEach(job::remove)
         job.put("rawFusionProcessingPolicy", metadataPolicy.name)
 
+        // NORMAL: remove any previous terminal processStatus so we don't persist NOT_PROCESSED,
+        // a prior success, or a prior failure alongside currentPipelineStage="PROCESSING".
+        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            job.remove("processStatus")
+        }
+
         val frames = job.getJSONArray("frames")
         val width = job.getInt("rawWidth")
         val height = job.getInt("rawHeight")
@@ -1758,12 +1791,18 @@ fun processRawFusionJob(
         job.put("processingStartedAt", processingStartedAt)
             .put("currentPipelineStage", "PROCESSING")
             .put("userCanMoveDevice", true)
+            // Explicit non-terminal RAW processing status for this run
+            .put("processStatus", "RAW_PROCESSING_IN_PROGRESS")
         Log.i(
             RAW_PIPELINE_LOG_TAG,
             "PROCESSING_STARTED jobDirAbsolutePath=${jobDir.absolutePath} processStatus=${job.optString("processStatus")}"
         )
         onStatus("RAW 프레임을 정렬하는 중입니다.")
         applyRawFusionMemoryMetadata(job, estimateRawFusionMemory(pixelCountLong))
+
+        // Capture current-run job reference AFTER initial metadata is written
+        currentRunJob = job
+
         persistProcessingMetadata(job)
         val highResolutionRaw = pixelCountLong >= HIGH_RES_RAW_MIN_PIXELS
         val preparedFrames = prepareRawFusionFrames(jobDir, job, frames, pixelCount)
@@ -1825,11 +1864,12 @@ fun processRawFusionJob(
             alignmentFile.exists()
         if (!classicMergedOk) {
             val failureMessage = classicMerge.errorMessage ?: "Classic RAW fusion failed"
-            job.put("processedAt", System.currentTimeMillis())
+            currentRunJob!!.put("processedAt", System.currentTimeMillis())
             persistRawFusionFailureMetadata(
                 processStatus = "CLASSIC_RAW_FUSION_FAILED_KEEPING_CACHE",
                 failureMessage = failureMessage,
-                currentProgressJob = job
+                failureType = "CLASSIC_MERGE",
+                currentProgressJob = currentRunJob!!
             )
             onStatus("Classic RAW fusion failed. RAW cache kept.")
             return RawFusionProcessResult(
@@ -1891,31 +1931,29 @@ fun processRawFusionJob(
         // and never causes a metadata write from this processor.
         throw ce
     } catch (oom: OutOfMemoryError) {
-        runCatching {
-            val local = JSONObject()
-                .put("processedAt", System.currentTimeMillis())
-                .put("rawFusionProcessingPolicy", metadataPolicy.name)
-            persistRawFusionFailureMetadata(
-                processStatus = "OOM_FAILED_KEEPING_CACHE",
-                failureMessage = "OutOfMemoryError",
-                currentProgressJob = local
-            )
-        }
+        // OOM path: allocation-light. Use the current-run job if we have one, otherwise skip
+        // owned-key cleanup (no current-run metadata to preserve).
+        val runJob = currentRunJob ?: runCatching { JSONObject(jobFile.readText()) }.getOrNull()
+        runJob?.put("processedAt", System.currentTimeMillis())
+        persistRawFusionFailureMetadata(
+            processStatus = "OOM_FAILED_KEEPING_CACHE",
+            failureMessage = "OutOfMemoryError",
+            failureType = "OOM",
+            currentProgressJob = runJob ?: JSONObject()
+        )
         onStatus("RAW fusion stopped: insufficient memory. RAW cache kept.")
         RawFusionProcessResult(false, null, null, null, null, "OutOfMemoryError: RAW cache kept")
     } catch (e: Exception) {
         // Do not return failure without recording the current NORMAL/reprocess failure metadata.
         val failureMessage = "${e.javaClass.simpleName}: ${e.message}"
-        runCatching {
-            val local = JSONObject()
-                .put("processedAt", System.currentTimeMillis())
-                .put("rawFusionProcessingPolicy", metadataPolicy.name)
-            persistRawFusionFailureMetadata(
-                processStatus = "FAILED_KEEPING_CACHE",
-                failureMessage = failureMessage,
-                currentProgressJob = local
-            )
-        }
+        val runJob = currentRunJob ?: runCatching { JSONObject(jobFile.readText()) }.getOrNull()
+        runJob?.put("processedAt", System.currentTimeMillis())
+        persistRawFusionFailureMetadata(
+            processStatus = "FAILED_KEEPING_CACHE",
+            failureMessage = failureMessage,
+            failureType = e.javaClass.simpleName,
+            currentProgressJob = runJob ?: JSONObject()
+        )
         RawFusionProcessResult(false, null, null, null, null, failureMessage)
     }
 }
