@@ -155,6 +155,8 @@ internal val RAW_FUSION_SHARED_PROCESSOR_KEYS: Set<String> = RAW_FUSION_PROGRESS
  *
  * Includes the explicit run identity scaler `rawFusionProcessingPolicy` so reprocess readers and
  * the shared finalizer can read which policy produced the diagnostic snapshot.
+ *
+ * This set is DISJOINT from RAW_CLASSIC_CURRENT_RUN_KEYS.
  */
 internal val RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS: Set<String> = setOf(
     "rawFusionProcessingPolicy",
@@ -204,67 +206,32 @@ internal val RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS: Set<String> = setOf(
     "outputOrientation",
     "selected24MpStrategy",
     "actualInputResolutionMode",
-    "outputResolutionMode",
-    "nativeMergeVersion",
-    "tileBasedMerge",
-    "tileRows",
-    "tileCount",
-    "fullFrameAccumulatorsUsed",
-    "fullFrameMergedBufferUsed",
-    "estimatedTileMergeWorkingSetBytes",
-    "estimatedTileMergeWorkingSetMb",
-    "acceptedFrameCount",
-    "rejectedFrameCount",
-    "ghostSuppressionEnabled",
-    "ghostRejectedSampleRatio",
-    "referencePreservedPixelRatio",
-    "mergeWarning",
-    "nativeAlignMs",
-    "nativeMergeMs",
-    "mergeWeightMapAvailable",
-    "mergeWeightMapFile",
-    "mergeRejectMapAvailable",
-    "mergeRejectMapFile",
-    "rawReferencePreviewFile",
-    "rawFusedPreviewFile",
-    "rawComparePreviewFile",
-    "rawDebugArtifactStatus",
-    "rawDebugArtifactError",
-    "referenceSinglePreviewFile",
-    "referenceFrameIndex",
-    "referenceFrameReason",
-    "usedFrameCount",
-    "excludedFrameCount",
-    "skippedFrameCount",
-    "requestedFrames",
-    "savedFrames",
-    "captureCompleteness",
-    "partialCapture",
-    "processingNotes",
-    "rawFusionNotes",
-    "blackLevelUsed",
-    "whiteLevelUsed",
-    "blackLevelSource",
-    "blackLevelMode",
-    "whiteLevelSource",
-    "mergedRawFormat",
-    "sensorOrientation"
+    "outputResolutionMode"
 )
 
 /**
  * NORMAL-only local-output keys covering the current export run's local candidate references
- * (`finalFile`, `previewFile`). These keys belong to the NORMAL export stage and NEVER to a
- * `REPROCESS_PROGRESS_ONLY` diagnostic run: reprocess must not directly write or clear local
- * output references. The shared finalizer owns reprocess terminal metadata instead, so the
- * reprocess export stage never writes these keys.
+ * (`finalFile`, `previewFile`, `isDebugPreviewUsedAsFinal`). These keys belong to the NORMAL
+ * export stage and NEVER to a `REPROCESS_PROGRESS_ONLY` diagnostic run: reprocess must not
+ * directly write or clear local output references. The shared finalizer owns reprocess terminal
+ * metadata instead, so the reprocess export stage never writes these keys.
  */
-internal val RAW_FUSION_EXPORT_NORMAL_ONLY_KEYS: Set<String> = setOf(
+internal val RAW_FUSION_EXPORT_NORMAL_LOCAL_KEYS: Set<String> = setOf(
+    "finalFile",
+    "previewFile",
+    "isDebugPreviewUsedAsFinal"
+)
+
+/**
+ * NORMAL-only failure overlay keys written on a local-render failure. These are written as an
+ * atomic overlay in the same locked update that persists the current-run diagnostics, so a
+ * NORMAL local-render failure cannot return without current failure metadata. NEVER owned by
+ * `REPROCESS_PROGRESS_ONLY`.
+ */
+internal val RAW_FUSION_EXPORT_NORMAL_FAILURE_KEYS: Set<String> = setOf(
     "userCanMoveDevice",
     "currentPipelineStage",
     "processStatus",
-    "finalFile",
-    "previewFile",
-    "isDebugPreviewUsedAsFinal",
     "exportStatus",
     "exportVerified",
     "exportError",
@@ -275,21 +242,22 @@ internal val RAW_FUSION_EXPORT_NORMAL_ONLY_KEYS: Set<String> = setOf(
 
 /**
  * Single NORMAL export run's owned key set: shared processor/export diagnostics plus the
- * NORMAL-only terminal/gallery/public/committed-export/final-output/timing/error keys. A NORMAL
- * export run copies present current-run values for every key here and removes absent ones inside a
- * single [KeplerJobMetadata.update], so stale previous-run export result metadata never survives a
- * current NORMAL export, success or failure.
+ * NORMAL-only local-output keys and NORMAL-only failure overlay keys.
  */
 internal val RAW_FUSION_EXPORT_NORMAL_OWNED_KEYS: Set<String> =
-    RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS + RAW_FUSION_EXPORT_NORMAL_ONLY_KEYS
+    RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS +
+    RAW_FUSION_EXPORT_NORMAL_LOCAL_KEYS +
+    RAW_FUSION_EXPORT_NORMAL_FAILURE_KEYS
 
 /**
  * `REPROCESS_PROGRESS_ONLY` export owned-key set: processor/export diagnostics only. NEVER
  * includes terminal stage/status, `userCanMoveDevice`, gallery linkage, public-result,
- * committed-export, final-output, or export-error terminal fields, in accordance with the progress
- * policy. The non-terminal processor/export-progress reads/writes flow through these keys so the
- * shared finalizer can inspect the current reprocess attempt without the reprocess stage writing
- * competing terminal metadata.
+ * committed-export, final-output, local-output, or export-error terminal fields, in accordance
+ * with the progress policy. The non-terminal processor/export-progress reads/writes flow through
+ * these keys so the shared finalizer can inspect the current reprocess attempt without the
+ * reprocess stage writing competing terminal metadata.
+ *
+ * This set is DISJOINT from RAW_CLASSIC_CURRENT_RUN_KEYS.
  */
 internal val RAW_FUSION_EXPORT_REPROCESS_KEYS: Set<String> =
     RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS

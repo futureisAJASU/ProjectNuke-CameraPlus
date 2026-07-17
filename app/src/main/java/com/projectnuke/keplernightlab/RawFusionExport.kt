@@ -17,11 +17,17 @@ import java.util.Locale
 
 /**
  * Explicit export-result model returned by [RawFusionExportCoordinator.export]. Each production
- * branch produces exactly one subclass so the export stage never collapses a verified committed
- * public export, a private/cache-only output, a failure before any commit, or a failure after a
- * public commit into a single ambiguous value. The model never reports a public header as a
- * committed public export unless its URI/output verification succeeded, and a verified committed
- * public export is preserved against later cancellation or processor cleanup.
+ * branch produces exactly one subclass so the export stage never collapses a local candidate
+ * output, a local-render failure, or a prior verified public export into a single ambiguous
+ * value. The model describes only:
+ *
+ * - Native RGBA local candidate (no MediaStore commit)
+ * - MP24 local candidate (no MediaStore commit)
+ * - Kotlin bitmap fallback local candidate (no MediaStore commit)
+ * - Local-render failure before public export
+ *
+ * This model does NOT represent public commit, verification, cache-only public results, or
+ * failure after commit. Those are handled by the shared finalizer in Phase 3B2.
  *
  * NORMAL callers persist current export owned-key metadata (success or failure) from the
  * [RawFusionExportResult.metadata] payload inside a single [KeplerJobMetadata.update]. The
@@ -49,14 +55,14 @@ internal sealed class RawFusionExportResult {
         override val metadata: JSONObject
     ) : RawFusionExportResult()
 
-    /** Standard Kotlin bitmap fallback output (final PNG with local artifact references). */
+    /** Standard Kotlin bitmap fallback output (local candidate PNG). */
     internal data class BitmapFallbackSuccess(
         override val base: RawFusionProcessResult,
         override val metadata: JSONObject
     ) : RawFusionExportResult()
 
-    /** Export failure before any public MediaStore commit. Ownership: current NORMAL failure metadata must reflect this. */
-    internal data class ExportFailureBeforeCommit(
+    /** Local-render failure before any public MediaStore commit. Ownership: current NORMAL failure metadata must reflect this. */
+    internal data class LocalRenderFailure(
         override val base: RawFusionProcessResult,
         override val metadata: JSONObject
     ) : RawFusionExportResult()
@@ -253,8 +259,11 @@ fun captureProcessExportRawNightFusion(
                     updateExportMetadata(
                         jobDir = jobDir,
                         export = result,
+                        verified = verified,
                         finalOutputFormat = finalOutputFormat,
-                        rawSidecarResult = null
+                        rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
+                        postExportCancellationRequested = cancellation.isCancelled,
+                        postExportWorkSkipped = cancellation.isCancelled
                     )
                     if (!verified) {
                         // Failure after a public MediaStore commit: the public export cannot be rolled
@@ -266,13 +275,17 @@ fun captureProcessExportRawNightFusion(
                         updateExportFailure(
                             jobDir = jobDir,
                             error = "Export verification failed",
-                            finalOutputFormat = finalOutputFormat
+                            finalOutputFormat = finalOutputFormat,
+                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
+                            export = result
                         )
                         post("PIPELINE_FAILED: RAW export verification failed; keeping RAW cache.")
                         return@post
                     }
                     if (cancellation.isCancelled) {
-                        updateExportMetadata(jobDir, result, finalOutputFormat, null)
+                        updateExportMetadata(jobDir, result, true, finalOutputFormat,
+                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
+                            postExportCancellationRequested = true, postExportWorkSkipped = true)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. RAW cache kept.")
                         return@post
                     }
@@ -306,11 +319,14 @@ fun captureProcessExportRawNightFusion(
                     updateExportMetadata(
                         jobDir = jobDir,
                         export = result,
+                        verified = true,
                         finalOutputFormat = finalOutputFormat,
-                        rawSidecarResult = rawSidecarResult
+                        rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
                     )
                     if (cancellation.isCancelled) {
-                        updateExportMetadata(jobDir, result, finalOutputFormat, rawSidecarResult)
+                        updateExportMetadata(jobDir, result, true, finalOutputFormat,
+                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
+                            postExportCancellationRequested = true, postExportWorkSkipped = true)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. RAW cache kept.")
                         return@post
                     }
@@ -345,7 +361,8 @@ fun captureProcessExportRawNightFusion(
                         updateExportFailure(
                             jobDir = jobDir,
                             error = "OutOfMemoryError during RAW export; cache kept",
-                            finalOutputFormat = finalOutputFormat
+                            finalOutputFormat = finalOutputFormat,
+                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
                         )
                     }
                     post("PIPELINE_FAILED: RAW export ran out of memory; keeping RAW cache.")
@@ -354,7 +371,8 @@ fun captureProcessExportRawNightFusion(
                         updateExportFailure(
                             jobDir = jobDir,
                             error = "${e.javaClass.simpleName}: ${e.message}",
-                            finalOutputFormat = finalOutputFormat
+                            finalOutputFormat = finalOutputFormat,
+                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
                         )
                     }
                     post(

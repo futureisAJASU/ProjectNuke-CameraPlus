@@ -199,9 +199,12 @@ fun queryMediaSize(context: Context, uri: Uri): Long {
 fun updateExportMetadata(
     jobDir: File,
     export: GalleryExportResult?,
+    verified: Boolean,
     finalOutputFormat: FinalOutputFormat,
     rawSidecarResult: RawSidecarExportResult? = null,
-    rawSidecarIgnored: Boolean = false
+    rawSidecarIgnored: Boolean = false,
+    postExportCancellationRequested: Boolean = false,
+    postExportWorkSkipped: Boolean = false
 ) {
     lateinit var pipelineStatusForLog: String
     lateinit var finalOutputSourceForLog: String
@@ -209,12 +212,13 @@ fun updateExportMetadata(
     lateinit var rawRenderDebugFileForLog: String
     KeplerJobMetadata.update(jobDir) { job ->
         job.put("finalOutputFormatSetting", finalOutputFormat.name)
-            .put("currentPipelineStage", "COMPLETE")
+            .put("currentPipelineStage", if (verified) "COMPLETE" else "PROCESSING")
             .put("exportStatus", when {
                 export == null -> "FAILED"
-                else -> "EXPORTED"
+                verified -> "EXPORTED"
+                else -> "EXPORT_UNVERIFIED"
             })
-            .put("exportVerified", true)
+            .put("exportVerified", verified)
             .put("exportUri", export?.uriString ?: JSONObject.NULL)
             .put("exportDisplayName", export?.displayName ?: JSONObject.NULL)
             .put("exportMimeType", export?.mimeType ?: JSONObject.NULL)
@@ -223,6 +227,8 @@ fun updateExportMetadata(
             .put("exportFallbackUsed", export?.fallbackUsed ?: false)
             .put("exportFileSizeBytes", export?.fileSizeBytes ?: 0L)
             .put("galleryExportCommitted", export?.success == true && !export?.uriString.isNullOrBlank())
+            .put("postExportCancellationRequested", postExportCancellationRequested)
+            .put("postExportWorkSkipped", postExportWorkSkipped)
             .put("rawSidecarRequested", finalOutputFormat.shouldExportRawSidecar)
             .put("rawSidecarExportStatus", when {
                 rawSidecarIgnored -> "UNAVAILABLE"
@@ -260,22 +266,23 @@ fun updateExportFailure(
     jobDir: File,
     error: String,
     finalOutputFormat: FinalOutputFormat,
-    rawSidecarIgnored: Boolean = false
+    rawSidecarIgnored: Boolean = false,
+    export: GalleryExportResult? = null
 ) {
     KeplerJobMetadata.update(jobDir) { job ->
         job.put("finalOutputFormatSetting", finalOutputFormat.name)
+            .put("processStatus", "EXPORT_FAILED_KEEPING_CACHE")
+            .put("currentPipelineStage", "FAILED")
             .put("exportStatus", "FAILED")
             .put("exportVerified", false)
-            .put("galleryExportCommitted", false)
-            .put("exportUri", JSONObject.NULL)
+            .put("galleryExportCommitted", export?.success == true && !export?.uriString.isNullOrBlank())
+            .put("exportUri", export?.uriString ?: JSONObject.NULL)
             .put("exportError", error)
             .put("rawSidecarRequested", finalOutputFormat.shouldExportRawSidecar)
             .put("rawSidecarExportStatus", if (rawSidecarIgnored) "UNAVAILABLE" else "SKIPPED")
             .put("rawSidecarError", if (rawSidecarIgnored) "RAW sidecar unavailable for YUV pipeline." else JSONObject.NULL)
             .put("cleanupStatus", "SKIPPED")
             .put("exportedAt", System.currentTimeMillis())
-            .put("processStatus", "EXPORT_FAILED_KEEPING_CACHE")
-            .put("currentPipelineStage", "FAILED")
     }
 }
 
