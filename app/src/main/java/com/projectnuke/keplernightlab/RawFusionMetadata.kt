@@ -206,7 +206,8 @@ internal val RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS: Set<String> = setOf(
     "outputOrientation",
     "selected24MpStrategy",
     "actualInputResolutionMode",
-    "outputResolutionMode"
+    "outputResolutionMode",
+    "outputFallbackReason"
 )
 
 /**
@@ -229,20 +230,35 @@ internal val RAW_FUSION_EXPORT_NORMAL_LOCAL_KEYS: Set<String> = setOf(
  * `REPROCESS_PROGRESS_ONLY`.
  */
 internal val RAW_FUSION_EXPORT_NORMAL_FAILURE_KEYS: Set<String> = setOf(
-    "userCanMoveDevice",
     "currentPipelineStage",
     "processStatus",
-    "exportStatus",
-    "exportVerified",
-    "exportError",
-    "cleanupStatus",
-    "exportedAt",
-    "totalPipelineMs"
+    "userCanMoveDevice",
+    "rawLocalRenderFailureType",
+    "rawLocalRenderFailureMessage"
 )
 
 /**
- * Single NORMAL export run's owned key set: shared processor/export diagnostics plus the
- * NORMAL-only local-output keys and NORMAL-only failure overlay keys.
+ * Keys initialized/cleared at local-render start: shared diagnostics + NORMAL local candidates.
+ * Does NOT include failure overlay keys, terminal fields, public-export fields, or gallery linkage.
+ */
+internal val RAW_FUSION_EXPORT_NORMAL_INIT_KEYS: Set<String> =
+    RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS + RAW_FUSION_EXPORT_NORMAL_LOCAL_KEYS
+
+/**
+ * Keys persisted on NORMAL local-render success: shared diagnostics + NORMAL local candidates.
+ * Does NOT include failure overlay keys, terminal fields, public-export fields, or gallery linkage.
+ */
+internal val RAW_FUSION_EXPORT_NORMAL_SUCCESS_KEYS: Set<String> =
+    RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS + RAW_FUSION_EXPORT_NORMAL_LOCAL_KEYS
+
+/**
+ * Keys persisted on NORMAL local-render failure: shared diagnostics + NORMAL local candidates
+ * + failure overlay. Does NOT include public-export fields.
+ */
+
+
+/**
+ * Single NORMAL export run's owned key set for reference: all keys the export stage may touch.
  */
 internal val RAW_FUSION_EXPORT_NORMAL_OWNED_KEYS: Set<String> =
     RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS +
