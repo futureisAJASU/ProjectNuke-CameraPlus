@@ -31,8 +31,6 @@ internal val RAW_FUSION_PROGRESS_KEYS: Set<String> = setOf(
     "estimatedNativeFallbackBytes",
     "memoryRiskLevel",
     "memoryEstimateUpdatedAt",
-    "totalPipelineMs",
-    "processedAt",
     "rawFusionProcessedAt",
     "rawFusionProcessingTimeMs",
     "nativePostprocessStatus",
@@ -44,6 +42,53 @@ internal val RAW_FUSION_PROGRESS_KEYS: Set<String> = setOf(
     "nativeAlignMs",
     "nativeMergeMs",
     "nativeIspRenderMs"
+)
+
+/**
+ * Current-run Classic RAW result and diagnostic keys produced by [runClassicRawFusionMerge]
+ * and its debug-preview path. Reset at current-run initialization so a previous success cannot
+ * leave Classic result or debug metadata after an early current failure. Persisted after a
+ * successful Classic merge; removed on any current-run failure.
+ */
+internal val RAW_CLASSIC_CURRENT_RUN_KEYS: Set<String> = setOf(
+    "rawFusionEngine",
+    "rawFusionVersion",
+    "rawReferenceFrameIndex",
+    "rawReferenceFrameReason",
+    "usedFrameCount",
+    "excludedFrameCount",
+    "skippedFrameCount",
+    "rawGhostSuppressionUsed",
+    "rawNoiseModelVersion",
+    "shotCoeff",
+    "readNoiseCoeff",
+    "rawOutlierRejectedRatio",
+    "rawOutlierDownweightedRatio",
+    "rawAlignmentSummary",
+    "nativeAlignmentAvailable",
+    "nativeAlignmentUsed",
+    "alignmentVersion",
+    "fallbackAlignmentCount",
+    "lowConfidenceAlignmentCount",
+    "rawFusionProcessedAt",
+    "rawFusionProcessingTimeMs",
+    "nativeAlignMs",
+    "nativeMergeMs",
+    "mergedRawFile",
+    "rawFusionDebugFile",
+    "alignmentFile",
+    "alignmentStatus",
+    "nativeRawMerge",
+    "rawFusionNotes",
+    "mergeWeightMapAvailable",
+    "mergeWeightMapFile",
+    "mergeRejectMapAvailable",
+    "mergeRejectMapFile",
+    "rawReferencePreviewFile",
+    "rawFusedPreviewFile",
+    "rawComparePreviewFile",
+    "rawDebugArtifactStatus",
+    "rawDebugArtifactError"
 )
 
 /**
@@ -88,6 +133,64 @@ internal val RAW_FUSION_NORMAL_FAILURE_TERMINAL_KEYS: Set<String> = setOf(
     "currentPipelineStage",
     "processStatus"
 )
+
+/**
+ * Current-run shared RAW processor progress keys split from NORMAL-only generic pipeline fields.
+ * These are written by both NORMAL and reprocess paths and do not include terminal failure keys
+ * or `userCanMoveDevice`.
+ */
+internal val RAW_FUSION_SHARED_PROCESSOR_KEYS: Set<String> = RAW_FUSION_PROGRESS_KEYS +
+    RAW_FUSION_NATIVE_DIAGNOSTIC_KEYS +
+    RAW_FUSION_PROCESSOR_ERROR_KEYS
+
+/**
+ * Persist current-run failure metadata in a single [KeplerJobMetadata.update] call.
+ * Copies present current-run owned fields from [currentRunJob], removes absent owned fields,
+ * directly writes the failure scalar fields, and optionally removes Classic current-run keys.
+ * Accepts a nullable [currentRunJob]; if null, all owned fields are treated as absent and only
+ * removed from the locked metadata.
+ *
+ * Does not allocate a separate failure [JSONObject]. Does not re-read or parse [job.json].
+ */
+internal fun persistRawFusionFailureMetadata(
+    jobDir: File,
+    metadataPolicy: ReprocessMetadataPolicy,
+    processStatus: String,
+    failureMessage: String,
+    failureType: String,
+    currentRunJob: JSONObject?,
+    ownedKeys: Set<String>,
+    classicKeysToRemove: Set<String> = emptySet()
+) {
+    runCatching {
+        KeplerJobMetadata.update(jobDir) { current ->
+            ownedKeys.forEach { key ->
+                if (currentRunJob != null && currentRunJob.has(key)) {
+                    current.put(key, currentRunJob.get(key))
+                } else {
+                    current.remove(key)
+                }
+            }
+            classicKeysToRemove.forEach { current.remove(it) }
+            if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+                current.put("currentPipelineStage", "FAILED")
+                current.put("processStatus", processStatus)
+                current.put("userCanMoveDevice", true)
+            }
+            current.put("rawProcessorFailureType", failureType)
+            current.put("rawProcessorFailureMessage", failureMessage)
+            current.put("processError", failureMessage)
+            current.put("processedAt", System.currentTimeMillis())
+            current.put("rawFusionProcessingPolicy", metadataPolicy.name)
+        }
+    }.onFailure { metadataWriteError ->
+        Log.e(
+            "KeplerRawPipeline",
+            "Failed to persist RAW fusion failure metadata: ${metadataWriteError.message}",
+            metadataWriteError
+        )
+    }
+}
 
 internal fun applyNativeMergeMetadata(
     target: JSONObject,
