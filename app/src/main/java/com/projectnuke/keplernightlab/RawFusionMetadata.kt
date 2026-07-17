@@ -223,60 +223,62 @@ internal val RAW_FUSION_EXPORT_NORMAL_LOCAL_KEYS: Set<String> = setOf(
     "isDebugPreviewUsedAsFinal"
 )
 
-/**
- * NORMAL-only failure overlay keys written on a local-render failure. These are written as an
- * atomic overlay in the same locked update that persists the current-run diagnostics, so a
- * NORMAL local-render failure cannot return without current failure metadata. NEVER owned by
- * `REPROCESS_PROGRESS_ONLY`.
- */
-internal val RAW_FUSION_EXPORT_NORMAL_FAILURE_KEYS: Set<String> = setOf(
-    "currentPipelineStage",
-    "processStatus",
-    "userCanMoveDevice",
+internal val RAW_FUSION_EXPORT_RENDERER_ERROR_KEYS: Set<String> = setOf(
     "rawLocalRenderFailureType",
     "rawLocalRenderFailureMessage"
 )
 
 /**
- * Keys initialized/cleared at local-render start: shared diagnostics + NORMAL local candidates.
- * Does NOT include failure overlay keys, terminal fields, public-export fields, or gallery linkage.
+ * Keys initialized/cleared at local-render start: shared diagnostics + NORMAL local candidates
+ * + renderer-error diagnostics. Does NOT include terminal fields, public-export fields,
+ * or gallery linkage.
  */
 internal val RAW_FUSION_EXPORT_NORMAL_INIT_KEYS: Set<String> =
-    RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS + RAW_FUSION_EXPORT_NORMAL_LOCAL_KEYS
+    RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS +
+    RAW_FUSION_EXPORT_NORMAL_LOCAL_KEYS +
+    RAW_FUSION_EXPORT_RENDERER_ERROR_KEYS
 
 /**
- * Keys persisted on NORMAL local-render success: shared diagnostics + NORMAL local candidates.
- * Does NOT include failure overlay keys, terminal fields, public-export fields, or gallery linkage.
+ * Keys persisted on NORMAL local-render success: shared diagnostics + NORMAL local candidates
+ * + renderer-error diagnostics (absent to clear a previous current-run error).
+ * Does NOT include terminal fields, public-export fields, or gallery linkage.
  */
 internal val RAW_FUSION_EXPORT_NORMAL_SUCCESS_KEYS: Set<String> =
-    RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS + RAW_FUSION_EXPORT_NORMAL_LOCAL_KEYS
+    RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS +
+    RAW_FUSION_EXPORT_NORMAL_LOCAL_KEYS +
+    RAW_FUSION_EXPORT_RENDERER_ERROR_KEYS
+
+/**
+ * NORMAL failure terminal overlay keys written directly in the locked update (not in
+ * the present-copy/absent-remove owned set).
+ */
+internal val RAW_FUSION_EXPORT_NORMAL_FAILURE_TERMINAL_KEYS: Set<String> = setOf(
+    "currentPipelineStage",
+    "processStatus",
+    "userCanMoveDevice"
+)
+
+/**
+ * `REPROCESS_PROGRESS_ONLY` export owned-key set: shared diagnostics + renderer-error
+ * diagnostics only. NEVER includes NORMAL local candidate keys, terminal stage/status,
+ * `userCanMoveDevice`, gallery linkage, public-result, committed-export, final-output,
+ * or local-output fields, in accordance with the progress policy.
+ *
+ * DISJOINT from RAW_CLASSIC_CURRENT_RUN_KEYS.
+ */
+internal val RAW_FUSION_EXPORT_REPROCESS_KEYS: Set<String> =
+    RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS + RAW_FUSION_EXPORT_RENDERER_ERROR_KEYS
 
 /**
  * Keys persisted on NORMAL local-render failure: shared diagnostics + NORMAL local candidates
- * + failure overlay. Does NOT include public-export fields.
+ * + renderer-error diagnostics. Terminal stage/status and `userCanMoveDevice` are written as a
+ * direct overlay inside the locked update (not in the present-copy/absent-remove owned set) so
+ * a NORMAL failure cannot return without current failure metadata.
  */
-
-
-/**
- * Single NORMAL export run's owned key set for reference: all keys the export stage may touch.
- */
-internal val RAW_FUSION_EXPORT_NORMAL_OWNED_KEYS: Set<String> =
+internal val RAW_FUSION_EXPORT_NORMAL_FAILURE_PERSIST_KEYS: Set<String> =
     RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS +
     RAW_FUSION_EXPORT_NORMAL_LOCAL_KEYS +
-    RAW_FUSION_EXPORT_NORMAL_FAILURE_KEYS
-
-/**
- * `REPROCESS_PROGRESS_ONLY` export owned-key set: processor/export diagnostics only. NEVER
- * includes terminal stage/status, `userCanMoveDevice`, gallery linkage, public-result,
- * committed-export, final-output, local-output, or export-error terminal fields, in accordance
- * with the progress policy. The non-terminal processor/export-progress reads/writes flow through
- * these keys so the shared finalizer can inspect the current reprocess attempt without the
- * reprocess stage writing competing terminal metadata.
- *
- * This set is DISJOINT from RAW_CLASSIC_CURRENT_RUN_KEYS.
- */
-internal val RAW_FUSION_EXPORT_REPROCESS_KEYS: Set<String> =
-    RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS
+    RAW_FUSION_EXPORT_RENDERER_ERROR_KEYS
 
 /**
  * Persist current-run failure metadata in a single [KeplerJobMetadata.update] call.
