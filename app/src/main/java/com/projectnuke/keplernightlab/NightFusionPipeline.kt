@@ -106,8 +106,7 @@ fun captureProcessExportNightFusion(
                             jobDir = jobDir,
                             error = export.errorMessage ?: "Unknown export failure",
                             finalOutputFormat = finalOutputFormat,
-                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
-                            export = export
+                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
                         )
                         post("PIPELINE_FAILED: Export failed; keeping cache. ${export.errorMessage}")
                         return@post
@@ -118,11 +117,8 @@ fun captureProcessExportNightFusion(
                     updateExportMetadata(
                         jobDir = jobDir,
                         export = export,
-                        verified = verified,
                         finalOutputFormat = finalOutputFormat,
                         rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
-                        ,postExportCancellationRequested = cancellation.isCancelled,
-                        postExportWorkSkipped = cancellation.isCancelled
                     )
 
                     if (!verified) {
@@ -131,16 +127,13 @@ fun captureProcessExportNightFusion(
                             error = "Export verification failed",
                             finalOutputFormat = finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
-                            ,export = export
                         )
                         post("PIPELINE_FAILED: Export verification failed; keeping source frames.")
                         return@post
                     }
 
                     if (cancellation.isCancelled) {
-                        updateExportMetadata(jobDir, export, true, finalOutputFormat,
-                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
-                            postExportCancellationRequested = true, postExportWorkSkipped = true)
+                        updateExportMetadata(jobDir, export, finalOutputFormat, null, finalOutputFormat.shouldExportRawSidecar)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. Cache was kept.")
                         return@post
                     }
@@ -152,15 +145,7 @@ fun captureProcessExportNightFusion(
                         onStatus = { post(it) }
                     )
                     if (cancellation.isCancelled) {
-                        updateExportMetadata(
-                            jobDir = jobDir,
-                            export = export,
-                            verified = true,
-                            finalOutputFormat = finalOutputFormat,
-                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
-                            postExportCancellationRequested = true,
-                            postExportWorkSkipped = true
-                        )
+                        updateExportMetadata(jobDir, export, finalOutputFormat, null, finalOutputFormat.shouldExportRawSidecar)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. Cache was kept.")
                         return@post
                     }

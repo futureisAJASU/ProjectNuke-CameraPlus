@@ -439,15 +439,12 @@ fun captureProcessExportSuperResolutionFusion(
                         return@post
                     }
 
-                    val verified = verifyGalleryExport(context, export.uriString)
+val verified = verifyGalleryExport(context, export.uriString)
                     updateExportMetadata(
                         jobDir = outputDir,
                         export = export,
-                        verified = verified,
                         finalOutputFormat = finalOutputFormat,
                         rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
-                        ,postExportCancellationRequested = cancellation.isCancelled,
-                        postExportWorkSkipped = cancellation.isCancelled
                     )
                     if (!verified) {
                         updateExportFailure(
@@ -455,16 +452,13 @@ fun captureProcessExportSuperResolutionFusion(
                             error = "Export verification failed",
                             finalOutputFormat = finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
-                            ,export = export
                         )
                         post("PIPELINE_FAILED: 24M Fusion export verification failed.")
                         return@post
                     }
 
                     if (cancellation.isCancelled) {
-                        updateExportMetadata(outputDir, export, true, finalOutputFormat,
-                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
-                            postExportCancellationRequested = true, postExportWorkSkipped = true)
+                        updateExportMetadata(outputDir, export, finalOutputFormat, null, finalOutputFormat.shouldExportRawSidecar)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. Cache was kept.")
                         return@post
                     }

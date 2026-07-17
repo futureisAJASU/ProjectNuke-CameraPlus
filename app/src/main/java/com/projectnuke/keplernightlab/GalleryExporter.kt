@@ -199,12 +199,9 @@ fun queryMediaSize(context: Context, uri: Uri): Long {
 fun updateExportMetadata(
     jobDir: File,
     export: GalleryExportResult?,
-    verified: Boolean,
     finalOutputFormat: FinalOutputFormat,
     rawSidecarResult: RawSidecarExportResult? = null,
-    rawSidecarIgnored: Boolean = false,
-    postExportCancellationRequested: Boolean = false,
-    postExportWorkSkipped: Boolean = false
+    rawSidecarIgnored: Boolean = false
 ) {
     lateinit var pipelineStatusForLog: String
     lateinit var finalOutputSourceForLog: String
@@ -212,13 +209,12 @@ fun updateExportMetadata(
     lateinit var rawRenderDebugFileForLog: String
     KeplerJobMetadata.update(jobDir) { job ->
         job.put("finalOutputFormatSetting", finalOutputFormat.name)
-            .put("currentPipelineStage", if (verified) "COMPLETE" else "PROCESSING")
+            .put("currentPipelineStage", "COMPLETE")
             .put("exportStatus", when {
                 export == null -> "FAILED"
-                verified -> "EXPORTED"
-                else -> "EXPORT_UNVERIFIED"
+                else -> "EXPORTED"
             })
-            .put("exportVerified", verified)
+            .put("exportVerified", true)
             .put("exportUri", export?.uriString ?: JSONObject.NULL)
             .put("exportDisplayName", export?.displayName ?: JSONObject.NULL)
             .put("exportMimeType", export?.mimeType ?: JSONObject.NULL)
@@ -226,9 +222,7 @@ fun updateExportMetadata(
             .put("exportFormatUsed", export?.formatUsed?.label ?: JSONObject.NULL)
             .put("exportFallbackUsed", export?.fallbackUsed ?: false)
             .put("exportFileSizeBytes", export?.fileSizeBytes ?: 0L)
-            .put("galleryExportCommitted", verified && export?.success == true && !export?.uriString.isNullOrBlank())
-            .put("postExportCancellationRequested", postExportCancellationRequested)
-            .put("postExportWorkSkipped", postExportWorkSkipped)
+            .put("galleryExportCommitted", export?.success == true && !export?.uriString.isNullOrBlank())
             .put("rawSidecarRequested", finalOutputFormat.shouldExportRawSidecar)
             .put("rawSidecarExportStatus", when {
                 rawSidecarIgnored -> "UNAVAILABLE"
@@ -266,36 +260,22 @@ fun updateExportFailure(
     jobDir: File,
     error: String,
     finalOutputFormat: FinalOutputFormat,
-    rawSidecarIgnored: Boolean = false,
-    export: GalleryExportResult? = null,
-    verified: Boolean = false,
-    processStatus: String = "EXPORT_FAILED_KEEPING_CACHE",
-    preservePublicExportMetadata: Boolean = false
+    rawSidecarIgnored: Boolean = false
 ) {
     KeplerJobMetadata.update(jobDir) { job ->
-        // A public export is reported as committed only when its URI/output verification succeeded.
-        // File creation alone is NOT a verified public export, so `galleryExportCommitted` is true
-        // only when both the Gallery export returned success and verification passed.
-        val publicExportCommitted = verified && export?.success == true &&
-            !export?.uriString.isNullOrBlank()
-        val builder = job.put("finalOutputFormatSetting", finalOutputFormat.name)
+        job.put("finalOutputFormatSetting", finalOutputFormat.name)
             .put("exportStatus", "FAILED")
-            .put("exportVerified", verified)
-            .put("galleryExportCommitted", publicExportCommitted)
-            .put("exportUri", export?.uriString ?: JSONObject.NULL)
+            .put("exportVerified", false)
+            .put("galleryExportCommitted", false)
+            .put("exportUri", JSONObject.NULL)
             .put("exportError", error)
             .put("rawSidecarRequested", finalOutputFormat.shouldExportRawSidecar)
             .put("rawSidecarExportStatus", if (rawSidecarIgnored) "UNAVAILABLE" else "SKIPPED")
             .put("rawSidecarError", if (rawSidecarIgnored) "RAW sidecar unavailable for YUV pipeline." else JSONObject.NULL)
             .put("cleanupStatus", "SKIPPED")
             .put("exportedAt", System.currentTimeMillis())
-        // When preserving a previously verified committed public result against a later failure or
-        // cancellation, do not roll back or clear committed export metadata after the commit point.
-        // Otherwise (the failure-before-commit branch) write the current NORMAL failure stage/status.
-        if (!preservePublicExportMetadata) {
-            builder.put("processStatus", processStatus)
-                .put("currentPipelineStage", "FAILED")
-        }
+            .put("processStatus", "EXPORT_FAILED_KEEPING_CACHE")
+            .put("currentPipelineStage", "FAILED")
     }
 }
 

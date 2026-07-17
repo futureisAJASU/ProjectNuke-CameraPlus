@@ -927,15 +927,14 @@ private object RawFusionExportCoordinator {
     /**
      * Persist current-run RAW export metadata in exactly one [KeplerJobMetadata.update] call.
      *
-     * NORMAL export run owns [RAW_FUSION_EXPORT_NORMAL_OWNED_KEYS]: terminal stage/status,
-     * `userCanMoveDevice`, gallery linkage, public-result fields, committed-export fields,
-     * export verification, generated output references, export timing, and export errors, plus
-     * the shared processor/export diagnostics (native RGBA, MP24, standard bitmap fallback).
+     * NORMAL export run owns [RAW_FUSION_EXPORT_NORMAL_OWNED_KEYS]: local output references
+     * (`finalFile`, `previewFile`), terminal stage/status, `userCanMoveDevice`, plus the shared
+     * processor/export diagnostics (native RGBA, MP24, standard bitmap fallback).
      *
      * `REPROCESS_PROGRESS_ONLY` owns [RAW_FUSION_EXPORT_REPROCESS_KEYS]: processor/export
      * progress and diagnostic fields explicitly needed by the shared finalizer, NEVER
      * `currentPipelineStage` / `processStatus` / `userCanMoveDevice` / gallery / public-result /
-     * committed-export / final-output fields.
+     * committed-export / final-output / local-output fields.
      *
      * For each owned key: copies the current-run value into the locked metadata when the
      * current-run [metadata] snapshot contains it, or removes the locked metadata key when the
@@ -976,6 +975,9 @@ private object RawFusionExportCoordinator {
      * failure. Removes every owned key produced by an earlier run inside a single
      * [KeplerJobMetadata.update]; writes the current metadata policy scalar so the shared
      * finalizer can attribute subsequent progress to the current policy.
+     *
+     * Does NOT clear Classic processing results (RAW_CLASSIC_CURRENT_RUN_KEYS) or a prior
+     * verified public export.
      */
     private fun initCurrentRunExportOwnership(context: RawFusionExportContext, job: JSONObject) {
         val ownedKeys = if (context.metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
@@ -1010,20 +1012,24 @@ private object RawFusionExportCoordinator {
         context: RawFusionExportContext,
         currentRunMetadata: JSONObject,
         processStatus: String,
-        errorMessage: String,
-        exportResult: GalleryExportResult? = null
+        errorMessage: String
     ): JSONObject {
-        val payload = JSONObject(currentRunMetadata.toString())
+        // Build from fresh JSONObject; do NOT clone context.job with toString()
+        val payload = JSONObject()
+        // Copy only keys from currentRunMetadata that are in NORMAL owned keys
+        RAW_FUSION_EXPORT_NORMAL_OWNED_KEYS.forEach { key ->
+            if (currentRunMetadata.has(key)) {
+                payload.put(key, currentRunMetadata.get(key))
+            }
+        }
         payload.put("currentPipelineStage", "FAILED")
             .put("processStatus", processStatus)
             .put("userCanMoveDevice", true)
             .put("exportStatus", "FAILED")
             .put("exportVerified", false)
             .put("exportError", errorMessage)
-            .put("galleryExportCommitted", exportResult?.success == true && !exportResult.uriString.isNullOrBlank())
-            .put("exportUri", exportResult?.uriString ?: JSONObject.NULL)
             .put("cleanupStatus", "SKIPPED")
-            .put("processedAt", System.currentTimeMillis())
+        // NORMAL export failure must NOT write processedAt (belongs to Classic/processor stage)
         return payload
     }
 
@@ -1100,16 +1106,14 @@ private object RawFusionExportCoordinator {
         cancellation.throwIfCancelled()
         if (!nativePostprocessUsed) {
             val failureMessage = "Native 24MP postprocess failed: $postprocessStatus"
-            val failedPayload = applyNativeMergeMetadata(
-                target = JSONObject(context.job.toString()),
-                alignment = context.nativeMerge.alignmentMetadata
-            )
+            val failedPayload = JSONObject()
                 .put("nativePostprocessRequired", true)
                 .put("nativePostprocessUsed", false)
                 .put("nativePostprocessStatus", postprocessStatus)
                 .put("nativeIspRenderMs", nativeIspRenderMs)
                 .put("alignmentStatus", context.nativeMerge.alignmentStatus)
-                .put("processedAt", System.currentTimeMillis())
+                .put("nativePostprocessRgbaFile", JSONObject.NULL)
+                .put("nativePostprocessMetadataFile", JSONObject.NULL)
             // Reprocess must not write terminal stage/status / userCanMoveDevice / export
             // terminal fields. For NORMAL, build a full failure payload and persist it so
             // exportResult.success=false cannot return without current failure metadata.
@@ -1163,7 +1167,7 @@ private object RawFusionExportCoordinator {
         val partialNote = captureCompletenessNote(context.frames)
         val updated = applyNativePostprocessMetadata(
             target = applyNativeMergeMetadata(
-                target = JSONObject(context.job.toString()),
+                target = JSONObject(),
                 alignment = context.nativeMerge.alignmentMetadata
             ),
             metadata = nativePostprocessMetadata
@@ -1174,10 +1178,6 @@ private object RawFusionExportCoordinator {
             .put("mergedDngFile", JSONObject.NULL)
             .put("previewFile", JSONObject.NULL)
             .put("finalFile", if (nativeMp24DebugPngWritten) finalFile.name else JSONObject.NULL)
-            .put("finalOutputSource", "native_rgba")
-            .put("galleryDisplayFile", JSONObject.NULL)
-            .put("galleryThumbnailFile", JSONObject.NULL)
-            .put("galleryDisplaySource", "awaiting_encoded_output")
             .put("isDebugPreviewUsedAsFinal", false)
             .put("nativeMp24DebugPngRequested", nativeMp24DebugPngRequested)
             .put("nativeMp24DebugPngWritten", nativeMp24DebugPngWritten)
@@ -1226,7 +1226,11 @@ private object RawFusionExportCoordinator {
             )
             .put("sensorOrientation", context.job.opt("sensorOrientation") ?: JSONObject.NULL)
             .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
-            .put("processedAt", System.currentTimeMillis())
+            .put("rawFusionProcessingPolicy", context.metadataPolicy.name)
+        // NORMAL export owns processedAt; reprocess does not
+        if (context.metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            updated.put("processedAt", System.currentTimeMillis())
+        }
         cancellation.throwIfCancelled()
         persistExportProgress(context, updated)
         return RawFusionExportResult.Mp24Success(
@@ -1313,10 +1317,7 @@ private object RawFusionExportCoordinator {
         )
         if (!nativeOk) {
             val failureMessage = "Native RAW ISP failed: $status"
-            val failedPayload = applyNativeMergeMetadata(
-                target = JSONObject(context.job.toString()),
-                alignment = context.nativeMerge.alignmentMetadata
-            )
+            val failedPayload = JSONObject()
                 .put("nativeRawIspUsed", false)
                 .put("nativePostprocessUsed", false)
                 .put("nativePostprocessStatus", status)
@@ -1324,7 +1325,11 @@ private object RawFusionExportCoordinator {
                 .put("rawRenderInputMetadataFile", renderInputMetadataFile.name)
                 .put("rawRenderDebugFile", renderDebugFile.name)
                 .put("nativeIspRenderMs", nativeIspRenderMs)
-                .put("processedAt", System.currentTimeMillis())
+                .put("nativePostprocessRgbaFile", JSONObject.NULL)
+                .put("nativePostprocessMetadataFile", JSONObject.NULL)
+                .put("rawReferenceDebugFile", JSONObject.NULL)
+                .put("rawMergedLinearDebugFile", JSONObject.NULL)
+                .put("rawFinalRenderDebugFile", JSONObject.NULL)
             // NORMAL: native render failure must persist current failure metadata BEFORE returning.
             // Reprocess: writes only the diagnostic fields above; never terminal stage/status /
             // userCanMoveDevice / export terminal fields, though the export-error scalar below
@@ -1364,7 +1369,7 @@ private object RawFusionExportCoordinator {
         )
         val hasWarnings = nativeWarnings.length() > 0 || warnings.isNotEmpty()
         val updated = applyNativeMergeMetadata(
-            target = JSONObject(context.job.toString()),
+            target = JSONObject(),
             alignment = context.nativeMerge.alignmentMetadata
         )
             .put("processStatus", if (hasWarnings) "RAW_FUSION_COMPLETE_WITH_RENDER_WARNINGS" else "RAW_FUSION_COMPLETE")
@@ -1399,7 +1404,6 @@ private object RawFusionExportCoordinator {
             .put("chromaArtifactSuppressionUsed", debug?.optBoolean("chromaArtifactSuppressionUsed", false) ?: false)
             .put("adaptiveSharpenUsed", debug?.optBoolean("adaptiveSharpenUsed", false) ?: false)
             .put("sharpenSuppressionLowConfidenceUsed", debug?.optBoolean("sharpenSuppressionLowConfidenceUsed", false) ?: false)
-            .put("finalOutputSource", "native_rgba")
             .put("fullSizeKotlinDemosaicUsed", false)
             .put("mergedRawFile", context.files.mergedRawFile.name)
             .put("finalFile", JSONObject.NULL)
@@ -1420,7 +1424,11 @@ private object RawFusionExportCoordinator {
             .put("alignmentFile", context.files.alignmentFile.name)
             .put("sensorOrientation", context.job.opt("sensorOrientation") ?: JSONObject.NULL)
             .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
-            .put("processedAt", System.currentTimeMillis())
+            .put("rawFusionProcessingPolicy", context.metadataPolicy.name)
+        // NORMAL export owns processedAt; reprocess does not
+        if (context.metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            updated.put("processedAt", System.currentTimeMillis())
+        }
         cancellation.throwIfCancelled()
         persistExportProgress(context, updated)
         return RawFusionExportResult.NativeRgbaSuccess(
@@ -1639,8 +1647,9 @@ private object RawFusionExportCoordinator {
 
         val partialNote = captureCompletenessNote(context.frames)
         val notes = "RAW Fusion MVP: Bayer weighted merge, black-level correction, exposure/ISO normalization, simple bilinear demosaic, gray-world-ish tone. $partialNote Merged DNG skipped because CaptureResult metadata was not available after process restart. TODO gyro Bayer alignment, image micro-alignment, ghost suppression, RAW super-resolution/detail fusion, proper Camera2 color matrices."
+        // Build from fresh JSONObject; do NOT clone context.job with toString()
         val updated = applyNativeMergeMetadata(
-            target = JSONObject(context.job.toString()),
+            target = JSONObject(),
             alignment = context.nativeMerge.alignmentMetadata
         )
             .put("processStatus", if (warnings.isEmpty()) "RAW_FUSION_COMPLETE" else "RAW_FUSION_COMPLETE_WITH_RENDER_WARNINGS")
@@ -1677,9 +1686,6 @@ private object RawFusionExportCoordinator {
             .put("mergedDngFile", JSONObject.NULL)
             .put("previewFile", if (skipDebugPreview) JSONObject.NULL else previewFile.name)
             .put("finalFile", finalFile.name)
-            .put("galleryDisplayFile", finalFile.name)
-            .put("galleryThumbnailFile", finalFile.name)
-            .put("galleryDisplaySource", "finalFile")
             .put("isDebugPreviewUsedAsFinal", false)
             .put("rawDebugPreviewSkipped", skipDebugPreview)
             .put(
@@ -1690,7 +1696,6 @@ private object RawFusionExportCoordinator {
                     JSONObject.NULL
                 }
             )
-            .put("finalOutputSource", "final_png")
             .put("outputFallbackReason", outputFallbackReason ?: JSONObject.NULL)
             .put("fullSizeKotlinDemosaicUsed", !context.highResolutionRaw)
             .put("nativePostprocessRequired", false)
@@ -1718,21 +1723,7 @@ private object RawFusionExportCoordinator {
             .put("referenceFrameIndex", context.referenceSelection.index)
             .put("referenceFrameReason", context.referenceSelection.reason)
             .put("alignmentStatus", context.nativeMerge.alignmentStatus)
-            .put("nativeRawMerge", context.nativeMerge.mergedOk)
-            .put(
-                "alignmentFile",
-                if (context.nativeMerge.mergedOk) {
-                    context.files.alignmentFile.name
-                } else {
-                    JSONObject.NULL
-                }
-            )
-            .put(
-                "alignmentError",
-                if (context.nativeMerge.mergedOk) JSONObject.NULL else context.nativeMerge.status
-            )
-            .put(
-                "mergedRawFormat",
+            .put("mergedRawFormat",
                 if (context.nativeMerge.mergedOk) {
                     "black_level_subtracted_aligned_compact_raw16"
                 } else {
@@ -1741,7 +1732,11 @@ private object RawFusionExportCoordinator {
             )
             .put("sensorOrientation", context.job.opt("sensorOrientation") ?: JSONObject.NULL)
             .put("outputOrientation", "UNROTATED_RAW_SENSOR_GRID")
-            .put("processedAt", System.currentTimeMillis())
+            .put("rawFusionProcessingPolicy", context.metadataPolicy.name)
+        // NORMAL export owns processedAt; reprocess does not
+        if (context.metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            updated.put("processedAt", System.currentTimeMillis())
+        }
         persistExportProgress(context, updated)
         return RawFusionExportResult.BitmapFallbackSuccess(
             base = RawFusionProcessResult(
@@ -1780,9 +1775,10 @@ fun processRawFusionJob(
      * diagnostics, memory estimates, timing, current stage/status, and `userCanMoveDevice`.
      * These keys belong exclusively to the current RAW processing stage and must be cleared when
      * the current run does not produce them, so stale previous-run values never survive.
+     * Does NOT include RAW_CLASSIC_CURRENT_RUN_KEYS (Classic processing results are preserved
+     * across export initialization and reprocess cancellation).
      */
     val ownedNormalKeys: Set<String> = RAW_FUSION_SHARED_PROCESSOR_KEYS +
-        RAW_CLASSIC_CURRENT_RUN_KEYS +
         RAW_FUSION_NORMAL_FAILURE_TERMINAL_KEYS +
         setOf("userCanMoveDevice")
 
@@ -1833,11 +1829,13 @@ fun processRawFusionJob(
         cancellation.throwIfCancelled()
 
         // 1-2. Remove stale previous-run values for every owned progress, diagnostic, processor-
-        // error, and Classic field BEFORE building the current run's values.
+        // error field BEFORE building the current run's values.
+        // IMPORTANT: Do NOT clear RAW_CLASSIC_CURRENT_RUN_KEYS — Classic processing results must
+        // be preserved across export initialization and reprocess cancellation. A prior Classic
+        // success followed by local-render initialization keeps all Classic metadata intact.
         RAW_FUSION_PROGRESS_KEYS.forEach(job::remove)
         RAW_FUSION_NATIVE_DIAGNOSTIC_KEYS.forEach(job::remove)
         RAW_FUSION_PROCESSOR_ERROR_KEYS.forEach(job::remove)
-        RAW_CLASSIC_CURRENT_RUN_KEYS.forEach(job::remove)
 
         // 3. Write the current metadata policy.
         job.put("rawFusionProcessingPolicy", metadataPolicy.name)

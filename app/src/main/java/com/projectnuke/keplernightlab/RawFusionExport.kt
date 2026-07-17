@@ -49,29 +49,8 @@ internal sealed class RawFusionExportResult {
         override val metadata: JSONObject
     ) : RawFusionExportResult()
 
-    /** Standard Kotlin bitmap fallback output (final PNG with gallery linkage). */
+    /** Standard Kotlin bitmap fallback output (final PNG with local artifact references). */
     internal data class BitmapFallbackSuccess(
-        override val base: RawFusionProcessResult,
-        override val metadata: JSONObject
-    ) : RawFusionExportResult()
-
-    /**
-     * Verified committed public MediaStore export with its in-job local artifact(s).
-     * `uriString` matches `export.uriString`; `verified == true` by construction. Cancellation or
-     * processor cleanup after this branch must not roll back the committed public result.
-     */
-    internal data class CommittedPublicExport(
-        override val base: RawFusionProcessResult,
-        override val metadata: JSONObject,
-        val export: GalleryExportResult,
-        val verified: Boolean
-    ) : RawFusionExportResult()
-
-    /**
-     * Cache/private-only result: current export produced a bitmap/path that is usable for the
-     * private cache but did NOT commit a public MediaStore export. NOT carried as `Committed`.
-     */
-    internal data class CacheOnlyResult(
         override val base: RawFusionProcessResult,
         override val metadata: JSONObject
     ) : RawFusionExportResult()
@@ -80,18 +59,6 @@ internal sealed class RawFusionExportResult {
     internal data class ExportFailureBeforeCommit(
         override val base: RawFusionProcessResult,
         override val metadata: JSONObject
-    ) : RawFusionExportResult()
-
-    /**
-     * Export failure after a public MediaStore commit succeeded but verification (or later post-
-     * commit work) failed. The previously committed public export is preserved; the current
-     * NORMAL failure metadata marks the run as failed WITHOUT rolling back the verified committed
-     * public result.
-     */
-    internal data class ExportFailureAfterCommit(
-        override val base: RawFusionProcessResult,
-        override val metadata: JSONObject,
-        val export: GalleryExportResult
     ) : RawFusionExportResult()
 
     val success: Boolean get() = base.success
@@ -286,11 +253,8 @@ fun captureProcessExportRawNightFusion(
                     updateExportMetadata(
                         jobDir = jobDir,
                         export = result,
-                        verified = verified,
                         finalOutputFormat = finalOutputFormat,
-                        rawSidecarResult = null,
-                        postExportCancellationRequested = cancellation.isCancelled,
-                        postExportWorkSkipped = cancellation.isCancelled
+                        rawSidecarResult = null
                     )
                     if (!verified) {
                         // Failure after a public MediaStore commit: the public export cannot be rolled
@@ -302,19 +266,13 @@ fun captureProcessExportRawNightFusion(
                         updateExportFailure(
                             jobDir = jobDir,
                             error = "Export verification failed",
-                            finalOutputFormat = finalOutputFormat,
-                            export = result,
-                            verified = false,
-                            processStatus = "EXPORT_UNVERIFIED_KEEPING_CACHE",
-                            preservePublicExportMetadata = true
+                            finalOutputFormat = finalOutputFormat
                         )
                         post("PIPELINE_FAILED: RAW export verification failed; keeping RAW cache.")
                         return@post
                     }
                     if (cancellation.isCancelled) {
-                        updateExportMetadata(jobDir, result, true, finalOutputFormat,
-                            rawSidecarResult = null, postExportCancellationRequested = true,
-                            postExportWorkSkipped = true)
+                        updateExportMetadata(jobDir, result, finalOutputFormat, null)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. RAW cache kept.")
                         return@post
                     }
@@ -348,14 +306,11 @@ fun captureProcessExportRawNightFusion(
                     updateExportMetadata(
                         jobDir = jobDir,
                         export = result,
-                        verified = true,
                         finalOutputFormat = finalOutputFormat,
                         rawSidecarResult = rawSidecarResult
                     )
                     if (cancellation.isCancelled) {
-                        updateExportMetadata(jobDir, result, true, finalOutputFormat,
-                            rawSidecarResult = rawSidecarResult,
-                            postExportCancellationRequested = true, postExportWorkSkipped = true)
+                        updateExportMetadata(jobDir, result, finalOutputFormat, rawSidecarResult)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. RAW cache kept.")
                         return@post
                     }
@@ -559,6 +514,7 @@ internal fun reprocessRawJob(
         cancel = { (cancellation as? KeplerPipelineCancellationToken)?.cancel() }
     )
 }
+
 private fun applyExplicitFrameSelection(jobDir: File, selectedFrameIndices: Set<Int>) {
     KeplerJobMetadata.update(jobDir) { job ->
     val frames = job.optJSONArray("frames") ?: return@update

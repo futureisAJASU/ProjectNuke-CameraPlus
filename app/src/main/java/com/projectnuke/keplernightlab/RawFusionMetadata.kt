@@ -199,8 +199,6 @@ internal val RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS: Set<String> = setOf(
     "adaptiveSharpenUsed",
     "sharpenSuppressionLowConfidenceUsed",
     "chromaArtifactSuppressionUsed",
-    "finalOutputSource",
-    "outputFallbackReason",
     "outputWidth",
     "outputHeight",
     "outputOrientation",
@@ -250,19 +248,15 @@ internal val RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS: Set<String> = setOf(
     "blackLevelMode",
     "whiteLevelSource",
     "mergedRawFormat",
-    "sensorOrientation",
-    "processedAt"
+    "sensorOrientation"
 )
 
 /**
- * Owned-only-on-NORMAL keys covering the current export run's terminal stage/status, `userCanMoveDevice`,
- * generated output references (`finalFile`, `previewFile`, `mergedRawFile`, `mergedDngFile`),
- * gallery linkage, public-result fields, committed-export scalars, export verification, export timing,
- * and current export errors. These keys belong to the NORMAL export stage and NEVER to a
- * `REPROCESS_PROGRESS_ONLY` diagnostic run: reprocess must not directly write or clear terminal
- * stage/status, `userCanMoveDevice`, gallery linkage, public-result fields, committed-export
- * fields, generated output references, or final-output ownership. The shared finalizer owns reprocess
- * terminal metadata instead, so the reprocess export stage never writes these keys.
+ * NORMAL-only local-output keys covering the current export run's local candidate references
+ * (`finalFile`, `previewFile`). These keys belong to the NORMAL export stage and NEVER to a
+ * `REPROCESS_PROGRESS_ONLY` diagnostic run: reprocess must not directly write or clear local
+ * output references. The shared finalizer owns reprocess terminal metadata instead, so the
+ * reprocess export stage never writes these keys.
  */
 internal val RAW_FUSION_EXPORT_NORMAL_ONLY_KEYS: Set<String> = setOf(
     "userCanMoveDevice",
@@ -270,33 +264,9 @@ internal val RAW_FUSION_EXPORT_NORMAL_ONLY_KEYS: Set<String> = setOf(
     "processStatus",
     "finalFile",
     "previewFile",
-    "mergedRawFile",
-    "mergedDngFile",
     "isDebugPreviewUsedAsFinal",
-    "alignmentFile",
-    "alignmentStatus",
-    "alignmentError",
-    "nativeRawMerge",
-    "galleryDisplayFile",
-    "galleryThumbnailFile",
-    "galleryDisplaySource",
-    "finalOutputFormatSetting",
     "exportStatus",
     "exportVerified",
-    "exportUri",
-    "exportDisplayName",
-    "exportMimeType",
-    "exportFormatRequested",
-    "exportFormatUsed",
-    "exportFallbackUsed",
-    "exportFileSizeBytes",
-    "galleryExportCommitted",
-    "postExportCancellationRequested",
-    "postExportWorkSkipped",
-    "rawSidecarRequested",
-    "rawSidecarExportStatus",
-    "rawSidecarExportedFiles",
-    "rawSidecarError",
     "exportError",
     "cleanupStatus",
     "exportedAt",
@@ -357,7 +327,6 @@ internal fun persistRawFusionFailureMetadata(
                 current.put("currentPipelineStage", "FAILED")
                 current.put("processStatus", processStatus)
                 current.put("userCanMoveDevice", true)
-                current.put("processedAt", System.currentTimeMillis())
             }
             current.put("rawProcessorFailureType", failureType)
             current.put("rawProcessorFailureMessage", failureMessage)
