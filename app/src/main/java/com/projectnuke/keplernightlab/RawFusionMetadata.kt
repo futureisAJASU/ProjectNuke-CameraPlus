@@ -37,7 +37,6 @@ internal val RAW_FUSION_PROGRESS_KEYS: Set<String> = setOf(
     "nativePostprocessRgbaFile",
     "nativePostprocessMetadataFile",
     "rawRenderDebugFile",
-    "rawFusionDebugFile",
     "rawRenderInputMetadataFile",
     "nativeAlignMs",
     "nativeMergeMs",
@@ -48,7 +47,10 @@ internal val RAW_FUSION_PROGRESS_KEYS: Set<String> = setOf(
  * Current-run Classic RAW result and diagnostic keys produced by [runClassicRawFusionMerge]
  * and its debug-preview path. Reset at current-run initialization so a previous success cannot
  * leave Classic result or debug metadata after an early current failure. Persisted after a
- * successful Classic merge; removed on any current-run failure.
+ * successful Classic merge via the owned-key present-copy/absent-remove rule: an early NORMAL
+ * failure removes absent previous-run Classic values; a failure after the current Classic merge
+ * preserves values actually produced by the current run; reprocess does not own full Classic
+ * result/artifact fields and never removes or replaces them.
  */
 internal val RAW_CLASSIC_CURRENT_RUN_KEYS: Set<String> = setOf(
     "rawFusionEngine",
@@ -104,7 +106,6 @@ internal val RAW_FUSION_NATIVE_DIAGNOSTIC_KEYS: Set<String> = setOf(
     "nativePostprocessRgbaFile",
     "nativePostprocessMetadataFile",
     "rawRenderDebugFile",
-    "rawFusionDebugFile",
     "rawReferenceDebugFile",
     "rawMergedLinearDebugFile",
     "rawFinalRenderDebugFile",
