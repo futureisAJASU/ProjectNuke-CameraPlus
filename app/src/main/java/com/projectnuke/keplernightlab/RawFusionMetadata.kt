@@ -145,6 +145,186 @@ internal val RAW_FUSION_SHARED_PROCESSOR_KEYS: Set<String> = RAW_FUSION_PROGRESS
     RAW_FUSION_PROCESSOR_ERROR_KEYS
 
 /**
+ * Diagnostic + progress keys owned by the current-run RAW export stage and shared between NORMAL
+ * and `REPROCESS_PROGRESS_ONLY` policy. These are safe to attribute to the current run in either
+ * policy because they do not flip a terminal stage/status, do not change `userCanMoveDevice`, and
+ * do not touch gallery linkage, public-result, committed-export, or final-output ownership.
+ * Includes only the processor/export progress diagnostics actually read by the shared finalizer or
+ * that need run-scoped replacement (a previous native RGBA run's status/isp timing/debug-file
+ * references must not survive a current run that did not produce them).
+ *
+ * Includes the explicit run identity scaler `rawFusionProcessingPolicy` so reprocess readers and
+ * the shared finalizer can read which policy produced the diagnostic snapshot.
+ */
+internal val RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS: Set<String> = setOf(
+    "rawFusionProcessingPolicy",
+    "nativePostprocessStatus",
+    "nativePostprocessRgbaFile",
+    "nativePostprocessMetadataFile",
+    "nativeIspRenderMs",
+    "nativeMp24DebugPngRequested",
+    "nativeMp24DebugPngWritten",
+    "nativeMp24DebugPngSkipReason",
+    "nativeRawIspUsed",
+    "nativeRawIspFullBufferFallbackUsed",
+    "fullSizeKotlinDemosaicUsed",
+    "native24RawUsed",
+    "highResRawInputUsed",
+    "highResRawInputThresholdPixels",
+    "highResRawInputThresholdMp",
+    "nativePostprocessRequired",
+    "nativePostprocessUsed",
+    "rawRenderVersion",
+    "rawRenderInputMetadataFile",
+    "rawRenderDebugFile",
+    "rawReferenceDebugFile",
+    "rawMergedLinearDebugFile",
+    "rawFinalRenderDebugFile",
+    "rawRenderWarnings",
+    "rawRenderColorTransform",
+    "rawRenderCameraWbGains",
+    "rawRenderDenoiseStrength",
+    "rawRenderChromaDenoiseStrength",
+    "rawRenderSharpenAmount",
+    "rawRenderExposureGain",
+    "rawRenderShadowLift",
+    "rawRenderHighlightRollOff",
+    "rawRenderWhiteBalance",
+    "rawDebugPreviewSkipped",
+    "rawDebugPreviewSkipReason",
+    "demosaicMethod",
+    "demosaicFallbackPixelCount",
+    "mhcBoundaryFallbackUsed",
+    "weightAwareDenoiseUsed",
+    "adaptiveSharpenUsed",
+    "sharpenSuppressionLowConfidenceUsed",
+    "chromaArtifactSuppressionUsed",
+    "finalOutputSource",
+    "outputFallbackReason",
+    "outputWidth",
+    "outputHeight",
+    "outputOrientation",
+    "selected24MpStrategy",
+    "actualInputResolutionMode",
+    "outputResolutionMode",
+    "nativeMergeVersion",
+    "tileBasedMerge",
+    "tileRows",
+    "tileCount",
+    "fullFrameAccumulatorsUsed",
+    "fullFrameMergedBufferUsed",
+    "estimatedTileMergeWorkingSetBytes",
+    "estimatedTileMergeWorkingSetMb",
+    "acceptedFrameCount",
+    "rejectedFrameCount",
+    "ghostSuppressionEnabled",
+    "ghostRejectedSampleRatio",
+    "referencePreservedPixelRatio",
+    "mergeWarning",
+    "nativeAlignMs",
+    "nativeMergeMs",
+    "mergeWeightMapAvailable",
+    "mergeWeightMapFile",
+    "mergeRejectMapAvailable",
+    "mergeRejectMapFile",
+    "rawReferencePreviewFile",
+    "rawFusedPreviewFile",
+    "rawComparePreviewFile",
+    "rawDebugArtifactStatus",
+    "rawDebugArtifactError",
+    "referenceSinglePreviewFile",
+    "referenceFrameIndex",
+    "referenceFrameReason",
+    "usedFrameCount",
+    "excludedFrameCount",
+    "skippedFrameCount",
+    "requestedFrames",
+    "savedFrames",
+    "captureCompleteness",
+    "partialCapture",
+    "processingNotes",
+    "rawFusionNotes",
+    "blackLevelUsed",
+    "whiteLevelUsed",
+    "blackLevelSource",
+    "blackLevelMode",
+    "whiteLevelSource",
+    "mergedRawFormat",
+    "sensorOrientation",
+    "processedAt"
+)
+
+/**
+ * Owned-only-on-NORMAL keys covering the current export run's terminal stage/status, `userCanMoveDevice`,
+ * generated output references (`finalFile`, `previewFile`, `mergedRawFile`, `mergedDngFile`),
+ * gallery linkage, public-result fields, committed-export scalars, export verification, export timing,
+ * and current export errors. These keys belong to the NORMAL export stage and NEVER to a
+ * `REPROCESS_PROGRESS_ONLY` diagnostic run: reprocess must not directly write or clear terminal
+ * stage/status, `userCanMoveDevice`, gallery linkage, public-result fields, committed-export
+ * fields, generated output references, or final-output ownership. The shared finalizer owns reprocess
+ * terminal metadata instead, so the reprocess export stage never writes these keys.
+ */
+internal val RAW_FUSION_EXPORT_NORMAL_ONLY_KEYS: Set<String> = setOf(
+    "userCanMoveDevice",
+    "currentPipelineStage",
+    "processStatus",
+    "finalFile",
+    "previewFile",
+    "mergedRawFile",
+    "mergedDngFile",
+    "isDebugPreviewUsedAsFinal",
+    "alignmentFile",
+    "alignmentStatus",
+    "alignmentError",
+    "nativeRawMerge",
+    "galleryDisplayFile",
+    "galleryThumbnailFile",
+    "galleryDisplaySource",
+    "finalOutputFormatSetting",
+    "exportStatus",
+    "exportVerified",
+    "exportUri",
+    "exportDisplayName",
+    "exportMimeType",
+    "exportFormatRequested",
+    "exportFormatUsed",
+    "exportFallbackUsed",
+    "exportFileSizeBytes",
+    "galleryExportCommitted",
+    "postExportCancellationRequested",
+    "postExportWorkSkipped",
+    "rawSidecarRequested",
+    "rawSidecarExportStatus",
+    "rawSidecarExportedFiles",
+    "rawSidecarError",
+    "exportError",
+    "cleanupStatus",
+    "exportedAt",
+    "totalPipelineMs"
+)
+
+/**
+ * Single NORMAL export run's owned key set: shared processor/export diagnostics plus the
+ * NORMAL-only terminal/gallery/public/committed-export/final-output/timing/error keys. A NORMAL
+ * export run copies present current-run values for every key here and removes absent ones inside a
+ * single [KeplerJobMetadata.update], so stale previous-run export result metadata never survives a
+ * current NORMAL export, success or failure.
+ */
+internal val RAW_FUSION_EXPORT_NORMAL_OWNED_KEYS: Set<String> =
+    RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS + RAW_FUSION_EXPORT_NORMAL_ONLY_KEYS
+
+/**
+ * `REPROCESS_PROGRESS_ONLY` export owned-key set: processor/export diagnostics only. NEVER
+ * includes terminal stage/status, `userCanMoveDevice`, gallery linkage, public-result,
+ * committed-export, final-output, or export-error terminal fields, in accordance with the progress
+ * policy. The non-terminal processor/export-progress reads/writes flow through these keys so the
+ * shared finalizer can inspect the current reprocess attempt without the reprocess stage writing
+ * competing terminal metadata.
+ */
+internal val RAW_FUSION_EXPORT_REPROCESS_KEYS: Set<String> =
+    RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS
+
+/**
  * Persist current-run failure metadata in a single [KeplerJobMetadata.update] call.
  * Copies present current-run owned fields from [currentRunJob], removes absent owned fields,
  * and directly writes the failure scalar fields. Accepts a nullable [currentRunJob]; if null,

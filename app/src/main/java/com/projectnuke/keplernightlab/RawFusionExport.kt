@@ -15,6 +15,91 @@ import java.util.concurrent.CancellationException
 import java.util.Date
 import java.util.Locale
 
+/**
+ * Explicit export-result model returned by [RawFusionExportCoordinator.export]. Each production
+ * branch produces exactly one subclass so the export stage never collapses a verified committed
+ * public export, a private/cache-only output, a failure before any commit, or a failure after a
+ * public commit into a single ambiguous value. The model never reports a public header as a
+ * committed public export unless its URI/output verification succeeded, and a verified committed
+ * public export is preserved against later cancellation or processor cleanup.
+ *
+ * NORMAL callers persist current export owned-key metadata (success or failure) from the
+ * [RawFusionExportResult.metadata] payload inside a single [KeplerJobMetadata.update]. The
+ * `REPROCESS_PROGRESS_ONLY` path returns the structured payload to the shared finalizer without
+ * writing competing terminal metadata.
+ *
+ * All branches keep the legacy [RawFusionProcessResult] (`base`) so existing bitmap-source
+ * extension functions (`validNativeRgbaFile`, `hasExportableBitmapSource`, `loadExportBitmap`)
+ * continue to work unchanged. `metadata` is the export-stage's current-run metadata snapshot and
+ * is intentionally a free-form [JSONObject] that the persisted helper copies owned keys out of.
+ */
+internal sealed class RawFusionExportResult {
+    abstract val base: RawFusionProcessResult
+    abstract val metadata: JSONObject
+
+    /** Native postprocess RGBA output for the standard path. */
+    internal data class NativeRgbaSuccess(
+        override val base: RawFusionProcessResult,
+        override val metadata: JSONObject
+    ) : RawFusionExportResult()
+
+    /** Native 24MP fusion RGBA output plus optional debug PNG. */
+    internal data class Mp24Success(
+        override val base: RawFusionProcessResult,
+        override val metadata: JSONObject
+    ) : RawFusionExportResult()
+
+    /** Standard Kotlin bitmap fallback output (final PNG with gallery linkage). */
+    internal data class BitmapFallbackSuccess(
+        override val base: RawFusionProcessResult,
+        override val metadata: JSONObject
+    ) : RawFusionExportResult()
+
+    /**
+     * Verified committed public MediaStore export with its in-job local artifact(s).
+     * `uriString` matches `export.uriString`; `verified == true` by construction. Cancellation or
+     * processor cleanup after this branch must not roll back the committed public result.
+     */
+    internal data class CommittedPublicExport(
+        override val base: RawFusionProcessResult,
+        override val metadata: JSONObject,
+        val export: GalleryExportResult,
+        val verified: Boolean
+    ) : RawFusionExportResult()
+
+    /**
+     * Cache/private-only result: current export produced a bitmap/path that is usable for the
+     * private cache but did NOT commit a public MediaStore export. NOT carried as `Committed`.
+     */
+    internal data class CacheOnlyResult(
+        override val base: RawFusionProcessResult,
+        override val metadata: JSONObject
+    ) : RawFusionExportResult()
+
+    /** Export failure before any public MediaStore commit. Ownership: current NORMAL failure metadata must reflect this. */
+    internal data class ExportFailureBeforeCommit(
+        override val base: RawFusionProcessResult,
+        override val metadata: JSONObject
+    ) : RawFusionExportResult()
+
+    /**
+     * Export failure after a public MediaStore commit succeeded but verification (or later post-
+     * commit work) failed. The previously committed public export is preserved; the current
+     * NORMAL failure metadata marks the run as failed WITHOUT rolling back the verified committed
+     * public result.
+     */
+    internal data class ExportFailureAfterCommit(
+        override val base: RawFusionProcessResult,
+        override val metadata: JSONObject,
+        val export: GalleryExportResult
+    ) : RawFusionExportResult()
+
+    val success: Boolean get() = base.success
+    val errorMessage: String? get() = base.errorMessage
+}
+
+internal val RawFusionExportResult.processResult: RawFusionProcessResult get() = base
+
 private data class RawFusionExportBitmap(
     val bitmap: Bitmap,
     val source: String,
@@ -208,11 +293,20 @@ fun captureProcessExportRawNightFusion(
                         postExportWorkSkipped = cancellation.isCancelled
                     )
                     if (!verified) {
+                        // Failure after a public MediaStore commit: the public export cannot be rolled
+                        // back. Preserve committed-export metadata previously written in
+                        // [updateExportMetadata], record the verification failure through the export
+                        // result model, and DO NOT roll back or clear committed export metadata after
+                        // the commit point. `verified=false` means `galleryExportCommitted` stays false
+                        // but the in-flight `exportUri` is preserved for diagnostics.
                         updateExportFailure(
                             jobDir = jobDir,
                             error = "Export verification failed",
-                            finalOutputFormat = finalOutputFormat
-                            ,export = result
+                            finalOutputFormat = finalOutputFormat,
+                            export = result,
+                            verified = false,
+                            processStatus = "EXPORT_UNVERIFIED_KEEPING_CACHE",
+                            preservePublicExportMetadata = true
                         )
                         post("PIPELINE_FAILED: RAW export verification failed; keeping RAW cache.")
                         return@post
