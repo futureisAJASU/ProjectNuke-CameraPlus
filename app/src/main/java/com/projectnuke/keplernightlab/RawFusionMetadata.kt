@@ -249,16 +249,6 @@ internal val RAW_FUSION_EXPORT_NORMAL_SUCCESS_KEYS: Set<String> =
     RAW_FUSION_EXPORT_RENDERER_ERROR_KEYS
 
 /**
- * NORMAL failure terminal overlay keys written directly in the locked update (not in
- * the present-copy/absent-remove owned set).
- */
-internal val RAW_FUSION_EXPORT_NORMAL_FAILURE_TERMINAL_KEYS: Set<String> = setOf(
-    "currentPipelineStage",
-    "processStatus",
-    "userCanMoveDevice"
-)
-
-/**
  * `REPROCESS_PROGRESS_ONLY` export owned-key set: shared diagnostics + renderer-error
  * diagnostics only. NEVER includes NORMAL local candidate keys, terminal stage/status,
  * `userCanMoveDevice`, gallery linkage, public-result, committed-export, final-output,

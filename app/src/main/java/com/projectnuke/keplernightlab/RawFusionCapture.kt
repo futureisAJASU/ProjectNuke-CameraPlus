@@ -941,6 +941,37 @@ private object RawFusionExportCoordinator {
         }
     }
 
+    // Persist local-render failure metadata in a single locked update. Performs
+    // present-copy/absent-remove on ownedKeys, writes renderer error fields directly,
+    // and in NORMAL mode writes terminal stage/status/userCanMoveDevice as a direct overlay.
+    // In REPROCESS mode no terminal fields are written. Exceptions propagate so the outer
+    // Phase 3A failure handler can record a fallback failure.
+    private fun persistExportFailure(
+        context: RawFusionExportContext,
+        currentRunMetadata: JSONObject,
+        ownedKeys: Set<String>,
+        processStatus: String?,
+        rendererFailureType: String,
+        errorMessage: String
+    ) {
+        KeplerJobMetadata.update(context.files.jobDir) { current ->
+            ownedKeys.forEach { key ->
+                if (currentRunMetadata.has(key)) {
+                    current.put(key, currentRunMetadata.get(key))
+                } else {
+                    current.remove(key)
+                }
+            }
+            current.put("rawLocalRenderFailureType", rendererFailureType)
+            current.put("rawLocalRenderFailureMessage", errorMessage)
+            if (context.metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+                current.put("currentPipelineStage", "FAILED")
+                current.put("processStatus", processStatus)
+                current.put("userCanMoveDevice", true)
+            }
+        }
+    }
+
     // Initialize current-run export-owned fields before any native RGBA/MP24/bitmap attempt.
     // NORMAL mode clears shared diagnostics + local candidates + renderer-error fields.
     // REPROCESS mode clears shared diagnostics + renderer-error fields only; MUST NOT
@@ -1074,35 +1105,31 @@ private object RawFusionExportCoordinator {
                 .put("rawFusionProcessingPolicy", context.metadataPolicy.name)
                 .put("rawLocalRenderFailureType", rendererFailureType)
                 .put("rawLocalRenderFailureMessage", failureMessage)
-            // NORMAL: build failure payload from NORMAL_FAILURE_PERSIST_KEYS, persist it,
-            // then directly overlay terminal stage/status in a locked update.
-            // REPROCESS: write only reprocess-owned diagnostic fields; no terminal overlay.
+            val ownedKeys: Set<String>
+            val resultMetadata: JSONObject
+            val failureProcessStatus: String?
             if (context.metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
                 val payload = buildNormalFailurePayload(
                     currentRunMetadata = failedPayload,
                     rendererFailureType = rendererFailureType,
                     errorMessage = failureMessage
                 )
-                persistExportProgress(context, payload, RAW_FUSION_EXPORT_NORMAL_FAILURE_PERSIST_KEYS)
-                KeplerJobMetadata.update(context.files.jobDir) { current ->
-                    current.put("currentPipelineStage", "FAILED")
-                    current.put("processStatus", "NATIVE_POSTPROCESS_FAILED_KEEPING_CACHE")
-                    current.put("userCanMoveDevice", true)
-                }
-                context.onStatus("RAW fusion native 24MP postprocess failed. RAW cache kept.")
-                return RawFusionExportResult.LocalRenderFailure(
-                    base = RawFusionProcessResult(
-                        success = false,
-                        mergedRawFile = context.files.mergedRawFile,
-                        mergedDngFile = null,
-                        previewPngFile = null,
-                        finalPngFile = null,
-                        errorMessage = failureMessage
-                    ),
-                    metadata = payload
-                )
+                ownedKeys = RAW_FUSION_EXPORT_NORMAL_FAILURE_PERSIST_KEYS
+                failureProcessStatus = "NATIVE_POSTPROCESS_FAILED_KEEPING_CACHE"
+                resultMetadata = payload
+            } else {
+                ownedKeys = RAW_FUSION_EXPORT_REPROCESS_KEYS
+                failureProcessStatus = null
+                resultMetadata = failedPayload
             }
-            persistExportProgress(context, failedPayload, RAW_FUSION_EXPORT_REPROCESS_KEYS)
+            persistExportFailure(
+                context = context,
+                currentRunMetadata = failedPayload,
+                ownedKeys = ownedKeys,
+                processStatus = failureProcessStatus,
+                rendererFailureType = rendererFailureType,
+                errorMessage = failureMessage
+            )
             context.onStatus("RAW fusion native 24MP postprocess failed. RAW cache kept.")
             return RawFusionExportResult.LocalRenderFailure(
                 base = RawFusionProcessResult(
@@ -1113,7 +1140,7 @@ private object RawFusionExportCoordinator {
                     finalPngFile = null,
                     errorMessage = failureMessage
                 ),
-                metadata = failedPayload
+                metadata = resultMetadata
             )
         }
 
@@ -1279,22 +1306,26 @@ private object RawFusionExportCoordinator {
                 .put("rawFinalRenderDebugFile", JSONObject.NULL)
                 .put("rawLocalRenderFailureType", "NativeRawIspFailure")
                 .put("rawLocalRenderFailureMessage", failureMessage)
-            // NORMAL: native render failure must persist current failure metadata BEFORE returning.
-            // Reprocess: writes only the diagnostic fields above; never terminal stage/status /
-            // userCanMoveDevice / export terminal fields.
-            val payload = if (context.metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-                buildNormalFailurePayload(failedPayload, "NativeRawIspFailure", failureMessage)
+            val ownedKeys: Set<String>
+            val resultMetadata: JSONObject
+            val failureProcessStatus: String?
+            if (context.metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+                val payload = buildNormalFailurePayload(failedPayload, "NativeRawIspFailure", failureMessage)
+                ownedKeys = RAW_FUSION_EXPORT_NORMAL_FAILURE_PERSIST_KEYS
+                failureProcessStatus = "NATIVE_RAW_ISP_FAILED_KEEPING_CACHE"
+                resultMetadata = payload
             } else {
-                failedPayload
+                ownedKeys = RAW_FUSION_EXPORT_REPROCESS_KEYS
+                failureProcessStatus = null
+                resultMetadata = failedPayload
             }
-            persistExportProgress(
-                context,
-                payload,
-                if (context.metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-                    RAW_FUSION_EXPORT_NORMAL_FAILURE_PERSIST_KEYS
-                } else {
-                    RAW_FUSION_EXPORT_REPROCESS_KEYS
-                }
+            persistExportFailure(
+                context = context,
+                currentRunMetadata = failedPayload,
+                ownedKeys = ownedKeys,
+                processStatus = failureProcessStatus,
+                rendererFailureType = "NativeRawIspFailure",
+                errorMessage = failureMessage
             )
             context.onStatus("PIPELINE_FAILED: Native RAW ISP failed; RAW cache kept. $status")
             return RawFusionExportResult.LocalRenderFailure(
@@ -1306,7 +1337,7 @@ private object RawFusionExportCoordinator {
                     finalPngFile = null,
                     errorMessage = failureMessage
                 ),
-                metadata = payload
+                metadata = resultMetadata
             )
         }
         cancellation.throwIfCancelled()
