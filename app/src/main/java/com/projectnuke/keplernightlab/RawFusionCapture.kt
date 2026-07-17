@@ -1648,6 +1648,7 @@ fun processRawFusionJob(
      * the current run does not produce them, so stale previous-run values never survive.
      */
     val ownedNormalKeys: Set<String> = RAW_FUSION_SHARED_PROCESSOR_KEYS +
+        RAW_CLASSIC_CURRENT_RUN_KEYS +
         RAW_FUSION_NORMAL_FAILURE_TERMINAL_KEYS +
         setOf("userCanMoveDevice")
 
@@ -1658,7 +1659,8 @@ fun processRawFusionJob(
      * non-terminal processor-error fields are included because they do not flip a terminal status
      * key and are explicitly attributed to the current reprocess attempt.
      */
-    val ownedReprocessKeys: Set<String> = RAW_FUSION_SHARED_PROCESSOR_KEYS
+    val ownedReprocessKeys: Set<String> = RAW_FUSION_SHARED_PROCESSOR_KEYS +
+        RAW_CLASSIC_CURRENT_RUN_KEYS
 
     val ownedKeys: Set<String> = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
         ownedNormalKeys
@@ -1796,12 +1798,17 @@ fun processRawFusionJob(
             alignmentFile.exists()
         if (!classicMergedOk) {
             val failureMessage = classicMerge.errorMessage ?: "Classic RAW fusion failed"
+            val classicFailureType = if (classicMerge.alignmentStatus == "OOM_FAILED") {
+                "OutOfMemoryError"
+            } else {
+                "ClassicRawFusionFailure"
+            }
             persistRawFusionFailureMetadata(
                 jobDir = jobDir,
                 metadataPolicy = metadataPolicy,
                 processStatus = "CLASSIC_RAW_FUSION_FAILED_KEEPING_CACHE",
                 failureMessage = failureMessage,
-                failureType = "ClassicRawFusionFailure",
+                failureType = classicFailureType,
                 currentRunJob = currentRunJob,
                 ownedKeys = ownedKeys,
                 classicKeysToRemove = RAW_CLASSIC_CURRENT_RUN_KEYS

@@ -176,11 +176,11 @@ internal fun persistRawFusionFailureMetadata(
                 current.put("currentPipelineStage", "FAILED")
                 current.put("processStatus", processStatus)
                 current.put("userCanMoveDevice", true)
+                current.put("processedAt", System.currentTimeMillis())
             }
             current.put("rawProcessorFailureType", failureType)
             current.put("rawProcessorFailureMessage", failureMessage)
             current.put("processError", failureMessage)
-            current.put("processedAt", System.currentTimeMillis())
             current.put("rawFusionProcessingPolicy", metadataPolicy.name)
         }
     }.onFailure { metadataWriteError ->
