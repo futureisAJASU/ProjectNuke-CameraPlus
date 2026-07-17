@@ -146,9 +146,11 @@ internal val RAW_FUSION_SHARED_PROCESSOR_KEYS: Set<String> = RAW_FUSION_PROGRESS
 /**
  * Persist current-run failure metadata in a single [KeplerJobMetadata.update] call.
  * Copies present current-run owned fields from [currentRunJob], removes absent owned fields,
- * directly writes the failure scalar fields, and optionally removes Classic current-run keys.
- * Accepts a nullable [currentRunJob]; if null, all owned fields are treated as absent and only
- * removed from the locked metadata.
+ * and directly writes the failure scalar fields. Accepts a nullable [currentRunJob]; if null,
+ * all owned fields are treated as absent and only removed from the locked metadata.
+ *
+ * Classic result keys are only removed when they appear in [ownedKeys] (NORMAL mode), so
+ * reprocess failure never touches full Classic result fields.
  *
  * Does not allocate a separate failure [JSONObject]. Does not re-read or parse [job.json].
  */
@@ -159,8 +161,7 @@ internal fun persistRawFusionFailureMetadata(
     failureMessage: String,
     failureType: String,
     currentRunJob: JSONObject?,
-    ownedKeys: Set<String>,
-    classicKeysToRemove: Set<String> = emptySet()
+    ownedKeys: Set<String>
 ) {
     runCatching {
         KeplerJobMetadata.update(jobDir) { current ->
@@ -171,7 +172,6 @@ internal fun persistRawFusionFailureMetadata(
                     current.remove(key)
                 }
             }
-            classicKeysToRemove.forEach { current.remove(it) }
             if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
                 current.put("currentPipelineStage", "FAILED")
                 current.put("processStatus", processStatus)

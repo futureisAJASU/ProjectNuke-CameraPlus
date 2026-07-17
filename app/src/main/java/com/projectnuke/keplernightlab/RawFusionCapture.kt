@@ -1654,13 +1654,13 @@ fun processRawFusionJob(
 
     /**
      * Keys owned by the run in `REPROCESS_PROGRESS_ONLY` mode: progress and diagnostics only.
-     * NEVER includes terminal status/stage, `userCanMoveDevice`, gallery, export, final-output,
-     * committed-export, or public-result fields, in accordance with the progress policy. The
-     * non-terminal processor-error fields are included because they do not flip a terminal status
-     * key and are explicitly attributed to the current reprocess attempt.
+     * NEVER includes terminal status/stage, `userCanMoveDevice`, Classic result fields, gallery,
+     * export, final-output, committed-export, or public-result fields, in accordance with the
+     * progress policy. The non-terminal processor-error fields are included because they do not
+     * flip a terminal status key and are explicitly attributed to the current reprocess attempt.
+     * Reprocess startup never clears earlier valid Classic result metadata.
      */
-    val ownedReprocessKeys: Set<String> = RAW_FUSION_SHARED_PROCESSOR_KEYS +
-        RAW_CLASSIC_CURRENT_RUN_KEYS
+    val ownedReprocessKeys: Set<String> = RAW_FUSION_SHARED_PROCESSOR_KEYS
 
     val ownedKeys: Set<String> = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
         ownedNormalKeys
@@ -1688,9 +1688,9 @@ fun processRawFusionJob(
         }
     }
 
-    // Holder for current-run job metadata — assigned immediately after reading the job,
-    // before any operation that can fail. Reused in all failure paths so we never construct
-    // failure metadata from an empty JSONObject or re-read job.json from a catch block.
+    // Holder for current-run job metadata — assigned after initial metadata is written, before
+    // any operation that can fail. Reused in all failure paths so we never construct failure
+    // metadata from an empty JSONObject or re-read job.json from a catch block.
     var currentRunJob: JSONObject? = null
 
     return try {
@@ -1698,19 +1698,24 @@ fun processRawFusionJob(
         val job = JSONObject(jobFile.readText())
         cancellation.throwIfCancelled()
 
-        // Assign current-run job immediately after reading, before any operation that can fail.
-        currentRunJob = job
-
-        // Initial current-run RAW processing metadata ownership pass:
-        // Remove stale previous-run values for every owned progress and diagnostic field BEFORE
-        // building the current run's values. The native postprocess/RGBA/debug file references
-        // and memory estimate/timing fields are included so a previous run's artifacts cannot
-        // survive this run unless the current run re-emits them into `jobLocal`.
+        // 1-2. Remove stale previous-run values for every owned progress, diagnostic, processor-
+        // error, and Classic field BEFORE building the current run's values.
         RAW_FUSION_PROGRESS_KEYS.forEach(job::remove)
         RAW_FUSION_NATIVE_DIAGNOSTIC_KEYS.forEach(job::remove)
         RAW_FUSION_PROCESSOR_ERROR_KEYS.forEach(job::remove)
         RAW_CLASSIC_CURRENT_RUN_KEYS.forEach(job::remove)
+
+        // 3. Write the current metadata policy.
         job.put("rawFusionProcessingPolicy", metadataPolicy.name)
+
+        // 4. Write the current processing start timestamp so malformed frames or dimensions
+        // still produce NORMAL failure metadata with the current processingStart.
+        val processingStartedAt = System.currentTimeMillis()
+        job.put("processingStartedAt", processingStartedAt)
+
+        // 5. Assign current-run job after initial metadata is written, before any operation
+        // that can fail.
+        currentRunJob = job
 
         // NORMAL: remove any previous terminal processStatus so we don't persist NOT_PROCESSED,
         // a prior success, or a prior failure alongside currentPipelineStage="PROCESSING".
@@ -1718,15 +1723,14 @@ fun processRawFusionJob(
             job.remove("processStatus")
         }
 
+        // 6. Only then parse frames, dimensions, invoke callbacks, or estimate memory.
         val frames = job.getJSONArray("frames")
         val width = job.getInt("rawWidth")
         val height = job.getInt("rawHeight")
         val pixelCountLong = width.toLong() * height.toLong()
         require(pixelCountLong <= Int.MAX_VALUE) { "RAW dimensions exceed Kotlin array limits: ${width}x$height" }
         val pixelCount = pixelCountLong.toInt()
-        val processingStartedAt = System.currentTimeMillis()
-        job.put("processingStartedAt", processingStartedAt)
-            .put("currentPipelineStage", "PROCESSING")
+        job.put("currentPipelineStage", "PROCESSING")
             .put("userCanMoveDevice", true)
             // Explicit non-terminal RAW processing status for this run
             .put("processStatus", "RAW_PROCESSING_IN_PROGRESS")
@@ -1810,8 +1814,7 @@ fun processRawFusionJob(
                 failureMessage = failureMessage,
                 failureType = classicFailureType,
                 currentRunJob = currentRunJob,
-                ownedKeys = ownedKeys,
-                classicKeysToRemove = RAW_CLASSIC_CURRENT_RUN_KEYS
+                ownedKeys = ownedKeys
             )
             onStatus("Classic RAW fusion failed. RAW cache kept.")
             return RawFusionProcessResult(
@@ -1883,8 +1886,7 @@ fun processRawFusionJob(
             failureMessage = "OutOfMemoryError",
             failureType = "OutOfMemoryError",
             currentRunJob = currentRunJob,
-            ownedKeys = ownedKeys,
-            classicKeysToRemove = RAW_CLASSIC_CURRENT_RUN_KEYS
+            ownedKeys = ownedKeys
         )
         onStatus("RAW fusion stopped: insufficient memory. RAW cache kept.")
         RawFusionProcessResult(false, null, null, null, null, "OutOfMemoryError: RAW cache kept")
@@ -1899,8 +1901,7 @@ fun processRawFusionJob(
             failureMessage = failureMessage,
             failureType = e.javaClass.simpleName,
             currentRunJob = currentRunJob,
-            ownedKeys = ownedKeys,
-            classicKeysToRemove = RAW_CLASSIC_CURRENT_RUN_KEYS
+            ownedKeys = ownedKeys
         )
         RawFusionProcessResult(false, null, null, null, null, failureMessage)
     }
