@@ -1304,6 +1304,7 @@ private object RawFusionExportCoordinator {
                 .put("rawReferenceDebugFile", JSONObject.NULL)
                 .put("rawMergedLinearDebugFile", JSONObject.NULL)
                 .put("rawFinalRenderDebugFile", JSONObject.NULL)
+                .put("rawFusionProcessingPolicy", context.metadataPolicy.name)
                 .put("rawLocalRenderFailureType", "NativeRawIspFailure")
                 .put("rawLocalRenderFailureMessage", failureMessage)
             val ownedKeys: Set<String>
