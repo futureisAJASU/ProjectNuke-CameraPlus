@@ -333,7 +333,34 @@ internal val RAW_PUBLIC_EXPORT_CURRENT_ATTEMPT_KEYS: Set<String> = setOf(
     "qualityDiagnosticNativeLimitedReason",
     "rawPublicExportAttemptStatus",
     "rawPublicExportAttemptError",
-    "rawPublicExportAttemptAt"
+    "rawPublicExportAttemptAt",
+    "rawQualityDiagnosticStatus",
+    "rawQualityDiagnosticError",
+    "rawQualityDiagnosticAt",
+    "qualityDiagnosticVersion",
+    "referenceSharpness",
+    "fusedSharpness",
+    "denoisedSharpness",
+    "finalSharpness",
+    "referenceNoiseEstimate",
+    "fusedNoiseEstimate",
+    "denoisedNoiseEstimate",
+    "finalNoiseEstimate",
+    "referenceLowGradientRegionRatio",
+    "fusedLowGradientRegionRatio",
+    "denoisedLowGradientRegionRatio",
+    "finalLowGradientRegionRatio",
+    "finalSaturatedPixelRatio",
+    "finalUnderexposedPixelRatio",
+    "sharpnessDropReferenceToFused",
+    "sharpnessDropFusedToFinal",
+    "noiseReductionReferenceToFused",
+    "noiseReductionFusedToFinal",
+    "fusionQualityHint",
+    "fusionQualityHints",
+    "referencePreservedPixelRatio",
+    "qualityDiagnosticCompareFile",
+    "diagnosticCropPrefix"
 )
 
 /**
@@ -512,17 +539,12 @@ internal fun updateRawExportBitmapMetadata(
  * upcoming public MediaStore commit. Reprocess treats the same action as run-scoped diagnostic
  * clearing only — terminal stage, status, `userCanMoveDevice`, and committed public metadata are
  * intentionally left untouched here.
+ *
+ * @throws Exception if metadata persistence fails; caller must handle and must not proceed with
+ * stale diagnostics.
  */
 internal fun resetRawExportAttemptDiagnostics(jobDir: File) {
-    runCatching {
-        KeplerJobMetadata.update(jobDir) { job ->
-            RAW_PUBLIC_EXPORT_CURRENT_ATTEMPT_KEYS.forEach { key -> job.remove(key) }
-        }
-    }.onFailure { metadataError ->
-        Log.e(
-            "KeplerRawPipeline",
-            "Failed to reset RAW export attempt diagnostics: ${metadataError.message}",
-            metadataError
-        )
+    KeplerJobMetadata.update(jobDir) { job ->
+        RAW_PUBLIC_EXPORT_CURRENT_ATTEMPT_KEYS.forEach { key -> job.remove(key) }
     }
 }

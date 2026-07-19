@@ -535,7 +535,32 @@ fun captureProcessExportRawNightFusion(
                     val requestedOutputFormat = requestedOutputFormatForSetting(finalOutputFormat)
                     post("결과 미리보기를 준비하는 중입니다.")
                     val previewPrepareStartedAt = System.currentTimeMillis()
-                    resetRawExportAttemptDiagnostics(jobDir)
+                    try {
+                        resetRawExportAttemptDiagnostics(jobDir)
+                    } catch (resetError: Exception) {
+                        Log.e(
+                            "KeplerRawPipeline",
+                            "RAW export attempt diagnostics reset failed; aborting export: ${resetError.message}",
+                            resetError
+                        )
+                        try {
+                            recordNormalPreCommitTerminal(
+                                jobDir,
+                                attemptStatus = "FAILED",
+                                pipelineStage = "FAILED",
+                                processStatus = "EXPORT_FAILED_KEEPING_CACHE",
+                                reason = "Diagnostics reset failed: ${resetError.message}"
+                            )
+                        } catch (metadataError: Exception) {
+                            Log.e(
+                                "KeplerRawPipeline",
+                                "Failed to persist RAW pre-commit failure metadata: ${metadataError.message}",
+                                metadataError
+                            )
+                        }
+                        post("PIPELINE_FAILED: RAW export diagnostics reset failed; keeping RAW cache. ${resetError.message}")
+                        return@post
+                    }
                     var exportBitmap: Bitmap? = null
                     val result = try {
                         cancellation.throwIfCancelled()
@@ -1170,7 +1195,18 @@ internal fun reprocessRawJob(
             }
             val requestedFormat = requestedOutputFormatForSetting(finalOutputFormat)
             post("Exporting reprocessed ${requestedFormat.label}...")
-            resetRawExportAttemptDiagnostics(jobDir)
+            try {
+                resetRawExportAttemptDiagnostics(jobDir)
+            } catch (resetError: Exception) {
+                Log.e(
+                    "KeplerRawPipeline",
+                    "RAW reprocess diagnostics reset failed; aborting export: ${resetError.message}",
+                    resetError
+                )
+                post("RAW reprocess diagnostics reset failed; source frames kept. ${resetError.message}")
+                terminalResult = Result.failure(resetError)
+                return@post
+            }
             var exportBitmap: Bitmap? = null
             val exportAttempted = try {
                 val loaded = process.loadExportBitmap()
@@ -1596,38 +1632,112 @@ private fun applyExplicitFrameSelection(jobDir: File, selectedFrameIndices: Set<
 }
 
 private fun updateRawNativeQualityDiagnostics(jobDir: File, bitmap: Bitmap) {
-    runCatching {
-        val finalPreview = saveBoundedDiagnosticPreview(bitmap, File(jobDir, "final_preview.png"))
-        val referencePreview = finalPreview.copy(Bitmap.Config.ARGB_8888, false)
-        try {
-            saveBoundedDiagnosticPreview(referencePreview, File(jobDir, "reference_single_preview.png"))
-            saveBoundedDiagnosticPreview(finalPreview, File(jobDir, "fused_before_denoise_preview.png"))
-            saveBoundedDiagnosticPreview(finalPreview, File(jobDir, "fused_after_denoise_no_sharpen_preview.png"))
-            KeplerJobMetadata.update(jobDir) { job ->
-                writeFusionQualityDiagnostics(
-                    job = job,
-                    jobDir = jobDir,
-                    prefix = "raw",
-                    reference = referencePreview,
-                    fused = finalPreview,
-                    denoised = finalPreview,
-                    finalImage = finalPreview,
-                    compareFileName = "compare_reference_vs_final.png"
-                )
-                job.put("referenceSinglePreviewFile", "reference_single_preview.png")
-                    .put("fusedBeforeDenoisePreviewFile", "fused_before_denoise_preview.png")
-                    .put("fusedAfterDenoiseNoSharpenPreviewFile", "fused_after_denoise_no_sharpen_preview.png")
-                    .put("finalPreviewFile", "final_preview.png")
-                    .put("compareReferenceVsFinalFile", "compare_reference_vs_final.png")
-                    .put("qualityDiagnosticNativeLimited", true)
-                    .put(
-                        "qualityDiagnosticNativeLimitedReason",
-                        "Native RGBA path only exposes final display bitmap to Kotlin export stage."
-                    )
-            }
-        } finally {
-            referencePreview.recycle()
-            finalPreview.recycle()
+    var finalPreview: Bitmap? = null
+    var referencePreview: Bitmap? = null
+    try {
+        finalPreview = saveBoundedDiagnosticPreview(bitmap, File(jobDir, "final_preview.png"))
+        referencePreview = try {
+            finalPreview.copy(Bitmap.Config.ARGB_8888, false)
+        } catch (copyError: OutOfMemoryError) {
+            Log.e(
+                "KeplerRawPipeline",
+                "OOM while creating reference diagnostic preview; recycling finalPreview: ${copyError.message}",
+                copyError
+            )
+            throw copyError
+        } catch (copyError: Exception) {
+            Log.e(
+                "KeplerRawPipeline",
+                "Failed to create reference diagnostic preview; recycling finalPreview: ${copyError.message}",
+                copyError
+            )
+            throw copyError
         }
+        saveBoundedDiagnosticPreview(referencePreview, File(jobDir, "reference_single_preview.png"))
+        saveBoundedDiagnosticPreview(finalPreview, File(jobDir, "fused_before_denoise_preview.png"))
+        saveBoundedDiagnosticPreview(finalPreview, File(jobDir, "fused_after_denoise_no_sharpen_preview.png"))
+        val diagnosticMetrics = writeFusionQualityDiagnostics(
+            job = JSONObject(),
+            jobDir = jobDir,
+            prefix = "raw",
+            reference = referencePreview,
+            fused = finalPreview,
+            denoised = finalPreview,
+            finalImage = finalPreview,
+            compareFileName = "compare_reference_vs_final.png"
+        )
+        KeplerJobMetadata.update(jobDir) { job ->
+            val metrics = diagnosticMetrics.metrics
+            metrics.keys().forEach { key -> job.put(key, metrics.get(key)) }
+            job.put("referenceSinglePreviewFile", "reference_single_preview.png")
+                .put("fusedBeforeDenoisePreviewFile", "fused_before_denoise_preview.png")
+                .put("fusedAfterDenoiseNoSharpenPreviewFile", "fused_after_denoise_no_sharpen_preview.png")
+                .put("finalPreviewFile", "final_preview.png")
+                .put("compareReferenceVsFinalFile", "compare_reference_vs_final.png")
+                .put("qualityDiagnosticNativeLimited", true)
+                .put(
+                    "qualityDiagnosticNativeLimitedReason",
+                    "Native RGBA path only exposes final display bitmap to Kotlin export stage."
+                )
+                .put("rawQualityDiagnosticStatus", "COMPLETE")
+                .put("rawQualityDiagnosticError", JSONObject.NULL)
+                .put("rawQualityDiagnosticAt", System.currentTimeMillis())
+        }
+    } catch (oom: OutOfMemoryError) {
+        Log.e(
+            "KeplerRawPipeline",
+            "OOM during quality diagnostics; recycling owned bitmaps and recording failure",
+            oom
+        )
+        try {
+            KeplerJobMetadata.update(jobDir) { job ->
+                job.put("rawQualityDiagnosticStatus", "FAILED")
+                    .put("rawQualityDiagnosticError", "OutOfMemoryError: ${oom.message}")
+                    .put("rawQualityDiagnosticAt", System.currentTimeMillis())
+            }
+        } catch (metadataOom: OutOfMemoryError) {
+            Log.e(
+                "KeplerRawPipeline",
+                "OOM while persisting diagnostic failure status; committed=true, verified=true, " +
+                    "uri=, metadataError=OutOfMemoryError",
+                metadataOom
+            )
+        } catch (metadataError: Exception) {
+            Log.e(
+                "KeplerRawPipeline",
+                "Failed to persist diagnostic failure status: ${metadataError.message}",
+                metadataError
+            )
+        }
+        referencePreview?.takeUnless { it.isRecycled }?.recycle()
+        finalPreview?.takeUnless { it.isRecycled }?.recycle()
+    } catch (e: Exception) {
+        Log.e(
+            "KeplerRawPipeline",
+            "Quality diagnostics failed; recycling owned bitmaps and recording failure",
+            e
+        )
+        try {
+            KeplerJobMetadata.update(jobDir) { job ->
+                job.put("rawQualityDiagnosticStatus", "FAILED")
+                    .put("rawQualityDiagnosticError", "${e.javaClass.simpleName}: ${e.message}")
+                    .put("rawQualityDiagnosticAt", System.currentTimeMillis())
+            }
+        } catch (metadataOom: OutOfMemoryError) {
+            Log.e(
+                "KeplerRawPipeline",
+                "OOM while persisting diagnostic failure status; committed=true, verified=true, " +
+                    "uri=, metadataError=OutOfMemoryError",
+                metadataOom
+            )
+        } catch (metadataError: Exception) {
+            Log.e(
+                "KeplerRawPipeline",
+                "Failed to persist diagnostic failure status: ${metadataError.message}",
+                metadataError
+            )
+        }
+        referencePreview?.takeUnless { it.isRecycled }?.recycle()
+        finalPreview?.takeUnless { it.isRecycled }?.recycle()
     }
 }
