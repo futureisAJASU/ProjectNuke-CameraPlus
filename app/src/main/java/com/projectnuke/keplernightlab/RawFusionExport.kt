@@ -252,6 +252,64 @@ internal sealed class RawFusionPublicExportOutcome {
     }
 
     /**
+     * Verified committed public export where optional post-export work (sidecar export, preview
+     * generation, etc.) has not yet reached an outcome. The committed URI is preserved and
+     * verification is true; this is non-rollback-eligible. Process status:
+     * `EXPORT_VERIFIED_PENDING_POST_WORK`, pipeline stage: `PROCESSING`.
+     *
+     * This checkpoint is persisted immediately after [verifyGalleryExport] returns true, before
+     * sidecars, so a post-verification crash never leaves the job in an unverified committed state.
+     * Final [VerifiedSuccess] is written only after optional post-export work has produced its
+     * current outcome.
+     */
+    internal data class VerifiedPendingPostWork(
+        override val base: RawFusionProcessResult,
+        override val finalOutputFormat: FinalOutputFormat,
+        override val export: GalleryExportResult,
+        override val currentLocalPreview: File?,
+        override val currentLocalOutput: File?
+    ) : RawFusionPublicExportOutcome() {
+        override val sidecar: RawSidecarExportResult? = null
+        override val committed: Boolean = true
+        override val verified: Boolean = true
+        override val postExportCancellationRequested: Boolean = false
+        override val postExportWorkSkipped: Boolean = false
+        override val currentError: String? = null
+        override val currentWarning: String? = null
+        override val disposition: ReprocessTerminalDisposition = ReprocessTerminalDisposition.COMMITTED_PARTIAL
+        override val rawPublicExportAttemptStatus: String? = null
+        override val rawPublicExportAttemptError: String? = null
+        override val rawPublicExportAttemptAt: Long = 0L
+    }
+
+    /**
+     * Verified committed public export where an OOM or exception occurred after verification
+     * but before final post-export work (sidecar export, etc.) completed. The committed URI is
+     * preserved, `exportVerified=true`, and `postExportWorkSkipped=true`. Non-rollback-eligible.
+     *
+     * Process/export status: verified-partial rather than full success or uncommitted failure.
+     */
+    internal data class VerifiedPostWorkInterrupted(
+        override val base: RawFusionProcessResult,
+        override val finalOutputFormat: FinalOutputFormat,
+        override val export: GalleryExportResult,
+        override val sidecar: RawSidecarExportResult?,
+        override val currentLocalPreview: File?,
+        override val currentLocalOutput: File?,
+        override val currentWarning: String? = null,
+        override val currentError: String? = null
+    ) : RawFusionPublicExportOutcome() {
+        override val committed: Boolean = true
+        override val verified: Boolean = true
+        override val postExportCancellationRequested: Boolean = false
+        override val postExportWorkSkipped: Boolean = true
+        override val disposition: ReprocessTerminalDisposition = ReprocessTerminalDisposition.COMMITTED_PARTIAL
+        override val rawPublicExportAttemptStatus: String? = null
+        override val rawPublicExportAttemptError: String? = null
+        override val rawPublicExportAttemptAt: Long = 0L
+    }
+
+    /**
      * Verified committed public export. Optional sidecar work may have completed, partially
      * completed, failed, been skipped, or been unavailable — see [sidecar]. Image success is
      * preserved in every sidecar outcome; sidecar failure does NOT downgrade the image outcome.
@@ -405,6 +463,21 @@ fun captureProcessExportRawNightFusion(
             try {
                 cancellation.throwIfCancelled()
             } catch (_: CancellationException) {
+                try {
+                    recordNormalPreCommitTerminal(
+                        jobDir,
+                        attemptStatus = "CANCELLED",
+                        pipelineStage = "CANCELLED",
+                        processStatus = "EXPORT_CANCELLED_BEFORE_COMMIT",
+                        reason = "Capture cancelled before processing started."
+                    )
+                } catch (metadataError: Exception) {
+                    Log.e(
+                        "KeplerRawPipeline",
+                        "Failed to persist RAW pre-commit cancellation metadata: ${metadataError.message}",
+                        metadataError
+                    )
+                }
                 post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 return@captureRawBurstForFusion
             }
@@ -515,7 +588,7 @@ fun captureProcessExportRawNightFusion(
                         } catch (metadataError: Exception) {
                             Log.e(
                                 "KeplerRawPipeline",
-                                "Reprocess commit-checkpoint persistence failed; preserving committed outcome in memory: ${metadataError.message}",
+                                "Normal commit-checkpoint persistence failed; preserving committed outcome in memory: ${metadataError.message}",
                                 metadataError
                             )
                             try {
@@ -617,11 +690,10 @@ fun captureProcessExportRawNightFusion(
                         post("PIPELINE_FAILED: RAW export verification failed; keeping RAW cache.")
                         return@post
                     }
-                    val verifiedPendingOutcome = RawFusionPublicExportOutcome.VerifiedSuccess(
+                    val verifiedPendingOutcome = RawFusionPublicExportOutcome.VerifiedPendingPostWork(
                         base = process,
                         finalOutputFormat = finalOutputFormat,
                         export = committedExport!!,
-                        sidecar = null,
                         currentLocalPreview = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L },
                         currentLocalOutput = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
                     )
@@ -742,6 +814,22 @@ fun captureProcessExportRawNightFusion(
                             )
                             updateRawPublicExportOutcome(jobDir, partial)
                         }
+                    } else {
+                        try {
+                            recordNormalPreCommitTerminal(
+                                jobDir,
+                                attemptStatus = "CANCELLED",
+                                pipelineStage = "CANCELLED",
+                                processStatus = "EXPORT_CANCELLED_BEFORE_COMMIT",
+                                reason = "Pipeline cancelled before export commit."
+                            )
+                        } catch (metadataError: Exception) {
+                            Log.e(
+                                "KeplerRawPipeline",
+                                "Failed to persist RAW pre-commit cancellation metadata: ${metadataError.message}",
+                                metadataError
+                            )
+                        }
                     }
                     post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 } catch (oom: OutOfMemoryError) {
@@ -753,7 +841,7 @@ fun captureProcessExportRawNightFusion(
                             if (exportVerified) {
                                 updateRawPublicExportOutcome(
                                     jobDir,
-                                    RawFusionPublicExportOutcome.VerifiedSuccess(
+                                    RawFusionPublicExportOutcome.VerifiedPostWorkInterrupted(
                                         base = proc ?: RawFusionProcessResult(success = false, null, null, null, null, "OOM after verified export"),
                                         finalOutputFormat = finalOutputFormat,
                                         export = committedExport!!,
@@ -805,7 +893,7 @@ fun captureProcessExportRawNightFusion(
                             if (exportVerified) {
                                 updateRawPublicExportOutcome(
                                     jobDir,
-                                    RawFusionPublicExportOutcome.VerifiedSuccess(
+                                    RawFusionPublicExportOutcome.VerifiedPostWorkInterrupted(
                                         base = proc ?: RawFusionProcessResult(success = false, null, null, null, null, "Exception after verified export"),
                                         finalOutputFormat = finalOutputFormat,
                                         export = committedExport!!,

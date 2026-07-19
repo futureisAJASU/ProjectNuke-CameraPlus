@@ -378,6 +378,8 @@ internal fun updateRawPublicExportOutcome(
         job.put("finalOutputFormatSetting", outcome.finalOutputFormat.name)
             .put("exportStatus", when (outcome) {
                 is RawFusionPublicExportOutcome.CommittedPendingVerification -> "COMMITTED_PENDING"
+                is RawFusionPublicExportOutcome.VerifiedPendingPostWork -> "EXPORTED_PENDING_POST_WORK"
+                is RawFusionPublicExportOutcome.VerifiedPostWorkInterrupted -> "EXPORTED_VERIFIED_POST_WORK_INTERRUPTED"
                 is RawFusionPublicExportOutcome.VerifiedSuccess,
                 is RawFusionPublicExportOutcome.VerifiedWithPostExportCancellation -> "EXPORTED"
                 is RawFusionPublicExportOutcome.CommittedVerificationFailure -> "EXPORT_UNVERIFIED"
@@ -400,6 +402,10 @@ internal fun updateRawPublicExportOutcome(
         val sidecarResult = outcome.sidecar
         val sidecarStatus = when {
             outcome is RawFusionPublicExportOutcome.UncommittedFailure -> "SKIPPED"
+            outcome is RawFusionPublicExportOutcome.CommittedVerificationFailure -> "SKIPPED"
+            outcome is RawFusionPublicExportOutcome.CommittedInterruptedBeforeVerification -> "SKIPPED"
+            outcome is RawFusionPublicExportOutcome.VerifiedPendingPostWork && sidecarResult == null && outcome.finalOutputFormat.shouldExportRawSidecar -> "PENDING"
+            outcome is RawFusionPublicExportOutcome.VerifiedPostWorkInterrupted && sidecarResult == null && outcome.finalOutputFormat.shouldExportRawSidecar -> "PENDING"
             sidecarResult == null && outcome.finalOutputFormat.shouldExportRawSidecar -> "SKIPPED"
             sidecarResult == null -> "NOT_REQUESTED"
             else -> sidecarResult.status
@@ -420,6 +426,8 @@ internal fun updateRawPublicExportOutcome(
             outcome is RawFusionPublicExportOutcome.CommittedVerificationFailure ||
             outcome is RawFusionPublicExportOutcome.CommittedCancelledBeforeVerification ||
             outcome is RawFusionPublicExportOutcome.CommittedInterruptedBeforeVerification ||
+            outcome is RawFusionPublicExportOutcome.VerifiedPendingPostWork ||
+            outcome is RawFusionPublicExportOutcome.VerifiedPostWorkInterrupted ||
             outcome is RawFusionPublicExportOutcome.VerifiedSuccess ||
             outcome is RawFusionPublicExportOutcome.VerifiedWithPostExportCancellation
         if (isCommittedOutcome) {
@@ -429,6 +437,15 @@ internal fun updateRawPublicExportOutcome(
         }
         if (outcome is RawFusionPublicExportOutcome.CommittedPendingVerification) {
             job.put("currentPipelineStage", "PROCESSING")
+                .put("userCanMoveDevice", true)
+                .put("exportError", JSONObject.NULL)
+                .put("exportedAt", System.currentTimeMillis())
+            if (outcome.finalOutputFormat.shouldExportRawSidecar) {
+                job.put("rawSidecarExportStatus", "PENDING")
+            }
+        } else if (outcome is RawFusionPublicExportOutcome.VerifiedPendingPostWork) {
+            job.put("currentPipelineStage", "PROCESSING")
+                .put("processStatus", "EXPORT_VERIFIED_PENDING_POST_WORK")
                 .put("userCanMoveDevice", true)
                 .put("exportError", JSONObject.NULL)
                 .put("exportedAt", System.currentTimeMillis())
@@ -445,6 +462,12 @@ internal fun updateRawPublicExportOutcome(
                     .put("processStatus", "NIGHT_FUSION_COMPLETE")
                     .put("userCanMoveDevice", true)
                     .put("exportError", JSONObject.NULL)
+            }
+            is RawFusionPublicExportOutcome.VerifiedPostWorkInterrupted -> {
+                job.put("currentPipelineStage", "PARTIAL")
+                    .put("processStatus", "EXPORT_VERIFIED_POST_WORK_INTERRUPTED")
+                    .put("userCanMoveDevice", true)
+                    .put("exportError", outcome.currentError ?: JSONObject.NULL)
             }
             is RawFusionPublicExportOutcome.UncommittedFailure -> {
                 job.put("currentPipelineStage", "FAILED")
@@ -465,6 +488,9 @@ internal fun updateRawPublicExportOutcome(
             }
             is RawFusionPublicExportOutcome.CommittedPendingVerification -> {
                 job.put("processStatus", "EXPORT_COMMITTED_PENDING")
+            }
+            is RawFusionPublicExportOutcome.VerifiedPendingPostWork -> {
+                // processStatus already set in the pipeline-stage block above
             }
             is RawFusionPublicExportOutcome.CommittedCancelledBeforeVerification -> {
                 job.put("currentPipelineStage", "PARTIAL")
