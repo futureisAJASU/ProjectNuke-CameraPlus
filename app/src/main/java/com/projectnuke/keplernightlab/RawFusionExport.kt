@@ -725,6 +725,16 @@ fun captureProcessExportRawNightFusion(
                         )
                         try {
                             updateRawPublicExportOutcome(jobDir, interruptedOutcome)
+                        } catch (secondaryOom: OutOfMemoryError) {
+                            Log.e(
+                                "KeplerRawPipeline",
+                                "Secondary verified-partial metadata write ran out of memory; " +
+                                    "committed=${committedExport != null}, verified=true, " +
+                                    "uri=${committedExport?.uriString.orEmpty()}, " +
+                                    "original=${checkpointError.message}, " +
+                                    "metadataError=OutOfMemoryError",
+                                secondaryOom
+                            )
                         } catch (secondaryError: Exception) {
                             Log.e(
                                 "KeplerRawPipeline",
@@ -736,7 +746,7 @@ fun captureProcessExportRawNightFusion(
                                 secondaryError
                             )
                         }
-                        post("PIPELINE_FAILED: Verified-pending checkpoint persistence failed; committed image preserved. ${checkpointError.message}")
+                        post("PIPELINE_COMPLETE_PARTIAL: Verified-pending checkpoint persistence failed; committed image preserved. ${checkpointError.message}")
                         return@post
                     }
                     if (cancellation.isCancelled) {
@@ -844,6 +854,7 @@ fun captureProcessExportRawNightFusion(
                                 currentLocalOutput = cancelLocalOutput
                             )
                             updateRawPublicExportOutcome(jobDir, outcome)
+                            post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. RAW cache kept.")
                         } else {
                             val partial = RawFusionPublicExportOutcome.CommittedCancelledBeforeVerification(
                                 base = proc ?: RawFusionProcessResult(success = false, null, null, null, null, "Cancelled after commit"),
@@ -854,6 +865,7 @@ fun captureProcessExportRawNightFusion(
                                 currentLocalOutput = cancelLocalOutput
                             )
                             updateRawPublicExportOutcome(jobDir, partial)
+                            post("PIPELINE_CANCELLED: Export cancelled after MediaStore commit, before verification. RAW cache kept.")
                         }
                     } else {
                         try {
@@ -871,8 +883,8 @@ fun captureProcessExportRawNightFusion(
                                 metadataError
                             )
                         }
+                        post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                     }
-                    post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 } catch (oom: OutOfMemoryError) {
                     if (committedExport != null) {
                         val proc = capturedProcess
@@ -899,6 +911,16 @@ fun captureProcessExportRawNightFusion(
                                         currentError = oomReason
                                     )
                                 )
+                            } catch (metadataOom: OutOfMemoryError) {
+                                Log.e(
+                                    "KeplerRawPipeline",
+                                    "Post-commit OOM metadata persistence ran out of memory; " +
+                                        "committed=true, verified=true, " +
+                                        "uri=${committedExport?.uriString.orEmpty()}, " +
+                                        "original=${oom.message}, " +
+                                        "metadataError=OutOfMemoryError",
+                                    metadataOom
+                                )
                             } catch (metadataError: Exception) {
                                 Log.e(
                                     "KeplerRawPipeline",
@@ -910,6 +932,7 @@ fun captureProcessExportRawNightFusion(
                                     metadataError
                                 )
                             }
+                            post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but post-export work was interrupted by OOM. RAW cache kept.")
                         } else {
                             try {
                                 updateRawPublicExportOutcome(
@@ -924,6 +947,16 @@ fun captureProcessExportRawNightFusion(
                                         currentError = oomReason
                                     )
                                 )
+                            } catch (metadataOom: OutOfMemoryError) {
+                                Log.e(
+                                    "KeplerRawPipeline",
+                                    "Post-commit OOM metadata persistence ran out of memory; " +
+                                        "committed=true, verified=false, " +
+                                        "uri=${committedExport?.uriString.orEmpty()}, " +
+                                        "original=${oom.message}, " +
+                                        "metadataError=OutOfMemoryError",
+                                    metadataOom
+                                )
                             } catch (metadataError: Exception) {
                                 Log.e(
                                     "KeplerRawPipeline",
@@ -935,6 +968,7 @@ fun captureProcessExportRawNightFusion(
                                     metadataError
                                 )
                             }
+                            post("PIPELINE_FAILED: RAW export committed but verification interrupted by OOM; keeping RAW cache.")
                         }
                     } else {
                         try {
@@ -952,8 +986,8 @@ fun captureProcessExportRawNightFusion(
                                 metadataError
                             )
                         }
+                        post("PIPELINE_FAILED: RAW export ran out of memory; keeping RAW cache.")
                     }
-                    post("PIPELINE_FAILED: RAW export ran out of memory; keeping RAW cache.")
                 } catch (e: Exception) {
                     if (committedExport != null) {
                         val proc = capturedProcess
@@ -980,6 +1014,16 @@ fun captureProcessExportRawNightFusion(
                                         currentError = excReason
                                     )
                                 )
+                            } catch (metadataOom: OutOfMemoryError) {
+                                Log.e(
+                                    "KeplerRawPipeline",
+                                    "Post-commit exception metadata persistence ran out of memory; " +
+                                        "committed=true, verified=true, " +
+                                        "uri=${committedExport?.uriString.orEmpty()}, " +
+                                        "original=$excReason, " +
+                                        "metadataError=OutOfMemoryError",
+                                    metadataOom
+                                )
                             } catch (metadataError: Exception) {
                                 Log.e(
                                     "KeplerRawPipeline",
@@ -991,6 +1035,7 @@ fun captureProcessExportRawNightFusion(
                                     metadataError
                                 )
                             }
+                            post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but post-export work was interrupted by ${e.javaClass.simpleName}. RAW cache kept.")
                         } else {
                             try {
                                 updateRawPublicExportOutcome(
@@ -1005,6 +1050,16 @@ fun captureProcessExportRawNightFusion(
                                         currentError = excReason
                                     )
                                 )
+                            } catch (metadataOom: OutOfMemoryError) {
+                                Log.e(
+                                    "KeplerRawPipeline",
+                                    "Post-commit exception metadata persistence ran out of memory; " +
+                                        "committed=true, verified=false, " +
+                                        "uri=${committedExport?.uriString.orEmpty()}, " +
+                                        "original=$excReason, " +
+                                        "metadataError=OutOfMemoryError",
+                                    metadataOom
+                                )
                             } catch (metadataError: Exception) {
                                 Log.e(
                                     "KeplerRawPipeline",
@@ -1016,6 +1071,7 @@ fun captureProcessExportRawNightFusion(
                                     metadataError
                                 )
                             }
+                            post("PIPELINE_FAILED: RAW export committed but verification interrupted by ${e.javaClass.simpleName}; keeping RAW cache.")
                         }
                     } else {
                         try {
@@ -1033,11 +1089,11 @@ fun captureProcessExportRawNightFusion(
                                 metadataError
                             )
                         }
+                        post(
+                            "PIPELINE_FAILED: RAW Night Fusion pipeline failed; keeping RAW cache.\n" +
+                                e.stackTraceToString()
+                        )
                     }
-                    post(
-                        "PIPELINE_FAILED: RAW Night Fusion pipeline failed; keeping RAW cache.\n" +
-                            e.stackTraceToString()
-                    )
                 } finally {
                     thread.quitSafely()
                 }
