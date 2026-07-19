@@ -435,7 +435,8 @@ private fun finalizeReprocessOutcome(
             writeReprocessPartialPublicOnly(
                 jobDir, jobKind, includedFrameIndices.size, outcome.export,
                 outcome.exportVerified, outputSettings, outcome.terminalError?.message,
-                sidecarResult, postExportCancellation, postExportWorkSkipped
+                sidecarResult, postExportCancellation, postExportWorkSkipped,
+                currentWarning
             )
         } else {
             writeReprocessPartial(
@@ -450,7 +451,12 @@ private fun finalizeReprocessOutcome(
         writeQuarantineMarker(backups)
         return Result.failure(metadataFailure)
     }
-    clearReprocessCommitCheckpoint(jobDir)
+    try {
+        clearReprocessCommitCheckpoint(jobDir)
+    } catch (checkpointClearError: Exception) {
+        writeQuarantineMarker(backups)
+        return Result.failure(checkpointClearError)
+    }
     removeQuarantineMarker(backups)
     val cleanupSuccess = deleteBackups(backups)
     if (!cleanupSuccess) {
@@ -1043,7 +1049,7 @@ private fun writeReprocessPartial(
         .put("galleryVisible", finalOutputFile?.isFile == true)
         .put("galleryDisplayUnavailable", finalOutputFile?.isFile != true)
         .put("finalOutputFormatSetting", outputSettings.name)
-        .put("exportStatus", "EXPORT_UNVERIFIED")
+        .put("exportStatus", if (exportVerified) "EXPORTED" else "EXPORT_UNVERIFIED")
         .put("exportVerified", exportVerified)
         .put("galleryExportCommitted", export?.success == true && !export?.uriString.isNullOrBlank())
         .put("exportUri", export?.uriString ?: JSONObject.NULL)
@@ -1096,7 +1102,8 @@ private fun writeReprocessPartialPublicOnly(
     error: String?,
     sidecarResult: RawSidecarExportResult? = null,
     postExportCancellationRequested: Boolean = false,
-    postExportWorkSkipped: Boolean = false
+    postExportWorkSkipped: Boolean = false,
+    currentWarning: String? = null
 ) {
     KeplerJobMetadata.update(jobDir) { job ->
         job.put("processStatus", "PARTIAL_PUBLIC_ONLY")
@@ -1128,6 +1135,13 @@ private fun writeReprocessPartialPublicOnly(
             .put("rawSidecarExportedFiles", JSONArray(sidecarResult?.exportedFiles ?: emptyList<String>()))
             .put("rawSidecarError", sidecarResult?.errorMessage ?: JSONObject.NULL)
             .put("reprocessError", JSONObject.NULL)
+            .put("reprocessWarning", currentWarning ?: JSONObject.NULL)
+        if (currentWarning != null) {
+            val previousWarnings = job.optJSONArray("reprocessWarnings") ?: JSONArray().also { job.put("reprocessWarnings", it) }
+            previousWarnings.put(currentWarning)
+        } else {
+            job.remove("reprocessWarning")
+        }
         job.remove("galleryDisplayFile")
         job.remove("galleryThumbnailFile")
         job.remove("galleryDisplaySource")

@@ -376,14 +376,13 @@ internal fun updateRawPublicExportOutcome(
     KeplerJobMetadata.update(jobDir) { job ->
         val requested = requestedOutputFormatForSetting(outcome.finalOutputFormat)
         job.put("finalOutputFormatSetting", outcome.finalOutputFormat.name)
-            .put("exportStatus", when {
-                outcome is RawFusionPublicExportOutcome.CommittedPendingVerification -> "COMMITTED_PENDING"
-                outcome !is RawFusionPublicExportOutcome.VerifiedSuccess &&
-                    outcome !is RawFusionPublicExportOutcome.VerifiedWithPostExportCancellation &&
-                    outcome !is RawFusionPublicExportOutcome.CommittedVerificationFailure &&
-                    outcome !is RawFusionPublicExportOutcome.CommittedPendingVerification -> "FAILED"
-                outcome.verified -> "EXPORTED"
-                else -> "EXPORT_UNVERIFIED"
+            .put("exportStatus", when (outcome) {
+                is RawFusionPublicExportOutcome.CommittedPendingVerification -> "COMMITTED_PENDING"
+                is RawFusionPublicExportOutcome.VerifiedSuccess,
+                is RawFusionPublicExportOutcome.VerifiedWithPostExportCancellation -> "EXPORTED"
+                is RawFusionPublicExportOutcome.CommittedVerificationFailure -> "EXPORT_UNVERIFIED"
+                is RawFusionPublicExportOutcome.CommittedCancelledBeforeVerification -> "EXPORT_COMMITTED_CANCELLED"
+                is RawFusionPublicExportOutcome.UncommittedFailure -> "FAILED"
             })
             .put("exportVerified", outcome.verified)
             .put("exportUri", outcome.export?.uriString ?: JSONObject.NULL)
