@@ -697,7 +697,48 @@ fun captureProcessExportRawNightFusion(
                         currentLocalPreview = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L },
                         currentLocalOutput = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
                     )
-                    updateRawPublicExportOutcome(jobDir, verifiedPendingOutcome)
+                    try {
+                        updateRawPublicExportOutcome(jobDir, verifiedPendingOutcome)
+                    } catch (checkpointError: Exception) {
+                        Log.e(
+                            "KeplerRawPipeline",
+                            "Verified-pending checkpoint persistence failed; " +
+                                "committed=${committedExport != null}, verified=true, " +
+                                "uri=${committedExport?.uriString.orEmpty()}, " +
+                                "error=${checkpointError.message}",
+                            checkpointError
+                        )
+                        val interruptedSidecar = ensureSidecarResultForPostWorkInterruption(
+                            sidecarResult,
+                            finalOutputFormat,
+                            "Verified-pending checkpoint persistence failed: ${checkpointError.message}"
+                        )
+                        val interruptedOutcome = RawFusionPublicExportOutcome.VerifiedPostWorkInterrupted(
+                            base = process,
+                            finalOutputFormat = finalOutputFormat,
+                            export = committedExport!!,
+                            sidecar = interruptedSidecar,
+                            currentLocalPreview = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L },
+                            currentLocalOutput = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L },
+                            currentWarning = "Verified-pending checkpoint persistence failed; committed image preserved.",
+                            currentError = "Verified-pending checkpoint persistence failed: ${checkpointError.message}"
+                        )
+                        try {
+                            updateRawPublicExportOutcome(jobDir, interruptedOutcome)
+                        } catch (secondaryError: Exception) {
+                            Log.e(
+                                "KeplerRawPipeline",
+                                "Secondary verified-partial metadata write also failed; " +
+                                    "committed=${committedExport != null}, verified=true, " +
+                                    "uri=${committedExport?.uriString.orEmpty()}, " +
+                                    "original=${checkpointError.message}, " +
+                                    "secondary=${secondaryError.message}",
+                                secondaryError
+                            )
+                        }
+                        post("PIPELINE_FAILED: Verified-pending checkpoint persistence failed; committed image preserved. ${checkpointError.message}")
+                        return@post
+                    }
                     if (cancellation.isCancelled) {
                         postExportCancellationRequested = true
                         val cancelSidecar = if (finalOutputFormat.shouldExportRawSidecar) {
@@ -833,25 +874,44 @@ fun captureProcessExportRawNightFusion(
                     }
                     post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 } catch (oom: OutOfMemoryError) {
-                    runCatching {
-                        if (committedExport != null) {
-                            val proc = capturedProcess
-                            val oomPrevFile = proc?.previewPngFile?.takeIf { it.isFile && it.length() > 0L }
-                            val oomLocalOutput = proc?.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
-                            if (exportVerified) {
+                    if (committedExport != null) {
+                        val proc = capturedProcess
+                        val oomPrevFile = proc?.previewPngFile?.takeIf { it.isFile && it.length() > 0L }
+                        val oomLocalOutput = proc?.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
+                        val oomReason = "OutOfMemoryError after committed export; cache kept"
+                        if (exportVerified) {
+                            val oomSidecar = ensureSidecarResultForPostWorkInterruption(
+                                sidecarResult,
+                                finalOutputFormat,
+                                oomReason
+                            )
+                            try {
                                 updateRawPublicExportOutcome(
                                     jobDir,
                                     RawFusionPublicExportOutcome.VerifiedPostWorkInterrupted(
                                         base = proc ?: RawFusionProcessResult(success = false, null, null, null, null, "OOM after verified export"),
                                         finalOutputFormat = finalOutputFormat,
                                         export = committedExport!!,
-                                        sidecar = sidecarResult,
+                                        sidecar = oomSidecar,
                                         currentLocalPreview = oomPrevFile,
                                         currentLocalOutput = oomLocalOutput,
-                                        currentWarning = "OOM after export; committed image preserved."
+                                        currentWarning = "OOM after export; committed image preserved.",
+                                        currentError = oomReason
                                     )
                                 )
-                            } else {
+                            } catch (metadataError: Exception) {
+                                Log.e(
+                                    "KeplerRawPipeline",
+                                    "Post-commit OOM metadata persistence failed; " +
+                                        "committed=true, verified=true, " +
+                                        "uri=${committedExport?.uriString.orEmpty()}, " +
+                                        "original=${oom.message}, " +
+                                        "metadataError=${metadataError.message}",
+                                    metadataError
+                                )
+                            }
+                        } else {
+                            try {
                                 updateRawPublicExportOutcome(
                                     jobDir,
                                     RawFusionPublicExportOutcome.CommittedInterruptedBeforeVerification(
@@ -861,49 +921,78 @@ fun captureProcessExportRawNightFusion(
                                         sidecar = null,
                                         currentLocalPreview = oomPrevFile,
                                         currentLocalOutput = oomLocalOutput,
-                                        currentError = "OutOfMemoryError after committed export; cache kept"
+                                        currentError = oomReason
                                     )
-                                )
-                            }
-                        } else {
-                            try {
-                                recordNormalPreCommitTerminal(
-                                    jobDir,
-                                    attemptStatus = "FAILED",
-                                    pipelineStage = "FAILED",
-                                    processStatus = "EXPORT_FAILED_KEEPING_CACHE",
-                                    reason = "OutOfMemoryError during RAW export; cache kept"
                                 )
                             } catch (metadataError: Exception) {
                                 Log.e(
                                     "KeplerRawPipeline",
-                                    "Failed to persist RAW pre-commit failure metadata: ${metadataError.message}",
+                                    "Post-commit OOM metadata persistence failed; " +
+                                        "committed=true, verified=false, " +
+                                        "uri=${committedExport?.uriString.orEmpty()}, " +
+                                        "original=${oom.message}, " +
+                                        "metadataError=${metadataError.message}",
                                     metadataError
                                 )
                             }
                         }
+                    } else {
+                        try {
+                            recordNormalPreCommitTerminal(
+                                jobDir,
+                                attemptStatus = "FAILED",
+                                pipelineStage = "FAILED",
+                                processStatus = "EXPORT_FAILED_KEEPING_CACHE",
+                                reason = "OutOfMemoryError during RAW export; cache kept"
+                            )
+                        } catch (metadataError: Exception) {
+                            Log.e(
+                                "KeplerRawPipeline",
+                                "Failed to persist RAW pre-commit failure metadata: ${metadataError.message}",
+                                metadataError
+                            )
+                        }
                     }
                     post("PIPELINE_FAILED: RAW export ran out of memory; keeping RAW cache.")
                 } catch (e: Exception) {
-                    runCatching {
-                        if (committedExport != null) {
-                            val proc = capturedProcess
-                            val excPrevFile = proc?.previewPngFile?.takeIf { it.isFile && it.length() > 0L }
-                            val excLocalOutput = proc?.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
-                            if (exportVerified) {
+                    if (committedExport != null) {
+                        val proc = capturedProcess
+                        val excPrevFile = proc?.previewPngFile?.takeIf { it.isFile && it.length() > 0L }
+                        val excLocalOutput = proc?.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
+                        val excReason = "${e.javaClass.simpleName}: ${e.message}"
+                        if (exportVerified) {
+                            val excSidecar = ensureSidecarResultForPostWorkInterruption(
+                                sidecarResult,
+                                finalOutputFormat,
+                                excReason
+                            )
+                            try {
                                 updateRawPublicExportOutcome(
                                     jobDir,
                                     RawFusionPublicExportOutcome.VerifiedPostWorkInterrupted(
                                         base = proc ?: RawFusionProcessResult(success = false, null, null, null, null, "Exception after verified export"),
                                         finalOutputFormat = finalOutputFormat,
                                         export = committedExport!!,
-                                        sidecar = sidecarResult,
+                                        sidecar = excSidecar,
                                         currentLocalPreview = excPrevFile,
                                         currentLocalOutput = excLocalOutput,
-                                        currentWarning = "${e.javaClass.simpleName}: ${e.message}"
+                                        currentWarning = excReason,
+                                        currentError = excReason
                                     )
                                 )
-                            } else {
+                            } catch (metadataError: Exception) {
+                                Log.e(
+                                    "KeplerRawPipeline",
+                                    "Post-commit exception metadata persistence failed; " +
+                                        "committed=true, verified=true, " +
+                                        "uri=${committedExport?.uriString.orEmpty()}, " +
+                                        "original=$excReason, " +
+                                        "metadataError=${metadataError.message}",
+                                    metadataError
+                                )
+                            }
+                        } else {
+                            try {
                                 updateRawPublicExportOutcome(
                                     jobDir,
                                     RawFusionPublicExportOutcome.CommittedInterruptedBeforeVerification(
@@ -913,26 +1002,36 @@ fun captureProcessExportRawNightFusion(
                                         sidecar = null,
                                         currentLocalPreview = excPrevFile,
                                         currentLocalOutput = excLocalOutput,
-                                        currentError = "${e.javaClass.simpleName}: ${e.message}"
+                                        currentError = excReason
                                     )
-                                )
-                            }
-                        } else {
-                            try {
-                                recordNormalPreCommitTerminal(
-                                    jobDir,
-                                    attemptStatus = "FAILED",
-                                    pipelineStage = "FAILED",
-                                    processStatus = "EXPORT_FAILED_KEEPING_CACHE",
-                                    reason = "${e.javaClass.simpleName}: ${e.message}"
                                 )
                             } catch (metadataError: Exception) {
                                 Log.e(
                                     "KeplerRawPipeline",
-                                    "Failed to persist RAW pre-commit failure metadata: ${metadataError.message}",
+                                    "Post-commit exception metadata persistence failed; " +
+                                        "committed=true, verified=false, " +
+                                        "uri=${committedExport?.uriString.orEmpty()}, " +
+                                        "original=$excReason, " +
+                                        "metadataError=${metadataError.message}",
                                     metadataError
                                 )
                             }
+                        }
+                    } else {
+                        try {
+                            recordNormalPreCommitTerminal(
+                                jobDir,
+                                attemptStatus = "FAILED",
+                                pipelineStage = "FAILED",
+                                processStatus = "EXPORT_FAILED_KEEPING_CACHE",
+                                reason = "${e.javaClass.simpleName}: ${e.message}"
+                            )
+                        } catch (metadataError: Exception) {
+                            Log.e(
+                                "KeplerRawPipeline",
+                                "Failed to persist RAW pre-commit failure metadata: ${metadataError.message}",
+                                metadataError
+                            )
                         }
                     }
                     post(
@@ -1353,6 +1452,21 @@ private fun recordNormalPreCommitTerminal(
             .put("processStatus", processStatus)
             .put("userCanMoveDevice", true)
     }
+}
+
+/**
+ * Create a failed [RawSidecarExportResult] for post-work interruption when RAW sidecars were
+ * requested but no sidecar result was produced before the interruption. Preserves an existing
+ * result unchanged.
+ */
+private fun ensureSidecarResultForPostWorkInterruption(
+    sidecarResult: RawSidecarExportResult?,
+    finalOutputFormat: FinalOutputFormat,
+    reason: String
+): RawSidecarExportResult {
+    if (sidecarResult != null) return sidecarResult
+    if (!finalOutputFormat.shouldExportRawSidecar) return RawSidecarExportResult.SKIPPED
+    return RawSidecarExportResult.failed(reason)
 }
 
 /**

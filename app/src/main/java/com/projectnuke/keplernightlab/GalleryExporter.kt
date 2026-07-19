@@ -405,7 +405,6 @@ internal fun updateRawPublicExportOutcome(
             outcome is RawFusionPublicExportOutcome.CommittedVerificationFailure -> "SKIPPED"
             outcome is RawFusionPublicExportOutcome.CommittedInterruptedBeforeVerification -> "SKIPPED"
             outcome is RawFusionPublicExportOutcome.VerifiedPendingPostWork && sidecarResult == null && outcome.finalOutputFormat.shouldExportRawSidecar -> "PENDING"
-            outcome is RawFusionPublicExportOutcome.VerifiedPostWorkInterrupted && sidecarResult == null && outcome.finalOutputFormat.shouldExportRawSidecar -> "PENDING"
             sidecarResult == null && outcome.finalOutputFormat.shouldExportRawSidecar -> "SKIPPED"
             sidecarResult == null -> "NOT_REQUESTED"
             else -> sidecarResult.status
