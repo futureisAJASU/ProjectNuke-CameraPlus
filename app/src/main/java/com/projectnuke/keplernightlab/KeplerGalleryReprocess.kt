@@ -77,7 +77,8 @@ internal data class ReprocessWorkerOutcome(
     val postExportCancellationRequested: Boolean = false,
     val postExportWorkSkipped: Boolean = false,
     val currentLocalPreview: File? = null,
-    val currentLocalOutput: File? = null
+    val currentLocalOutput: File? = null,
+    val publicOutcome: RawFusionPublicExportOutcome? = null
 )
 
 internal class ReprocessWorkerDidNotExitException(message: String) : IllegalStateException(message)
@@ -400,9 +401,6 @@ private fun finalizeReprocessOutcome(
     val finalFile = outcome.finalOutputFile?.takeIf { it.isFile && it.length() > 0L }
     val previewFile = outcome.previewFile?.takeIf { it.isFile && it.length() > 0L } ?: finalFile
     if (outcome.result.isSuccess && !outcome.publicExportCommitted && finalFile?.isFile != true) {
-        // Committed neither the public export nor a local final output. If a preview was produced
-        // by this operation, use it as the gallery display/thumbnail so the previous result is
-        // not mistaken for the current one. Otherwise roll back to the prior state.
         if (previewFile == null || previewFile == finalFile) {
             return try {
                 restoreBackups(jobDir, backups).getOrThrow()
@@ -418,26 +416,40 @@ private fun finalizeReprocessOutcome(
         ?: finalFile?.length()
         ?: 0L
     val verifiedSuccess = outcome.result.isSuccess && outcome.exportVerified
-    // Verified committed export without a current local preview: the gallery must not present an older
-    // preview as this reprocess. Prefer the bounded preview produced for this operation when present;
-    // otherwise record a previewless public-only result that is not gallery-visible.
     val publicOnlyWithoutPreview = verifiedSuccess && outcome.publicExportCommitted && finalFile == null && previewFile == null
     val displayFile = finalFile ?: previewFile
+    val publicOutcome = outcome.publicOutcome
+    val sidecarResult = publicOutcome?.sidecar ?: outcome.sidecar
+    val postExportCancellation = outcome.postExportCancellationRequested
+    val postExportWorkSkipped = outcome.postExportWorkSkipped
+    val currentWarning = publicOutcome?.currentWarning
     try {
         if (verifiedSuccess && !publicOnlyWithoutPreview) {
-            writeReprocessSuccess(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices, outcome.export, outcome.exportVerified, outputSettings)
+            writeReprocessSuccess(
+                jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile,
+                selectionMode, includedFrameIndices, outcome.export, outcome.exportVerified,
+                outputSettings, sidecarResult, postExportCancellation, postExportWorkSkipped,
+                currentWarning
+            )
         } else if (publicOnlyWithoutPreview) {
-            writeReprocessPartialPublicOnly(jobDir, jobKind, includedFrameIndices.size, outcome.export, outcome.exportVerified, outputSettings, outcome.terminalError?.message)
+            writeReprocessPartialPublicOnly(
+                jobDir, jobKind, includedFrameIndices.size, outcome.export,
+                outcome.exportVerified, outputSettings, outcome.terminalError?.message,
+                sidecarResult, postExportCancellation, postExportWorkSkipped
+            )
         } else {
-            writeReprocessPartial(jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile, selectionMode, includedFrameIndices, outcome.result.exceptionOrNull()?.message, outcome.export, outcome.exportVerified, outputSettings)
+            writeReprocessPartial(
+                jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile,
+                selectionMode, includedFrameIndices,
+                outcome.result.exceptionOrNull()?.message, outcome.export,
+                outcome.exportVerified, outputSettings, sidecarResult,
+                postExportCancellation, postExportWorkSkipped, currentWarning
+            )
         }
     } catch (metadataFailure: Exception) {
-        // Terminal metadata write failed after a safe-ish outcome. Do not delete backups; quarantine.
         writeQuarantineMarker(backups)
         return Result.failure(metadataFailure)
     }
-    // Remove the quarantine marker before deleting backup files so the cleanup ordering never
-    // leaves a stale marker in a root whose backup files have already been removed.
     removeQuarantineMarker(backups)
     val cleanupSuccess = deleteBackups(backups)
     if (!cleanupSuccess) {
@@ -907,7 +919,11 @@ private fun writeReprocessSuccess(
     includedFrameIndices: Set<Int>,
     export: GalleryExportResult?,
     exportVerified: Boolean,
-    outputSettings: FinalOutputFormat
+    outputSettings: FinalOutputFormat,
+    sidecarResult: RawSidecarExportResult? = null,
+    postExportCancellationRequested: Boolean = false,
+    postExportWorkSkipped: Boolean = false,
+    currentWarning: String? = null
 ) {
     KeplerJobMetadata.update(jobDir) { job ->
     job.put("status", "COMPLETE")
@@ -936,8 +952,22 @@ private fun writeReprocessSuccess(
         .put("exportDisplayName", export?.displayName ?: JSONObject.NULL)
         .put("exportMimeType", export?.mimeType ?: JSONObject.NULL)
         .put("exportFileSizeBytes", export?.fileSizeBytes ?: 0L)
+        .put("postExportCancellationRequested", postExportCancellationRequested)
+        .put("postExportWorkSkipped", postExportWorkSkipped)
+        .put("rawSidecarRequested", outputSettings.shouldExportRawSidecar)
+        .put("rawSidecarExportStatus", when {
+            sidecarResult == null && outputSettings.shouldExportRawSidecar -> "SKIPPED"
+            sidecarResult == null -> "NOT_REQUESTED"
+            else -> sidecarResult.status
+        })
+        .put("rawSidecarExportedFiles", JSONArray(sidecarResult?.exportedFiles ?: emptyList<String>()))
+        .put("rawSidecarError", sidecarResult?.errorMessage ?: JSONObject.NULL)
         .put("reprocessError", JSONObject.NULL)
-        .put("reprocessWarning", JSONObject.NULL)
+        .put("reprocessWarning", currentWarning ?: JSONObject.NULL)
+    if (currentWarning != null) {
+        val previousWarnings = job.optJSONArray("reprocessWarnings") ?: JSONArray().also { job.put("reprocessWarnings", it) }
+        previousWarnings.put(currentWarning)
+    }
     if (job.optString("cleanupType") == "SOURCE_ONLY") {
         job.put("cleanupType", "REPROCESSED_FROM_SOURCE_ONLY")
     }
@@ -991,7 +1021,11 @@ private fun writeReprocessPartial(
     error: String?,
     export: GalleryExportResult?,
     exportVerified: Boolean,
-    outputSettings: FinalOutputFormat
+    outputSettings: FinalOutputFormat,
+    sidecarResult: RawSidecarExportResult? = null,
+    postExportCancellationRequested: Boolean = false,
+    postExportWorkSkipped: Boolean = false,
+    currentWarning: String? = null
 ) {
     KeplerJobMetadata.update(jobDir) { job ->
     job.put("processStatus", "REPROCESS_PARTIAL")
@@ -1015,6 +1049,21 @@ private fun writeReprocessPartial(
         .put("exportDisplayName", export?.displayName ?: JSONObject.NULL)
         .put("exportMimeType", export?.mimeType ?: JSONObject.NULL)
         .put("exportFileSizeBytes", export?.fileSizeBytes ?: 0L)
+        .put("postExportCancellationRequested", postExportCancellationRequested)
+        .put("postExportWorkSkipped", postExportWorkSkipped)
+        .put("rawSidecarRequested", outputSettings.shouldExportRawSidecar)
+        .put("rawSidecarExportStatus", when {
+            sidecarResult == null && outputSettings.shouldExportRawSidecar -> "SKIPPED"
+            sidecarResult == null -> "NOT_REQUESTED"
+            else -> sidecarResult.status
+        })
+        .put("rawSidecarExportedFiles", JSONArray(sidecarResult?.exportedFiles ?: emptyList<String>()))
+        .put("rawSidecarError", sidecarResult?.errorMessage ?: JSONObject.NULL)
+        .put("reprocessWarning", currentWarning ?: JSONObject.NULL)
+    if (currentWarning != null) {
+        val previousWarnings = job.optJSONArray("reprocessWarnings") ?: JSONArray().also { job.put("reprocessWarnings", it) }
+        previousWarnings.put(currentWarning)
+    }
     finalOutputFile?.let { job.put("galleryDisplayFile", it.name).put("galleryThumbnailFile", previewFile?.name ?: it.name) }
         ?: run {
             val previewName = previewFile?.takeIf { it.isFile }?.name
@@ -1043,7 +1092,10 @@ private fun writeReprocessPartialPublicOnly(
     export: GalleryExportResult?,
     exportVerified: Boolean,
     outputSettings: FinalOutputFormat,
-    error: String?
+    error: String?,
+    sidecarResult: RawSidecarExportResult? = null,
+    postExportCancellationRequested: Boolean = false,
+    postExportWorkSkipped: Boolean = false
 ) {
     KeplerJobMetadata.update(jobDir) { job ->
         job.put("processStatus", "PARTIAL_PUBLIC_ONLY")
@@ -1064,6 +1116,16 @@ private fun writeReprocessPartialPublicOnly(
             .put("exportDisplayName", export?.displayName ?: JSONObject.NULL)
             .put("exportMimeType", export?.mimeType ?: JSONObject.NULL)
             .put("exportFileSizeBytes", export?.fileSizeBytes ?: 0L)
+            .put("postExportCancellationRequested", postExportCancellationRequested)
+            .put("postExportWorkSkipped", postExportWorkSkipped)
+            .put("rawSidecarRequested", outputSettings.shouldExportRawSidecar)
+            .put("rawSidecarExportStatus", when {
+                sidecarResult == null && outputSettings.shouldExportRawSidecar -> "SKIPPED"
+                sidecarResult == null -> "NOT_REQUESTED"
+                else -> sidecarResult.status
+            })
+            .put("rawSidecarExportedFiles", JSONArray(sidecarResult?.exportedFiles ?: emptyList<String>()))
+            .put("rawSidecarError", sidecarResult?.errorMessage ?: JSONObject.NULL)
             .put("reprocessError", JSONObject.NULL)
         job.remove("galleryDisplayFile")
         job.remove("galleryThumbnailFile")

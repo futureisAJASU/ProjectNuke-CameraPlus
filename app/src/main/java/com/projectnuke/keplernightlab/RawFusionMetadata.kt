@@ -290,6 +290,7 @@ internal val RAW_PUBLIC_EXPORT_KEYS: Set<String> = setOf(
     "exportVerified",
     "exportStatus",
     "exportError",
+    "currentWarning",
     "exportedAt",
     "postExportCancellationRequested",
     "postExportWorkSkipped",
@@ -322,7 +323,10 @@ internal val RAW_PUBLIC_EXPORT_CURRENT_ATTEMPT_KEYS: Set<String> = setOf(
     "finalPreviewFile",
     "compareReferenceVsFinalFile",
     "qualityDiagnosticNativeLimited",
-    "qualityDiagnosticNativeLimitedReason"
+    "qualityDiagnosticNativeLimitedReason",
+    "rawPublicExportAttemptStatus",
+    "rawPublicExportAttemptError",
+    "rawPublicExportAttemptAt"
 )
 
 /**

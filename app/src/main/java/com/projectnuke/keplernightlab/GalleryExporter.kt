@@ -30,24 +30,7 @@ data class RawSidecarExportResult(
     val success: Boolean,
     val exportedFiles: List<String>,
     val errorMessage: String?,
-    /**
-     * Discriminator for what actually happened on the wire for the RAW sidecar pass:
-     *
-     * - [RawSidecarOutcomeKind.COMPLETE] — every requested DNG was inserted and verified.
-     * - [RawSidecarOutcomeKind.PARTIAL] — at least one DNG committed, but later DNGs (or later
-     *   verification) failed or were cancelled.
-     * - [RawSidecarOutcomeKind.FAILED] — the DNG list was empty, or no DNG committed at all.
-     * - [RawSidecarOutcomeKind.SKIPPED] — caller asked not to run the sidecar pass.
-     * - [RawSidecarOutcomeKind.UNAVAILABLE] — sidecar export is unavailable for this pipeline
-     *   (e.g. YUV pipeline; never produced by [exportRawSidecarsToPublicStorage]).
-     * - [RawSidecarOutcomeKind.CANCELLED] — cancellation occurred before any DNG commit.
-     */
-    val kind: RawSidecarOutcomeKind = when {
-        success && exportedFiles.isNotEmpty() -> RawSidecarOutcomeKind.COMPLETE
-        success -> RawSidecarOutcomeKind.PARTIAL
-        exportedFiles.isEmpty() -> RawSidecarOutcomeKind.FAILED
-        else -> RawSidecarOutcomeKind.PARTIAL
-    }
+    val kind: RawSidecarOutcomeKind
 ) {
     /** Public-export status string persisted alongside the image. */
     val status: String get() = when (kind) {
@@ -89,6 +72,12 @@ data class RawSidecarExportResult(
             exportedFiles = emptyList(),
             errorMessage = errorMessage,
             kind = RawSidecarOutcomeKind.FAILED
+        )
+        fun cancelled() = RawSidecarExportResult(
+            success = false,
+            exportedFiles = emptyList(),
+            errorMessage = "RAW sidecar export cancelled before any DNG commit.",
+            kind = RawSidecarOutcomeKind.CANCELLED
         )
     }
 }
@@ -238,7 +227,7 @@ fun exportRawSidecarsToPublicStorage(
                 errorMessage = "RAW sidecar export cancelled after partial commit"
             )
         }
-        throw ce
+        return RawSidecarExportResult.cancelled()
     }
 
     return RawSidecarExportResult.complete(exportedFiles = exported)
@@ -386,9 +375,11 @@ internal fun updateRawPublicExportOutcome(
         val requested = requestedOutputFormatForSetting(outcome.finalOutputFormat)
         job.put("finalOutputFormatSetting", outcome.finalOutputFormat.name)
             .put("exportStatus", when {
+                outcome is RawFusionPublicExportOutcome.CommittedPendingVerification -> "COMMITTED_PENDING"
                 outcome !is RawFusionPublicExportOutcome.VerifiedSuccess &&
                     outcome !is RawFusionPublicExportOutcome.VerifiedWithPostExportCancellation &&
-                    outcome !is RawFusionPublicExportOutcome.CommittedVerificationFailure -> "FAILED"
+                    outcome !is RawFusionPublicExportOutcome.CommittedVerificationFailure &&
+                    outcome !is RawFusionPublicExportOutcome.CommittedPendingVerification -> "FAILED"
                 outcome.verified -> "EXPORTED"
                 else -> "EXPORT_UNVERIFIED"
             })
@@ -418,7 +409,27 @@ internal fun updateRawPublicExportOutcome(
         job.put("rawSidecarExportStatus", sidecarStatus)
             .put("rawSidecarExportedFiles", JSONArray(sidecarResult?.exportedFiles ?: emptyList<String>()))
             .put("rawSidecarError", sidecarError)
-            .put("exportedAt", System.currentTimeMillis())
+        if (outcome.currentWarning != null) {
+            job.put("currentWarning", outcome.currentWarning)
+        } else {
+            job.remove("currentWarning")
+        }
+        val isCommittedOutcome = outcome is RawFusionPublicExportOutcome.CommittedPendingVerification ||
+            outcome is RawFusionPublicExportOutcome.CommittedVerificationFailure ||
+            outcome is RawFusionPublicExportOutcome.VerifiedSuccess ||
+            outcome is RawFusionPublicExportOutcome.VerifiedWithPostExportCancellation
+        if (isCommittedOutcome) {
+            job.remove("rawPublicExportAttemptStatus")
+            job.remove("rawPublicExportAttemptError")
+            job.remove("rawPublicExportAttemptAt")
+        }
+        if (outcome is RawFusionPublicExportOutcome.CommittedPendingVerification) {
+            job.put("currentPipelineStage", "PROCESSING")
+                .put("userCanMoveDevice", false)
+                .put("exportError", JSONObject.NULL)
+        } else {
+            job.put("exportedAt", System.currentTimeMillis())
+        }
         when (outcome) {
             is RawFusionPublicExportOutcome.VerifiedSuccess,
             is RawFusionPublicExportOutcome.VerifiedWithPostExportCancellation -> {
@@ -432,12 +443,20 @@ internal fun updateRawPublicExportOutcome(
                     .put("processStatus", "EXPORT_FAILED_KEEPING_CACHE")
                     .put("userCanMoveDevice", true)
                     .put("exportError", outcome.currentError)
+                outcome.rawPublicExportAttemptError?.let {
+                    job.put("rawPublicExportAttemptStatus", outcome.rawPublicExportAttemptStatus)
+                        .put("rawPublicExportAttemptError", it)
+                        .put("rawPublicExportAttemptAt", outcome.rawPublicExportAttemptAt)
+                }
             }
             is RawFusionPublicExportOutcome.CommittedVerificationFailure -> {
                 job.put("currentPipelineStage", "PARTIAL")
                     .put("processStatus", "EXPORT_VERIFICATION_FAILED")
                     .put("userCanMoveDevice", true)
                     .put("exportError", outcome.currentError)
+            }
+            is RawFusionPublicExportOutcome.CommittedPendingVerification -> {
+                job.put("processStatus", "EXPORT_COMMITTED_PENDING")
             }
         }
         val exportUri = outcome.export?.uriString
