@@ -260,6 +260,72 @@ internal val RAW_FUSION_EXPORT_REPROCESS_KEYS: Set<String> =
     RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS + RAW_FUSION_EXPORT_RENDERER_ERROR_KEYS
 
 /**
+ * NORMAL RAW public-export owned keys: only the public/export fields produced by the NORMAL
+ * public-export stage inside [captureProcessExportRawNightFusion]:
+ *
+ * - export URI / display name / MIME / requested & used format
+ * - fallback and file-size metadata
+ * - export committed and verified state
+ * - export status and current export error
+ * - exported timestamp
+ * - post-export cancellation and post-export work-skipped flags
+ * - RAW sidecar requested / status / exported files / error
+ * - gallery/public-result linkage owned by this export (current public export URI linkage)
+ *
+ * Excludes Classic processing, local-render diagnostics, frame selection, capture, alignment,
+ * merge, or unrelated finalizer fields.
+ *
+ * Disjoint from every other RAW owned set. Mutating these keys must stay inside a single
+ * [KeplerJobMetadata.update] call.
+ */
+internal val RAW_PUBLIC_EXPORT_KEYS: Set<String> = setOf(
+    "exportUri",
+    "exportDisplayName",
+    "exportMimeType",
+    "exportFormatRequested",
+    "exportFormatUsed",
+    "exportFallbackUsed",
+    "exportFileSizeBytes",
+    "galleryExportCommitted",
+    "exportVerified",
+    "exportStatus",
+    "exportError",
+    "exportedAt",
+    "postExportCancellationRequested",
+    "postExportWorkSkipped",
+    "rawSidecarRequested",
+    "rawSidecarExportStatus",
+    "rawSidecarExportedFiles",
+    "rawSidecarError",
+    "galleryPublicExportLinkage"
+)
+
+/**
+ * Current-attempt bitmap preparation / native quality diagnostic keys owned by the RAW export
+ * stage. Reset at the start of each new public-export attempt so previous-attempt diagnostics
+ * do not survive when the current attempt does not produce them. Reprocess mode may update these
+ * keys but never writes terminal or committed public metadata from this set.
+ *
+ * Disjoint from [RAW_PUBLIC_EXPORT_KEYS] and from [RAW_FUSION_EXPORT_SHARED_DIAGNOSTIC_KEYS].
+ */
+internal val RAW_PUBLIC_EXPORT_CURRENT_ATTEMPT_KEYS: Set<String> = setOf(
+    "exportBitmapSource",
+    "nativeRgbaDirectExportUsed",
+    "nativeRgbaBitmapLoadedForExport",
+    "finalPngDecodeSkippedForExport",
+    "exportBitmapWidth",
+    "exportBitmapHeight",
+    "nativePreviewPrepareMs",
+    "referenceSinglePreviewFile",
+    "fusedBeforeDenoisePreviewFile",
+    "fusedAfterDenoiseNoSharpenPreviewFile",
+    "finalPreviewFile",
+    "compareReferenceVsFinalFile",
+    "qualityDiagnosticNativeLimited",
+    "qualityDiagnosticNativeLimitedReason"
+)
+
+/**
  * Keys persisted on NORMAL local-render failure: shared diagnostics + NORMAL local candidates
  * + renderer-error diagnostics. Terminal stage/status and `userCanMoveDevice` are written as a
  * direct overlay inside the locked update (not in the present-copy/absent-remove owned set) so
@@ -423,4 +489,29 @@ internal fun updateRawExportBitmapMetadata(
         "KeplerRawPipeline",
         "exportBitmapSource=$source exportBitmapWidth=$exportBitmapWidth exportBitmapHeight=$exportBitmapHeight"
     )
+}
+
+/**
+ * Reset RAW export current-attempt diagnostic fields at the start of a new public-export attempt
+ * so previous-attempt values cannot survive. Removes each key in
+ * [RAW_PUBLIC_EXPORT_CURRENT_ATTEMPT_KEYS] from job metadata and persists the cleared state
+ * inside a single [KeplerJobMetadata.update].
+ *
+ * NORMAL callers invoke this immediately before they capture/load/prepare the bitmap for the
+ * upcoming public MediaStore commit. Reprocess treats the same action as run-scoped diagnostic
+ * clearing only — terminal stage, status, `userCanMoveDevice`, and committed public metadata are
+ * intentionally left untouched here.
+ */
+internal fun resetRawExportAttemptDiagnostics(jobDir: File) {
+    runCatching {
+        KeplerJobMetadata.update(jobDir) { job ->
+            RAW_PUBLIC_EXPORT_CURRENT_ATTEMPT_KEYS.forEach { key -> job.remove(key) }
+        }
+    }.onFailure { metadataError ->
+        Log.e(
+            "KeplerRawPipeline",
+            "Failed to reset RAW export attempt diagnostics: ${metadataError.message}",
+            metadataError
+        )
+    }
 }

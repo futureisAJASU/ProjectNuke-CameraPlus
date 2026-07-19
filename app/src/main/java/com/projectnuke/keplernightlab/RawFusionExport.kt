@@ -73,6 +73,159 @@ internal sealed class RawFusionExportResult {
 
 internal val RawFusionExportResult.processResult: RawFusionProcessResult get() = base
 
+/**
+ * Explicit RAW public-export outcome model. Captures precisely what happened during the
+ * public MediaStore commit, verification, sidecar pass, and any post-commit cancellation —
+ * never collapsing a verified export, a verification failure after commit, or a sidecar
+ * failure into a single ambiguous value.
+ *
+ * The legacy [RawFusionProcessResult]-style `success: Boolean` is NOT used here because a
+ * verified-after-commit success, a verification failure after commit, and an image success with
+ * a sidecar failure all carry different terminal metadata; collapsing them to a single boolean
+ * would also collapse terminal ownership.
+ *
+ * Each variant exposes:
+ *
+ * - `committed: Boolean` — whether the public URI crossed the MediaStore commit point (i.e. a
+ *   successful `IS_PENDING=0`).
+ * - `verified: Boolean` — whether the committed URI was verified via [verifyGalleryExport].
+ * - `export: GalleryExportResult?` — the committed export value, when present.
+ * - `sidecar: RawSidecarExportResult?` — the sidecar outcome, when sidecars were attempted.
+ * - `postExportCancellationRequested: Boolean` — true if cancellation was requested after
+ *   commit. Diagnostics only; never causes the outcome to be classified as failure.
+ * - `currentLocalPreview`, `currentLocalOutput`, `currentError`, `currentWarning` — local
+ *   preview/output and current error/warning fields.
+ * - `disposition: ReprocessTerminalDisposition` — the corresponding reprocess terminal
+ *   disposition used when the same job reaches this state through [reprocessRawJob].
+ */
+internal sealed class RawFusionPublicExportOutcome {
+    abstract val base: RawFusionProcessResult
+    abstract val finalOutputFormat: FinalOutputFormat
+    abstract val export: GalleryExportResult?
+    abstract val sidecar: RawSidecarExportResult?
+    abstract val committed: Boolean
+    abstract val verified: Boolean
+    abstract val postExportCancellationRequested: Boolean
+    abstract val postExportWorkSkipped: Boolean
+    abstract val currentLocalPreview: File?
+    abstract val currentLocalOutput: File?
+    abstract val currentError: String?
+    abstract val currentWarning: String?
+    abstract val disposition: ReprocessTerminalDisposition
+
+    /**
+     * Failure that occurred before any public MediaStore commit — local render failure, bitmap
+     * preparation failure, or MediaStore insert failure with no URI committed.
+     *
+     * `committed=false`, `verified=false`. No sidecar is meaningful here because the image
+     * itself never reached the public store.
+     */
+    internal data class UncommittedFailure(
+        override val base: RawFusionProcessResult,
+        override val finalOutputFormat: FinalOutputFormat,
+        override val currentLocalPreview: File?,
+        override val currentLocalOutput: File?,
+        override val currentError: String,
+        override val currentWarning: String? = null
+    ) : RawFusionPublicExportOutcome() {
+        override val export: GalleryExportResult? = null
+        override val sidecar: RawSidecarExportResult? = null
+        override val committed: Boolean = false
+        override val verified: Boolean = false
+        override val postExportCancellationRequested: Boolean = false
+        override val postExportWorkSkipped: Boolean = false
+        override val disposition: ReprocessTerminalDisposition = ReprocessTerminalDisposition.UNCOMMITTED_FAILURE
+    }
+
+    /**
+     * MediaStore commit succeeded (URI crossed the IS_PENDING=0 commit point) but the post-
+     * commit verification failed. The committed URI is retained even though verification failed;
+     * `galleryExportCommitted=true`, `exportVerified=false`.
+     *
+     * No image rollback is permitted: any deletion of the committed MediaStore row is forbidden.
+     */
+    internal data class CommittedVerificationFailure(
+        override val base: RawFusionProcessResult,
+        override val finalOutputFormat: FinalOutputFormat,
+        override val export: GalleryExportResult,
+        override val sidecar: RawSidecarExportResult?,
+        override val currentLocalPreview: File?,
+        override val currentLocalOutput: File?,
+        override val currentError: String
+    ) : RawFusionPublicExportOutcome() {
+        override val committed: Boolean = true
+        override val verified: Boolean = false
+        override val postExportCancellationRequested: Boolean = false
+        override val postExportWorkSkipped: Boolean = false
+        override val currentWarning: String? = null
+        override val disposition: ReprocessTerminalDisposition = ReprocessTerminalDisposition.COMMITTED_PARTIAL
+    }
+
+    /**
+     * Verified committed public export. Optional sidecar work may have completed, partially
+     * completed, failed, been skipped, or been unavailable — see [sidecar]. Image success is
+     * preserved in every sidecar outcome; sidecar failure does NOT downgrade the image outcome.
+     */
+    internal data class VerifiedSuccess(
+        override val base: RawFusionProcessResult,
+        override val finalOutputFormat: FinalOutputFormat,
+        override val export: GalleryExportResult,
+        override val sidecar: RawSidecarExportResult?,
+        override val currentLocalPreview: File?,
+        override val currentLocalOutput: File?,
+        override val currentWarning: String? = null
+    ) : RawFusionPublicExportOutcome() {
+        override val committed: Boolean = true
+        override val verified: Boolean = true
+        override val postExportCancellationRequested: Boolean = false
+        override val postExportWorkSkipped: Boolean = false
+        override val currentError: String? = null
+        override val disposition: ReprocessTerminalDisposition = ReprocessTerminalDisposition.VERIFIED_SUCCESS
+    }
+
+    /**
+     * Verified committed public export where post-export optional work was cancelled
+     * (cleanup, additional diagnostics, etc.). The committed URI is preserved and verification
+     * remains true. `postExportCancellationRequested=true`, `postExportWorkSkipped=true`.
+     *
+     * Cancellation-or-skip NEVER downgrades the verified result to a rollback-eligible failure.
+     */
+    internal data class VerifiedWithPostExportCancellation(
+        override val base: RawFusionProcessResult,
+        override val finalOutputFormat: FinalOutputFormat,
+        override val export: GalleryExportResult,
+        override val sidecar: RawSidecarExportResult?,
+        override val currentLocalPreview: File?,
+        override val currentLocalOutput: File?,
+        override val currentWarning: String? = "Optional post-export work was cancelled."
+    ) : RawFusionPublicExportOutcome() {
+        override val committed: Boolean = true
+        override val verified: Boolean = true
+        override val postExportCancellationRequested: Boolean = true
+        override val postExportWorkSkipped: Boolean = true
+        override val currentError: String? = null
+        override val disposition: ReprocessTerminalDisposition = ReprocessTerminalDisposition.VERIFIED_SUCCESS
+    }
+
+    companion object {
+        /** True when this outcome represents an image that crossed the MediaStore commit point. */
+        val RawFusionPublicExportOutcome.didCommitMediaStore: Boolean get() = committed
+        /** True when this outcome represents a verified public export (success or cancellation-after-commit). */
+        val RawFusionPublicExportOutcome.isVerified: Boolean get() = verified
+    }
+}
+
+/**
+ * Wrap a RAW public-export outcome for reprocess dispatch. The reprocess worker computes one
+ * of these and hands it to the shared finalizer; the worker must NOT write competing terminal
+ * stage, status, or gallery/public-result metadata directly.
+ */
+internal data class RawReprocessPublicExport(
+    val outcome: RawFusionPublicExportOutcome,
+    val rawSidecarResult: RawSidecarExportResult?,
+    val lastErrorMessage: String?
+)
+
 private data class RawFusionExportBitmap(
     val bitmap: Bitmap,
     val source: String,
@@ -183,11 +336,14 @@ fun captureProcessExportRawNightFusion(
                         cancellation = cancellation
                     ) { post(it) }
                     if (!process.success || !process.hasExportableBitmapSource()) {
-                        updateExportFailure(
-                            jobDir = jobDir,
-                            error = process.errorMessage ?: "RAW fusion process failed",
-                            finalOutputFormat = finalOutputFormat
+                        val outcome = RawFusionPublicExportOutcome.UncommittedFailure(
+                            base = process,
+                            finalOutputFormat = finalOutputFormat,
+                            currentLocalPreview = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L },
+                            currentLocalOutput = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L },
+                            currentError = process.errorMessage ?: "RAW fusion process failed"
                         )
+                        updateRawPublicExportOutcome(jobDir, outcome)
                         post(
                             "PIPELINE_FAILED: RAW Night Fusion failed; keeping RAW cache. " +
                                 process.errorMessage
@@ -208,6 +364,7 @@ fun captureProcessExportRawNightFusion(
                     val requestedOutputFormat = requestedOutputFormatForSetting(finalOutputFormat)
                     post("결과 미리보기를 준비하는 중입니다.")
                     val previewPrepareStartedAt = System.currentTimeMillis()
+                    resetRawExportAttemptDiagnostics(jobDir)
                     var exportBitmap: Bitmap? = null
                     val result = try {
                         cancellation.throwIfCancelled()
@@ -243,11 +400,14 @@ fun captureProcessExportRawNightFusion(
                         exportBitmap?.takeUnless { it.isRecycled }?.recycle()
                     }
                     if (!result.success || result.uriString.isNullOrBlank()) {
-                        updateExportFailure(
-                            jobDir = jobDir,
-                            error = result.errorMessage ?: "Export failed",
-                            finalOutputFormat = finalOutputFormat
+                        val outcome = RawFusionPublicExportOutcome.UncommittedFailure(
+                            base = process,
+                            finalOutputFormat = finalOutputFormat,
+                            currentLocalPreview = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L },
+                            currentLocalOutput = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L },
+                            currentError = result.errorMessage ?: "Export failed"
                         )
+                        updateRawPublicExportOutcome(jobDir, outcome)
                         post(
                             "PIPELINE_FAILED: RAW export failed; keeping RAW cache. " +
                                 result.errorMessage
@@ -256,36 +416,30 @@ fun captureProcessExportRawNightFusion(
                     }
                     post("Verifying gallery export...")
                     val verified = verifyGalleryExport(context, result.uriString)
-                    updateExportMetadata(
-                        jobDir = jobDir,
-                        export = result,
-                        verified = verified,
-                        finalOutputFormat = finalOutputFormat,
-                        rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
-                        postExportCancellationRequested = cancellation.isCancelled,
-                        postExportWorkSkipped = cancellation.isCancelled
-                    )
                     if (!verified) {
-                        // Failure after a public MediaStore commit: the public export cannot be rolled
-                        // back. Preserve committed-export metadata previously written in
-                        // [updateExportMetadata], record the verification failure through the export
-                        // result model, and DO NOT roll back or clear committed export metadata after
-                        // the commit point. `verified=false` means `galleryExportCommitted` stays false
-                        // but the in-flight `exportUri` is preserved for diagnostics.
-                        updateExportFailure(
-                            jobDir = jobDir,
-                            error = "Export verification failed",
+                        val outcome = RawFusionPublicExportOutcome.CommittedVerificationFailure(
+                            base = process,
                             finalOutputFormat = finalOutputFormat,
-                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
-                            export = result
+                            export = result,
+                            sidecar = null,
+                            currentLocalPreview = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L },
+                            currentLocalOutput = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L },
+                            currentError = "Export verification failed"
                         )
+                        updateRawPublicExportOutcome(jobDir, outcome)
                         post("PIPELINE_FAILED: RAW export verification failed; keeping RAW cache.")
                         return@post
                     }
                     if (cancellation.isCancelled) {
-                        updateExportMetadata(jobDir, result, true, finalOutputFormat,
-                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
-                            postExportCancellationRequested = true, postExportWorkSkipped = true)
+                        val outcome = RawFusionPublicExportOutcome.VerifiedWithPostExportCancellation(
+                            base = process,
+                            finalOutputFormat = finalOutputFormat,
+                            export = result,
+                            sidecar = null,
+                            currentLocalPreview = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L },
+                            currentLocalOutput = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
+                        )
+                        updateRawPublicExportOutcome(jobDir, outcome)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. RAW cache kept.")
                         return@post
                     }
@@ -296,48 +450,52 @@ fun captureProcessExportRawNightFusion(
                             displayNameBase = "Kepler_RAW_${jobDir.name}",
                             cancellation = cancellation
                         ).also { sidecars ->
-                            if (sidecars.success) {
-                                if (sidecars.status == "PARTIAL") {
-                                    post(
-                                        "RAW sidecar export partial: " +
-                                            "${sidecars.exportedFiles.size} DNG files. " +
-                                            "${sidecars.errorMessage.orEmpty()}"
-                                    )
-                                } else {
-                                    post(
-                                        "Exported RAW sidecars: " +
-                                            "${sidecars.exportedFiles.size} DNG files"
-                                    )
-                                }
-                            } else if (sidecars.errorMessage != null) {
-                                post("RAW sidecar export failed: ${sidecars.errorMessage}")
+                            when (sidecars.kind) {
+                                RawSidecarOutcomeKind.COMPLETE -> post("Exported RAW sidecars: ${sidecars.exportedFiles.size} DNG files")
+                                RawSidecarOutcomeKind.PARTIAL -> post("RAW sidecar export partial: ${sidecars.exportedFiles.size} DNG files. ${sidecars.errorMessage.orEmpty()}")
+                                RawSidecarOutcomeKind.FAILED -> post("RAW sidecar export failed: ${sidecars.errorMessage}")
+                                else -> { /* no log for SKIPPED/UNAVAILABLE/CANCELLED */ }
                             }
                         }
                     } else {
                         null
                     }
-                    updateExportMetadata(
-                        jobDir = jobDir,
-                        export = result,
-                        verified = true,
-                        finalOutputFormat = finalOutputFormat,
-                        rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
-                    )
+                    val previewFile = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L }
+                    val localOutput = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
                     if (cancellation.isCancelled) {
-                        updateExportMetadata(jobDir, result, true, finalOutputFormat,
-                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
-                            postExportCancellationRequested = true, postExportWorkSkipped = true)
+                        val outcome = RawFusionPublicExportOutcome.VerifiedWithPostExportCancellation(
+                            base = process,
+                            finalOutputFormat = finalOutputFormat,
+                            export = result,
+                            sidecar = rawSidecarResult,
+                            currentLocalPreview = previewFile,
+                            currentLocalOutput = localOutput
+                        )
+                        updateRawPublicExportOutcome(jobDir, outcome)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. RAW cache kept.")
                         return@post
                     }
-                    val rawSuffix = if (rawSidecarResult?.status == "EXPORTED") {
-                        " + RAW"
-                    } else {
-                        ""
+                    val warning: String? = when {
+                        partialCapture -> "Used fewer frames than requested."
+                        rawSidecarResult != null && rawSidecarResult.kind != RawSidecarOutcomeKind.COMPLETE &&
+                            rawSidecarResult.kind != RawSidecarOutcomeKind.SKIPPED &&
+                            rawSidecarResult.kind != RawSidecarOutcomeKind.UNAVAILABLE -> "Sidecar export incomplete: ${rawSidecarResult.status}."
+                        else -> null
                     }
+                    val outcome = RawFusionPublicExportOutcome.VerifiedSuccess(
+                        base = process,
+                        finalOutputFormat = finalOutputFormat,
+                        export = result,
+                        sidecar = rawSidecarResult,
+                        currentLocalPreview = previewFile,
+                        currentLocalOutput = localOutput,
+                        currentWarning = warning
+                    )
+                    updateRawPublicExportOutcome(jobDir, outcome)
+                    val rawSuffix = if (rawSidecarResult?.kind == RawSidecarOutcomeKind.COMPLETE) " + RAW" else ""
                     val rawSidecarCount = rawSidecarResult?.exportedFiles?.size ?: 0
                     val rawSidecarError = rawSidecarResult?.errorMessage?.takeIf { it.isNotBlank() }
-                    if (partialCapture || rawSidecarResult?.status == "PARTIAL" || rawSidecarResult?.status == "FAILED") {
+                    if (warning != null) {
                         post("처리가 완료되었습니다.")
                         post(
                             "PIPELINE_COMPLETE_PARTIAL: Saved ${result.formatUsed.label}$rawSuffix. " +
@@ -358,22 +516,24 @@ fun captureProcessExportRawNightFusion(
                     post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 } catch (oom: OutOfMemoryError) {
                     runCatching {
-                        updateExportFailure(
-                            jobDir = jobDir,
-                            error = "OutOfMemoryError during RAW export; cache kept",
+                        updateRawPublicExportOutcome(jobDir, RawFusionPublicExportOutcome.UncommittedFailure(
+                            base = RawFusionProcessResult(success = false, mergedRawFile = null, mergedDngFile = null, previewPngFile = null, finalPngFile = null, errorMessage = "OutOfMemoryError during RAW export; cache kept"),
                             finalOutputFormat = finalOutputFormat,
-                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
-                        )
+                            currentLocalPreview = null,
+                            currentLocalOutput = null,
+                            currentError = "OutOfMemoryError during RAW export; cache kept"
+                        ))
                     }
                     post("PIPELINE_FAILED: RAW export ran out of memory; keeping RAW cache.")
                 } catch (e: Exception) {
                     runCatching {
-                        updateExportFailure(
-                            jobDir = jobDir,
-                            error = "${e.javaClass.simpleName}: ${e.message}",
+                        updateRawPublicExportOutcome(jobDir, RawFusionPublicExportOutcome.UncommittedFailure(
+                            base = RawFusionProcessResult(success = false, mergedRawFile = null, mergedDngFile = null, previewPngFile = null, finalPngFile = null, errorMessage = "${e.javaClass.simpleName}: ${e.message}"),
                             finalOutputFormat = finalOutputFormat,
-                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
-                        )
+                            currentLocalPreview = null,
+                            currentLocalOutput = null,
+                            currentError = "${e.javaClass.simpleName}: ${e.message}"
+                        ))
                     }
                     post(
                         "PIPELINE_FAILED: RAW Night Fusion pipeline failed; keeping RAW cache.\n" +
@@ -409,6 +569,8 @@ internal fun reprocessRawJob(
         var currentPreviewFile: File? = null
         var enabledCount = 0
         var totalCount = 0
+        var sidecarResult: RawSidecarExportResult? = null
+        var capturedProcess: RawFusionProcessResult? = null
         try {
             cancellation.throwIfCancelled()
             if (selectedFrameIndices != null) {
@@ -431,6 +593,7 @@ internal fun reprocessRawJob(
                 cancellation = cancellation
                 , metadataPolicy = ReprocessMetadataPolicy.REPROCESS_PROGRESS_ONLY
             ) { post(it) }
+            capturedProcess = process
             currentOutputFile = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
             currentPreviewFile = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L }
             if (!process.success || !process.hasExportableBitmapSource()) {
@@ -441,6 +604,7 @@ internal fun reprocessRawJob(
             }
             val requestedFormat = requestedOutputFormatForSetting(finalOutputFormat)
             post("Exporting reprocessed ${requestedFormat.label}...")
+            resetRawExportAttemptDiagnostics(jobDir)
             var exportBitmap: Bitmap? = null
             val export = try {
                 val loaded = process.loadExportBitmap()
@@ -482,10 +646,30 @@ internal fun reprocessRawJob(
                 terminalResult = Result.failure(IllegalStateException(reason))
                 return@post
             }
-            // Verified committed export may have no local preview when the export format leaves
-            // no in-job PNG (HEIF/JPEG). Materialize a bounded current-operation preview so the
-            // gallery can display this reprocess without reusing an older preview. Must be created
-            // before recycling exportBitmap.
+            if (cancellation.isCancelled) {
+                sidecarResult = RawSidecarExportResult.SKIPPED
+                post("RAW reprocess verified; cancelling post-export work.")
+                terminalResult = Result.success(Unit)
+                terminalDisposition = ReprocessTerminalDisposition.VERIFIED_SUCCESS
+                return@post
+            }
+            sidecarResult = if (finalOutputFormat.shouldExportRawSidecar) {
+                exportRawSidecarsToPublicStorage(
+                    context = context,
+                    jobDir = jobDir,
+                    displayNameBase = "Kepler_RAW_REPROCESS_${jobDir.name}",
+                    cancellation = cancellation
+                ).also { sc ->
+                    when (sc.kind) {
+                        RawSidecarOutcomeKind.COMPLETE -> post("Exported RAW sidecars: ${sc.exportedFiles.size} DNG files")
+                        RawSidecarOutcomeKind.PARTIAL -> post("RAW sidecar export partial: ${sc.exportedFiles.size} DNG files. ${sc.errorMessage.orEmpty()}")
+                        RawSidecarOutcomeKind.FAILED -> post("RAW sidecar export failed: ${sc.errorMessage}")
+                        else -> { /* no log for skipped/unavailable */ }
+                    }
+                }
+            } else {
+                RawSidecarExportResult.SKIPPED
+            }
             if (currentPreviewFile == null && publicExportCommitted) {
                 currentPreviewFile = try {
                     writeBoundedReprocessPreview(jobDir, exportBitmap)
@@ -522,7 +706,10 @@ internal fun reprocessRawJob(
                     previewFile = currentPreviewFile ?: currentOutputFile,
                     bytesWritten = currentOutputFile?.length() ?: 0L,
                     disposition = terminalDisposition,
-                    terminalError = terminalResult.exceptionOrNull()
+                    terminalError = terminalResult.exceptionOrNull(),
+                    sidecar = sidecarResult,
+                    currentLocalPreview = currentPreviewFile,
+                    currentLocalOutput = currentOutputFile
                 )
             )
         }

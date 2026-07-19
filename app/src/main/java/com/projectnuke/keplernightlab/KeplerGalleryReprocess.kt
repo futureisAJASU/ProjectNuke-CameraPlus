@@ -72,7 +72,12 @@ internal data class ReprocessWorkerOutcome(
         result.isSuccess && exportVerified -> ReprocessTerminalDisposition.VERIFIED_SUCCESS
         else -> ReprocessTerminalDisposition.UNCOMMITTED_FAILURE
     },
-    val terminalError: Throwable? = result.exceptionOrNull()
+    val terminalError: Throwable? = result.exceptionOrNull(),
+    val sidecar: RawSidecarExportResult? = null,
+    val postExportCancellationRequested: Boolean = false,
+    val postExportWorkSkipped: Boolean = false,
+    val currentLocalPreview: File? = null,
+    val currentLocalOutput: File? = null
 )
 
 internal class ReprocessWorkerDidNotExitException(message: String) : IllegalStateException(message)

@@ -30,8 +30,77 @@ data class RawSidecarExportResult(
     val success: Boolean,
     val exportedFiles: List<String>,
     val errorMessage: String?,
-    val status: String = if (success) "EXPORTED" else "FAILED"
-)
+    /**
+     * Discriminator for what actually happened on the wire for the RAW sidecar pass:
+     *
+     * - [RawSidecarOutcomeKind.COMPLETE] — every requested DNG was inserted and verified.
+     * - [RawSidecarOutcomeKind.PARTIAL] — at least one DNG committed, but later DNGs (or later
+     *   verification) failed or were cancelled.
+     * - [RawSidecarOutcomeKind.FAILED] — the DNG list was empty, or no DNG committed at all.
+     * - [RawSidecarOutcomeKind.SKIPPED] — caller asked not to run the sidecar pass.
+     * - [RawSidecarOutcomeKind.UNAVAILABLE] — sidecar export is unavailable for this pipeline
+     *   (e.g. YUV pipeline; never produced by [exportRawSidecarsToPublicStorage]).
+     * - [RawSidecarOutcomeKind.CANCELLED] — cancellation occurred before any DNG commit.
+     */
+    val kind: RawSidecarOutcomeKind = when {
+        success && exportedFiles.isNotEmpty() -> RawSidecarOutcomeKind.COMPLETE
+        success -> RawSidecarOutcomeKind.PARTIAL
+        exportedFiles.isEmpty() -> RawSidecarOutcomeKind.FAILED
+        else -> RawSidecarOutcomeKind.PARTIAL
+    }
+) {
+    /** Public-export status string persisted alongside the image. */
+    val status: String get() = when (kind) {
+        RawSidecarOutcomeKind.COMPLETE -> "EXPORTED"
+        RawSidecarOutcomeKind.PARTIAL -> "PARTIAL"
+        RawSidecarOutcomeKind.FAILED -> "FAILED"
+        RawSidecarOutcomeKind.SKIPPED -> "SKIPPED"
+        RawSidecarOutcomeKind.UNAVAILABLE -> "UNAVAILABLE"
+        RawSidecarOutcomeKind.CANCELLED -> "CANCELLED"
+    }
+
+    companion object {
+        val SKIPPED = RawSidecarExportResult(
+            success = false,
+            exportedFiles = emptyList(),
+            errorMessage = null,
+            kind = RawSidecarOutcomeKind.SKIPPED
+        )
+        val UNAVAILABLE = RawSidecarExportResult(
+            success = false,
+            exportedFiles = emptyList(),
+            errorMessage = "RAW sidecar unavailable for YUV pipeline.",
+            kind = RawSidecarOutcomeKind.UNAVAILABLE
+        )
+        fun complete(exportedFiles: List<String>) = RawSidecarExportResult(
+            success = true,
+            exportedFiles = exportedFiles,
+            errorMessage = null,
+            kind = RawSidecarOutcomeKind.COMPLETE
+        )
+        fun partial(exportedFiles: List<String>, errorMessage: String) = RawSidecarExportResult(
+            success = true,
+            exportedFiles = exportedFiles,
+            errorMessage = errorMessage,
+            kind = RawSidecarOutcomeKind.PARTIAL
+        )
+        fun failed(errorMessage: String) = RawSidecarExportResult(
+            success = false,
+            exportedFiles = emptyList(),
+            errorMessage = errorMessage,
+            kind = RawSidecarOutcomeKind.FAILED
+        )
+    }
+}
+
+enum class RawSidecarOutcomeKind {
+    COMPLETE,
+    PARTIAL,
+    FAILED,
+    SKIPPED,
+    UNAVAILABLE,
+    CANCELLED
+}
 
 fun exportNightFusionBitmapToGallery(
     context: Context,
@@ -112,7 +181,7 @@ fun exportRawSidecarsToPublicStorage(
         ?.sortedBy { it.name }
         .orEmpty()
     if (dngFiles.isEmpty()) {
-        return RawSidecarExportResult(false, emptyList(), "No DNG sidecars found", "FAILED")
+        return RawSidecarExportResult.failed("No DNG sidecars found")
     }
 
     val exported = mutableListOf<String>()
@@ -144,38 +213,35 @@ fun exportRawSidecarsToPublicStorage(
             }
 
             if (result == null) {
-                val status = if (exported.isNotEmpty()) "PARTIAL" else "FAILED"
-                return RawSidecarExportResult(
-                    success = exported.isNotEmpty(),
-                    exportedFiles = exported,
-                    errorMessage = "Failed exporting ${file.name}",
-                    status = status
-                )
+                return if (exported.isNotEmpty()) {
+                    RawSidecarExportResult.partial(
+                        exportedFiles = exported,
+                        errorMessage = "Failed exporting ${file.name}"
+                    )
+                } else {
+                    RawSidecarExportResult.failed("Failed exporting ${file.name}")
+                }
             }
             exported += result.first.toString()
             val verifiedSize = result.second
             if (verifiedSize <= 0L || verifiedSize < file.length().coerceAtLeast(1L)) {
-                return RawSidecarExportResult(
-                    success = true,
+                return RawSidecarExportResult.partial(
                     exportedFiles = exported,
-                    errorMessage = "Verification failed for ${file.name}: committed size=$verifiedSize sourceSize=${file.length()}",
-                    status = "PARTIAL"
+                    errorMessage = "Verification failed for ${file.name}: committed size=$verifiedSize sourceSize=${file.length()}"
                 )
             }
         }
     } catch (ce: CancellationException) {
         if (exported.isNotEmpty()) {
-            return RawSidecarExportResult(
-                success = true,
+            return RawSidecarExportResult.partial(
                 exportedFiles = exported,
-                errorMessage = "RAW sidecar export cancelled after partial commit",
-                status = "PARTIAL"
+                errorMessage = "RAW sidecar export cancelled after partial commit"
             )
         }
         throw ce
     }
 
-    return RawSidecarExportResult(true, exported, null, "EXPORTED")
+    return RawSidecarExportResult.complete(exportedFiles = exported)
 }
 
 fun queryMediaSize(context: Context, uri: Uri): Long {
@@ -283,6 +349,103 @@ fun updateExportFailure(
             .put("rawSidecarError", if (rawSidecarIgnored) "RAW sidecar unavailable for YUV pipeline." else JSONObject.NULL)
             .put("cleanupStatus", "SKIPPED")
             .put("exportedAt", System.currentTimeMillis())
+    }
+}
+
+/**
+ * Persist the explicit [RawFusionPublicExportOutcome] inside a single [KeplerJobMetadata.update].
+ * Writes terminal stage/status, `userCanMoveDevice`, committed/verified export metadata, and the
+ * public-result linkage owned by this export. NORMAL callers replace the previous RAW sequence of
+ * separate `updateExportMetadata(...)` and `updateExportFailure(...)` calls with this helper.
+ *
+ * Tracks the commit point exactly:
+ *
+ * - Before the `IS_PENDING=0` MediaStore commit → no committed URI, `galleryExportCommitted=false`.
+ * - After the `IS_PENDING=0` MediaStore commit → committed URI is retained even if verification,
+ *   sidecar, metadata persistence, or post-commit cancellation later fails.
+ *
+ * For verified success: a complete success (`currentPipelineStage="COMPLETE"`,
+ * `processStatus=`"NIGHT_FUSION_COMPLETE"`, `userCanMoveDevice=true`) is written alongside
+ * committed and verified export metadata.
+ * For failure before commit: a terminal failure (`currentPipelineStage="FAILED"`,
+ * `processStatus="EXPORT_FAILED_KEEPING_CACHE"`, `userCanMoveDevice=true`) is written and no new
+ * committed URI is recorded.
+ * For verification failure after commit: a committed-partial state (`currentPipelineStage="PARTIAL"`,
+ * `processStatus="EXPORT_VERIFICATION_FAILED"`, `userCanMoveDevice=true`,
+ * `galleryExportCommitted=true`, `exportVerified=false`) is written and the committed URI is
+ * preserved.
+ * For cancellation after verified commit: the verified committed success/partial-success state
+ * is retained, `postExportCancellationRequested=true`, `postExportWorkSkipped=true`. The verified
+ * result is NEVER overwritten with generic `FAILED` because sidecars or later optional work failed.
+ */
+internal fun updateRawPublicExportOutcome(
+    jobDir: File,
+    outcome: RawFusionPublicExportOutcome
+) {
+    KeplerJobMetadata.update(jobDir) { job ->
+        val requested = requestedOutputFormatForSetting(outcome.finalOutputFormat)
+        job.put("finalOutputFormatSetting", outcome.finalOutputFormat.name)
+            .put("exportStatus", when {
+                outcome !is RawFusionPublicExportOutcome.VerifiedSuccess &&
+                    outcome !is RawFusionPublicExportOutcome.VerifiedWithPostExportCancellation &&
+                    outcome !is RawFusionPublicExportOutcome.CommittedVerificationFailure -> "FAILED"
+                outcome.verified -> "EXPORTED"
+                else -> "EXPORT_UNVERIFIED"
+            })
+            .put("exportVerified", outcome.verified)
+            .put("exportUri", outcome.export?.uriString ?: JSONObject.NULL)
+            .put("exportDisplayName", outcome.export?.displayName ?: JSONObject.NULL)
+            .put("exportMimeType", outcome.export?.mimeType ?: JSONObject.NULL)
+            .put("exportFormatRequested", requested.label)
+            .put("exportFormatUsed", outcome.export?.formatUsed?.label ?: JSONObject.NULL)
+            .put("exportFallbackUsed", outcome.export?.fallbackUsed ?: false)
+            .put("exportFileSizeBytes", outcome.export?.fileSizeBytes ?: 0L)
+            .put("galleryExportCommitted", outcome.committed)
+            .put("postExportCancellationRequested", outcome.postExportCancellationRequested)
+            .put("postExportWorkSkipped", outcome.postExportWorkSkipped)
+            .put("rawSidecarRequested", outcome.finalOutputFormat.shouldExportRawSidecar)
+        val sidecarResult = outcome.sidecar
+        val sidecarStatus = when {
+            outcome is RawFusionPublicExportOutcome.UncommittedFailure -> "SKIPPED"
+            sidecarResult == null && outcome.finalOutputFormat.shouldExportRawSidecar -> "SKIPPED"
+            sidecarResult == null -> "NOT_REQUESTED"
+            else -> sidecarResult.status
+        }
+        val sidecarError = when {
+            sidecarResult == null -> JSONObject.NULL
+            else -> sidecarResult.errorMessage ?: JSONObject.NULL
+        }
+        job.put("rawSidecarExportStatus", sidecarStatus)
+            .put("rawSidecarExportedFiles", JSONArray(sidecarResult?.exportedFiles ?: emptyList<String>()))
+            .put("rawSidecarError", sidecarError)
+            .put("exportedAt", System.currentTimeMillis())
+        when (outcome) {
+            is RawFusionPublicExportOutcome.VerifiedSuccess,
+            is RawFusionPublicExportOutcome.VerifiedWithPostExportCancellation -> {
+                job.put("currentPipelineStage", "COMPLETE")
+                    .put("processStatus", "NIGHT_FUSION_COMPLETE")
+                    .put("userCanMoveDevice", true)
+                    .put("exportError", JSONObject.NULL)
+            }
+            is RawFusionPublicExportOutcome.UncommittedFailure -> {
+                job.put("currentPipelineStage", "FAILED")
+                    .put("processStatus", "EXPORT_FAILED_KEEPING_CACHE")
+                    .put("userCanMoveDevice", true)
+                    .put("exportError", outcome.currentError)
+            }
+            is RawFusionPublicExportOutcome.CommittedVerificationFailure -> {
+                job.put("currentPipelineStage", "PARTIAL")
+                    .put("processStatus", "EXPORT_VERIFICATION_FAILED")
+                    .put("userCanMoveDevice", true)
+                    .put("exportError", outcome.currentError)
+            }
+        }
+        val exportUri = outcome.export?.uriString
+        if (exportUri != null) {
+            job.put("galleryPublicExportLinkage", exportUri)
+        } else {
+            job.remove("galleryPublicExportLinkage")
+        }
     }
 }
 
