@@ -196,6 +196,34 @@ internal sealed class RawFusionPublicExportOutcome {
     }
 
     /**
+     * MediaStore commit succeeded but cancellation was requested before verification could
+     * complete. Distinct from [CommittedVerificationFailure] — this is an intentional
+     * cancellation, not a verification failure. The committed URI is retained;
+     * `galleryExportCommitted=true`, `exportVerified=false`.
+     *
+     * No image rollback is permitted. Process status: `EXPORT_COMMITTED_CANCELLED_BEFORE_VERIFICATION`.
+     */
+    internal data class CommittedCancelledBeforeVerification(
+        override val base: RawFusionProcessResult,
+        override val finalOutputFormat: FinalOutputFormat,
+        override val export: GalleryExportResult,
+        override val sidecar: RawSidecarExportResult?,
+        override val currentLocalPreview: File?,
+        override val currentLocalOutput: File?,
+        override val currentError: String = "Cancelled before export verification completed."
+    ) : RawFusionPublicExportOutcome() {
+        override val committed: Boolean = true
+        override val verified: Boolean = false
+        override val postExportCancellationRequested: Boolean = true
+        override val postExportWorkSkipped: Boolean = true
+        override val currentWarning: String? = null
+        override val disposition: ReprocessTerminalDisposition = ReprocessTerminalDisposition.COMMITTED_PARTIAL
+        override val rawPublicExportAttemptStatus: String? = null
+        override val rawPublicExportAttemptError: String? = null
+        override val rawPublicExportAttemptAt: Long = 0L
+    }
+
+    /**
      * Verified committed public export. Optional sidecar work may have completed, partially
      * completed, failed, been skipped, or been unavailable — see [sidecar]. Image success is
      * preserved in every sidecar outcome; sidecar failure does NOT downgrade the image outcome.
@@ -451,31 +479,13 @@ fun captureProcessExportRawNightFusion(
                     }
                     if (committedExport == null) {
                         if (cancellation.isCancelled) {
-                            val previewFile = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L }
-                            val localOutput = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
-                            val outcome = RawFusionPublicExportOutcome.UncommittedFailure(
-                                base = process,
-                                finalOutputFormat = finalOutputFormat,
-                                currentLocalPreview = previewFile,
-                                currentLocalOutput = localOutput,
-                                currentError = "Export cancelled before MediaStore commit."
-                            )
-                            updateRawPublicExportOutcome(jobDir, outcome)
+                            recordNormalPreCommitFailure(jobDir, "Export cancelled before MediaStore commit.")
                             post("PIPELINE_CANCELLED: Export cancelled before MediaStore commit. RAW cache kept.")
                             return@post
                         }
                         val error = result.errorMessage ?: "Export failed"
                         recordRawPublicExportAttempt(jobDir, "FAILED", error)
-                        val previewFile = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L }
-                        val localOutput = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
-                        val outcome = RawFusionPublicExportOutcome.UncommittedFailure(
-                            base = process,
-                            finalOutputFormat = finalOutputFormat,
-                            currentLocalPreview = previewFile,
-                            currentLocalOutput = localOutput,
-                            currentError = error
-                        )
-                        updateRawPublicExportOutcome(jobDir, outcome)
+                        recordNormalPreCommitFailure(jobDir, error)
                         post(
                             "PIPELINE_FAILED: RAW export failed; keeping RAW cache. $error"
                         )
@@ -532,7 +542,7 @@ fun captureProcessExportRawNightFusion(
                     }
                     val previewFile = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L }
                     val localOutput = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
-                    if (cancellation.isCancelled) {
+                    if (cancellation.isCancelled || sidecarResult?.cancellationRequested == true) {
                         postExportCancellationRequested = true
                         val outcome = RawFusionPublicExportOutcome.VerifiedWithPostExportCancellation(
                             base = process,
@@ -599,14 +609,13 @@ fun captureProcessExportRawNightFusion(
                             )
                             updateRawPublicExportOutcome(jobDir, outcome)
                         } else {
-                            val partial = RawFusionPublicExportOutcome.CommittedVerificationFailure(
+                            val partial = RawFusionPublicExportOutcome.CommittedCancelledBeforeVerification(
                                 base = proc ?: RawFusionProcessResult(success = false, null, null, null, null, "Cancelled after commit"),
                                 finalOutputFormat = finalOutputFormat,
                                 export = committedExport!!,
-                                sidecar = null,
+                                sidecar = sidecarResult,
                                 currentLocalPreview = cancelPrevFile,
-                                currentLocalOutput = cancelLocalOutput,
-                                currentError = "Cancelled after MediaStore commit, before verification completed."
+                                currentLocalOutput = cancelLocalOutput
                             )
                             updateRawPublicExportOutcome(jobDir, partial)
                         }
@@ -646,13 +655,7 @@ fun captureProcessExportRawNightFusion(
                                 )
                             }
                         } else {
-                            updateRawPublicExportOutcome(jobDir, RawFusionPublicExportOutcome.UncommittedFailure(
-                                base = RawFusionProcessResult(success = false, mergedRawFile = null, mergedDngFile = null, previewPngFile = null, finalPngFile = null, errorMessage = "OutOfMemoryError during RAW export; cache kept"),
-                                finalOutputFormat = finalOutputFormat,
-                                currentLocalPreview = null,
-                                currentLocalOutput = null,
-                                currentError = "OutOfMemoryError during RAW export; cache kept"
-                            ))
+                            recordNormalPreCommitFailure(jobDir, "OutOfMemoryError during RAW export; cache kept")
                         }
                     }
                     post("PIPELINE_FAILED: RAW export ran out of memory; keeping RAW cache.")
@@ -691,13 +694,7 @@ fun captureProcessExportRawNightFusion(
                             }
                         } else {
                             recordRawPublicExportAttempt(jobDir, "FAILED", "${e.javaClass.simpleName}: ${e.message}")
-                            updateRawPublicExportOutcome(jobDir, RawFusionPublicExportOutcome.UncommittedFailure(
-                                base = RawFusionProcessResult(success = false, mergedRawFile = null, mergedDngFile = null, previewPngFile = null, finalPngFile = null, errorMessage = "${e.javaClass.simpleName}: ${e.message}"),
-                                finalOutputFormat = finalOutputFormat,
-                                currentLocalPreview = null,
-                                currentLocalOutput = null,
-                                currentError = "${e.javaClass.simpleName}: ${e.message}"
-                            ))
+                            recordNormalPreCommitFailure(jobDir, "${e.javaClass.simpleName}: ${e.message}")
                         }
                     }
                     post(
@@ -821,6 +818,7 @@ internal fun reprocessRawJob(
             try {
             if (exportAttempted.success && !exportAttempted.uriString.isNullOrBlank()) {
                 committedExport = exportAttempted
+                persistReprocessCommitCheckpoint(jobDir, exportAttempted)
                 publicOutcome = RawFusionPublicExportOutcome.CommittedPendingVerification(
                     base = process,
                     finalOutputFormat = finalOutputFormat,
@@ -859,6 +857,15 @@ internal fun reprocessRawJob(
                 terminalResult = Result.failure(IllegalStateException(reason))
                 return@post
             }
+            markReprocessCommitCheckpointVerified(jobDir)
+            publicOutcome = RawFusionPublicExportOutcome.VerifiedSuccess(
+                base = process,
+                finalOutputFormat = finalOutputFormat,
+                export = committedExport!!,
+                sidecar = null,
+                currentLocalPreview = currentPreviewFile,
+                currentLocalOutput = currentOutputFile
+            )
             var reprocessSidecarResult: RawSidecarExportResult? = null
             if (cancellation.isCancelled) {
                 reprocessSidecarResult = if (finalOutputFormat.shouldExportRawSidecar) {
@@ -895,6 +902,18 @@ internal fun reprocessRawJob(
                 }
             } else {
                 RawSidecarExportResult.SKIPPED
+            }
+            if (cancellation.isCancelled || reprocessSidecarResult?.cancellationRequested == true) {
+                publicOutcome = RawFusionPublicExportOutcome.VerifiedWithPostExportCancellation(
+                    base = process,
+                    finalOutputFormat = finalOutputFormat,
+                    export = committedExport!!,
+                    sidecar = reprocessSidecarResult,
+                    currentLocalPreview = currentPreviewFile,
+                    currentLocalOutput = currentOutputFile
+                )
+                terminalResult = Result.success(Unit)
+                return@post
             }
             if (currentPreviewFile == null && exportBitmap != null) {
                 currentPreviewFile = try {
@@ -940,14 +959,13 @@ internal fun reprocessRawJob(
                 // Already reached verified-with-cancellation inside the try; outcome is already set.
                 terminalResult = Result.success(Unit)
             } else {
-                publicOutcome = RawFusionPublicExportOutcome.CommittedVerificationFailure(
+                publicOutcome = RawFusionPublicExportOutcome.CommittedCancelledBeforeVerification(
                     base = capturedProcess ?: RawFusionProcessResult(success = false, null, null, null, null, "Reprocess cancelled after commit"),
                     finalOutputFormat = finalOutputFormat,
                     export = publicOutcome!!.export!!,
-                    sidecar = null,
+                    sidecar = publicOutcome!!.sidecar,
                     currentLocalPreview = currentPreviewFile,
-                    currentLocalOutput = currentOutputFile,
-                    currentError = "RAW reprocess cancelled after commit, before verification"
+                    currentLocalOutput = currentOutputFile
                 )
                 terminalResult = Result.failure(IllegalStateException("RAW reprocess cancelled after commit"))
             }
@@ -1026,6 +1044,100 @@ private fun recordRawPublicExportAttempt(jobDir: File, status: String, error: St
         Log.e(
             "KeplerRawPipeline",
             "Failed to persist RAW export attempt failure: ${metadataError.message}",
+            metadataError
+        )
+    }
+}
+
+/**
+ * Persist a NORMAL pre-commit failure without replacing any previously committed public
+ * export metadata. Writes only the narrow attempt-status/error/timestamp keys, the terminal
+ * pipeline stage, and `userCanMoveDevice=true`. Does NOT touch export URI, verification,
+ * format, timestamp, linkage, sidecar, or warning fields — so a pre-commit failure can never
+ * overwrite an earlier verified public export.
+ */
+private fun recordNormalPreCommitFailure(jobDir: File, error: String) {
+    runCatching {
+        KeplerJobMetadata.update(jobDir) { job ->
+            job.put("rawPublicExportAttemptStatus", "FAILED")
+                .put("rawPublicExportAttemptError", error)
+                .put("rawPublicExportAttemptAt", System.currentTimeMillis())
+                .put("currentPipelineStage", "FAILED")
+                .put("userCanMoveDevice", true)
+        }
+    }.onFailure { metadataError ->
+        Log.e(
+            "KeplerRawPipeline",
+            "Failed to persist RAW normal pre-commit failure: ${metadataError.message}",
+            metadataError
+        )
+    }
+}
+
+/**
+ * Persist a reprocess commit-checkpoint immediately after the MediaStore commit succeeds,
+ * before verification or sidecar export. Ensures a post-commit crash never loses the
+ * committed export identity. The shared finalizer clears these fields after safe terminal
+ * persistence.
+ */
+private fun persistReprocessCommitCheckpoint(jobDir: File, export: GalleryExportResult) {
+    runCatching {
+        KeplerJobMetadata.update(jobDir) { job ->
+            job.put("reprocessPublicCommitCheckpointUri", export.uriString ?: JSONObject.NULL)
+                .put("reprocessPublicCommitCheckpointDisplayName", export.displayName ?: JSONObject.NULL)
+                .put("reprocessPublicCommitCheckpointMimeType", export.mimeType ?: JSONObject.NULL)
+                .put("reprocessPublicCommitCheckpointFileSizeBytes", export.fileSizeBytes)
+                .put("reprocessPublicCommitCheckpointCommitted", true)
+                .put("reprocessPublicCommitCheckpointVerified", false)
+                .put("reprocessPublicCommitCheckpointAt", System.currentTimeMillis())
+        }
+    }.onFailure { metadataError ->
+        Log.e(
+            "KeplerRawPipeline",
+            "Failed to persist reprocess commit-checkpoint: ${metadataError.message}",
+            metadataError
+        )
+    }
+}
+
+/**
+ * Mark the reprocess commit-checkpoint as verified after successful export verification.
+ * Called immediately after [verifyGalleryExport] returns true. Any subsequent OOM,
+ * exception, or cancellation must preserve `verified=true`.
+ */
+private fun markReprocessCommitCheckpointVerified(jobDir: File) {
+    runCatching {
+        KeplerJobMetadata.update(jobDir) { job ->
+            job.put("reprocessPublicCommitCheckpointVerified", true)
+        }
+    }.onFailure { metadataError ->
+        Log.e(
+            "KeplerRawPipeline",
+            "Failed to mark reprocess commit-checkpoint verified: ${metadataError.message}",
+            metadataError
+        )
+    }
+}
+
+/**
+ * Clear reprocess commit-checkpoint fields after safe terminal persistence.
+ * Called by the shared finalizer once the committed/verified state is durably written.
+ */
+internal fun clearReprocessCommitCheckpoint(jobDir: File) {
+    runCatching {
+        KeplerJobMetadata.update(jobDir) { job ->
+            job.remove("reprocessPublicCommitCheckpointUri")
+            job.remove("reprocessPublicCommitCheckpointDisplayName")
+            job.remove("reprocessPublicCommitCheckpointMimeType")
+            job.remove("reprocessPublicCommitCheckpointFileSizeBytes")
+            job.remove("reprocessPublicCommitCheckpointCommitted")
+            job.remove("reprocessPublicCommitCheckpointVerified")
+            job.remove("reprocessPublicCommitCheckpointAt")
+        }
+    }.onFailure { metadataError ->
+        Log.e(
+            "KeplerRawPipeline",
+            "Failed to clear reprocess commit-checkpoint: ${metadataError.message}",
             metadataError
         )
     }

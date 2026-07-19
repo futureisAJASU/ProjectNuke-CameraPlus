@@ -298,7 +298,14 @@ internal val RAW_PUBLIC_EXPORT_KEYS: Set<String> = setOf(
     "rawSidecarExportStatus",
     "rawSidecarExportedFiles",
     "rawSidecarError",
-    "galleryPublicExportLinkage"
+    "galleryPublicExportLinkage",
+    "reprocessPublicCommitCheckpointUri",
+    "reprocessPublicCommitCheckpointDisplayName",
+    "reprocessPublicCommitCheckpointMimeType",
+    "reprocessPublicCommitCheckpointFileSizeBytes",
+    "reprocessPublicCommitCheckpointCommitted",
+    "reprocessPublicCommitCheckpointVerified",
+    "reprocessPublicCommitCheckpointAt"
 )
 
 /**

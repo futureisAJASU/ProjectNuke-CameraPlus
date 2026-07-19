@@ -450,6 +450,7 @@ private fun finalizeReprocessOutcome(
         writeQuarantineMarker(backups)
         return Result.failure(metadataFailure)
     }
+    clearReprocessCommitCheckpoint(jobDir)
     removeQuarantineMarker(backups)
     val cleanupSuccess = deleteBackups(backups)
     if (!cleanupSuccess) {
