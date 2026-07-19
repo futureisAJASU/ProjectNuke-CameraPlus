@@ -382,6 +382,7 @@ internal fun updateRawPublicExportOutcome(
                 is RawFusionPublicExportOutcome.VerifiedWithPostExportCancellation -> "EXPORTED"
                 is RawFusionPublicExportOutcome.CommittedVerificationFailure -> "EXPORT_UNVERIFIED"
                 is RawFusionPublicExportOutcome.CommittedCancelledBeforeVerification -> "EXPORT_COMMITTED_CANCELLED"
+                is RawFusionPublicExportOutcome.CommittedInterruptedBeforeVerification -> "EXPORT_COMMITTED_INTERRUPTED"
                 is RawFusionPublicExportOutcome.UncommittedFailure -> "FAILED"
             })
             .put("exportVerified", outcome.verified)
@@ -418,6 +419,7 @@ internal fun updateRawPublicExportOutcome(
         val isCommittedOutcome = outcome is RawFusionPublicExportOutcome.CommittedPendingVerification ||
             outcome is RawFusionPublicExportOutcome.CommittedVerificationFailure ||
             outcome is RawFusionPublicExportOutcome.CommittedCancelledBeforeVerification ||
+            outcome is RawFusionPublicExportOutcome.CommittedInterruptedBeforeVerification ||
             outcome is RawFusionPublicExportOutcome.VerifiedSuccess ||
             outcome is RawFusionPublicExportOutcome.VerifiedWithPostExportCancellation
         if (isCommittedOutcome) {
@@ -429,6 +431,7 @@ internal fun updateRawPublicExportOutcome(
             job.put("currentPipelineStage", "PROCESSING")
                 .put("userCanMoveDevice", true)
                 .put("exportError", JSONObject.NULL)
+                .put("exportedAt", System.currentTimeMillis())
             if (outcome.finalOutputFormat.shouldExportRawSidecar) {
                 job.put("rawSidecarExportStatus", "PENDING")
             }
@@ -466,6 +469,12 @@ internal fun updateRawPublicExportOutcome(
             is RawFusionPublicExportOutcome.CommittedCancelledBeforeVerification -> {
                 job.put("currentPipelineStage", "PARTIAL")
                     .put("processStatus", "EXPORT_COMMITTED_CANCELLED_BEFORE_VERIFICATION")
+                    .put("userCanMoveDevice", true)
+                    .put("exportError", outcome.currentError)
+            }
+            is RawFusionPublicExportOutcome.CommittedInterruptedBeforeVerification -> {
+                job.put("currentPipelineStage", "PARTIAL")
+                    .put("processStatus", "EXPORT_COMMITTED_INTERRUPTED_BEFORE_VERIFICATION")
                     .put("userCanMoveDevice", true)
                     .put("exportError", outcome.currentError)
             }
