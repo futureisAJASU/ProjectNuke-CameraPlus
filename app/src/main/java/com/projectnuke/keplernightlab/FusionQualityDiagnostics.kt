@@ -133,8 +133,8 @@ private fun saveCompareSheet(reference: Bitmap, finalImage: Bitmap, file: File) 
     val sheet = Bitmap.createBitmap(w * 2, h, Bitmap.Config.ARGB_8888)
     try {
         Canvas(sheet).apply {
-            drawBitmap(reference, Rect(0, 0, w, h), Rect(0, 0, w, h), null)
-            drawBitmap(finalImage, Rect(0, 0, w, h), Rect(w, 0, w * 2, h), null)
+            drawBitmap(reference, Rect(0, 0, reference.width, reference.height), Rect(0, 0, w, h), null)
+            drawBitmap(finalImage, Rect(0, 0, finalImage.width, finalImage.height), Rect(w, 0, w * 2, h), null)
         }
         savePng(sheet, file)
     } finally {
