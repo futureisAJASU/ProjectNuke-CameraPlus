@@ -135,8 +135,8 @@ private fun saveCompareSheet(reference: Bitmap, finalImage: Bitmap, file: File) 
         }
         savePng(sheet, file)
     } finally {
-        ref.recycle()
-        fin.recycle()
+        if (ref !== reference) ref.recycle()
+        if (fin !== finalImage) fin.recycle()
         sheet.recycle()
     }
 }
@@ -145,8 +145,8 @@ private fun saveDiagnosticCropSheet(reference: Bitmap, fused: Bitmap, finalImage
     val size = min(220, min(reference.width, reference.height).coerceAtLeast(1))
     val crops = cropRects(reference.width, reference.height, size)
     val sheet = Bitmap.createBitmap(size * 3, size * crops.size, Bitmap.Config.ARGB_8888)
-    val canvas = Canvas(sheet)
     try {
+        val canvas = Canvas(sheet)
         crops.forEachIndexed { row, rect ->
             canvas.drawBitmap(reference, rect, Rect(0, row * size, size, (row + 1) * size), null)
             canvas.drawBitmap(fused, scaleRect(rect, fused.width, fused.height, reference.width, reference.height), Rect(size, row * size, size * 2, (row + 1) * size), null)

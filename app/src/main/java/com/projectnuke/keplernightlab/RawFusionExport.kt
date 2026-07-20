@@ -1636,26 +1636,13 @@ private fun updateRawNativeQualityDiagnostics(jobDir: File, bitmap: Bitmap) {
     var referencePreview: Bitmap? = null
     try {
         finalPreview = saveBoundedDiagnosticPreview(bitmap, File(jobDir, "final_preview.png"))
-        referencePreview = try {
-            finalPreview.copy(Bitmap.Config.ARGB_8888, false)
-        } catch (copyError: OutOfMemoryError) {
-            Log.e(
-                "KeplerRawPipeline",
-                "OOM while creating reference diagnostic preview; recycling finalPreview: ${copyError.message}",
-                copyError
-            )
-            throw copyError
-        } catch (copyError: Exception) {
-            Log.e(
-                "KeplerRawPipeline",
-                "Failed to create reference diagnostic preview; recycling finalPreview: ${copyError.message}",
-                copyError
-            )
-            throw copyError
-        }
-        saveBoundedDiagnosticPreview(referencePreview, File(jobDir, "reference_single_preview.png"))
-        saveBoundedDiagnosticPreview(finalPreview, File(jobDir, "fused_before_denoise_preview.png"))
-        saveBoundedDiagnosticPreview(finalPreview, File(jobDir, "fused_after_denoise_no_sharpen_preview.png"))
+        referencePreview = finalPreview.copy(Bitmap.Config.ARGB_8888, false)
+        val refFile = saveBoundedDiagnosticPreview(referencePreview, File(jobDir, "reference_single_preview.png"))
+        refFile.takeUnless { it === referencePreview }?.recycle()
+        val fusedFile = saveBoundedDiagnosticPreview(finalPreview, File(jobDir, "fused_before_denoise_preview.png"))
+        fusedFile.takeUnless { it === finalPreview }?.recycle()
+        val denoisedFile = saveBoundedDiagnosticPreview(finalPreview, File(jobDir, "fused_after_denoise_no_sharpen_preview.png"))
+        denoisedFile.takeUnless { it === finalPreview }?.recycle()
         val diagnosticMetrics = writeFusionQualityDiagnostics(
             job = JSONObject(),
             jobDir = jobDir,
@@ -1680,13 +1667,13 @@ private fun updateRawNativeQualityDiagnostics(jobDir: File, bitmap: Bitmap) {
                     "Native RGBA path only exposes final display bitmap to Kotlin export stage."
                 )
                 .put("rawQualityDiagnosticStatus", "COMPLETE")
-                .put("rawQualityDiagnosticError", JSONObject.NULL)
                 .put("rawQualityDiagnosticAt", System.currentTimeMillis())
+            job.remove("rawQualityDiagnosticError")
         }
     } catch (oom: OutOfMemoryError) {
         Log.e(
             "KeplerRawPipeline",
-            "OOM during quality diagnostics; recycling owned bitmaps and recording failure",
+            "OOM during pre-commit optional RAW quality diagnostics; recording failure",
             oom
         )
         try {
@@ -1698,23 +1685,22 @@ private fun updateRawNativeQualityDiagnostics(jobDir: File, bitmap: Bitmap) {
         } catch (metadataOom: OutOfMemoryError) {
             Log.e(
                 "KeplerRawPipeline",
-                "OOM while persisting diagnostic failure status; committed=true, verified=true, " +
-                    "uri=, metadataError=OutOfMemoryError",
+                "Secondary OOM while persisting diagnostic failure status during pre-commit quality diagnostics; " +
+                    "metadataError=OutOfMemoryError",
                 metadataOom
             )
         } catch (metadataError: Exception) {
             Log.e(
                 "KeplerRawPipeline",
-                "Failed to persist diagnostic failure status: ${metadataError.message}",
+                "Secondary failure while persisting diagnostic failure status during pre-commit quality diagnostics; " +
+                    "metadataError=${metadataError.message}",
                 metadataError
             )
         }
-        referencePreview?.takeUnless { it.isRecycled }?.recycle()
-        finalPreview?.takeUnless { it.isRecycled }?.recycle()
     } catch (e: Exception) {
         Log.e(
             "KeplerRawPipeline",
-            "Quality diagnostics failed; recycling owned bitmaps and recording failure",
+            "Pre-commit optional RAW quality diagnostics failed; recording failure",
             e
         )
         try {
@@ -1726,17 +1712,19 @@ private fun updateRawNativeQualityDiagnostics(jobDir: File, bitmap: Bitmap) {
         } catch (metadataOom: OutOfMemoryError) {
             Log.e(
                 "KeplerRawPipeline",
-                "OOM while persisting diagnostic failure status; committed=true, verified=true, " +
-                    "uri=, metadataError=OutOfMemoryError",
+                "Secondary OOM while persisting diagnostic failure status during pre-commit quality diagnostics; " +
+                    "metadataError=OutOfMemoryError",
                 metadataOom
             )
         } catch (metadataError: Exception) {
             Log.e(
                 "KeplerRawPipeline",
-                "Failed to persist diagnostic failure status: ${metadataError.message}",
+                "Secondary failure while persisting diagnostic failure status during pre-commit quality diagnostics; " +
+                    "metadataError=${metadataError.message}",
                 metadataError
             )
         }
+    } finally {
         referencePreview?.takeUnless { it.isRecycled }?.recycle()
         finalPreview?.takeUnless { it.isRecycled }?.recycle()
     }
