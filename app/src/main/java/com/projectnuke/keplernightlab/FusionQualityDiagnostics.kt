@@ -34,10 +34,15 @@ fun saveBoundedDiagnosticPreview(
     maxDimension: Int = FUSION_DIAG_MAX_DIM
 ): Bitmap {
     val bounded = boundedBitmap(bitmap, maxDimension)
-    FileOutputStream(file).use { out ->
-        check(bounded.compress(Bitmap.CompressFormat.PNG, 92, out)) {
-            "Diagnostic preview compress failed: ${file.name}"
+    try {
+        FileOutputStream(file).use { out ->
+            check(bounded.compress(Bitmap.CompressFormat.PNG, 92, out)) {
+                "Diagnostic preview compress failed: ${file.name}"
+            }
         }
+    } catch (t: Throwable) {
+        bounded.recycle()
+        throw t
     }
     return bounded
 }
@@ -125,18 +130,14 @@ private fun boundedBitmap(bitmap: Bitmap, maxDimension: Int): Bitmap {
 private fun saveCompareSheet(reference: Bitmap, finalImage: Bitmap, file: File) {
     val w = min(reference.width, finalImage.width)
     val h = min(reference.height, finalImage.height)
-    val ref = Bitmap.createScaledBitmap(reference, w, h, true)
-    val fin = Bitmap.createScaledBitmap(finalImage, w, h, true)
     val sheet = Bitmap.createBitmap(w * 2, h, Bitmap.Config.ARGB_8888)
     try {
         Canvas(sheet).apply {
-            drawBitmap(ref, 0f, 0f, null)
-            drawBitmap(fin, w.toFloat(), 0f, null)
+            drawBitmap(reference, Rect(0, 0, w, h), Rect(0, 0, w, h), null)
+            drawBitmap(finalImage, Rect(0, 0, w, h), Rect(w, 0, w * 2, h), null)
         }
         savePng(sheet, file)
     } finally {
-        if (ref !== reference) ref.recycle()
-        if (fin !== finalImage) fin.recycle()
         sheet.recycle()
     }
 }
