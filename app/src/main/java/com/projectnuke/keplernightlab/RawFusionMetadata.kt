@@ -384,6 +384,9 @@ internal val RAW_FUSION_EXPORT_NORMAL_FAILURE_PERSIST_KEYS: Set<String> =
  * reprocess failure never touches full Classic result fields.
  *
  * Does not allocate a separate failure [JSONObject]. Does not re-read or parse [job.json].
+ *
+ * @throws Exception if metadata persistence fails; caller must handle and must not proceed
+ * with stale locked metadata.
  */
 internal fun persistRawFusionFailureMetadata(
     jobDir: File,
@@ -394,80 +397,24 @@ internal fun persistRawFusionFailureMetadata(
     currentRunJob: JSONObject?,
     ownedKeys: Set<String>
 ) {
-    runCatching {
-        KeplerJobMetadata.update(jobDir) { current ->
-            ownedKeys.forEach { key ->
-                if (currentRunJob != null && currentRunJob.has(key)) {
-                    current.put(key, currentRunJob.get(key))
-                } else {
-                    current.remove(key)
-                }
+    KeplerJobMetadata.update(jobDir) { current ->
+        ownedKeys.forEach { key ->
+            if (currentRunJob != null && currentRunJob.has(key)) {
+                current.put(key, currentRunJob.get(key))
+            } else {
+                current.remove(key)
             }
-            if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-                current.put("currentPipelineStage", "FAILED")
-                current.put("processStatus", processStatus)
-                current.put("userCanMoveDevice", true)
-            }
-            current.put("rawProcessorFailureType", failureType)
-            current.put("rawProcessorFailureMessage", failureMessage)
-            current.put("processError", failureMessage)
-            current.put("rawFusionProcessingPolicy", metadataPolicy.name)
         }
-    }.onFailure { metadataWriteError ->
-        Log.e(
-            "KeplerRawPipeline",
-            "Failed to persist RAW fusion failure metadata: ${metadataWriteError.message}",
-            metadataWriteError
-        )
+        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            current.put("currentPipelineStage", "FAILED")
+            current.put("processStatus", processStatus)
+            current.put("userCanMoveDevice", true)
+        }
+        current.put("rawProcessorFailureType", failureType)
+        current.put("rawProcessorFailureMessage", failureMessage)
+        current.put("processError", failureMessage)
+        current.put("rawFusionProcessingPolicy", metadataPolicy.name)
     }
-}
-
-internal fun applyNativeMergeMetadata(
-    target: JSONObject,
-    alignment: JSONObject?
-): JSONObject {
-    if (alignment == null || !alignment.has("nativeMergeVersion")) return target
-    return target
-        .put("nativeMergeVersion", alignment.optString("nativeMergeVersion"))
-        .put("tileBasedMerge", alignment.optBoolean("tileBasedMerge", false))
-        .put("tileRows", alignment.optInt("tileRows", 0))
-        .put("tileCount", alignment.optInt("tileCount", 0))
-        .put(
-            "fullFrameAccumulatorsUsed",
-            alignment.optBoolean("fullFrameAccumulatorsUsed", true)
-        )
-        .put(
-            "fullFrameMergedBufferUsed",
-            alignment.optBoolean("fullFrameMergedBufferUsed", true)
-        )
-        .put(
-            "estimatedTileMergeWorkingSetBytes",
-            alignment.optLong("estimatedTileMergeWorkingSetBytes", 0L)
-        )
-        .put(
-            "estimatedTileMergeWorkingSetMb",
-            alignment.optDouble("estimatedTileMergeWorkingSetMb", 0.0)
-        )
-        .put("acceptedFrameCount", alignment.optInt("acceptedFrameCount", 0))
-        .put("rejectedFrameCount", alignment.optInt("rejectedFrameCount", 0))
-        .put("ghostSuppressionEnabled", alignment.optBoolean("ghostSuppressionEnabled", false))
-        .put("ghostRejectedSampleRatio", alignment.optDouble("ghostRejectedSampleRatio", 0.0))
-        .put(
-            "referencePreservedPixelRatio",
-            alignment.optDouble("referencePreservedPixelRatio", 0.0)
-        )
-        .put(
-            "mergeWarning",
-            alignment.opt("mergeWarning")
-                ?.takeUnless { it == JSONObject.NULL }
-                ?: JSONObject.NULL
-        )
-        .put("nativeAlignMs", alignment.optLong("nativeAlignMs", 0L))
-        .put("nativeMergeMs", alignment.optLong("nativeMergeMs", 0L))
-        .put("mergeWeightMapAvailable", alignment.optBoolean("mergeWeightMapAvailable", false))
-        .put("mergeWeightMapFile", alignment.opt("mergeWeightMapFile") ?: JSONObject.NULL)
-        .put("mergeRejectMapAvailable", alignment.optBoolean("mergeRejectMapAvailable", false))
-        .put("mergeRejectMapFile", alignment.opt("mergeRejectMapFile") ?: JSONObject.NULL)
 }
 
 internal fun applyNativePostprocessMetadata(
