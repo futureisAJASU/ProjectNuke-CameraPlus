@@ -83,7 +83,7 @@ fun saveJobJson(jobDir: File, job: JSONObject) {
 }
 
 fun setFrameExcluded(jobDir: File, frameIndex: Int, excluded: Boolean) {
-    require(!isReprocessQuarantined(jobDir)) { "Cannot modify frames of a quarantined reprocess job." }
+    require(!isReprocessQuarantined(jobDir)) { "Cannot modify frames of a quarantined or unresolved reprocess job." }
     KeplerJobMetadata.update(jobDir) { job ->
         val frames = job.getJSONArray("frames")
         var found = false
