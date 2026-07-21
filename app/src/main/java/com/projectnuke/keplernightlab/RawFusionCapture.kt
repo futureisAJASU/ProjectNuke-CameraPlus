@@ -1000,15 +1000,8 @@ private object RawFusionExportCoordinator {
         // metadata. A locked-update failure is a metadata-integrity failure even though no prior
         // local metadata was changed: the export stage must not proceed with stale renderer
         // metadata, and the integrity exception must bypass ordinary processor-failure conversion.
-        try {
+        wrapMetadataIntegrityFailure(originalFailure = null) {
             initCurrentRunExportOwnership(context, context.job)
-        } catch (resetFailure: Throwable) {
-            if (resetFailure is CancellationException) throw resetFailure
-            if (resetFailure is ThreadDeath) throw resetFailure
-            throw RawFusionMetadataIntegrityException(
-                metadataPersistenceFailure = resetFailure,
-                originalFailure = null
-            )
         }
         return if (
             context.outputMode == CaptureResolutionMode.MP24_FUSION &&
@@ -1580,7 +1573,7 @@ fun processRawFusionJob(
             }
             val originalClassicFailure = classicMerge.originalFailure
                 ?: IllegalStateException("Classic RAW fusion: $failureMessage")
-            try {
+            wrapMetadataIntegrityFailure(originalFailure = originalClassicFailure) {
                 persistRawFusionFailureMetadata(
                     jobDir = jobDir,
                     metadataPolicy = metadataPolicy,
@@ -1589,16 +1582,6 @@ fun processRawFusionJob(
                     failureType = classicFailureType,
                     currentRunJob = currentRunJob,
                     ownedKeys = ownedKeys
-                )
-            } catch (persistFailure: Exception) {
-                throw RawFusionMetadataIntegrityException(
-                    metadataPersistenceFailure = persistFailure,
-                    originalFailure = originalClassicFailure
-                )
-            } catch (persistOom: OutOfMemoryError) {
-                throw RawFusionMetadataIntegrityException(
-                    metadataPersistenceFailure = persistOom,
-                    originalFailure = originalClassicFailure
                 )
             }
             onStatus("Classic RAW fusion failed. RAW cache kept.")
@@ -1674,7 +1657,7 @@ fun processRawFusionJob(
     } catch (oom: OutOfMemoryError) {
         // OOM path: allocation-light. Use the current-run job if we have one, otherwise skip
         // owned-key cleanup (no current-run metadata to preserve). Do not re-read job.json.
-        try {
+        wrapMetadataIntegrityFailure(originalFailure = oom) {
             persistRawFusionFailureMetadata(
                 jobDir = jobDir,
                 metadataPolicy = metadataPolicy,
@@ -1683,16 +1666,6 @@ fun processRawFusionJob(
                 failureType = "OutOfMemoryError",
                 currentRunJob = currentRunJob,
                 ownedKeys = ownedKeys
-            )
-        } catch (persistFailure: Exception) {
-            throw RawFusionMetadataIntegrityException(
-                metadataPersistenceFailure = persistFailure,
-                originalFailure = oom
-            )
-        } catch (persistOom: OutOfMemoryError) {
-            throw RawFusionMetadataIntegrityException(
-                metadataPersistenceFailure = persistOom,
-                originalFailure = oom
             )
         }
         onStatus("RAW fusion stopped: insufficient memory. RAW cache kept.")
@@ -1706,7 +1679,7 @@ fun processRawFusionJob(
         // Do not return failure without recording the current NORMAL/reprocess failure metadata.
         // Do not re-read job.json; use the current-run job assigned immediately after read.
         val failureMessage = "${e.javaClass.simpleName}: ${e.message}"
-        try {
+        wrapMetadataIntegrityFailure(originalFailure = e) {
             persistRawFusionFailureMetadata(
                 jobDir = jobDir,
                 metadataPolicy = metadataPolicy,
@@ -1715,16 +1688,6 @@ fun processRawFusionJob(
                 failureType = e.javaClass.simpleName,
                 currentRunJob = currentRunJob,
                 ownedKeys = ownedKeys
-            )
-        } catch (persistFailure: Exception) {
-            throw RawFusionMetadataIntegrityException(
-                metadataPersistenceFailure = persistFailure,
-                originalFailure = e
-            )
-        } catch (persistOom: OutOfMemoryError) {
-            throw RawFusionMetadataIntegrityException(
-                metadataPersistenceFailure = persistOom,
-                originalFailure = e
             )
         }
         RawFusionProcessResult(false, null, null, null, null, failureMessage)

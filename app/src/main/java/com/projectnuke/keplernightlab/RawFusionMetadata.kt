@@ -3,6 +3,7 @@ package com.projectnuke.keplernightlab
 import android.util.Log
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.CancellationException
 
 /**
  * Propagation exception for metadata-integrity failures during RAW fusion metadata operations.
@@ -13,24 +14,45 @@ import java.io.File
  * arose from an initialization reset alone. Reaches [terminalError] so the reprocess finalizer
  * sees the integrity failure rather than a stringified [RawFusionProcessResult] alone.
  *
+ * The message is a fixed, allocation-light literal. Actual failure details are in [cause]
+ * and [suppressed].
+ *
  * CancellationException and ThreadDeath are never wrapped by this exception.
  */
 internal class RawFusionMetadataIntegrityException(
     metadataPersistenceFailure: Throwable,
     originalFailure: Throwable? = null
-) : Exception(
-    buildString {
-        append("Metadata persistence failed: ${metadataPersistenceFailure.message}")
-        if (originalFailure != null && originalFailure !== metadataPersistenceFailure) {
-            append("; original failure: ${originalFailure.javaClass.simpleName}: ${originalFailure.message}")
-        }
-    },
-    metadataPersistenceFailure
-) {
+) : Exception("RAW metadata integrity failure", metadataPersistenceFailure) {
     init {
         if (originalFailure != null && originalFailure !== metadataPersistenceFailure) {
             addSuppressed(originalFailure)
         }
+    }
+}
+
+/**
+ * Execute [block] and convert any metadata-integrity failure into a
+ * [RawFusionMetadataIntegrityException]. Narrow contract:
+ * - [CancellationException] propagates unchanged.
+ * - [ThreadDeath] propagates unchanged.
+ * - ordinary [Exception] is wrapped with [originalFailure] as suppressed.
+ * - [OutOfMemoryError] is wrapped with [originalFailure] as suppressed.
+ * - Every other [Error] (fatal, unrelated) propagates unchanged.
+ */
+internal inline fun wrapMetadataIntegrityFailure(
+    originalFailure: Throwable? = null,
+    block: () -> Unit
+) {
+    try {
+        block()
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (td: ThreadDeath) {
+        throw td
+    } catch (e: Exception) {
+        throw RawFusionMetadataIntegrityException(e, originalFailure)
+    } catch (oom: OutOfMemoryError) {
+        throw RawFusionMetadataIntegrityException(oom, originalFailure)
     }
 }
 
