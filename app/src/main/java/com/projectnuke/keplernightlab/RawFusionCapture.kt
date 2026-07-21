@@ -41,7 +41,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.pow
 
 private const val RAW_RENDER_VERSION = "native_raw_isp_v0.3"
 private const val RAW_RENDER_SHARPEN_AMOUNT = 0.12f
@@ -997,8 +996,20 @@ private object RawFusionExportCoordinator {
         // REPROCESS: clears shared diagnostics + renderer-error diagnostics only.
         // Does NOT touch gallery, verification, committed-export, public metadata, or terminal
         // stage/status — those belong to the shared finalizer and export-commit stage.
-        // Throws so caller cannot proceed with stale locked renderer metadata.
-        initCurrentRunExportOwnership(context, context.job)
+        // Propagates metadata write failure so caller cannot proceed with stale locked renderer
+        // metadata. A locked-update failure is a metadata-integrity failure even though no prior
+        // local metadata was changed: the export stage must not proceed with stale renderer
+        // metadata, and the integrity exception must bypass ordinary processor-failure conversion.
+        try {
+            initCurrentRunExportOwnership(context, context.job)
+        } catch (resetFailure: Throwable) {
+            if (resetFailure is CancellationException) throw resetFailure
+            if (resetFailure is ThreadDeath) throw resetFailure
+            throw RawFusionMetadataIntegrityException(
+                metadataPersistenceFailure = resetFailure,
+                originalFailure = null
+            )
+        }
         return if (
             context.outputMode == CaptureResolutionMode.MP24_FUSION &&
             context.highResolutionRaw
@@ -1584,6 +1595,11 @@ fun processRawFusionJob(
                     metadataPersistenceFailure = persistFailure,
                     originalFailure = originalClassicFailure
                 )
+            } catch (persistOom: OutOfMemoryError) {
+                throw RawFusionMetadataIntegrityException(
+                    metadataPersistenceFailure = persistOom,
+                    originalFailure = originalClassicFailure
+                )
             }
             onStatus("Classic RAW fusion failed. RAW cache kept.")
             return RawFusionProcessResult(
@@ -1673,6 +1689,11 @@ fun processRawFusionJob(
                 metadataPersistenceFailure = persistFailure,
                 originalFailure = oom
             )
+        } catch (persistOom: OutOfMemoryError) {
+            throw RawFusionMetadataIntegrityException(
+                metadataPersistenceFailure = persistOom,
+                originalFailure = oom
+            )
         }
         onStatus("RAW fusion stopped: insufficient memory. RAW cache kept.")
         RawFusionProcessResult(false, null, null, null, null, "OutOfMemoryError: RAW cache kept")
@@ -1698,6 +1719,11 @@ fun processRawFusionJob(
         } catch (persistFailure: Exception) {
             throw RawFusionMetadataIntegrityException(
                 metadataPersistenceFailure = persistFailure,
+                originalFailure = e
+            )
+        } catch (persistOom: OutOfMemoryError) {
+            throw RawFusionMetadataIntegrityException(
+                metadataPersistenceFailure = persistOom,
                 originalFailure = e
             )
         }

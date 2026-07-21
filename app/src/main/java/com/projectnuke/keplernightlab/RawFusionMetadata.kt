@@ -5,10 +5,15 @@ import org.json.JSONObject
 import java.io.File
 
 /**
- * Propagation exception for metadata-integrity failures during RAW fusion failure persistence.
- * Carries the metadata persistence failure as [cause] and the original processing failure
- * (Classic, generic, or OOM) as a suppressed exception. Reaches [terminalError] so the
- * reprocess finalizer sees both failures rather than a stringified process result alone.
+ * Propagation exception for metadata-integrity failures during RAW fusion metadata operations.
+ * Covers both initialization-reset (locked update before any local metadata change or native
+ * rendering) and failure-persistence (writing processor-failure metadata to the locked job).
+ * Carries the metadata operation failure as [cause] and the original processing failure
+ * (Classic, generic, or OOM) as a suppressed exception, or null if the integrity failure
+ * arose from an initialization reset alone. Reaches [terminalError] so the reprocess finalizer
+ * sees the integrity failure rather than a stringified [RawFusionProcessResult] alone.
+ *
+ * CancellationException and ThreadDeath are never wrapped by this exception.
  */
 internal class RawFusionMetadataIntegrityException(
     metadataPersistenceFailure: Throwable,
