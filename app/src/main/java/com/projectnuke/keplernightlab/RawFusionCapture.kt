@@ -992,9 +992,12 @@ private object RawFusionExportCoordinator {
         cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
     ): RawFusionExportResult {
         cancellation.throwIfCancelled()
-        // Initialize current-run export-owned fields before attempting native RGBA, MP24 so
-        // stale native RGBA, MP24, gallery, verification, and export-error fields cannot
-        // survive the current run unless produced by it.
+        // Initialize current-run export-owned fields before any native RGBA/MP24/bitmap attempt.
+        // NORMAL: clears shared diagnostics + local candidates + renderer-error diagnostics.
+        // REPROCESS: clears shared diagnostics + renderer-error diagnostics only.
+        // Does NOT touch gallery, verification, committed-export, public metadata, or terminal
+        // stage/status — those belong to the shared finalizer and export-commit stage.
+        // Throws so caller cannot proceed with stale locked renderer metadata.
         initCurrentRunExportOwnership(context, context.job)
         return if (
             context.outputMode == CaptureResolutionMode.MP24_FUSION &&
@@ -1564,15 +1567,24 @@ fun processRawFusionJob(
             } else {
                 "ClassicRawFusionFailure"
             }
-            persistRawFusionFailureMetadata(
-                jobDir = jobDir,
-                metadataPolicy = metadataPolicy,
-                processStatus = "CLASSIC_RAW_FUSION_FAILED_KEEPING_CACHE",
-                failureMessage = failureMessage,
-                failureType = classicFailureType,
-                currentRunJob = currentRunJob,
-                ownedKeys = ownedKeys
-            )
+            val originalClassicFailure = classicMerge.originalFailure
+                ?: IllegalStateException("Classic RAW fusion: $failureMessage")
+            try {
+                persistRawFusionFailureMetadata(
+                    jobDir = jobDir,
+                    metadataPolicy = metadataPolicy,
+                    processStatus = "CLASSIC_RAW_FUSION_FAILED_KEEPING_CACHE",
+                    failureMessage = failureMessage,
+                    failureType = classicFailureType,
+                    currentRunJob = currentRunJob,
+                    ownedKeys = ownedKeys
+                )
+            } catch (persistFailure: Exception) {
+                throw RawFusionMetadataIntegrityException(
+                    metadataPersistenceFailure = persistFailure,
+                    originalFailure = originalClassicFailure
+                )
+            }
             onStatus("Classic RAW fusion failed. RAW cache kept.")
             return RawFusionProcessResult(
                 success = false,
@@ -1646,30 +1658,49 @@ fun processRawFusionJob(
     } catch (oom: OutOfMemoryError) {
         // OOM path: allocation-light. Use the current-run job if we have one, otherwise skip
         // owned-key cleanup (no current-run metadata to preserve). Do not re-read job.json.
-        persistRawFusionFailureMetadata(
-            jobDir = jobDir,
-            metadataPolicy = metadataPolicy,
-            processStatus = "OOM_FAILED_KEEPING_CACHE",
-            failureMessage = "OutOfMemoryError",
-            failureType = "OutOfMemoryError",
-            currentRunJob = currentRunJob,
-            ownedKeys = ownedKeys
-        )
+        try {
+            persistRawFusionFailureMetadata(
+                jobDir = jobDir,
+                metadataPolicy = metadataPolicy,
+                processStatus = "OOM_FAILED_KEEPING_CACHE",
+                failureMessage = "OutOfMemoryError",
+                failureType = "OutOfMemoryError",
+                currentRunJob = currentRunJob,
+                ownedKeys = ownedKeys
+            )
+        } catch (persistFailure: Exception) {
+            throw RawFusionMetadataIntegrityException(
+                metadataPersistenceFailure = persistFailure,
+                originalFailure = oom
+            )
+        }
         onStatus("RAW fusion stopped: insufficient memory. RAW cache kept.")
         RawFusionProcessResult(false, null, null, null, null, "OutOfMemoryError: RAW cache kept")
+    } catch (mie: RawFusionMetadataIntegrityException) {
+        // Metadata-integrity failure that already carries both the original processing failure
+        // and the metadata persistence failure. Bypass ordinary processor-failure conversion so
+        // it reaches the reprocess finalizer through terminalError with both failures intact.
+        throw mie
     } catch (e: Exception) {
         // Do not return failure without recording the current NORMAL/reprocess failure metadata.
         // Do not re-read job.json; use the current-run job assigned immediately after read.
         val failureMessage = "${e.javaClass.simpleName}: ${e.message}"
-        persistRawFusionFailureMetadata(
-            jobDir = jobDir,
-            metadataPolicy = metadataPolicy,
-            processStatus = "FAILED_KEEPING_CACHE",
-            failureMessage = failureMessage,
-            failureType = e.javaClass.simpleName,
-            currentRunJob = currentRunJob,
-            ownedKeys = ownedKeys
-        )
+        try {
+            persistRawFusionFailureMetadata(
+                jobDir = jobDir,
+                metadataPolicy = metadataPolicy,
+                processStatus = "FAILED_KEEPING_CACHE",
+                failureMessage = failureMessage,
+                failureType = e.javaClass.simpleName,
+                currentRunJob = currentRunJob,
+                ownedKeys = ownedKeys
+            )
+        } catch (persistFailure: Exception) {
+            throw RawFusionMetadataIntegrityException(
+                metadataPersistenceFailure = persistFailure,
+                originalFailure = e
+            )
+        }
         RawFusionProcessResult(false, null, null, null, null, failureMessage)
     }
 }

@@ -36,7 +36,8 @@ internal data class ClassicRawFusionResult(
     val referenceReason: String,
     val alignmentStatus: String,
     val debugMetadata: JSONObject?,
-    val errorMessage: String?
+    val errorMessage: String?,
+    val originalFailure: Throwable? = null
 )
 
 private data class ClassicRawFrame(
@@ -273,7 +274,7 @@ internal fun runClassicRawFusionMerge(
             .put("rawFusionEngine", "classic_raw_v1")
             .put("processError", "OutOfMemoryError")
             .put("processedAt", System.currentTimeMillis())
-        ClassicRawFusionResult(false, null, null, 0, "failed", "OOM_FAILED", null, "OutOfMemoryError")
+        ClassicRawFusionResult(false, null, null, 0, "failed", "OOM_FAILED", null, "OutOfMemoryError", originalFailure = oom)
     } catch (e: Exception) {
         job.put("processStatus", "CLASSIC_RAW_FUSION_FAILED_KEEPING_CACHE")
             .put("rawFusionEngine", "classic_raw_v1")
@@ -287,7 +288,8 @@ internal fun runClassicRawFusionMerge(
             "failed",
             "CLASSIC_RAW_FUSION_FAILED",
             null,
-            "${e.javaClass.simpleName}: ${e.message}"
+            "${e.javaClass.simpleName}: ${e.message}",
+            originalFailure = e
         )
     }
 }

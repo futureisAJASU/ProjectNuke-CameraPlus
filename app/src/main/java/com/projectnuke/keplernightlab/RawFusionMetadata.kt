@@ -4,6 +4,31 @@ import android.util.Log
 import org.json.JSONObject
 import java.io.File
 
+/**
+ * Propagation exception for metadata-integrity failures during RAW fusion failure persistence.
+ * Carries the metadata persistence failure as [cause] and the original processing failure
+ * (Classic, generic, or OOM) as a suppressed exception. Reaches [terminalError] so the
+ * reprocess finalizer sees both failures rather than a stringified process result alone.
+ */
+internal class RawFusionMetadataIntegrityException(
+    metadataPersistenceFailure: Throwable,
+    originalFailure: Throwable? = null
+) : Exception(
+    buildString {
+        append("Metadata persistence failed: ${metadataPersistenceFailure.message}")
+        if (originalFailure != null && originalFailure !== metadataPersistenceFailure) {
+            append("; original failure: ${originalFailure.javaClass.simpleName}: ${originalFailure.message}")
+        }
+    },
+    metadataPersistenceFailure
+) {
+    init {
+        if (originalFailure != null && originalFailure !== metadataPersistenceFailure) {
+            addSuppressed(originalFailure)
+        }
+    }
+}
+
 internal fun applyRawFusionMemoryMetadata(
     job: JSONObject,
     estimate: RawFusionMemoryEstimate
