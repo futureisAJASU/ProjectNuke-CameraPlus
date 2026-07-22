@@ -167,8 +167,12 @@ fun saveFrameSelection(
     mode: FrameSelectionMode,
     frames: List<KeplerFrameReviewItem>
 ): Result<Unit> = runCatching {
-    require(!isReprocessQuarantined(jobDir)) { "Cannot save frame selection for a quarantined reprocess job." }
-    KeplerJobMetadata.update(jobDir) { job ->
+    // External mutation: acquire own operation lease, reject unresolved transactions
+    val lease = KeplerJobMetadata.acquireOperation(jobDir)
+        ?: throw IllegalStateException("Job mutation is in progress.")
+    try {
+        require(!isReprocessQuarantined(jobDir)) { "Cannot save frame selection for a quarantined or unresolved reprocess job." }
+        KeplerJobMetadata.update(jobDir) { job ->
     val included = frames.filter { it.included }.map { it.index }.sorted()
     job.put("frameSelectionMode", mode.name)
         .put("frameSelectionUpdatedAt", isoNow())
@@ -209,17 +213,62 @@ fun saveFrameSelection(
     job.put("frameSelectionFrames", frameSelectionFrames)
         .put("updatedAt", System.currentTimeMillis())
     }
+} finally {
+    lease.release()
+}
+/** Internal mutation path for reprocess transaction owner. Does NOT check quarantine;
+ * caller must already hold a valid operation lease. */
+internal fun saveFrameSelectionInternal(
+    jobDir: File,
+    mode: FrameSelectionMode,
+    frames: List<KeplerFrameReviewItem>
+): Result<Unit> = runCatching {
+    // No quarantine check - the owning transaction's ACTIVE manifest allows its own mutations
+    // Caller must already hold a valid operation lease (acquired by reprocessKeplerGalleryJob)
+    KeplerJobMetadata.update(jobDir) { job ->
+        val included = frames.filter { it.included }.map { it.index }.sorted()
+        job.put("frameSelectionMode", mode.name)
+            .put("frameSelectionUpdatedAt", isoNow())
+            .put("includedFrameIndices", JSONArray(included))
+        val frameSelectionFrames = JSONArray()
+        val frameMap = frames.associateBy { it.index }
+        val sourceFrames = job.optJSONArray("frames")
+        repeat(sourceFrames?.length() ?: 0) { position ->
+            val frameJson = sourceFrames?.optJSONObject(position) ?: return@repeat
+            val index = frameJson.optInt("index", position)
+            val review = frameMap[index] ?: return@repeat
+            frameJson.put("enabled", review.included)
+                .put("excludedByUser", !review.included)
+                .put("userDecision", review.userDecision.name)
+                .put("recommendedInclude", review.recommendedInclude)
+                .put("excludeReason", if (review.included) JSONObject.NULL else (review.reason ?: "USER_EXCLUDED"))
+            review.quality?.let { quality ->
+                frameJson.put("qualityScore", quality.overallScore.toDouble())
+                    .put("qualityLabel", quality.label)
+                    .put("sharpnessScore", quality.sharpness.toDouble())
+                    .put("motionScore", quality.motion?.toDouble() ?: JSONObject.NULL)
+                    .put("exposureScore", quality.exposure.toDouble())
+                    .put("clippedShadowRatio", quality.clippedShadowRatio.toDouble())
+                    .put("clippedHighlightRatio", quality.clippedHighlightRatio.toDouble())
+            }
+            frameSelectionFrames.put(
+                JSONObject()
+                    .put("index", review.index)
+                    .put("fileName", review.fileName)
+                    .put("included", review.included)
+                    .put("userDecision", review.userDecision.name)
+                    .put("recommendedInclude", review.recommendedInclude)
+                    .put("qualityScore", review.quality?.overallScore?.toDouble() ?: JSONObject.NULL)
+                    .put("qualityLabel", review.quality?.label ?: JSONObject.NULL)
+                    .put("qualityReason", review.reason ?: JSONObject.NULL)
+            )
+        }
+        job.put("frameSelectionFrames", frameSelectionFrames)
+            .put("updatedAt", System.currentTimeMillis())
+    }
 }
 
 internal fun persistedIncludedFrameIndices(job: JSONObject): Set<Int> =
-    buildSet {
-        val array = job.optJSONArray("includedFrameIndices") ?: return@buildSet
-        repeat(array.length()) { index ->
-            add(array.optInt(index, Int.MIN_VALUE))
-        }
-    }.filter { it != Int.MIN_VALUE }.toSet()
-
-internal fun persistedFrameSelectionMode(job: JSONObject): FrameSelectionMode? =
     runCatching { FrameSelectionMode.valueOf(job.optString("frameSelectionMode")) }.getOrNull()
 
 internal fun applyFrameSelectionToItems(

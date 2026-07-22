@@ -83,8 +83,12 @@ fun saveJobJson(jobDir: File, job: JSONObject) {
 }
 
 fun setFrameExcluded(jobDir: File, frameIndex: Int, excluded: Boolean) {
-    require(!isReprocessQuarantined(jobDir)) { "Cannot modify frames of a quarantined or unresolved reprocess job." }
-    KeplerJobMetadata.update(jobDir) { job ->
+    // External mutation: acquire own operation lease, reject unresolved transactions
+    val lease = KeplerJobMetadata.acquireOperation(jobDir)
+        ?: throw IllegalStateException("Job mutation is in progress.")
+    try {
+        require(!isReprocessQuarantined(jobDir)) { "Cannot modify frames of a quarantined or unresolved reprocess job." }
+        KeplerJobMetadata.update(jobDir) { job ->
         val frames = job.getJSONArray("frames")
         var found = false
         repeat(frames.length()) { position ->
@@ -99,6 +103,8 @@ fun setFrameExcluded(jobDir: File, frameIndex: Int, excluded: Boolean) {
         require(found) { "Frame index $frameIndex not found." }
         job.put("updatedAt", System.currentTimeMillis())
     }
+} finally {
+    lease.release()
 }
 
 fun getEnabledRawFrames(jobDir: File): List<JSONObject> {
@@ -134,7 +140,7 @@ fun loadKeplerGalleryJobs(context: Context): List<KeplerGalleryJobSummary> {
 private const val STALE_JOB_RECOVERY_AGE_MILLIS = 15 * 60 * 1000L
 
 /** Jobs have no live worker after process death; stale in-progress metadata must not remain active forever. */
-private fun recoverStaleInterruptedJob(directory: File) {
+fun recoverStaleInterruptedJob(directory: File) {
     if (isReprocessQuarantined(directory)) return
     val job = runCatching { KeplerJobMetadata.read(directory) }.getOrNull() ?: return
     val status = job.optString("status").uppercase()
@@ -278,7 +284,7 @@ fun cleanupKeplerGalleryJob(
     }
 }
 
-private fun keplerGalleryRoots(context: Context): List<File> {
+fun keplerGalleryRoots(context: Context): List<File> {
     val pictures = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return emptyList()
     return listOf(
         File(pictures, "KeplerRawFusion"),
@@ -288,7 +294,7 @@ private fun keplerGalleryRoots(context: Context): List<File> {
     )
 }
 
-private fun cleanupSafeRoots(context: Context): List<File> {
+fun cleanupSafeRoots(context: Context): List<File> {
     val pictures = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return emptyList()
     return listOf(
         File(pictures, "KeplerRawFusion"),
@@ -298,7 +304,7 @@ private fun cleanupSafeRoots(context: Context): List<File> {
     )
 }
 
-private fun requireCleanupSafeJobDirectory(context: Context, jobDirectory: File): File {
+fun requireCleanupSafeJobDirectory(context: Context, jobDirectory: File): File {
     val target = jobDirectory.canonicalFile
     val allowed = cleanupSafeRoots(context).any { root ->
         target.parentFile == root.canonicalFile && matchesJobPrefix(root, target.name)
@@ -307,7 +313,7 @@ private fun requireCleanupSafeJobDirectory(context: Context, jobDirectory: File)
     return target
 }
 
-private fun matchesJobPrefix(root: File, name: String): Boolean = when (root.name) {
+fun matchesJobPrefix(root: File, name: String): Boolean = when (root.name) {
     "KeplerRawFusion" -> name.startsWith("KPL_RAW_FUSION_")
     "KeplerYuvFusion" -> name.startsWith("KPL_YUV_FUSION_")
     "KeplerColorBurst" -> name.startsWith("KPL_COLOR_BURST_")
@@ -315,7 +321,7 @@ private fun matchesJobPrefix(root: File, name: String): Boolean = when (root.nam
     else -> false
 }
 
-private fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
+fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
     val job = File(directory, JOB_JSON_FILE_NAME).takeIf { it.isFile }?.let { file ->
         runCatching { JSONObject(file.readText()) }.getOrNull()
     }
@@ -374,7 +380,7 @@ private fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
     )
 }
 
-private fun computeKeplerJobStorage(
+fun computeKeplerJobStorage(
     directory: File,
     job: JSONObject?,
     finalPreview: File?
@@ -434,13 +440,14 @@ private fun computeKeplerJobStorage(
     )
 }
 
-private fun maybePersistStorageMetadata(
+fun maybePersistStorageMetadata(
     directory: File,
     job: JSONObject?,
     storage: KeplerJobStorageInfo
 ) {
     if (job == null) return
     if (isReprocessQuarantined(directory)) return
+    if (KeplerJobMetadata.isOperationActive(directory)) return
     if (
         job.optLong("totalJobBytes", -1L) == storage.totalJobBytes &&
         job.optInt("fileCount", -1) == storage.fileCount
@@ -453,7 +460,7 @@ private fun maybePersistStorageMetadata(
     }
 }
 
-private fun putStorageMetadata(job: JSONObject, storage: KeplerJobStorageInfo): JSONObject {
+fun putStorageMetadata(job: JSONObject, storage: KeplerJobStorageInfo): JSONObject {
     return job.put("totalJobBytes", storage.totalJobBytes)
         .put("totalJobSizeText", storage.totalJobSizeText)
         .put("finalOutputBytes", storage.finalOutputBytes)
@@ -467,7 +474,7 @@ private fun putStorageMetadata(job: JSONObject, storage: KeplerJobStorageInfo): 
         .put("fileCount", storage.fileCount)
 }
 
-private fun finalFilesForCleanup(directory: File, job: JSONObject?): Set<File> {
+fun finalFilesForCleanup(directory: File, job: JSONObject?): Set<File> {
     val names = setOfNotNull(
         job?.optString("galleryDisplayFile").orEmpty().ifBlank { null },
         job?.optString("galleryThumbnailFile").orEmpty().ifBlank { null },
@@ -479,7 +486,7 @@ private fun finalFilesForCleanup(directory: File, job: JSONObject?): Set<File> {
     return names.mapNotNull { name -> File(directory, name).takeIf { it.isFile }?.canonicalFile }.toSet()
 }
 
-private fun isDeletableDebugFile(file: File, finalFiles: Set<File>): Boolean {
+fun isDeletableDebugFile(file: File, finalFiles: Set<File>): Boolean {
     if (file.name == JOB_JSON_FILE_NAME || file.canonicalFile in finalFiles) return false
     val name = file.name.lowercase()
     if (name == "raw_render_debug.json" || name == "fusion_debug.json" || name == "yuv_debug.json") return false
@@ -489,12 +496,12 @@ private fun isDeletableDebugFile(file: File, finalFiles: Set<File>): Boolean {
         name.endsWith(".log")
 }
 
-private fun isDeletableSourceOrIntermediate(file: File, finalFiles: Set<File>): Boolean {
+fun isDeletableSourceOrIntermediate(file: File, finalFiles: Set<File>): Boolean {
     if (file.name == JOB_JSON_FILE_NAME || file.canonicalFile in finalFiles) return false
     return isSourceFrame(file) || isIntermediateFile(file, finalFiles.map { it.name }.toSet())
 }
 
-private fun isDeletableForSourceOnly(file: File, finalFiles: Set<File>): Boolean {
+fun isDeletableForSourceOnly(file: File, finalFiles: Set<File>): Boolean {
     if (file.name == JOB_JSON_FILE_NAME || isRequiredSourceOnlyMetadata(file) || isSourceFrame(file)) return false
     val name = file.name.lowercase()
     return file.canonicalFile in finalFiles ||
@@ -663,7 +670,7 @@ private fun firstPositive(job: JSONObject?, vararg keys: String): Int? {
     return keys.firstNotNullOfOrNull { key -> job?.optInt(key, 0)?.takeIf { it > 0 } }
 }
 
-private fun isSourceFrame(file: File): Boolean {
+fun isSourceFrame(file: File): Boolean {
     val name = file.name.lowercase()
     return name.startsWith("frame_") &&
         (name.endsWith(".png") || name.endsWith(".raw16") || name.endsWith(".dng") ||
