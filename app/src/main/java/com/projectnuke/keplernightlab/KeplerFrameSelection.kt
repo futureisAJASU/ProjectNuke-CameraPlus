@@ -212,19 +212,24 @@ fun saveFrameSelection(
     }
     job.put("frameSelectionFrames", frameSelectionFrames)
         .put("updatedAt", System.currentTimeMillis())
-    }
+        }
 } finally {
     lease.release()
+}
 }
 /** Internal mutation path for reprocess transaction owner. Does NOT check quarantine;
  * caller must already hold a valid operation lease. */
 internal fun saveFrameSelectionInternal(
     jobDir: File,
     mode: FrameSelectionMode,
-    frames: List<KeplerFrameReviewItem>
+    frames: List<KeplerFrameReviewItem>,
+    operationLease: JobOperationLease
 ): Result<Unit> = runCatching {
     // No quarantine check - the owning transaction's ACTIVE manifest allows its own mutations
     // Caller must already hold a valid operation lease (acquired by reprocessKeplerGalleryJob)
+    check(KeplerJobMetadata.isOperationOwner(jobDir, operationLease)) {
+        "Reprocess operation lease is not the current owner."
+    }
     KeplerJobMetadata.update(jobDir) { job ->
         val included = frames.filter { it.included }.map { it.index }.sorted()
         job.put("frameSelectionMode", mode.name)
@@ -269,6 +274,12 @@ internal fun saveFrameSelectionInternal(
 }
 
 internal fun persistedIncludedFrameIndices(job: JSONObject): Set<Int> =
+    buildSet {
+        val array = job.optJSONArray("includedFrameIndices") ?: return@buildSet
+        repeat(array.length()) { index -> add(array.optInt(index, Int.MIN_VALUE)) }
+    }.filter { it != Int.MIN_VALUE }.toSet()
+
+internal fun persistedFrameSelectionMode(job: JSONObject): FrameSelectionMode? =
     runCatching { FrameSelectionMode.valueOf(job.optString("frameSelectionMode")) }.getOrNull()
 
 internal fun applyFrameSelectionToItems(

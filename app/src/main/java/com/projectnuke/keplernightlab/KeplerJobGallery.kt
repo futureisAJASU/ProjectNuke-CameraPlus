@@ -102,9 +102,10 @@ fun setFrameExcluded(jobDir: File, frameIndex: Int, excluded: Boolean) {
         }
         require(found) { "Frame index $frameIndex not found." }
         job.put("updatedAt", System.currentTimeMillis())
-    }
+        }
 } finally {
     lease.release()
+}
 }
 
 fun getEnabledRawFrames(jobDir: File): List<JSONObject> {

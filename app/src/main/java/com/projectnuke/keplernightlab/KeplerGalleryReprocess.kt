@@ -125,7 +125,7 @@ suspend fun reprocessKeplerGalleryJob(
     val operationLease = KeplerJobMetadata.acquireOperation(target) ?: run {
         return@withContext Result.failure(IllegalStateException("A job mutation is already in progress."))
     }
-    var releaseOperationLease = true
+    var releaseOperationLease = false
     try {
     val capability = detectReprocessCapability(context, target)
     if (!capability.canReprocess) {
@@ -164,7 +164,8 @@ suspend fun reprocessKeplerGalleryJob(
     saveFrameSelectionInternal(
         jobDir = target,
         mode = selectionMode,
-        frames = applyFrameSelectionToItems(reviewItems, resolvedSelection, selectionMode)
+        frames = applyFrameSelectionToItems(reviewItems, resolvedSelection, selectionMode),
+        operationLease = operationLease
     ).getOrElse {
         val frameSelectionError = it
         val rollback = restoreBackups(target, transaction.backups)
@@ -353,7 +354,7 @@ return if (committed.isSuccess) {
                 writeTransactionState(backups, ReprocessTransactionState.QUARANTINED)
             } catch (e: Exception) {
                 // State write failed; transaction remains unresolved.
-                return ReprocessFinalizationState.QUARANTINED, Result.failure(e)
+                return ReprocessFinalizationResult(ReprocessFinalizationState.QUARANTINED, Result.failure(e))
             }
             ReprocessFinalizationResult(ReprocessFinalizationState.QUARANTINED, committed)
         }
