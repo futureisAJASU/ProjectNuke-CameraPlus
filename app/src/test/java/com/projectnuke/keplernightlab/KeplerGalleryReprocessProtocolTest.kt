@@ -7,6 +7,7 @@ import kotlinx.coroutines.yield
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -134,7 +135,8 @@ class KeplerGalleryReprocessProtocolTest {
                     reason = null
                 )
             )
-            val result = saveFrameSelectionInternal(directory, FrameSelectionMode.AUTO_RULE_BASED, frames)
+            val lease = KeplerJobMetadata.acquireOperation(directory)!!
+            val result = saveFrameSelectionInternal(directory, FrameSelectionMode.AUTO_RULE_BASED, frames, lease)
             assertTrue(result.isSuccess)
         } finally {
             directory.deleteRecursively()
@@ -201,7 +203,8 @@ class KeplerGalleryReprocessProtocolTest {
                     reason = "TEST_EXCLUDE"
                 )
             )
-            val result = saveFrameSelectionInternal(directory, FrameSelectionMode.MANUAL, frames)
+            val lease = KeplerJobMetadata.acquireOperation(directory)!!
+            val result = saveFrameSelectionInternal(directory, FrameSelectionMode.MANUAL, frames, lease)
             assertTrue(result.isSuccess)
 
             // Verify the frame was actually excluded
@@ -277,7 +280,7 @@ class KeplerGalleryReprocessProtocolTest {
             )
 
             val finalization = finalizeTerminalOutcome(
-                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG,
+                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG_DEBUG,
                 FrameSelectionMode.AUTO_RULE_BASED, setOf(0),
                 Result.success(outcome), transaction.backups
             )
@@ -309,7 +312,7 @@ class KeplerGalleryReprocessProtocolTest {
             )
 
             val finalization = finalizeTerminalOutcome(
-                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG,
+                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG_DEBUG,
                 FrameSelectionMode.AUTO_RULE_BASED, setOf(0),
                 Result.success(failureOutcome), transaction.backups
             )
@@ -334,7 +337,7 @@ class KeplerGalleryReprocessProtocolTest {
             )
 
             val finalization2 = finalizeTerminalOutcome(
-                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG,
+                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG_DEBUG,
                 FrameSelectionMode.AUTO_RULE_BASED, setOf(0),
                 Result.success(successOutcome), transaction2.backups
             )
@@ -366,7 +369,7 @@ class KeplerGalleryReprocessProtocolTest {
             )
 
             val finalization = finalizeTerminalOutcome(
-                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG,
+                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG_DEBUG,
                 FrameSelectionMode.AUTO_RULE_BASED, setOf(0),
                 Result.success(successOutcome), transaction.backups
             )
@@ -378,7 +381,7 @@ class KeplerGalleryReprocessProtocolTest {
 
             // Re-run finalization - cleanup failure should not downgrade state
             val finalization2 = finalizeTerminalOutcome(
-                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG,
+                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG_DEBUG,
                 FrameSelectionMode.AUTO_RULE_BASED, setOf(0),
                 Result.success(successOutcome), transaction.backups
             )
@@ -406,7 +409,7 @@ class KeplerGalleryReprocessProtocolTest {
                 // The late finalization will be triggered when workerCompletion is completed
                 workerCompletion.await().let { outcome ->
                     finalizeTerminalOutcome(
-                        directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG,
+                        directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG_DEBUG,
                         FrameSelectionMode.AUTO_RULE_BASED, setOf(0),
                         Result.success(outcome), transaction.backups
                     )
@@ -450,7 +453,7 @@ class KeplerGalleryReprocessProtocolTest {
             )
 
             val finalization = finalizeTerminalOutcome(
-                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG,
+                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG_DEBUG,
                 FrameSelectionMode.AUTO_RULE_BASED, setOf(0),
                 Result.success(quarantinedOutcome), transaction.backups
             )
@@ -459,7 +462,7 @@ class KeplerGalleryReprocessProtocolTest {
 
             // Register late finalization (should not re-run because terminalOutcome was NOT a failure)
             val lateFinalization = finalizeTerminalOutcome(
-                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG,
+                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG_DEBUG,
                 FrameSelectionMode.AUTO_RULE_BASED, setOf(0),
                 Result.success(quarantinedOutcome), transaction.backups
             )
@@ -480,16 +483,7 @@ class KeplerGalleryReprocessProtocolTest {
             source.writeText("original")
             val transaction = backupReprocessTransaction(directory, listOf(source)).getOrThrow()
 
-            val lease = KeplerJobMetadata.acquireOperation(directory)!!
-            var releaseCount = 0
-
-            // Wrap lease to count releases
-            val countingLease = object : JobOperationLease(lease.key) {
-                override fun release() {
-                    releaseCount++
-                    super.release()
-                }
-            }
+            assertTrue(KeplerJobMetadata.isOperationActive(directory))
 
             val successOutcome = ReprocessWorkerOutcome(
                 result = Result.success(Unit),
@@ -497,15 +491,14 @@ class KeplerGalleryReprocessProtocolTest {
                 exportVerified = true
             )
 
-            // Simulate late completion by directly calling finalization with lease
             val finalization = finalizeTerminalOutcome(
-                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG,
+                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG_DEBUG,
                 FrameSelectionMode.AUTO_RULE_BASED, setOf(0),
                 Result.success(successOutcome), transaction.backups
             )
 
             assertEquals(ReprocessFinalizationState.COMMITTED, finalization.state)
-            // Lease should have been released by finalization
+            assertFalse(KeplerJobMetadata.isOperationActive(directory))
         } finally {
             directory.deleteRecursively()
         }
@@ -529,7 +522,7 @@ class KeplerGalleryReprocessProtocolTest {
             )
 
             val finalization = finalizeTerminalOutcome(
-                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG,
+                directory, ReprocessJobKind.RAW_FUSION, FinalOutputFormat.PNG_DEBUG,
                 FrameSelectionMode.AUTO_RULE_BASED, setOf(0),
                 Result.success(failureOutcome), transaction.backups
             )

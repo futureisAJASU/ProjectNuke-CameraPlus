@@ -309,7 +309,7 @@ private fun registerLateFinalization(
     }
 }
 
-private fun finalizeTerminalOutcome(
+internal fun finalizeTerminalOutcome(
     jobDir: File,
     jobKind: ReprocessJobKind,
     outputSettings: FinalOutputFormat,
@@ -561,7 +561,7 @@ internal fun writeQuarantineMarker(backups: List<ReprocessBackup>) {
  * Throws on any failure — state persistence is mandatory and must not be silently ignored.
  * Failure here leaves the transaction unresolved; caller must not release the operation lease.
  */
-private fun writeTransactionState(transactionBackups: List<ReprocessBackup>, state: ReprocessTransactionState) {
+internal fun writeTransactionState(transactionBackups: List<ReprocessBackup>, state: ReprocessTransactionState) {
     val root = reprocessBackupRoot(transactionBackups)
         ?: throw IllegalStateException("Transaction backup root not found for state write")
     val manifestFile = File(root, REPROCESS_TX_MANIFEST_FILE)
@@ -845,7 +845,7 @@ internal data class ReprocessBackup(
     val originalLength: Long = backup.length()
 )
 
-private const val REPROCESS_TX_MANIFEST_FILE = "manifest.json"
+internal const val REPROCESS_TX_MANIFEST_FILE = "manifest.json"
 
 /**
  * Transaction manifest recording the job state before the reprocess. Records which relative paths
