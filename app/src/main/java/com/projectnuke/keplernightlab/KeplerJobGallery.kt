@@ -103,9 +103,9 @@ fun setFrameExcluded(jobDir: File, frameIndex: Int, excluded: Boolean) {
         require(found) { "Frame index $frameIndex not found." }
         job.put("updatedAt", System.currentTimeMillis())
         }
-} finally {
-    lease.release()
-}
+    } finally {
+        lease.release()
+    }
 }
 
 fun getEnabledRawFrames(jobDir: File): List<JSONObject> {
@@ -141,7 +141,7 @@ fun loadKeplerGalleryJobs(context: Context): List<KeplerGalleryJobSummary> {
 private const val STALE_JOB_RECOVERY_AGE_MILLIS = 15 * 60 * 1000L
 
 /** Jobs have no live worker after process death; stale in-progress metadata must not remain active forever. */
-fun recoverStaleInterruptedJob(directory: File) {
+internal fun recoverStaleInterruptedJob(directory: File) {
     if (isReprocessQuarantined(directory)) return
     val job = runCatching { KeplerJobMetadata.read(directory) }.getOrNull() ?: return
     val status = job.optString("status").uppercase()
@@ -295,7 +295,7 @@ fun keplerGalleryRoots(context: Context): List<File> {
     )
 }
 
-fun cleanupSafeRoots(context: Context): List<File> {
+internal fun cleanupSafeRoots(context: Context): List<File> {
     val pictures = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return emptyList()
     return listOf(
         File(pictures, "KeplerRawFusion"),
@@ -305,7 +305,7 @@ fun cleanupSafeRoots(context: Context): List<File> {
     )
 }
 
-fun requireCleanupSafeJobDirectory(context: Context, jobDirectory: File): File {
+internal fun requireCleanupSafeJobDirectory(context: Context, jobDirectory: File): File {
     val target = jobDirectory.canonicalFile
     val allowed = cleanupSafeRoots(context).any { root ->
         target.parentFile == root.canonicalFile && matchesJobPrefix(root, target.name)
@@ -314,7 +314,7 @@ fun requireCleanupSafeJobDirectory(context: Context, jobDirectory: File): File {
     return target
 }
 
-fun matchesJobPrefix(root: File, name: String): Boolean = when (root.name) {
+internal fun matchesJobPrefix(root: File, name: String): Boolean = when (root.name) {
     "KeplerRawFusion" -> name.startsWith("KPL_RAW_FUSION_")
     "KeplerYuvFusion" -> name.startsWith("KPL_YUV_FUSION_")
     "KeplerColorBurst" -> name.startsWith("KPL_COLOR_BURST_")

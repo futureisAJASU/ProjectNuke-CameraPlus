@@ -172,64 +172,35 @@ fun saveFrameSelection(
         ?: throw IllegalStateException("Job mutation is in progress.")
     try {
         require(!isReprocessQuarantined(jobDir)) { "Cannot save frame selection for a quarantined or unresolved reprocess job." }
-        KeplerJobMetadata.update(jobDir) { job ->
-    val included = frames.filter { it.included }.map { it.index }.sorted()
-    job.put("frameSelectionMode", mode.name)
-        .put("frameSelectionUpdatedAt", isoNow())
-        .put("includedFrameIndices", JSONArray(included))
-    val frameSelectionFrames = JSONArray()
-    val frameMap = frames.associateBy { it.index }
-    val sourceFrames = job.optJSONArray("frames")
-    repeat(sourceFrames?.length() ?: 0) { position ->
-        val frameJson = sourceFrames?.optJSONObject(position) ?: return@repeat
-        val index = frameJson.optInt("index", position)
-        val review = frameMap[index] ?: return@repeat
-        frameJson.put("enabled", review.included)
-            .put("excludedByUser", !review.included)
-            .put("userDecision", review.userDecision.name)
-            .put("recommendedInclude", review.recommendedInclude)
-            .put("excludeReason", if (review.included) JSONObject.NULL else (review.reason ?: "USER_EXCLUDED"))
-        review.quality?.let { quality ->
-            frameJson.put("qualityScore", quality.overallScore.toDouble())
-                .put("qualityLabel", quality.label)
-                .put("sharpnessScore", quality.sharpness.toDouble())
-                .put("motionScore", quality.motion?.toDouble() ?: JSONObject.NULL)
-                .put("exposureScore", quality.exposure.toDouble())
-                .put("clippedShadowRatio", quality.clippedShadowRatio.toDouble())
-                .put("clippedHighlightRatio", quality.clippedHighlightRatio.toDouble())
-        }
-        frameSelectionFrames.put(
-            JSONObject()
-                .put("index", review.index)
-                .put("fileName", review.fileName)
-                .put("included", review.included)
-                .put("userDecision", review.userDecision.name)
-                .put("recommendedInclude", review.recommendedInclude)
-                .put("qualityScore", review.quality?.overallScore?.toDouble() ?: JSONObject.NULL)
-                .put("qualityLabel", review.quality?.label ?: JSONObject.NULL)
-                .put("qualityReason", review.reason ?: JSONObject.NULL)
-        )
+        writeFrameSelection(jobDir, mode, frames)
+    } finally {
+        lease.release()
     }
-    job.put("frameSelectionFrames", frameSelectionFrames)
-        .put("updatedAt", System.currentTimeMillis())
-        }
-} finally {
-    lease.release()
 }
-}
+
 /** Internal mutation path for reprocess transaction owner. Does NOT check quarantine;
- * caller must already hold a valid operation lease. */
+ * bypasses only its own ACTIVE transaction block — the owning lease is required. */
 internal fun saveFrameSelectionInternal(
     jobDir: File,
     mode: FrameSelectionMode,
     frames: List<KeplerFrameReviewItem>,
     operationLease: JobOperationLease
 ): Result<Unit> = runCatching {
-    // No quarantine check - the owning transaction's ACTIVE manifest allows its own mutations
-    // Caller must already hold a valid operation lease (acquired by reprocessKeplerGalleryJob)
     check(KeplerJobMetadata.isOperationOwner(jobDir, operationLease)) {
         "Reprocess operation lease is not the current owner."
     }
+    writeFrameSelection(jobDir, mode, frames)
+}
+
+/**
+ * One private locked writer for frame-selection JSON mutation.
+ * Both public and internal paths call this to prevent drift.
+ */
+private fun writeFrameSelection(
+    jobDir: File,
+    mode: FrameSelectionMode,
+    frames: List<KeplerFrameReviewItem>
+) {
     KeplerJobMetadata.update(jobDir) { job ->
         val included = frames.filter { it.included }.map { it.index }.sorted()
         job.put("frameSelectionMode", mode.name)

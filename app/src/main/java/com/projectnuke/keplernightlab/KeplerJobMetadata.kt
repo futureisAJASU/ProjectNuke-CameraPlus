@@ -31,7 +31,8 @@ object KeplerJobMetadata {
 
     fun isOperationActive(jobDir: File): Boolean = operationLeases.containsKey(jobDir.canonicalPath)
 
-    internal fun isOperationOwner(jobDir: File, lease: JobOperationLease): Boolean =
+    /** True if the given lease is the actual job operation owner. Public for production checks. */
+    fun isOperationOwner(jobDir: File, lease: JobOperationLease): Boolean =
         operationLeases[jobDir.canonicalPath] === lease
 
     internal fun releaseOperation(lease: JobOperationLease) {
