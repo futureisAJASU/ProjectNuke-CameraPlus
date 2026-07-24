@@ -5,8 +5,8 @@ import android.graphics.Bitmap
 import android.os.Environment
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -96,9 +96,14 @@ internal data class ReprocessFinalizationResult(
 private const val REPROCESS_TIMEOUT_MS = 10 * 60 * 1000L
 private const val REPROCESS_WORKER_EXIT_TIMEOUT_MS = 30_000L
 private const val REPROCESS_QUARANTINE_MARKER = ".reprocess_quarantine"
+private const val REPROCESS_FALLBACK_QUARANTINE_MARKER = ".reprocess_unresolved"
 private const val REPROCESS_PREVIEW_PREFIX = "reprocess_preview_"
 private const val REPROCESS_PREVIEW_MAX_DIMENSION = 1600
 private const val REPROCESS_HISTORY_LIMIT = 32
+
+/** Test-only bounded-exit timeout override. Each test must restore it in `finally`. */
+internal var reprocessWorkerExitTimeoutMsForTest: Long? = null
+internal var reprocessTimeoutMsForTest: Long? = null
 
 /**
  * Result of classifying a transaction manifest's state for evidence inspection.
@@ -110,53 +115,38 @@ internal sealed class ManifestClassification {
 }
 
 /**
- * Strict manifest parser/classifier. Fails closed:
- * - Missing/corrupt/unreadable/incomplete manifests → Unresolved
- * - Legacy manifests missing only "state" key → Unresolved (ACTIVE)
+ * Strict manifest parser/classifier. Fails closed by reusing [loadStrictManifest]:
+ * - Missing/corrupt/unreadable/incomplete/unsafe manifests → Unresolved
+ * - Legacy structurally-valid manifest missing only `state` → still ACTIVE (Unresolved)
  * - Only fully validated COMMITTED or ROLLED_BACK → Resolved
- * - Valid QUARANTINED/ACTIVE manifests → Unresolved
+ * - Valid ACTIVE/QUARANTINED manifests → Unresolved
  *
- * Required fields: transactionId (non-blank), createdAt (>0), state (valid enum),
- * preExistingPaths, backedUpPaths arrays. Safe relative paths only (no traversal).
+ * A manifest missing backup arrays/entries is never treated as terminal-resolved, even if the
+ * `state` field claims COMMITTED/ROLLED_BACK.
  */
 internal fun classifyTransactionManifest(backupRoot: File): ManifestClassification {
     if (!backupRoot.isDirectory) return ManifestClassification.Unresolved
     val manifestFile = File(backupRoot, REPROCESS_TX_MANIFEST_FILE)
     if (!manifestFile.isFile) return ManifestClassification.Unresolved
-    val json = runCatching { JSONObject(manifestFile.readText()) }.getOrNull()
+    val manifest = runCatching { loadStrictManifest(manifestFile) }.getOrNull()
         ?: return ManifestClassification.Unresolved
-    val txId = json.optString("transactionId")
-    if (txId.isNullOrBlank()) return ManifestClassification.Unresolved
-    val createdAt = json.optLong("createdAt", 0L)
-    if (createdAt <= 0L) return ManifestClassification.Unresolved
-    val preExisting = json.optJSONArray("preExistingPaths")
-    val backedUp = json.optJSONArray("backedUpPaths")
-    if (preExisting == null || backedUp == null) return ManifestClassification.Unresolved
-    // Validate safe relative paths
-    if (!areManifestPathsSafe(preExisting) || !areManifestPathsSafe(backedUp)) return ManifestClassification.Unresolved
-    val newlyCreated = json.optJSONArray("newlyCreatedPaths")
-    if (newlyCreated != null && !areManifestPathsSafe(newlyCreated)) return ManifestClassification.Unresolved
-    // State: missing state means legacy ACTIVE (unresolved)
-    if (!json.has("state") || json.isNull("state")) return ManifestClassification.Unresolved
-    val stateName = json.optString("state")
-    val state = runCatching { ReprocessTransactionState.valueOf(stateName) }.getOrNull()
-        ?: return ManifestClassification.Unresolved
-    return when (state) {
+    return when (manifest.state) {
         ReprocessTransactionState.COMMITTED,
-        ReprocessTransactionState.ROLLED_BACK -> ManifestClassification.Resolved(state)
+        ReprocessTransactionState.ROLLED_BACK -> ManifestClassification.Resolved(manifest.state)
         ReprocessTransactionState.ACTIVE,
         ReprocessTransactionState.QUARANTINED -> ManifestClassification.Unresolved
     }
 }
 
-private fun areManifestPathsSafe(array: JSONArray): Boolean {
-    repeat(array.length()) { i ->
-        val path = array.optString(i)
-        if (path.isNullOrBlank()) return false
-        if (path.contains("..") || path.startsWith("/") || File(path).isAbsolute) return false
-        val normalized = File(path).path.replace("\\", "/")
-        if (normalized.contains("..")) return false
-    }
+private fun isStrictRelativePath(path: String): Boolean {
+    if (path.isBlank()) return false
+    if (path.contains("..")) return false
+    if (path.startsWith("/")) return false
+    if (path.startsWith("\\")) return false
+    if (File(path).isAbsolute) return false
+    val normalized = File(path).path.replace("\\", "/")
+    if (normalized.contains("..")) return false
+    if (normalized.startsWith("/")) return false
     return true
 }
 
@@ -199,19 +189,29 @@ suspend fun reprocessKeplerGalleryJob(
 )
 
 /**
- * Transaction session: explicit ownership model for the operation lease.
+ * Transaction session: explicit ownership model for the operation lease. One authoritative
+ * object stores the transaction, owning lease, and late-registration state. The lease is
+ * released exactly by the path that owns it after durable COMMITTED/ROLLED_BACK, or never
+ * (QUARANTINED).
  *
- * Before the ACTIVE transaction is durably written, the session releases the lease
- * on every return or exception. After ownership transfer (durably persisted ACTIVE
- * manifest), the outer finally must never release it — only the shared settlement
- * releases it after durable COMMITTED or ROLLED_BACK.
+ * Before the ACTIVE transaction is durably written, [releaseIfUnowned] releases the lease for
+ * every pre-transaction return, progress failure, exception, and cancellation in a single
+ * outer `finally` of [reprocessKeplerGalleryJob]. After [transferOwnership] the outer finally
+ * must never release the lease; only [finalizeTransaction] (shared settlement) does.
+ *
+ * The once-guard for late registration also lives here so every registration attempt — timeout,
+ * cancellation, late callback — shares it.
  */
-private class ReprocessTransactionSession(val jobDir: File) {
+internal class ReprocessTransactionSession(val jobDir: File) {
     var lease: JobOperationLease? = null
         private set
     var transaction: ReprocessTransaction? = null
         private set
+    var worker: ReprocessWorkerRun? = null
+        private set
     private val ownershipTransferred = AtomicBoolean(false)
+    private val lateRegistered = AtomicBoolean(false)
+    private val finalizerExecuted = AtomicBoolean(false)
 
     fun acquireLease(): JobOperationLease? {
         val acquired = KeplerJobMetadata.acquireOperation(jobDir)
@@ -219,10 +219,14 @@ private class ReprocessTransactionSession(val jobDir: File) {
         return acquired
     }
 
-    /** Transfer lease ownership to the transaction. After this, the outer finally must NOT release. */
+    /** Transfer lease ownership to the durable ACTIVE transaction. After this the outer finally must NOT release. */
     fun transferOwnership(tx: ReprocessTransaction) {
         transaction = tx
         ownershipTransferred.set(true)
+    }
+
+    fun bindWorker(run: ReprocessWorkerRun) {
+        worker = run
     }
 
     /** True if ownership has been transferred to a durable ACTIVE transaction. */
@@ -235,6 +239,85 @@ private class ReprocessTransactionSession(val jobDir: File) {
             lease = null
         }
     }
+
+    /** Try to acquire the once-guard for late-finalization registration. Returns true only the first time. */
+    fun tryAcquireLateRegistration(): Boolean = lateRegistered.compareAndSet(false, true)
+
+    /** Try to acquire the once-guard for late finalizer invocation. Returns true only the first time. */
+    fun tryBeginFinalization(): Boolean = finalizerExecuted.compareAndSet(false, true)
+
+    /** Whether a finalization pass was already processed (prevents duplicate cross-terminal writes). */
+    fun finalizationProcessed(): Boolean = finalizerExecuted.get()
+
+    /** Legacy/test seam: bind an existing transaction+lease to this session as if ownership had been
+     *  transferred, so [finalizeTransactionWithLease] exercises the real strict finalizer path. */
+    fun bindForLegacyFinalizer(tx: ReprocessTransaction, lease: JobOperationLease) {
+        transaction = tx
+        ownershipTransferred.set(true)
+        this.lease = lease
+    }
+}
+
+/**
+ * Structured terminal acquisition result for a worker [Deferred]. Covers every confirmed terminal
+ * state without beginning rollback before worker exit is confirmed. The caller must:
+ * - feed [TerminalReceived] / [DeferredExceptionalCompletion] into shared settlement,
+ * - object to rollback until either of those is returned (i.e. NOT on [CancelCallbackFailed]
+ *   alone, since a failed cancel callback does not prove worker exit),
+ * - on [WorkerDidNotExitBeforeTimeout] persist unresolved/quarantine evidence and register late
+ *   finalization; never begin rollback,
+ * - on [CallerCancelledWhileWorkerExited] treat as terminal received and rethrow caller
+ *   cancellation after settlement,
+ * - on [CallerCancelledWhileWorkerActive] persist unresolved/quarantine evidence and register
+ *   late finalization, then rethrow the caller cancellation.
+ */
+internal sealed class WorkerTerminalResult {
+    /** Confirmed terminal outcome received from the worker. */
+    data class TerminalReceived(val outcome: ReprocessWorkerOutcome) : WorkerTerminalResult()
+
+    /** Deferred completed exceptionally — the worker exited with failure. Enters normal uncommitted settlement. */
+    data class DeferredExceptionalCompletion(val cause: Throwable) : WorkerTerminalResult()
+
+    /** Cancel callback invocation threw. Does NOT prove worker exit — do not begin rollback. */
+    data class CancelCallbackFailed(val cause: Throwable) : WorkerTerminalResult()
+
+    /** Worker exited after [cancel] was requested. Holds the real outcome if any. */
+    data class WorkerExitedAfterCancellation(
+        val outcome: ReprocessWorkerOutcome?,
+        val cancelFailure: Throwable?
+    ) : WorkerTerminalResult()
+
+    /** Worker did not exit before the rollback timeout. Rollback is unsafe. */
+    data class WorkerDidNotExitBeforeTimeout(val cancelFailure: Throwable?) : WorkerTerminalResult()
+
+    /** Caller cancellation arrived after the worker had already exited with a terminal outcome. */
+    data class CallerCancelledWhileWorkerExited(
+        val outcome: ReprocessWorkerOutcome,
+        val callerCancellation: kotlinx.coroutines.CancellationException
+    ) : WorkerTerminalResult()
+
+    /** Caller cancellation arrived while the worker was still active. */
+    data class CallerCancelledWhileWorkerActive(
+        val callerCancellation: kotlinx.coroutines.CancellationException,
+        val cancelFailure: Throwable?,
+        val workerDidExit: Boolean
+    ) : WorkerTerminalResult()
+}
+
+private fun combineCause(primary: Throwable, vararg suppressed: Throwable?): Throwable {
+    for (s in suppressed) if (s != null && s !== primary) {
+        runCatching { primary.addSuppressed(s) }
+    }
+    return primary
+}
+
+/** Compact cause/suppressed helper used by rollback, cleanup, terminal metadata, quarantine, and late-finalization. */
+private fun combineCauseWithMessage(primary: Throwable, message: String, suppressedFailure: Throwable?): Throwable {
+    val wrapping = if (primary.message != message) RuntimeException(message, primary) else primary
+    if (suppressedFailure != null && suppressedFailure !== primary) {
+        runCatching { wrapping.addSuppressed(suppressedFailure) }
+    }
+    return wrapping
 }
 
 suspend fun reprocessKeplerGalleryJob(
@@ -255,220 +338,455 @@ suspend fun reprocessKeplerGalleryJob(
         return@withContext Result.failure(IllegalStateException("A job mutation is already in progress."))
     }
 
-    // Pre-transaction phase: every path here must release the lease via session.releaseIfUnowned()
-    // No transaction exists yet, so the session will release it.
-    val capability = detectReprocessCapability(context, target)
-    if (!capability.canReprocess) {
-        writeReprocessFailure(target, capability.reason)
-        session.releaseIfUnowned()
-        return@withContext Result.failure(IllegalStateException(capability.reason))
-    }
+    // Unresolved transaction evidence must be inspected before any metadata mutation. A job
+    // rejected because it is unresolved must NOT write reprocess-failure metadata or alter job.json.
+    val unresolved = runCatching { isReprocessQuarantined(target) }.getOrDefault(false)
+    var capability: ReprocessCapability? = null
+    var transaction: ReprocessTransaction? = null
+    var kind: ReprocessJobKind = ReprocessJobKind.UNSUPPORTED
+    var job: JSONObject? = null
+    var reviewItems: List<KeplerFrameReviewItem> = emptyList()
+    var resolvedSelection: Set<Int> = emptySet()
+    var selectionMode: FrameSelectionMode = FrameSelectionMode.AUTO_RULE_BASED
 
-    postProgress("원본 프레임 확인 중…")
-    val job = try {
-        KeplerJobMetadata.read(target)
-    } catch (metadataError: KeplerJobMetadataException) {
-        writeReprocessFailure(target, "${metadataError.javaClass.simpleName}: ${metadataError.message}")
-        session.releaseIfUnowned()
-        return@withContext Result.failure(metadataError)
-    }
-    val kind = detectJobKind(target, job)
-    val reviewItems = loadFrameReviewItems(context, target).getOrElse {
-        writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
-        session.releaseIfUnowned()
-        return@withContext Result.failure(it)
-    }
-    val resolvedSelection = resolveFrameSelection(target, kind, reviewItems, frameSelection).getOrElse {
-        writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
-        session.releaseIfUnowned()
-        return@withContext Result.failure(it)
-    }
-    if (resolvedSelection.size < requiredSelectedFrameCount(kind)) {
-        val message = "선택한 원본 프레임이 부족합니다. 다시 합성할 수 없습니다."
-        writeReprocessFailure(target, message)
-        session.releaseIfUnowned()
-        return@withContext Result.failure(IllegalStateException(message))
-    }
-    val selectionMode = resolveSelectionMode(job, frameSelection)
-    val transaction = backupReprocessTransaction(
-        target,
-        target.listFiles()?.filter { it.isFile && isReprocessWorkerWritable(it) }.orEmpty()
-    ).getOrElse {
-        writeReprocessFailure(target, "Required reprocess backup failed: ${it.message}")
-        session.releaseIfUnowned()
-        return@withContext Result.failure(it)
-    }
-
-    // Ownership transfer: ACTIVE manifest is now durably persisted.
-    // After this point, the outer finally must NOT release the lease.
-    session.transferOwnership(transaction)
-
-    // Post-transaction phase: ALL failures route through the shared finalizer.
-    // The finalizer handles lease release after durable COMMITTED/ROLLED_BACK,
-    // quarantine retention, and backup evidence preservation.
     try {
-    postProgress("프레임 선택 적용 중…")
-    saveFrameSelectionInternal(
-        jobDir = target,
-        mode = selectionMode,
-        frames = applyFrameSelectionToItems(reviewItems, resolvedSelection, selectionMode),
-        operationLease = operationLease
-    ).getOrElse {
-        return@withContext settlePostTransactionFailure(transaction, operationLease, target, it)
-    }
-
-    val progressScope = CoroutineScope(coroutineContext)
-    val cancellation = KeplerPipelineCancellationToken()
-    val worker = when (capability.jobKind) {
-        ReprocessJobKind.RAW_FUSION ->
-            reprocessRawJob(
-                context,
-                target,
-                outputSettings,
-                resolvedSelection,
-                cancellation = cancellation,
-                onStatus = { message -> progressScope.launch { postProgress(message) } }
-            )
-        ReprocessJobKind.YUV_FUSION ->
-            reprocessYuvJob(
-                context,
-                target,
-                outputSettings,
-                resolvedSelection,
-                cancellation = cancellation,
-                onStatus = { message -> progressScope.launch { postProgress(message) } }
-            )
-        ReprocessJobKind.COLOR_BURST, ReprocessJobKind.UNSUPPORTED -> {
-            ReprocessWorkerRun(
-                terminal = CompletableDeferred<ReprocessWorkerOutcome>().apply {
-                    complete(ReprocessWorkerOutcome(Result.failure(UnsupportedOperationException("Reprocess job is unsupported.")), false))
-                },
-                cancel = {}
+        // Pre-transaction phase: outer `finally` (below) releases the lease via the session for any
+        // pre-transaction return, progress failure, ordinary exception, or cancellation. We do NOT
+        // call releaseIfUnowned() inline — the single finally handles it.
+        if (unresolved) {
+            return@withContext Result.failure(
+                IllegalStateException("다시 합성을 진행할 수 없습니다. 이 작업은 격리되었습니다.")
             )
         }
-    }
+        capability = detectReprocessCapability(context, target)
+        if (!capability.canReprocess) {
+            // The job is purely unsupported (no unresolved evidence); safe to record terminal metadata.
+            writeReprocessFailure(target, capability.reason)
+            return@withContext Result.failure(IllegalStateException(capability.reason))
+        }
+        postProgress("원본 프레임 확인 중…")
+        job = try {
+            KeplerJobMetadata.read(target)
+        } catch (metadataError: KeplerJobMetadataException) {
+            writeReprocessFailure(target, "${metadataError.javaClass.simpleName}: ${metadataError.message}")
+            return@withContext Result.failure(metadataError)
+        }
+        kind = detectJobKind(target, job)
+        reviewItems = loadFrameReviewItems(context, target).getOrElse {
+            writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
+            return@withContext Result.failure(it)
+        }
+        resolvedSelection = resolveFrameSelection(target, kind, reviewItems, frameSelection).getOrElse {
+            writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
+            return@withContext Result.failure(it)
+        }
+        if (resolvedSelection.size < requiredSelectedFrameCount(kind)) {
+            val message = "선택한 원본 프레임이 부족합니다. 다시 합성할 수 없습니다."
+            writeReprocessFailure(target, message)
+            return@withContext Result.failure(IllegalStateException(message))
+        }
+        selectionMode = resolveSelectionMode(job, frameSelection)
+        transaction = backupReprocessTransaction(
+            target,
+            target.listFiles()?.filter { it.isFile && isReprocessWorkerWritable(it) }.orEmpty()
+        ).getOrElse {
+            writeReprocessFailure(target, "Required reprocess backup failed: ${it.message}")
+            return@withContext Result.failure(it)
+        }
 
-    val pipelineOutcome = try {
-        withTimeoutOrNull(REPROCESS_TIMEOUT_MS) { worker.terminal.await() }
+        // Ownership transfer exactly once: ACTIVE manifest is now durably persisted and validated
+        // against the in-memory transaction. Strict identity must hold before any post-ACTIVE work;
+        // if it does not, the durable manifest is authoritative and we quarantine without mutation.
+        session.transferOwnership(transaction)
+        if (!validateTransactionIdentity(target, transaction)) {
+            return@withContext quarantineWithPersistence(
+                transaction,
+                IllegalStateException("Transaction identity validation failed after ACTIVE creation")
+            ).result
+        }
+
+        // After ownership transfer the outer `finally` must NEVER release the lease; only shared
+        // settlement in [finalizeTransaction] releases it after durable COMMITTED/ROLLED_BACK.
+
+        postProgress("프레임 선택 적용 중…")
+        saveFrameSelectionInternal(
+            jobDir = target,
+            mode = selectionMode,
+            frames = applyFrameSelectionToItems(reviewItems, resolvedSelection, selectionMode),
+            operationLease = operationLease
+        ).getOrElse {
+            return@withContext finalizeTransaction(
+                session, transaction, target, capability.jobKind, outputSettings, selectionMode,
+                resolvedSelection, Result.failure(it)
+            ).result
+        }
+        check(KeplerJobMetadata.isOperationOwner(target, operationLease)) {
+            "Reprocess operation lease ownership lost before worker start."
+        }
+
+        val progressScope = CoroutineScope(coroutineContext)
+        val cancellation = KeplerPipelineCancellationToken()
+        val worker = when (capability.jobKind) {
+            ReprocessJobKind.RAW_FUSION ->
+                reprocessRawJob(
+                    context,
+                    target,
+                    outputSettings,
+                    resolvedSelection,
+                    cancellation = cancellation,
+                    onStatus = { message -> progressScope.launch { postProgress(message) } }
+                )
+            ReprocessJobKind.YUV_FUSION ->
+                reprocessYuvJob(
+                    context,
+                    target,
+                    outputSettings,
+                    resolvedSelection,
+                    cancellation = cancellation,
+                    onStatus = { message -> progressScope.launch { postProgress(message) } }
+                )
+            ReprocessJobKind.COLOR_BURST, ReprocessJobKind.UNSUPPORTED -> {
+                ReprocessWorkerRun(
+                    terminal = CompletableDeferred<ReprocessWorkerOutcome>().apply {
+                        complete(ReprocessWorkerOutcome(Result.failure(UnsupportedOperationException("Reprocess job is unsupported.")), false))
+                    },
+                    cancel = {}
+                )
+            }
+        }
+        session.bindWorker(worker)
+
+        // Structured terminal acquisition owns the initial timeout, cancellation callback, and
+        // bounded terminal wait. Rollback is never started before it reports a confirmed exit.
+        val terminalOutcome = acquireWorkerTerminal(worker, callerCancellation = null)
+        val finalization = settleTerminalResult(
+            session, transaction, target, capability.jobKind, outputSettings, selectionMode,
+            resolvedSelection, worker, terminalOutcome
+        )
+        return@withContext finalization.result
     } catch (callerCancellation: kotlinx.coroutines.CancellationException) {
-        val cleanup = cancelWorkerAndAwaitTerminal(worker)
-        val outcome = cleanup.getOrNull()
-        if (outcome != null) {
-            finalizeTransactionWithLease(
-                transaction, operationLease,
-                target, capability.jobKind, outputSettings, selectionMode,
-                resolvedSelection, Result.success(outcome)
+        // A caller cancellation has one owner: this branch. It either safely settles a confirmed
+        // worker exit or durably quarantines and hands late completion to the session callback.
+        val tx = transaction
+        val worker = session.worker
+        if (tx != null && worker != null) {
+            val acquisition = acquireWorkerTerminal(worker, callerCancellation)
+            settleTerminalResult(
+                session, tx, target, kind, outputSettings, selectionMode, resolvedSelection,
+                worker, acquisition
             )
-        } else {
-            val didNotExit = cleanup.exceptionOrNull() is ReprocessWorkerDidNotExitException
-            if (didNotExit) writeQuarantineMarker(transaction)
-            registerLateFinalization(worker, transaction, operationLease, target, capability, outputSettings, selectionMode, resolvedSelection)
+        } else if (tx != null) {
+            finalizeTransaction(
+                session, tx, target, kind, outputSettings, selectionMode, resolvedSelection,
+                Result.failure(callerCancellation)
+            )
         }
         throw callerCancellation
-    }
-    val terminalOutcome = if (pipelineOutcome == null) {
-        cancelWorkerAndAwaitTerminal(worker)
-    } else {
-        Result.success(pipelineOutcome)
-    }
-    val finalization = finalizeTransactionWithLease(
-        transaction, operationLease,
-        target, capability.jobKind, outputSettings, selectionMode,
-        resolvedSelection, terminalOutcome
-    )
-    if (finalization.state == ReprocessFinalizationState.QUARANTINED && terminalOutcome.isFailure) {
-        registerLateFinalization(worker, transaction, operationLease, target, capability, outputSettings, selectionMode, resolvedSelection)
-    }
-    return@withContext finalization.result
-    } catch (@Suppress("UNUSED_VARIABLE") unexpected: Exception) {
-        // Unexpected post-transaction exception: route through shared settlement.
-        // The finalizer quarantines and retains the lease if it cannot resolve.
-        val tx = transaction
-        return@withContext finalizeTransactionWithLease(
-            tx, operationLease,
-            target, capability.jobKind, outputSettings, selectionMode,
-            resolvedSelection, Result.failure(unexpected)
+    } catch (unexpected: Exception) {
+        val tx = transaction ?: run {
+            // Pre-ACTIVE unexpected: metadata is untouched beneath the lease; outer finally releases it.
+            return@withContext Result.failure(unexpected)
+        }
+        return@withContext finalizeTransaction(
+            session, tx, target, kind,
+            outputSettings, selectionMode, resolvedSelection,
+            Result.failure(unexpected)
         ).result
+    } finally {
+        // One authority for pre-transaction release; after ownership transfer the outer cleanup
+        // NEVER releases the lease — only shared settlement does.
+        session.releaseIfUnowned()
+    }
+}
+/**
+ * Structured worker terminal acquisition. Replaces ad-hoc `withTimeoutOrNull` + throwing cancel.
+ * Does not begin rollback until worker exit is confirmed. Preserves cancel failure, terminal
+ * failure, timeout, and caller cancellation through cause/suppressed linkage. Does not convert or
+ * swallow unrelated fatal [Error]s (OOM, ThreadDeath).
+ */
+internal suspend fun acquireWorkerTerminal(
+    worker: ReprocessWorkerRun,
+    callerCancellation: kotlinx.coroutines.CancellationException?
+): WorkerTerminalResult = withContext(NonCancellable) {
+    val terminal = worker.terminal
+    // The ordinary operation gets its full reprocess timeout before cancellation is requested.
+    // A caller cancellation, on the other hand, requests cancellation immediately.
+    if (callerCancellation == null && !terminal.isCompleted) {
+        try {
+            val initial = withTimeoutOrNull(reprocessTimeoutMsForTest ?: REPROCESS_TIMEOUT_MS) {
+                terminal.await()
+            }
+            if (initial != null) return@withContext WorkerTerminalResult.TerminalReceived(initial)
+        } catch (deferredFailure: Throwable) {
+            if (deferredFailure is OutOfMemoryError || deferredFailure is ThreadDeath) throw deferredFailure
+            return@withContext WorkerTerminalResult.DeferredExceptionalCompletion(deferredFailure)
+        }
+    }
+    val alreadyComplete = terminal.isCompleted
+    val cancelFailure: Throwable? = try {
+        worker.cancel()
+        null
+    } catch (cancelError: Throwable) {
+        if (cancelError is OutOfMemoryError || cancelError is ThreadDeath) throw cancelError
+        cancelError
+    }
+    if (alreadyComplete) {
+        val awaited = runCatching { terminal.await() }
+        return@withContext awaited.fold(
+            onSuccess = { outcome ->
+                if (callerCancellation != null) {
+                    WorkerTerminalResult.CallerCancelledWhileWorkerExited(outcome, callerCancellation)
+                } else {
+                    WorkerTerminalResult.TerminalReceived(outcome)
+                }
+            },
+            onFailure = { deferredFailure ->
+                if (deferredFailure is OutOfMemoryError || deferredFailure is ThreadDeath) throw deferredFailure
+                WorkerTerminalResult.DeferredExceptionalCompletion(combineCause(deferredFailure, cancelFailure))
+            }
+        )
+    }
+    val exitOutcome = try {
+        withTimeoutOrNull(reprocessWorkerExitTimeoutMsForTest ?: REPROCESS_WORKER_EXIT_TIMEOUT_MS) {
+            terminal.await()
+        }
+    } catch (deferredExceptional: Throwable) {
+        if (deferredExceptional is OutOfMemoryError || deferredExceptional is ThreadDeath) throw deferredExceptional
+        // Deferred completed exceptionally ⇒ worker exited with failure.
+        if (callerCancellation != null) {
+            runCatching { callerCancellation.addSuppressed(deferredExceptional) }
+            throw callerCancellation
+        }
+        return@withContext WorkerTerminalResult.DeferredExceptionalCompletion(combineCause(deferredExceptional, cancelFailure))
+    }
+    if (exitOutcome != null) {
+        return@withContext if (callerCancellation != null) {
+            WorkerTerminalResult.CallerCancelledWhileWorkerExited(exitOutcome, callerCancellation)
+        } else {
+            WorkerTerminalResult.WorkerExitedAfterCancellation(exitOutcome, cancelFailure)
+        }
+    }
+    // Worker did not exit before timeout. Rollback is unsafe.
+    if (callerCancellation != null) {
+        return@withContext WorkerTerminalResult.CallerCancelledWhileWorkerActive(
+            callerCancellation, cancelFailure, workerDidExit = false
+        )
+    }
+    return@withContext WorkerTerminalResult.WorkerDidNotExitBeforeTimeout(cancelFailure)
+}
+
+/**
+ * Map a [WorkerTerminalResult] into shared settlement, registering late finalization when the
+ * worker exit is uncertain. Quarantine + late-finalization paths never release the lease.
+ */
+private fun settleTerminalResult(
+    session: ReprocessTransactionSession,
+    transaction: ReprocessTransaction?,
+    target: File,
+    jobKind: ReprocessJobKind,
+    outputSettings: FinalOutputFormat,
+    selectionMode: FrameSelectionMode,
+    resolvedSelection: Set<Int>,
+    worker: ReprocessWorkerRun?,
+    acquisition: WorkerTerminalResult
+): ReprocessFinalizationResult {
+    if (transaction == null) {
+        return ReprocessFinalizationResult(
+            ReprocessFinalizationState.QUARANTINED,
+            Result.failure(IllegalStateException("No transaction available to settle terminal result."))
+        )
+    }
+    return when (acquisition) {
+        is WorkerTerminalResult.TerminalReceived -> finalizeTransaction(
+            session, transaction, target, jobKind, outputSettings, selectionMode,
+            resolvedSelection, Result.success(acquisition.outcome)
+        )
+        is WorkerTerminalResult.DeferredExceptionalCompletion -> finalizeTransaction(
+            session, transaction, target, jobKind, outputSettings, selectionMode,
+            resolvedSelection, Result.failure(acquisition.cause)
+        )
+        is WorkerTerminalResult.WorkerExitedAfterCancellation -> finalizeTransaction(
+            session, transaction, target, jobKind, outputSettings, selectionMode,
+            resolvedSelection, acquisition.outcome?.let { Result.success(it) }
+                ?: Result.failure(
+                    combineCause(
+                        IllegalStateException("Worker exited after cancellation with no outcome."),
+                        acquisition.cancelFailure
+                    )
+                )
+        )
+        is WorkerTerminalResult.CallerCancelledWhileWorkerExited -> finalizeTransaction(
+            session, transaction, target, jobKind, outputSettings, selectionMode,
+            resolvedSelection, Result.success(acquisition.outcome)
+        )
+        is WorkerTerminalResult.WorkerDidNotExitBeforeTimeout -> {
+            persistUnresolvedQuarantine(session, transaction, acquisition.cancelFailure)
+            registerLateFinalization(session, worker, target, jobKind, outputSettings, selectionMode, resolvedSelection)
+            ReprocessFinalizationResult(
+                ReprocessFinalizationState.QUARANTINED,
+                Result.failure(IllegalStateException("Reprocess worker did not exit before rollback timeout."))
+            )
+        }
+        is WorkerTerminalResult.CallerCancelledWhileWorkerActive -> {
+            persistUnresolvedQuarantine(session, transaction, acquisition.cancelFailure)
+            registerLateFinalization(session, worker, target, jobKind, outputSettings, selectionMode, resolvedSelection)
+            ReprocessFinalizationResult(
+                ReprocessFinalizationState.QUARANTINED,
+                Result.failure(acquisition.callerCancellation)
+            )
+        }
+        is WorkerTerminalResult.CancelCallbackFailed -> {
+            persistUnresolvedQuarantine(session, transaction, acquisition.cause)
+            registerLateFinalization(session, worker, target, jobKind, outputSettings, selectionMode, resolvedSelection)
+            ReprocessFinalizationResult(
+                ReprocessFinalizationState.QUARANTINED,
+                Result.failure(IllegalStateException("Reprocess cancel callback failed; worker exit unconfirmed."))
+            )
+        }
     }
 }
 
 /**
- * Shared settlement for post-transaction failures (progress, frame-selection, worker-construction).
- * Routes all failures through the single transaction finalizer as uncommitted terminal outcomes.
- * The finalizer handles rollback, quarantine, lease release per the settlement contract.
+ * Holds the session, owning lease, and late-registration state for one late finalization pass.
+ * Shared between timeout/cancellation registration and the eventual completion callback so every
+ * attempt shares the same once-guard.
  */
-private fun settlePostTransactionFailure(
-    transaction: ReprocessTransaction,
-    operationLease: JobOperationLease,
-    jobDir: File,
-    error: Throwable
-): Result<KeplerReprocessResult> {
-    val failedOutcome = ReprocessWorkerOutcome(
-        result = Result.failure(error),
-        publicExportCommitted = false,
-        exportVerified = false
-    )
-    val finalization = finalizeTransactionWithLease(
-        transaction = transaction,
-        operationLease = operationLease,
-        jobDir = jobDir,
-        jobKind = ReprocessJobKind.UNSUPPORTED,
-        outputSettings = FinalOutputFormat.PNG_DEBUG,
-        selectionMode = FrameSelectionMode.AUTO_RULE_BASED,
-        includedFrameIndices = emptySet(),
-        terminal = Result.success(failedOutcome)
-    )
-    return finalization.result
+internal data class ReprocessLateFinalizationHandoff(
+    val session: ReprocessTransactionSession,
+    val transaction: ReprocessTransaction,
+    val lease: JobOperationLease,
+    val target: File,
+    val jobKind: ReprocessJobKind,
+    val outputSettings: FinalOutputFormat,
+    val selectionMode: FrameSelectionMode,
+    val resolvedSelection: Set<Int>,
+    val workerTerminal: Deferred<ReprocessWorkerOutcome>? = null,
+    val workerOutcomeSnapshot: ReprocessWorkerOutcome = noOutcomeSnapshot
+) {
+    companion object
 }
 
-/** Register a late finalization callback on the worker's terminal for when it eventually completes.
- * Uses narrow exception boundary to avoid swallowing CancellationException, OOME, ThreadDeath, etc.
- * The callback releases the real retained lease once after safe settlement (COMMITTED/ROLLED_BACK).
- * Quarantined late completion retains the lease.
- * Registration is idempotent: only registered when no terminal outcome was obtained. */
-private fun registerLateFinalization(
-    worker: ReprocessWorkerRun,
-    transaction: ReprocessTransaction,
-    operationLease: JobOperationLease,
+private val noOutcomeSnapshot: ReprocessWorkerOutcome = ReprocessWorkerOutcome(
+    result = Result.failure(IllegalStateException("Late finalization invoked without a worker outcome.")),
+    publicExportCommitted = false,
+    exportVerified = false
+)
+
+/**
+ * Narrow internal test seam: the latest late-finalization handoff registered for the current
+ * session. Tests invoke [runLateFinalization] through this handoff (the real callback path); they
+ * must reset it in `finally`. Production code does not read this outside [registerLateFinalization].
+ */
+internal var lateFinalizationHandoffScope: ReprocessLateFinalizationHandoff? = null
+
+/**
+ * Once-only late-finalization registration. Uses the session shared once-guard so duplicate
+ * registration (timeout then cancellation, or racing completion) is ignored. The detached IO scope
+ * survives caller cancellation; the late callback invokes shared settlement exactly once via
+ * [runLateFinalization]. Late finalization failure retains backups and the lease (QUARANTINED).
+ */
+internal fun registerLateFinalization(
+    session: ReprocessTransactionSession,
+    worker: ReprocessWorkerRun?,
     target: File,
-    capability: ReprocessCapability,
+    jobKind: ReprocessJobKind,
     outputSettings: FinalOutputFormat,
     selectionMode: FrameSelectionMode,
     resolvedSelection: Set<Int>
-) {
-    val registered = AtomicBoolean(false)
-    if (!registered.compareAndSet(false, true)) return
-    worker.terminal.invokeOnCompletion { _ ->
-        // Detached IO scope survives caller cancellation; ownership is the late-finalization callback.
+): ReprocessLateFinalizationHandoff? {
+    val tx = session.transaction ?: return null
+    val lease = session.lease ?: return null
+    if (!session.tryAcquireLateRegistration()) return null
+    val handoff = ReprocessLateFinalizationHandoff(
+        session, tx, lease, target, jobKind, outputSettings, selectionMode,
+        resolvedSelection, workerTerminal = worker?.terminal
+    )
+    lateFinalizationHandoffScope = handoff
+    worker?.terminal?.invokeOnCompletion { cause ->
+        // Completion that races immediately before callback registration still finalizes once
+        // because [runLateFinalization] re-checks the session once-guard. The detached IO scope
+        // survives caller cancellation; the late callback owns settlement of the retained lease.
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val outcome = worker.terminal.await()
-                val late = finalizeTransactionWithLease(
-                    transaction, operationLease,
-                    target, capability.jobKind, outputSettings, selectionMode,
-                    resolvedSelection, Result.success(outcome)
-                )
-                // Shared finalizer already released the lease for COMMITTED/ROLLED_BACK.
-                // Only release here if the finalizer did not (QUARANTINED retains).
-                // The finalizer handles release internally; do not double-release.
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
+                runLateFinalization(handoff, cause)
             } catch (e: OutOfMemoryError) {
                 throw e
             } catch (e: ThreadDeath) {
                 throw e
+            } catch (_: kotlinx.coroutines.CancellationException) {
+                // Detached late finalization was cancelled: retain quarantine and lease.
             } catch (_: Exception) {
-                // Late finalization failure; retain quarantine and backups.
-                // The lease is retained for unresolved state.
+                ensureDurableFallbackQuarantine(handoff.target, handoff.transaction)
             }
         }
     }
+    return handoff
 }
 
 /**
+ * Late-finalization entry point. Invokes shared settlement exactly once using the worker terminal
+ * outcome (awaited from the deferred), the completion [cause], or a snapshot. Exceptional deferred
+ * completion enters shared settlement as a worker failure. Never silently swallows callback exceptions:
+ * ordinary callback failure leaves durable unresolved evidence and retains the lease.
+ */
+internal suspend fun runLateFinalization(handoff: ReprocessLateFinalizationHandoff, completionCause: Throwable?) {
+    if (!handoff.session.tryBeginFinalization()) return
+    val outcome: Result<ReprocessWorkerOutcome> = try {
+        val terminal = handoff.workerTerminal
+        if (terminal != null && terminal.isCompleted) {
+            val awaited = runCatching { terminal.await() }
+            awaited.fold(
+                onSuccess = { Result.success(it) },
+                onFailure = { deferredFailure ->
+                    // Exceptional deferred completion ⇒ worker exited with failure.
+                    Result.failure<ReprocessWorkerOutcome>(combineCause(deferredFailure, completionCause))
+                }
+            )
+        } else if (completionCause != null) {
+            Result.failure<ReprocessWorkerOutcome>(
+                combineCause(
+                    IllegalStateException("Reprocess late finalization after completion cause."),
+                    completionCause
+                )
+            )
+        } else {
+            Result.success(handoff.workerOutcomeSnapshot)
+        }
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
+    } catch (e: OutOfMemoryError) {
+        throw e
+    } catch (e: ThreadDeath) {
+        throw e
+    } catch (e: Exception) {
+        ensureDurableFallbackQuarantine(handoff.target, handoff.transaction)
+        return
+    }
+    val late = finalizeTransaction(
+        handoff.session, handoff.transaction, handoff.target, handoff.jobKind,
+        handoff.outputSettings, handoff.selectionMode, handoff.resolvedSelection, outcome
+    )
+    if (late.state == ReprocessFinalizationState.QUARANTINED) {
+        ensureDurableFallbackQuarantine(handoff.target, handoff.transaction)
+    }
+}
+
+
+/**
  * Single authoritative transaction finalizer. All post-transaction outcomes (success, failure,
- * cancellation, timeout, late completion) route through here. Handles lease release only after
- * durable COMMITTED or ROLLED_BACK. QUARANTINED retains the lease.
+ * cancellation, timeout, late completion) route through here. Enforces monotonically terminal
+ * states and idempotency. Handles lease release exactly once after durable COMMITTED or ROLLED_BACK;
+ * QUARANTINED retains the lease.
+ *
+ * A duplicate finalization of an already-terminal transaction performs no second restore, no second
+ * terminal metadata write, no cross-terminal transition, does not acquire or retain a new lease, and
+ * returns a result consistent with the existing terminal state.
+ *
+ * A committed public export never invokes restore, even when terminal metadata, checkpoint clearing,
+ * sidecar, diagnostics, or cleanup fails.
+ *
+ * Identity is strictly verified before any state transition, rollback, or cleanup uses the durable
+ * manifest; the durable manifest is authoritative and never falls back to the in-memory snapshot.
  *
  * Commit path ordering:
  *   1. Write terminal metadata and clear the commit checkpoint
@@ -489,10 +807,108 @@ private fun registerLateFinalization(
  *
  * Quarantine path ordering:
  *   1. Preserve the original error
- *   2. Attempt durable marker persistence
+ *   2. Attempt durable marker persistence (including durable fallback)
  *   3. Attempt durable QUARANTINED state
- *   4. Retain backups
- *   5. Retain the lease
+ *   4. Retain backups and the lease
+ */
+internal fun finalizeTransaction(
+    session: ReprocessTransactionSession,
+    transaction: ReprocessTransaction,
+    jobDir: File,
+    jobKind: ReprocessJobKind,
+    outputSettings: FinalOutputFormat,
+    selectionMode: FrameSelectionMode,
+    includedFrameIndices: Set<Int>,
+    terminal: Result<ReprocessWorkerOutcome>
+): ReprocessFinalizationResult {
+    val operationLease = session.lease
+        ?: return ReprocessFinalizationResult(
+            ReprocessFinalizationState.QUARANTINED,
+            Result.failure(IllegalStateException("Operation lease missing for finalization"))
+        )
+    if (!KeplerJobMetadata.isOperationOwner(jobDir, operationLease)) {
+        return ReprocessFinalizationResult(
+            ReprocessFinalizationState.QUARANTINED,
+            Result.failure(IllegalStateException("Operation lease owner mismatch during finalization"))
+        )
+    }
+    // Strict identity verification BEFORE any mutation. The durable manifest is authoritative.
+    if (!validateTransactionIdentity(jobDir, transaction)) {
+        // Backup-root evidence unavailable: durable fallback quarantine marker survives process death.
+        ensureDurableFallbackQuarantine(jobDir, transaction)
+        return ReprocessFinalizationResult(
+            ReprocessFinalizationState.QUARANTINED,
+            Result.failure(IllegalStateException("Transaction identity validation failed during finalization"))
+        )
+    }
+    val currentManifest = loadStrictManifest(File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE))
+    val outcome = terminal.getOrElse { terminalError ->
+        // Exceptional Deferred completion is a confirmed worker exit, not an unresolved timeout.
+        // It therefore follows the ordinary uncommitted rollback settlement path.
+        ReprocessWorkerOutcome(
+            result = Result.failure(terminalError),
+            publicExportCommitted = false,
+            disposition = ReprocessTerminalDisposition.UNCOMMITTED_FAILURE,
+            terminalError = terminalError
+        )
+    }
+    // Idempotency: an already terminal transaction is never re-resolved.
+    when (currentManifest.state) {
+        ReprocessTransactionState.COMMITTED -> return ReprocessFinalizationResult(
+            ReprocessFinalizationState.COMMITTED, Result.success(
+                KeplerReprocessResult(jobDir, jobKind, null, null, 0L, listOf("Already finalized: COMMITTED"))
+            )
+        )
+        ReprocessTransactionState.ROLLED_BACK -> return ReprocessFinalizationResult(
+            ReprocessFinalizationState.ROLLED_BACK, Result.failure(
+                IllegalStateException("Already finalized: ROLLED_BACK")
+            )
+        )
+        ReprocessTransactionState.ACTIVE, ReprocessTransactionState.QUARANTINED -> Unit
+    }
+
+    val hasUsableOutput = outcome.publicExportCommitted || outcome.exportVerified ||
+        (outcome.finalOutputFile?.isFile == true && outcome.finalOutputFile.length() > 0L)
+    val shouldCommit = (outcome.disposition == ReprocessTerminalDisposition.VERIFIED_SUCCESS ||
+        outcome.disposition == ReprocessTerminalDisposition.COMMITTED_PARTIAL ||
+        outcome.publicExportCommitted) && hasUsableOutput
+
+    return if (shouldCommit) {
+        val commitResult = runCatching {
+            finalizeReprocessOutcome(
+                jobDir, jobKind, outputSettings, selectionMode, includedFrameIndices, outcome, transaction
+            )
+        }
+        commitResult.fold(
+            onSuccess = { committed ->
+                try {
+                    writeTransactionState(transaction, ReprocessTransactionState.COMMITTED)
+                } catch (e: Exception) {
+                    if (e is OutOfMemoryError || e is ThreadDeath) throw e
+                    return@fold quarantineWithPersistence(transaction, e)
+                }
+                runCatching { removeQuarantineMarker(transaction) }
+                runCatching { cleanupBackups(transaction) }
+                try { operationLease.release() } catch (_: Throwable) {}
+                ReprocessFinalizationResult(ReprocessFinalizationState.COMMITTED, Result.success(committed))
+            },
+            onFailure = { metadataError ->
+                if (outcome.publicExportCommitted) {
+                    // Public export committed but terminal metadata failed: quarantine, never rollback.
+                    return@fold quarantineWithPersistence(transaction, metadataError)
+                }
+                rollback(transaction, operationLease, jobDir, jobKind, outcome, metadataError)
+            }
+        )
+    } else {
+        rollback(transaction, operationLease, jobDir, jobKind, outcome,
+            outcome.terminalError ?: IllegalStateException("Reprocess worker failed."))
+    }
+}
+
+/**
+ * Legacy entry compatible with [ReprocessTransaction]-and-lease tests. Constructs a transient
+ * session so the strict finalizer's lease/identity/idempotency checks are exercised for real.
  */
 internal fun finalizeTransactionWithLease(
     transaction: ReprocessTransaction,
@@ -504,130 +920,51 @@ internal fun finalizeTransactionWithLease(
     includedFrameIndices: Set<Int>,
     terminal: Result<ReprocessWorkerOutcome>
 ): ReprocessFinalizationResult {
-    val backupRoot = transaction.backupRoot
-
-    // Validate transaction integrity — fail closed
-    if (!backupRoot.isDirectory) {
-        return quarantineNoMutation(operationLease, IllegalStateException("Transaction backup root missing: $backupRoot"))
-    }
-    val manifestFile = File(backupRoot, REPROCESS_TX_MANIFEST_FILE)
-    if (!manifestFile.isFile) {
-        return quarantineNoMutation(operationLease, IllegalStateException("Transaction manifest missing for finalization"))
-    }
-    val currentManifest = runCatching { ReprocessTransactionManifest.fromJson(JSONObject(manifestFile.readText())) }.getOrNull()
-        ?: return quarantineNoMutation(operationLease, IllegalStateException("Transaction manifest unreadable for finalization"))
-    if (currentManifest.transactionId != transaction.transactionId) {
-        return quarantineNoMutation(operationLease, IllegalStateException("Transaction ID mismatch during finalization"))
-    }
-
-    val outcome = terminal.getOrElse { terminalError ->
-        // Terminal error = never received worker outcome. Quarantine and retain.
-        return quarantineWithPersistence(transaction, operationLease, terminalError)
-    }
-
-    // If already terminal, do not re-run finalization (idempotent)
-    val currentState = currentManifest.state
-    if (currentState == ReprocessTransactionState.COMMITTED || currentState == ReprocessTransactionState.ROLLED_BACK) {
-        val existingState = when (currentState) {
-            ReprocessTransactionState.COMMITTED -> ReprocessFinalizationState.COMMITTED
-            ReprocessTransactionState.ROLLED_BACK -> ReprocessFinalizationState.ROLLED_BACK
-            else -> ReprocessFinalizationState.QUARANTINED
-        }
-        val terminalResult = terminal.fold(
-            onSuccess = { Result.success(KeplerReprocessResult(jobDir, jobKind, null, null, 0L, listOf("Already finalized: ${currentState.name}"))) },
-            onFailure = { Result.failure(it) }
-        )
-        // Already resolved — lease was released by the first finalization pass.
-        // Do NOT release again. The late callback must also not double-release.
-        return ReprocessFinalizationResult(existingState, terminalResult)
-    }
-
-    // Commit path: VERIFIED_SUCCESS, COMMITTED_PARTIAL, or publicExportCommitted
-    // An uncommitted apparent success with no usable local/public output must go to rollback.
-    val hasUsableOutput = outcome.publicExportCommitted || outcome.exportVerified ||
-        (outcome.finalOutputFile?.isFile == true && outcome.finalOutputFile.length() > 0L)
-    val shouldCommit = (outcome.disposition == ReprocessTerminalDisposition.VERIFIED_SUCCESS ||
-        outcome.disposition == ReprocessTerminalDisposition.COMMITTED_PARTIAL ||
-        outcome.publicExportCommitted) && hasUsableOutput
-
-    if (shouldCommit) {
-        val commitResult = runCatching {
-            // 1. Write terminal metadata and clear the commit checkpoint
-            finalizeReprocessOutcome(
-                jobDir, jobKind, outputSettings, selectionMode, includedFrameIndices, outcome, transaction
-            )
-        }
-        return commitResult.fold(
-            onSuccess = { committed ->
-                // 2. Durably write COMMITTED
-                try {
-                    writeTransactionState(transaction, ReprocessTransactionState.COMMITTED)
-                } catch (e: Exception) {
-                    // State write failed; quarantine and retain backups and lease.
-                    return quarantineWithPersistence(transaction, operationLease, e)
-                }
-                // 3. Remove quarantine marker if present
-                runCatching { removeQuarantineMarker(transaction) }
-                // 4. Best-effort cleanup of backup payloads/root
-                runCatching { cleanupBackups(transaction) }
-                // 5. Release the operation lease
-                operationLease.release()
-                ReprocessFinalizationResult(ReprocessFinalizationState.COMMITTED, Result.success(committed))
-            },
-            onFailure = { metadataError ->
-                // Terminal metadata write failed after MediaStore output already committed.
-                // Public export cannot be rolled back → quarantine, retain backups and lease.
-                if (outcome.publicExportCommitted) {
-                    return quarantineWithPersistence(transaction, operationLease, metadataError)
-                }
-                // No public export committed — metadata failure before commit → rollback path
-                // Fall through to rollback path below
-                rollback(transaction, operationLease, jobDir, jobKind, outcome, metadataError)
-            }
-        )
-    }
-
-    // Rollback path
-    return rollback(transaction, operationLease, jobDir, jobKind, outcome,
-        outcome.terminalError ?: IllegalStateException("Reprocess worker failed."))
+    val session = ReprocessTransactionSession(jobDir)
+    session.bindForLegacyFinalizer(transaction, operationLease)
+    return finalizeTransaction(
+        session, transaction, jobDir, jobKind, outputSettings, selectionMode,
+        includedFrameIndices, terminal
+    )
 }
 
-/** Quarantine without mutating job files (backup root/manifest invalid). Retains lease. */
-private fun quarantineNoMutation(operationLease: JobOperationLease, error: Throwable): ReprocessFinalizationResult {
-    // Cannot write quarantine marker or state — root/manifest is invalid.
-    // Retain the lease; do NOT release it (unresolved → invariant 5).
-    return ReprocessFinalizationResult(ReprocessFinalizationState.QUARANTINED, Result.failure(error))
-}
 
-/** Quarantine with durable marker + state persistence. Retains lease. Combines errors. */
-private fun quarantineWithPersistence(
+/** Quarantine with durable marker + state persistence. Retains lease. Preserves the original error
+ *  and links marker/state failures through suppressed attachments. */
+internal fun quarantineWithPersistence(
     transaction: ReprocessTransaction,
-    operationLease: JobOperationLease,
     originalError: Throwable
 ): ReprocessFinalizationResult {
-    var combinedError = originalError
+    val canonicalError = originalError
     var markerError: Throwable? = null
     var stateError: Throwable? = null
     try {
-        writeQuarantineMarker(transaction)
+        runCatching { writeQuarantineMarker(transaction) }
+            .exceptionOrNull()?.let { markerError = it }
     } catch (e: Exception) {
+        if (e is OutOfMemoryError || e is ThreadDeath) throw e
         markerError = e
     }
     try {
         writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED)
     } catch (e: Exception) {
+        if (e is OutOfMemoryError || e is ThreadDeath) throw e
         stateError = e
     }
-    if (markerError != null || stateError != null) {
-        combinedError = RuntimeException("Quarantine persistence failed after processing error", originalError)
-        markerError?.let { combinedError.addSuppressed(it) }
-        stateError?.let { combinedError.addSuppressed(it) }
-    }
-    return ReprocessFinalizationResult(ReprocessFinalizationState.QUARANTINED, Result.failure(combinedError))
+    val combined = if (markerError != null || stateError != null) {
+        combineCauseWithMessage(canonicalError, "Quarantine persistence failed after processing error", markerError)
+            .also { stateError?.let { se -> runCatching { it.addSuppressed(se) } } }
+    } else canonicalError
+    ensureDurableFallbackQuarantine(transaction.backupRoot.parentFile ?: transaction.backupRoot, transaction)
+    return ReprocessFinalizationResult(ReprocessFinalizationState.QUARANTINED, Result.failure(combined))
 }
 
-/** Exact rollback path. Returns ROLLED_BACK (leases released) or QUARANTINED (lease retained). */
-private fun rollback(
+/**
+ * Exact rollback path. Returns ROLLED_BACK (lease released) or QUARANTINED (lease retained).
+ * Does not begin target mutation until every backup and the durable manifest have been validated.
+ * Preserves the original error and links restore/deletion/state failures through suppressed attachments.
+ */
+internal fun rollback(
     transaction: ReprocessTransaction,
     operationLease: JobOperationLease,
     jobDir: File,
@@ -635,16 +972,22 @@ private fun rollback(
     outcome: ReprocessWorkerOutcome,
     error: Throwable
 ): ReprocessFinalizationResult {
-    // 1. Validate every backup before mutating any target
-    // 2. Restore all backed-up files (exact rollback)
-    val restoreSuccess = restoreBackups(jobDir, transaction).isSuccess
-    if (!restoreSuccess) {
-        return quarantineWithPersistence(transaction, operationLease,
-            IllegalStateException("Rollback restore failed: ${error.message}", error))
+    val restore = restoreBackups(jobDir, transaction)
+    if (restore.isFailure) {
+        val restoreError = restore.exceptionOrNull()
+            ?: IllegalStateException("Rollback restore failed without a cause")
+        val linked = combineCauseWithMessage(
+            error, "Rollback restore failed: ${restoreError.message}", restoreError
+        )
+        return quarantineWithPersistence(transaction, linked)
     }
-    // 3. Remove transaction-created mutable files
-    removeTransactionCreatedFiles(jobDir, transaction)
-    // 4. Write terminal failure/cancellation metadata
+    removeTransactionCreatedFiles(jobDir, transaction, error)
+        .exceptionOrNull()?.let { deleteError ->
+            return quarantineWithPersistence(
+                transaction,
+                combineCauseWithMessage(error, "Created-file deletion failed during rollback", deleteError)
+            )
+        }
     val metadataError = try {
         if (outcome.disposition == ReprocessTerminalDisposition.CANCELLED) {
             writeReprocessCancelled(jobDir, error.message)
@@ -653,20 +996,23 @@ private fun rollback(
         }
         null
     } catch (metadataFailure: Exception) {
+        if (metadataFailure is OutOfMemoryError || metadataFailure is ThreadDeath) throw metadataFailure
         metadataFailure
     }
     if (metadataError != null) {
-        return quarantineWithPersistence(transaction, operationLease, metadataError)
+        return quarantineWithPersistence(
+            transaction, combineCauseWithMessage(error, "Terminal metadata failure during rollback", metadataError)
+        )
     }
-    // 5. Durably write ROLLED_BACK
     try {
         writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
-    } catch (e: Exception) {
-        return quarantineWithPersistence(transaction, operationLease, e)
+    } catch (stateFailure: Exception) {
+        if (stateFailure is OutOfMemoryError || stateFailure is ThreadDeath) throw stateFailure
+        return quarantineWithPersistence(
+            transaction, combineCauseWithMessage(error, "State persistence failure during rollback", stateFailure)
+        )
     }
-    // 6. Remove quarantine marker if present
     runCatching { removeQuarantineMarker(transaction) }
-    // 7. Best-effort cleanup
     val cleanupSuccess = runCatching { cleanupBackups(transaction) }.getOrDefault(false)
     if (!cleanupSuccess) {
         runCatching {
@@ -675,26 +1021,65 @@ private fun rollback(
             }
         }
     }
-    // 8. Release the operation lease
-    operationLease.release()
+    // Lease release only after durable ROLLED_BACK; QUARANTINED retains it.
+    try { operationLease.release() } catch (_: Throwable) {}
     return ReprocessFinalizationResult(ReprocessFinalizationState.ROLLED_BACK, Result.failure(error))
 }
 
-/** Remove files that were created by this transaction and are not pre-existing or backed-up. */
-private fun removeTransactionCreatedFiles(jobDir: File, transaction: ReprocessTransaction) {
+/**
+ * Remove files created by this transaction that are safe, mutable, and proven not to have existed
+ * before the transaction. Immutable source frames and unrelated pre-existing files are untouched.
+ * Deletion failure means rollback is not safely complete and must quarantine.
+ */
+private fun removeTransactionCreatedFiles(
+    jobDir: File,
+    transaction: ReprocessTransaction,
+    originalError: Throwable
+): Result<Unit> = runCatching {
     val manifest = transaction.manifest
     val preExisting = manifest.preExistingPaths
     val backedUp = manifest.backedUpPaths
     val backupRootName = transaction.backupRoot.name
+    val backupRootCanonical = transaction.backupRoot.canonicalFile
     jobDir.listFiles()?.filter { it.isFile }?.forEach { file ->
         val name = file.name
-        if (name !in preExisting && name !in backedUp && name != backupRootName && name != JOB_JSON_FILE_NAME) {
-            if (manifest.isNewlyCreated(name)) {
-                runCatching { file.delete() }
-            }
+        if (name == JOB_JSON_FILE_NAME) return@forEach
+        if (name == backupRootName) return@forEach
+        if (name in preExisting) return@forEach
+        if (name in backedUp) return@forEach
+        if (!isReprocessCreatedOutputFile(name)) return@forEach
+        // Defensive: never delete anything inside or matching the backup root.
+        if (file.canonicalFile == backupRootCanonical) return@forEach
+        if (!runCatching { file.delete() }.getOrDefault(false) && file.exists()) {
+            throw combineCauseWithMessage(
+                originalError,
+                "Created-file deletion failed: $name",
+                IllegalStateException("Failed to delete created file: $name")
+            )
         }
     }
 }
+
+/** Narrow test seam for the real created-file removal path. */
+internal fun removeTransactionCreatedFilesForTest(
+    jobDir: File,
+    transaction: ReprocessTransaction
+): Result<Unit> = removeTransactionCreatedFiles(
+    jobDir,
+    transaction,
+    IllegalStateException("Protocol test created-file cleanup")
+)
+
+private fun isReprocessCreatedOutputFile(name: String): Boolean {
+    val lower = name.lowercase(Locale.US)
+    if (name.startsWith(REPROCESS_PREVIEW_PREFIX)) return true
+    if (lower.contains("final") || lower.contains("preview") || lower.contains("diagnostic")) return true
+    if (lower.endsWith(".tmp") || lower.endsWith(".restore")) return true
+    if (lower.startsWith("merged_raw") || lower.contains("merged_yuv") || lower.contains("intermediate")) return true
+    if (lower.endsWith(".rgba") || lower.endsWith(".rgb") || lower.endsWith(".bin")) return true
+    return false
+}
+
 
 /**
  * Finalizes the reprocess outcome metadata and checkpoints only.
@@ -764,15 +1149,27 @@ private fun finalizeReprocessOutcome(
     )
 }
 
+/**
+ * Tests-only helper that cancels a worker and awaits its terminal outcome. Production code uses
+ * [acquireWorkerTerminal] which preserves cancel-failure, timeout, and caller-cancellation linkage.
+ */
 internal suspend fun cancelWorkerAndAwaitTerminal(
     worker: ReprocessWorkerRun
 ): Result<ReprocessWorkerOutcome> = withContext(NonCancellable) {
-    worker.cancel()
-    val outcome = withTimeoutOrNull(REPROCESS_WORKER_EXIT_TIMEOUT_MS) { worker.terminal.await() }
-    if (outcome == null) {
-        Result.failure(ReprocessWorkerDidNotExitException("Reprocess worker did not exit before rollback timeout."))
-    } else {
-        Result.success(outcome)
+    val result = acquireWorkerTerminal(worker, callerCancellation = null)
+    when (result) {
+        is WorkerTerminalResult.TerminalReceived -> Result.success(result.outcome)
+        is WorkerTerminalResult.WorkerExitedAfterCancellation ->
+            result.outcome?.let { Result.success(it) }
+                ?: Result.failure(IllegalStateException("Worker exited with no outcome."))
+        is WorkerTerminalResult.DeferredExceptionalCompletion -> Result.failure(result.cause)
+        is WorkerTerminalResult.CancelCallbackFailed ->
+            Result.failure(ReprocessWorkerDidNotExitException("Reprocess cancel callback failed; worker exit unconfirmed."))
+        is WorkerTerminalResult.WorkerDidNotExitBeforeTimeout ->
+            Result.failure(ReprocessWorkerDidNotExitException("Reprocess worker did not exit before rollback timeout."))
+        is WorkerTerminalResult.CallerCancelledWhileWorkerExited -> Result.success(result.outcome)
+        is WorkerTerminalResult.CallerCancelledWhileWorkerActive ->
+            Result.failure(result.callerCancellation)
     }
 }
 
@@ -817,21 +1214,25 @@ internal fun writeQuarantineMarker(transaction: ReprocessTransaction) {
 }
 
 /**
- * Single authoritative atomic state writer. Validates monotonic state transitions.
- * Throws on any failure — state persistence is mandatory and must not be silently ignored.
- * Failure here leaves the transaction unresolved; caller must not release the operation lease.
- * Rejects: terminal → ACTIVE, terminal → QUARANTINED, COMMITTED → ROLLED_BACK,
- * ROLLED_BACK → COMMITTED, transaction-ID mismatch, invalid/incomplete manifest.
- * Same-terminal writes are idempotent.
+ * Single authoritative atomic state writer. Validates monotonic state transitions and durable
+ * transaction identity using the strict manifest parser. Throws on any failure — state persistence
+ * is mandatory and must not be silently ignored. Failure leaves the transaction unresolved and the
+ * caller must not release the operation lease. Rejects terminal → ACTIVE/QUARANTINED and any
+ * cross-terminal transition; same-terminal writes are idempotent.
  */
 internal fun writeTransactionState(transaction: ReprocessTransaction, state: ReprocessTransactionState) {
     val root = transaction.backupRoot
     val manifestFile = File(root, REPROCESS_TX_MANIFEST_FILE)
-    check(manifestFile.isFile) { "Transaction manifest missing for state write: $state" }
-    val json = JSONObject(manifestFile.readText())
-    val currentManifest = ReprocessTransactionManifest.fromJson(json)
-    check(currentManifest.transactionId == transaction.transactionId) {
+    require(manifestFile.isFile) { "Transaction manifest missing for state write: $state" }
+    val currentManifest = loadStrictManifest(manifestFile)
+    require(currentManifest.transactionId == transaction.transactionId) {
         "Transaction ID mismatch: manifest=${currentManifest.transactionId}, expected=${transaction.transactionId}"
+    }
+    require(currentManifest.createdAt == transaction.manifest.createdAt) {
+        "Transaction createdAt mismatch during state write"
+    }
+    require(currentManifest == transaction.manifest) {
+        "Transaction manifest drift during state write"
     }
     val currentState = currentManifest.state
     // Idempotent for same-terminal writes
@@ -840,6 +1241,59 @@ internal fun writeTransactionState(transaction: ReprocessTransaction, state: Rep
     val updatedManifest = currentManifest.copy(state = state)
     KeplerJobMetadata.atomicWrite(manifestFile, updatedManifest.toJson().toString(2))
 }
+
+/**
+ * Persist durable unresolved/quarantine evidence when a worker exit is uncertain (timeout, cancel
+ * callback failure, caller cancellation while active). Tries the in-backup-root quarantine marker
+ * first, then the job-level durable fallback marker. Never throws — callers rethrow caller
+ * cancellation. Always registers late finalization afterwards through [settleTerminalResult].
+ */
+internal fun persistUnresolvedQuarantine(
+    session: ReprocessTransactionSession,
+    transaction: ReprocessTransaction,
+    cancelFailure: Throwable?
+) {
+    var markerFailure: Throwable? = null
+    var stateFailure: Throwable? = null
+    try {
+        runCatching { writeQuarantineMarker(transaction) }.exceptionOrNull()?.let { markerFailure = it }
+    } catch (e: Exception) {
+        if (e is OutOfMemoryError || e is ThreadDeath) throw e
+        markerFailure = e
+    }
+    if (markerFailure == null) {
+        try {
+            writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED)
+        } catch (e: Exception) {
+            if (e is OutOfMemoryError || e is ThreadDeath) throw e
+            stateFailure = e
+        }
+    }
+    // Job-level durable fallback quarantine marker survives process death when the backup root is
+    // missing or state persistence is impossible.
+    ensureDurableFallbackQuarantine(transaction.backupRoot.parentFile ?: transaction.backupRoot, transaction)
+    if (cancelFailure != null && (markerFailure != null || stateFailure != null)) {
+        runCatching { cancelFailure.addSuppressed(markerFailure ?: stateFailure ?: return) }
+    }
+}
+
+/**
+ * Job-level durable fallback quarantine marker. Survives process death when the backup-root marker
+ * or in-backup-root QUARANTINED state cannot be persisted. Inspected by [isReprocessQuarantined]
+ * and [recoverValidatedQuarantine] so process restart never treats a missing backup root as safe.
+ */
+internal fun ensureDurableFallbackQuarantine(jobDir: File, transaction: ReprocessTransaction) {
+    if (!jobDir.isDirectory) return
+    val marker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
+    if (marker.exists()) return
+    val payload = buildString {
+        append("transactionId="); append(transaction.transactionId); append('\n')
+        append("backupRoot="); append(transaction.backupRoot.name); append('\n')
+        append("createdAt="); append(System.currentTimeMillis()); append('\n')
+    }
+    runCatching { KeplerJobMetadata.atomicWrite(marker, payload) }
+}
+
 
 /** Remove the quarantine marker only after a safe commit or rollback.
  * Throwing on marker removal failure is not required — the terminal state is already durable.
@@ -860,17 +1314,17 @@ internal fun removeQuarantineMarker(transaction: ReprocessTransaction) {
  * A valid terminal manifest remains authoritative if cleanup artifacts remain.
  */
 internal fun isReprocessQuarantined(jobDir: File): Boolean {
-    var anyRoot = false
+    val fallbackMarker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
+    if (fallbackMarker.isFile) return true
     jobDir.listFiles()?.forEach { child ->
         if (child.isDirectory && child.name.startsWith(".reprocess_backup_")) {
-            anyRoot = true
             when (classifyTransactionManifest(child)) {
                 is ManifestClassification.Unresolved -> return true
                 is ManifestClassification.Resolved -> { /* resolved roots do not block */ }
             }
         }
     }
-    return false // no unresolved root found; resolved roots or no roots are fine
+    return false
 }
 
 /**
@@ -883,28 +1337,36 @@ internal fun isReprocessQuarantined(jobDir: File): Boolean {
  *   no backup payload, and no transaction-related temporary evidence.
  * - Valid COMMITTED/ROLLED_BACK roots may be cleaned best-effort.
  * - Process-local active operations are never recovered concurrently.
- * - Multiple roots are handled independently; the aggregate job remains blocked if any unresolved root remains.
+ * - Multiple roots are handled independently; the aggregate job remains blocked if any unresolved
+ *   root remains, or if the durable job-level fallback marker survives.
  */
 internal fun recoverValidatedQuarantine(jobDir: File) {
     if (KeplerJobMetadata.isOperationActive(jobDir)) return
+    val fallbackMarker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
+    // The durable fallback marker alone proves the job has unresolved reprocess evidence even when
+    // no backup root survived process death. Do NOT delete it merely because the in-memory lease
+    // disappeared.
+    val hasFallback = fallbackMarker.isFile
+    var anyUnresolvedRoot = hasFallback
     jobDir.listFiles()?.forEach { child ->
         if (child.isDirectory && child.name.startsWith(".reprocess_backup_")) {
             val classification = classifyTransactionManifest(child)
             when (classification) {
                 is ManifestClassification.Unresolved -> {
-                    // Preserve unresolved evidence — do NOT delete.
-                    // Only remove a truly empty/abandoned root (no evidence at all).
+                    anyUnresolvedRoot = true
                     if (isRootEvidenceFree(child)) {
                         child.delete()
                     }
                 }
                 is ManifestClassification.Resolved -> {
-                    // Valid terminal root: best-effort cleanup of backup payloads/root.
-                    // Leaves terminal manifest until cleanup is safe.
                     cleanupTerminalRoot(child)
                 }
             }
         }
+    }
+    // Only remove the fallback marker once every backup root is resolved and evidence-free.
+    if (!anyUnresolvedRoot && hasFallback) {
+        runCatching { fallbackMarker.delete() }
     }
 }
 
@@ -920,18 +1382,41 @@ private fun isRootEvidenceFree(root: File): Boolean {
     }
 }
 
-/** Best-effort cleanup of a valid terminal root. Deletes payloads first, manifest last, root only if empty. */
+/**
+ * Best-effort cleanup of a strictly validated terminal root used by process-restart recovery.
+ * Shares the cleanup contract with [cleanupBackups]: never delete the terminal manifest while any
+ * unknown content remains; delete the manifest last; remove the root only when empty; never delete
+ * terminal evidence after a failed payload deletion.
+ */
 private fun cleanupTerminalRoot(root: File) {
     val children = root.listFiles() ?: return
-    // Delete backup payloads and temp artifacts first
-    children.filter { it.isFile && it.name != REPROCESS_TX_MANIFEST_FILE && it.name != REPROCESS_QUARANTINE_MARKER }
-        .forEach { file -> runCatching { file.delete() } }
-    // Delete quarantine marker
-    children.firstOrNull { it.name == REPROCESS_QUARANTINE_MARKER }?.let { runCatching { it.delete() } }
-    // Delete manifest last
-    children.firstOrNull { it.name == REPROCESS_TX_MANIFEST_FILE }?.let { runCatching { it.delete() } }
-    // Remove root only if empty
-    if (root.listFiles()?.isEmpty() == true) root.delete()
+    val manifestFile = children.firstOrNull { it.name == REPROCESS_TX_MANIFEST_FILE } ?: return
+    val durable = runCatching { loadStrictManifest(manifestFile) }.getOrNull() ?: return
+    val state = durable.state
+    if (state != ReprocessTransactionState.COMMITTED && state != ReprocessTransactionState.ROLLED_BACK) return
+    val knownNames = durable.backupEntries.keys.map { "$it$BACKUP_ENTRY_SUFFIX" }.toSet() +
+        setOf(REPROCESS_QUARANTINE_MARKER, REPROCESS_TX_MANIFEST_FILE)
+    val cleanupDelete = cleanupDeleteOperation
+    // Delete known payloads and temp artifacts first (files then directories).
+    children.sortedBy { it.isDirectory }.forEach { entry ->
+        if (entry.name == REPROCESS_TX_MANIFEST_FILE) return@forEach
+        if (entry.name in knownNames || entry.name.endsWith(".tmp") || entry.name.endsWith(".restore") || entry.isDirectory) {
+            runCatching { cleanupDelete(entry) }
+        }
+    }
+    // Unknown content remaining? Do NOT delete the manifest.
+    val remainingUnknown = root.listFiles()?.filter { it.name !in knownNames }.orEmpty()
+    if (remainingUnknown.isNotEmpty()) return
+    // Delete manifest last.
+    val remainingAfterPayloads = root.listFiles() ?: return
+    if (remainingAfterPayloads.any { it.name != REPROCESS_TX_MANIFEST_FILE && it.name != REPROCESS_QUARANTINE_MARKER }) return
+    remainingAfterPayloads.firstOrNull { it.name == REPROCESS_QUARANTINE_MARKER }?.let { runCatching { cleanupDelete(it) } }
+    runCatching { cleanupDelete(manifestFile) }
+    // Remove root only when actually empty.
+    val finalContents = root.listFiles()
+    if (finalContents == null || finalContents.isEmpty()) {
+        runCatching { root.delete() }
+    }
 }
 
 fun detectReprocessCapability(context: Context, jobDir: File): ReprocessCapability {
@@ -1177,23 +1662,58 @@ internal data class ReprocessTransactionManifest(
     }
 
     companion object {
+        /**
+         * Single strict parser used by classifier, rollback, cleanup, recovery, and state writer.
+         * Throws on any structural violation so the caller can degrade closed (Unresolved).
+         * A structurally valid legacy manifest missing only `state` remains ACTIVE.
+         */
         fun fromJson(json: JSONObject): ReprocessTransactionManifest {
-            val txId = json.optString("transactionId")
+            val txId = json.optString("transactionId").orEmpty()
             require(txId.isNotBlank()) { "Transaction ID is blank" }
-            val createdAt = json.optLong("createdAt")
+            val createdAt = json.optLong("createdAt", 0L)
             require(createdAt > 0L) { "Transaction createdAt is invalid: $createdAt" }
-            val preExisting = json.optJSONArray("preExistingPaths")?.toStringSet().orEmpty()
-            val backedUp = json.optJSONArray("backedUpPaths")?.toStringSet().orEmpty()
-            val entriesJson = json.optJSONObject("backupEntries") ?: JSONObject()
+            val preExistingArray = json.optJSONArray("preExistingPaths")
+                ?: throw IllegalArgumentException("preExistingPaths missing")
+            val backedUpArray = json.optJSONArray("backedUpPaths")
+                ?: throw IllegalArgumentException("backedUpPaths missing")
+            val preExisting = preExistingArray.toStringSetStrict()
+            val backedUp = backedUpArray.toStringSetStrict()
+            // Backup entries are required; every backed-up path must have an entry, and vice versa.
+            val entriesJson = json.optJSONObject("backupEntries")
+                ?: throw IllegalArgumentException("backupEntries missing")
             val backupEntries = mutableMapOf<String, BackupEntry>()
             entriesJson.keys().forEach { name ->
-                val entryJson = entriesJson.optJSONObject(name) ?: return@forEach
-                backupEntries[name] = BackupEntry.fromJson(entryJson)
+                require(isStrictRelativePath(name)) { "Unsafe backup entry key: $name" }
+                val entryJson = entriesJson.optJSONObject(name)
+                    ?: throw IllegalArgumentException("Malformed backup entry: $name")
+                val entry = BackupEntry.fromJson(entryJson)
+                require(name == entry.relativePath) { "Backup entry key/target mismatch: $name" }
+                require(backupEntries.values.none { it.backupName == entry.backupName }) {
+                    "Duplicate backup file name: ${entry.backupName}"
+                }
+                backupEntries[name] = entry
             }
-            val newlyCreated = json.optJSONArray("newlyCreatedPaths")?.toStringSet().orEmpty()
+            require(backupEntries.isNotEmpty() || backedUp.isEmpty()) {
+                "backupEntries absent on non-empty backedUpPaths"
+            }
+            require(backupEntries.keys.toSet() == backedUp) {
+                "backupEntries/backedUpPaths mismatch: entries=${backupEntries.keys}, backedUp=$backedUp"
+            }
+            for (entry in backupEntries.values) {
+                require(entry.relativePath in backedUp) {
+                    "backupEntry ${entry.backupName} target ${entry.relativePath} not in backedUpPaths"
+                }
+            }
+            require(preExisting.containsAll(backedUp)) {
+                "backed-up paths must be a subset of pre-existing paths"
+            }
+            val newlyCreated = json.optJSONArray("newlyCreatedPaths")?.toStringSetStrict().orEmpty()
             val state = if (json.has("state") && !json.isNull("state")) {
-                ReprocessTransactionState.valueOf(json.optString("state"))
+                val name = json.optString("state")
+                runCatching { ReprocessTransactionState.valueOf(name) }.getOrNull()
+                    ?: throw IllegalArgumentException("Unknown transaction state: $name")
             } else {
+                // Legacy structurally valid manifest missing only `state` remains ACTIVE.
                 ReprocessTransactionState.ACTIVE
             }
             return ReprocessTransactionManifest(
@@ -1207,11 +1727,28 @@ internal data class ReprocessTransactionManifest(
             )
         }
 
-        private fun JSONArray?.toStringSet(): Set<String> = buildSet {
-            if (this@toStringSet == null) return@buildSet
-            repeat(length()) { i -> add(optString(i)) }
+        private fun JSONArray.toStringSetStrict(): Set<String> {
+            val out = LinkedHashSet<String>(length())
+            repeat(length()) { i ->
+                val raw = optString(i).orEmpty()
+                require(isStrictRelativePath(raw)) { "Unsafe or invalid manifest path: $raw" }
+                require(raw !in out) { "Duplicate manifest path: $raw" }
+                out += raw
+            }
+            return out
         }
     }
+}
+
+/**
+ * Strict durable manifest loader. Reads and fully validates [manifestFile] using the single
+ * authoritative parser. Returns null on any I/O, JSON, structural, unsafe, or unknown-state
+ * failure so callers can fail closed. Never falls back to an in-memory snapshot.
+ */
+internal fun loadStrictManifest(manifestFile: File): ReprocessTransactionManifest {
+    require(manifestFile.isFile) { "Manifest file missing: ${manifestFile.absolutePath}" }
+    val json = JSONObject(manifestFile.readText())
+    return ReprocessTransactionManifest.fromJson(json)
 }
 
 internal data class BackupEntry(
@@ -1226,16 +1763,17 @@ internal data class BackupEntry(
         .put("originalLength", originalLength)
         .put("sha256", sha256)
     companion object {
+        private val HEX256 = Regex("^[0-9a-f]{64}$")
         fun fromJson(json: JSONObject): BackupEntry {
-            val backupName = json.optString("backupName")
-            val relativePath = json.optString("relativePath")
-            val originalLength = json.optLong("originalLength")
-            val sha256 = json.optString("sha256")
+            val backupName = json.optString("backupName").orEmpty()
+            val relativePath = json.optString("relativePath").orEmpty()
+            val originalLength = json.optLong("originalLength", -1L)
+            val sha256 = json.optString("sha256").orEmpty()
             require(backupName.isNotBlank()) { "backupName is blank" }
-            require(relativePath.isNotBlank()) { "relativePath is blank" }
-            require(!relativePath.contains("..") && !File(relativePath).isAbsolute) { "Unsafe relative path: $relativePath" }
+            require(isStrictRelativePath(relativePath)) { "Unsafe relative path: $relativePath" }
+            require(isStrictRelativePath(backupName)) { "Unsafe backup name: $backupName" }
             require(originalLength >= 0L) { "Invalid originalLength: $originalLength" }
-            require(sha256.length == 64) { "Invalid SHA-256 digest length: ${sha256.length}" }
+            require(HEX256.matches(sha256)) { "Invalid SHA-256 digest: $sha256" }
             return BackupEntry(backupName, relativePath, originalLength, sha256)
         }
     }
@@ -1248,13 +1786,64 @@ internal data class ReprocessTransaction(
     val backups: List<ReprocessBackup>
 )
 
-/** True if the file is an immutable source frame that must never be backed up by reprocess transactions. */
-private fun isImmutableSourceFrame(file: File): Boolean {
+/**
+ * Validate that [transaction] is internally consistent and that every backed-up path maps to a
+ * file that lives strictly inside [jobDir]. Returns true only when the durable manifest and the
+ * in-memory manifest agree on identity and every entry has safe relative target and backup paths
+ * that live inside the expected job and backup roots.
+ */
+internal fun validateTransactionIdentity(
+    jobDir: File,
+    transaction: ReprocessTransaction
+): Boolean {
+    val canonicalJob = jobDir.canonicalFile
+    val canonicalBackup = transaction.backupRoot.canonicalFile
+    val expectedParent = canonicalJob
+    if (canonicalBackup.parentFile?.canonicalFile != expectedParent) return false
+    if (!canonicalBackup.name.startsWith(".reprocess_backup_")) return false
+    val manifestFile = File(canonicalBackup, REPROCESS_TX_MANIFEST_FILE)
+    if (!manifestFile.isFile) return false
+    val durable = runCatching { loadStrictManifest(manifestFile) }.getOrNull() ?: return false
+    if (durable.transactionId != transaction.transactionId) return false
+    if (durable.createdAt != transaction.manifest.createdAt) return false
+    if (durable.preExistingPaths != transaction.manifest.preExistingPaths) return false
+    if (durable.backedUpPaths != transaction.manifest.backedUpPaths) return false
+    if (durable.backupEntries != transaction.manifest.backupEntries) return false
+    if (durable != transaction.manifest) return false
+    for (entry in durable.backupEntries.values) {
+        if (!isStrictRelativePath(entry.relativePath)) return false
+        val target = File(canonicalJob, entry.relativePath).canonicalFile
+        if (target.parentFile?.canonicalFile != canonicalJob) return false
+        val backup = File(canonicalBackup, entry.backupName).canonicalFile
+        if (backup.parentFile?.canonicalFile != canonicalBackup) return false
+        if (backup.name == REPROCESS_TX_MANIFEST_FILE) return false
+    }
+    return true
+}
+
+/**
+ * True if the file is an immutable source frame for [jobKind] that must never be backed up, deleted,
+ * or replaced by a reprocess transaction. Identifies source frames from actual job metadata + kind:
+ * RAW/YUV/Color PNG/JPEG/RAW/YUV source frames are all immutable.
+ */
+private fun isImmutableSourceFrame(file: File, jobKind: ReprocessJobKind = detectImmutableSourceKind(file)): Boolean {
     val name = file.name.lowercase(Locale.US)
     if (!name.startsWith("frame_")) return false
-    return name.endsWith(".raw16") || name.endsWith(".dng") ||
-        name.endsWith(".yuv") || name.endsWith(".nv21") || name.endsWith(".yuv420")
+    return when (jobKind) {
+        ReprocessJobKind.RAW_FUSION ->
+            name.endsWith(".raw16") || name.endsWith(".dng") || name.endsWith(".png") ||
+                name.endsWith(".jpg") || name.endsWith(".jpeg")
+        ReprocessJobKind.YUV_FUSION ->
+            name.endsWith(".yuv") || name.endsWith(".nv21") || name.endsWith(".yuv420") ||
+                name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg")
+        ReprocessJobKind.COLOR_BURST ->
+            name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg")
+        ReprocessJobKind.UNSUPPORTED -> true
+    }
 }
+
+/** Best-effort detection used when no job kind is available; keeps RAW/YUV source frames immutable. */
+private fun detectImmutableSourceKind(file: File): ReprocessJobKind = ReprocessJobKind.RAW_FUSION
 
 /** True if the file is a mutable output or metadata that the reprocess worker may overwrite. */
 internal fun isReprocessWorkerWritable(file: File): Boolean = !isImmutableSourceFrame(file)
@@ -1280,20 +1869,32 @@ internal fun backupReprocessTransaction(jobDir: File, files: List<File>): Result
         check(root.mkdirs()) { "Could not create reprocess backup directory." }
         val metadata = File(jobDir, JOB_JSON_FILE_NAME)
         check(metadata.isFile) { "job.json is required for rollback." }
+        // Identify immutable source frames from actual job metadata and job kind. RAW/YUV/ColorBurst
+        // source PNG/JPEG/RAW/YUV frames must NEVER be backed up, deleted, or replaced.
+        val job = runCatching { JSONObject(metadata.readText()) }.getOrNull() ?: JSONObject()
+        val jobKind = detectJobKind(jobDir, job)
+        val immutableSourceFiles = mutableSetOf<File>()
+        jobDir.listFiles()?.forEach { child ->
+            if (child.isFile && isImmutableSourceFrame(child, jobKind)) {
+                immutableSourceFiles += child.canonicalFile
+            }
+        }
         val preExistingNames = jobDir.listFiles()?.filter { it.isFile }?.map { it.name }?.toSet().orEmpty()
+        // Record every pre-existing mutable file (job.json + worker-writable non-source files).
         val filesToBackup = (files + metadata)
             .asSequence()
             .filter { it.isFile }
             .map { it.canonicalFile }
             .distinctBy { it.path }
-            .filter { isReprocessWorkerWritable(it) }
+            .filter { it.parentFile?.canonicalFile == jobDir.canonicalFile }
+            .filter { !immutableSourceFiles.contains(it.canonicalFile) && isReprocessWorkerWritable(it) }
             .toList()
         val backups = filesToBackup.map { original ->
             val backup = File(root, "${original.name}$BACKUP_ENTRY_SUFFIX")
             original.copyTo(backup, overwrite = false)
             check(backup.isFile && backup.length() == original.length()) { "Backup verification failed for ${original.name}" }
             val sha = computeSha256(backup)
-            // Verify backup digest matches original digest
+            // Verify backup digest matches original digest without whole-file allocation.
             val originalSha = computeSha256(original)
             check(sha == originalSha) { "Backup digest mismatch for ${original.name}" }
             ReprocessBackup(
@@ -1333,22 +1934,53 @@ internal fun backupReprocessTransaction(jobDir: File, files: List<File>): Result
  * Never skips replacement merely because lengths match — a worker can overwrite with same-size different data.
  * Restores job.json last.
  * Returns failure before any target mutation if any backup is corrupt/missing.
+ * The durable manifest is authoritative; corrupt/missing evidence never falls back to the in-memory snapshot.
  */
 internal fun restoreBackups(jobDir: File, transaction: ReprocessTransaction): Result<Unit> = runCatching {
-    val root = transaction.backupRoot
+    val root = transaction.backupRoot.canonicalFile
     if (!root.isDirectory) throw IllegalStateException("Backup root missing for rollback")
+    val canonicalJobDir = jobDir.canonicalFile
+    if (root.parentFile?.canonicalFile != canonicalJobDir) {
+        throw IllegalStateException("Backup root is not a direct child of the job directory")
+    }
+    if (!root.name.startsWith(".reprocess_backup_")) {
+        throw IllegalStateException("Backup root name is not a valid transaction-root name")
+    }
     val manifestFile = File(root, REPROCESS_TX_MANIFEST_FILE)
-    val manifest = if (manifestFile.isFile) {
-        runCatching { ReprocessTransactionManifest.fromJson(JSONObject(manifestFile.readText())) }.getOrNull()
-    } else null
-    // Strictly read and validate the durable manifest/entries
-    val currentManifest = manifest ?: transaction.manifest
-    if (currentManifest.transactionId != transaction.transactionId) {
+    if (!manifestFile.isFile) throw IllegalStateException("Transaction manifest missing for rollback")
+    val durable = loadStrictManifest(manifestFile)
+    if (durable.transactionId != transaction.transactionId) {
         throw IllegalStateException("Transaction ID mismatch during rollback")
     }
-    val backups = transaction.backups
-    // 1. Validate every required backup exists, and verify length and digest
-    backups.forEach { backup ->
+    if (durable != transaction.manifest) {
+        throw IllegalStateException("Durable manifest drift relative to in-memory transaction")
+    }
+    // Backups are derived exclusively from the durable manifest entries; never the in-memory snapshot.
+    val backupsByEntry = transaction.backups.associateBy { it.original.name }
+    durable.backupEntries.values.forEach { entry ->
+        if (entry.relativePath !in backupsByEntry) {
+            throw IllegalStateException("Durable manifest references unbacked file: ${entry.relativePath}")
+        }
+        val backup = backupsByEntry.getValue(entry.relativePath)
+        if (backup.backup.name != entry.backupName) {
+            throw IllegalStateException("Durable backup name mismatch: ${entry.relativePath} -> ${backup.backup.name} vs ${entry.backupName}")
+        }
+        if (backup.originalLength != entry.originalLength) {
+            throw IllegalStateException("Durable backup length mismatch: ${entry.relativePath}")
+        }
+    }
+    // 1. Validate every required backup exists and lives inside the backup root, then verify length + digest.
+    transaction.backups.forEach { backup ->
+        val target = File(canonicalJobDir, backup.original.name).canonicalFile
+        if (target.parentFile?.canonicalFile != canonicalJobDir) {
+            throw IllegalStateException("Unsafe backup target path: ${backup.original.name}")
+        }
+        if (backup.backup.parentFile?.canonicalFile != root) {
+            throw IllegalStateException("Backup file lives outside backup root: ${backup.backup.name}")
+        }
+        if (backup.original.name == REPROCESS_TX_MANIFEST_FILE) {
+            throw IllegalStateException("Refusing to overwrite durable manifest file as target")
+        }
         check(backup.backup.isFile) { "Missing rollback backup: ${backup.original.name}" }
         check(backup.backup.length() == backup.originalLength) {
             "Invalid rollback backup length: ${backup.original.name} (was ${backup.backup.length()}, expected ${backup.originalLength})"
@@ -1358,13 +1990,12 @@ internal fun restoreBackups(jobDir: File, transaction: ReprocessTransaction): Re
             "Rollback backup digest mismatch: ${backup.original.name}"
         }
     }
-    // 2. Stage and verify all replacement temp files before replacing any destination
+    // 2. Stage and verify all replacement temp files before replacing any destination.
     data class StagedRestore(val backup: ReprocessBackup, val temp: File)
     val staged = mutableListOf<StagedRestore>()
     try {
-        backups.forEach { backup ->
+        transaction.backups.forEach { backup ->
             val target = backup.original
-            // Never skip replacement merely because lengths match
             val temp = File(target.parentFile, ".${target.name}.${System.nanoTime()}.restore")
             backup.backup.copyTo(temp, overwrite = true)
             check(temp.length() == backup.backup.length()) { "Rollback temp verification failed: ${target.name}" }
@@ -1372,8 +2003,7 @@ internal fun restoreBackups(jobDir: File, transaction: ReprocessTransaction): Re
             check(tempSha == backup.sha256) { "Rollback temp digest failed: ${target.name}" }
             staged.add(StagedRestore(backup, temp))
         }
-        // 3. Atomically replace restored non-metadata files
-        // Restore job.json last
+        // 3. Atomically replace restored non-metadata files. Restore job.json last.
         val (jobJsonFirst, jobJsonLast) = staged.partition { it.backup.original.name != JOB_JSON_FILE_NAME }
         jobJsonFirst.forEach { stagedRestore ->
             KeplerJobMetadata.atomicReplace(stagedRestore.temp, stagedRestore.backup.original)
@@ -1382,53 +2012,94 @@ internal fun restoreBackups(jobDir: File, transaction: ReprocessTransaction): Re
             KeplerJobMetadata.atomicReplace(stagedRestore.temp, stagedRestore.backup.original)
         }
     } finally {
-        // Clean up any remaining temp files
+        // Clean up any remaining temp files.
         staged.forEach { if (it.temp.exists()) runCatching { it.temp.delete() } }
     }
 }
 
-/** Narrow injectable IO seam for file deletion in cleanup. Tests can override. */
+/** Narrow injectable IO seam for file deletion in cleanup. Tests can override and must reset in `finally`. */
 internal var cleanupDeleteOperation: (File) -> Boolean = { it.delete() }
 
 /**
- * Safe backup cleanup that preserves terminal evidence on partial failure.
- * Cleanup is allowed only for a validated COMMITTED or ROLLED_BACK transaction.
- * - Delete known backup payloads and temporary artifacts best-effort
- * - Do NOT delete the terminal manifest while unknown/non-removable contents remain
- * - Delete the manifest last, immediately before removing an otherwise empty root
- * - An empty root left after manifest deletion is safe for recovery to remove
- * - If cleanup fails, leave a valid terminal manifest whenever possible
- * - Cleanup failure may add a warning but cannot change COMMITTED/ROLLED_BACK to QUARANTINED
+ * Safe backup cleanup, shared by immediate finalization and process-restart recovery.
+ *
+ * - Cleanup is allowed only for a strictly validated COMMITTED or ROLLED_BACK terminal manifest.
+ * - Delete known payload/temp files first; inspect both files and directories.
+ * - Never delete the terminal manifest while any known or unknown content failed to delete.
+ * - Delete the terminal manifest only after terminal state is durable and every other entry is gone.
+ * - Delete the root only when actually empty.
+ * - A successful root deletion reports `true` (not a spurious failure because `listFiles()` is null).
+ * - Cleanup failure leaves a valid terminal manifest and must not block the job; it may add a warning
+ *   but cannot downgrade COMMITTED/ROLLED_BACK to QUARANTINED.
+ * - Recovery does not delete terminal evidence after a failed payload deletion.
+ * - Unresolved roots are never cleaned merely because their payload is absent.
  */
 internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     val root = transaction.backupRoot
-    if (!root.isDirectory) return true
-    val children = root.listFiles() ?: return false
+    if (!root.isDirectory) {
+        // Already gone — a resolved transaction with no root is fully cleaned.
+        return true
+    }
+    // Cleanup is allowed only for strictly validated terminal manifests.
+    val manifestFile = File(root, REPROCESS_TX_MANIFEST_FILE)
+    if (!manifestFile.isFile) return false
+    val durable = runCatching { loadStrictManifest(manifestFile) }.getOrNull() ?: return false
+    if (durable.transactionId != transaction.transactionId) return false
+    if (durable != transaction.manifest) return false
+    val state = durable.state
+    if (state != ReprocessTransactionState.COMMITTED && state != ReprocessTransactionState.ROLLED_BACK) {
+        return false
+    }
     val cleanupDelete = cleanupDeleteOperation
-    // Delete known backup payloads and temp artifacts first
     val backupNames = transaction.backups.map { it.backup.name }.toSet()
-    var allPayloadsDeleted = true
-    children.filter { it.isFile && (it.name in backupNames || it.name.endsWith(".tmp") || it.name.endsWith(".restore")) }
-        .forEach { file ->
-            if (!cleanupDelete(file) && file.exists()) allPayloadsDeleted = false
+    val knownNames = backupNames + setOf(REPROCESS_QUARANTINE_MARKER, REPROCESS_TX_MANIFEST_FILE)
+    val allKnownDeletedRemoved = mutableSetOf<File>()
+    // 1. Delete known payload files and temp artifacts first; inspect files and directories.
+    root.listFiles()?.sortedBy { it.isDirectory }?.forEach { entry ->
+        if (!entry.isDirectory) {
+            if (entry.name == REPROCESS_TX_MANIFEST_FILE) return@forEach
+            if (entry.name in backupNames || entry.name.endsWith(".tmp") || entry.name.endsWith(".restore")) {
+                if (!cleanupDelete(entry)) {
+                    if (entry.exists()) return false
+                }
+                allKnownDeletedRemoved += entry
+            }
+        } else {
+            // Directories inside a backup root: any non-empty dir is unknown content that blocks.
+            if (!cleanupDelete(entry)) {
+                if (entry.exists()) return false
+            }
+            allKnownDeletedRemoved += entry
         }
-    // Delete quarantine marker best-effort
-    children.firstOrNull { it.name == REPROCESS_QUARANTINE_MARKER }?.let { marker ->
-        if (!cleanupDelete(marker) && marker.exists()) { /* best-effort; terminal state is already durable */ }
     }
-    // Check if unknown/non-removable contents remain
-    val remaining = root.listFiles()?.filter { it.isFile }.orEmpty()
-    val manifestFile = remaining.firstOrNull { it.name == REPROCESS_TX_MANIFEST_FILE }
-    val unknownContents = remaining.filter { it != manifestFile && it.name !in backupNames }
-    // Delete manifest last, only when no unknown/non-removable contents remain
-    if (unknownContents.isEmpty() && manifestFile != null) {
-        if (!cleanupDelete(manifestFile) && manifestFile.exists()) return false
+    // 2. Delete quarantine marker once known payloads are gone.
+    val markerFile = File(root, REPROCESS_QUARANTINE_MARKER)
+    if (markerFile.exists()) {
+        if (!cleanupDelete(markerFile) && markerFile.exists()) {
+            // Terminal state is already durable, but its manifest must remain while any known
+            // payload/marker could not be removed.
+            return false
+        }
     }
-    // Remove an otherwise empty root
-    if (root.listFiles()?.isEmpty() == true) {
-        root.delete()
+    // 3. Check if unknown/non-removable contents remain.
+    val remaining = root.listFiles()?.toList().orEmpty()
+    val unknownContents = remaining.filter { it.name !in knownNames }
+    val manifestRemaining = remaining.firstOrNull { it.name == REPROCESS_TX_MANIFEST_FILE }
+    if (unknownContents.isNotEmpty()) {
+        // Do NOT delete the terminal manifest while unknown content remains.
+        return false
     }
-    return allPayloadsDeleted && (root.listFiles()?.isEmpty() == true)
+    // 4. Delete the terminal manifest last after terminal state is durable.
+    if (manifestRemaining != null) {
+        if (!cleanupDelete(manifestRemaining) && manifestRemaining.exists()) return false
+    }
+    // 5. Remove an empty root; a successful root deletion reports success, not failure.
+    val finalContents = root.listFiles()
+    if (finalContents == null || finalContents.isEmpty()) {
+        if (!root.delete() && root.exists()) return false
+        return true
+    }
+    return false
 }
 
 private fun writeReprocessSuccess(
