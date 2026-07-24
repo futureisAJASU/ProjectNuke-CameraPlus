@@ -237,4 +237,18 @@ class KeplerGalleryReprocessProtocolTest {
 
     private fun removeCreatedForTest(directory: File, transaction: ReprocessTransaction): Result<Unit> =
         removeTransactionCreatedFilesForTest(directory, transaction)
+
+    @Test
+    fun terminalManifestRemainsAuthoritativeAfterStateTransition() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED)
+            writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
+            assertTrue(validateTransactionIdentity(directory, transaction))
+            assertTrue(cleanupBackups(transaction))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
 }
