@@ -11,6 +11,8 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -575,7 +577,8 @@ internal suspend fun acquireWorkerTerminal(
             }
             if (initial != null) return WorkerTerminalResult.TerminalReceived(initial)
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            throw cancelled
+            if (!currentCoroutineContext().isActive) throw cancelled
+            return WorkerTerminalResult.DeferredExceptionalCompletion(cancelled)
         } catch (deferredFailure: Exception) {
             return WorkerTerminalResult.DeferredExceptionalCompletion(deferredFailure)
         }

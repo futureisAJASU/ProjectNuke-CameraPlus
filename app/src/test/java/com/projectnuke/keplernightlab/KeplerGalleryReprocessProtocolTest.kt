@@ -266,4 +266,15 @@ class KeplerGalleryReprocessProtocolTest {
             session.jobDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun cancelledWorkerDeferredIsWorkerFailureWhileCallerActive() = runBlocking {
+        val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
+        terminal.cancel(kotlinx.coroutines.CancellationException("worker cancelled"))
+        val result = acquireWorkerTerminal(
+            ReprocessWorkerRun(terminal) {},
+            callerCancellation = null
+        )
+        assertTrue(result is WorkerTerminalResult.DeferredExceptionalCompletion)
+    }
 }
