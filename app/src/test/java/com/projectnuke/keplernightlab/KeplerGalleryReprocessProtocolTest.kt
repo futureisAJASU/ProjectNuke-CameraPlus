@@ -251,4 +251,19 @@ class KeplerGalleryReprocessProtocolTest {
             directory.deleteRecursively()
         }
     }
+
+    @Test
+    fun lateRegistrationAllowsOnlyExplicitUnresolvedRetry() {
+        val session = ReprocessTransactionSession(Files.createTempDirectory("kepler-session-").toFile())
+        try {
+            assertTrue(session.tryAcquireLateRegistration())
+            assertFalse(session.tryAcquireLateRegistration())
+            session.markLateUnresolved()
+            assertTrue(session.tryAcquireLateRegistration())
+            assertFalse(session.tryAcquireLateRegistration())
+        } finally {
+            session.releaseIfUnowned()
+            session.jobDir.deleteRecursively()
+        }
+    }
 }

@@ -264,7 +264,7 @@ internal class ReprocessTransactionSession(val jobDir: File) {
     fun tryAcquireLateRegistration(): Boolean {
         while (true) {
             val current = lateState.get()
-            if (current == LateState.TERMINAL || current == LateState.FINALIZING) return false
+            if (current != LateState.IDLE && current != LateState.UNRESOLVED) return false
             if (lateState.compareAndSet(current, LateState.LATE_REGISTERED)) return true
         }
     }
@@ -289,7 +289,7 @@ internal class ReprocessTransactionSession(val jobDir: File) {
  * Structured terminal acquisition result for a worker [Deferred]. Covers every confirmed terminal
  * state without beginning rollback before worker exit is confirmed. The caller must:
  * - feed [TerminalReceived] / [DeferredExceptionalCompletion] into shared settlement,
- * - object to rollback until either of those is returned (i.e. NOT on [CancelCallbackFailed]
+ * - object to rollback until either of those is returned
  *   alone, since a failed cancel callback does not prove worker exit),
  * - on [WorkerDidNotExitBeforeTimeout] persist unresolved/quarantine evidence and register late
  *   finalization; never begin rollback,
@@ -306,7 +306,7 @@ internal sealed class WorkerTerminalResult {
     data class DeferredExceptionalCompletion(val cause: Throwable) : WorkerTerminalResult()
 
     /** Cancel callback invocation threw. Does NOT prove worker exit — do not begin rollback. */
-    /** Worker exited after [cancel] was requested. Holds the real outcome if any. */
+    /** Worker exited after cancellation was requested. Holds the real outcome if any. */
     data class WorkerExitedAfterCancellation(
         val outcome: ReprocessWorkerOutcome?,
         val cancelFailure: Throwable?
@@ -324,8 +324,7 @@ internal sealed class WorkerTerminalResult {
     /** Caller cancellation arrived while the worker was still active. */
     data class CallerCancelledWhileWorkerActive(
         val callerCancellation: kotlinx.coroutines.CancellationException,
-        val cancelFailure: Throwable?,
-        val workerDidExit: Boolean
+        val cancelFailure: Throwable?
     ) : WorkerTerminalResult()
 }
 
@@ -511,15 +510,21 @@ suspend fun reprocessKeplerGalleryJob(
         val worker = session.worker
         if (tx != null && worker != null) {
             val acquisition = acquireWorkerTerminal(worker, callerCancellation)
-            settleTerminalResult(
+            val settled = settleTerminalResult(
                 session, tx, target, kind, outputSettings, selectionMode, resolvedSelection,
                 worker, acquisition
             )
+            settled.result.exceptionOrNull()?.let { settlementFailure ->
+                try { callerCancellation.addSuppressed(settlementFailure) } catch (_: Exception) { }
+            }
         } else if (tx != null) {
-            finalizeTransaction(
+            val settled = finalizeTransaction(
                 session, tx, target, kind, outputSettings, selectionMode, resolvedSelection,
                 Result.failure(callerCancellation)
             )
+            settled.result.exceptionOrNull()?.let { settlementFailure ->
+                try { callerCancellation.addSuppressed(settlementFailure) } catch (_: Exception) { }
+            }
         }
         throw callerCancellation
     } catch (unexpected: Exception) {
@@ -602,7 +607,7 @@ internal suspend fun acquireWorkerTerminal(
     // Worker did not exit before timeout. Rollback is unsafe.
     if (callerCancellation != null) {
         return@withContext WorkerTerminalResult.CallerCancelledWhileWorkerActive(
-            callerCancellation, cancelFailure, workerDidExit = false
+            callerCancellation, cancelFailure
         )
     }
     return@withContext WorkerTerminalResult.WorkerDidNotExitBeforeTimeout(cancelFailure)
