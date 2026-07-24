@@ -22,6 +22,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 
 typealias OutputSettings = FinalOutputFormat
@@ -229,8 +230,8 @@ internal class ReprocessTransactionSession(val jobDir: File) {
     var worker: ReprocessWorkerRun? = null
         private set
     private val ownershipTransferred = AtomicBoolean(false)
-    private val lateRegistered = AtomicBoolean(false)
-    private val finalizerExecuted = AtomicBoolean(false)
+    internal enum class LateState { IDLE, LATE_REGISTERED, FINALIZING, TERMINAL, UNRESOLVED }
+    private val lateState = AtomicReference(LateState.IDLE)
 
     fun acquireLease(): JobOperationLease? {
         val acquired = KeplerJobMetadata.acquireOperation(jobDir)
@@ -260,13 +261,20 @@ internal class ReprocessTransactionSession(val jobDir: File) {
     }
 
     /** Try to acquire the once-guard for late-finalization registration. Returns true only the first time. */
-    fun tryAcquireLateRegistration(): Boolean = lateRegistered.compareAndSet(false, true)
+    fun tryAcquireLateRegistration(): Boolean {
+        while (true) {
+            val current = lateState.get()
+            if (current == LateState.TERMINAL || current == LateState.FINALIZING) return false
+            if (lateState.compareAndSet(current, LateState.LATE_REGISTERED)) return true
+        }
+    }
 
     /** Try to acquire the once-guard for late finalizer invocation. Returns true only the first time. */
-    fun tryBeginFinalization(): Boolean = finalizerExecuted.compareAndSet(false, true)
+    fun tryBeginFinalization(): Boolean = lateState.compareAndSet(LateState.LATE_REGISTERED, LateState.FINALIZING)
 
     /** Whether a finalization pass was already processed (prevents duplicate cross-terminal writes). */
-    fun finalizationProcessed(): Boolean = finalizerExecuted.get()
+    fun markLateTerminal() { lateState.set(LateState.TERMINAL) }
+    fun markLateUnresolved() { lateState.set(LateState.UNRESOLVED) }
 
     /** Legacy/test seam: bind an existing transaction+lease to this session as if ownership had been
      *  transferred, so [finalizeTransactionWithLease] exercises the real strict finalizer path. */
@@ -298,8 +306,6 @@ internal sealed class WorkerTerminalResult {
     data class DeferredExceptionalCompletion(val cause: Throwable) : WorkerTerminalResult()
 
     /** Cancel callback invocation threw. Does NOT prove worker exit — do not begin rollback. */
-    data class CancelCallbackFailed(val cause: Throwable) : WorkerTerminalResult()
-
     /** Worker exited after [cancel] was requested. Holds the real outcome if any. */
     data class WorkerExitedAfterCancellation(
         val outcome: ReprocessWorkerOutcome?,
@@ -573,21 +579,17 @@ internal suspend fun acquireWorkerTerminal(
     val cancelFailure: Throwable? = try {
         worker.cancel()
         null
-    } catch (cancelError: Throwable) {
-        if (cancelError is OutOfMemoryError || cancelError is ThreadDeath) throw cancelError
+    } catch (cancelError: Exception) {
         cancelError
     }
     val exitOutcome = try {
         withTimeoutOrNull(reprocessWorkerExitTimeoutMsForTest ?: REPROCESS_WORKER_EXIT_TIMEOUT_MS) {
             terminal.await()
         }
-    } catch (deferredExceptional: Throwable) {
-        if (deferredExceptional is OutOfMemoryError || deferredExceptional is ThreadDeath) throw deferredExceptional
+    } catch (deferredExceptional: Error) {
+        throw deferredExceptional
+    } catch (deferredExceptional: Exception) {
         // Deferred completed exceptionally ⇒ worker exited with failure.
-        if (callerCancellation != null) {
-            runCatching { callerCancellation.addSuppressed(deferredExceptional) }
-            throw callerCancellation
-        }
         return@withContext WorkerTerminalResult.DeferredExceptionalCompletion(combineCause(deferredExceptional, cancelFailure))
     }
     if (exitOutcome != null) {
@@ -668,17 +670,6 @@ private fun settleTerminalResult(
             ReprocessFinalizationResult(
                 ReprocessFinalizationState.QUARANTINED,
                 Result.failure(combineCause(acquisition.callerCancellation, persistence.error))
-            )
-        }
-        is WorkerTerminalResult.CancelCallbackFailed -> {
-            val persistence = persistUnresolvedQuarantine(session, transaction, acquisition.cause)
-            registerLateFinalization(session, worker, target, jobKind, outputSettings, selectionMode, resolvedSelection)
-            ReprocessFinalizationResult(
-                ReprocessFinalizationState.QUARANTINED,
-                Result.failure(combineCauseWithMessage(
-                    IllegalStateException("Reprocess cancel callback failed; worker exit unconfirmed."),
-                    "Unresolved persistence failed", persistence.error
-                ))
             )
         }
     }
@@ -808,6 +799,7 @@ internal suspend fun runLateFinalization(handoff: ReprocessLateFinalizationHando
     } catch (e: ThreadDeath) {
         throw e
     } catch (e: Exception) {
+        handoff.session.markLateUnresolved()
         ensureDurableFallbackQuarantine(handoff.target, handoff.transaction)
         return
     }
@@ -816,7 +808,10 @@ internal suspend fun runLateFinalization(handoff: ReprocessLateFinalizationHando
         handoff.outputSettings, handoff.selectionMode, handoff.resolvedSelection, outcome
     )
     if (late.state == ReprocessFinalizationState.QUARANTINED) {
+        handoff.session.markLateUnresolved()
         ensureDurableFallbackQuarantine(handoff.target, handoff.transaction)
+    } else {
+        handoff.session.markLateTerminal()
     }
 }
 
@@ -1236,8 +1231,6 @@ internal suspend fun cancelWorkerAndAwaitTerminal(
             result.outcome?.let { Result.success(it) }
                 ?: Result.failure(IllegalStateException("Worker exited with no outcome."))
         is WorkerTerminalResult.DeferredExceptionalCompletion -> Result.failure(result.cause)
-        is WorkerTerminalResult.CancelCallbackFailed ->
-            Result.failure(ReprocessWorkerDidNotExitException("Reprocess cancel callback failed; worker exit unconfirmed."))
         is WorkerTerminalResult.WorkerDidNotExitBeforeTimeout ->
             Result.failure(ReprocessWorkerDidNotExitException("Reprocess worker did not exit before rollback timeout."))
         is WorkerTerminalResult.CallerCancelledWhileWorkerExited -> Result.success(result.outcome)
