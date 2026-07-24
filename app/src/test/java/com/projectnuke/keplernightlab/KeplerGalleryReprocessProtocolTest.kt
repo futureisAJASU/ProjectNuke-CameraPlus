@@ -19,6 +19,39 @@ import java.nio.file.Files
 class KeplerGalleryReprocessProtocolTest {
 
     @Test
+    fun immutableIdentitySurvivesQuarantineTerminalTransitionAndCleanup() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED)
+            assertTrue(validateTransactionIdentity(directory, transaction))
+            writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
+            assertTrue(validateTransactionIdentity(directory, transaction))
+            assertTrue(cleanupBackups(transaction))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fallbackIsOnlyCreatedWhenRootQuarantineCannotPersist() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            val rootResult = quarantineWithPersistence(transaction, IllegalStateException("failure"))
+            assertTrue(rootResult.result.isFailure)
+            assertFalse(File(directory, ".reprocess_unresolved").exists())
+
+            transaction.backupRoot.deleteRecursively()
+            val missingRoot = quarantineWithPersistence(transaction, IllegalStateException("failure"))
+            assertTrue(missingRoot.result.isFailure)
+            assertTrue(File(directory, ".reprocess_unresolved").isFile)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun strictManifestAcceptsOnlyCompleteSafeManifest() {
         val directory = tempJob()
         try {

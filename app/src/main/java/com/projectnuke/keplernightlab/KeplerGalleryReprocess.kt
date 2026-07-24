@@ -340,7 +340,13 @@ suspend fun reprocessKeplerGalleryJob(
 
     // Unresolved transaction evidence must be inspected before any metadata mutation. A job
     // rejected because it is unresolved must NOT write reprocess-failure metadata or alter job.json.
-    val unresolved = runCatching { isReprocessQuarantined(target) }.getOrDefault(false)
+    val unresolved = try {
+        isReprocessQuarantined(target)
+    } catch (inspectionFailure: Exception) {
+        return@withContext Result.failure(
+            IllegalStateException("Unable to inspect existing reprocess transaction evidence.", inspectionFailure)
+        )
+    }
     var capability: ReprocessCapability? = null
     var transaction: ReprocessTransaction? = null
     var kind: ReprocessJobKind = ReprocessJobKind.UNSUPPORTED
@@ -388,7 +394,9 @@ suspend fun reprocessKeplerGalleryJob(
         selectionMode = resolveSelectionMode(job, frameSelection)
         transaction = backupReprocessTransaction(
             target,
-            target.listFiles()?.filter { it.isFile && isReprocessWorkerWritable(it) }.orEmpty()
+            target.listFiles()?.filter { it.isFile && isReprocessWorkerWritable(it) }.orEmpty(),
+            job = job,
+            jobKind = kind
         ).getOrElse {
             writeReprocessFailure(target, "Required reprocess backup failed: ${it.message}")
             return@withContext Result.failure(it)
@@ -507,8 +515,20 @@ suspend fun reprocessKeplerGalleryJob(
 internal suspend fun acquireWorkerTerminal(
     worker: ReprocessWorkerRun,
     callerCancellation: kotlinx.coroutines.CancellationException?
-): WorkerTerminalResult = withContext(NonCancellable) {
+): WorkerTerminalResult {
     val terminal = worker.terminal
+    if (terminal.isCompleted) {
+        return try {
+            val outcome = terminal.await()
+            if (callerCancellation != null) {
+                WorkerTerminalResult.CallerCancelledWhileWorkerExited(outcome, callerCancellation)
+            } else WorkerTerminalResult.TerminalReceived(outcome)
+        } catch (failure: kotlinx.coroutines.CancellationException) {
+            WorkerTerminalResult.DeferredExceptionalCompletion(failure)
+        } catch (failure: Exception) {
+            WorkerTerminalResult.DeferredExceptionalCompletion(failure)
+        }
+    }
     // The ordinary operation gets its full reprocess timeout before cancellation is requested.
     // A caller cancellation, on the other hand, requests cancellation immediately.
     if (callerCancellation == null && !terminal.isCompleted) {
@@ -516,35 +536,20 @@ internal suspend fun acquireWorkerTerminal(
             val initial = withTimeoutOrNull(reprocessTimeoutMsForTest ?: REPROCESS_TIMEOUT_MS) {
                 terminal.await()
             }
-            if (initial != null) return@withContext WorkerTerminalResult.TerminalReceived(initial)
-        } catch (deferredFailure: Throwable) {
-            if (deferredFailure is OutOfMemoryError || deferredFailure is ThreadDeath) throw deferredFailure
-            return@withContext WorkerTerminalResult.DeferredExceptionalCompletion(deferredFailure)
+            if (initial != null) return WorkerTerminalResult.TerminalReceived(initial)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (deferredFailure: Exception) {
+            return WorkerTerminalResult.DeferredExceptionalCompletion(deferredFailure)
         }
     }
-    val alreadyComplete = terminal.isCompleted
+    return withContext(NonCancellable) {
     val cancelFailure: Throwable? = try {
         worker.cancel()
         null
     } catch (cancelError: Throwable) {
         if (cancelError is OutOfMemoryError || cancelError is ThreadDeath) throw cancelError
         cancelError
-    }
-    if (alreadyComplete) {
-        val awaited = runCatching { terminal.await() }
-        return@withContext awaited.fold(
-            onSuccess = { outcome ->
-                if (callerCancellation != null) {
-                    WorkerTerminalResult.CallerCancelledWhileWorkerExited(outcome, callerCancellation)
-                } else {
-                    WorkerTerminalResult.TerminalReceived(outcome)
-                }
-            },
-            onFailure = { deferredFailure ->
-                if (deferredFailure is OutOfMemoryError || deferredFailure is ThreadDeath) throw deferredFailure
-                WorkerTerminalResult.DeferredExceptionalCompletion(combineCause(deferredFailure, cancelFailure))
-            }
-        )
     }
     val exitOutcome = try {
         withTimeoutOrNull(reprocessWorkerExitTimeoutMsForTest ?: REPROCESS_WORKER_EXIT_TIMEOUT_MS) {
@@ -573,6 +578,7 @@ internal suspend fun acquireWorkerTerminal(
         )
     }
     return@withContext WorkerTerminalResult.WorkerDidNotExitBeforeTimeout(cancelFailure)
+    }
 }
 
 /**
@@ -888,6 +894,7 @@ internal fun finalizeTransaction(
                     return@fold quarantineWithPersistence(transaction, e)
                 }
                 runCatching { removeQuarantineMarker(transaction) }
+                removeMatchingFallbackQuarantine(jobDir, transaction)
                 runCatching { cleanupBackups(transaction) }
                 try { operationLease.release() } catch (_: Throwable) {}
                 ReprocessFinalizationResult(ReprocessFinalizationState.COMMITTED, Result.success(committed))
@@ -955,7 +962,16 @@ internal fun quarantineWithPersistence(
         combineCauseWithMessage(canonicalError, "Quarantine persistence failed after processing error", markerError)
             .also { stateError?.let { se -> runCatching { it.addSuppressed(se) } } }
     } else canonicalError
-    ensureDurableFallbackQuarantine(transaction.backupRoot.parentFile ?: transaction.backupRoot, transaction)
+    if (markerError != null || stateError != null) {
+        try {
+            ensureDurableFallbackQuarantine(transaction.backupRoot.parentFile ?: transaction.backupRoot, transaction)
+        } catch (fallbackError: Exception) {
+            return ReprocessFinalizationResult(
+                ReprocessFinalizationState.QUARANTINED,
+                Result.failure(combineCauseWithMessage(combined, "Fallback quarantine persistence failed", fallbackError))
+            )
+        }
+    }
     return ReprocessFinalizationResult(ReprocessFinalizationState.QUARANTINED, Result.failure(combined))
 }
 
@@ -1012,6 +1028,7 @@ internal fun rollback(
             transaction, combineCauseWithMessage(error, "State persistence failure during rollback", stateFailure)
         )
     }
+    removeMatchingFallbackQuarantine(jobDir, transaction)
     runCatching { removeQuarantineMarker(transaction) }
     val cleanupSuccess = runCatching { cleanupBackups(transaction) }.getOrDefault(false)
     if (!cleanupSuccess) {
@@ -1036,7 +1053,10 @@ private fun removeTransactionCreatedFiles(
     transaction: ReprocessTransaction,
     originalError: Throwable
 ): Result<Unit> = runCatching {
-    val manifest = transaction.manifest
+    val manifest = loadStrictManifest(File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE))
+    require(manifest.hasSameImmutableIdentity(transaction.manifest)) {
+        "Durable manifest identity changed before created-file rollback"
+    }
     val preExisting = manifest.preExistingPaths
     val backedUp = manifest.backedUpPaths
     val backupRootName = transaction.backupRoot.name
@@ -1231,7 +1251,7 @@ internal fun writeTransactionState(transaction: ReprocessTransaction, state: Rep
     require(currentManifest.createdAt == transaction.manifest.createdAt) {
         "Transaction createdAt mismatch during state write"
     }
-    require(currentManifest == transaction.manifest) {
+    require(currentManifest.hasSameImmutableIdentity(transaction.manifest)) {
         "Transaction manifest drift during state write"
     }
     val currentState = currentManifest.state
@@ -1269,9 +1289,10 @@ internal fun persistUnresolvedQuarantine(
             stateFailure = e
         }
     }
-    // Job-level durable fallback quarantine marker survives process death when the backup root is
-    // missing or state persistence is impossible.
-    ensureDurableFallbackQuarantine(transaction.backupRoot.parentFile ?: transaction.backupRoot, transaction)
+    // The fallback is required only when the root marker/state cannot establish durable evidence.
+    if (markerFailure != null || stateFailure != null) {
+        ensureDurableFallbackQuarantine(transaction.backupRoot.parentFile ?: transaction.backupRoot, transaction)
+    }
     if (cancelFailure != null && (markerFailure != null || stateFailure != null)) {
         runCatching { cancelFailure.addSuppressed(markerFailure ?: stateFailure ?: return) }
     }
@@ -1283,15 +1304,45 @@ internal fun persistUnresolvedQuarantine(
  * and [recoverValidatedQuarantine] so process restart never treats a missing backup root as safe.
  */
 internal fun ensureDurableFallbackQuarantine(jobDir: File, transaction: ReprocessTransaction) {
-    if (!jobDir.isDirectory) return
+    check(jobDir.isDirectory) { "Job directory unavailable for fallback quarantine" }
     val marker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
-    if (marker.exists()) return
+    if (marker.exists()) {
+        check(readFallbackIdentity(marker) == fallbackIdentity(transaction)) {
+            "Existing fallback quarantine marker belongs to another or corrupt transaction"
+        }
+        return
+    }
     val payload = buildString {
         append("transactionId="); append(transaction.transactionId); append('\n')
         append("backupRoot="); append(transaction.backupRoot.name); append('\n')
-        append("createdAt="); append(System.currentTimeMillis()); append('\n')
+        append("createdAt="); append(transaction.manifest.createdAt); append('\n')
     }
-    runCatching { KeplerJobMetadata.atomicWrite(marker, payload) }
+    KeplerJobMetadata.atomicWrite(marker, payload)
+    check(readFallbackIdentity(marker) == fallbackIdentity(transaction)) {
+        "Fallback quarantine marker verification failed"
+    }
+}
+
+private fun fallbackIdentity(transaction: ReprocessTransaction): Triple<String, String, Long> = Triple(
+    transaction.transactionId, transaction.backupRoot.name, transaction.manifest.createdAt
+)
+
+private fun readFallbackIdentity(marker: File): Triple<String, String, Long>? = try {
+    val values = marker.readLines().associate { line ->
+        val split = line.indexOf('=')
+        require(split > 0) { "Malformed fallback marker" }
+        line.substring(0, split) to line.substring(split + 1)
+    }
+    if (values.keys != setOf("transactionId", "backupRoot", "createdAt")) null
+    else Triple(values.getValue("transactionId"), values.getValue("backupRoot"), values.getValue("createdAt").toLong())
+} catch (_: Exception) { null }
+
+/** Removes only a verified matching fallback marker after a durable terminal transition. */
+internal fun removeMatchingFallbackQuarantine(jobDir: File, transaction: ReprocessTransaction): Boolean {
+    val marker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
+    if (!marker.exists()) return true
+    if (readFallbackIdentity(marker) != fallbackIdentity(transaction)) return false
+    return marker.delete() && !marker.exists()
 }
 
 
@@ -1786,6 +1837,15 @@ internal data class ReprocessTransaction(
     val backups: List<ReprocessBackup>
 )
 
+/** Immutable transaction identity; durable state is deliberately excluded. */
+private fun ReprocessTransactionManifest.hasSameImmutableIdentity(
+    other: ReprocessTransactionManifest
+): Boolean = transactionId == other.transactionId &&
+    createdAt == other.createdAt &&
+    preExistingPaths == other.preExistingPaths &&
+    backedUpPaths == other.backedUpPaths &&
+    backupEntries == other.backupEntries
+
 /**
  * Validate that [transaction] is internally consistent and that every backed-up path maps to a
  * file that lives strictly inside [jobDir]. Returns true only when the durable manifest and the
@@ -1800,7 +1860,7 @@ internal fun validateTransactionIdentity(
     val canonicalBackup = transaction.backupRoot.canonicalFile
     val expectedParent = canonicalJob
     if (canonicalBackup.parentFile?.canonicalFile != expectedParent) return false
-    if (!canonicalBackup.name.startsWith(".reprocess_backup_")) return false
+    if (canonicalBackup.name != ".reprocess_backup_${transaction.transactionId}") return false
     val manifestFile = File(canonicalBackup, REPROCESS_TX_MANIFEST_FILE)
     if (!manifestFile.isFile) return false
     val durable = runCatching { loadStrictManifest(manifestFile) }.getOrNull() ?: return false
@@ -1809,7 +1869,7 @@ internal fun validateTransactionIdentity(
     if (durable.preExistingPaths != transaction.manifest.preExistingPaths) return false
     if (durable.backedUpPaths != transaction.manifest.backedUpPaths) return false
     if (durable.backupEntries != transaction.manifest.backupEntries) return false
-    if (durable != transaction.manifest) return false
+    if (!durable.hasSameImmutableIdentity(transaction.manifest)) return false
     for (entry in durable.backupEntries.values) {
         if (!isStrictRelativePath(entry.relativePath)) return false
         val target = File(canonicalJob, entry.relativePath).canonicalFile
@@ -1862,7 +1922,12 @@ private fun computeSha256(file: File): String {
     return digest.digest().joinToString("") { "%02x".format(it) }
 }
 
-internal fun backupReprocessTransaction(jobDir: File, files: List<File>): Result<ReprocessTransaction> {
+internal fun backupReprocessTransaction(
+    jobDir: File,
+    files: List<File>,
+    job: JSONObject? = null,
+    jobKind: ReprocessJobKind? = null
+): Result<ReprocessTransaction> {
     val transactionId = "${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}"
     val root = File(jobDir, ".reprocess_backup_$transactionId")
     return runCatching {
@@ -1871,11 +1936,11 @@ internal fun backupReprocessTransaction(jobDir: File, files: List<File>): Result
         check(metadata.isFile) { "job.json is required for rollback." }
         // Identify immutable source frames from actual job metadata and job kind. RAW/YUV/ColorBurst
         // source PNG/JPEG/RAW/YUV frames must NEVER be backed up, deleted, or replaced.
-        val job = runCatching { JSONObject(metadata.readText()) }.getOrNull() ?: JSONObject()
-        val jobKind = detectJobKind(jobDir, job)
+        val validatedJob = job ?: KeplerJobMetadata.read(jobDir)
+        val resolvedKind = jobKind ?: detectJobKind(jobDir, validatedJob)
         val immutableSourceFiles = mutableSetOf<File>()
         jobDir.listFiles()?.forEach { child ->
-            if (child.isFile && isImmutableSourceFrame(child, jobKind)) {
+            if (child.isFile && isImmutableSourceFrame(child, resolvedKind)) {
                 immutableSourceFiles += child.canonicalFile
             }
         }
@@ -1943,7 +2008,7 @@ internal fun restoreBackups(jobDir: File, transaction: ReprocessTransaction): Re
     if (root.parentFile?.canonicalFile != canonicalJobDir) {
         throw IllegalStateException("Backup root is not a direct child of the job directory")
     }
-    if (!root.name.startsWith(".reprocess_backup_")) {
+    if (root.name != ".reprocess_backup_${transaction.transactionId}") {
         throw IllegalStateException("Backup root name is not a valid transaction-root name")
     }
     val manifestFile = File(root, REPROCESS_TX_MANIFEST_FILE)
@@ -1952,64 +2017,53 @@ internal fun restoreBackups(jobDir: File, transaction: ReprocessTransaction): Re
     if (durable.transactionId != transaction.transactionId) {
         throw IllegalStateException("Transaction ID mismatch during rollback")
     }
-    if (durable != transaction.manifest) {
+    if (!durable.hasSameImmutableIdentity(transaction.manifest)) {
         throw IllegalStateException("Durable manifest drift relative to in-memory transaction")
     }
-    // Backups are derived exclusively from the durable manifest entries; never the in-memory snapshot.
-    val backupsByEntry = transaction.backups.associateBy { it.original.name }
-    durable.backupEntries.values.forEach { entry ->
-        if (entry.relativePath !in backupsByEntry) {
-            throw IllegalStateException("Durable manifest references unbacked file: ${entry.relativePath}")
-        }
-        val backup = backupsByEntry.getValue(entry.relativePath)
-        if (backup.backup.name != entry.backupName) {
-            throw IllegalStateException("Durable backup name mismatch: ${entry.relativePath} -> ${backup.backup.name} vs ${entry.backupName}")
-        }
-        if (backup.originalLength != entry.originalLength) {
-            throw IllegalStateException("Durable backup length mismatch: ${entry.relativePath}")
-        }
-    }
-    // 1. Validate every required backup exists and lives inside the backup root, then verify length + digest.
-    transaction.backups.forEach { backup ->
-        val target = File(canonicalJobDir, backup.original.name).canonicalFile
+    data class DurableRestore(val target: File, val backup: File, val entry: BackupEntry)
+    // Restore authority is exclusively the strict durable manifest. In-memory backup objects are
+    // deliberately ignored so an injected extra entry cannot mutate an unrelated file.
+    val durableRestores = durable.backupEntries.values.map { entry ->
+        val target = File(canonicalJobDir, entry.relativePath).canonicalFile
+        val backup = File(root, entry.backupName).canonicalFile
         if (target.parentFile?.canonicalFile != canonicalJobDir) {
-            throw IllegalStateException("Unsafe backup target path: ${backup.original.name}")
+            throw IllegalStateException("Unsafe backup target path: ${entry.relativePath}")
         }
-        if (backup.backup.parentFile?.canonicalFile != root) {
-            throw IllegalStateException("Backup file lives outside backup root: ${backup.backup.name}")
+        if (backup.parentFile?.canonicalFile != root) {
+            throw IllegalStateException("Backup file lives outside backup root: ${entry.backupName}")
         }
-        if (backup.original.name == REPROCESS_TX_MANIFEST_FILE) {
+        if (entry.relativePath == REPROCESS_TX_MANIFEST_FILE) {
             throw IllegalStateException("Refusing to overwrite durable manifest file as target")
         }
-        check(backup.backup.isFile) { "Missing rollback backup: ${backup.original.name}" }
-        check(backup.backup.length() == backup.originalLength) {
-            "Invalid rollback backup length: ${backup.original.name} (was ${backup.backup.length()}, expected ${backup.originalLength})"
+        check(backup.isFile) { "Missing rollback backup: ${entry.relativePath}" }
+        check(backup.length() == entry.originalLength) {
+            "Invalid rollback backup length: ${entry.relativePath} (was ${backup.length()}, expected ${entry.originalLength})"
         }
-        val backupSha = computeSha256(backup.backup)
-        check(backupSha == backup.sha256) {
-            "Rollback backup digest mismatch: ${backup.original.name}"
+        check(computeSha256(backup) == entry.sha256) {
+            "Rollback backup digest mismatch: ${entry.relativePath}"
         }
+        DurableRestore(target, backup, entry)
     }
     // 2. Stage and verify all replacement temp files before replacing any destination.
-    data class StagedRestore(val backup: ReprocessBackup, val temp: File)
+    data class StagedRestore(val restore: DurableRestore, val temp: File)
     val staged = mutableListOf<StagedRestore>()
     try {
-        transaction.backups.forEach { backup ->
-            val target = backup.original
+        durableRestores.forEach { restore ->
+            val target = restore.target
             val temp = File(target.parentFile, ".${target.name}.${System.nanoTime()}.restore")
-            backup.backup.copyTo(temp, overwrite = true)
-            check(temp.length() == backup.backup.length()) { "Rollback temp verification failed: ${target.name}" }
+            restore.backup.copyTo(temp, overwrite = true)
+            check(temp.length() == restore.entry.originalLength) { "Rollback temp verification failed: ${target.name}" }
             val tempSha = computeSha256(temp)
-            check(tempSha == backup.sha256) { "Rollback temp digest failed: ${target.name}" }
-            staged.add(StagedRestore(backup, temp))
+            check(tempSha == restore.entry.sha256) { "Rollback temp digest failed: ${target.name}" }
+            staged.add(StagedRestore(restore, temp))
         }
         // 3. Atomically replace restored non-metadata files. Restore job.json last.
-        val (jobJsonFirst, jobJsonLast) = staged.partition { it.backup.original.name != JOB_JSON_FILE_NAME }
+        val (jobJsonFirst, jobJsonLast) = staged.partition { it.restore.target.name != JOB_JSON_FILE_NAME }
         jobJsonFirst.forEach { stagedRestore ->
-            KeplerJobMetadata.atomicReplace(stagedRestore.temp, stagedRestore.backup.original)
+            KeplerJobMetadata.atomicReplace(stagedRestore.temp, stagedRestore.restore.target)
         }
         jobJsonLast.forEach { stagedRestore ->
-            KeplerJobMetadata.atomicReplace(stagedRestore.temp, stagedRestore.backup.original)
+            KeplerJobMetadata.atomicReplace(stagedRestore.temp, stagedRestore.restore.target)
         }
     } finally {
         // Clean up any remaining temp files.
@@ -2045,13 +2099,13 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     if (!manifestFile.isFile) return false
     val durable = runCatching { loadStrictManifest(manifestFile) }.getOrNull() ?: return false
     if (durable.transactionId != transaction.transactionId) return false
-    if (durable != transaction.manifest) return false
+    if (!durable.hasSameImmutableIdentity(transaction.manifest)) return false
     val state = durable.state
     if (state != ReprocessTransactionState.COMMITTED && state != ReprocessTransactionState.ROLLED_BACK) {
         return false
     }
     val cleanupDelete = cleanupDeleteOperation
-    val backupNames = transaction.backups.map { it.backup.name }.toSet()
+    val backupNames = durable.backupEntries.values.map { it.backupName }.toSet()
     val knownNames = backupNames + setOf(REPROCESS_QUARANTINE_MARKER, REPROCESS_TX_MANIFEST_FILE)
     val allKnownDeletedRemoved = mutableSetOf<File>()
     // 1. Delete known payload files and temp artifacts first; inspect files and directories.
@@ -2065,11 +2119,9 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
                 allKnownDeletedRemoved += entry
             }
         } else {
-            // Directories inside a backup root: any non-empty dir is unknown content that blocks.
-            if (!cleanupDelete(entry)) {
-                if (entry.exists()) return false
-            }
-            allKnownDeletedRemoved += entry
+            // No transaction format owns directories inside the backup root. Preserve terminal
+            // evidence rather than deleting even an empty unknown directory.
+            return false
         }
     }
     // 2. Delete quarantine marker once known payloads are gone.
