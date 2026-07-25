@@ -428,7 +428,7 @@ suspend fun reprocessKeplerGalleryJob(
         selectionMode = resolveSelectionMode(job, frameSelection)
         transaction = backupReprocessTransaction(
             target,
-            target.listFiles()?.filter { it.isFile && isReprocessWorkerWritable(it) }.orEmpty(),
+            target.listFiles()?.filter { it.isFile && isReprocessWorkerWritable(it, kind) }.orEmpty(),
             job = job,
             jobKind = kind
         ).getOrElse {
@@ -1086,10 +1086,13 @@ internal fun rollback(
         )
     }
     if (!removeMatchingFallbackQuarantine(jobDir, transaction)) {
-        return quarantineWithPersistence(
-            transaction,
-            combineCauseWithMessage(error, "Fallback marker deletion failed during rollback, quarantining", null)
-        )
+        runCatching {
+            KeplerJobMetadata.update(jobDir) {
+                it.put("reprocessWarning", "Fallback marker deletion failed after rollback; root preserved for retry.")
+            }
+        }
+        try { operationLease.release() } catch (_: Exception) {}
+        return ReprocessFinalizationResult(ReprocessFinalizationState.ROLLED_BACK, Result.failure(error))
     }
     runCatching { removeQuarantineMarker(transaction) }
     val cleanupSuccess = runCatching { cleanupBackups(transaction) }.getOrDefault(false)
@@ -1105,10 +1108,15 @@ internal fun rollback(
     return ReprocessFinalizationResult(ReprocessFinalizationState.ROLLED_BACK, Result.failure(error))
 }
 
+/** Narrow injectable IO seam for created-output deletion during rollback. Tests can override and must reset in `finally`. */
+internal var createdOutputDeleteOperation: ((File) -> Boolean)? = null
+
 /**
  * Remove files created by this transaction that are safe, mutable, and proven not to have existed
  * before the transaction. Immutable source frames and unrelated pre-existing files are untouched.
  * Deletion failure means rollback is not safely complete and must quarantine.
+ * Uses durable preExistingPaths from the manifest and an explicit production-owned output list/policy.
+ * Only direct-child files are candidates; metadata-referenced source files are never deleted.
  */
 private fun removeTransactionCreatedFiles(
     jobDir: File,
@@ -1123,7 +1131,10 @@ private fun removeTransactionCreatedFiles(
     val backedUp = manifest.backedUpPaths
     val backupRootName = transaction.backupRoot.name
     val backupRootCanonical = transaction.backupRoot.canonicalFile
-    jobDir.listFiles()?.filter { it.isFile }?.forEach { file ->
+    val children = jobDir.listFiles()
+        ?: throw IllegalStateException("Cannot list job directory during created-file rollback")
+    val deleteOp = createdOutputDeleteOperation
+    children.filter { it.isFile }.forEach { file ->
         val name = file.name
         if (name == JOB_JSON_FILE_NAME) return@forEach
         if (name == backupRootName) return@forEach
@@ -1132,7 +1143,8 @@ private fun removeTransactionCreatedFiles(
         if (!isReprocessCreatedOutputFile(name)) return@forEach
         // Defensive: never delete anything inside or matching the backup root.
         if (file.canonicalFile == backupRootCanonical) return@forEach
-        if (!runCatching { file.delete() }.getOrDefault(false) && file.exists()) {
+        val deleted = if (deleteOp != null) deleteOp(file) else file.delete()
+        if (!deleted || file.exists()) {
             throw combineCauseWithMessage(
                 originalError,
                 "Created-file deletion failed: $name",
@@ -1154,19 +1166,29 @@ internal fun removeTransactionCreatedFilesForTest(
 
 private fun isReprocessCreatedOutputFile(name: String): Boolean {
     val lower = name.lowercase(Locale.US)
+    // Explicit production-owned outputs from RAW, YUV, and color fusion writers.
     val explicit = setOf(
         "sharpened_night_fusion.png", "average_color_rotated.png", "denoise_color.png",
-        "fused_classic_yuv_v1.png", "reference_frame.png", "raw_fusion_final.png"
+        "fused_classic_yuv_v1.png", "fused_classic_yuv_v1_debug.png",
+        "reference_frame.png", "raw_fusion_final.png",
+        "raw_yuv_comparison.png", "yuv_raw_comparison.png", "yuv_compare_reference_vs_fused.png",
+        "compare_reference_vs_fused.png",
+        "raw_native_rgba.png", "raw_native_preview.png", "raw_intermediate_map.png",
+        "current_diagnostic_map.png", "raw_render_debug.json",
+        "native_postprocess_rgba.png"
     )
-    if (lower in explicit || lower.startsWith("fused_classic_yuv_v1_") ||
-        lower.startsWith("raw_yuv_comparison") || lower.startsWith("yuv_raw_comparison") ||
-        lower.startsWith("raw_native_") || lower.startsWith("raw_intermediate_") ||
-        lower.startsWith("current_diagnostic_")) return true
+    if (lower in explicit) return true
+    if (lower.startsWith("fused_classic_yuv_v1_")) return true
+    if (lower.startsWith("raw_yuv_comparison")) return true
+    if (lower.startsWith("yuv_raw_comparison")) return true
+    if (lower.startsWith("raw_native_")) return true
+    if (lower.startsWith("raw_intermediate_")) return true
+    if (lower.startsWith("current_diagnostic_")) return true
     if (name.startsWith(REPROCESS_PREVIEW_PREFIX)) return true
-    if (lower.contains("final") || lower.contains("preview") || lower.contains("diagnostic")) return true
-    if (lower.endsWith(".tmp") || lower.endsWith(".restore")) return true
-    if (lower.startsWith("merged_raw") || lower.contains("merged_yuv") || lower.contains("intermediate")) return true
     if (lower.endsWith(".rgba") || lower.endsWith(".rgb") || lower.endsWith(".bin")) return true
+    if (lower.endsWith(".tmp") || lower.endsWith(".restore")) return true
+    if (lower.startsWith("merged_raw")) return true
+    if (lower.contains("merged_yuv")) return true
     return false
 }
 
@@ -1500,7 +1522,7 @@ internal fun recoverValidatedQuarantine(jobDir: File) {
         if (fallbackId != null) {
             val matchingRoot = children.firstOrNull { it.isDirectory && it.name == fallbackId.second }
             val matchingClassification = matchingRoot?.let { classifyTransactionManifest(jobDir, it) }
-            if (matchingClassification is ManifestClassification.Resolved && matchingRoot != null) {
+            if (matchingClassification is ManifestClassification.Resolved) {
                 val manifest = runCatching { loadStrictManifest(File(matchingRoot, REPROCESS_TX_MANIFEST_FILE)) }.getOrNull()
                 if (manifest != null &&
                     manifest.transactionId == fallbackId.first &&
@@ -1695,21 +1717,23 @@ private fun countActualSourceFrames(jobDir: File, job: JSONObject, kind: Reproce
         if (frames != null) {
             repeat(frames.length()) { index ->
                 val frame = frames.optJSONObject(index) ?: return@repeat
-                val name = when (kind) {
-                    ReprocessJobKind.RAW_FUSION -> frame.optString("raw16File")
-                        .ifBlank { frame.optString("dngFile") }
-                        .ifBlank { frame.optString("file") }
-                    ReprocessJobKind.YUV_FUSION, ReprocessJobKind.COLOR_BURST -> frame.optString("file")
-                        .ifBlank { frame.optString("yuvFile") }
-                        .ifBlank { frame.optString("nv21File") }
-                    ReprocessJobKind.UNSUPPORTED -> frame.optString("file")
+                val candidates = when (kind) {
+                    ReprocessJobKind.RAW_FUSION -> listOfNotNull(
+                        frame.optString("raw16File"),
+                        frame.optString("dngFile"),
+                        frame.optString("file")
+                    )
+                    ReprocessJobKind.YUV_FUSION, ReprocessJobKind.COLOR_BURST -> listOfNotNull(
+                        frame.optString("file"),
+                        frame.optString("yuvFile"),
+                        frame.optString("nv21File")
+                    )
+                    ReprocessJobKind.UNSUPPORTED -> emptyList()
                 }
-                if (
-                    name.isNotBlank() &&
-                    frame.optBoolean("enabled", true) &&
-                    !frame.optBoolean("excludedByUser", false)
-                ) {
-                    File(jobDir, name).takeIf { it.isFile && isReprocessSourceFrame(it, kind) }?.let { add(it.canonicalFile) }
+                for (name in candidates) {
+                    if (name.isNotBlank() && name != "null") {
+                        File(jobDir, name).takeIf { it.isFile && isReprocessSourceFrame(it, kind) }?.let { add(it.canonicalFile) }
+                    }
                 }
             }
         }
@@ -1978,7 +2002,7 @@ internal fun validateTransactionIdentity(
  * or replaced by a reprocess transaction. Identifies source frames from actual job metadata + kind:
  * RAW/YUV/Color PNG/JPEG/RAW/YUV source frames are all immutable.
  */
-private fun isImmutableSourceFrame(file: File, jobKind: ReprocessJobKind = detectImmutableSourceKind(file)): Boolean {
+private fun isImmutableSourceFrame(file: File, jobKind: ReprocessJobKind): Boolean {
     val name = file.name.lowercase(Locale.US)
     if (!name.startsWith("frame_")) return false
     return when (jobKind) {
@@ -1990,15 +2014,12 @@ private fun isImmutableSourceFrame(file: File, jobKind: ReprocessJobKind = detec
                 name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg")
         ReprocessJobKind.COLOR_BURST ->
             name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg")
-        ReprocessJobKind.UNSUPPORTED -> true
+        ReprocessJobKind.UNSUPPORTED -> false
     }
 }
 
-/** Best-effort detection used when no job kind is available; keeps RAW/YUV source frames immutable. */
-private fun detectImmutableSourceKind(file: File): ReprocessJobKind = ReprocessJobKind.RAW_FUSION
-
 /** True if the file is a mutable output or metadata that the reprocess worker may overwrite. */
-internal fun isReprocessWorkerWritable(file: File): Boolean = !isImmutableSourceFrame(file)
+internal fun isReprocessWorkerWritable(file: File, kind: ReprocessJobKind): Boolean = !isImmutableSourceFrame(file, kind)
 
 /** Compute SHA-256 digest of a file by streaming — never loads whole large files into memory. */
 private fun computeSha256(file: File): String {
@@ -2030,10 +2051,42 @@ internal fun backupReprocessTransaction(
         // source PNG/JPEG/RAW/YUV frames must NEVER be backed up, deleted, or replaced.
         val validatedJob = job ?: KeplerJobMetadata.read(jobDir)
         val resolvedKind = jobKind ?: detectJobKind(jobDir, validatedJob)
+        val canonicalJobDir = jobDir.canonicalFile
         val immutableSourceFiles = mutableSetOf<File>()
-        jobDir.listFiles()?.forEach { child ->
-            if (child.isFile && isImmutableSourceFrame(child, resolvedKind)) {
-                immutableSourceFiles += child.canonicalFile
+        // All frames metadata entries (including disabled, excluded, and locked) contribute
+        // to the immutable source set. Every filename field is inspected.
+        // Malformed or unsafe source references fail before ACTIVE transaction creation.
+        val frames = validatedJob.optJSONArray("frames")
+        if (frames != null) {
+            repeat(frames.length()) { index ->
+                val frame = frames.optJSONObject(index) ?: return@repeat
+                val candidates = listOfNotNull(
+                    frame.optString("raw16File"),
+                    frame.optString("dngFile"),
+                    frame.optString("file"),
+                    frame.optString("yuvFile"),
+                    frame.optString("nv21File")
+                ).filter { it.isNotBlank() && it != "null" }
+                for (ref in candidates) {
+                    require(isStrictRelativePath(ref)) {
+                        "Unsafe source reference in frames metadata: $ref"
+                    }
+                    val source = File(canonicalJobDir, ref)
+                    if (source.parentFile?.canonicalFile != canonicalJobDir) {
+                        // Canonicalization moved the file outside the job directory; it was unsafe.
+                        require(false) { "Source reference escapes job directory: $ref" }
+                    }
+                    if (source.isFile) {
+                        immutableSourceFiles += source.canonicalFile
+                    }
+                }
+            }
+        } else {
+            // Legacy job without frames metadata: use filename-based detection as fallback.
+            jobDir.listFiles()?.forEach { child ->
+                if (child.isFile && isImmutableSourceFrame(child, resolvedKind)) {
+                    immutableSourceFiles += child.canonicalFile
+                }
             }
         }
         val preExistingNames = jobDir.listFiles()?.filter { it.isFile }?.map { it.name }?.toSet().orEmpty()
@@ -2044,7 +2097,7 @@ internal fun backupReprocessTransaction(
             .map { it.canonicalFile }
             .distinctBy { it.path }
             .filter { it.parentFile?.canonicalFile == jobDir.canonicalFile }
-            .filter { !immutableSourceFiles.contains(it.canonicalFile) && isReprocessWorkerWritable(it) }
+            .filter { it !in immutableSourceFiles && isReprocessWorkerWritable(it, resolvedKind) }
             .toList()
         val backups = filesToBackup.map { original ->
             val backup = File(root, "${original.name}$BACKUP_ENTRY_SUFFIX")
