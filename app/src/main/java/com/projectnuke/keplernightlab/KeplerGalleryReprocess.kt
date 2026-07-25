@@ -18,6 +18,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.IOException
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -1086,21 +1087,25 @@ internal fun rollback(
         )
     }
     if (!removeMatchingFallbackQuarantine(jobDir, transaction)) {
-        runCatching {
+        try {
             KeplerJobMetadata.update(jobDir) {
                 it.put("reprocessWarning", "Fallback marker deletion failed after rollback; root preserved for retry.")
             }
+        } catch (e : IOException) {
+        } catch (e : SecurityException) {
         }
         try { operationLease.release() } catch (_: Exception) {}
         return ReprocessFinalizationResult(ReprocessFinalizationState.ROLLED_BACK, Result.failure(error))
     }
-    runCatching { removeQuarantineMarker(transaction) }
-    val cleanupSuccess = runCatching { cleanupBackups(transaction) }.getOrDefault(false)
+    try { removeQuarantineMarker(transaction) } catch (_: IllegalStateException) {}
+    val cleanupSuccess = try { cleanupBackups(transaction) } catch (e : IOException) { false } catch (e : SecurityException) { false }
     if (!cleanupSuccess) {
-        runCatching {
+        try {
             KeplerJobMetadata.update(jobDir) {
                 it.put("reprocessWarning", "Reprocess backup cleanup failed after safe rollback.")
             }
+        } catch (e : IOException) {
+        } catch (e : SecurityException) {
         }
     }
     // Lease release only after durable ROLLED_BACK; QUARANTINED retains it.
@@ -1558,7 +1563,7 @@ internal fun recoverValidatedQuarantine(jobDir: File) {
 
 /** True when a root has no marker, no manifest, no backup payload, and no temp evidence. */
 private fun isRootEvidenceFree(root: File): Boolean {
-    val children = root.listFiles() ?: emptyArray()
+    val children = root.listFiles() ?: return false
     return children.none { file ->
         file.name == REPROCESS_QUARANTINE_MARKER ||
             file.name == REPROCESS_TX_MANIFEST_FILE ||
@@ -1577,7 +1582,15 @@ private fun isRootEvidenceFree(root: File): Boolean {
 private fun cleanupTerminalRoot(root: File) {
     val children = root.listFiles() ?: return
     val manifestFile = children.firstOrNull { it.name == REPROCESS_TX_MANIFEST_FILE } ?: return
-    val durable = runCatching { loadStrictManifest(manifestFile) }.getOrNull() ?: return
+    val durable = try {
+        loadStrictManifest(manifestFile)
+    } catch (e : IOException) {
+        return
+    } catch (e : SecurityException) {
+        return
+    } catch (e : IllegalArgumentException) {
+        return
+    }
     val state = durable.state
     if (state != ReprocessTransactionState.COMMITTED && state != ReprocessTransactionState.ROLLED_BACK) return
     val dummyTx = ReprocessTransaction(durable.transactionId, root, durable, emptyList())
@@ -1711,34 +1724,36 @@ internal fun detectJobKind(jobDir: File, job: JSONObject): ReprocessJobKind {
     }
 }
 
-private fun countActualSourceFrames(jobDir: File, job: JSONObject, kind: ReprocessJobKind): Int {
+internal fun countActualSourceFrames(jobDir: File, job: JSONObject, kind: ReprocessJobKind): Int {
     val frames = job.optJSONArray("frames")
-    val fromMetadata = buildSet {
-        if (frames != null) {
-            repeat(frames.length()) { index ->
-                val frame = frames.optJSONObject(index) ?: return@repeat
-                val candidates = when (kind) {
-                    ReprocessJobKind.RAW_FUSION -> listOfNotNull(
-                        frame.optString("raw16File"),
-                        frame.optString("dngFile"),
-                        frame.optString("file")
-                    )
-                    ReprocessJobKind.YUV_FUSION, ReprocessJobKind.COLOR_BURST -> listOfNotNull(
-                        frame.optString("file"),
-                        frame.optString("yuvFile"),
-                        frame.optString("nv21File")
-                    )
-                    ReprocessJobKind.UNSUPPORTED -> emptyList()
-                }
-                for (name in candidates) {
-                    if (name.isNotBlank() && name != "null") {
-                        File(jobDir, name).takeIf { it.isFile && isReprocessSourceFrame(it, kind) }?.let { add(it.canonicalFile) }
+    if (frames != null) {
+        var count = 0
+        repeat(frames.length()) { index ->
+            val frame = frames.optJSONObject(index) ?: return@repeat
+            val candidates = when (kind) {
+                ReprocessJobKind.RAW_FUSION -> listOfNotNull(
+                    frame.optString("raw16File"),
+                    frame.optString("dngFile"),
+                    frame.optString("file")
+                )
+                ReprocessJobKind.YUV_FUSION, ReprocessJobKind.COLOR_BURST -> listOfNotNull(
+                    frame.optString("file"),
+                    frame.optString("yuvFile"),
+                    frame.optString("nv21File")
+                )
+                ReprocessJobKind.UNSUPPORTED -> emptyList()
+            }
+            for (name in candidates) {
+                if (name.isNotBlank() && name != "null") {
+                    if (File(jobDir, name).isFile && isReprocessSourceFrame(File(jobDir, name), kind)) {
+                        count++
+                        return@repeat
                     }
                 }
             }
         }
+        if (count > 0) return count
     }
-    if (fromMetadata.isNotEmpty()) return fromMetadata.size
     return jobDir.listFiles()
         ?.count { it.isFile && isReprocessSourceFrame(it, kind) }
         ?: 0
@@ -2227,7 +2242,7 @@ internal var cleanupDeleteOperation: (File) -> Boolean = { it.delete() }
  * - Never delete the terminal manifest while any known or unknown content failed to delete.
  * - Delete the terminal manifest only after terminal state is durable and every other entry is gone.
  * - Delete the root only when actually empty.
- * - A successful root deletion reports `true` (not a spurious failure because `listFiles()` is null).
+ * - A successful root deletion reports `true` (null listing from a non-existent root is success).
  * - Cleanup failure leaves a valid terminal manifest and must not block the job; it may add a warning
  *   but cannot downgrade COMMITTED/ROLLED_BACK to QUARANTINED.
  * - Recovery does not delete terminal evidence after a failed payload deletion.
@@ -2242,7 +2257,15 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     // Cleanup is allowed only for strictly validated terminal manifests.
     val manifestFile = File(root, REPROCESS_TX_MANIFEST_FILE)
     if (!manifestFile.isFile) return false
-    val durable = runCatching { loadStrictManifest(manifestFile) }.getOrNull() ?: return false
+    val durable = try {
+        loadStrictManifest(manifestFile)
+    } catch (e : IOException) {
+        return false
+    } catch (e : SecurityException) {
+        return false
+    } catch (e : IllegalArgumentException) {
+        return false
+    }
     if (durable.transactionId != transaction.transactionId) return false
     if (!durable.hasSameImmutableIdentity(transaction.manifest)) return false
     val state = durable.state
@@ -2254,13 +2277,13 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     val knownNames = backupNames + setOf(REPROCESS_QUARANTINE_MARKER, REPROCESS_TX_MANIFEST_FILE)
     val allKnownDeletedRemoved = mutableSetOf<File>()
     // 1. Delete known payload files and temp artifacts first; inspect files and directories.
-    root.listFiles()?.sortedBy { it.isDirectory }?.forEach { entry ->
+    val entries = root.listFiles() ?: return false
+    entries.sortedBy { it.isDirectory }.forEach { entry ->
         if (!entry.isDirectory) {
             if (entry.name == REPROCESS_TX_MANIFEST_FILE) return@forEach
             if (entry.name in backupNames || entry.name.endsWith(".tmp") || entry.name.endsWith(".restore")) {
-                if (!cleanupDelete(entry)) {
-                    if (entry.exists()) return false
-                }
+                cleanupDelete(entry)
+                if (entry.exists()) return false
                 allKnownDeletedRemoved += entry
             }
         } else {
@@ -2272,8 +2295,8 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     // 2. Delete quarantine marker once known payloads are gone.
     val markerFile = File(root, REPROCESS_QUARANTINE_MARKER)
     if (markerFile.exists()) {
-        val deleted = cleanupDelete(markerFile)
-        if (!deleted || markerFile.exists()) {
+        cleanupDelete(markerFile)
+        if (markerFile.exists()) {
             // Terminal state is already durable, but its manifest must remain while any known
             // payload/marker could not be removed.
             return false
@@ -2290,7 +2313,8 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     }
     // 4. Delete the terminal manifest last after terminal state is durable.
     if (manifestRemaining != null) {
-        if (!cleanupDelete(manifestRemaining) && manifestRemaining.exists()) return false
+        cleanupDelete(manifestRemaining)
+        if (manifestRemaining.exists()) return false
     }
     // 5. Remove an empty root; a successful root deletion reports success, not failure.
     val finalContents = root.listFiles()

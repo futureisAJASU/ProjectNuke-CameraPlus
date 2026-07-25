@@ -3,6 +3,7 @@ package com.projectnuke.keplernightlab
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -210,6 +211,140 @@ class KeplerGalleryReprocessProtocolTest {
             File(transaction.backupRoot, "unknown").mkdir()
             assertFalse(cleanupBackups(transaction))
             assertTrue(File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE).isFile)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun cleanupSeamLyingWhilePayloadRemainsPreservesManifest() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
+            val previousDelete = cleanupDeleteOperation
+            cleanupDeleteOperation = { file ->
+                file.name == "final.png.backup"
+            }
+            try {
+                assertFalse(cleanupBackups(transaction))
+                assertTrue(File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE).isFile)
+            } finally {
+                cleanupDeleteOperation = previousDelete
+            }
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun markerCleanupFailurePreservesManifest() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
+            File(transaction.backupRoot, ".reprocess_quarantine").writeText("quarantined\n")
+            val previousDelete = cleanupDeleteOperation
+            cleanupDeleteOperation = { file ->
+                file.name == ".reprocess_quarantine"
+            }
+            try {
+                assertFalse(cleanupBackups(transaction))
+                assertTrue(File(transaction.backupRoot, ".reprocess_quarantine").exists())
+                assertTrue(File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE).isFile)
+            } finally {
+                cleanupDeleteOperation = previousDelete
+            }
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun payloadCleanupRemainsEvenWhenDeleteSaysSuccess() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
+            val previousDelete = cleanupDeleteOperation
+            cleanupDeleteOperation = { file ->
+                // Lies: claims success but file is still there
+                true
+            }
+            try {
+                assertFalse(cleanupBackups(transaction))
+                assertTrue(File(transaction.backupRoot, ".reprocess_quarantine").isFile || File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE).isFile)
+            } finally {
+                cleanupDeleteOperation = previousDelete
+            }
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun successfulImmediateCleanupDeletesRoot() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
+            assertTrue(cleanupBackups(transaction))
+            assertFalse(transaction.backupRoot.exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun raw16AndDngRefsForOneFrameCountAsOne() {
+        val directory = tempJob()
+        try {
+            val job = JSONObject().put("jobType", "RAW_NIGHT_FUSION")
+            val frames = JSONArray()
+            frames.put(JSONObject().put("raw16File", "frame_0001.raw16").put("dngFile", "frame_0001.dng").put("enabled", true))
+            job.put("frames", frames)
+            File(directory, "frame_0001.raw16").writeText("raw")
+            File(directory, "frame_0001.dng").writeText("raw")
+            assertEquals(1, countActualSourceFrames(directory, job, ReprocessJobKind.RAW_FUSION))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun successfulRestartCleanupCleansResolvedRoot() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
+            assertTrue(cleanupBackups(transaction))
+            assertFalse(transaction.backupRoot.exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun everyActiveYuvClassicCreatedOutputIsRemovedOnRollback() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            val yuvOutput = File(directory, "fused_classic_yuv_v1.png")
+            yuvOutput.writeText("yuv")
+            val classicOutput = File(directory, "average_color_rotated.png")
+            classicOutput.writeText("color")
+            val rawOutput = File(directory, "raw_fusion_final.png")
+            rawOutput.writeText("raw")
+            val debugOutput = File(directory, "raw_render_debug.json")
+            debugOutput.writeText("{}")
+            val tempOutput = File(directory, "tmp_fused.tmp")
+            tempOutput.writeText("temp")
+            assertTrue(removeCreatedForTest(directory, transaction).isSuccess)
+            assertFalse(yuvOutput.exists())
+            assertFalse(classicOutput.exists())
+            assertFalse(rawOutput.exists())
+            assertFalse(debugOutput.exists())
+            assertFalse(tempOutput.exists())
         } finally {
             directory.deleteRecursively()
         }
