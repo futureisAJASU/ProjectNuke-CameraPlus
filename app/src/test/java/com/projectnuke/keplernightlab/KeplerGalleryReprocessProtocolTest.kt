@@ -776,7 +776,7 @@ class KeplerGalleryReprocessProtocolTest {
             KeplerJobMetadata.write(directory, job)
             File(directory, "final.png").writeText("output")
             val result = backupReprocessTransaction(directory, listOf(File(directory, "final.png")), job)
-            assertTrue(result.isSuccess) // empty frame is valid; no mutable source to protect
+            assertTrue(result.isFailure)
         } finally {
             directory.deleteRecursively()
         }
@@ -807,6 +807,85 @@ class KeplerGalleryReprocessProtocolTest {
             File(directory, "final.png").writeText("output")
             val result = backupReprocessTransaction(directory, listOf(File(directory, "final.png")))
             assertTrue(result.isFailure)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun nonObjectFrameEntryRejectsBackup() {
+        val directory = tempJob()
+        try {
+            val job = JSONObject().put("jobType", "RAW_NIGHT_FUSION")
+            val frames = JSONArray()
+            frames.put("not-an-object")
+            job.put("frames", frames)
+            KeplerJobMetadata.write(directory, job)
+            File(directory, "final.png").writeText("output")
+            val result = backupReprocessTransaction(directory, listOf(File(directory, "final.png")), job)
+            assertTrue(result.isFailure)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun createdOutputDeletionFailureQuarantines() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            File(directory, "reprocess_preview_new.png").writeText("created")
+            val previousDelete = createdOutputDeleteOperation
+            createdOutputDeleteOperation = { false }
+            try {
+                assertTrue(removeCreatedForTest(directory, transaction).isFailure)
+            } finally {
+                createdOutputDeleteOperation = previousDelete
+            }
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun specificActiveRawYuvClassicOutputNamesRemoved() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            val outputs = listOf(
+                "sharpened_night_fusion.png", "average_color_rotated.png", "denoise_color.png",
+                "fused_classic_yuv_v1.png", "fused_classic_yuv_v1_debug.png",
+                "raw_fusion_final.png", "raw_yuv_comparison.png", "yuv_raw_comparison.png",
+                "yuv_compare_reference_vs_fused.png", "compare_reference_vs_fused.png",
+                "raw_native_rgba.png", "raw_native_preview.png", "raw_intermediate_map.png",
+                "current_diagnostic_map.png", "raw_render_debug.json",
+                "native_postprocess_rgba.png", "fusion_debug.json", "yuv_debug.json",
+                "raw_fusion_debug.json", "raw_render_input_metadata.json",
+                "final_preview.png", "reference_single_preview.png", "preview_single_reference.png"
+            )
+            for (name in outputs) {
+                File(directory, name).writeText("output")
+            }
+            assertTrue(removeCreatedForTest(directory, transaction).isSuccess)
+            for (name in outputs) {
+                assertFalse("$name not removed", File(directory, name).exists())
+            }
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun unsafeNestedSourceReferenceDoesNotCount() {
+        val directory = tempJob()
+        try {
+            val job = JSONObject().put("jobType", "RAW_NIGHT_FUSION")
+            val frames = JSONArray()
+            frames.put(JSONObject().put("raw16File", "frame_0001.raw16").put("enabled", true))
+            frames.put(JSONObject().put("raw16File", "../other/frame_0002.raw16"))
+            job.put("frames", frames)
+            File(directory, "frame_0001.raw16").writeText("raw")
+            assertEquals(1, countActualSourceFrames(directory, job, ReprocessJobKind.RAW_FUSION))
         } finally {
             directory.deleteRecursively()
         }

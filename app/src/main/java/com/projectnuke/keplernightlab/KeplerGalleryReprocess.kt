@@ -930,10 +930,14 @@ internal fun finalizeTransaction(
         outcome.publicExportCommitted) && hasUsableOutput
 
     return if (shouldCommit) {
-        val commitResult = runCatching {
-            finalizeReprocessOutcome(
+        val commitResult = try {
+            Result.success(finalizeReprocessOutcome(
                 jobDir, jobKind, outputSettings, selectionMode, includedFrameIndices, outcome, transaction
-            )
+            ))
+        } catch (e : IOException) {
+            Result.failure<KeplerReprocessResult>(e)
+        } catch (e : SecurityException) {
+            Result.failure<KeplerReprocessResult>(e)
         }
         commitResult.fold(
             onSuccess = { committed ->
@@ -943,18 +947,20 @@ internal fun finalizeTransaction(
                     if (e is OutOfMemoryError || e is ThreadDeath) throw e
                     return@fold quarantineWithPersistence(transaction, e)
                 }
-                runCatching { removeQuarantineMarker(transaction) }
+                try { removeQuarantineMarker(transaction) } catch (_: IllegalStateException) {}
                 if (!removeMatchingFallbackQuarantine(jobDir, transaction)) {
-                    runCatching {
+                    try {
                         KeplerJobMetadata.update(jobDir) {
                             it.put("reprocessWarning", "Fallback quarantine marker deletion failed after commit. Root preserved for retry.")
                         }
+                    } catch (e : IOException) {
+                    } catch (e : SecurityException) {
                     }
-                    try { ownedLease.release() } catch (_: Exception) {}
+                    try { ownedLease.release() } catch (_: IOException) {} catch (_: SecurityException) {}
                     return@fold ReprocessFinalizationResult(ReprocessFinalizationState.COMMITTED, Result.success(committed))
                 }
-                runCatching { cleanupBackups(transaction) }
-                try { ownedLease.release() } catch (_: Exception) {}
+                try { cleanupBackups(transaction) } catch (e : IOException) {} catch (e : SecurityException) {}
+                try { ownedLease.release() } catch (_: IOException) {} catch (_: SecurityException) {}
                 ReprocessFinalizationResult(ReprocessFinalizationState.COMMITTED, Result.success(committed))
             },
             onFailure = { metadataError ->
@@ -1057,14 +1063,10 @@ internal fun rollback(
     }
     removeTransactionCreatedFiles(jobDir, transaction, error)
         .exceptionOrNull()?.let { deleteError ->
-            if (deleteError is OutOfMemoryError || deleteError is ThreadDeath) throw deleteError
-            try {
-                KeplerJobMetadata.update(jobDir) {
-                    it.put("reprocessWarning", "Created-file deletion failed during rollback; root preserved for retry.")
-                }
-            } catch (e : IOException) {
-            } catch (e : SecurityException) {
-            }
+            return quarantineWithPersistence(
+                transaction,
+                combineCauseWithMessage(error, "Created-file deletion failed during rollback", deleteError)
+            )
         }
     val metadataError = try {
         if (outcome.disposition == ReprocessTerminalDisposition.CANCELLED) {
@@ -1199,9 +1201,6 @@ private fun isReprocessCreatedOutputFile(name: String): Boolean {
     if (lower.endsWith(".tmp") || lower.endsWith(".restore")) return true
     if (lower.startsWith("merged_raw")) return true
     if (lower.contains("merged_yuv")) return true
-    if (lower.endsWith("_preview.png")) return true
-    if (lower.contains("reference") && lower.endsWith(".png")) return true
-    if (lower.contains("debug") && lower.endsWith(".json")) return true
     return false
 }
 
@@ -2088,11 +2087,13 @@ internal fun backupReprocessTransaction(
         val immutableSourceFiles = mutableSetOf<File>()
         // All frames metadata entries (including disabled, excluded, and locked) contribute
         // to the immutable source set. Every filename field is inspected.
-        // Malformed or unsafe source references fail before ACTIVE transaction creation.
+        // Malformed, non-object, empty, unsafe, or escaping source references fail before ACTIVE creation.
         val frames = validatedJob.optJSONArray("frames")
         if (frames != null) {
             repeat(frames.length()) { index ->
-                val frame = frames.optJSONObject(index) ?: return@repeat
+                val value = frames.opt(index)
+                check(value is JSONObject) { "Frame entry at index $index is not a JSON object." }
+                val frame = value as JSONObject
                 val candidates = listOfNotNull(
                     frame.optString("raw16File"),
                     frame.optString("dngFile"),
@@ -2100,6 +2101,7 @@ internal fun backupReprocessTransaction(
                     frame.optString("yuvFile"),
                     frame.optString("nv21File")
                 ).filter { it.isNotBlank() && it != "null" }
+                require(candidates.isNotEmpty()) { "Frame entry at index $index has no valid source references." }
                 for (ref in candidates) {
                     require(isStrictRelativePath(ref)) {
                         "Unsafe source reference in frames metadata: $ref"
