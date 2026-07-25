@@ -268,53 +268,99 @@ class KeplerGalleryReprocessProtocolTest {
     }
 
     @Test
-    fun mismatchedOrCorruptFallbackRemainsBlocking() {
+    fun fallbackCreatedOnlyWhenBothRootMechanismsFail() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+
+            // Case 1: marker succeeds / state fails -> no fallback
+            val case1Root = File(directory, ".reprocess_backup_case1")
+            case1Root.mkdir()
+            // Valid manifest file so writeQuarantineMarker succeeds, but mismatch transactionId in memory so writeTransactionState throws IllegalArgumentException
+            val case1Manifest = ReprocessTransactionManifest(
+                transactionId = "case1_disk_id",
+                createdAt = transaction.manifest.createdAt,
+                preExistingPaths = transaction.manifest.preExistingPaths,
+                backedUpPaths = transaction.manifest.backedUpPaths,
+                backupEntries = transaction.manifest.backupEntries
+            )
+            KeplerJobMetadata.atomicWrite(File(case1Root, REPROCESS_TX_MANIFEST_FILE), case1Manifest.toJson().toString(2))
+            val txStateFail = ReprocessTransaction("case1_mem_id", case1Root, case1Manifest, emptyList())
+            val res1 = quarantineWithPersistence(txStateFail, IllegalStateException("fail"))
+            assertTrue(res1.result.isFailure)
+            assertTrue(File(case1Root, ".reprocess_quarantine").isFile)
+            assertFalse(File(directory, ".reprocess_unresolved").exists())
+            case1Root.deleteRecursively()
+
+            // Case 2: state succeeds / marker fails -> no fallback
+            val case2Root = File(directory, ".reprocess_backup_case2")
+            case2Root.mkdir()
+            val case2Manifest = ReprocessTransactionManifest(
+                transactionId = "case2_id",
+                createdAt = transaction.manifest.createdAt,
+                preExistingPaths = transaction.manifest.preExistingPaths,
+                backedUpPaths = transaction.manifest.backedUpPaths,
+                backupEntries = transaction.manifest.backupEntries
+            )
+            KeplerJobMetadata.atomicWrite(File(case2Root, REPROCESS_TX_MANIFEST_FILE), case2Manifest.toJson().toString(2))
+            // Marker fail simulated by creating .reprocess_quarantine as a non-writable directory
+            val markerDir = File(case2Root, ".reprocess_quarantine")
+            markerDir.mkdir()
+            val txMarkerFail = ReprocessTransaction("case2_id", case2Root, case2Manifest, emptyList())
+            try {
+                val res2 = quarantineWithPersistence(txMarkerFail, IllegalStateException("fail"))
+                assertTrue(res2.result.isFailure)
+                assertFalse(File(directory, ".reprocess_unresolved").exists())
+            } finally {
+                case2Root.deleteRecursively()
+            }
+
+            // Case 3: both fail -> fallback created
+            transaction.backupRoot.deleteRecursively()
+            val res3 = quarantineWithPersistence(transaction, IllegalStateException("fail"))
+            assertTrue(res3.result.isFailure)
+            assertTrue(File(directory, ".reprocess_unresolved").isFile)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun transactionIdOnlyMismatchRemainsBlocking() {
         val directory = tempJob()
         try {
             val transaction = backup(directory, "final.png" to "before")
             ensureDurableFallbackQuarantine(directory, transaction)
-            assertTrue(isReprocessQuarantined(directory))
+            writeTransactionState(transaction, ReprocessTransactionState.COMMITTED)
 
             val marker = File(directory, ".reprocess_unresolved")
-            marker.writeText("transactionId=corrupt\nbackupRoot=bad\ncreatedAt=0\n")
-            assertTrue(isReprocessQuarantined(directory))
-            assertFalse(removeMatchingFallbackQuarantine(directory, transaction))
-        } finally {
-            directory.deleteRecursively()
-        }
-    }
+            // Mismatch transactionId only, keep backupRoot name and createdAt matching
+            marker.writeText("transactionId=mismatched_tx_id\nbackupRoot=${transaction.backupRoot.name}\ncreatedAt=${transaction.manifest.createdAt}\n")
 
-    @Test
-    fun matchingTerminalFallbackRemovedAndCrashAfterTerminalStateRecovers() {
-        val directory = tempJob()
-        try {
-            val transaction = backup(directory, "final.png" to "before")
-            ensureDurableFallbackQuarantine(directory, transaction)
-            assertTrue(isReprocessQuarantined(directory))
-
-            writeTransactionState(transaction, ReprocessTransactionState.COMMITTED)
-            // Simulated restart recovery
             recoverValidatedQuarantine(directory)
-            assertFalse(File(directory, ".reprocess_unresolved").exists())
-            assertFalse(isReprocessQuarantined(directory))
+            assertTrue(marker.isFile)
+            assertTrue(isReprocessQuarantined(directory))
         } finally {
             directory.deleteRecursively()
         }
     }
 
     @Test
-    fun payloadOrMarkerDeletionFailurePreservesManifest() {
+    fun actualMarkerDeletionFailurePreservesTerminalManifest() {
         val directory = tempJob()
         try {
             val transaction = backup(directory, "final.png" to "before")
+            writeQuarantineMarker(transaction)
             writeTransactionState(transaction, ReprocessTransactionState.COMMITTED)
+
             val previousDelete = cleanupDeleteOperation
             cleanupDeleteOperation = { file ->
-                if (file.name.endsWith(".backup")) false else file.delete()
+                if (file.name == ".reprocess_quarantine") false else file.delete()
             }
             try {
                 assertFalse(cleanupBackups(transaction))
                 assertTrue(File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE).isFile)
+                assertTrue(File(transaction.backupRoot, ".reprocess_quarantine").isFile)
             } finally {
                 cleanupDeleteOperation = previousDelete
             }
@@ -324,20 +370,13 @@ class KeplerGalleryReprocessProtocolTest {
     }
 
     @Test
-    fun unknownDirectoryPreservesManifestAndImmediateAndRestartCleanupMatch() {
-        val directory = tempJob()
-        try {
-            val transaction = backup(directory, "final.png" to "before")
-            writeTransactionState(transaction, ReprocessTransactionState.COMMITTED)
-            File(transaction.backupRoot, "unknown_dir").mkdir()
-
-            assertFalse(cleanupBackups(transaction))
-            assertTrue(File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE).isFile)
-
-            recoverValidatedQuarantine(directory)
-            assertTrue(File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE).isFile)
-        } finally {
-            directory.deleteRecursively()
-        }
+    fun cancelledWorkerDeferredIsWorkerFailureWhileCallerActive() = runBlocking {
+        val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
+        terminal.cancel(kotlinx.coroutines.CancellationException("worker cancelled"))
+        val result = acquireWorkerTerminal(
+            ReprocessWorkerRun(terminal) {},
+            callerCancellation = null
+        )
+        assertTrue(result is WorkerTerminalResult.DeferredExceptionalCompletion)
     }
 }

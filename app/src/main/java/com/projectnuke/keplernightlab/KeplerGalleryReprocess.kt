@@ -1010,7 +1010,7 @@ internal fun quarantineWithPersistence(
         combineCauseWithMessage(canonicalError, "Quarantine persistence failed after processing error", markerError)
             .also { stateError?.let { se -> runCatching { it.addSuppressed(se) } } }
     } else canonicalError
-    if (markerError != null || stateError != null) {
+    if (markerError != null && stateError != null) {
         try {
             ensureDurableFallbackQuarantine(transaction.backupRoot.parentFile ?: transaction.backupRoot, transaction)
         } catch (fallbackError: Exception) {
@@ -1332,7 +1332,7 @@ internal fun persistUnresolvedQuarantine(
     try { writeQuarantineMarker(transaction) } catch (e: Exception) { markerFailure = e }
     try { writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED) }
     catch (e: Exception) { stateFailure = e }
-    val rootEvidence = markerFailure == null && stateFailure == null
+    val rootEvidence = markerFailure == null || stateFailure == null
     var fallbackFailure: Throwable? = null
     var fallbackPersisted = false
     if (!rootEvidence) {
@@ -1448,29 +1448,29 @@ internal fun isReprocessQuarantined(jobDir: File): Boolean {
 internal fun recoverValidatedQuarantine(jobDir: File) {
     if (KeplerJobMetadata.isOperationActive(jobDir)) return
     val fallbackMarker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
-    // The durable fallback marker alone proves the job has unresolved reprocess evidence even when
-    // no backup root survived process death. Do NOT delete it merely because the in-memory lease
-    // disappeared.
     val children = jobDir.listFiles() ?: return
-    var hasFallback = fallbackMarker.exists()
-    val fallbackIdentity = if (hasFallback) readFallbackIdentity(fallbackMarker) else null
-    if (hasFallback && fallbackIdentity != null) {
-        val matchingRoot = children.firstOrNull { it.isDirectory && it.name == fallbackIdentity.second }
-        val matchingClassification = matchingRoot?.let { classifyTransactionManifest(jobDir, it) }
-        if (matchingClassification is ManifestClassification.Resolved &&
-            matchingRoot != null &&
-            runCatching { loadStrictManifest(File(matchingRoot, REPROCESS_TX_MANIFEST_FILE)).createdAt == fallbackIdentity.third }.getOrDefault(false)
-        ) {
-            hasFallback = !(fallbackMarker.delete() && !fallbackMarker.exists())
+    if (fallbackMarker.exists()) {
+        val fallbackIdentity = readFallbackIdentity(fallbackMarker)
+        if (fallbackIdentity != null) {
+            val matchingRoot = children.firstOrNull { it.isDirectory && it.name == fallbackIdentity.second }
+            val matchingClassification = matchingRoot?.let { classifyTransactionManifest(jobDir, it) }
+            if (matchingClassification is ManifestClassification.Resolved && matchingRoot != null) {
+                val manifest = runCatching { loadStrictManifest(File(matchingRoot, REPROCESS_TX_MANIFEST_FILE)) }.getOrNull()
+                if (manifest != null &&
+                    manifest.transactionId == fallbackIdentity.first &&
+                    matchingRoot.name == fallbackIdentity.second &&
+                    manifest.createdAt == fallbackIdentity.third
+                ) {
+                    fallbackMarker.delete()
+                }
+            }
         }
     }
-    var anyUnresolvedRoot = false
     children.forEach { child ->
         if (child.isDirectory && child.name.startsWith(".reprocess_backup_")) {
             val classification = classifyTransactionManifest(jobDir, child)
             when (classification) {
                 is ManifestClassification.Unresolved -> {
-                    anyUnresolvedRoot = true
                     if (isRootEvidenceFree(child)) {
                         child.delete()
                     }
@@ -1481,7 +1481,6 @@ internal fun recoverValidatedQuarantine(jobDir: File) {
             }
         }
     }
-    // Unmatched, corrupt, or failed-to-delete fallback evidence remains blocking.
 }
 
 /** True when a root has no marker, no manifest, no backup payload, and no temp evidence. */
