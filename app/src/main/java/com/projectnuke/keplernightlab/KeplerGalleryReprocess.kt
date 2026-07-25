@@ -1332,7 +1332,7 @@ internal fun persistUnresolvedQuarantine(
     try { writeQuarantineMarker(transaction) } catch (e: Exception) { markerFailure = e }
     try { writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED) }
     catch (e: Exception) { stateFailure = e }
-    val rootEvidence = markerFailure == null || stateFailure == null
+    val rootEvidence = markerFailure == null && stateFailure == null
     var fallbackFailure: Throwable? = null
     var fallbackPersisted = false
     if (!rootEvidence) {
@@ -1508,29 +1508,8 @@ private fun cleanupTerminalRoot(root: File) {
     val durable = runCatching { loadStrictManifest(manifestFile) }.getOrNull() ?: return
     val state = durable.state
     if (state != ReprocessTransactionState.COMMITTED && state != ReprocessTransactionState.ROLLED_BACK) return
-    val knownNames = durable.backupEntries.values.map { it.backupName }.toSet() +
-        setOf(REPROCESS_QUARANTINE_MARKER, REPROCESS_TX_MANIFEST_FILE)
-    val cleanupDelete = cleanupDeleteOperation
-    // Delete known payloads and temp artifacts first (files then directories).
-    children.sortedBy { it.isDirectory }.forEach { entry ->
-        if (entry.name == REPROCESS_TX_MANIFEST_FILE) return@forEach
-        if (entry.name in knownNames || entry.name.endsWith(".tmp") || entry.name.endsWith(".restore") || entry.isDirectory) {
-            runCatching { cleanupDelete(entry) }
-        }
-    }
-    // Unknown content remaining? Do NOT delete the manifest.
-    val remainingUnknown = root.listFiles()?.filter { it.name !in knownNames }.orEmpty()
-    if (remainingUnknown.isNotEmpty()) return
-    // Delete manifest last.
-    val remainingAfterPayloads = root.listFiles() ?: return
-    if (remainingAfterPayloads.any { it.name != REPROCESS_TX_MANIFEST_FILE && it.name != REPROCESS_QUARANTINE_MARKER }) return
-    remainingAfterPayloads.firstOrNull { it.name == REPROCESS_QUARANTINE_MARKER }?.let { runCatching { cleanupDelete(it) } }
-    runCatching { cleanupDelete(manifestFile) }
-    // Remove root only when actually empty.
-    val finalContents = root.listFiles()
-    if (finalContents == null || finalContents.isEmpty()) {
-        runCatching { root.delete() }
-    }
+    val dummyTx = ReprocessTransaction(durable.transactionId, root, durable, emptyList())
+    cleanupBackups(dummyTx)
 }
 
 fun detectReprocessCapability(context: Context, jobDir: File): ReprocessCapability {
@@ -2190,12 +2169,14 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     // 2. Delete quarantine marker once known payloads are gone.
     val markerFile = File(root, REPROCESS_QUARANTINE_MARKER)
     if (markerFile.exists()) {
-        if (!cleanupDelete(markerFile) && markerFile.exists()) {
+        val deleted = cleanupDelete(markerFile)
+        if (!deleted || markerFile.exists()) {
             // Terminal state is already durable, but its manifest must remain while any known
             // payload/marker could not be removed.
             return false
         }
     }
+    check(!markerFile.exists()) { "Quarantine marker must be deleted before manifest removal" }
     // 3. Check if unknown/non-removable contents remain.
     val remaining = root.listFiles()?.toList().orEmpty()
     val unknownContents = remaining.filter { it.name !in knownNames }
