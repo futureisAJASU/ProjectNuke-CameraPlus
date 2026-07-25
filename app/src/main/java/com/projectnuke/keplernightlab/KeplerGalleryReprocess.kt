@@ -1274,17 +1274,34 @@ internal fun writeBoundedReprocessPreview(jobDir: File, source: Bitmap): File {
 private fun File.write(block: (java.io.OutputStream) -> Unit) {
     FileOutputStream(this).use { block(it) }
 }
+/** Narrow test seam for quarantine marker file write. Tests can override and must reset in `finally`. */
+internal var quarantineMarkerWriteOperation: ((File, String) -> Unit)? = null
+
 /**
  * Persist a quarantine marker in the transaction backup directory. Retains the backups.
  * Throws on failure — quarantine must be durable or the transaction is unresolved.
  * Fails if the backup root is missing, not a directory, or marker write/sync fails.
+ * An existing path that is a directory, unreadable, corrupt, or fails verification is
+ * treated as a persistence failure — not silently accepted as success.
  */
 internal fun writeQuarantineMarker(transaction: ReprocessTransaction) {
     val root = transaction.backupRoot
     check(root.isDirectory) { "Quarantine marker write failed: backup root missing or not a directory: $root" }
     val marker = File(root, REPROCESS_QUARANTINE_MARKER)
-    if (marker.exists()) return
-    KeplerJobMetadata.atomicWrite(marker, "quarantined\n")
+    if (marker.exists()) {
+        // A directory or unreadable/corrupt file at the marker path is a persistence failure.
+        check(marker.isFile) { "Quarantine marker path exists but is not a regular file: $marker" }
+        val content = runCatching { marker.readText() }.getOrNull()
+        check(content != null && content.isNotBlank()) { "Quarantine marker exists but is unreadable or empty: $marker" }
+        return
+    }
+    val writeOp = quarantineMarkerWriteOperation
+    if (writeOp != null) {
+        writeOp(marker, "quarantined\n")
+    } else {
+        KeplerJobMetadata.atomicWrite(marker, "quarantined\n")
+    }
+    check(marker.isFile) { "Quarantine marker write produced no file: $marker" }
 }
 
 /**
@@ -1390,12 +1407,17 @@ private fun readFallbackIdentity(marker: File): Triple<String, String, Long>? = 
     else Triple(values.getValue("transactionId"), values.getValue("backupRoot"), values.getValue("createdAt").toLong())
 } catch (_: Exception) { null }
 
-/** Removes only a verified matching fallback marker after a durable terminal transition. */
+/**
+ * Removes only a verified matching fallback marker after a durable terminal transition.
+ * Returns true only when the marker was absent or is confirmed gone after deletion.
+ * Returns false when the identity does not match or deletion leaves the file present.
+ */
 internal fun removeMatchingFallbackQuarantine(jobDir: File, transaction: ReprocessTransaction): Boolean {
     val marker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
     if (!marker.exists()) return true
     if (readFallbackIdentity(marker) != fallbackIdentity(transaction)) return false
-    return marker.delete() && !marker.exists()
+    marker.delete()
+    return !marker.exists()
 }
 
 
