@@ -99,6 +99,7 @@ internal data class ReprocessFinalizationResult(
 private const val REPROCESS_TIMEOUT_MS = 10 * 60 * 1000L
 private const val REPROCESS_WORKER_EXIT_TIMEOUT_MS = 30_000L
 private const val REPROCESS_QUARANTINE_MARKER = ".reprocess_quarantine"
+private const val REPROCESS_QUARANTINE_MARKER_CONTENT = "quarantined\n"
 private const val REPROCESS_FALLBACK_QUARANTINE_MARKER = ".reprocess_unresolved"
 private const val REPROCESS_PREVIEW_PREFIX = "reprocess_preview_"
 private const val REPROCESS_PREVIEW_MAX_DIMENSION = 1600
@@ -942,7 +943,15 @@ internal fun finalizeTransaction(
                     return@fold quarantineWithPersistence(transaction, e)
                 }
                 runCatching { removeQuarantineMarker(transaction) }
-                removeMatchingFallbackQuarantine(jobDir, transaction)
+                if (!removeMatchingFallbackQuarantine(jobDir, transaction)) {
+                    runCatching {
+                        KeplerJobMetadata.update(jobDir) {
+                            it.put("reprocessWarning", "Fallback quarantine marker deletion failed after commit. Root preserved for retry.")
+                        }
+                    }
+                    try { ownedLease.release() } catch (_: Exception) {}
+                    return@fold ReprocessFinalizationResult(ReprocessFinalizationState.COMMITTED, Result.success(committed))
+                }
                 runCatching { cleanupBackups(transaction) }
                 try { ownedLease.release() } catch (_: Exception) {}
                 ReprocessFinalizationResult(ReprocessFinalizationState.COMMITTED, Result.success(committed))
@@ -1076,7 +1085,12 @@ internal fun rollback(
             transaction, combineCauseWithMessage(error, "State persistence failure during rollback", stateFailure)
         )
     }
-    removeMatchingFallbackQuarantine(jobDir, transaction)
+    if (!removeMatchingFallbackQuarantine(jobDir, transaction)) {
+        return quarantineWithPersistence(
+            transaction,
+            combineCauseWithMessage(error, "Fallback marker deletion failed during rollback, quarantining", null)
+        )
+    }
     runCatching { removeQuarantineMarker(transaction) }
     val cleanupSuccess = runCatching { cleanupBackups(transaction) }.getOrDefault(false)
     if (!cleanupSuccess) {
@@ -1281,27 +1295,29 @@ internal var quarantineMarkerWriteOperation: ((File, String) -> Unit)? = null
  * Persist a quarantine marker in the transaction backup directory. Retains the backups.
  * Throws on failure — quarantine must be durable or the transaction is unresolved.
  * Fails if the backup root is missing, not a directory, or marker write/sync fails.
- * An existing path that is a directory, unreadable, corrupt, or fails verification is
+ * An existing path that is a directory, unreadable, corrupt, empty, or non-canonical is
  * treated as a persistence failure — not silently accepted as success.
+ * After writing, the content is reread and verified to be exactly canonical.
  */
 internal fun writeQuarantineMarker(transaction: ReprocessTransaction) {
     val root = transaction.backupRoot
     check(root.isDirectory) { "Quarantine marker write failed: backup root missing or not a directory: $root" }
     val marker = File(root, REPROCESS_QUARANTINE_MARKER)
     if (marker.exists()) {
-        // A directory or unreadable/corrupt file at the marker path is a persistence failure.
         check(marker.isFile) { "Quarantine marker path exists but is not a regular file: $marker" }
         val content = runCatching { marker.readText() }.getOrNull()
-        check(content != null && content.isNotBlank()) { "Quarantine marker exists but is unreadable or empty: $marker" }
+        check(content == REPROCESS_QUARANTINE_MARKER_CONTENT) { "Quarantine marker exists but content is not canonical: $marker" }
         return
     }
     val writeOp = quarantineMarkerWriteOperation
     if (writeOp != null) {
-        writeOp(marker, "quarantined\n")
+        writeOp(marker, REPROCESS_QUARANTINE_MARKER_CONTENT)
     } else {
-        KeplerJobMetadata.atomicWrite(marker, "quarantined\n")
+        KeplerJobMetadata.atomicWrite(marker, REPROCESS_QUARANTINE_MARKER_CONTENT)
     }
     check(marker.isFile) { "Quarantine marker write produced no file: $marker" }
+    val writtenContent = runCatching { marker.readText() }.getOrNull()
+    check(writtenContent == REPROCESS_QUARANTINE_MARKER_CONTENT) { "Quarantine marker content verification failed after write: $marker" }
 }
 
 /**
@@ -1408,6 +1424,12 @@ private fun readFallbackIdentity(marker: File): Triple<String, String, Long>? = 
 } catch (_: Exception) { null }
 
 /**
+ * Narrow injectable IO seam for fallback marker deletion. Tests can override and must reset in `finally`.
+ * Receiving the marker [File] to delete; must return true when the file is gone after the attempt.
+ */
+internal var fallbackDeleteOperation: ((File) -> Boolean)? = null
+
+/**
  * Removes only a verified matching fallback marker after a durable terminal transition.
  * Returns true only when the marker was absent or is confirmed gone after deletion.
  * Returns false when the identity does not match or deletion leaves the file present.
@@ -1416,8 +1438,9 @@ internal fun removeMatchingFallbackQuarantine(jobDir: File, transaction: Reproce
     val marker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
     if (!marker.exists()) return true
     if (readFallbackIdentity(marker) != fallbackIdentity(transaction)) return false
-    marker.delete()
-    return !marker.exists()
+    val deleteOp = fallbackDeleteOperation
+    val deleted = if (deleteOp != null) deleteOp(marker) else marker.delete()
+    return deleted && !marker.exists()
 }
 
 
@@ -1471,25 +1494,31 @@ internal fun recoverValidatedQuarantine(jobDir: File) {
     if (KeplerJobMetadata.isOperationActive(jobDir)) return
     val fallbackMarker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
     val children = jobDir.listFiles() ?: return
+    val rootsToSkip = mutableSetOf<String>()
     if (fallbackMarker.exists()) {
-        val fallbackIdentity = readFallbackIdentity(fallbackMarker)
-        if (fallbackIdentity != null) {
-            val matchingRoot = children.firstOrNull { it.isDirectory && it.name == fallbackIdentity.second }
+        val fallbackId = readFallbackIdentity(fallbackMarker)
+        if (fallbackId != null) {
+            val matchingRoot = children.firstOrNull { it.isDirectory && it.name == fallbackId.second }
             val matchingClassification = matchingRoot?.let { classifyTransactionManifest(jobDir, it) }
             if (matchingClassification is ManifestClassification.Resolved && matchingRoot != null) {
                 val manifest = runCatching { loadStrictManifest(File(matchingRoot, REPROCESS_TX_MANIFEST_FILE)) }.getOrNull()
                 if (manifest != null &&
-                    manifest.transactionId == fallbackIdentity.first &&
-                    matchingRoot.name == fallbackIdentity.second &&
-                    manifest.createdAt == fallbackIdentity.third
+                    manifest.transactionId == fallbackId.first &&
+                    matchingRoot.name == fallbackId.second &&
+                    manifest.createdAt == fallbackId.third
                 ) {
-                    fallbackMarker.delete()
+                    val deleteOp = fallbackDeleteOperation
+                    val deleted = if (deleteOp != null) deleteOp(fallbackMarker) else fallbackMarker.delete()
+                    if (!deleted || fallbackMarker.exists()) {
+                        rootsToSkip.add(matchingRoot.name)
+                    }
                 }
             }
         }
     }
     children.forEach { child ->
         if (child.isDirectory && child.name.startsWith(".reprocess_backup_")) {
+            if (child.name in rootsToSkip) return@forEach
             val classification = classifyTransactionManifest(jobDir, child)
             when (classification) {
                 is ManifestClassification.Unresolved -> {

@@ -439,6 +439,114 @@ class KeplerGalleryReprocessProtocolTest {
     }
 
     @Test
+    fun nonemptyCorruptQuarantineMarkerRejected() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            val marker = File(transaction.backupRoot, ".reprocess_quarantine")
+            marker.writeText("not the canonical content\n")
+            assertThrows(IllegalStateException::class.java) {
+                writeQuarantineMarker(transaction)
+            }
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun quarantineMarkerWriteSeamCorruptNoFileRejected() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            val previousSeam = quarantineMarkerWriteOperation
+            try {
+                // Seam writes corrupt content (wrong text)
+                quarantineMarkerWriteOperation = { file, _ ->
+                    file.writeText("corrupted\n")
+                }
+                assertThrows(IllegalStateException::class.java) {
+                    writeQuarantineMarker(transaction)
+                }
+                // Seam produces no file at all
+                quarantineMarkerWriteOperation = { _, _ -> }
+                assertThrows(IllegalStateException::class.java) {
+                    writeQuarantineMarker(transaction)
+                }
+                // Seam creates a directory instead of a file
+                quarantineMarkerWriteOperation = { file, _ -> file.mkdir() }
+                assertThrows(IllegalStateException::class.java) {
+                    writeQuarantineMarker(transaction)
+                }
+            } finally {
+                quarantineMarkerWriteOperation = previousSeam
+            }
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun matchingFallbackIdentityDeletionFailureRemainsBlocked() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            ensureDurableFallbackQuarantine(directory, transaction)
+
+            val previousDeleteSeam = fallbackDeleteOperation
+            try {
+                fallbackDeleteOperation = { false }
+                assertFalse(removeMatchingFallbackQuarantine(directory, transaction))
+                assertTrue(isReprocessQuarantined(directory))
+            } finally {
+                fallbackDeleteOperation = previousDeleteSeam
+            }
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun recoverValidatedQuarantinePreservesRootWhenFallbackDeletionFails() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            ensureDurableFallbackQuarantine(directory, transaction)
+            writeTransactionState(transaction, ReprocessTransactionState.COMMITTED)
+
+            val previousDeleteSeam = fallbackDeleteOperation
+            try {
+                fallbackDeleteOperation = { false }
+                recoverValidatedQuarantine(directory)
+                assertTrue(File(directory, ".reprocess_unresolved").exists())
+                assertTrue(transaction.backupRoot.isDirectory)
+                assertTrue(isReprocessQuarantined(directory))
+            } finally {
+                fallbackDeleteOperation = previousDeleteSeam
+            }
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun successfulMatchingFallbackDeletionPermitsCleanup() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            ensureDurableFallbackQuarantine(directory, transaction)
+            writeTransactionState(transaction, ReprocessTransactionState.COMMITTED)
+
+            recoverValidatedQuarantine(directory)
+            assertFalse(File(directory, ".reprocess_unresolved").exists())
+            assertFalse(isReprocessQuarantined(directory))
+            assertTrue(cleanupBackups(transaction))
+            assertFalse(transaction.backupRoot.exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun cancelledWorkerDeferredIsWorkerFailureWhileCallerActive() = runBlocking {
         val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
         terminal.cancel(kotlinx.coroutines.CancellationException("worker cancelled"))
