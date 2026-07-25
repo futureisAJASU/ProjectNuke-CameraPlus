@@ -1057,10 +1057,14 @@ internal fun rollback(
     }
     removeTransactionCreatedFiles(jobDir, transaction, error)
         .exceptionOrNull()?.let { deleteError ->
-            return quarantineWithPersistence(
-                transaction,
-                combineCauseWithMessage(error, "Created-file deletion failed during rollback", deleteError)
-            )
+            if (deleteError is OutOfMemoryError || deleteError is ThreadDeath) throw deleteError
+            try {
+                KeplerJobMetadata.update(jobDir) {
+                    it.put("reprocessWarning", "Created-file deletion failed during rollback; root preserved for retry.")
+                }
+            } catch (e : IOException) {
+            } catch (e : SecurityException) {
+            }
         }
     val metadataError = try {
         if (outcome.disposition == ReprocessTerminalDisposition.CANCELLED) {
@@ -1093,9 +1097,9 @@ internal fun rollback(
             }
         } catch (e : IOException) {
         } catch (e : SecurityException) {
-        }
-        try { operationLease.release() } catch (_: Exception) {}
-        return ReprocessFinalizationResult(ReprocessFinalizationState.ROLLED_BACK, Result.failure(error))
+         }
+         try { operationLease.release() } catch (_: IOException) {} catch (_: SecurityException) {}
+         return ReprocessFinalizationResult(ReprocessFinalizationState.ROLLED_BACK, Result.failure(error))
     }
     try { removeQuarantineMarker(transaction) } catch (_: IllegalStateException) {}
     val cleanupSuccess = try { cleanupBackups(transaction) } catch (e : IOException) { false } catch (e : SecurityException) { false }
@@ -1108,8 +1112,7 @@ internal fun rollback(
         } catch (e : SecurityException) {
         }
     }
-    // Lease release only after durable ROLLED_BACK; QUARANTINED retains it.
-    try { operationLease.release() } catch (_: Throwable) {}
+    try { operationLease.release() } catch (_: IOException) {} catch (_: SecurityException) {}
     return ReprocessFinalizationResult(ReprocessFinalizationState.ROLLED_BACK, Result.failure(error))
 }
 
@@ -1180,7 +1183,9 @@ private fun isReprocessCreatedOutputFile(name: String): Boolean {
         "compare_reference_vs_fused.png",
         "raw_native_rgba.png", "raw_native_preview.png", "raw_intermediate_map.png",
         "current_diagnostic_map.png", "raw_render_debug.json",
-        "native_postprocess_rgba.png"
+        "native_postprocess_rgba.png", "fusion_debug.json", "yuv_debug.json",
+        "raw_fusion_debug.json", "raw_render_input_metadata.json",
+        "final_preview.png", "reference_single_preview.png", "preview_single_reference.png"
     )
     if (lower in explicit) return true
     if (lower.startsWith("fused_classic_yuv_v1_")) return true
@@ -1194,6 +1199,9 @@ private fun isReprocessCreatedOutputFile(name: String): Boolean {
     if (lower.endsWith(".tmp") || lower.endsWith(".restore")) return true
     if (lower.startsWith("merged_raw")) return true
     if (lower.contains("merged_yuv")) return true
+    if (lower.endsWith("_preview.png")) return true
+    if (lower.contains("reference") && lower.endsWith(".png")) return true
+    if (lower.contains("debug") && lower.endsWith(".json")) return true
     return false
 }
 
@@ -1745,7 +1753,7 @@ internal fun countActualSourceFrames(jobDir: File, job: JSONObject, kind: Reproc
             }
             for (name in candidates) {
                 if (name.isNotBlank() && name != "null") {
-                    if (File(jobDir, name).isFile && isReprocessSourceFrame(File(jobDir, name), kind)) {
+                    if (File(jobDir, name).isFile && isReprocessMetadataSourceFrame(name, kind)) {
                         count++
                         return@repeat
                     }
@@ -1762,11 +1770,20 @@ internal fun countActualSourceFrames(jobDir: File, job: JSONObject, kind: Reproc
 internal fun isReprocessSourceFrame(file: File, kind: ReprocessJobKind): Boolean {
     val name = file.name.lowercase(Locale.US)
     if (!name.startsWith("frame_")) return false
+    return isReprocessSourceFrameFromMetadata(name, kind)
+}
+
+internal fun isReprocessMetadataSourceFrame(name: String, kind: ReprocessJobKind): Boolean {
+    val lower = name.lowercase(Locale.US)
+    return isReprocessSourceFrameFromMetadata(lower, kind)
+}
+
+private fun isReprocessSourceFrameFromMetadata(lower: String, kind: ReprocessJobKind): Boolean {
     return when (kind) {
-        ReprocessJobKind.RAW_FUSION -> name.endsWith(".raw16") || name.endsWith(".dng")
-        ReprocessJobKind.YUV_FUSION -> name.endsWith(".png") || name.endsWith(".yuv") ||
-            name.endsWith(".nv21") || name.endsWith(".yuv420")
-        ReprocessJobKind.COLOR_BURST -> name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg")
+        ReprocessJobKind.RAW_FUSION -> lower.endsWith(".raw16") || lower.endsWith(".dng")
+        ReprocessJobKind.YUV_FUSION -> lower.endsWith(".png") || lower.endsWith(".yuv") ||
+            lower.endsWith(".nv21") || lower.endsWith(".yuv420")
+        ReprocessJobKind.COLOR_BURST -> lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg")
         ReprocessJobKind.UNSUPPORTED -> false
     }
 }
@@ -2062,11 +2079,12 @@ internal fun backupReprocessTransaction(
         check(root.mkdirs()) { "Could not create reprocess backup directory." }
         val metadata = File(jobDir, JOB_JSON_FILE_NAME)
         check(metadata.isFile) { "job.json is required for rollback." }
-        // Identify immutable source frames from actual job metadata and job kind. RAW/YUV/ColorBurst
-        // source PNG/JPEG/RAW/YUV frames must NEVER be backed up, deleted, or replaced.
         val validatedJob = job ?: KeplerJobMetadata.read(jobDir)
         val resolvedKind = jobKind ?: detectJobKind(jobDir, validatedJob)
+        check(resolvedKind != ReprocessJobKind.UNSUPPORTED) { "Unsupported job kind." }
         val canonicalJobDir = jobDir.canonicalFile
+        val jobDirListing = jobDir.listFiles()
+        check(jobDirListing != null) { "Cannot read job directory contents." }
         val immutableSourceFiles = mutableSetOf<File>()
         // All frames metadata entries (including disabled, excluded, and locked) contribute
         // to the immutable source set. Every filename field is inspected.
@@ -2098,13 +2116,13 @@ internal fun backupReprocessTransaction(
             }
         } else {
             // Legacy job without frames metadata: use filename-based detection as fallback.
-            jobDir.listFiles()?.forEach { child ->
+            jobDirListing.forEach { child ->
                 if (child.isFile && isImmutableSourceFrame(child, resolvedKind)) {
                     immutableSourceFiles += child.canonicalFile
                 }
             }
         }
-        val preExistingNames = jobDir.listFiles()?.filter { it.isFile }?.map { it.name }?.toSet().orEmpty()
+        val preExistingNames = jobDirListing.filter { it.isFile }.map { it.name }.toSet()
         // Record every pre-existing mutable file (job.json + worker-writable non-source files).
         val filesToBackup = (files + metadata)
             .asSequence()
@@ -2275,16 +2293,20 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     val cleanupDelete = cleanupDeleteOperation
     val backupNames = durable.backupEntries.values.map { it.backupName }.toSet()
     val knownNames = backupNames + setOf(REPROCESS_QUARANTINE_MARKER, REPROCESS_TX_MANIFEST_FILE)
-    val allKnownDeletedRemoved = mutableSetOf<File>()
     // 1. Delete known payload files and temp artifacts first; inspect files and directories.
     val entries = root.listFiles() ?: return false
     entries.sortedBy { it.isDirectory }.forEach { entry ->
         if (!entry.isDirectory) {
             if (entry.name == REPROCESS_TX_MANIFEST_FILE) return@forEach
             if (entry.name in backupNames || entry.name.endsWith(".tmp") || entry.name.endsWith(".restore")) {
-                cleanupDelete(entry)
+                try {
+                    cleanupDelete(entry)
+                } catch (e : IOException) {
+                    return false
+                } catch (e : SecurityException) {
+                    return false
+                }
                 if (entry.exists()) return false
-                allKnownDeletedRemoved += entry
             }
         } else {
             // No transaction format owns directories inside the backup root. Preserve terminal
@@ -2295,7 +2317,13 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     // 2. Delete quarantine marker once known payloads are gone.
     val markerFile = File(root, REPROCESS_QUARANTINE_MARKER)
     if (markerFile.exists()) {
-        cleanupDelete(markerFile)
+        try {
+            cleanupDelete(markerFile)
+        } catch (e : IOException) {
+            return false
+        } catch (e : SecurityException) {
+            return false
+        }
         if (markerFile.exists()) {
             // Terminal state is already durable, but its manifest must remain while any known
             // payload/marker could not be removed.
@@ -2313,7 +2341,13 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     }
     // 4. Delete the terminal manifest last after terminal state is durable.
     if (manifestRemaining != null) {
-        cleanupDelete(manifestRemaining)
+        try {
+            cleanupDelete(manifestRemaining)
+        } catch (e : IOException) {
+            return false
+        } catch (e : SecurityException) {
+            return false
+        }
         if (manifestRemaining.exists()) return false
     }
     // 5. Remove an empty root; a successful root deletion reports success, not failure.

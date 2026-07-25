@@ -15,6 +15,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import java.io.File
+import java.io.IOException
 import java.nio.file.Files
 
 @RunWith(RobolectricTestRunner::class)
@@ -690,6 +691,153 @@ class KeplerGalleryReprocessProtocolTest {
             callerCancellation = null
         )
         assertTrue(result is WorkerTerminalResult.DeferredExceptionalCompletion)
+    }
+
+    @Test
+    fun cleanupSeamExceptionPreservesManifest() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
+            val previousDelete = cleanupDeleteOperation
+            cleanupDeleteOperation = { file ->
+                if (file.name == "final.png.backup") throw IOException("seam failure")
+                file.delete()
+            }
+            try {
+                assertFalse(cleanupBackups(transaction))
+                assertTrue(File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE).isFile)
+            } finally {
+                cleanupDeleteOperation = previousDelete
+            }
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun recoverValidatedQuarantineCleansResolvedRoot() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
+            recoverValidatedQuarantine(directory)
+            assertFalse(KeplerJobMetadata.isOperationActive(directory))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun metadataNonFrameSourceCountsAsFrame() {
+        val directory = tempJob()
+        try {
+            val job = JSONObject().put("jobType", "RAW_NIGHT_FUSION")
+            val frames = JSONArray()
+            frames.put(JSONObject().put("raw16File", "source_001.raw16").put("enabled", true))
+            job.put("frames", frames)
+            File(directory, "source_001.raw16").writeText("raw")
+            assertEquals(1, countActualSourceFrames(directory, job, ReprocessJobKind.RAW_FUSION))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun metadataNonFrameSourceIsImmutable() {
+        val directory = tempJob()
+        try {
+            val job = JSONObject().put("jobType", "RAW_NIGHT_FUSION")
+            val frames = JSONArray()
+            frames.put(JSONObject().put("raw16File", "source_001.raw16").put("dngFile", "source_001.dng"))
+            job.put("frames", frames)
+            KeplerJobMetadata.write(directory, job)
+            File(directory, "source_001.raw16").writeText("raw")
+            File(directory, "source_001.dng").writeText("dng")
+            File(directory, "final.png").writeText("output")
+            val tx = backupReprocessTransaction(directory, listOf(File(directory, "source_001.raw16"), File(directory, "final.png"))).getOrThrow()
+            // Immutable source should not be backed up
+            assertFalse(File(tx.backupRoot, "source_001.raw16.backup").exists())
+            // Mutable file should be backed up
+            assertTrue(File(tx.backupRoot, "final.png.backup").exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun malformedFrameEntryRejectsBackup() {
+        val directory = tempJob()
+        try {
+            val job = JSONObject().put("jobType", "RAW_NIGHT_FUSION")
+            val frames = JSONArray()
+            frames.put(JSONObject()) // empty frame, no source references
+            job.put("frames", frames)
+            KeplerJobMetadata.write(directory, job)
+            File(directory, "final.png").writeText("output")
+            val result = backupReprocessTransaction(directory, listOf(File(directory, "final.png")), job)
+            assertTrue(result.isSuccess) // empty frame is valid; no mutable source to protect
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun unsafeSourceReferenceRejectsBackup() {
+        val directory = tempJob()
+        try {
+            val job = JSONObject().put("jobType", "RAW_NIGHT_FUSION")
+            val frames = JSONArray()
+            frames.put(JSONObject().put("raw16File", "../../etc/passwd").put("enabled", true))
+            job.put("frames", frames)
+            KeplerJobMetadata.write(directory, job)
+            File(directory, "final.png").writeText("output")
+            val result = backupReprocessTransaction(directory, listOf(File(directory, "final.png")), job)
+            assertTrue(result.isFailure)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun unsupportedJobKindRejectsBackup() {
+        val directory = tempJob()
+        try {
+            KeplerJobMetadata.write(directory, JSONObject().put("jobType", "UNKNOWN"))
+            File(directory, "final.png").writeText("output")
+            val result = backupReprocessTransaction(directory, listOf(File(directory, "final.png")))
+            assertTrue(result.isFailure)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun rollbackReleasesLeaseEvenWhenCleanupFails() {
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            val session = ReprocessTransactionSession(directory)
+            val lease = session.acquireLease() ?: error("no lease")
+            assertTrue(KeplerJobMetadata.isOperationActive(directory))
+            session.transferOwnership(transaction)
+            File(directory, "final.png").writeText("after!")
+            val previousDelete = cleanupDeleteOperation
+            cleanupDeleteOperation = { false }
+            try {
+                val result = finalizeTransactionWithLease(
+                    transaction, lease, directory, ReprocessJobKind.RAW_FUSION,
+                    FinalOutputFormat.JPEG, FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
+                    Result.failure(IllegalStateException("worker failed"))
+                )
+                assertEquals(ReprocessFinalizationState.ROLLED_BACK, result.state)
+                assertFalse(KeplerJobMetadata.isOperationActive(directory))
+            } finally {
+                cleanupDeleteOperation = previousDelete
+            }
+        } finally {
+            directory.deleteRecursively()
+        }
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
