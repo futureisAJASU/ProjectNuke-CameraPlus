@@ -1183,7 +1183,7 @@ internal fun removeTransactionCreatedFilesForTest(
 private fun isReprocessCreatedOutputFile(name: String): Boolean {
     val lower = name.lowercase(Locale.US)
     val explicit = setOf(
-        "sharpened_night_fusion.png", "average_color_rotated.png",
+        "sharpened_night_fusion.png", "average_color_rotated.png", "denoise_color.png",
         "fused_classic_yuv_v1.png", "reference_frame.png", "raw_fusion_final.png",
         "yuv_compare_reference_vs_fused.png", "compare_reference_vs_fused.png",
         "raw_reference_preview.png", "raw_fused_classic_v1_preview.png",
@@ -1192,8 +1192,12 @@ private fun isReprocessCreatedOutputFile(name: String): Boolean {
         "yuv_fused_before_denoise_preview.png",
         "yuv_fused_after_denoise_no_sharpen_preview.png",
         "yuv_final_preview.png", "yuv_compare_reference_vs_final.png",
+        "fused_before_denoise_preview.png",
+        "fused_after_denoise_no_sharpen_preview.png",
         "final_preview.png", "reference_single_preview.png",
-        "fusion_debug.json", "yuv_debug.json"
+        "compare_reference_vs_final.png",
+        "fusion_debug.json", "yuv_debug.json", "raw_fusion_debug.json",
+        "raw_render_debug.json", "raw_render_input_metadata.json"
     )
     if (lower in explicit) return true
     if (lower.startsWith("fused_classic_yuv_v1_")) return true
@@ -2114,6 +2118,13 @@ internal fun backupReprocessTransaction(
                         // Canonicalization moved the file outside the job directory; it was unsafe.
                         require(false) { "Source reference escapes job directory: $ref" }
                     }
+                    // Reject direct-child symlinks that resolve outside the job directory.
+                    if (source.isFile && source.canonicalPath != source.absolutePath) {
+                        val canonicalTarget = source.canonicalFile
+                        if (canonicalTarget.parentFile != canonicalJobDir) {
+                            require(false) { "Symlink source reference escapes job directory: $ref" }
+                        }
+                    }
                     if (source.isFile) {
                         immutableSourceFiles += source.canonicalFile
                     }
@@ -2319,7 +2330,13 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
             return false
         }
     }
-    // 2. Delete quarantine marker once known payloads are gone.
+    // 2. Verify no unknown files or directories remain.
+    val afterPayloadDelete = root.listFiles() ?: return false
+    val unknownContents = afterPayloadDelete.filter { it.name !in knownNames }
+    if (unknownContents.isNotEmpty()) {
+        return false
+    }
+    // 3. Remove quarantine marker and verify deletion.
     val markerFile = File(root, REPROCESS_QUARANTINE_MARKER)
     if (markerFile.exists()) {
         try {
@@ -2330,21 +2347,13 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
             return false
         }
         if (markerFile.exists()) {
-            // Terminal state is already durable, but its manifest must remain while any known
-            // payload/marker could not be removed.
             return false
         }
     }
     check(!markerFile.exists()) { "Quarantine marker must be deleted before manifest removal" }
-    // 3. Check if unknown/non-removable contents remain.
-    val remaining = root.listFiles() ?: return false
-    val unknownContents = remaining.filter { it.name !in knownNames }
-    val manifestRemaining = remaining.firstOrNull { it.name == REPROCESS_TX_MANIFEST_FILE }
-    if (unknownContents.isNotEmpty()) {
-        // Do NOT delete the terminal manifest while unknown content remains.
-        return false
-    }
     // 4. Delete the terminal manifest last after terminal state is durable.
+    val finalInspection = root.listFiles() ?: return false
+    val manifestRemaining = finalInspection.firstOrNull { it.name == REPROCESS_TX_MANIFEST_FILE }
     if (manifestRemaining != null) {
         try {
             cleanupDelete(manifestRemaining)

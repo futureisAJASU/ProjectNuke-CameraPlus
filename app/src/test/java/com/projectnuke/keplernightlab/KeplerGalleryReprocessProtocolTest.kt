@@ -853,7 +853,7 @@ class KeplerGalleryReprocessProtocolTest {
         try {
             val transaction = backup(directory, "final.png" to "before")
             val outputs = listOf(
-                "sharpened_night_fusion.png", "average_color_rotated.png",
+                "sharpened_night_fusion.png", "average_color_rotated.png", "denoise_color.png",
                 "fused_classic_yuv_v1.png",
                 "raw_fusion_final.png",
                 "yuv_compare_reference_vs_fused.png", "compare_reference_vs_fused.png",
@@ -863,8 +863,12 @@ class KeplerGalleryReprocessProtocolTest {
                 "yuv_fused_before_denoise_preview.png",
                 "yuv_fused_after_denoise_no_sharpen_preview.png",
                 "yuv_final_preview.png", "yuv_compare_reference_vs_final.png",
+                "fused_before_denoise_preview.png",
+                "fused_after_denoise_no_sharpen_preview.png",
                 "final_preview.png", "reference_single_preview.png",
-                "fusion_debug.json", "yuv_debug.json"
+                "compare_reference_vs_final.png",
+                "fusion_debug.json", "yuv_debug.json", "raw_fusion_debug.json",
+                "raw_render_debug.json", "raw_render_input_metadata.json"
             )
             for (name in outputs) {
                 File(directory, name).writeText("output")
@@ -917,6 +921,38 @@ class KeplerGalleryReprocessProtocolTest {
             } finally {
                 cleanupDeleteOperation = previousDelete
             }
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun outsideJobSourceReferenceRejectsBackup() {
+        val directory = tempJob()
+        try {
+            val job = JSONObject().put("jobType", "RAW_NIGHT_FUSION")
+            val frames = JSONArray()
+            frames.put(JSONObject().put("raw16File", "../outside/frame.raw16").put("enabled", true))
+            job.put("frames", frames)
+            KeplerJobMetadata.write(directory, job)
+            File(directory, "final.png").writeText("output")
+            val result = backupReprocessTransaction(directory, listOf(File(directory, "final.png")), job)
+            assertTrue(result.isFailure)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun preExistingOutputSurvivesRollback() {
+        val directory = tempJob()
+        try {
+            File(directory, "sharpened_night_fusion.png").writeText("preexisting")
+            val transaction = backup(directory, "final.png" to "before")
+            // sharpened_night_fusion.png was pre-existing and is in backedUpPaths,
+            // so it should survive rollback
+            assertTrue(removeCreatedForTest(directory, transaction).isSuccess)
+            assertTrue(File(directory, "sharpened_night_fusion.png").exists())
         } finally {
             directory.deleteRecursively()
         }
