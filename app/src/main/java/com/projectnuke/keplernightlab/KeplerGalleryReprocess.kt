@@ -947,21 +947,25 @@ internal fun finalizeTransaction(
                     if (e is OutOfMemoryError || e is ThreadDeath) throw e
                     return@fold quarantineWithPersistence(transaction, e)
                 }
-                try { removeQuarantineMarker(transaction) } catch (_: IllegalStateException) {}
-                if (!removeMatchingFallbackQuarantine(jobDir, transaction)) {
-                    try {
-                        KeplerJobMetadata.update(jobDir) {
-                            it.put("reprocessWarning", "Fallback quarantine marker deletion failed after commit. Root preserved for retry.")
+                val result: ReprocessFinalizationResult
+                try {
+                    try { removeQuarantineMarker(transaction) } catch (_: IllegalStateException) {}
+                    if (!removeMatchingFallbackQuarantine(jobDir, transaction)) {
+                        try {
+                            KeplerJobMetadata.update(jobDir) {
+                                it.put("reprocessWarning", "Fallback quarantine marker deletion failed after commit. Root preserved for retry.")
+                            }
+                        } catch (e : IOException) {
+                        } catch (e : SecurityException) {
                         }
-                    } catch (e : IOException) {
-                    } catch (e : SecurityException) {
+                        // Lease released in finally; COMMITTED state is already durable.
                     }
+                    try { cleanupBackups(transaction) } catch (e : IOException) {} catch (e : SecurityException) {}
+                    result = ReprocessFinalizationResult(ReprocessFinalizationState.COMMITTED, Result.success(committed))
+                } finally {
                     try { ownedLease.release() } catch (_: IOException) {} catch (_: SecurityException) {}
-                    return@fold ReprocessFinalizationResult(ReprocessFinalizationState.COMMITTED, Result.success(committed))
                 }
-                try { cleanupBackups(transaction) } catch (e : IOException) {} catch (e : SecurityException) {}
-                try { ownedLease.release() } catch (_: IOException) {} catch (_: SecurityException) {}
-                ReprocessFinalizationResult(ReprocessFinalizationState.COMMITTED, Result.success(committed))
+                result
             },
             onFailure = { metadataError ->
                 if (outcome.publicExportCommitted) {
@@ -1092,29 +1096,31 @@ internal fun rollback(
             transaction, combineCauseWithMessage(error, "State persistence failure during rollback", stateFailure)
         )
     }
-    if (!removeMatchingFallbackQuarantine(jobDir, transaction)) {
-        try {
-            KeplerJobMetadata.update(jobDir) {
-                it.put("reprocessWarning", "Fallback marker deletion failed after rollback; root preserved for retry.")
+    try {
+        if (!removeMatchingFallbackQuarantine(jobDir, transaction)) {
+            try {
+                KeplerJobMetadata.update(jobDir) {
+                    it.put("reprocessWarning", "Fallback marker deletion failed after rollback; root preserved for retry.")
+                }
+            } catch (e : IOException) {
+            } catch (e : SecurityException) {
             }
-        } catch (e : IOException) {
-        } catch (e : SecurityException) {
-         }
-         try { operationLease.release() } catch (_: IOException) {} catch (_: SecurityException) {}
-         return ReprocessFinalizationResult(ReprocessFinalizationState.ROLLED_BACK, Result.failure(error))
-    }
-    try { removeQuarantineMarker(transaction) } catch (_: IllegalStateException) {}
-    val cleanupSuccess = try { cleanupBackups(transaction) } catch (e : IOException) { false } catch (e : SecurityException) { false }
-    if (!cleanupSuccess) {
-        try {
-            KeplerJobMetadata.update(jobDir) {
-                it.put("reprocessWarning", "Reprocess backup cleanup failed after safe rollback.")
+        } else {
+            try { removeQuarantineMarker(transaction) } catch (_: IllegalStateException) {}
+            val cleanupSuccess = try { cleanupBackups(transaction) } catch (e : IOException) { false } catch (e : SecurityException) { false }
+            if (!cleanupSuccess) {
+                try {
+                    KeplerJobMetadata.update(jobDir) {
+                        it.put("reprocessWarning", "Reprocess backup cleanup failed after safe rollback.")
+                    }
+                } catch (e : IOException) {
+                } catch (e : SecurityException) {
+                }
             }
-        } catch (e : IOException) {
-        } catch (e : SecurityException) {
         }
+    } finally {
+        try { operationLease.release() } catch (_: IOException) {} catch (_: SecurityException) {}
     }
-    try { operationLease.release() } catch (_: IOException) {} catch (_: SecurityException) {}
     return ReprocessFinalizationResult(ReprocessFinalizationState.ROLLED_BACK, Result.failure(error))
 }
 
@@ -1176,26 +1182,21 @@ internal fun removeTransactionCreatedFilesForTest(
 
 private fun isReprocessCreatedOutputFile(name: String): Boolean {
     val lower = name.lowercase(Locale.US)
-    // Explicit production-owned outputs from RAW, YUV, and color fusion writers.
     val explicit = setOf(
-        "sharpened_night_fusion.png", "average_color_rotated.png", "denoise_color.png",
-        "fused_classic_yuv_v1.png", "fused_classic_yuv_v1_debug.png",
-        "reference_frame.png", "raw_fusion_final.png",
-        "raw_yuv_comparison.png", "yuv_raw_comparison.png", "yuv_compare_reference_vs_fused.png",
-        "compare_reference_vs_fused.png",
-        "raw_native_rgba.png", "raw_native_preview.png", "raw_intermediate_map.png",
-        "current_diagnostic_map.png", "raw_render_debug.json",
-        "native_postprocess_rgba.png", "fusion_debug.json", "yuv_debug.json",
-        "raw_fusion_debug.json", "raw_render_input_metadata.json",
-        "final_preview.png", "reference_single_preview.png", "preview_single_reference.png"
+        "sharpened_night_fusion.png", "average_color_rotated.png",
+        "fused_classic_yuv_v1.png", "reference_frame.png", "raw_fusion_final.png",
+        "yuv_compare_reference_vs_fused.png", "compare_reference_vs_fused.png",
+        "raw_reference_preview.png", "raw_fused_classic_v1_preview.png",
+        "raw_compare_reference_vs_fused.png",
+        "yuv_reference_preview.png", "yuv_fused_preview.png",
+        "yuv_fused_before_denoise_preview.png",
+        "yuv_fused_after_denoise_no_sharpen_preview.png",
+        "yuv_final_preview.png", "yuv_compare_reference_vs_final.png",
+        "final_preview.png", "reference_single_preview.png",
+        "fusion_debug.json", "yuv_debug.json"
     )
     if (lower in explicit) return true
     if (lower.startsWith("fused_classic_yuv_v1_")) return true
-    if (lower.startsWith("raw_yuv_comparison")) return true
-    if (lower.startsWith("yuv_raw_comparison")) return true
-    if (lower.startsWith("raw_native_")) return true
-    if (lower.startsWith("raw_intermediate_")) return true
-    if (lower.startsWith("current_diagnostic_")) return true
     if (name.startsWith(REPROCESS_PREVIEW_PREFIX)) return true
     if (lower.endsWith(".rgba") || lower.endsWith(".rgb") || lower.endsWith(".bin")) return true
     if (lower.endsWith(".tmp") || lower.endsWith(".restore")) return true
@@ -1734,6 +1735,7 @@ internal fun detectJobKind(jobDir: File, job: JSONObject): ReprocessJobKind {
 internal fun countActualSourceFrames(jobDir: File, job: JSONObject, kind: ReprocessJobKind): Int {
     val frames = job.optJSONArray("frames")
     if (frames != null) {
+        val canonicalJobDir = jobDir.canonicalFile
         var count = 0
         repeat(frames.length()) { index ->
             val frame = frames.optJSONObject(index) ?: return@repeat
@@ -1751,8 +1753,9 @@ internal fun countActualSourceFrames(jobDir: File, job: JSONObject, kind: Reproc
                 ReprocessJobKind.UNSUPPORTED -> emptyList()
             }
             for (name in candidates) {
-                if (name.isNotBlank() && name != "null") {
-                    if (File(jobDir, name).isFile && isReprocessMetadataSourceFrame(name, kind)) {
+                if (name.isNotBlank() && name != "null" && isStrictRelativePath(name)) {
+                    val source = File(jobDir, name).canonicalFile
+                    if (source.parentFile == canonicalJobDir && source.isFile && isReprocessMetadataSourceFrame(name, kind)) {
                         count++
                         return@repeat
                     }
@@ -2334,7 +2337,7 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     }
     check(!markerFile.exists()) { "Quarantine marker must be deleted before manifest removal" }
     // 3. Check if unknown/non-removable contents remain.
-    val remaining = root.listFiles()?.toList().orEmpty()
+    val remaining = root.listFiles() ?: return false
     val unknownContents = remaining.filter { it.name !in knownNames }
     val manifestRemaining = remaining.firstOrNull { it.name == REPROCESS_TX_MANIFEST_FILE }
     if (unknownContents.isNotEmpty()) {

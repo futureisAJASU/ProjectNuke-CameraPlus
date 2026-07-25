@@ -336,7 +336,7 @@ class KeplerGalleryReprocessProtocolTest {
             classicOutput.writeText("color")
             val rawOutput = File(directory, "raw_fusion_final.png")
             rawOutput.writeText("raw")
-            val debugOutput = File(directory, "raw_render_debug.json")
+            val debugOutput = File(directory, "fusion_debug.json")
             debugOutput.writeText("{}")
             val tempOutput = File(directory, "tmp_fused.tmp")
             tempOutput.writeText("temp")
@@ -853,15 +853,18 @@ class KeplerGalleryReprocessProtocolTest {
         try {
             val transaction = backup(directory, "final.png" to "before")
             val outputs = listOf(
-                "sharpened_night_fusion.png", "average_color_rotated.png", "denoise_color.png",
-                "fused_classic_yuv_v1.png", "fused_classic_yuv_v1_debug.png",
-                "raw_fusion_final.png", "raw_yuv_comparison.png", "yuv_raw_comparison.png",
+                "sharpened_night_fusion.png", "average_color_rotated.png",
+                "fused_classic_yuv_v1.png",
+                "raw_fusion_final.png",
                 "yuv_compare_reference_vs_fused.png", "compare_reference_vs_fused.png",
-                "raw_native_rgba.png", "raw_native_preview.png", "raw_intermediate_map.png",
-                "current_diagnostic_map.png", "raw_render_debug.json",
-                "native_postprocess_rgba.png", "fusion_debug.json", "yuv_debug.json",
-                "raw_fusion_debug.json", "raw_render_input_metadata.json",
-                "final_preview.png", "reference_single_preview.png", "preview_single_reference.png"
+                "raw_reference_preview.png", "raw_fused_classic_v1_preview.png",
+                "raw_compare_reference_vs_fused.png",
+                "yuv_reference_preview.png", "yuv_fused_preview.png",
+                "yuv_fused_before_denoise_preview.png",
+                "yuv_fused_after_denoise_no_sharpen_preview.png",
+                "yuv_final_preview.png", "yuv_compare_reference_vs_final.png",
+                "final_preview.png", "reference_single_preview.png",
+                "fusion_debug.json", "yuv_debug.json"
             )
             for (name in outputs) {
                 File(directory, name).writeText("output")
