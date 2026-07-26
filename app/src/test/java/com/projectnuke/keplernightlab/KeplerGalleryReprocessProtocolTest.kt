@@ -956,16 +956,249 @@ class KeplerGalleryReprocessProtocolTest {
         } finally {
             directory.deleteRecursively()
         }
+}
+
+// ── Phase 1: Terminal settlement exception safety ─────────────────────────
+
+@Test
+fun warningMetadataFailureAfterDurableCommittedStillReturnsTerminalAndReleasesLease() = runBlocking {
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    val session = ReprocessTransactionSession(directory)
+    val lease = session.acquireLease() ?: error("no lease")
+    session.transferOwnership(transaction)
+    KeplerJobMetadata.write(directory, KeplerJobMetadata.read(directory).apply {
+      put("finalOutputFile", "final.png")
+    })
+    val previous = createdOutputDeleteOperation
+    createdOutputDeleteOperation = { true }
+    val outcome = ReprocessWorkerOutcome(
+      result = Result.success(Unit),
+      publicExportCommitted = false,
+      exportVerified = true,
+      finalOutputFile = File(directory, "final.png")
+    )
+    try {
+      val result = finalizeTransactionWithLease(
+        transaction, lease, directory,
+        ReprocessJobKind.RAW_FUSION, FinalOutputFormat.JPEG,
+        FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
+        Result.success(outcome)
+      )
+      assertEquals(ReprocessFinalizationState.COMMITTED, result.state)
+      assertFalse(KeplerJobMetadata.isOperationActive(directory))
+    } finally {
+      createdOutputDeleteOperation = previous
+      lateFinalizationHandoffScope = null
     }
+  } finally {
+    directory.deleteRecursively()
+  }
+}
 
-    // ── Private helpers ───────────────────────────────────────────────────────
+@Test
+fun cleanupSeamThrowingIllegalStateExceptionReturnsCleanupFailure() {
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
+    val previousDelete = cleanupDeleteOperation
+    cleanupDeleteOperation = { throw IllegalStateException("seam boom") }
+    try {
+      assertFalse(cleanupBackups(transaction))
+    } finally {
+      cleanupDeleteOperation = previousDelete
+    }
+  } finally {
+    directory.deleteRecursively()
+  }
+}
 
-    private fun rootManifest(txId: String, root: File): ReprocessTransactionManifest =
-        ReprocessTransactionManifest(
-            transactionId = txId,
-            createdAt = System.currentTimeMillis(),
-            preExistingPaths = emptySet(),
-            backedUpPaths = emptySet(),
-            backupEntries = emptyMap()
-        )
+// ── Phase 2: Fail-closed cleanup ──────────────────────────────────────────
+
+@Test
+fun nullListingOnExistingRootFailsClosed() {
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
+    val previousDelete = cleanupDeleteOperation
+    cleanupDeleteOperation = { false }
+    try {
+      assertFalse(cleanupBackups(transaction))
+    } finally {
+      cleanupDeleteOperation = previousDelete
+    }
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun restartRecoveryDeletesCleanResolvedBackupRoot() {
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
+    assertTrue(transaction.backupRoot.isDirectory)
+    recoverValidatedQuarantine(directory)
+    assertFalse(transaction.backupRoot.exists())
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+// ── Phase 3: Strict source validation ─────────────────────────────────────
+
+@Test
+fun missingSourceRejectsBackup() {
+  val directory = tempJob()
+  try {
+    val job = JSONObject().put("jobType", "RAW_NIGHT_FUSION")
+    val frames = JSONArray()
+    frames.put(JSONObject().put("raw16File", "frame_0001.raw16").put("enabled", true))
+    job.put("frames", frames)
+    KeplerJobMetadata.write(directory, job)
+    File(directory, "final.png").writeText("output")
+    val result = backupReprocessTransaction(directory, listOf(File(directory, "final.png")), job)
+    assertTrue(result.isFailure)
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun directorySourceReferenceRejectsBackup() {
+  val directory = tempJob()
+  try {
+    val job = JSONObject().put("jobType", "RAW_NIGHT_FUSION")
+    val frames = JSONArray()
+    frames.put(JSONObject().put("raw16File", "frame_0001.raw16").put("enabled", true))
+    job.put("frames", frames)
+    KeplerJobMetadata.write(directory, job)
+    File(directory, "frame_0001.raw16").mkdir()
+    File(directory, "final.png").writeText("output")
+    val result = backupReprocessTransaction(directory, listOf(File(directory, "final.png")), job)
+    assertTrue(result.isFailure)
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun traversalOutsideJobRejected() {
+  val directory = tempJob()
+  try {
+    val job = JSONObject().put("jobType", "RAW_NIGHT_FUSION")
+    val frames = JSONArray()
+    frames.put(JSONObject().put("raw16File", "../../escape.raw16").put("enabled", true))
+    job.put("frames", frames)
+    KeplerJobMetadata.write(directory, job)
+    File(directory, "final.png").writeText("output")
+    val result = backupReprocessTransaction(directory, listOf(File(directory, "final.png")), job)
+    assertTrue(result.isFailure)
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun directChildSymlinkToOutsideRejected() {
+  val directory = tempJob()
+  try {
+    val outside = File(directory.parentFile, "outside.raw16")
+    outside.writeText("outside")
+    val symlink = File(directory, "frame_0001.raw16")
+    runCatching {
+      (directory as java.nio.file.Path).toAbsolutePath().let { path ->
+        java.nio.file.Files.createSymbolicLink(symlink.toPath(), outside.toPath())
+      }
+    }.isSuccess
+    val job = JSONObject().put("jobType", "RAW_NIGHT_FUSION")
+    val frames = JSONArray()
+    frames.put(JSONObject().put("raw16File", "frame_0001.raw16").put("enabled", true))
+    job.put("frames", frames)
+    KeplerJobMetadata.write(directory, job)
+    File(directory, "final.png").writeText("output")
+    val result = backupReprocessTransaction(directory, listOf(File(directory, "final.png")), job)
+    assertTrue(result.isFailure)
+    outside.delete()
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun invalidFramesMetadataDoesNotFallBackToLegacyScan() {
+  val directory = tempJob()
+  try {
+    val job = JSONObject().put("jobType", "RAW_NIGHT_FUSION")
+    val frames = JSONArray()
+    frames.put(JSONObject()) // empty frame with no source refs
+    job.put("frames", frames)
+    KeplerJobMetadata.write(directory, job)
+    File(directory, "final.png").writeText("output")
+    val result = backupReprocessTransaction(directory, listOf(File(directory, "final.png")), job)
+    assertTrue(result.isFailure)
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+// ── Phase 4: Created-output deletion failure quarantines and retains lease ───
+
+@Test
+fun rollbackCreatedOutputDeletionFailureQuarantinesAndRetainsLease() = runBlocking {
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    File(directory, "native_postprocess.json").writeText("{}")
+    val session = ReprocessTransactionSession(directory)
+    val lease = session.acquireLease() ?: error("no lease")
+    session.transferOwnership(transaction)
+    val previousDelete = createdOutputDeleteOperation
+    createdOutputDeleteOperation = { false }
+    try {
+      val result = finalizeTransactionWithLease(
+        transaction, lease, directory,
+        ReprocessJobKind.RAW_FUSION, FinalOutputFormat.JPEG,
+        FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
+        Result.failure(IllegalStateException("worker failed"))
+      )
+      assertEquals(ReprocessFinalizationState.QUARANTINED, result.state)
+      assertTrue(KeplerJobMetadata.isOperationActive(directory))
+    } finally {
+      createdOutputDeleteOperation = previousDelete
+      lateFinalizationHandoffScope = null
+    }
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+// ── Pre-existing active outputs survive rollback deletion ──────────────────
+
+@Test
+fun preExistingActiveOutputSurvivesRollbackDeletion() {
+  val directory = tempJob()
+  try {
+    File(directory, "native_postprocess.json").writeText("preexisting")
+    val transaction = backup(directory, "final.png" to "before")
+    assertTrue(removeCreatedForTest(directory, transaction).isSuccess)
+    assertTrue(File(directory, "native_postprocess.json").exists())
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+// ── Private helpers ───────────────────────────────────────────────────────
+
+private fun rootManifest(txId: String, root: File): ReprocessTransactionManifest = ReprocessTransactionManifest(
+  transactionId = txId,
+  createdAt = System.currentTimeMillis(),
+  preExistingPaths = emptySet(),
+  backedUpPaths = emptySet(),
+  backupEntries = emptyMap()
+)
 }
