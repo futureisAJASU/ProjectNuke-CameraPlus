@@ -849,6 +849,7 @@ class KeplerGalleryReprocessProtocolTest {
 
     @Test
     fun specificActiveRawYuvClassicOutputNamesRemoved() {
+        createdOutputDeleteOperation = null
         val directory = tempJob()
         try {
             val transaction = backup(directory, "final.png" to "before")
@@ -988,8 +989,7 @@ fun warningMetadataFailureAfterDurableCommittedStillReturnsTerminalAndReleasesLe
       )
       assertEquals(ReprocessFinalizationState.COMMITTED, result.state)
       assertFalse(KeplerJobMetadata.isOperationActive(directory))
-    } finally {
-      createdOutputDeleteOperation = previous
+} finally {
       lateFinalizationHandoffScope = null
     }
   } finally {
@@ -1381,6 +1381,72 @@ fun realFilesCreateSymbolicLinkToOutsideRejectAfterUnsoported() {
     val result = backupReprocessTransaction(directory, listOf(File(directory, "final.png")), job)
     assertTrue(result.isFailure)
     outside.delete()
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+// ── Phase 4b: Real-seam cleanup, listing, idempotency, and fallback tests ──
+
+@Test
+fun nullListingAtInitialInspectionFailsClosedViaRealSeam() {
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
+    val previousList = cleanupListOperation
+    cleanupListOperation = { null }
+    try {
+      assertFalse(cleanupBackups(transaction))
+    } finally {
+      cleanupListOperation = previousList
+    }
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun nullListingAtIntermediateFailsClosedViaRealSeam() {
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
+    val callCount = java.util.concurrent.atomic.AtomicInteger(0)
+    val previousList = cleanupListOperation
+    cleanupListOperation = { root ->
+      val c = callCount.incrementAndGet()
+      if (c == 2) null else root.listFiles()
+    }
+    try {
+      assertFalse(cleanupBackups(transaction))
+      assertTrue(File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE).isFile)
+    } finally {
+      cleanupListOperation = previousList
+    }
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun nullListingAtFinalFailsClosedViaRealSeam() {
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
+    val callCount = java.util.concurrent.atomic.AtomicInteger(0)
+    val previousList = cleanupListOperation
+    cleanupListOperation = { root ->
+      val c = callCount.incrementAndGet()
+      if (c == 3) null else root.listFiles()
+    }
+    try {
+      assertFalse(cleanupBackups(transaction))
+      assertTrue(File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE).isFile)
+    } finally {
+      cleanupListOperation = previousList
+    }
   } finally {
     directory.deleteRecursively()
   }
