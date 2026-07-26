@@ -1452,6 +1452,80 @@ fun nullListingAtFinalFailsClosedViaRealSeam() {
   }
 }
 
+// ── Phase 4b: Terminal cache, metadata routing, cleanup real-seam tests ──
+
+@Test
+fun freshCommittedIsCachedBeforeCleanup() {
+    val directory = tempJob()
+    try {
+        val transaction = backup(directory, "final.png" to "before")
+        val session = ReprocessTransactionSession(directory)
+        val lease = session.acquireLease() ?: error("no lease")
+        session.transferOwnership(transaction)
+        File(directory, "final.png").writeText("output")
+        val outcome = ReprocessWorkerOutcome(
+            result = Result.success(Unit),
+            publicExportCommitted = false,
+            exportVerified = true,
+            finalOutputFile = File(directory, "final.png")
+        )
+        val previousDelete = createdOutputDeleteOperation
+        createdOutputDeleteOperation = { true }
+        try {
+            val first = finalizeTransaction(
+                session, transaction, directory,
+                ReprocessJobKind.RAW_FUSION, FinalOutputFormat.JPEG,
+                FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
+                Result.success(outcome)
+            )
+            assertEquals(ReprocessFinalizationState.COMMITTED, first.state)
+            assertFalse(KeplerJobMetadata.isOperationActive(directory))
+            val second = finalizeTransaction(
+                session, transaction, directory,
+                ReprocessJobKind.RAW_FUSION, FinalOutputFormat.JPEG,
+                FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
+                Result.success(outcome)
+            )
+            assertEquals(ReprocessFinalizationState.COMMITTED, second.state)
+        } finally {
+            createdOutputDeleteOperation = previousDelete
+            lateFinalizationHandoffScope = null
+        }
+    } finally {
+        directory.deleteRecursively()
+    }
+}
+
+@Test
+fun freshRolledBackIsCachedBeforeCleanup() {
+    val directory = tempJob()
+    try {
+        val transaction = backup(directory, "final.png" to "before")
+        File(directory, "final.png").writeText("after!")
+        val session = ReprocessTransactionSession(directory)
+        val lease = session.acquireLease() ?: error("no lease")
+        session.transferOwnership(transaction)
+        val first = finalizeTransaction(
+            session, transaction, directory,
+            ReprocessJobKind.RAW_FUSION, FinalOutputFormat.JPEG,
+            FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
+            Result.failure(IllegalStateException("worker failed"))
+        )
+        assertEquals(ReprocessFinalizationState.ROLLED_BACK, first.state)
+        assertFalse(KeplerJobMetadata.isOperationActive(directory))
+        val second = finalizeTransaction(
+            session, transaction, directory,
+            ReprocessJobKind.RAW_FUSION, FinalOutputFormat.JPEG,
+            FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
+            Result.failure(IllegalStateException("worker failed"))
+        )
+        assertEquals(ReprocessFinalizationState.ROLLED_BACK, second.state)
+    } finally {
+        lateFinalizationHandoffScope = null
+        directory.deleteRecursively()
+    }
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────
 
 private fun rootManifest(txId: String, root: File): ReprocessTransactionManifest = ReprocessTransactionManifest(

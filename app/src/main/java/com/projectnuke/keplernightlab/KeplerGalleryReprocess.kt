@@ -440,16 +440,18 @@ suspend fun reprocessKeplerGalleryJob(
             writeReprocessFailure(target, message)
             return@withContext Result.failure(IllegalStateException(message))
         }
-        selectionMode = resolveSelectionMode(job, frameSelection)
-        transaction = backupReprocessTransaction(
-            target,
-            target.listFiles()?.filter { it.isFile && isReprocessWorkerWritable(it, kind) }.orEmpty(),
-            job = job,
-            jobKind = kind
-        ).getOrElse {
-            writeReprocessFailure(target, "Required reprocess backup failed: ${it.message}")
-            return@withContext Result.failure(it)
-        }
+selectionMode = resolveSelectionMode(job, frameSelection)
+    val listing = target.listFiles()
+    check(listing != null) { "Cannot read job directory contents." }
+    transaction = backupReprocessTransaction(
+        target,
+        listing.filter { it.isFile && isReprocessWorkerWritable(it, kind) },
+        job = job,
+        jobKind = kind
+    ).getOrElse { backupError ->
+        writeReprocessFailure(target, "Required reprocess backup failed: ${backupError.message}")
+        return@withContext Result.failure(backupError)
+    }
 
         // Ownership transfer exactly once: ACTIVE manifest is now durably persisted and validated
         // against the in-memory transaction. Strict identity must hold before any post-ACTIVE work;
@@ -807,7 +809,11 @@ internal suspend fun runLateFinalization(handoff: ReprocessLateFinalizationHando
     } catch (e: Error) { throw e
     } catch (_: Exception) {
         handoff.session.markLateUnresolved()
-        ensureDurableFallbackQuarantine(handoff.target, handoff.transaction)
+        val rootEvidenceExists = handoff.transaction.backupRoot.isDirectory &&
+            File(handoff.transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE).isFile
+        if (!rootEvidenceExists) {
+            ensureDurableFallbackQuarantine(handoff.target, handoff.transaction)
+        }
         return
     }
     val late = finalizeTransaction(
@@ -944,16 +950,17 @@ internal fun finalizeTransaction(
         outcome.publicExportCommitted) && hasUsableOutput
 
     return if (shouldCommit) {
-        val commitResult = try {
-            Result.success(finalizeReprocessOutcome(
-                jobDir, jobKind, outputSettings, selectionMode, includedFrameIndices, outcome, transaction
-            ))
-        } catch (e : IOException) {
-            Result.failure<KeplerReprocessResult>(e)
-        } catch (e : SecurityException) {
+        val finalOutcome: Result<KeplerReprocessResult> = try {
+            Result.success(finalizeReprocessOutcome(jobDir, jobKind, outputSettings, selectionMode, includedFrameIndices, outcome, transaction))
+        } catch (e: OutOfMemoryError) { throw e
+        } catch (e: ThreadDeath) { throw e
+        } catch (e: LinkageError) { throw e
+        } catch (e: InternalError) { throw e
+        } catch (e: Error) { throw e
+        } catch (e: Exception) {
             Result.failure<KeplerReprocessResult>(e)
         }
-  commitResult.fold(
+        finalOutcome.fold(
     onSuccess = { committed ->
       try {
         writeTransactionState(transaction, ReprocessTransactionState.COMMITTED)
@@ -965,17 +972,10 @@ internal fun finalizeTransaction(
       } catch (e: Exception) {
         return@fold quarantineWithPersistence(transaction, e)
       }
-      val warnings = performTerminalCleanupDebt(session, transaction, jobDir, ReprocessTransactionState.COMMITTED, ownedLease)
-      try {
-        if (warnings.isNotEmpty()) {
-          KeplerJobMetadata.update(jobDir) { job ->
-            val existing = job.optJSONArray("reprocessWarnings") ?: JSONArray().also { job.put("reprocessWarnings", it) }
-            warnings.forEach { existing.put(it) }
-            job.put("reprocessWarning", warnings.first())
-          }
-        }
-      } catch (_: IOException) {} catch (_: SecurityException) {}
-      ReprocessFinalizationResult(ReprocessFinalizationState.COMMITTED, Result.success(committed))
+      val terminalResult = ReprocessFinalizationResult(ReprocessFinalizationState.COMMITTED, Result.success(committed))
+      session.storeTerminalResult(terminalResult)
+      performTerminalCleanupDebt(session, transaction, jobDir, ReprocessTransactionState.COMMITTED, ownedLease)
+      terminalResult
     },
             onFailure = { metadataError ->
                 if (outcome.publicExportCommitted) {
@@ -1121,8 +1121,10 @@ internal fun rollback(
             transaction, combineCauseWithMessage(error, "State persistence failure during rollback", stateFailure)
         )
     }
+    val rolledBack = ReprocessFinalizationResult(ReprocessFinalizationState.ROLLED_BACK, Result.failure(error))
+    session.storeTerminalResult(rolledBack)
     performTerminalCleanupDebt(session, transaction, jobDir, ReprocessTransactionState.ROLLED_BACK, operationLease)
-    return ReprocessFinalizationResult(ReprocessFinalizationState.ROLLED_BACK, Result.failure(error))
+    return rolledBack
 }
 
 /**
@@ -1146,22 +1148,16 @@ private fun performTerminalCleanupDebt(
     val warnings = mutableListOf<String>()
     try {
         val fallbackRemoved = runTerminalFallbackRemoval(jobDir, transaction, warnings)
-        if (!fallbackRemoved) {
-            return warnings // root+manifest preserved, fallback blocking, lease released in finally
+        if (fallbackRemoved) {
+            val cleanupOk = try {
+                cleanupBackups(transaction)
+            } catch (_: Exception) {
+                false
+            }
+            if (!cleanupOk) {
+                warnings += "Reprocess backup cleanup failed after durable $state."
+            }
         }
-        val cleanupOk = try {
-            cleanupBackups(transaction)
-        } catch (_: Exception) {
-            false
-        }
-        if (!cleanupOk) {
-            warnings += "Reprocess backup cleanup failed after durable $state."
-        }
-    } catch (e: OutOfMemoryError) { throw e
-    } catch (e: ThreadDeath) { throw e
-    } catch (e: LinkageError) { throw e
-    } catch (e: InternalError) { throw e
-    } catch (e: Error) { throw e
     } catch (_: Exception) {
         warnings += "Cleanup debt threw after durable $state."
     } finally {
@@ -1440,7 +1436,7 @@ internal fun writeQuarantineMarker(transaction: ReprocessTransaction) {
     val marker = File(root, REPROCESS_QUARANTINE_MARKER)
     if (marker.exists()) {
         check(marker.isFile) { "Quarantine marker path exists but is not a regular file: $marker" }
-        val content = runCatching { marker.readText() }.getOrNull()
+        val content = try { marker.readText() } catch (e: Exception) { null }
         check(content == REPROCESS_QUARANTINE_MARKER_CONTENT) { "Quarantine marker exists but content is not canonical: $marker" }
         return
     }
@@ -1451,7 +1447,7 @@ internal fun writeQuarantineMarker(transaction: ReprocessTransaction) {
         KeplerJobMetadata.atomicWrite(marker, REPROCESS_QUARANTINE_MARKER_CONTENT)
     }
     check(marker.isFile) { "Quarantine marker write produced no file: $marker" }
-    val writtenContent = runCatching { marker.readText() }.getOrNull()
+    val writtenContent = try { marker.readText() } catch (e: Exception) { null }
     check(writtenContent == REPROCESS_QUARANTINE_MARKER_CONTENT) { "Quarantine marker content verification failed after write: $marker" }
 }
 
@@ -1661,7 +1657,7 @@ internal fun recoverValidatedQuarantine(jobDir: File) {
             val matchingRoot = children.firstOrNull { it.isDirectory && it.name == fallbackId.second }
             val matchingClassification = matchingRoot?.let { classifyTransactionManifest(jobDir, it) }
             if (matchingClassification is ManifestClassification.Resolved) {
-                val manifest = runCatching { loadStrictManifest(File(matchingRoot, REPROCESS_TX_MANIFEST_FILE)) }.getOrNull()
+                val manifest = try { loadStrictManifest(File(matchingRoot, REPROCESS_TX_MANIFEST_FILE)) } catch (_: Exception) { null }
                 if (manifest != null &&
                     manifest.transactionId == fallbackId.first &&
                     matchingRoot.name == fallbackId.second &&
@@ -2295,7 +2291,7 @@ internal fun backupReprocessTransaction(
 ): Result<ReprocessTransaction> {
     val transactionId = "${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}"
     val root = File(jobDir, ".reprocess_backup_$transactionId")
-    return runCatching {
+    return try {
         check(root.mkdirs()) { "Could not create reprocess backup directory." }
         val metadata = File(jobDir, JOB_JSON_FILE_NAME)
         check(metadata.isFile) { "job.json is required for rollback." }
@@ -2399,10 +2395,16 @@ internal fun backupReprocessTransaction(
             backupEntries = backupEntries
         )
         KeplerJobMetadata.atomicWrite(File(root, REPROCESS_TX_MANIFEST_FILE), manifest.toJson().toString(2))
-        ReprocessTransaction(transactionId, root, manifest, backups)
-    }.onFailure {
+        Result.success(ReprocessTransaction(transactionId, root, manifest, backups))
+    } catch (e: OutOfMemoryError) { throw e
+    } catch (e: ThreadDeath) { throw e
+    } catch (e: LinkageError) { throw e
+    } catch (e: InternalError) { throw e
+    } catch (e: Error) { throw e
+    } catch (e: Exception) {
         root.listFiles()?.forEach { it.delete() }
         if (root.exists()) root.delete()
+        Result.failure(e)
     }
 }
 
