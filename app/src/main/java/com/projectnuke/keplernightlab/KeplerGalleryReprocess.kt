@@ -807,15 +807,37 @@ internal suspend fun runLateFinalization(handoff: ReprocessLateFinalizationHando
     } catch (e: LinkageError) { throw e
     } catch (e: InternalError) { throw e
     } catch (e: Error) { throw e
-    } catch (_: Exception) {
-        handoff.session.markLateUnresolved()
-        val rootEvidenceExists = handoff.transaction.backupRoot.isDirectory &&
-            File(handoff.transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE).isFile
-        if (!rootEvidenceExists) {
-            ensureDurableFallbackQuarantine(handoff.target, handoff.transaction)
-        }
-        return
+} catch (_: Exception) {
+  handoff.session.markLateUnresolved()
+  val backupRoot = handoff.transaction.backupRoot
+  val shouldPreserveFallback = when {
+    !backupRoot.isDirectory -> false
+    else -> {
+      val marker = File(backupRoot, REPROCESS_QUARANTINE_MARKER)
+      if (marker.exists() && marker.isFile) {
+        val content = runCatching { marker.readText() }.getOrNull()
+        content == REPROCESS_QUARANTINE_MARKER_CONTENT
+      } else {
+        val manifestFile = File(backupRoot, REPROCESS_TX_MANIFEST_FILE)
+        manifestFile.isFile && runCatching {
+          val durable = loadStrictManifest(manifestFile)
+          durable.transactionId == handoff.transaction.transactionId &&
+              durable.createdAt == handoff.transaction.manifest.createdAt &&
+              durable.state in setOf(
+                  ReprocessTransactionState.ACTIVE,
+                  ReprocessTransactionState.QUARANTINED
+              ) && durable.hasSameImmutableIdentity(handoff.transaction.manifest)
+        }.getOrNull() == true
+      }
     }
+  }
+  if (!shouldPreserveFallback) {
+    try { ensureDurableFallbackQuarantine(handoff.target, handoff.transaction) }
+    catch (_: Exception) {}
+  }
+  try { handoff.session.lease?.release() } catch (_: Exception) {}
+  return
+}
     val late = finalizeTransaction(
         handoff.session, handoff.transaction, handoff.target, handoff.jobKind,
         handoff.outputSettings, handoff.selectionMode, handoff.resolvedSelection, outcome

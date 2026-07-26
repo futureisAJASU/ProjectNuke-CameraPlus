@@ -9,6 +9,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -1498,32 +1499,48 @@ fun freshCommittedIsCachedBeforeCleanup() {
 
 @Test
 fun freshRolledBackIsCachedBeforeCleanup() {
-    val directory = tempJob()
-    try {
-        val transaction = backup(directory, "final.png" to "before")
-        File(directory, "final.png").writeText("after!")
-        val session = ReprocessTransactionSession(directory)
-        val lease = session.acquireLease() ?: error("no lease")
-        session.transferOwnership(transaction)
-        val first = finalizeTransaction(
-            session, transaction, directory,
-            ReprocessJobKind.RAW_FUSION, FinalOutputFormat.JPEG,
-            FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
-            Result.failure(IllegalStateException("worker failed"))
-        )
-        assertEquals(ReprocessFinalizationState.ROLLED_BACK, first.state)
-        assertFalse(KeplerJobMetadata.isOperationActive(directory))
-        val second = finalizeTransaction(
-            session, transaction, directory,
-            ReprocessJobKind.RAW_FUSION, FinalOutputFormat.JPEG,
-            FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
-            Result.failure(IllegalStateException("worker failed"))
-        )
-        assertEquals(ReprocessFinalizationState.ROLLED_BACK, second.state)
-    } finally {
-        lateFinalizationHandoffScope = null
-        directory.deleteRecursively()
-    }
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    File(directory, "final.png").writeText("after!")
+    val session = ReprocessTransactionSession(directory)
+    val lease = session.acquireLease() ?: error("no lease")
+    session.transferOwnership(transaction)
+    val first = finalizeTransaction(
+      session, transaction, directory,
+      ReprocessJobKind.RAW_FUSION, FinalOutputFormat.JPEG,
+      FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
+      Result.failure(IllegalStateException("worker failed"))
+    )
+    assertEquals(ReprocessFinalizationState.ROLLED_BACK, first.state)
+    assertFalse(KeplerJobMetadata.isOperationActive(directory))
+    val second = finalizeTransaction(
+      session, transaction, directory,
+      ReprocessJobKind.RAW_FUSION, FinalOutputFormat.JPEG,
+      FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
+      Result.failure(IllegalStateException("worker failed"))
+    )
+    assertEquals(ReprocessFinalizationState.ROLLED_BACK, second.state)
+  } finally {
+    lateFinalizationHandoffScope = null
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun lateFinalizationFallsClosedWithDurableFallbackWhenRootEvidenceMissing() {
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    transaction.backupRoot.deleteRecursively()
+    ensureDurableFallbackQuarantine(directory, transaction)
+    assertTrue(File(directory, ".reprocess_unresolved").isFile)
+    val fallback = File(directory, ".reprocess_unresolved")
+    assertTrue(fallback.readText().contains(transaction.transactionId))
+    assertTrue(fallback.readText().contains(transaction.backupRoot.name))
+  } finally {
+    directory.deleteRecursively()
+  }
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────
