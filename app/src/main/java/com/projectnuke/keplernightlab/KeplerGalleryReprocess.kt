@@ -780,14 +780,6 @@ internal suspend fun runLateFinalization(handoff: ReprocessLateFinalizationHando
                 Result.failure<ReprocessWorkerOutcome>(combineCause(deferredFailure, completionCause))
             }
             awaited
-            /* awaited result already carries explicit success/failure */
-            /*
-                onFailure = { deferredFailure ->
-                    // Exceptional deferred completion ⇒ worker exited with failure.
-                    Result.failure<ReprocessWorkerOutcome>(combineCause(deferredFailure, completionCause))
-                }
-            )
-            */
         } else if (completionCause != null) {
             Result.failure<ReprocessWorkerOutcome>(
                 combineCause(
@@ -798,14 +790,19 @@ internal suspend fun runLateFinalization(handoff: ReprocessLateFinalizationHando
         } else {
             Result.success(handoff.workerOutcomeSnapshot)
         }
-} catch (_: kotlinx.coroutines.CancellationException) {
-  throw kotlinx.coroutines.CancellationException("Late finalization companion cancelled")
-} catch (_: Exception) {
-  handoff.session.markLateUnresolved()
-  ensureDurableFallbackQuarantine(handoff.target, handoff.transaction)
-  return
-}
-val late = finalizeTransaction(
+} catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
+    } catch (e: OutOfMemoryError) { throw e
+    } catch (e: ThreadDeath) { throw e
+    } catch (e: LinkageError) { throw e
+    } catch (e: InternalError) { throw e
+    } catch (e: Error) { throw e
+    } catch (_: Exception) {
+        handoff.session.markLateUnresolved()
+        ensureDurableFallbackQuarantine(handoff.target, handoff.transaction)
+        return
+    }
+    val late = finalizeTransaction(
         handoff.session, handoff.transaction, handoff.target, handoff.jobKind,
         handoff.outputSettings, handoff.selectionMode, handoff.resolvedSelection, outcome
     )
@@ -935,14 +932,15 @@ internal fun finalizeTransaction(
     onSuccess = { committed ->
       try {
         writeTransactionState(transaction, ReprocessTransactionState.COMMITTED)
+      } catch (e: OutOfMemoryError) { throw e
+      } catch (e: ThreadDeath) { throw e
+      } catch (e: LinkageError) { throw e
+      } catch (e: InternalError) { throw e
+      } catch (e: Error) { throw e
       } catch (e: Exception) {
         return@fold quarantineWithPersistence(transaction, e)
       }
-      val warnings = try {
-        performTerminalCleanupDebt(transaction, jobDir, ReprocessTransactionState.COMMITTED, ownedLease)
-      } catch (cleanupFailure: Exception) {
-        return@fold quarantineWithPersistence(transaction, cleanupFailure)
-      }
+      val warnings = performTerminalCleanupDebt(transaction, jobDir, ReprocessTransactionState.COMMITTED, ownedLease)
       try {
         if (warnings.isNotEmpty()) {
           KeplerJobMetadata.update(jobDir) { job ->
@@ -1001,17 +999,24 @@ internal fun quarantineWithPersistence(
     var markerError: Throwable? = null
     var stateError: Throwable? = null
     try {
-        runCatching { writeQuarantineMarker(transaction) }
-            .exceptionOrNull()?.let { markerError = it }
-    } catch (e: Exception) {
-        if (e is OutOfMemoryError || e is ThreadDeath) throw e
-  markerError = e
-  }
-  try {
-    writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED)
-  } catch (e: Exception) {
-    stateError = e
-  }
+        try {
+            writeQuarantineMarker(transaction)
+        } catch (e: Exception) {
+            markerError = e
+        }
+        try {
+            writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED)
+        } catch (e: Exception) {
+            stateError = e
+        }
+    } catch (e: OutOfMemoryError) { throw e
+    } catch (e: ThreadDeath) { throw e
+    } catch (e: LinkageError) { throw e
+    } catch (e: InternalError) { throw e
+    } catch (e: Error) { throw e
+    } catch (e: Throwable) {
+        markerError = e
+    }
     val combined = if (markerError != null || stateError != null) {
         combineCauseWithMessage(canonicalError, "Quarantine persistence failed after processing error", markerError)
             .also { stateError?.let { se -> runCatching { it.addSuppressed(se) } } }
@@ -1065,6 +1070,11 @@ internal fun rollback(
             writeReprocessFailure(jobDir, "${error.javaClass.simpleName}: ${error.message}")
         }
         null
+  } catch (e: OutOfMemoryError) { throw e
+  } catch (e: ThreadDeath) { throw e
+  } catch (e: LinkageError) { throw e
+  } catch (e: InternalError) { throw e
+  } catch (e: Error) { throw e
   } catch (metadataFailure: Exception) {
     metadataFailure
   }
@@ -1075,21 +1085,17 @@ internal fun rollback(
     }
     try {
         writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
+  } catch (e: OutOfMemoryError) { throw e
+  } catch (e: ThreadDeath) { throw e
+  } catch (e: LinkageError) { throw e
+  } catch (e: InternalError) { throw e
+  } catch (e: Error) { throw e
   } catch (stateFailure: Exception) {
     return quarantineWithPersistence(
             transaction, combineCauseWithMessage(error, "State persistence failure during rollback", stateFailure)
         )
     }
-  val warnings = mutableListOf<String>()
-  try {
-    if (!removeMatchingFallbackQuarantine(jobDir, transaction)) {
-      warnings += "Fallback marker deletion failed after rollback; root preserved for retry."
-    }
-    val warningsFromDebt = performTerminalCleanupDebt(transaction, jobDir, ReprocessTransactionState.ROLLED_BACK, operationLease)
-    warnings += warningsFromDebt
-  } catch (_: Exception) {
-    // cleanup debt already captured warnings; lease already released by helper
-  }
+  val warnings = performTerminalCleanupDebt(transaction, jobDir, ReprocessTransactionState.ROLLED_BACK, operationLease)
   try {
     if (warnings.isNotEmpty()) {
       KeplerJobMetadata.update(jobDir) { job ->
@@ -1103,10 +1109,10 @@ internal fun rollback(
 }
 
 /**
- * Narrow shared terminal-cleanup-debt helper. Called after durable COMMITTED or ROLLED_BACK:
- * fallback-removal, warning metadata, marker removal, and backup cleanup are cleanup debt only.
- * Always releases the operation lease. Never downgrades terminal result. Preserves cleanup
- * failures as warnings. Catches ordinary failures; rethrows Cancellation; propagates fatal Errors.
+ * Shared terminal-cleanup-debt helper. Called after durable COMMITTED or ROLLED_BACK.
+ * Fallback-removal, warning metadata, marker removal, and backup cleanup are cleanup debt only.
+ * Always releases the operation lease in a finally block. Never downgrades terminal result.
+ * If fallback deletion fails the terminal root/manifest is preserved and cleanup skips the root.
  */
 private fun performTerminalCleanupDebt(
   transaction: ReprocessTransaction,
@@ -1116,21 +1122,27 @@ private fun performTerminalCleanupDebt(
 ): List<String> {
   val warnings = mutableListOf<String>()
   try {
-    try { removeQuarantineMarker(transaction) } catch (_: IllegalStateException) {}
-    if (!removeMatchingFallbackQuarantine(jobDir, transaction)) {
-      warnings += "Fallback quarantine marker deletion failed after $state. Root preserved for retry."
+    try {
+      try { removeQuarantineMarker(transaction) } catch (_: IllegalStateException) {}
+      if (!removeMatchingFallbackQuarantine(jobDir, transaction)) {
+        warnings += "Fallback quarantine marker deletion failed after $state. Root preserved for retry."
+        return warnings
+      }
+    } catch (_: IOException) {} catch (_: SecurityException) {
+      warnings += "Fallback cleanup inspection failed after $state."
+      return warnings
     }
-  } catch (_: IOException) {} catch (_: SecurityException) {}
-  try {
-    val cleanupSuccess = try { cleanupBackups(transaction) }
-    catch (_: IOException) { false }
-    catch (_: SecurityException) { false }
-    catch (_: IllegalStateException) { false }
-    if (!cleanupSuccess) {
-      warnings += "Reprocess backup cleanup failed after safe $state."
+    try {
+      val cleanupSuccess = try { cleanupBackups(transaction) }
+      catch (_: IOException) { false }
+      catch (_: SecurityException) { false }
+      catch (_: IllegalStateException) { false }
+      if (!cleanupSuccess) {
+        warnings += "Reprocess backup cleanup failed after safe $state."
+      }
+    } catch (_: Exception) {
+      warnings += "Reprocess backup cleanup threw after safe $state."
     }
-  } catch (_: Exception) {
-    warnings += "Reprocess backup cleanup threw after safe $state."
   } finally {
     try { lease.release() } catch (_: IOException) {} catch (_: SecurityException) {}
   }
@@ -1415,9 +1427,18 @@ internal fun persistUnresolvedQuarantine(
 ): UnresolvedPersistenceResult {
     var markerFailure: Throwable? = null
     var stateFailure: Throwable? = null
-    try { writeQuarantineMarker(transaction) } catch (e: Exception) { markerFailure = e }
-    try { writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED) }
-    catch (e: Exception) { stateFailure = e }
+    try {
+        try { writeQuarantineMarker(transaction) } catch (e: Exception) { markerFailure = e }
+        try { writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED) }
+        catch (e: Exception) { stateFailure = e }
+    } catch (e: OutOfMemoryError) { throw e
+    } catch (e: ThreadDeath) { throw e
+    } catch (e: LinkageError) { throw e
+    } catch (e: InternalError) { throw e
+    } catch (e: Error) { throw e
+    } catch (e: Throwable) {
+        markerFailure = e
+    }
     val rootEvidence = markerFailure == null || stateFailure == null
     var fallbackFailure: Throwable? = null
     var fallbackPersisted = false
@@ -1761,7 +1782,7 @@ internal fun detectJobKind(jobDir: File, job: JSONObject): ReprocessJobKind {
 
 internal fun countActualSourceFrames(jobDir: File, job: JSONObject, kind: ReprocessJobKind): Int {
     val frames = job.optJSONArray("frames")
-    if (frames != null && frames.length() > 0) {
+    if (frames != null) {
         val canonicalJobDir = jobDir.canonicalFile
         var count = 0
         repeat(frames.length()) { index ->
