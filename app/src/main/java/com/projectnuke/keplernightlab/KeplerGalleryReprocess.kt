@@ -110,6 +110,21 @@ private const val REPROCESS_HISTORY_LIMIT = 32
 internal var reprocessWorkerExitTimeoutMsForTest: Long? = null
 internal var reprocessTimeoutMsForTest: Long? = null
 
+/** Test-only counters for transaction-critical idempotency verification. Each test must save the
+ *  prior value and restore it in `finally`. Production never reads these. */
+@Volatile
+internal var restoreBackupsKickbackCount: Int = 0
+@Volatile
+internal var createdOutputKickbackCount: Int = 0
+@Volatile
+internal var fallbackWriteCount: Int = 0
+/** Convenience accessor aligned with the [KeplerJobMetadata.leaseReleaseCount] storage. */
+internal val leaseReleaseCount: Int
+    get() = KeplerJobMetadata.leaseReleaseCount
+/** Convenience accessor aligned with the [KeplerJobMetadata.atomicWriteCount] storage. */
+internal val metadataWriteCount: Int
+    get() = KeplerJobMetadata.atomicWriteCount
+
 /**
  * Result of classifying a transaction manifest's state for evidence inspection.
  * Only [Resolved] allows cleanup; all other states block job mutation/deletion.
@@ -133,11 +148,19 @@ internal fun classifyTransactionManifest(backupRoot: File): ManifestClassificati
     if (!backupRoot.isDirectory) return ManifestClassification.Unresolved
     val manifestFile = File(backupRoot, REPROCESS_TX_MANIFEST_FILE)
     if (!manifestFile.isFile) return ManifestClassification.Unresolved
-    val manifest = runCatching { loadStrictManifest(manifestFile) }.getOrNull()
-        ?: return ManifestClassification.Unresolved
-    return when (manifest.state) {
+    val parsed: ReprocessTransactionManifest? = try {
+        loadStrictManifest(manifestFile)
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (_: Exception) { null }
+    if (parsed == null) return ManifestClassification.Unresolved
+    return when (parsed.state) {
         ReprocessTransactionState.COMMITTED,
-        ReprocessTransactionState.ROLLED_BACK -> ManifestClassification.Resolved(manifest.state)
+        ReprocessTransactionState.ROLLED_BACK -> ManifestClassification.Resolved(parsed.state)
         ReprocessTransactionState.ACTIVE,
         ReprocessTransactionState.QUARANTINED -> ManifestClassification.Unresolved
     }
@@ -147,9 +170,27 @@ private fun classifyTransactionManifest(jobDir: File, backupRoot: File): Manifes
     val base = classifyTransactionManifest(backupRoot)
     if (base is ManifestClassification.Unresolved) return base
     val manifest = try { loadStrictManifest(File(backupRoot, REPROCESS_TX_MANIFEST_FILE)) }
+    catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
     catch (_: Exception) { return ManifestClassification.Unresolved }
-    val job = try { jobDir.canonicalFile } catch (_: Exception) { return ManifestClassification.Unresolved }
-    val root = try { backupRoot.canonicalFile } catch (_: Exception) { return ManifestClassification.Unresolved }
+    val job = try { jobDir.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (_: Exception) { return ManifestClassification.Unresolved }
+    val root = try { backupRoot.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (_: Exception) { return ManifestClassification.Unresolved }
     try {
         if (root.parentFile?.canonicalFile != job || root.name != ".reprocess_backup_${manifest.transactionId}") {
             return ManifestClassification.Unresolved
@@ -160,7 +201,13 @@ private fun classifyTransactionManifest(jobDir: File, backupRoot: File): Manifes
                 target.parentFile?.canonicalFile != job || backup.parentFile?.canonicalFile != root ||
                     entry.relativePath == REPROCESS_TX_MANIFEST_FILE || entry.backupName == REPROCESS_TX_MANIFEST_FILE
             }) return ManifestClassification.Unresolved
-    } catch (_: Exception) { return ManifestClassification.Unresolved }
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (_: Exception) { return ManifestClassification.Unresolved }
     return base
 }
 
@@ -240,6 +287,10 @@ internal class ReprocessTransactionSession(val jobDir: File) {
     private val lateState = AtomicReference(LateState.IDLE)
     /** Durable terminal result stored before cleanup, reused for idempotent duplicate finalization. */
     private val terminalResult = AtomicReference<ReprocessFinalizationResult?>(null)
+    /** Bounded production retry counter: at most one retry is permitted from UNRESOLVED. */
+    private val lateRetryCount = java.util.concurrent.atomic.AtomicInteger(0)
+    /** Maximum production late-finalization retries from UNRESOLVED. */
+    private val LATE_RETRY_BOUND = 1
 
     fun acquireLease(): JobOperationLease? {
         val acquired = KeplerJobMetadata.acquireOperation(jobDir)
@@ -278,14 +329,23 @@ internal class ReprocessTransactionSession(val jobDir: File) {
     /** True when a durable terminal result has already been recorded. */
     fun isTerminal(): Boolean = terminalResult.get() != null
 
-    /** Try to acquire the once-guard for late-finalization registration. Returns true only the first time. */
+    /** Try to acquire the once-guard for late-finalization registration. Returns true only the first time.
+     *  Permits at most [LATE_RETRY_BOUND] bounded production retries from UNRESOLVED. */
     fun tryAcquireLateRegistration(): Boolean {
         while (true) {
             val current = lateState.get()
             if (current != LateState.IDLE && current != LateState.UNRESOLVED) return false
-            if (lateState.compareAndSet(current, LateState.LATE_REGISTERED)) return true
+            val isRetry = current == LateState.UNRESOLVED
+            if (isRetry && lateRetryCount.get() >= LATE_RETRY_BOUND) return false
+            if (lateState.compareAndSet(current, LateState.LATE_REGISTERED)) {
+                if (isRetry) lateRetryCount.incrementAndGet()
+                return true
+            }
         }
     }
+
+    /** True when no more production retries are allowed (bound reached or terminal). */
+    fun lateRetryExhausted(): Boolean = lateRetryCount.get() >= LATE_RETRY_BOUND
 
     /** Try to acquire the once-guard for late finalizer invocation. Returns true only the first time. */
     fun tryBeginFinalization(): Boolean = lateState.compareAndSet(LateState.LATE_REGISTERED, LateState.FINALIZING)
@@ -350,18 +410,14 @@ internal sealed class WorkerTerminalResult {
 }
 
 private fun combineCause(primary: Throwable, vararg suppressed: Throwable?): Throwable {
-    for (s in suppressed) if (s != null && s !== primary) {
-        runCatching { primary.addSuppressed(s) }
-    }
+    for (s in suppressed) if (s != null && s !== primary) addSuppressedSafe(primary, s)
     return primary
 }
 
 /** Compact cause/suppressed helper used by rollback, cleanup, terminal metadata, quarantine, and late-finalization. */
 private fun combineCauseWithMessage(primary: Throwable, message: String, suppressedFailure: Throwable?): Throwable {
     val wrapping = if (primary.message != message) RuntimeException(message, primary) else primary
-    if (suppressedFailure != null && suppressedFailure !== primary) {
-        runCatching { wrapping.addSuppressed(suppressedFailure) }
-    }
+    if (suppressedFailure != null && suppressedFailure !== primary) addSuppressedSafe(wrapping, suppressedFailure)
     return wrapping
 }
 
@@ -369,8 +425,16 @@ internal data class UnresolvedPersistenceResult(
     val rootMarkerPersisted: Boolean,
     val quarantinedStatePersisted: Boolean,
     val fallbackPersisted: Boolean,
+    val durableEvidenceEstablished: Boolean,
+    val markerError: Throwable?,
+    val stateError: Throwable?,
+    val fallbackError: Throwable?,
+    val cancelError: Throwable?,
+) {
+    /** Compatibility shim for callers that need a single error. */
     val error: Throwable?
-)
+        get() = listOfNotNull(cancelError, markerError, stateError, fallbackError).firstOrNull()
+}
 
 suspend fun reprocessKeplerGalleryJob(
     context: Context,
@@ -383,8 +447,14 @@ suspend fun reprocessKeplerGalleryJob(
         withContext(Dispatchers.Main) { onProgress(message) }
     }
 
-    val target = runCatching { requireReprocessSafeJobDirectory(context, jobDir) }
-        .getOrElse { return@withContext Result.failure(it) }
+    val target = try { requireReprocessSafeJobDirectory(context, jobDir) }
+    catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (sf: Exception) { return@withContext Result.failure(sf) }
     val session = ReprocessTransactionSession(target)
     val operationLease = session.acquireLease() ?: run {
         return@withContext Result.failure(IllegalStateException("A job mutation is already in progress."))
@@ -403,7 +473,13 @@ suspend fun reprocessKeplerGalleryJob(
         // Inspection failure is unsafe and must not write ordinary failure metadata.
         val unresolved = try {
             isReprocessQuarantined(target)
-        } catch (inspectionFailure: Exception) {
+        } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+        catch (oom: OutOfMemoryError) { throw oom }
+        catch (td: ThreadDeath) { throw td }
+        catch (le: LinkageError) { throw le }
+        catch (ie: InternalError) { throw ie }
+        catch (e: Error) { throw e }
+        catch (inspectionFailure: Exception) {
             return@withContext Result.failure(
                 IllegalStateException("Unable to inspect existing reprocess transaction evidence.", inspectionFailure)
             )
@@ -431,10 +507,12 @@ suspend fun reprocessKeplerGalleryJob(
         }
         kind = detectJobKind(target, job)
         reviewItems = loadFrameReviewItems(context, target).getOrElse {
+            if (it is kotlinx.coroutines.CancellationException) throw it
             writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
             return@withContext Result.failure(it)
         }
         resolvedSelection = resolveFrameSelection(target, kind, reviewItems, frameSelection).getOrElse {
+            if (it is kotlinx.coroutines.CancellationException) throw it
             writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
             return@withContext Result.failure(it)
         }
@@ -685,24 +763,42 @@ private fun settleTerminalResult(
         is WorkerTerminalResult.WorkerDidNotExitBeforeTimeout -> {
             val persistence = persistUnresolvedQuarantine(session, transaction, acquisition.cancelFailure)
             registerLateFinalization(session, worker, target, jobKind, outputSettings, selectionMode, resolvedSelection)
-            ReprocessFinalizationResult(
-                ReprocessFinalizationState.QUARANTINED,
-                Result.failure(combineCauseWithMessage(
-                    IllegalStateException("Reprocess worker did not exit before rollback timeout."),
-                    "Unresolved persistence failed", persistence.error
-                ))
-            )
+            val original = IllegalStateException("Reprocess worker did not exit before rollback timeout.")
+            val combined = when {
+                !persistence.durableEvidenceEstablished && persistence.fallbackError != null ->
+                    combineCauseWithMessage(original, "Unresolved persistence failed", persistence.fallbackError)
+                persistence.durableEvidenceEstablished -> original
+                else -> combineCauseWithMessage(original, "Unresolved persistence failed", null)
+            }
+            ReprocessFinalizationResult(ReprocessFinalizationState.QUARANTINED, Result.failure(combined))
         }
         is WorkerTerminalResult.CallerCancelledWhileWorkerActive -> {
             val persistence = persistUnresolvedQuarantine(session, transaction, acquisition.cancelFailure)
             registerLateFinalization(session, worker, target, jobKind, outputSettings, selectionMode, resolvedSelection)
-            ReprocessFinalizationResult(
-                ReprocessFinalizationState.QUARANTINED,
-                Result.failure(combineCause(acquisition.callerCancellation, persistence.error))
-            )
+            val combined = if (!persistence.durableEvidenceEstablished && persistence.fallbackError != null)
+                combineCause(acquisition.callerCancellation, persistence.fallbackError)
+            else acquisition.callerCancellation
+            ReprocessFinalizationResult(ReprocessFinalizationState.QUARANTINED, Result.failure(combined))
         }
     }
 }
+
+/**
+ * Structured late-evidence persistence result: every ordinary outcome is preserved separately.
+ * [durableEvidenceEstablished] is true when either the marker or state succeeded and verified via
+ * [strictRootEvidence]. The caller may combine [markerError], [stateError], [fallbackError], or
+ * [cancelError] with the original operation failure; the result itself only describes persistence.
+ */
+internal data class LateEvidencePersistenceResult(
+    val markerPersisted: Boolean,
+    val statePersisted: Boolean,
+    val fallbackPersisted: Boolean,
+    val durableEvidenceEstablished: Boolean,
+    val markerError: Throwable?,
+    val stateError: Throwable?,
+    val fallbackError: Throwable?,
+    val evidenceError: Throwable?
+)
 
 /**
  * Holds the session, owning lease, and late-registration state for one late finalization pass.
@@ -719,7 +815,9 @@ internal data class ReprocessLateFinalizationHandoff(
     val selectionMode: FrameSelectionMode,
     val resolvedSelection: Set<Int>,
     val workerTerminal: Deferred<ReprocessWorkerOutcome>? = null,
-    val workerOutcomeSnapshot: ReprocessWorkerOutcome = noOutcomeSnapshot
+    val workerOutcomeSnapshot: ReprocessWorkerOutcome = noOutcomeSnapshot,
+    /** Cumulative evidence-persistence error preserved across late attempts; nulled on terminal success. */
+    var evidenceError: Throwable? = null
 ) {
     companion object
 }
@@ -764,12 +862,23 @@ internal fun registerLateFinalization(
       CoroutineScope(Dispatchers.IO).launch {
         try {
           runLateFinalization(handoff, cause)
+          // Production retry path: after the first ordinary finalizer/evidence failure leaves the
+          // session in UNRESOLVED, schedule exactly one bounded retry sharing the same session/lease.
+          // Never retries after COMMITTED/ROLLED_BACK; the session once-guard prevents concurrency.
+          if (handoff.session.lateStateForTest() == ReprocessTransactionSession.LateState.UNRESOLVED &&
+              !handoff.session.lateRetryExhausted()) {
+            scheduleUnresolvedRetry(handoff)
+          }
         } catch (e: kotlinx.coroutines.CancellationException) {
-          // `runLateFinalization` already transitioned FINALIZING -> UNRESOLVED and retained the lease.
-          // Do not silently swallow callback cancellation — rethrow so the detached scope's failure
-          // handling observes it. Worker-deferred cancellation classification is preserved separately
-          // inside `runLateFinalization` and never reaches here as callback cancellation.
+          // `runLateFinalization` already transitioned FINALIZING -> UNRESOLVED, retained the lease,
+          // and preserved the evidence-persistence error in `handoff.evidenceError`. Do not silently
+          // swallow callback cancellation — rethrow so the detached scope's failure handling observes it.
           throw e
+        } catch (e: OutOfMemoryError) { throw e
+        } catch (e: ThreadDeath) { throw e
+        } catch (e: LinkageError) { throw e
+        } catch (e: InternalError) { throw e
+        } catch (e: Error) { throw e
         }
       }
     }
@@ -777,27 +886,82 @@ internal fun registerLateFinalization(
 }
 
 /**
+ * Persist durable evidence for a late failure and return a structured result. Used by
+ * [runLateFinalization] when terminal retrieval, finalizer, or callback cancellation occurs
+ * before a durable terminal state. Never silently swallows fallback failures: the caller
+ * must inspect [LateEvidencePersistenceResult.evidenceError] and rethrow/aggregate as needed.
+ *
+ * Contract:
+ *  - if strict root evidence is [RootEvidence.Trustworthy], do NOT create a fallback marker.
+ *  - otherwise persist the job-level durable fallback marker and verify it.
+ *  - preserve the evidence-persistence error that blocked durable evidence establishment.
+ *
+ * Fatal Errors and [CancellationException] propagate unchanged from marker/state inspection.
+ */
+internal fun persistLateEvidence(
+    handoff: ReprocessLateFinalizationHandoff
+): LateEvidencePersistenceResult {
+    val rootEvidence = strictRootEvidence(handoff.target, handoff.transaction)
+    val durableEvidence = rootEvidence === RootEvidence.Trustworthy
+    if (durableEvidence) return LateEvidencePersistenceResult(
+        markerPersisted = false,
+        statePersisted = false,
+        fallbackPersisted = false,
+        durableEvidenceEstablished = true,
+        markerError = null, stateError = null, fallbackError = null, evidenceError = null
+    )
+    // Root evidence is not trustworthy — establish a durable fallback marker.
+    var fallbackError: Throwable? = (rootEvidence as? RootEvidence.InspectionFailed)?.cause
+    var fallbackPersisted = false
+    try {
+        ensureDurableFallbackQuarantine(handoff.target, handoff.transaction)
+        fallbackPersisted = true
+    } catch (ce: kotlinx.coroutines.CancellationException) {
+        throw ce
+    } catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (fb: Exception) {
+        if (fallbackError == null) fallbackError = fb
+        else fallbackError = combineCause(fallbackError, fb)
+    }
+    return LateEvidencePersistenceResult(
+        markerPersisted = false,
+        statePersisted = false,
+        fallbackPersisted = fallbackPersisted,
+        durableEvidenceEstablished = fallbackPersisted,
+        markerError = null,
+        stateError = null,
+        fallbackError = fallbackError,
+        // If the fallback failed and the root was merely Untrustworthy (no inspection error), preserve fallbackError.
+        evidenceError = if (!fallbackPersisted) fallbackError else null
+    )
+}
+
+/**
  * Late-finalization entry point. Invokes shared settlement exactly once using the worker terminal
  * outcome (awaited from the deferred), the completion [cause], or a snapshot. Exceptional deferred
  * completion enters shared settlement as a worker failure. Never silently swallows callback exceptions:
  * ordinary callback failure leaves durable unresolved evidence and retains the lease.
+ *
+ * Exception policy per the late callback contract:
+ *  - ordinary terminal-retrieval/finalizer failure before terminal state → FINALIZING → UNRESOLVED,
+ *    retain lease, establish or verify durable evidence, preserve complete failure context.
+ *  - callback cancellation → transition to UNRESOLVED, retain lease, preserve durable evidence,
+ *    rethrow original [CancellationException].
+ *  - fatal [Error] → propagate unchanged; never convert into worker failure or "no evidence".
+ *  - COMMITTED/ROLLED_BACK → terminal result already cached; mark TERMINAL; no fallback; no extra
+ *    lease release outside the shared terminal cleanup path.
+ *  - QUARANTINED → mark UNRESOLVED, retain lease; do not create fallback if strict root evidence exists.
  */
 internal suspend fun runLateFinalization(handoff: ReprocessLateFinalizationHandoff, completionCause: Throwable?) {
     if (!handoff.session.tryBeginFinalization()) return
     val outcome: Result<ReprocessWorkerOutcome> = try {
         val terminal = handoff.workerTerminal
         if (terminal != null && terminal.isCompleted) {
-            val awaited = try {
-                Result.success(terminal.await())
-            } catch (deferredCancellation: kotlinx.coroutines.CancellationException) {
-                if (!terminal.isCancelled) throw deferredCancellation
-                Result.failure<ReprocessWorkerOutcome>(combineCause(deferredCancellation, completionCause))
-            } catch (fatal: Error) {
-                throw fatal
-            } catch (deferredFailure: Exception) {
-                Result.failure<ReprocessWorkerOutcome>(combineCause(deferredFailure, completionCause))
-            }
-            awaited
+            Result.success(terminal.await())
         } else if (completionCause != null) {
             Result.failure<ReprocessWorkerOutcome>(
                 combineCause(
@@ -813,22 +977,23 @@ internal suspend fun runLateFinalization(handoff: ReprocessLateFinalizationHando
         // retain the lease, preserve durable evidence. Rethrow so the detached scope's failure
         // handling observes cancellation; do not silently swallow it.
         handoff.session.markLateUnresolved()
-        if (!hasTrustworthyRootEvidence(handoff.target, handoff.transaction)) {
-            try { ensureDurableFallbackQuarantine(handoff.target, handoff.transaction) }
-            catch (_: Exception) {}
-        }
+        val evidence = persistLateEvidence(handoff)
+        handoff.evidenceError = evidence.evidenceError
         throw e
     } catch (e: OutOfMemoryError) { throw e
     } catch (e: ThreadDeath) { throw e
     } catch (e: LinkageError) { throw e
     } catch (e: InternalError) { throw e
     } catch (e: Error) { throw e
-    } catch (_: Exception) {
-        // Ordinary terminal-retrieval failure: UNRESOLVED, retain lease, preserve evidence.
+    } catch (ordinaryRetrieval: Exception) {
+        // Deferred completed exceptionally (ordinary terminal-retrieval failure before
+        // result conversion): UNRESOLVED, retain lease, preserve evidence. Do NOT wrap as
+        // Result.failure and feed to finalizeTransaction — the outcome was never produced.
         handoff.session.markLateUnresolved()
-        if (!hasTrustworthyRootEvidence(handoff.target, handoff.transaction)) {
-            try { ensureDurableFallbackQuarantine(handoff.target, handoff.transaction) }
-            catch (_: Exception) {}
+        val evidence = persistLateEvidence(handoff)
+        handoff.evidenceError = when {
+            evidence.evidenceError != null -> combineCause(ordinaryRetrieval, evidence.evidenceError)
+            else -> ordinaryRetrieval
         }
         return
     }
@@ -840,83 +1005,224 @@ internal suspend fun runLateFinalization(handoff: ReprocessLateFinalizationHando
         )
     } catch (e: kotlinx.coroutines.CancellationException) {
         handoff.session.markLateUnresolved()
-        if (!hasTrustworthyRootEvidence(handoff.target, handoff.transaction)) {
-            try { ensureDurableFallbackQuarantine(handoff.target, handoff.transaction) }
-            catch (_: Exception) {}
-        }
+        val evidence = persistLateEvidence(handoff)
+        handoff.evidenceError = evidence.evidenceError
         throw e
     } catch (e: OutOfMemoryError) { throw e
     } catch (e: ThreadDeath) { throw e
     } catch (e: LinkageError) { throw e
     } catch (e: InternalError) { throw e
     } catch (e: Error) { throw e
-    } catch (_: Exception) {
+    } catch (ordinaryFinalizerFailure: Exception) {
         // Ordinary finalizer failure: UNRESOLVED, retain lease, preserve evidence.
         handoff.session.markLateUnresolved()
-        if (!hasTrustworthyRootEvidence(handoff.target, handoff.transaction)) {
-            try { ensureDurableFallbackQuarantine(handoff.target, handoff.transaction) }
-            catch (_: Exception) {}
+        val evidence = persistLateEvidence(handoff)
+        handoff.evidenceError = when {
+            evidence.evidenceError != null -> combineCause(ordinaryFinalizerFailure, evidence.evidenceError)
+            else -> ordinaryFinalizerFailure
         }
         return
     }
     when (late.state) {
         ReprocessFinalizationState.QUARANTINED -> {
             handoff.session.markLateUnresolved()
+            // QUARANTINED result: do not create a fallback if strict root evidence already exists.
+            // If strict evidence is missing, persist a durable fallback marker and surface its error.
+            val rootEvidence = strictRootEvidence(handoff.target, handoff.transaction)
+            if (rootEvidence !== RootEvidence.Trustworthy) {
+                try {
+                    ensureDurableFallbackQuarantine(handoff.target, handoff.transaction)
+                } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+                catch (oom: OutOfMemoryError) { throw oom }
+                catch (td: ThreadDeath) { throw td }
+                catch (le: LinkageError) { throw le }
+                catch (ie: InternalError) { throw ie }
+                catch (e: Error) { throw e }
+                catch (fb: Exception) {
+                    handoff.evidenceError = combineCause(
+                        late.result.exceptionOrNull() ?: IllegalStateException("Quarantine without durable evidence."),
+                        fb
+                    )
+                }
+            }
         }
         ReprocessFinalizationState.COMMITTED, ReprocessFinalizationState.ROLLED_BACK -> {
             handoff.session.markLateTerminal()
+            handoff.evidenceError = null
         }
     }
 }
 
 /**
- * Strict root-evidence inspection shared by late retrieval failure, late finalizer failure,
- * unresolved persistence, and fallback-creation decisions. Trusts root evidence only when
- * either (a) the quarantine marker is a regular file with exact canonical content, or (b) a
- * strict manifest matches the transaction ID, createdAt, immutable identity, canonical job/root
- * relationship, and state ACTIVE or QUARANTINED. Treats as untrusted: missing/corrupt/unreadable
- * marker, marker directory, malformed manifest, wrong ID/root/createdAt, terminal state with
- * identity mismatch, and canonicalization or security failures. Uses explicit exception
- * handling — never broad `runCatching`.
+ * Production recovery entry for an UNRESOLVED late-finalization session. Schedules at most one
+ * bounded late-finalization retry after the first ordinary finalizer/evidence failure. Shares the
+ * existing session, transaction, and lease, and never registers an unbounded callback loop.
+ *
+ * Contract:
+ *  - only retries from [ReprocessTransactionSession.LateState.UNRESOLVED]
+ *  - never retries after durable COMMITTED/ROLLED_BACK (terminal result is already cached)
+ *  - the session holds the once-guard so two finalizers never run concurrently
+ *  - retry failure remains UNRESOLVED with durable evidence and lease retained
+ *  - returns the durable terminal result if the retry reached terminal, or `null` if no retry
+ *    was scheduled (already terminal, bound exceeded, or pre-condition not met)
+ *
+ * Worker terminal integration: the retry uses the existing [ReprocessLateFinalizationHandoff.workerTerminal]
+ * cached on the latest registered handoff (in [lateFinalizationHandoffScope]); if absent, it falls
+ * back to the cached terminal result or a snapshot of the original failure recorded in [evidenceError].
  */
-internal fun hasTrustworthyRootEvidence(jobDir: File, transaction: ReprocessTransaction): Boolean {
+internal suspend fun scheduleUnresolvedRetry(
+    originalHandoff: ReprocessLateFinalizationHandoff?
+): ReprocessFinalizationResult? {
+    val handoff = originalHandoff ?: lateFinalizationHandoffScope ?: return null
+    val session = handoff.session
+    if (session.isTerminal()) return session.existingTerminalResult()
+    if (session.lateStateForTest() != ReprocessTransactionSession.LateState.UNRESOLVED) return null
+    if (!session.tryAcquireLateRegistration()) return null
+    // One bounded retry: reuse the shared session/transaction/lease (no new lease).
+    // The terminal deferred is already settled (possibly exceptionally) from the first attempt.
+    // Extract its outcome before retry; do NOT re-await a failed deferred.
+    val snapshot: ReprocessWorkerOutcome = try {
+        val terminal = handoff.workerTerminal
+        if (terminal != null && terminal.isCompleted) {
+            terminal.getCompleted()
+        } else {
+            handoff.workerOutcomeSnapshot
+        }
+    } catch (terminalFailure: Throwable) {
+        when (terminalFailure) {
+            is kotlinx.coroutines.CancellationException -> throw terminalFailure
+            is OutOfMemoryError -> throw terminalFailure
+            is ThreadDeath -> throw terminalFailure
+            is LinkageError -> throw terminalFailure
+            is InternalError -> throw terminalFailure
+            is Error -> throw terminalFailure
+            else -> ReprocessWorkerOutcome(
+                result = Result.failure(terminalFailure),
+                publicExportCommitted = false
+            )
+        }
+    }
+    val retryHandoff = handoff.copy(
+        workerTerminal = null,
+        workerOutcomeSnapshot = snapshot
+    )
+    runLateFinalization(retryHandoff, completionCause = null)
+    return when (session.lateStateForTest()) {
+        ReprocessTransactionSession.LateState.TERMINAL -> session.existingTerminalResult()
+        else -> null
+    }
+}
+
+/**
+ * Structured root-evidence inspection result.
+ *
+ *  - [Trustworthy]: at least one independent mechanism (marker or manifest) verified.
+ *  - [Untrustworthy]: no mechanism verified; noinspection-fatal reason was ordinary.
+ *  - [InspectionFailed]: an ordinary inspection error blocked evaluation. The marker and
+ *    manifest are evaluated independently so a corrupt marker cannot mask a valid manifest
+ *    and vice versa.
+ *
+ * Fatal [Error]s (OOM, ThreadDeath, LinkageError, InternalError) and [CancellationException]
+ * propagate unchanged — they never convert into [Untrustworthy] or [InspectionFailed].
+ */
+internal sealed class RootEvidence {
+    data object Trustworthy : RootEvidence()
+    data object Untrustworthy : RootEvidence()
+    data class InspectionFailed(val cause: Throwable) : RootEvidence()
+}
+
+/** Boolean shim retained by production paths that branch on trustworthiness. */
+internal fun hasTrustworthyRootEvidence(jobDir: File, transaction: ReprocessTransaction): Boolean =
+    strictRootEvidence(jobDir, transaction) === RootEvidence.Trustworthy
+
+/**
+ * Strict root-evidence inspection shared by late retrieval failure, late finalizer failure,
+ * unresolved persistence, and fallback-creation decisions. Trusts root evidence when either
+ * (a) the quarantine marker is a regular file with exact canonical content, or (b) a strict
+ * manifest matches the transaction ID, createdAt, immutable identity, canonical job/root
+ * relationship, and state ACTIVE or QUARANTINED. The marker and manifest are evaluated
+ * independently so a corrupt/marker directory cannot mask a valid manifest. Treats as
+ * untrusted: missing/corrupt/unreadable marker, marker directory, malformed manifest,
+ * wrong ID/root/createdAt, terminal state with identity mismatch, and canonicalization or
+ * security failures. Uses explicit exception handling — never broad `runCatching`.
+ *
+ * Exception policy:
+ *  - ordinary parsing/IO/security/corrupt-evidence failure → [Untrustworthy] or [InspectionFailed]
+ *  - [CancellationException] → propagate unchanged
+ *  - [OutOfMemoryError], [ThreadDeath], [LinkageError], [InternalError], other fatal [Error] → propagate unchanged
+ */
+internal fun strictRootEvidence(jobDir: File, transaction: ReprocessTransaction): RootEvidence {
     val backupRoot = transaction.backupRoot
-    if (!backupRoot.isDirectory) return false
-    // (a) Canonical quarantine marker with exact content.
+    if (!backupRoot.isDirectory) return RootEvidence.Untrustworthy
+
+    var markerTrustworthy = false
+    var markerInspectionError: Throwable? = null
+    // (a) Canonical quarantine marker with exact content, evaluated independently.
     val marker = File(backupRoot, REPROCESS_QUARANTINE_MARKER)
     if (marker.exists()) {
-        if (!marker.isFile) return false
-        try {
-            if (marker.readText() == REPROCESS_QUARANTINE_MARKER_CONTENT) return true
-        } catch (_: OutOfMemoryError) { return false
-        } catch (_: ThreadDeath) { return false
-        } catch (_: LinkageError) { return false
-        } catch (_: InternalError) { return false
-        } catch (_: Error) { return false
-        } catch (_: Exception) { /* fall through to manifest check */ }
+        if (!marker.isFile) {
+            // Caller-cancellation/fatal never throw from marker.isFile; ordinary failure → not trusted.
+        } else {
+            try {
+                if (marker.readText() == REPROCESS_QUARANTINE_MARKER_CONTENT) markerTrustworthy = true
+            } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+            catch (oom: OutOfMemoryError) { throw oom }
+            catch (td: ThreadDeath) { throw td }
+            catch (le: LinkageError) { throw le }
+            catch (ie: InternalError) { throw ie }
+            catch (e: Error) { throw e }
+            catch (readFailure: Exception) { markerInspectionError = readFailure }
+        }
     }
-    // (b) Strict ACTIVE/QUARANTINED manifest matching transaction identity.
+    if (markerTrustworthy) return RootEvidence.Trustworthy
+
+    // (b) Strict ACTIVE/QUARANTINED manifest matching transaction identity, evaluated independently.
     val manifestFile = File(backupRoot, REPROCESS_TX_MANIFEST_FILE)
-    if (!manifestFile.isFile) return false
+    if (!manifestFile.isFile) {
+        return if (markerInspectionError != null) RootEvidence.InspectionFailed(markerInspectionError)
+        else RootEvidence.Untrustworthy
+    }
     val durable = try {
         loadStrictManifest(manifestFile)
-    } catch (_: OutOfMemoryError) { return false
-    } catch (_: ThreadDeath) { return false
-    } catch (_: LinkageError) { return false
-    } catch (_: InternalError) { return false
-    } catch (_: Error) { return false
-    } catch (_: Exception) { return false }
-    if (durable.transactionId != transaction.transactionId) return false
-    if (durable.createdAt != transaction.manifest.createdAt) return false
-    if (!durable.hasSameImmutableIdentity(transaction.manifest)) return false
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (manifestFailure: Exception) {
+        return if (markerInspectionError != null) RootEvidence.InspectionFailed(markerInspectionError)
+        else RootEvidence.InspectionFailed(manifestFailure)
+    }
+    if (durable.transactionId != transaction.transactionId) return RootEvidence.Untrustworthy
+    if (durable.createdAt != transaction.manifest.createdAt) return RootEvidence.Untrustworthy
+    if (!durable.hasSameImmutableIdentity(transaction.manifest)) return RootEvidence.Untrustworthy
     if (durable.state != ReprocessTransactionState.ACTIVE &&
-        durable.state != ReprocessTransactionState.QUARANTINED) return false
+        durable.state != ReprocessTransactionState.QUARANTINED) return RootEvidence.Untrustworthy
     // Canonical job/root relationship.
-    val canonicalJob = try { jobDir.canonicalFile } catch (_: Exception) { return false }
-    val canonicalRoot = try { backupRoot.canonicalFile } catch (_: Exception) { return false }
-    if (canonicalRoot.parentFile?.canonicalFile != canonicalJob) return false
-    if (canonicalRoot.name != ".reprocess_backup_${durable.transactionId}") return false
-    return true
+    val canonicalJob = try { jobDir.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (_: Exception) {
+        return if (markerInspectionError != null) RootEvidence.InspectionFailed(markerInspectionError)
+        else RootEvidence.Untrustworthy
+    }
+    val canonicalRoot = try { backupRoot.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (_: Exception) {
+        return if (markerInspectionError != null) RootEvidence.InspectionFailed(markerInspectionError)
+        else RootEvidence.Untrustworthy
+    }
+    if (canonicalRoot.parentFile?.canonicalFile != canonicalJob) return RootEvidence.Untrustworthy
+    if (canonicalRoot.name != ".reprocess_backup_${durable.transactionId}") return RootEvidence.Untrustworthy
+    return RootEvidence.Trustworthy
 }
 
 
@@ -970,11 +1276,10 @@ internal fun finalizeTransaction(
     terminal: Result<ReprocessWorkerOutcome>
 ): ReprocessFinalizationResult {
     val operationLease = session.lease
-    // Idempotency: duplicate finalization of the same terminal transaction returns the stored result.
+    // Idempotency: duplicate finalization of the same terminal transaction returns the exact cached
+    // result — no second metadata write, no fallback creation, no second cleanup, no second lease
+    // release (the lease was already released by the shared terminal cleanup path on the first call).
     session.existingTerminalResult()?.let { stored ->
-        if (operationLease != null && KeplerJobMetadata.isOperationOwner(jobDir, operationLease)) {
-            try { operationLease.release() } catch (_: Exception) {}
-        }
         return stored
     }
     // Strict identity verification BEFORE any mutation. The durable manifest is authoritative.
@@ -1109,40 +1414,51 @@ internal fun quarantineWithPersistence(
     transaction: ReprocessTransaction,
     originalError: Throwable
 ): ReprocessFinalizationResult {
-    val canonicalError = originalError
+    // Preserve the original processing/rollback error as primary context.
     var markerError: Throwable? = null
     var stateError: Throwable? = null
     try {
-        try {
-            writeQuarantineMarker(transaction)
-        } catch (e: Exception) {
-            markerError = e
-        }
-        try {
-            writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED)
-        } catch (e: Exception) {
-            stateError = e
-        }
-    } catch (e: OutOfMemoryError) { throw e
-    } catch (e: ThreadDeath) { throw e
-    } catch (e: LinkageError) { throw e
-    } catch (e: InternalError) { throw e
-    } catch (e: Error) { throw e
-    } catch (e: Throwable) {
-        markerError = e
-    }
-    val combined = if (markerError != null || stateError != null) {
-        combineCauseWithMessage(canonicalError, "Quarantine persistence failed after processing error", markerError)
-            .also { stateError?.let { se -> runCatching { it.addSuppressed(se) } } }
-    } else canonicalError
+        writeQuarantineMarker(transaction)
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (mf: Exception) { markerError = mf }
+    try {
+        writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED)
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (sf: Exception) { stateError = sf }
+
+    // Inner try used addSuppressed for linked failures; replace with narrow helper that ignores
+    // only self-suppression or IllegalArgumentException for invalid suppression.
+    val combined: Throwable = if (markerError != null || stateError != null) {
+        val wrapping = combineCauseWithMessage(originalError, "Quarantine persistence failed after processing error", markerError)
+        if (stateError != null) addSuppressedSafe(wrapping, stateError)
+        wrapping
+    } else originalError
+
+    // Fallback only when both root mechanisms failed. Use one narrow suppressed-error helper and
+    // compact fixed messages.
     if (markerError != null && stateError != null) {
         try {
             ensureDurableFallbackQuarantine(transaction.backupRoot.parentFile ?: transaction.backupRoot, transaction)
-        } catch (fallbackError: Exception) {
-            return ReprocessFinalizationResult(
-                ReprocessFinalizationState.QUARANTINED,
-                Result.failure(combineCauseWithMessage(combined, "Fallback quarantine persistence failed", fallbackError))
-            )
+            return ReprocessFinalizationResult(ReprocessFinalizationState.QUARANTINED, Result.failure(combined))
+        } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+        catch (oom: OutOfMemoryError) { throw oom }
+        catch (td: ThreadDeath) { throw td }
+        catch (le: LinkageError) { throw le }
+        catch (ie: InternalError) { throw ie }
+        catch (e: Error) { throw e }
+        catch (fallbackError: Exception) {
+            val finalError = combineCauseWithMessage(combined, "Fallback quarantine persistence failed", fallbackError)
+            return ReprocessFinalizationResult(ReprocessFinalizationState.QUARANTINED, Result.failure(finalError))
         }
     }
     return ReprocessFinalizationResult(ReprocessFinalizationState.QUARANTINED, Result.failure(combined))
@@ -1236,7 +1552,7 @@ private fun performTerminalCleanupDebt(
     val warnings = mutableListOf<String>()
     // Outmost finally: lease release always runs, even if warning metadata throws a fatal Error
     // or CancellationException. Ordinary cleanup and warning errors remain cleanup debt and do
-    // not escape or downgrade COMMITTED/ROLLED_BACK. Fatal errors and cancellation may propagate
+    // not escape or downgrade COMMITTED/ROLLED_BACK. Cancellation and fatal Errors may propagate
     // only after lease release.
     try {
         try {
@@ -1244,14 +1560,24 @@ private fun performTerminalCleanupDebt(
             if (fallbackRemoved) {
                 val cleanupOk = try {
                     cleanupBackups(transaction)
-                } catch (_: Exception) {
-                    false
-                }
+                } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+                catch (oom: OutOfMemoryError) { throw oom }
+                catch (td: ThreadDeath) { throw td }
+                catch (le: LinkageError) { throw le }
+                catch (ie: InternalError) { throw ie }
+                catch (e: Error) { throw e }
+                catch (_: Exception) { false }
                 if (!cleanupOk) {
                     warnings += "Reprocess backup cleanup failed after durable $state."
                 }
             }
-        } catch (_: Exception) {
+        } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+        catch (oom: OutOfMemoryError) { throw oom }
+        catch (td: ThreadDeath) { throw td }
+        catch (le: LinkageError) { throw le }
+        catch (ie: InternalError) { throw ie }
+        catch (e: Error) { throw e }
+        catch (_: Exception) {
             warnings += "Cleanup debt threw after durable $state."
         }
         // Warning metadata: ordinary failures are ignored. Cancellation/fatal Errors propagate
@@ -1264,7 +1590,13 @@ private fun performTerminalCleanupDebt(
                     warnings.forEach { existing.put(it) }
                     job.put("reprocessWarning", warnings.first())
                 }
-            } catch (_: KeplerJobMetadataMissing) {
+            } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+            catch (oom: OutOfMemoryError) { throw oom }
+            catch (td: ThreadDeath) { throw td }
+            catch (le: LinkageError) { throw le }
+            catch (ie: InternalError) { throw ie }
+            catch (e: Error) { throw e }
+            catch (_: KeplerJobMetadataMissing) {
             } catch (_: KeplerJobMetadataCorrupt) {
             } catch (_: IllegalStateException) {
             } catch (_: IOException) {
@@ -1273,7 +1605,14 @@ private fun performTerminalCleanupDebt(
             }
         }
     } finally {
-        try { lease.release() } catch (_: Exception) {}
+        try { lease.release() }
+        catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+        catch (oom: OutOfMemoryError) { throw oom }
+        catch (td: ThreadDeath) { throw td }
+        catch (le: LinkageError) { throw le }
+        catch (ie: InternalError) { throw ie }
+        catch (e: Error) { throw e }
+        catch (_: Exception) {}
     }
     return warnings
 }
@@ -1296,12 +1635,13 @@ private fun runTerminalFallbackRemoval(
             return false
         }
         return true
-    } catch (e: OutOfMemoryError) { throw e
-    } catch (e: ThreadDeath) { throw e
-    } catch (e: LinkageError) { throw e
-    } catch (e: InternalError) { throw e
-    } catch (e: Error) { throw e
-    } catch (e: Exception) {
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (e: Exception) {
         warnings += "Fallback quarantine removal threw during terminal cleanup."
         return false
     }
@@ -1582,10 +1922,35 @@ internal fun writeTransactionState(transaction: ReprocessTransaction, state: Rep
 }
 
 /**
+ * Narrow suppressed-error helper. Adds [suppressed] as a suppressed exception of the [primary]
+ * unless both refer to the same instance (self-suppression) or the JVM refuses the suppression
+ * ([IllegalArgumentException] for an invalid suppression). Never broad `runCatching`. Cancellation
+ * and fatal Errors propagate unchanged.
+ */
+internal fun addSuppressedSafe(primary: Throwable, suppressed: Throwable) {
+    if (suppressed === primary) return
+    try {
+        primary.addSuppressed(suppressed)
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (_: IllegalArgumentException) { /* invalid suppression — ignore */ }
+}
+
+/**
  * Persist durable unresolved/quarantine evidence when a worker exit is uncertain (timeout, cancel
- * callback failure, caller cancellation while active). Tries the in-backup-root quarantine marker
- * first, then the job-level durable fallback marker. Never throws — callers rethrow caller
- * cancellation. Always registers late finalization afterwards through [settleTerminalResult].
+ * callback failure, caller cancellation while active). Attempts marker and state persistence
+ * independently; root evidence succeeds when either operation succeeds and verifies via
+ * [strictRootEvidence]. The fallback is created only when both root mechanisms fail.
+ *
+ * The result preserves the failure of each mechanism separately. The caller may combine them but
+ * the persistence result itself never reports the worker cancel failure as unresolved persistence
+ * failure — the [cancelError] is preserved separately for caller-side rethrow/aggregation.
+ *
+ * Fatal Errors and [CancellationException] propagate unchanged from marker/state inspection.
  */
 internal fun persistUnresolvedQuarantine(
     session: ReprocessTransactionSession,
@@ -1595,33 +1960,55 @@ internal fun persistUnresolvedQuarantine(
     var markerFailure: Throwable? = null
     var stateFailure: Throwable? = null
     try {
-        try { writeQuarantineMarker(transaction) } catch (e: Exception) { markerFailure = e }
-        try { writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED) }
-        catch (e: Exception) { stateFailure = e }
-    } catch (e: OutOfMemoryError) { throw e
-    } catch (e: ThreadDeath) { throw e
-    } catch (e: LinkageError) { throw e
-    } catch (e: InternalError) { throw e
-    } catch (e: Error) { throw e
-    } catch (e: Throwable) {
-        markerFailure = e
-    }
-    val rootEvidence = markerFailure == null || stateFailure == null
+        writeQuarantineMarker(transaction)
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (mf: Exception) { markerFailure = mf }
+
+    try {
+        writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED)
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (sf: Exception) { stateFailure = sf }
+
+    val markerPersisted = markerFailure == null
+    val statePersisted = stateFailure == null
+    // Root evidence succeeds when either mechanism succeeded AND the strict inspection verifies.
+    val jobDir = transaction.backupRoot.parentFile
+    val durableEvidenceEstablished = jobDir != null && (markerPersisted || statePersisted) &&
+        strictRootEvidence(jobDir, transaction) === RootEvidence.Trustworthy
+
     var fallbackFailure: Throwable? = null
     var fallbackPersisted = false
-    if (!rootEvidence) {
+    if (!durableEvidenceEstablished) {
         try {
             ensureDurableFallbackQuarantine(transaction.backupRoot.parentFile ?: transaction.backupRoot, transaction)
             fallbackPersisted = true
-        } catch (e: Exception) { fallbackFailure = e }
+        } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+        catch (oom: OutOfMemoryError) { throw oom }
+        catch (td: ThreadDeath) { throw td }
+        catch (le: LinkageError) { throw le }
+        catch (ie: InternalError) { throw ie }
+        catch (e: Error) { throw e }
+        catch (fb: Exception) { fallbackFailure = fb }
     }
-    val combined = listOfNotNull(cancelFailure, markerFailure, stateFailure, fallbackFailure)
-        .firstOrNull()?.also { primary -> combineCause(primary, *listOfNotNull(markerFailure, stateFailure, fallbackFailure).toTypedArray()) }
     return UnresolvedPersistenceResult(
-        rootMarkerPersisted = markerFailure == null,
-        quarantinedStatePersisted = stateFailure == null,
+        rootMarkerPersisted = markerPersisted,
+        quarantinedStatePersisted = statePersisted,
         fallbackPersisted = fallbackPersisted,
-        error = if (rootEvidence || fallbackPersisted) combined else (combined ?: IllegalStateException("Unresolved persistence failed"))
+        durableEvidenceEstablished = durableEvidenceEstablished || fallbackPersisted,
+        markerError = markerFailure,
+        stateError = stateFailure,
+        fallbackError = fallbackFailure,
+        cancelError = cancelFailure
     )
 }
 
@@ -1644,7 +2031,9 @@ internal fun ensureDurableFallbackQuarantine(jobDir: File, transaction: Reproces
         append("backupRoot="); append(transaction.backupRoot.name); append('\n')
         append("createdAt="); append(transaction.manifest.createdAt); append('\n')
     }
-    KeplerJobMetadata.atomicWrite(marker, payload)
+    val writeOp = fallbackWriteOperation
+    if (writeOp != null) writeOp(jobDir, marker, payload)
+    else KeplerJobMetadata.atomicWrite(marker, payload)
     check(readFallbackIdentity(marker) == fallbackIdentity(transaction)) {
         "Fallback quarantine marker verification failed"
     }
@@ -1676,6 +2065,11 @@ private fun readFallbackIdentity(marker: File): Triple<String, String, Long>? {
  * Receiving the marker [File] to delete; must return true when the file is gone after the attempt.
  */
 internal var fallbackDeleteOperation: ((File) -> Boolean)? = null
+
+/** Narrow injectable IO seam for fallback marker creation during late finalization. Tests can
+ *  override to inject failure of `ensureDurableFallbackQuarantine`. Receives (jobDir, marker);
+ *  the real call writes via `KeplerJobMetadata.atomicWrite`. Reset in `finally`. */
+internal var fallbackWriteOperation: ((File, File, String) -> Unit)? = null
 
 /**
  * Removes only a verified matching fallback marker after a durable terminal transition.
@@ -1758,7 +2152,14 @@ internal fun recoverValidatedQuarantine(jobDir: File) {
             val matchingRoot = children.firstOrNull { it.isDirectory && it.name == fallbackId.second }
             val matchingClassification = matchingRoot?.let { classifyTransactionManifest(jobDir, it) }
             if (matchingClassification is ManifestClassification.Resolved) {
-                val manifest = try { loadStrictManifest(File(matchingRoot, REPROCESS_TX_MANIFEST_FILE)) } catch (_: Exception) { null }
+                val manifest = try { loadStrictManifest(File(matchingRoot, REPROCESS_TX_MANIFEST_FILE)) }
+                catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+                catch (oom: OutOfMemoryError) { throw oom }
+                catch (td: ThreadDeath) { throw td }
+                catch (le: LinkageError) { throw le }
+                catch (ie: InternalError) { throw ie }
+                catch (e: Error) { throw e }
+                catch (_: Exception) { null }
                 if (manifest != null &&
                     manifest.transactionId == fallbackId.first &&
                     matchingRoot.name == fallbackId.second &&
@@ -1814,21 +2215,39 @@ private fun cleanupTerminalRoot(root: File) {
     val manifestFile = children.firstOrNull { it.name == REPROCESS_TX_MANIFEST_FILE } ?: return
     val durable = try {
         loadStrictManifest(manifestFile)
-    } catch (e : IOException) {
-        return
-    } catch (e : SecurityException) {
-        return
-    } catch (e : IllegalArgumentException) {
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (_: Exception) {
+        // Restart recovery must not throw ordinary injected IO failures into gallery loading.
         return
     }
     val state = durable.state
     if (state != ReprocessTransactionState.COMMITTED && state != ReprocessTransactionState.ROLLED_BACK) return
     val dummyTx = ReprocessTransaction(durable.transactionId, root, durable, emptyList())
-    cleanupBackups(dummyTx)
+    try {
+        cleanupBackups(dummyTx)
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (_: Exception) { /* swallow ordinary cleanup failure during restart recovery */ }
 }
 
 fun detectReprocessCapability(context: Context, jobDir: File): ReprocessCapability {
-    val target = runCatching { requireReprocessSafeJobDirectory(context, jobDir) }.getOrNull()
+    val target = try { requireReprocessSafeJobDirectory(context, jobDir) }
+    catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (_: Exception) { null }
         ?: return ReprocessCapability(
             canReprocess = false,
             jobKind = ReprocessJobKind.UNSUPPORTED,
@@ -2107,7 +2526,14 @@ private fun isReprocessSourceFrameFromMetadata(lower: String, kind: ReprocessJob
 
 internal fun loadJobJsonSafe(jobDir: File): JSONObject =
     File(jobDir, JOB_JSON_FILE_NAME).takeIf { it.isFile }?.let {
-        runCatching { KeplerJobMetadata.read(jobDir) }.getOrNull()
+        try { KeplerJobMetadata.read(jobDir) }
+        catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+        catch (oom: OutOfMemoryError) { throw oom }
+        catch (td: ThreadDeath) { throw td }
+        catch (le: LinkageError) { throw le }
+        catch (ie: InternalError) { throw ie }
+        catch (e: Error) { throw e }
+        catch (_: Exception) { null }
     } ?: JSONObject()
 
 private fun finalOutputCandidates(jobDir: File, job: JSONObject): List<File> {
@@ -2328,7 +2754,14 @@ internal fun validateTransactionIdentity(
     if (canonicalBackup.name != ".reprocess_backup_${transaction.transactionId}") return false
     val manifestFile = File(canonicalBackup, REPROCESS_TX_MANIFEST_FILE)
     if (!manifestFile.isFile) return false
-    val durable = runCatching { loadStrictManifest(manifestFile) }.getOrNull() ?: return false
+    val durable = try { loadStrictManifest(manifestFile) }
+    catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (_: Exception) { return false }
     if (durable.transactionId != transaction.transactionId) return false
     if (durable.createdAt != transaction.manifest.createdAt) return false
     if (durable.preExistingPaths != transaction.manifest.preExistingPaths) return false
@@ -2497,6 +2930,20 @@ internal fun backupReprocessTransaction(
         )
         KeplerJobMetadata.atomicWrite(File(root, REPROCESS_TX_MANIFEST_FILE), manifest.toJson().toString(2))
         Result.success(ReprocessTransaction(transactionId, root, manifest, backups))
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        // Pre-ACTIVE caller cancellation: do not write ordinary failure metadata, do not create
+        // an ACTIVE transaction after cancellation, do not convert cancellation into rollback.
+        // Partial backup artifacts are cleaned best-effort under a narrow non-fatal boundary.
+        try {
+            root.listFiles()?.forEach { it.delete() }
+            if (root.exists()) root.delete()
+        } catch (oom: OutOfMemoryError) { throw oom }
+        catch (td: ThreadDeath) { throw td }
+        catch (le: LinkageError) { throw le }
+        catch (ie: InternalError) { throw ie }
+        catch (fatal: Error) { throw fatal }
+        catch (_: Exception) { /* best-effort partial cleanup; cancellation is the caller's error */ }
+        throw e
     } catch (e: OutOfMemoryError) { throw e
     } catch (e: ThreadDeath) { throw e
     } catch (e: LinkageError) { throw e
@@ -2583,8 +3030,19 @@ internal fun restoreBackups(jobDir: File, transaction: ReprocessTransaction): Re
             KeplerJobMetadata.atomicReplace(stagedRestore.temp, stagedRestore.restore.target)
         }
     } finally {
-        // Clean up any remaining temp files.
-        staged.forEach { if (it.temp.exists()) runCatching { it.temp.delete() } }
+        // Clean up any remaining temp files best-effort. Cancellation/fatal Errors propagate unchanged.
+        staged.forEach {
+            if (it.temp.exists()) {
+                try { it.temp.delete() }
+                catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+                catch (oom: OutOfMemoryError) { throw oom }
+                catch (td: ThreadDeath) { throw td }
+                catch (le: LinkageError) { throw le }
+                catch (ie: InternalError) { throw ie }
+                catch (e: Error) { throw e }
+                catch (_: Exception) { /* best-effort temp cleanup; rollback already validated */ }
+            }
+        }
     }
     Result.success(Unit)
     } catch (e: OutOfMemoryError) { throw e
@@ -2604,6 +3062,11 @@ internal var cleanupDeleteOperation: (File) -> Boolean = { it.delete() }
  *  to simulate directory listing errors. Receives the directory [File]; the real call is `root.listFiles()`.
  *  Reset in `finally` after use. */
 internal var cleanupListOperation: ((File) -> Array<File>?)? = null
+
+/** Narrow injectable IO seam for the root directory deletion at the end of cleanup. The real call is
+ *  [File.delete]. Tests inject false to simulate actual root deletion failure while payload removal
+ *  succeeded. Reset in `finally`. */
+    internal var cleanupRootDeleteOperation: (File) -> Boolean = { it.deleteRecursively() }
 
 /**
  * Safe backup cleanup, shared by immediate finalization and process-restart recovery.
@@ -2632,17 +3095,18 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     // Cleanup is allowed only for strictly validated terminal manifests.
     val manifestFile = File(root, REPROCESS_TX_MANIFEST_FILE)
     if (!manifestFile.isFile) return false
-  val durable = try {
-    loadStrictManifest(manifestFile)
-  } catch (_: IOException) {
-    return false
-  } catch (_: SecurityException) {
-    return false
-  } catch (_: IllegalArgumentException) {
-    return false
-  } catch (_: IllegalStateException) {
-    return false
-  }
+    val durable = try {
+        loadStrictManifest(manifestFile)
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (_: Exception) {
+        // Ordinary manifest/parser failure: must return false (terminal manifest preserved).
+        return false
+    }
     if (durable.transactionId != transaction.transactionId) return false
     if (!durable.hasSameImmutableIdentity(transaction.manifest)) return false
     val state = durable.state
@@ -2706,29 +3170,27 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
       return false
     }
   }
-  // 4. Delete the terminal manifest last after terminal state is durable.
-  val finalInspection = listRoot(root) ?: return false
-  val manifestRemaining = finalInspection.firstOrNull { it.name == REPROCESS_TX_MANIFEST_FILE }
-  if (manifestRemaining != null) {
-    try {
-      cleanupDelete(manifestRemaining)
-    } catch (e: kotlinx.coroutines.CancellationException) { throw e
-    } catch (e: OutOfMemoryError) { throw e
-    } catch (e: ThreadDeath) { throw e
-    } catch (e: LinkageError) { throw e
-    } catch (e: InternalError) { throw e
-    } catch (e: Error) { throw e
-    } catch (_: Exception) {
+  // 4. Verify only the manifest (and optionally a resolved marker) remain so root contains
+  // only known files before directory deletion.
+  val finalContents = listRoot(root) ?: return false
+  val remaining = finalContents.filter { it.name != REPROCESS_TX_MANIFEST_FILE }
+  if (remaining.isNotEmpty()) return false
+  // 5. Delete the root directory (which includes the manifest). If root deletion fails, the
+  //    manifest is preserved inside the still-existing root — no separate manifest deletion.
+  try {
+      val rootDeleted = cleanupRootDeleteOperation(root)
+      if (!rootDeleted || root.exists()) return false
+  } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+  catch (oom: OutOfMemoryError) { throw oom }
+  catch (td: ThreadDeath) { throw td }
+  catch (le: LinkageError) { throw le }
+  catch (ie: InternalError) { throw ie }
+  catch (e: Error) { throw e }
+  catch (_: Exception) {
+      // Root deletion SecurityException/ordinary failure: preserve manifest evidence.
       return false
-    }
-    if (manifestRemaining.exists()) return false
   }
-    // 5. Remove an empty root only after a verified non-null empty listing; verify root is absent after deletion.
-    val finalContents = listRoot(root)
-    if (finalContents == null) return false
-    if (finalContents.isNotEmpty()) return false
-    if (!root.delete() || root.exists()) return false
-    return true
+  return true
 }
 
 private fun writeReprocessSuccess(

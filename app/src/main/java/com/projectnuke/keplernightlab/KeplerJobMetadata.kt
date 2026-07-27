@@ -21,6 +21,23 @@ object KeplerJobMetadata {
     private val locks = ConcurrentHashMap<String, Any>()
     private val operationLeases = ConcurrentHashMap<String, JobOperationLease>()
 
+    /** Narrow lease/metadata test seam: incremented each time a job metadata write is durably
+     *  persisted. Tests must save the prior value and restore it in `finally`. Production never reads it. */
+    @Volatile
+    internal var atomicWriteCount: Int = 0
+        private set
+
+    /** Narrow lease/metadata test seam: incremented each time a lease is actually released (the
+     *  idempotent guard has NOT skipped the release). Tests must save & restore in `finally`. */
+    @Volatile
+    internal var leaseReleaseCount: Int = 0
+        internal set
+
+    /** Narrow test-only seam to reset [atomicWriteCount]. Tests must save/restore prior value. */
+    internal fun setAtomicWriteCountForTest(value: Int) { atomicWriteCount = value }
+    /** Narrow test-only seam to reset [leaseReleaseCount]. Tests must save/restore prior value. */
+    internal fun setLeaseReleaseCountForTest(value: Int) { leaseReleaseCount = value }
+
     private fun lockFor(jobDir: File): Any = locks.getOrPut(jobDir.canonicalPath) { Any() }
 
     fun acquireOperation(jobDir: File): JobOperationLease? {
@@ -100,6 +117,7 @@ object KeplerJobMetadata {
                 output.fd.sync()
             }
             atomicReplace(temp, file)
+            atomicWriteCount += 1
         } finally {
             if (temp.exists()) temp.delete()
         }
@@ -121,6 +139,7 @@ class JobOperationLease internal constructor(internal val key: String) {
         if (!released) {
             released = true
             KeplerJobMetadata.releaseOperation(this)
+            KeplerJobMetadata.leaseReleaseCount += 1
         }
     }
 }
