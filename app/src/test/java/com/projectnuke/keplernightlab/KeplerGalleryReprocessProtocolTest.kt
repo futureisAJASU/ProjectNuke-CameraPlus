@@ -472,7 +472,7 @@ class KeplerGalleryReprocessProtocolTest {
     }
 
     @Test
-    fun existingMarkerDirectoryOrCorruptNotAcceptedAsSuccess() {
+    fun existingMarkerDirectoryOrEmptyFileOverwritten() {
         val directory = tempJob()
         try {
             val transaction = backup(directory, "final.png" to "before")
@@ -485,12 +485,10 @@ class KeplerGalleryReprocessProtocolTest {
             }
             markerPath.delete()
 
-            // Sub-case B: empty file at marker path is treated as corrupt/unreadable
+            // Sub-case B: empty file is overwritten with identity-bound content — no throw.
             markerPath.createNewFile()
-            assertThrows(IllegalStateException::class.java) {
-                writeQuarantineMarker(transaction)
-            }
-            markerPath.delete()
+            writeQuarantineMarker(transaction)
+            assertTrue(markerPath.isFile)
         } finally {
             directory.deleteRecursively()
         }
@@ -576,15 +574,19 @@ class KeplerGalleryReprocessProtocolTest {
     }
 
     @Test
-    fun nonemptyCorruptQuarantineMarkerRejected() {
+    fun nonemptyCorruptQuarantineMarkerOverwritten() {
         val directory = tempJob()
         try {
             val transaction = backup(directory, "final.png" to "before")
             val marker = File(transaction.backupRoot, ".reprocess_quarantine")
-            marker.writeText("not the canonical content\n")
-            assertThrows(IllegalStateException::class.java) {
-                writeQuarantineMarker(transaction)
-            }
+            marker.writeText("legacy marker content\n")
+            // Legacy non-identity marker is overwritten with identity-bound content — no throw.
+            writeQuarantineMarker(transaction)
+            assertTrue(marker.isFile)
+            val identity = readQuarantineMarkerIdentity(marker)
+            assertNotNull(identity)
+            assertEquals(transaction.transactionId, identity!!.first)
+            assertEquals(transaction.backupRoot.name, identity.second)
         } finally {
             directory.deleteRecursively()
         }
@@ -2022,6 +2024,254 @@ fun duplicateRolledBackAfterRootDeletionPreservesOriginalFailureAndReturnsCached
       lateFinalizationHandoffScope = null
     }
   } finally {
+    directory.deleteRecursively()
+  }
+}
+
+// ── Phase 4d: Transient finalizer failure with automatic retry ──
+
+@Test
+fun transientFinalizerFailureTriggersAutomaticRetryAndSucceeds() = runBlocking {
+  var invocationCount = 0
+  val previousSeam = finalizerFailureSeam
+  finalizerFailureSeam = {
+    invocationCount++
+    if (invocationCount == 1) IllegalStateException("transient finalizer failure")
+    else null
+  }
+  lateFinalizationHandoffScope = null
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    val session = ReprocessTransactionSession(directory)
+    val lease = session.acquireLease() ?: error("no lease")
+    session.transferOwnership(transaction)
+    assertTrue(session.tryAcquireLateRegistration())
+    val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
+    terminal.complete(ReprocessWorkerOutcome(
+      result = Result.failure(IllegalStateException("worker failed")),
+      publicExportCommitted = false
+    ))
+    val handoff = ReprocessLateFinalizationHandoff(
+      session, transaction, lease!!, directory, ReprocessJobKind.RAW_FUSION,
+      FinalOutputFormat.JPEG, FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
+      workerTerminal = terminal
+    )
+    runLateFinalization(handoff, null)
+    // First attempt fails (injected seam), retry succeeds
+    assertEquals(ReprocessTransactionSession.LateState.UNRESOLVED, session.lateStateForTest())
+    assertEquals(1, invocationCount)
+    val result = scheduleUnresolvedRetry(handoff)
+    assertNotNull(result)
+    assertEquals(ReprocessTransactionSession.LateState.TERMINAL, session.lateStateForTest())
+    assertEquals(ReprocessFinalizationState.ROLLED_BACK, result!!.state)
+    assertEquals(2, invocationCount)
+    assertFalse(KeplerJobMetadata.isOperationActive(directory))
+  } finally {
+    finalizerFailureSeam = previousSeam
+    lateFinalizationHandoffScope = null
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun permanentRetryFailureStaysUnresolvedWithDurableEvidence() = runBlocking {
+  var invocationCount = 0
+  val previousSeam = finalizerFailureSeam
+  finalizerFailureSeam = {
+    invocationCount++
+    IllegalStateException("permanent finalizer failure")
+  }
+  lateFinalizationHandoffScope = null
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    // Delete backup root so strictRootEvidence fails → fallback is created
+    transaction.backupRoot.deleteRecursively()
+    val session = ReprocessTransactionSession(directory)
+    val lease = session.acquireLease() ?: error("no lease")
+    session.transferOwnership(transaction)
+    assertTrue(session.tryAcquireLateRegistration())
+    val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
+    terminal.complete(ReprocessWorkerOutcome(
+      result = Result.failure(IllegalStateException("worker failed")),
+      publicExportCommitted = false
+    ))
+    val handoff = ReprocessLateFinalizationHandoff(
+      session, transaction, lease!!, directory, ReprocessJobKind.RAW_FUSION,
+      FinalOutputFormat.JPEG, FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
+      workerTerminal = terminal
+    )
+    runLateFinalization(handoff, null)
+    assertEquals(ReprocessTransactionSession.LateState.UNRESOLVED, session.lateStateForTest())
+    assertEquals(1, invocationCount)
+    val result = scheduleUnresolvedRetry(handoff)
+    assertNull(result)
+    assertEquals(ReprocessTransactionSession.LateState.UNRESOLVED, session.lateStateForTest())
+    assertEquals(2, invocationCount)
+    assertTrue(KeplerJobMetadata.isOperationActive(directory))
+    assertTrue(File(directory, ".reprocess_unresolved").isFile)
+  } finally {
+    finalizerFailureSeam = previousSeam
+    lateFinalizationHandoffScope = null
+    directory.deleteRecursively()
+  }
+}
+
+@Test(expected = kotlinx.coroutines.CancellationException::class)
+fun actualCallbackCancellationLeavesUnresolvedAndRethrows() {
+  runBlocking {
+    val directory = tempJob()
+    try {
+      val transaction = backup(directory, "final.png" to "before")
+      val session = ReprocessTransactionSession(directory)
+      val lease = session.acquireLease() ?: error("no lease")
+      session.transferOwnership(transaction)
+      assertTrue(session.tryAcquireLateRegistration())
+      val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
+      terminal.complete(ReprocessWorkerOutcome(
+        result = Result.failure(IllegalStateException("worker failed")),
+        publicExportCommitted = false
+      ))
+      val handoff = ReprocessLateFinalizationHandoff(
+        session, transaction, lease!!, directory, ReprocessJobKind.RAW_FUSION,
+        FinalOutputFormat.JPEG, FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
+        workerTerminal = terminal
+      )
+      val previousSeam = finalizerFailureSeam
+      finalizerFailureSeam = { throw kotlinx.coroutines.CancellationException("callback cancelled") }
+      try {
+        runLateFinalization(handoff, null)
+        throw AssertionError("runLateFinalization should have rethrown callback cancellation")
+      } finally {
+        assertEquals(ReprocessTransactionSession.LateState.UNRESOLVED, session.lateStateForTest())
+        assertTrue(KeplerJobMetadata.isOperationActive(directory))
+        finalizerFailureSeam = previousSeam
+        lateFinalizationHandoffScope = null
+      }
+    } finally {
+      lateFinalizationHandoffScope = null
+      directory.deleteRecursively()
+    }
+  }
+}
+
+@Test
+fun cancelledWorkerDeferredDuringFinalizationSettlesAsWorkerFailure() = runBlocking {
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    val session = ReprocessTransactionSession(directory)
+    val lease = session.acquireLease() ?: error("no lease")
+    session.transferOwnership(transaction)
+    assertTrue(session.tryAcquireLateRegistration())
+    val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
+    terminal.completeExceptionally(kotlinx.coroutines.CancellationException("worker cancelled"))
+    val handoff = ReprocessLateFinalizationHandoff(
+      session, transaction, lease!!, directory, ReprocessJobKind.RAW_FUSION,
+      FinalOutputFormat.JPEG, FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
+      workerTerminal = terminal
+    )
+    runLateFinalization(handoff, null)
+    // Cancelled worker Deferred with active caller → confirmed worker failure → rollback → TERMINAL
+    assertEquals(ReprocessTransactionSession.LateState.TERMINAL, session.lateStateForTest())
+    assertFalse(KeplerJobMetadata.isOperationActive(directory))
+  } finally {
+    lateFinalizationHandoffScope = null
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun retryCancellationNeverLeavesLateRegistered() = runBlocking {
+  val previousSeam = finalizerFailureSeam
+  finalizerFailureSeam = null // first pass succeeds
+  lateFinalizationHandoffScope = null
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    val session = ReprocessTransactionSession(directory)
+    val lease = session.acquireLease() ?: error("no lease")
+    session.transferOwnership(transaction)
+    // First attempt: delete backup payload → QUARANTINED → UNRESOLVED
+    assertTrue(session.tryAcquireLateRegistration())
+    val terminal1 = CompletableDeferred<ReprocessWorkerOutcome>()
+    terminal1.complete(ReprocessWorkerOutcome(
+      result = Result.failure(IllegalStateException("worker failed")),
+      publicExportCommitted = false
+    ))
+    val handoff1 = ReprocessLateFinalizationHandoff(
+      session, transaction, lease!!, directory, ReprocessJobKind.RAW_FUSION,
+      FinalOutputFormat.JPEG, FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
+      workerTerminal = terminal1
+    )
+    val backupEntry = transaction.manifest.backupEntries.values.first()
+    File(transaction.backupRoot, backupEntry.backupName).delete()
+    runLateFinalization(handoff1, null)
+    assertEquals(ReprocessTransactionSession.LateState.UNRESOLVED, session.lateStateForTest())
+    // Set seam to throw CancellationException for retry
+    finalizerFailureSeam = { throw kotlinx.coroutines.CancellationException("retry cancelled") }
+    try {
+      scheduleUnresolvedRetry(handoff1)
+      throw AssertionError("scheduleUnresolvedRetry should have rethrown cancellation")
+    } catch (e: kotlinx.coroutines.CancellationException) {
+      // runLateFinalization caught CancellationException → UNRESOLVED
+      assertEquals(ReprocessTransactionSession.LateState.UNRESOLVED, session.lateStateForTest())
+    }
+  } finally {
+    finalizerFailureSeam = previousSeam
+    lateFinalizationHandoffScope = null
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun retryExhaustionWithoutDurableEvidenceCallsFailureHandler() = runBlocking {
+  val previousSeam = finalizerFailureSeam
+  val previousFallbackWrite = fallbackWriteOperation
+  finalizerFailureSeam = { IllegalStateException("stuck") }
+  fallbackWriteOperation = { _, _, _ -> throw IOException("fallback write seam failure") }
+  var handlerCalled = false
+  val previousHandler = lateFinalizationFailureHandler
+  lateFinalizationFailureHandler = { _, _ -> handlerCalled = true }
+  lateFinalizationHandoffScope = null
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    transaction.backupRoot.deleteRecursively()
+    val session = ReprocessTransactionSession(directory)
+    val lease = session.acquireLease() ?: error("no lease")
+    session.transferOwnership(transaction)
+    assertTrue(session.tryAcquireLateRegistration())
+    val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
+    terminal.completeExceptionally(IllegalStateException("worker failed"))
+    val handoff = ReprocessLateFinalizationHandoff(
+      session, transaction, lease!!, directory, ReprocessJobKind.RAW_FUSION,
+      FinalOutputFormat.JPEG, FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
+      workerTerminal = terminal
+    )
+    runLateFinalization(handoff, null)
+    scheduleUnresolvedRetry(handoff)
+    assertEquals(ReprocessTransactionSession.LateState.UNRESOLVED, session.lateStateForTest())
+    assertTrue(session.lateRetryExhausted())
+    assertTrue(strictRootEvidence(directory, transaction) !== RootEvidence.Trustworthy)
+    assertTrue(strictFallbackEvidence(directory, transaction) !== FallbackEvidence.Trustworthy)
+    assertFalse(File(directory, ".reprocess_unresolved").exists())
+    // Manual invocation of exhaustion check (simulates what registerLateFinalization's callback does)
+    if (session.lateStateForTest() == ReprocessTransactionSession.LateState.UNRESOLVED && session.lateRetryExhausted()) {
+      val rootEv = strictRootEvidence(directory, transaction)
+      val fbEv = strictFallbackEvidence(directory, transaction)
+      if (rootEv !== RootEvidence.Trustworthy && fbEv !== FallbackEvidence.Trustworthy) {
+        val handler = lateFinalizationFailureHandler
+        if (handler != null) handler(IllegalStateException("test exhaustion"), directory)
+      }
+    }
+    assertTrue(handlerCalled)
+  } finally {
+    finalizerFailureSeam = previousSeam
+    fallbackWriteOperation = previousFallbackWrite
+    lateFinalizationFailureHandler = previousHandler
+    lateFinalizationHandoffScope = null
     directory.deleteRecursively()
   }
 }

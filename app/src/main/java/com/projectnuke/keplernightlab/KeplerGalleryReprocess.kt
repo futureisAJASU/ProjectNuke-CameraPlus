@@ -424,12 +424,34 @@ private fun combineCauseWithMessage(primary: Throwable, message: String, suppres
 /** Structured completed-terminal helper. Avoids [Deferred.getCompleted] experimental opt-in and
  *  ambiguous cancellation behavior. Returns the completed value, or throws if the Deferred completed
  *  exceptionally. CancellationException, fatal Errors propagate unchanged. */
-internal suspend fun <T> acquireCompletedDeferred(terminal: Deferred<T>): Result<T> {
-    if (!terminal.isCompleted) return Result.failure(IllegalStateException("Deferred not yet completed"))
+/**
+ *  Classify a completed worker terminal Deferred into a worker outcome.
+ *
+ *  Returns null if the terminal is null or not yet completed.
+ *  Returns [Result.success] for a normal worker outcome.
+ *  Returns [Result.failure] for a confirmed worker exit:
+ *    - ordinary exception thrown by the Deferred
+ *    - [CancellationException] while [currentCoroutineContext] is [isActive]
+ *      (the worker Deferred was cancelled but this callback/retry coroutine is alive)
+ *  Throws [CancellationException] when this coroutine is cancelled (callback/retry cancellation).
+ *  Throws fatal [Error]s unchanged.
+ */
+private suspend fun resolveWorkerTerminal(
+    terminal: Deferred<ReprocessWorkerOutcome>?
+): Result<ReprocessWorkerOutcome>? {
+    if (terminal == null || !terminal.isCompleted) return null
     return try {
         Result.success(terminal.await())
-    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-    catch (oom: OutOfMemoryError) { throw oom }
+    } catch (ce: kotlinx.coroutines.CancellationException) {
+        if (currentCoroutineContext().isActive) {
+            // Worker Deferred was cancelled, but this coroutine is still active.
+            // Confirmed worker failure, not callback cancellation.
+            Result.failure(ce)
+        } else {
+            // This coroutine is cancelled → callback/retry cancellation, propagate.
+            throw ce
+        }
+    } catch (oom: OutOfMemoryError) { throw oom }
     catch (td: ThreadDeath) { throw td }
     catch (le: LinkageError) { throw le }
     catch (ie: InternalError) { throw ie }
@@ -890,8 +912,9 @@ internal fun registerLateFinalization(
           if (handoff.session.lateStateForTest() == ReprocessTransactionSession.LateState.UNRESOLVED &&
               handoff.session.lateRetryExhausted()) {
             val rootEvidence = strictRootEvidence(handoff.target, handoff.transaction)
-            val fallbackMarker = File(handoff.target, REPROCESS_FALLBACK_QUARANTINE_MARKER)
-            if (rootEvidence !== RootEvidence.Trustworthy && !fallbackMarker.isFile) {
+            val fallbackEvidence = strictFallbackEvidence(handoff.target, handoff.transaction)
+            if (rootEvidence !== RootEvidence.Trustworthy &&
+                fallbackEvidence !== FallbackEvidence.Trustworthy) {
               val combinedError = combineCauseWithMessage(
                 handoff.evidenceError ?: IllegalStateException(
                   "Late finalization failed without establishing durable evidence for ${handoff.target.name}"
@@ -998,24 +1021,11 @@ internal fun persistLateEvidence(
  */
 internal suspend fun runLateFinalization(handoff: ReprocessLateFinalizationHandoff, completionCause: Throwable?) {
     if (!handoff.session.tryBeginFinalization()) return
-    val outcome: Result<ReprocessWorkerOutcome> = try {
-        val terminal = handoff.workerTerminal
-        if (terminal != null && terminal.isCompleted) {
-            // Classify cancellation: if this coroutine is still active, the worker Deferred itself
-            // was cancelled → confirmed worker exceptional exit → settle rollback directly.
-            // Only when this coroutine is cancelled do we treat it as callback cancellation.
-            try {
-                Result.success(terminal.await())
-            } catch (ce: kotlinx.coroutines.CancellationException) {
-                if (currentCoroutineContext().isActive) {
-                    // This coroutine is still active → worker Deferred itself was cancelled.
-                    // Treat as confirmed worker exceptional exit, not unresolved.
-                    Result.failure<ReprocessWorkerOutcome>(ce)
-                } else {
-                    // This coroutine is cancelled → callback cancellation, propagate.
-                    throw ce
-                }
-            }
+    val outcome: Result<ReprocessWorkerOutcome>
+    try {
+        val resolved = resolveWorkerTerminal(handoff.workerTerminal)
+        outcome = if (resolved != null) {
+            resolved
         } else if (completionCause != null) {
             Result.failure<ReprocessWorkerOutcome>(
                 combineCause(
@@ -1027,27 +1037,18 @@ internal suspend fun runLateFinalization(handoff: ReprocessLateFinalizationHando
             Result.success(handoff.workerOutcomeSnapshot)
         }
     } catch (e: kotlinx.coroutines.CancellationException) {
-        // Detached callback cancellation: transition to UNRESOLVED, retain the lease,
-        // preserve durable evidence. Rethrow so the detached scope observes cancellation.
         handoff.session.markLateUnresolved()
         val evidence = persistLateEvidence(handoff)
         handoff.evidenceError = evidence.evidenceError
         throw e
-    } catch (e: OutOfMemoryError) { throw e
-    } catch (e: ThreadDeath) { throw e
-    } catch (e: LinkageError) { throw e
-    } catch (e: InternalError) { throw e
-    } catch (e: Error) { throw e
-    } catch (ordinaryRetrieval: Exception) {
-        // Deferred completed exceptionally (ordinary terminal-retrieval failure):
-        // feed into finalizeTransaction as a worker failure.
-        // This is a confirmed worker exit → settle directly, not UNRESOLVED.
-        Result.failure<ReprocessWorkerOutcome>(ordinaryRetrieval)
+    } catch (e: OutOfMemoryError) { handoff.session.markLateUnresolved(); throw e
+    } catch (e: ThreadDeath) { handoff.session.markLateUnresolved(); throw e
+    } catch (e: LinkageError) { handoff.session.markLateUnresolved(); throw e
+    } catch (e: InternalError) { handoff.session.markLateUnresolved(); throw e
+    } catch (e: Error) { handoff.session.markLateUnresolved(); throw e
     }
     val late: ReprocessFinalizationResult
     try {
-        // Apply finalizer failure seam: if injected, check for a forced failure before
-        // calling the real finalizeTransaction. Terminal retrieval already succeeded.
         val injectedFailure = finalizerFailureSeam?.invoke()
         if (injectedFailure != null) throw injectedFailure
         late = finalizeTransaction(
@@ -1059,13 +1060,12 @@ internal suspend fun runLateFinalization(handoff: ReprocessLateFinalizationHando
         val evidence = persistLateEvidence(handoff)
         handoff.evidenceError = evidence.evidenceError
         throw e
-    } catch (e: OutOfMemoryError) { throw e
-    } catch (e: ThreadDeath) { throw e
-    } catch (e: LinkageError) { throw e
-    } catch (e: InternalError) { throw e
-    } catch (e: Error) { throw e
+    } catch (e: OutOfMemoryError) { handoff.session.markLateUnresolved(); throw e
+    } catch (e: ThreadDeath) { handoff.session.markLateUnresolved(); throw e
+    } catch (e: LinkageError) { handoff.session.markLateUnresolved(); throw e
+    } catch (e: InternalError) { handoff.session.markLateUnresolved(); throw e
+    } catch (e: Error) { handoff.session.markLateUnresolved(); throw e
     } catch (ordinaryFinalizerFailure: Exception) {
-        // Ordinary finalizer failure: UNRESOLVED, retain lease, preserve evidence.
         handoff.session.markLateUnresolved()
         val evidence = persistLateEvidence(handoff)
         handoff.evidenceError = when {
@@ -1077,8 +1077,6 @@ internal suspend fun runLateFinalization(handoff: ReprocessLateFinalizationHando
     when (late.state) {
         ReprocessFinalizationState.QUARANTINED -> {
             handoff.session.markLateUnresolved()
-            // QUARANTINED result: do not create a fallback if strict root evidence already exists.
-            // If strict evidence is missing, persist a durable fallback marker and surface its error.
             val rootEvidence = strictRootEvidence(handoff.target, handoff.transaction)
             if (rootEvidence !== RootEvidence.Trustworthy) {
                 try {
@@ -1131,38 +1129,30 @@ internal suspend fun scheduleUnresolvedRetry(
     if (!session.tryAcquireLateRegistration()) return null
     // One bounded retry: reuse the shared session/transaction/lease (no new lease).
     // Extract the completed outcome before retry; do NOT re-await a failed deferred.
-    val snapshot: ReprocessWorkerOutcome = try {
-        val terminal = handoff.workerTerminal
-        if (terminal != null && terminal.isCompleted) {
-            val completed = acquireCompletedDeferred(terminal)
-            completed.getOrThrow()
+    val snapshot: ReprocessWorkerOutcome
+    try {
+        val resolved = resolveWorkerTerminal(handoff.workerTerminal)
+        snapshot = if (resolved != null) {
+            resolved.fold(
+                onSuccess = { it },
+                onFailure = { error ->
+                    ReprocessWorkerOutcome(
+                        result = Result.failure(error),
+                        publicExportCommitted = false
+                    )
+                }
+            )
         } else {
             handoff.workerOutcomeSnapshot
         }
     } catch (ce: kotlinx.coroutines.CancellationException) {
-        // Cancellation during snapshot retrieval: worker Deferred was cancelled.
-        // If retry hasn't started (still LATE_REGISTERED), transition back to UNRESOLVED.
-        if (session.lateStateForTest() == ReprocessTransactionSession.LateState.LATE_REGISTERED) {
-            session.markLateUnresolved()
-        }
-        // Treat as confirmed worker failure for the retry, enter rollback settlement.
-        ReprocessWorkerOutcome(
-            result = Result.failure(ce),
-            publicExportCommitted = false
-        )
-    } catch (oom: OutOfMemoryError) { throw oom }
-    catch (td: ThreadDeath) { throw td }
-    catch (le: LinkageError) { throw le }
-    catch (ie: InternalError) { throw ie }
-    catch (e: Error) { throw e }
-    catch (terminalFailure: Exception) {
-        // Ordinary terminal-retrieval failure is a confirmed worker exit, not cancellation.
-        // Keep LATE_REGISTERED so runLateFinalization → tryBeginFinalization proceeds with rollback.
-        ReprocessWorkerOutcome(
-            result = Result.failure(terminalFailure),
-            publicExportCommitted = false
-        )
-    }
+        // Retry coroutine cancellation → revert to UNRESOLVED, rethrow.
+        session.markLateUnresolved(); throw ce
+    } catch (oom: OutOfMemoryError) { session.markLateUnresolved(); throw oom }
+    catch (td: ThreadDeath) { session.markLateUnresolved(); throw td }
+    catch (le: LinkageError) { session.markLateUnresolved(); throw le }
+    catch (ie: InternalError) { session.markLateUnresolved(); throw ie }
+    catch (e: Error) { session.markLateUnresolved(); throw e }
     val retryHandoff = handoff.copy(
         workerTerminal = null,
         workerOutcomeSnapshot = snapshot
@@ -1243,14 +1233,22 @@ internal fun strictRootEvidence(jobDir: File, transaction: ReprocessTransaction)
 
     var markerTrustworthy = false
     var markerInspectionError: Throwable? = null
-    // (a) Canonical quarantine marker with exact content, evaluated independently.
+    // (a) Identity-bound quarantine marker with matching transaction identity, evaluated independently.
+    //     Legacy fixed-content marker is NOT independently trustworthy — falls through to manifest check.
     val marker = File(backupRoot, REPROCESS_QUARANTINE_MARKER)
     if (marker.exists()) {
         if (!marker.isFile) {
-            // Caller-cancellation/fatal never throw from marker.isFile; ordinary failure → not trusted.
+            // directory or special → not trusted
         } else {
             try {
-                if (marker.readText() == REPROCESS_QUARANTINE_MARKER_CONTENT) markerTrustworthy = true
+                val identity = readQuarantineMarkerIdentity(marker)
+                if (identity != null &&
+                    identity.first == transaction.transactionId &&
+                    identity.second == canonicalRoot.name &&
+                    identity.third == transaction.manifest.createdAt
+                ) {
+                    markerTrustworthy = true
+                }
             } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
             catch (oom: OutOfMemoryError) { throw oom }
             catch (td: ThreadDeath) { throw td }
@@ -1288,6 +1286,66 @@ internal fun strictRootEvidence(jobDir: File, transaction: ReprocessTransaction)
         durable.state != ReprocessTransactionState.QUARANTINED) return RootEvidence.Untrustworthy
     return RootEvidence.Trustworthy
 }
+
+/**
+ *  Strict fallback evidence classification.
+ *
+ *  Identical semantics to [RootEvidence] but for the job-directory-level fallback quarantine
+ *  marker (`.reprocess_unresolved`). Used by retry-exhaustion reporting and restart gating.
+ */
+internal sealed class FallbackEvidence {
+    data object Trustworthy : FallbackEvidence()
+    data object Untrustworthy : FallbackEvidence()
+    data class InspectionFailed(val cause: Throwable) : FallbackEvidence()
+}
+
+/**
+ *  Strict fallback-evidence inspection for the job-directory fallback marker.
+ *
+ *  Verifies:
+ *   - marker is a regular file
+ *   - exact transaction ID, backup-root name, createdAt
+ *   - canonical job relationship
+ *   - no malformed or duplicate fields recognized as valid
+ *
+ *  A missing, corrupt, or mismatched marker → [Untrustworthy] or [InspectionFailed].
+ *  Legacy fixed-content marker is NOT independently trustworthy.
+ *
+ *  Exception policy identical to [strictRootEvidence]:
+ *   - ordinary parsing/IO failure → [Untrustworthy] or [InspectionFailed]
+ *   - [CancellationException] → propagate
+ *   - fatal [Error] → propagate
+ */
+internal fun strictFallbackEvidence(jobDir: File, transaction: ReprocessTransaction): FallbackEvidence {
+    val marker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
+    if (!marker.exists()) return FallbackEvidence.Untrustworthy
+    if (!marker.isFile) return FallbackEvidence.Untrustworthy
+    val canonicalJob = try { jobDir.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (_: Exception) { return FallbackEvidence.Untrustworthy }
+    if (marker.parentFile?.canonicalFile != canonicalJob) return FallbackEvidence.Untrustworthy
+    val identity = try { readFallbackIdentity(marker) }
+    catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (readFailure: Exception) { return FallbackEvidence.InspectionFailed(readFailure) }
+    if (identity == null) return FallbackEvidence.Untrustworthy
+    if (identity.first != transaction.transactionId) return FallbackEvidence.Untrustworthy
+    if (identity.second != transaction.backupRoot.name) return FallbackEvidence.Untrustworthy
+    if (identity.third != transaction.manifest.createdAt) return FallbackEvidence.Untrustworthy
+    return FallbackEvidence.Trustworthy
+}
+
+/** Boolean shim for fallback evidence. */
+internal fun hasTrustworthyFallbackEvidence(jobDir: File, transaction: ReprocessTransaction): Boolean =
+    strictFallbackEvidence(jobDir, transaction) === FallbackEvidence.Trustworthy
 
 
 /**
@@ -1939,35 +1997,33 @@ internal fun writeQuarantineMarker(transaction: ReprocessTransaction) {
     val root = transaction.backupRoot
     check(root.isDirectory) { "Quarantine marker write failed: backup root missing or not a directory: $root" }
     val marker = File(root, REPROCESS_QUARANTINE_MARKER)
+    val expectedContent = quarantineMarkerContent(transaction)
     if (marker.exists()) {
         check(marker.isFile) { "Quarantine marker path exists but is not a regular file: $marker" }
-        val content = try { marker.readText() }
-        catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-        catch (oom: OutOfMemoryError) { throw oom }
-        catch (td: ThreadDeath) { throw td }
-        catch (le: LinkageError) { throw le }
-        catch (ie: InternalError) { throw ie }
-        catch (e: Error) { throw e }
-        catch (_: Exception) { null }
-        check(content == REPROCESS_QUARANTINE_MARKER_CONTENT) { "Quarantine marker exists but content is not canonical: $marker" }
-        return
+        val identity = readQuarantineMarkerIdentity(marker)
+        if (identity != null &&
+            identity.first == transaction.transactionId &&
+            identity.second == transaction.backupRoot.name &&
+            identity.third == transaction.manifest.createdAt
+        ) {
+            return // Identity-bound marker with matching identity already exists
+        }
+        // Legacy fixed-content or mismatched marker → overwrite below
     }
     val writeOp = quarantineMarkerWriteOperation
     if (writeOp != null) {
-        writeOp(marker, REPROCESS_QUARANTINE_MARKER_CONTENT)
+        writeOp(marker, expectedContent)
     } else {
-        KeplerJobMetadata.atomicWrite(marker, REPROCESS_QUARANTINE_MARKER_CONTENT)
+        KeplerJobMetadata.atomicWrite(marker, expectedContent)
     }
     check(marker.isFile) { "Quarantine marker write produced no file: $marker" }
-    val writtenContent = try { marker.readText() }
-    catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-    catch (oom: OutOfMemoryError) { throw oom }
-    catch (td: ThreadDeath) { throw td }
-    catch (le: LinkageError) { throw le }
-    catch (ie: InternalError) { throw ie }
-    catch (e: Error) { throw e }
-    catch (_: Exception) { null }
-    check(writtenContent == REPROCESS_QUARANTINE_MARKER_CONTENT) { "Quarantine marker content verification failed after write: $marker" }
+    val writtenIdentity = readQuarantineMarkerIdentity(marker)
+    check(writtenIdentity != null &&
+          writtenIdentity.first == transaction.transactionId &&
+          writtenIdentity.second == transaction.backupRoot.name &&
+          writtenIdentity.third == transaction.manifest.createdAt) {
+        "Quarantine marker content verification failed after write: $marker"
+    }
 }
 
 /**
@@ -2130,6 +2186,35 @@ private fun readFallbackIdentity(marker: File): Triple<String, String, Long>? {
         }
         if (values.keys != setOf("transactionId", "backupRoot", "createdAt")) null
         else Triple(values.getValue("transactionId"), values.getValue("backupRoot"), values.getValue("createdAt").toLong())
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce
+    } catch (e: OutOfMemoryError) { throw e
+    } catch (e: ThreadDeath) { throw e
+    } catch (e: LinkageError) { throw e
+    } catch (e: InternalError) { throw e
+    } catch (e: Error) { throw e
+    } catch (_: Exception) { null }
+}
+
+/** Identity-bound content for the quarantine marker inside the backup root. */
+internal fun quarantineMarkerContent(transaction: ReprocessTransaction): String = buildString {
+    append("transactionId="); append(transaction.transactionId); append('\n')
+    append("backupRoot="); append(transaction.backupRoot.name); append('\n')
+    append("createdAt="); append(transaction.manifest.createdAt); append('\n')
+}
+
+/** Parse an identity-bound quarantine marker and return (transactionId, backupRoot, createdAt).
+ *  Returns null if the marker is missing, malformed, or uses the legacy fixed-content format. */
+internal fun readQuarantineMarkerIdentity(marker: File): Triple<String, String, Long>? {
+    return try {
+        val lines = marker.readLines()
+        if (lines.size == 1 && lines[0].trim() == "quarantined") return null
+        val values = lines.associate { line ->
+            val split = line.indexOf('=')
+            require(split > 0) { "Malformed quarantine marker" }
+            line.substring(0, split) to line.substring(split + 1)
+        }
+        if (values.keys != setOf("transactionId", "backupRoot", "createdAt")) return null
+        Triple(values.getValue("transactionId"), values.getValue("backupRoot"), values.getValue("createdAt").toLong())
     } catch (ce: kotlinx.coroutines.CancellationException) { throw ce
     } catch (e: OutOfMemoryError) { throw e
     } catch (e: ThreadDeath) { throw e
