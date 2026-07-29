@@ -873,6 +873,11 @@ private val noOutcomeSnapshot: ReprocessWorkerOutcome = ReprocessWorkerOutcome(
  */
 internal var lateFinalizationHandoffScope: ReprocessLateFinalizationHandoff? = null
 
+/** Narrow test seam: overrides the CoroutineScope used by the invokeOnCompletion callback in
+ *  [registerLateFinalization]. When null, defaults to `CoroutineScope(Dispatchers.IO)`. Tests
+ *  inject a controlled scope to verify real callback cancellation. Always reset in `finally`. */
+internal var lateFinalizationCallbackScope: CoroutineScope? = null
+
 /**
  * Once-only late-finalization registration. Uses the session shared once-guard so duplicate
  * registration (timeout then cancellation, or racing completion) is ignored. The detached IO scope
@@ -896,8 +901,9 @@ internal fun registerLateFinalization(
         resolvedSelection, workerTerminal = worker?.terminal
     )
     lateFinalizationHandoffScope = handoff
+    val callbackScope = lateFinalizationCallbackScope ?: CoroutineScope(Dispatchers.IO)
     worker?.terminal?.invokeOnCompletion { cause ->
-      CoroutineScope(Dispatchers.IO).launch {
+      callbackScope.launch {
         try {
           runLateFinalization(handoff, cause)
           // Production retry path: after the first ordinary finalizer/evidence failure leaves the
@@ -915,10 +921,20 @@ internal fun registerLateFinalization(
             val fallbackEvidence = strictFallbackEvidence(handoff.target, handoff.transaction)
             if (rootEvidence !== RootEvidence.Trustworthy &&
                 fallbackEvidence !== FallbackEvidence.Trustworthy) {
+              // Collect all evidence errors: initial/retry errors, plus root/fallback inspection causes.
+              var combined = handoff.evidenceError ?: IllegalStateException(
+                "Late finalization failed without establishing durable evidence for ${handoff.target.name}"
+              )
+              val rootCause = (rootEvidence as? RootEvidence.InspectionFailed)?.cause
+              val fallbackCause = (fallbackEvidence as? FallbackEvidence.InspectionFailed)?.cause
+              if (rootCause != null && rootCause !== combined) {
+                combined = combineCause(combined, rootCause)
+              }
+              if (fallbackCause != null && fallbackCause !== combined) {
+                combined = combineCause(combined, fallbackCause)
+              }
               val combinedError = combineCauseWithMessage(
-                handoff.evidenceError ?: IllegalStateException(
-                  "Late finalization failed without establishing durable evidence for ${handoff.target.name}"
-                ),
+                combined,
                 "Late finalization exhausted retries with no durable quarantine evidence",
                 null
               )
@@ -1252,6 +1268,17 @@ internal fun strictRootEvidence(jobDir: File, transaction: ReprocessTransaction)
         if (!marker.isFile) {
             // directory or special → not trusted
         } else {
+            // Reject symlink-backed markers: the marker itself must be a regular direct child.
+            val markerCanonical = try { marker.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+            catch (oom: OutOfMemoryError) { throw oom }
+            catch (td: ThreadDeath) { throw td }
+            catch (le: LinkageError) { throw le }
+            catch (ie: InternalError) { throw ie }
+            catch (e: Error) { throw e }
+            catch (_: Exception) { null }
+            if (markerCanonical == null || markerCanonical != marker.absoluteFile) {
+                // symlink marker → not trustworthy, but capture error if canonicalization failed
+            } else {
             try {
                 val identity = readQuarantineMarkerIdentity(marker)
                 if (identity != null &&
@@ -1268,6 +1295,7 @@ internal fun strictRootEvidence(jobDir: File, transaction: ReprocessTransaction)
             catch (ie: InternalError) { throw ie }
             catch (e: Error) { throw e }
             catch (readFailure: Exception) { markerInspectionError = readFailure }
+        }
         }
     }
     if (markerTrustworthy) return RootEvidence.Trustworthy
@@ -1332,6 +1360,17 @@ internal fun strictFallbackEvidence(jobDir: File, transaction: ReprocessTransact
     val marker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
     if (!marker.exists()) return FallbackEvidence.Untrustworthy
     if (!marker.isFile) return FallbackEvidence.Untrustworthy
+    // Reject symlink markers: the marker itself must be a regular direct child, not a symlink
+    // to an external file. A symlink pointing to a correctly formatted file must not be trusted
+    // and must not permit terminal-root cleanup.
+    val canonicalMarker = try { marker.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (_: Exception) { return FallbackEvidence.InspectionFailed(Exception("Cannot canonicalize fallback marker")) }
+    if (canonicalMarker != marker.absoluteFile) return FallbackEvidence.Untrustworthy
     val canonicalJob = try { jobDir.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
     catch (oom: OutOfMemoryError) { throw oom }
     catch (td: ThreadDeath) { throw td }
@@ -2020,6 +2059,13 @@ internal fun writeQuarantineMarker(transaction: ReprocessTransaction) {
     val expectedContent = quarantineMarkerContent(transaction)
     if (marker.exists()) {
         check(marker.isFile) { "Quarantine marker path exists but is not a regular file: $marker" }
+        // Reject symlink-backed marker — must be a canonical direct child.
+        check(marker.canonicalFile == marker.absoluteFile) {
+            "Quarantine marker is a symlink, not a direct child: $marker"
+        }
+        check(marker.parentFile?.canonicalFile == root.canonicalFile) {
+            "Quarantine marker parent is not the backup root: $marker"
+        }
         val identity = readQuarantineMarkerIdentity(marker)
         if (identity != null &&
             identity.first == transaction.transactionId &&
@@ -2175,6 +2221,14 @@ internal fun ensureDurableFallbackQuarantine(jobDir: File, transaction: Reproces
     check(jobDir.isDirectory) { "Job directory unavailable for fallback quarantine" }
     val marker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
     if (marker.exists()) {
+        check(marker.isFile) { "Fallback quarantine marker exists but is not a regular file" }
+        // Reject symlink-backed marker — must be a canonical direct child.
+        check(marker.canonicalFile == marker.absoluteFile) {
+            "Fallback quarantine marker is a symlink, not a direct child"
+        }
+        check(marker.parentFile?.canonicalFile == jobDir.canonicalFile) {
+            "Fallback quarantine marker parent is not the job directory"
+        }
         check(readFallbackIdentity(marker) == fallbackIdentity(transaction)) {
             "Existing fallback quarantine marker belongs to another or corrupt transaction"
         }
@@ -2197,34 +2251,38 @@ private fun fallbackIdentity(transaction: ReprocessTransaction): Triple<String, 
     transaction.transactionId, transaction.backupRoot.name, transaction.manifest.createdAt
 )
 
+/** Strict identity parser shared by fallback and quarantine markers. Expects exactly 3 non-blank
+ *  lines in `key=value` format with keys: transactionId, backupRoot, createdAt.
+ *  Rejects duplicate keys, unknown keys, blank values, whitespace padding, non-positive createdAt,
+ *  and backupRoot that does not start with `.reprocess_backup_`. Does NOT catch exceptions —
+ *  IO/security failures propagate to the caller so the evidence layer can distinguish
+ *  InspectionFailed from Untrustworthy. */
+private fun readMarkerIdentity(marker: File): Triple<String, String, Long>? {
+    val lines = marker.readLines()
+    val nonblank = lines.filter { it.isNotBlank() }
+    if (nonblank.size != 3) return null
+    val parsed = linkedMapOf<String, String>()
+    for (line in nonblank) {
+        val split = line.indexOf('=')
+        if (split <= 0) return null
+        val key = line.substring(0, split)
+        if (key.isEmpty() || parsed.containsKey(key)) return null
+        parsed[key] = line.substring(split + 1)
+    }
+    if (parsed.keys != setOf("transactionId", "backupRoot", "createdAt")) return null
+    val txId = parsed.getValue("transactionId")
+    if (txId.isBlank()) return null
+    val rootName = parsed.getValue("backupRoot")
+    if (rootName.isBlank() || !rootName.startsWith(".reprocess_backup_")) return null
+    val createdAt = parsed.getValue("createdAt").toLongOrNull() ?: return null
+    if (createdAt <= 0L) return null
+    return Triple(txId, rootName, createdAt)
+}
+
+/** Read fallback quarantine marker identity using the shared strict parser.
+ *  Returns null for malformed content. IO/security exceptions propagate. */
 private fun readFallbackIdentity(marker: File): Triple<String, String, Long>? {
-    return try {
-        val lines = marker.readLines()
-        val nonblank = lines.filter { it.isNotBlank() }
-        if (nonblank.size != 3) return null
-        val parsed = linkedMapOf<String, String>()
-        for (line in nonblank) {
-            val split = line.indexOf('=')
-            if (split <= 0) return null
-            val key = line.substring(0, split)
-            if (key.isEmpty() || parsed.containsKey(key)) return null
-            parsed[key] = line.substring(split + 1)
-        }
-        if (parsed.keys != setOf("transactionId", "backupRoot", "createdAt")) return null
-        val txId = parsed.getValue("transactionId")
-        if (txId.isBlank()) return null
-        val rootName = parsed.getValue("backupRoot")
-        if (rootName.isBlank() || !rootName.startsWith(".reprocess_backup_")) return null
-        val createdAt = parsed.getValue("createdAt").toLongOrNull() ?: return null
-        if (createdAt <= 0L) return null
-        Triple(txId, rootName, createdAt)
-    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce
-    } catch (e: OutOfMemoryError) { throw e
-    } catch (e: ThreadDeath) { throw e
-    } catch (e: LinkageError) { throw e
-    } catch (e: InternalError) { throw e
-    } catch (e: Error) { throw e
-    } catch (_: Exception) { null }
+    return readMarkerIdentity(marker)
 }
 
 /** Identity-bound content for the quarantine marker inside the backup root. */
@@ -2234,37 +2292,14 @@ internal fun quarantineMarkerContent(transaction: ReprocessTransaction): String 
     append("createdAt="); append(transaction.manifest.createdAt); append('\n')
 }
 
-/** Parse an identity-bound quarantine marker and return (transactionId, backupRoot, createdAt).
- *  Returns null if the marker is missing, malformed, or uses the legacy fixed-content format. */
+/** Parse an identity-bound quarantine marker using the shared strict parser, then check for the
+ *  legacy fixed-content format ("quarantined") which returns null. IO/security exceptions
+ *  propagate to the caller so the evidence layer can distinguish InspectionFailed from
+ *  Untrustworthy. */
 internal fun readQuarantineMarkerIdentity(marker: File): Triple<String, String, Long>? {
-    return try {
-        val lines = marker.readLines()
-        if (lines.size == 1 && lines[0].trim() == "quarantined") return null
-        val nonblank = lines.filter { it.isNotBlank() }
-        if (nonblank.size != 3) return null
-        val parsed = linkedMapOf<String, String>()
-        for (line in nonblank) {
-            val split = line.indexOf('=')
-            if (split <= 0) return null
-            val key = line.substring(0, split)
-            if (key.isEmpty() || parsed.containsKey(key)) return null
-            parsed[key] = line.substring(split + 1)
-        }
-        if (parsed.keys != setOf("transactionId", "backupRoot", "createdAt")) return null
-        val txId = parsed.getValue("transactionId")
-        if (txId.isBlank()) return null
-        val rootName = parsed.getValue("backupRoot")
-        if (rootName.isBlank() || !rootName.startsWith(".reprocess_backup_")) return null
-        val createdAt = parsed.getValue("createdAt").toLongOrNull() ?: return null
-        if (createdAt <= 0L) return null
-        Triple(txId, rootName, createdAt)
-    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce
-    } catch (e: OutOfMemoryError) { throw e
-    } catch (e: ThreadDeath) { throw e
-    } catch (e: LinkageError) { throw e
-    } catch (e: InternalError) { throw e
-    } catch (e: Error) { throw e
-    } catch (_: Exception) { null }
+    val lines = marker.readLines()
+    if (lines.size == 1 && lines[0].trim() == "quarantined") return null
+    return readMarkerIdentity(marker)
 }
 
 /**
@@ -2299,6 +2334,10 @@ internal var finalizerFailureSeam: (() -> Throwable?)? = null
 internal fun removeMatchingFallbackQuarantine(jobDir: File, transaction: ReprocessTransaction): Boolean {
     val marker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
     if (!marker.exists()) return true
+    // Reject symlink markers — only remove verified direct-child markers.
+    if (!marker.isFile) return false
+    if (marker.canonicalFile != marker.absoluteFile) return false
+    if (marker.parentFile?.canonicalFile != jobDir.canonicalFile) return false
     if (readFallbackIdentity(marker) != fallbackIdentity(transaction)) return false
     val deleteOp = fallbackDeleteOperation
     val deleted = if (deleteOp != null) deleteOp(marker) else marker.delete()
@@ -2376,7 +2415,14 @@ internal fun recoverValidatedQuarantine(jobDir: File) {
     if (!fallbackMarker.isFile) {
       true
     } else {
-      val fallbackId = readFallbackIdentity(fallbackMarker)
+      val fallbackId = try { readFallbackIdentity(fallbackMarker) }
+        catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+        catch (oom: OutOfMemoryError) { throw oom }
+        catch (td: ThreadDeath) { throw td }
+        catch (le: LinkageError) { throw le }
+        catch (ie: InternalError) { throw ie }
+        catch (e: Error) { throw e }
+        catch (_: Exception) { null }
       if (fallbackId == null) {
         true
       } else {
@@ -3320,8 +3366,14 @@ internal var cleanupListOperation: ((File) -> Array<File>?)? = null
 
 /** Narrow injectable IO seam for the root directory deletion at the end of cleanup. The real call is
  *  [File.delete]. Tests inject false to simulate actual root deletion failure while payload removal
- *  succeeded. Reset in `finally`. */
-    internal var cleanupRootDeleteOperation: (File) -> Boolean = { it.deleteRecursively() }
+ *  succeeded. Reset in `finally`. Never uses recursive deletion — only removes an already-empty root. */
+internal var cleanupRootDeleteOperation: (File) -> Boolean = { it.delete() }
+
+/** Narrow injectable seam: called after the terminal manifest is deleted and before the
+ *  post-deletion listing. Tests simulate a new file appearing during (window) to verify
+ *  cleanup refuses it. The unknown file must survive and must never be recursively removed.
+ *  Reset in `finally`. */
+internal var afterManifestDeleteOperation: ((File) -> Unit)? = null
 
 /**
  * Safe backup cleanup, shared by immediate finalization and process-restart recovery.
@@ -3425,16 +3477,62 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
       return false
     }
   }
-  // 4. Verify only the manifest (and optionally a resolved marker) remain so root contains
-  // only known files before directory deletion.
-  val finalContents = listRoot(root) ?: return false
-  val remaining = finalContents.filter { it.name != REPROCESS_TX_MANIFEST_FILE }
-  if (remaining.isNotEmpty()) return false
-  // 5. Delete the root directory (which includes the manifest). If root deletion fails, the
-  //    manifest is preserved inside the still-existing root — no separate manifest deletion.
+  // 4. Verify only the terminal manifest remains before deleting it as the final file operation.
+  val preManifestDelete = listRoot(root) ?: return false
+  val preRemaining = preManifestDelete.filter { it.name != REPROCESS_TX_MANIFEST_FILE }
+  if (preRemaining.isNotEmpty()) return false
+  // 5. Delete the terminal manifest as the final file operation. After this, the root should be empty.
   try {
-      val rootDeleted = cleanupRootDeleteOperation(root)
-      if (!rootDeleted || root.exists()) return false
+    cleanupDelete(manifestFile)
+  } catch (e: kotlinx.coroutines.CancellationException) { throw e
+  } catch (e: OutOfMemoryError) { throw e
+  } catch (e: ThreadDeath) { throw e
+  } catch (e: LinkageError) { throw e
+  } catch (e: InternalError) { throw e
+  } catch (e: Error) { throw e
+  } catch (_: Exception) {
+    return false
+  }
+  if (manifestFile.exists()) return false
+  // Seam: simulate a new file appearing after manifest deletion.
+  afterManifestDeleteOperation?.invoke(root)
+  // 6. List root again. A new/unknown file that appeared after manifest deletion is blocking.
+  val afterManifestDelete = listRoot(root) ?: run {
+    // No listing means the root was already removed (e.g., concurrent deletion). Treat as success.
+    return true
+  }
+  if (afterManifestDelete.isNotEmpty()) {
+    // An unknown file appeared after manifest deletion. Restore the terminal manifest atomically
+    // so the root has a valid manifest for the next recovery attempt. Never recursively remove
+    // a file that appeared after the final listing.
+    try {
+      KeplerJobMetadata.atomicWrite(manifestFile, durable.toJson().toString(2))
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (_: Exception) { /* manifest restore best-effort */ }
+    return false
+  }
+  // 7. Delete the now-empty root using non-recursive File.delete(). If root deletion fails,
+  //    restore the terminal manifest atomically so the evidence is preserved.
+  try {
+    val rootDeleted = cleanupRootDeleteOperation(root)
+    if (!rootDeleted) {
+      // Root deletion failed but manifest is already deleted. Restore the manifest.
+      try {
+        KeplerJobMetadata.atomicWrite(manifestFile, durable.toJson().toString(2))
+      } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+      catch (oom: OutOfMemoryError) { throw oom }
+      catch (td: ThreadDeath) { throw td }
+      catch (le: LinkageError) { throw le }
+      catch (ie: InternalError) { throw ie }
+      catch (e: Error) { throw e }
+      catch (_: Exception) { /* manifest restore best-effort */ }
+      return false
+    }
   } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
   catch (oom: OutOfMemoryError) { throw oom }
   catch (td: ThreadDeath) { throw td }
@@ -3442,8 +3540,31 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
   catch (ie: InternalError) { throw ie }
   catch (e: Error) { throw e }
   catch (_: Exception) {
-      // Root deletion SecurityException/ordinary failure: preserve manifest evidence.
-      return false
+    // Root deletion failed: restore manifest.
+    try {
+      KeplerJobMetadata.atomicWrite(manifestFile, durable.toJson().toString(2))
+    } catch (ce2: kotlinx.coroutines.CancellationException) { throw ce2 }
+    catch (oom2: OutOfMemoryError) { throw oom2 }
+    catch (td2: ThreadDeath) { throw td2 }
+    catch (le2: LinkageError) { throw le2 }
+    catch (ie2: InternalError) { throw ie2 }
+    catch (e2: Error) { throw e2 }
+    catch (_: Exception) { /* manifest restore best-effort */ }
+    return false
+  }
+  // Verify root absence.
+  if (root.exists()) {
+    // Root still exists after successful deletion call. Restore manifest.
+    try {
+      KeplerJobMetadata.atomicWrite(manifestFile, durable.toJson().toString(2))
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (_: Exception) { /* manifest restore best-effort */ }
+    return false
   }
   return true
 }
