@@ -933,20 +933,22 @@ internal fun registerLateFinalization(
             }
           }
         } catch (e: kotlinx.coroutines.CancellationException) {
-          // `runLateFinalization` already transitioned FINALIZING -> UNRESOLVED, retained the lease,
-          // and preserved the evidence-persistence error in `handoff.evidenceError`. Do not silently
-          // swallow callback cancellation — rethrow so the detached scope's failure handling observes it.
           throw e
         } catch (e: OutOfMemoryError) { throw e
         } catch (e: ThreadDeath) { throw e
         } catch (e: LinkageError) { throw e
         } catch (e: InternalError) { throw e
         } catch (e: Error) { throw e
+        } finally {
+          lateFinalizationCompleteCallback?.invoke(handoff)
         }
       }
     }
     return handoff
 }
+
+/** Narrow test seam: called after the invokeOnCompletion callback completes (in its finally block). */
+internal var lateFinalizationCompleteCallback: ((ReprocessLateFinalizationHandoff) -> Unit)? = null
 
 /**
  * Persist durable evidence for a late failure and return a structured result. Used by
@@ -1158,6 +1160,16 @@ internal suspend fun scheduleUnresolvedRetry(
         workerOutcomeSnapshot = snapshot
     )
     runLateFinalization(retryHandoff, completionCause = null)
+    // Merge retry evidence errors back into the original handoff so the
+    // exhaustion check in registerLateFinalization observes the full context.
+    if (session.lateStateForTest() == ReprocessTransactionSession.LateState.TERMINAL) {
+        handoff.evidenceError = null
+    } else {
+        val retryError = retryHandoff.evidenceError
+        if (retryError != null) {
+            handoff.evidenceError = handoff.evidenceError?.let { combineCause(it, retryError) } ?: retryError
+        }
+    }
     return when (session.lateStateForTest()) {
         ReprocessTransactionSession.LateState.TERMINAL -> session.existingTerminalResult()
         else -> null
@@ -1326,8 +1338,16 @@ internal fun strictFallbackEvidence(jobDir: File, transaction: ReprocessTransact
     catch (le: LinkageError) { throw le }
     catch (ie: InternalError) { throw ie }
     catch (e: Error) { throw e }
-    catch (_: Exception) { return FallbackEvidence.Untrustworthy }
-    if (marker.parentFile?.canonicalFile != canonicalJob) return FallbackEvidence.Untrustworthy
+    catch (ce: Exception) { return FallbackEvidence.InspectionFailed(ce) }
+    val markerParent = try { marker.parentFile?.canonicalFile }
+    catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (pe: Exception) { return FallbackEvidence.InspectionFailed(pe) }
+    if (markerParent != canonicalJob) return FallbackEvidence.Untrustworthy
     val identity = try { readFallbackIdentity(marker) }
     catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
     catch (oom: OutOfMemoryError) { throw oom }
@@ -2179,13 +2199,25 @@ private fun fallbackIdentity(transaction: ReprocessTransaction): Triple<String, 
 
 private fun readFallbackIdentity(marker: File): Triple<String, String, Long>? {
     return try {
-        val values = marker.readLines().associate { line ->
+        val lines = marker.readLines()
+        val nonblank = lines.filter { it.isNotBlank() }
+        if (nonblank.size != 3) return null
+        val parsed = linkedMapOf<String, String>()
+        for (line in nonblank) {
             val split = line.indexOf('=')
-            require(split > 0) { "Malformed fallback marker" }
-            line.substring(0, split) to line.substring(split + 1)
+            if (split <= 0) return null
+            val key = line.substring(0, split)
+            if (key.isEmpty() || parsed.containsKey(key)) return null
+            parsed[key] = line.substring(split + 1)
         }
-        if (values.keys != setOf("transactionId", "backupRoot", "createdAt")) null
-        else Triple(values.getValue("transactionId"), values.getValue("backupRoot"), values.getValue("createdAt").toLong())
+        if (parsed.keys != setOf("transactionId", "backupRoot", "createdAt")) return null
+        val txId = parsed.getValue("transactionId")
+        if (txId.isBlank()) return null
+        val rootName = parsed.getValue("backupRoot")
+        if (rootName.isBlank() || !rootName.startsWith(".reprocess_backup_")) return null
+        val createdAt = parsed.getValue("createdAt").toLongOrNull() ?: return null
+        if (createdAt <= 0L) return null
+        Triple(txId, rootName, createdAt)
     } catch (ce: kotlinx.coroutines.CancellationException) { throw ce
     } catch (e: OutOfMemoryError) { throw e
     } catch (e: ThreadDeath) { throw e
@@ -2208,13 +2240,24 @@ internal fun readQuarantineMarkerIdentity(marker: File): Triple<String, String, 
     return try {
         val lines = marker.readLines()
         if (lines.size == 1 && lines[0].trim() == "quarantined") return null
-        val values = lines.associate { line ->
+        val nonblank = lines.filter { it.isNotBlank() }
+        if (nonblank.size != 3) return null
+        val parsed = linkedMapOf<String, String>()
+        for (line in nonblank) {
             val split = line.indexOf('=')
-            require(split > 0) { "Malformed quarantine marker" }
-            line.substring(0, split) to line.substring(split + 1)
+            if (split <= 0) return null
+            val key = line.substring(0, split)
+            if (key.isEmpty() || parsed.containsKey(key)) return null
+            parsed[key] = line.substring(split + 1)
         }
-        if (values.keys != setOf("transactionId", "backupRoot", "createdAt")) return null
-        Triple(values.getValue("transactionId"), values.getValue("backupRoot"), values.getValue("createdAt").toLong())
+        if (parsed.keys != setOf("transactionId", "backupRoot", "createdAt")) return null
+        val txId = parsed.getValue("transactionId")
+        if (txId.isBlank()) return null
+        val rootName = parsed.getValue("backupRoot")
+        if (rootName.isBlank() || !rootName.startsWith(".reprocess_backup_")) return null
+        val createdAt = parsed.getValue("createdAt").toLongOrNull() ?: return null
+        if (createdAt <= 0L) return null
+        Triple(txId, rootName, createdAt)
     } catch (ce: kotlinx.coroutines.CancellationException) { throw ce
     } catch (e: OutOfMemoryError) { throw e
     } catch (e: ThreadDeath) { throw e
@@ -2312,61 +2355,96 @@ internal fun isReprocessQuarantined(jobDir: File): Boolean {
 internal fun recoverValidatedQuarantine(jobDir: File) {
   if (KeplerJobMetadata.isOperationActive(jobDir)) return
   val fallbackMarker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
-  val jobDirListing = jobDir.listFiles()
+  val jobDirListing = try { jobDir.listFiles() } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+  catch (oom: OutOfMemoryError) { throw oom }
+  catch (td: ThreadDeath) { throw td }
+  catch (le: LinkageError) { throw le }
+  catch (ie: InternalError) { throw ie }
+  catch (e: Error) { throw e }
+  catch (_: Exception) { null }
   if (jobDirListing == null) {
     if (jobDir.exists() && jobDir.isDirectory) {
-      // Existing directory with unreadable listing: fail closed, retain quarantine.
       return
     }
-    // Directory itself is gone: nothing to recover.
     return
   }
   val children = jobDirListing
-    val rootsToSkip = mutableSetOf<String>()
-    if (fallbackMarker.exists()) {
-        val fallbackId = readFallbackIdentity(fallbackMarker)
-        if (fallbackId != null) {
-            val matchingRoot = children.firstOrNull { it.isDirectory && it.name == fallbackId.second }
-            val matchingClassification = matchingRoot?.let { classifyTransactionManifest(jobDir, it) }
-            if (matchingClassification is ManifestClassification.Resolved) {
-                val manifest = try { loadStrictManifest(File(matchingRoot, REPROCESS_TX_MANIFEST_FILE)) }
-                catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-                catch (oom: OutOfMemoryError) { throw oom }
-                catch (td: ThreadDeath) { throw td }
-                catch (le: LinkageError) { throw le }
-                catch (ie: InternalError) { throw ie }
-                catch (e: Error) { throw e }
-                catch (_: Exception) { null }
-                if (manifest != null &&
-                    manifest.transactionId == fallbackId.first &&
-                    matchingRoot.name == fallbackId.second &&
-                    manifest.createdAt == fallbackId.third
-                ) {
-                    val deleteOp = fallbackDeleteOperation
-                    val deleted = if (deleteOp != null) deleteOp(fallbackMarker) else fallbackMarker.delete()
-                    if (!deleted || fallbackMarker.exists()) {
-                        rootsToSkip.add(matchingRoot.name)
-                    }
-                }
+  // Conservative fallback resolution: while an unverified or undeleted fallback
+  // exists, skip ALL destructive terminal-root cleanup for this job.
+  // This preserves every root that might be needed to resolve the fallback.
+  val fallbackBlocked = if (fallbackMarker.exists()) {
+    if (!fallbackMarker.isFile) {
+      true
+    } else {
+      val fallbackId = readFallbackIdentity(fallbackMarker)
+      if (fallbackId == null) {
+        true
+      } else {
+        val matchingRoot = children.firstOrNull { it.isDirectory && it.name == fallbackId.second }
+        if (matchingRoot == null) {
+          true
+        } else {
+          val classification = classifyTransactionManifest(jobDir, matchingRoot)
+          if (classification !is ManifestClassification.Resolved) {
+            true
+          } else {
+            val manifest = try { loadStrictManifest(File(matchingRoot, REPROCESS_TX_MANIFEST_FILE)) }
+            catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+            catch (oom: OutOfMemoryError) { throw oom }
+            catch (td: ThreadDeath) { throw td }
+            catch (le: LinkageError) { throw le }
+            catch (ie: InternalError) { throw ie }
+            catch (e: Error) { throw e }
+            catch (_: Exception) { null }
+            if (manifest == null ||
+                manifest.transactionId != fallbackId.first ||
+                matchingRoot.name != fallbackId.second ||
+                manifest.createdAt != fallbackId.third
+            ) {
+              true
+            } else {
+              val deleted = try {
+                val deleteOp = fallbackDeleteOperation
+                val result = if (deleteOp != null) deleteOp(fallbackMarker) else fallbackMarker.delete()
+                result && !fallbackMarker.exists()
+              } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+              catch (oom: OutOfMemoryError) { throw oom }
+              catch (td: ThreadDeath) { throw td }
+              catch (le: LinkageError) { throw le }
+              catch (ie: InternalError) { throw ie }
+              catch (e: Error) { throw e }
+              catch (_: Exception) { false }
+              !deleted
             }
+          }
         }
+      }
     }
+  } else false
+
+  if (!fallbackBlocked) {
     children.forEach { child ->
-        if (child.isDirectory && child.name.startsWith(".reprocess_backup_")) {
-            if (child.name in rootsToSkip) return@forEach
-            val classification = classifyTransactionManifest(jobDir, child)
-            when (classification) {
-                is ManifestClassification.Unresolved -> {
-                    if (isRootEvidenceFree(child)) {
-                        child.delete()
-                    }
-                }
-                is ManifestClassification.Resolved -> {
-                    cleanupTerminalRoot(child)
-                }
+      if (child.isDirectory && child.name.startsWith(".reprocess_backup_")) {
+        val classification = classifyTransactionManifest(jobDir, child)
+        when (classification) {
+          is ManifestClassification.Unresolved -> {
+            if (isRootEvidenceFree(child)) {
+              try { child.delete() } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+              catch (oom: OutOfMemoryError) { throw oom }
+              catch (td: ThreadDeath) { throw td }
+              catch (le: LinkageError) { throw le }
+              catch (ie: InternalError) { throw ie }
+              catch (e: Error) { throw e }
+              catch (_: Exception) { }
             }
+          }
+          is ManifestClassification.Resolved -> {
+            cleanupTerminalRoot(child)
+          }
         }
+      }
     }
+  }
 }
 
 /** True when a root has no marker, no manifest, no backup payload, and no temp evidence. */
