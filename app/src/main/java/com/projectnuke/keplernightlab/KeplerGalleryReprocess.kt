@@ -1269,15 +1269,19 @@ internal fun strictRootEvidence(jobDir: File, transaction: ReprocessTransaction)
             // directory or special → not trusted
         } else {
             // Reject symlink-backed markers: the marker itself must be a regular direct child.
-            val markerCanonical = try { marker.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+            var markerCanonical: File? = null
+            try { markerCanonical = marker.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
             catch (oom: OutOfMemoryError) { throw oom }
             catch (td: ThreadDeath) { throw td }
             catch (le: LinkageError) { throw le }
             catch (ie: InternalError) { throw ie }
             catch (e: Error) { throw e }
-            catch (_: Exception) { null }
-            if (markerCanonical == null || markerCanonical != marker.absoluteFile) {
-                // symlink marker → not trustworthy, but capture error if canonicalization failed
+            catch (ex: Exception) { markerInspectionError = ex }
+            if (markerCanonical == null) {
+                // Canonicalization failed — preserve the marker inspection error for retry reporting.
+                // The marker is not trustworthy but the failure is structural, not content-based.
+            } else if (markerCanonical != marker.absoluteFile) {
+                // symlink marker → not trustworthy
             } else {
             try {
                 val identity = readQuarantineMarkerIdentity(marker)
@@ -1369,7 +1373,7 @@ internal fun strictFallbackEvidence(jobDir: File, transaction: ReprocessTransact
     catch (le: LinkageError) { throw le }
     catch (ie: InternalError) { throw ie }
     catch (e: Error) { throw e }
-    catch (_: Exception) { return FallbackEvidence.InspectionFailed(Exception("Cannot canonicalize fallback marker")) }
+    catch (ex: Exception) { return FallbackEvidence.InspectionFailed(ex) }
     if (canonicalMarker != marker.absoluteFile) return FallbackEvidence.Untrustworthy
     val canonicalJob = try { jobDir.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
     catch (oom: OutOfMemoryError) { throw oom }
@@ -2251,22 +2255,24 @@ private fun fallbackIdentity(transaction: ReprocessTransaction): Triple<String, 
     transaction.transactionId, transaction.backupRoot.name, transaction.manifest.createdAt
 )
 
-/** Strict identity parser shared by fallback and quarantine markers. Expects exactly 3 non-blank
- *  lines in `key=value` format with keys: transactionId, backupRoot, createdAt.
- *  Rejects duplicate keys, unknown keys, blank values, whitespace padding, non-positive createdAt,
- *  and backupRoot that does not start with `.reprocess_backup_`. Does NOT catch exceptions —
+/** Strict identity parser shared by fallback and quarantine markers. Expects exactly 3
+ *  physical lines in `key=value` format with keys: transactionId, backupRoot, createdAt.
+ *  Rejects blank lines (leading, trailing, or intermediate), duplicate keys, unknown keys,
+ *  blank values, whitespace padding, extra `=` content, non-positive createdAt, and
+ *  backupRoot that does not start with `.reprocess_backup_`. Does NOT catch exceptions —
  *  IO/security failures propagate to the caller so the evidence layer can distinguish
  *  InspectionFailed from Untrustworthy. */
 private fun readMarkerIdentity(marker: File): Triple<String, String, Long>? {
     val lines = marker.readLines()
-    val nonblank = lines.filter { it.isNotBlank() }
-    if (nonblank.size != 3) return null
+    // Require exactly 3 physical lines; reject blank lines anywhere.
+    if (lines.size != 3) return null
+    if (lines.any { it.isBlank() }) return null
     val parsed = linkedMapOf<String, String>()
-    for (line in nonblank) {
+    for (line in lines) {
         val split = line.indexOf('=')
-        if (split <= 0) return null
+        if (split <= 0 || split == line.length - 1) return null
         val key = line.substring(0, split)
-        if (key.isEmpty() || parsed.containsKey(key)) return null
+        if (key.contains('=') || parsed.containsKey(key)) return null
         parsed[key] = line.substring(split + 1)
     }
     if (parsed.keys != setOf("transactionId", "backupRoot", "createdAt")) return null
@@ -2344,18 +2350,6 @@ internal fun removeMatchingFallbackQuarantine(jobDir: File, transaction: Reproce
     return deleted && !marker.exists()
 }
 
-
-/** Remove the quarantine marker only after a safe commit or rollback.
- * Throwing on marker removal failure is not required — the terminal state is already durable.
- * Caller wraps this in runCatching for the commit/rollback paths. */
-internal fun removeQuarantineMarker(transaction: ReprocessTransaction) {
-    val root = transaction.backupRoot
-    val marker = File(root, REPROCESS_QUARANTINE_MARKER)
-    if (marker.exists() && !marker.delete()) {
-        throw IllegalStateException("Quarantine marker deletion failed: ${marker.absolutePath}")
-    }
-}
-
 /**
  * True when any reprocess backup root has an unresolved (ACTIVE, QUARANTINED, missing,
  * corrupt, or incomplete) transaction. Resolved roots never mask unresolved roots.
@@ -2407,15 +2401,17 @@ internal fun recoverValidatedQuarantine(jobDir: File) {
     }
     return
   }
-  val children = jobDirListing
+val children = jobDirListing
   // Conservative fallback resolution: while an unverified or undeleted fallback
   // exists, skip ALL destructive terminal-root cleanup for this job.
   // This preserves every root that might be needed to resolve the fallback.
+  // Uses the same strict fallback evidence checks as strictFallbackEvidence()
+  // so symlink, canonical, and content validation are consistent.
   val fallbackBlocked = if (fallbackMarker.exists()) {
     if (!fallbackMarker.isFile) {
-      true
+      true // directory or special → blocked
     } else {
-      val fallbackId = try { readFallbackIdentity(fallbackMarker) }
+      val canonicalMarker = try { fallbackMarker.canonicalFile }
         catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
         catch (oom: OutOfMemoryError) { throw oom }
         catch (td: ThreadDeath) { throw td }
@@ -2423,44 +2419,67 @@ internal fun recoverValidatedQuarantine(jobDir: File) {
         catch (ie: InternalError) { throw ie }
         catch (e: Error) { throw e }
         catch (_: Exception) { null }
-      if (fallbackId == null) {
+      val canonicalJob = try { jobDir.canonicalFile }
+        catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+        catch (oom: OutOfMemoryError) { throw oom }
+        catch (td: ThreadDeath) { throw td }
+        catch (le: LinkageError) { throw le }
+        catch (ie: InternalError) { throw ie }
+        catch (e: Error) { throw e }
+        catch (_: Exception) { null }
+      // Symlink marker or canonicalization failure → not trusted, preserve roots.
+      if (canonicalMarker == null || canonicalMarker != fallbackMarker.absoluteFile) {
+        true
+      } else if (canonicalJob == null || canonicalMarker.parentFile?.canonicalFile != canonicalJob) {
         true
       } else {
-        val matchingRoot = children.firstOrNull { it.isDirectory && it.name == fallbackId.second }
-        if (matchingRoot == null) {
+        val fallbackId = try { readFallbackIdentity(fallbackMarker) }
+          catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+          catch (oom: OutOfMemoryError) { throw oom }
+          catch (td: ThreadDeath) { throw td }
+          catch (le: LinkageError) { throw le }
+          catch (ie: InternalError) { throw ie }
+          catch (e: Error) { throw e }
+          catch (_: Exception) { null }
+        if (fallbackId == null) {
           true
         } else {
-          val classification = classifyTransactionManifest(jobDir, matchingRoot)
-          if (classification !is ManifestClassification.Resolved) {
+          val matchingRoot = children.firstOrNull { it.isDirectory && it.name == fallbackId.second }
+          if (matchingRoot == null) {
             true
           } else {
-            val manifest = try { loadStrictManifest(File(matchingRoot, REPROCESS_TX_MANIFEST_FILE)) }
-            catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-            catch (oom: OutOfMemoryError) { throw oom }
-            catch (td: ThreadDeath) { throw td }
-            catch (le: LinkageError) { throw le }
-            catch (ie: InternalError) { throw ie }
-            catch (e: Error) { throw e }
-            catch (_: Exception) { null }
-            if (manifest == null ||
-                manifest.transactionId != fallbackId.first ||
-                matchingRoot.name != fallbackId.second ||
-                manifest.createdAt != fallbackId.third
-            ) {
+            val classification = classifyTransactionManifest(jobDir, matchingRoot)
+            if (classification !is ManifestClassification.Resolved) {
               true
             } else {
-              val deleted = try {
-                val deleteOp = fallbackDeleteOperation
-                val result = if (deleteOp != null) deleteOp(fallbackMarker) else fallbackMarker.delete()
-                result && !fallbackMarker.exists()
-              } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+              val manifest = try { loadStrictManifest(File(matchingRoot, REPROCESS_TX_MANIFEST_FILE)) }
+              catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
               catch (oom: OutOfMemoryError) { throw oom }
               catch (td: ThreadDeath) { throw td }
               catch (le: LinkageError) { throw le }
               catch (ie: InternalError) { throw ie }
               catch (e: Error) { throw e }
-              catch (_: Exception) { false }
-              !deleted
+              catch (_: Exception) { null }
+              if (manifest == null ||
+                manifest.transactionId != fallbackId.first ||
+                matchingRoot.name != fallbackId.second ||
+                manifest.createdAt != fallbackId.third
+              ) {
+                true
+              } else {
+                val deleted = try {
+                  val deleteOp = fallbackDeleteOperation
+                  val result = if (deleteOp != null) deleteOp(fallbackMarker) else fallbackMarker.delete()
+                  result && !fallbackMarker.exists()
+                } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+                catch (oom: OutOfMemoryError) { throw oom }
+                catch (td: ThreadDeath) { throw td }
+                catch (le: LinkageError) { throw le }
+                catch (ie: InternalError) { throw ie }
+                catch (e: Error) { throw e }
+                catch (_: Exception) { false }
+                !deleted
+              }
             }
           }
         }
@@ -3422,6 +3441,27 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     }
     val cleanupDelete = cleanupDeleteOperation
     val cleanupList = cleanupListOperation
+    /** Atomically restore the terminal manifest and verify it matches the durable identity.
+     *  Returns true when the restored manifest exists and is strictly valid for this transaction.
+     *  Returns false (best-effort) when restoration or verification fails — this is a
+     *  terminal evidence gap but does not escape the caller. */
+    fun restoreManifest(): Boolean {
+        return try {
+            KeplerJobMetadata.atomicWrite(manifestFile, durable.toJson().toString(2))
+            if (!manifestFile.isFile) return false
+            val restored = loadStrictManifest(manifestFile)
+            restored.transactionId == durable.transactionId &&
+                restored.createdAt == durable.createdAt &&
+                restored.hasSameImmutableIdentity(durable) &&
+                restored.state == durable.state
+        } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+        catch (oom: OutOfMemoryError) { throw oom }
+        catch (td: ThreadDeath) { throw td }
+        catch (le: LinkageError) { throw le }
+        catch (ie: InternalError) { throw ie }
+        catch (e: Error) { throw e }
+        catch (_: Exception) { false }
+    }
     fun listRoot(rootDir: File): Array<File>? {
         val seam = cleanupList
         return if (seam != null) seam(rootDir) else rootDir.listFiles()
@@ -3496,41 +3536,40 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
   if (manifestFile.exists()) return false
   // Seam: simulate a new file appearing after manifest deletion.
   afterManifestDeleteOperation?.invoke(root)
-  // 6. List root again. A new/unknown file that appeared after manifest deletion is blocking.
+  // 6. Check root existence and re-list. After manifest deletion, the root may be gone.
+  //  If root still exists but listing returns null, that is an IO failure — fail closed.
+  //  A new/unknown file that appeared after manifest deletion is blocking.
+  if (!root.exists()) return true // root already removed
   val afterManifestDelete = listRoot(root) ?: run {
-    // No listing means the root was already removed (e.g., concurrent deletion). Treat as success.
-    return true
-  }
-  if (afterManifestDelete.isNotEmpty()) {
-    // An unknown file appeared after manifest deletion. Restore the terminal manifest atomically
-    // so the root has a valid manifest for the next recovery attempt. Never recursively remove
-    // a file that appeared after the final listing.
-    try {
-      KeplerJobMetadata.atomicWrite(manifestFile, durable.toJson().toString(2))
-    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-    catch (oom: OutOfMemoryError) { throw oom }
-    catch (td: ThreadDeath) { throw td }
-    catch (le: LinkageError) { throw le }
-    catch (ie: InternalError) { throw ie }
-    catch (e: Error) { throw e }
-    catch (_: Exception) { /* manifest restore best-effort */ }
+    // Root still exists but listing returned null — IO failure, fail closed.
+    restoreManifest()
     return false
   }
-  // 7. Delete the now-empty root using non-recursive File.delete(). If root deletion fails,
-  //    restore the terminal manifest atomically so the evidence is preserved.
-  try {
-    val rootDeleted = cleanupRootDeleteOperation(root)
-    if (!rootDeleted) {
-      // Root deletion failed but manifest is already deleted. Restore the manifest.
+  if (afterManifestDelete.isNotEmpty()) {
+    // An unknown file appeared after manifest deletion. Restore terminal evidence.
+    // Never recursively remove a file that appeared after the final listing.
+    if (!restoreManifest()) {
+      // Manifest restoration failed while an unknown file exists. Leave a durable
+      // empty-root cleanup-debt marker so restart recovery can safely remove it.
       try {
-        KeplerJobMetadata.atomicWrite(manifestFile, durable.toJson().toString(2))
+        val debtFile = File(root, ".reprocess_cleanup_debt")
+        KeplerJobMetadata.atomicWrite(debtFile, durable.transactionId)
       } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
       catch (oom: OutOfMemoryError) { throw oom }
       catch (td: ThreadDeath) { throw td }
       catch (le: LinkageError) { throw le }
       catch (ie: InternalError) { throw ie }
       catch (e: Error) { throw e }
-      catch (_: Exception) { /* manifest restore best-effort */ }
+      catch (_: Exception) { /* best-effort debt marker */ }
+    }
+    return false
+  }
+  // 7. Delete the now-empty root using non-recursive File.delete(). If root deletion fails,
+  //    restore the terminal manifest and verify it matches the durable identity.
+  try {
+    val rootDeleted = cleanupRootDeleteOperation(root)
+    if (!rootDeleted) {
+      restoreManifest()
       return false
     }
   } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
@@ -3540,30 +3579,13 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
   catch (ie: InternalError) { throw ie }
   catch (e: Error) { throw e }
   catch (_: Exception) {
-    // Root deletion failed: restore manifest.
-    try {
-      KeplerJobMetadata.atomicWrite(manifestFile, durable.toJson().toString(2))
-    } catch (ce2: kotlinx.coroutines.CancellationException) { throw ce2 }
-    catch (oom2: OutOfMemoryError) { throw oom2 }
-    catch (td2: ThreadDeath) { throw td2 }
-    catch (le2: LinkageError) { throw le2 }
-    catch (ie2: InternalError) { throw ie2 }
-    catch (e2: Error) { throw e2 }
-    catch (_: Exception) { /* manifest restore best-effort */ }
+    // Root deletion threw: restore and verify terminal manifest.
+    restoreManifest()
     return false
   }
-  // Verify root absence.
+  // Verify root absence. If root persists after successful delete, restore evidence.
   if (root.exists()) {
-    // Root still exists after successful deletion call. Restore manifest.
-    try {
-      KeplerJobMetadata.atomicWrite(manifestFile, durable.toJson().toString(2))
-    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-    catch (oom: OutOfMemoryError) { throw oom }
-    catch (td: ThreadDeath) { throw td }
-    catch (le: LinkageError) { throw le }
-    catch (ie: InternalError) { throw ie }
-    catch (e: Error) { throw e }
-    catch (_: Exception) { /* manifest restore best-effort */ }
+    restoreManifest()
     return false
   }
   return true
