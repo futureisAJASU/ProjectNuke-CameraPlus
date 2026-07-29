@@ -2852,6 +2852,97 @@ fun strictEvidenceInspectionFailedRetainsOriginalException() = runBlocking {
   }
 }
 
+// ── Marker path classifier tests ──
+
+@Test
+fun classifyMarkerPath_liveSymlinkReturnsSymlink() = runBlocking {
+  val directory = tempJob()
+  try {
+    val outside = File(directory, "external_marker")
+    outside.writeText("transactionId=tx\nbackupRoot=.reprocess_backup_tx\ncreatedAt=1000\n")
+    val symlink = File(directory, "test_marker")
+    try {
+      Files.createSymbolicLink(symlink.toPath(), outside.toPath())
+    } catch (e: Exception) {
+      assumeTrue("Symlink creation not supported — skipping test", false)
+      return@runBlocking
+    }
+    val classification = classifyMarkerPath(symlink, directory)
+    assertTrue(classification is MarkerPathClassification.Symlink)
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun classifyMarkerPath_danglingSymlinkReturnsSymlink() = runBlocking {
+  val directory = tempJob()
+  try {
+    val missing = File(directory, "nonexistent_target")
+    val symlink = File(directory, "dangling_marker")
+    try {
+      Files.createSymbolicLink(symlink.toPath(), missing.toPath())
+    } catch (e: Exception) {
+      assumeTrue("Symlink creation not supported — skipping test", false)
+      return@runBlocking
+    }
+    val classification = classifyMarkerPath(symlink, directory)
+    // Dangling symlink is still a symlink
+    assertTrue(classification is MarkerPathClassification.Symlink)
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun classifyMarkerPath_directoryReturnsNotRegularFile() = runBlocking {
+  val directory = tempJob()
+  try {
+    val marker = File(directory, "test_marker")
+    marker.mkdir()
+    val classification = classifyMarkerPath(marker, directory)
+    assertTrue(classification is MarkerPathClassification.NotRegularFile)
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun readMarkerIdentity_extraEqualsInKeyReturnsNull() = runBlocking {
+  val directory = tempJob()
+  try {
+    val marker = File(directory, "test_marker")
+    marker.writeText("transactionId=tx\nbackupRoot=.reprocess_backup_tx\ncreate=dAt=1000\n")
+    assertNull(readQuarantineMarkerIdentity(marker))
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun readMarkerIdentity_whitespaceInKeyReturnsNull() = runBlocking {
+  val directory = tempJob()
+  try {
+    val marker = File(directory, "test_marker")
+    marker.writeText("transactionId=tx\nbackupRoo t=.reprocess_backup_tx\ncreatedAt=1000\n")
+    assertNull(readQuarantineMarkerIdentity(marker))
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun readMarkerIdentity_backupRootWithoutPrefixReturnsNull() = runBlocking {
+  val directory = tempJob()
+  try {
+    val marker = File(directory, "test_marker")
+    marker.writeText("transactionId=tx\nbackupRoot=wrong_name\ncreatedAt=1000\n")
+    assertNull(readQuarantineMarkerIdentity(marker))
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
 private fun rootManifest(txId: String, root: File): ReprocessTransactionManifest = ReprocessTransactionManifest(
   transactionId = txId,
   createdAt = System.currentTimeMillis(),

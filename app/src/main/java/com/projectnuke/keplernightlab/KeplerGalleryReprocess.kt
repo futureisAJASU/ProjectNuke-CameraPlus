@@ -19,6 +19,8 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -1264,25 +1266,8 @@ internal fun strictRootEvidence(jobDir: File, transaction: ReprocessTransaction)
     // (a) Identity-bound quarantine marker with matching transaction identity, evaluated independently.
     //     Legacy fixed-content marker is NOT independently trustworthy — falls through to manifest check.
     val marker = File(backupRoot, REPROCESS_QUARANTINE_MARKER)
-    if (marker.exists()) {
-        if (!marker.isFile) {
-            // directory or special → not trusted
-        } else {
-            // Reject symlink-backed markers: the marker itself must be a regular direct child.
-            var markerCanonical: File? = null
-            try { markerCanonical = marker.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-            catch (oom: OutOfMemoryError) { throw oom }
-            catch (td: ThreadDeath) { throw td }
-            catch (le: LinkageError) { throw le }
-            catch (ie: InternalError) { throw ie }
-            catch (e: Error) { throw e }
-            catch (ex: Exception) { markerInspectionError = ex }
-            if (markerCanonical == null) {
-                // Canonicalization failed — preserve the marker inspection error for retry reporting.
-                // The marker is not trustworthy but the failure is structural, not content-based.
-            } else if (markerCanonical != marker.absoluteFile) {
-                // symlink marker → not trustworthy
-            } else {
+    when (val classification = classifyMarkerPath(marker, backupRoot)) {
+        is MarkerPathClassification.Valid -> {
             try {
                 val identity = readQuarantineMarkerIdentity(marker)
                 if (identity != null &&
@@ -1300,7 +1285,11 @@ internal fun strictRootEvidence(jobDir: File, transaction: ReprocessTransaction)
             catch (e: Error) { throw e }
             catch (readFailure: Exception) { markerInspectionError = readFailure }
         }
+        is MarkerPathClassification.InspectionError -> {
+            markerInspectionError = classification.cause
         }
+        // Absent, Symlink, NotRegularFile, NotDirectChild → not trustworthy
+        else -> {}
     }
     if (markerTrustworthy) return RootEvidence.Trustworthy
 
@@ -1362,54 +1351,71 @@ internal sealed class FallbackEvidence {
  */
 internal fun strictFallbackEvidence(jobDir: File, transaction: ReprocessTransaction): FallbackEvidence {
     val marker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
-    if (!marker.exists()) return FallbackEvidence.Untrustworthy
-    if (!marker.isFile) return FallbackEvidence.Untrustworthy
-    // Reject symlink markers: the marker itself must be a regular direct child, not a symlink
-    // to an external file. A symlink pointing to a correctly formatted file must not be trusted
-    // and must not permit terminal-root cleanup.
-    val canonicalMarker = try { marker.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-    catch (oom: OutOfMemoryError) { throw oom }
-    catch (td: ThreadDeath) { throw td }
-    catch (le: LinkageError) { throw le }
-    catch (ie: InternalError) { throw ie }
-    catch (e: Error) { throw e }
-    catch (ex: Exception) { return FallbackEvidence.InspectionFailed(ex) }
-    if (canonicalMarker != marker.absoluteFile) return FallbackEvidence.Untrustworthy
-    val canonicalJob = try { jobDir.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-    catch (oom: OutOfMemoryError) { throw oom }
-    catch (td: ThreadDeath) { throw td }
-    catch (le: LinkageError) { throw le }
-    catch (ie: InternalError) { throw ie }
-    catch (e: Error) { throw e }
-    catch (ce: Exception) { return FallbackEvidence.InspectionFailed(ce) }
-    val markerParent = try { marker.parentFile?.canonicalFile }
-    catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-    catch (oom: OutOfMemoryError) { throw oom }
-    catch (td: ThreadDeath) { throw td }
-    catch (le: LinkageError) { throw le }
-    catch (ie: InternalError) { throw ie }
-    catch (e: Error) { throw e }
-    catch (pe: Exception) { return FallbackEvidence.InspectionFailed(pe) }
-    if (markerParent != canonicalJob) return FallbackEvidence.Untrustworthy
-    val identity = try { readFallbackIdentity(marker) }
-    catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-    catch (oom: OutOfMemoryError) { throw oom }
-    catch (td: ThreadDeath) { throw td }
-    catch (le: LinkageError) { throw le }
-    catch (ie: InternalError) { throw ie }
-    catch (e: Error) { throw e }
-    catch (readFailure: Exception) { return FallbackEvidence.InspectionFailed(readFailure) }
-    if (identity == null) return FallbackEvidence.Untrustworthy
-    if (identity.first != transaction.transactionId) return FallbackEvidence.Untrustworthy
-    if (identity.second != transaction.backupRoot.name) return FallbackEvidence.Untrustworthy
-    if (identity.third != transaction.manifest.createdAt) return FallbackEvidence.Untrustworthy
-    return FallbackEvidence.Trustworthy
+    return when (val classification = classifyMarkerPath(marker, jobDir)) {
+        is MarkerPathClassification.Valid -> {
+            val identity = try { readFallbackIdentity(marker) }
+            catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+            catch (oom: OutOfMemoryError) { throw oom }
+            catch (td: ThreadDeath) { throw td }
+            catch (le: LinkageError) { throw le }
+            catch (ie: InternalError) { throw ie }
+            catch (e: Error) { throw e }
+            catch (readFailure: Exception) { return FallbackEvidence.InspectionFailed(readFailure) }
+            if (identity == null) return FallbackEvidence.Untrustworthy
+            if (identity.first != transaction.transactionId) return FallbackEvidence.Untrustworthy
+            if (identity.second != transaction.backupRoot.name) return FallbackEvidence.Untrustworthy
+            if (identity.third != transaction.manifest.createdAt) return FallbackEvidence.Untrustworthy
+            FallbackEvidence.Trustworthy
+        }
+        is MarkerPathClassification.InspectionError -> FallbackEvidence.InspectionFailed(classification.cause)
+        is MarkerPathClassification.Absent,
+        is MarkerPathClassification.Symlink,
+        is MarkerPathClassification.NotRegularFile,
+        is MarkerPathClassification.NotDirectChild -> FallbackEvidence.Untrustworthy
+    }
 }
 
 /** Boolean shim for fallback evidence. */
 internal fun hasTrustworthyFallbackEvidence(jobDir: File, transaction: ReprocessTransaction): Boolean =
     strictFallbackEvidence(jobDir, transaction) === FallbackEvidence.Trustworthy
 
+/**
+ * Marker path classification using NIO [LinkOption.NOFOLLOW_LINKS].
+ * [Valid] only when the marker is a regular file, not a symlink, and a direct child
+ * of the expected parent directory. IO/security failures produce [InspectionError].
+ */
+internal sealed class MarkerPathClassification {
+    data class Valid(val file: File) : MarkerPathClassification()
+    data object Absent : MarkerPathClassification()
+    data object NotRegularFile : MarkerPathClassification()
+    data object Symlink : MarkerPathClassification()
+    data object NotDirectChild : MarkerPathClassification()
+    data class InspectionError(val cause: Throwable) : MarkerPathClassification()
+}
+
+/**
+ * Classify [marker] relative to its expected [parentDir] using NIO [LinkOption.NOFOLLOW_LINKS].
+ * A symlink marker (live or dangling) is never [Valid]. A non-existent marker is [Absent].
+ * A directory or special file is [NotRegularFile]. IO/security exceptions propagate as [InspectionError].
+ */
+internal fun classifyMarkerPath(marker: File, parentDir: File): MarkerPathClassification {
+    return try {
+        val path = marker.toPath()
+        if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) return MarkerPathClassification.Absent
+        if (Files.isSymbolicLink(path)) return MarkerPathClassification.Symlink
+        if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) return MarkerPathClassification.NotRegularFile
+        val canonicalParent = parentDir.canonicalFile
+        val markerParent = marker.parentFile?.canonicalFile
+        if (markerParent != canonicalParent) return MarkerPathClassification.NotDirectChild
+        MarkerPathClassification.Valid(marker)
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (ex: Exception) { MarkerPathClassification.InspectionError(ex) }
+}
 
 /**
  * Single authoritative transaction finalizer. All post-transaction outcomes (success, failure,
@@ -2061,24 +2067,22 @@ internal fun writeQuarantineMarker(transaction: ReprocessTransaction) {
     check(root.isDirectory) { "Quarantine marker write failed: backup root missing or not a directory: $root" }
     val marker = File(root, REPROCESS_QUARANTINE_MARKER)
     val expectedContent = quarantineMarkerContent(transaction)
-    if (marker.exists()) {
-        check(marker.isFile) { "Quarantine marker path exists but is not a regular file: $marker" }
-        // Reject symlink-backed marker — must be a canonical direct child.
-        check(marker.canonicalFile == marker.absoluteFile) {
-            "Quarantine marker is a symlink, not a direct child: $marker"
+    when (val existing = classifyMarkerPath(marker, root)) {
+        is MarkerPathClassification.Valid -> {
+            val identity = readQuarantineMarkerIdentity(marker)
+            if (identity != null &&
+                identity.first == transaction.transactionId &&
+                identity.second == transaction.backupRoot.name &&
+                identity.third == transaction.manifest.createdAt
+            ) {
+                return // Identity-bound marker with matching identity already exists
+            }
         }
-        check(marker.parentFile?.canonicalFile == root.canonicalFile) {
-            "Quarantine marker parent is not the backup root: $marker"
-        }
-        val identity = readQuarantineMarkerIdentity(marker)
-        if (identity != null &&
-            identity.first == transaction.transactionId &&
-            identity.second == transaction.backupRoot.name &&
-            identity.third == transaction.manifest.createdAt
-        ) {
-            return // Identity-bound marker with matching identity already exists
-        }
-        // Legacy fixed-content or mismatched marker → overwrite below
+        is MarkerPathClassification.Absent -> { /* write below */ }
+        is MarkerPathClassification.Symlink -> error("Quarantine marker is a symlink, not a direct child: $marker")
+        is MarkerPathClassification.NotRegularFile -> error("Quarantine marker path exists but is not a regular file: $marker")
+        is MarkerPathClassification.NotDirectChild -> error("Quarantine marker parent is not the backup root: $marker")
+        is MarkerPathClassification.InspectionError -> error("Quarantine marker inspection failed: $marker")
     }
     val writeOp = quarantineMarkerWriteOperation
     if (writeOp != null) {
@@ -2086,7 +2090,7 @@ internal fun writeQuarantineMarker(transaction: ReprocessTransaction) {
     } else {
         KeplerJobMetadata.atomicWrite(marker, expectedContent)
     }
-    check(marker.isFile) { "Quarantine marker write produced no file: $marker" }
+    check(classifyMarkerPath(marker, root) is MarkerPathClassification.Valid) { "Quarantine marker write produced no valid file: $marker" }
     val writtenIdentity = readQuarantineMarkerIdentity(marker)
     check(writtenIdentity != null &&
           writtenIdentity.first == transaction.transactionId &&
@@ -2224,19 +2228,22 @@ internal fun persistUnresolvedQuarantine(
 internal fun ensureDurableFallbackQuarantine(jobDir: File, transaction: ReprocessTransaction) {
     check(jobDir.isDirectory) { "Job directory unavailable for fallback quarantine" }
     val marker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
-    if (marker.exists()) {
-        check(marker.isFile) { "Fallback quarantine marker exists but is not a regular file" }
-        // Reject symlink-backed marker — must be a canonical direct child.
-        check(marker.canonicalFile == marker.absoluteFile) {
-            "Fallback quarantine marker is a symlink, not a direct child"
+    when (val existing = classifyMarkerPath(marker, jobDir)) {
+        is MarkerPathClassification.Valid -> {
+            check(readFallbackIdentity(marker) == fallbackIdentity(transaction)) {
+                "Existing fallback quarantine marker belongs to another or corrupt transaction"
+            }
+            return
         }
-        check(marker.parentFile?.canonicalFile == jobDir.canonicalFile) {
-            "Fallback quarantine marker parent is not the job directory"
-        }
-        check(readFallbackIdentity(marker) == fallbackIdentity(transaction)) {
-            "Existing fallback quarantine marker belongs to another or corrupt transaction"
-        }
-        return
+        is MarkerPathClassification.Absent -> { /* write below */ }
+        is MarkerPathClassification.Symlink ->
+            error("Fallback quarantine marker is a symlink, not a direct child")
+        is MarkerPathClassification.NotRegularFile ->
+            error("Fallback quarantine marker exists but is not a regular file")
+        is MarkerPathClassification.NotDirectChild ->
+            error("Fallback quarantine marker parent is not the job directory")
+        is MarkerPathClassification.InspectionError ->
+            error("Fallback quarantine marker inspection failed")
     }
     val payload = buildString {
         append("transactionId="); append(transaction.transactionId); append('\n')
@@ -2339,15 +2346,16 @@ internal var finalizerFailureSeam: (() -> Throwable?)? = null
  */
 internal fun removeMatchingFallbackQuarantine(jobDir: File, transaction: ReprocessTransaction): Boolean {
     val marker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
-    if (!marker.exists()) return true
-    // Reject symlink markers — only remove verified direct-child markers.
-    if (!marker.isFile) return false
-    if (marker.canonicalFile != marker.absoluteFile) return false
-    if (marker.parentFile?.canonicalFile != jobDir.canonicalFile) return false
-    if (readFallbackIdentity(marker) != fallbackIdentity(transaction)) return false
-    val deleteOp = fallbackDeleteOperation
-    val deleted = if (deleteOp != null) deleteOp(marker) else marker.delete()
-    return deleted && !marker.exists()
+    return when (val classification = classifyMarkerPath(marker, jobDir)) {
+        is MarkerPathClassification.Absent -> true
+        is MarkerPathClassification.Valid -> {
+            if (readFallbackIdentity(marker) != fallbackIdentity(transaction)) return false
+            val deleteOp = fallbackDeleteOperation
+            val deleted = if (deleteOp != null) deleteOp(marker) else marker.delete()
+            deleted && !marker.exists()
+        }
+        else -> false
+    }
 }
 
 /**
@@ -2402,16 +2410,10 @@ internal fun recoverValidatedQuarantine(jobDir: File) {
     return
   }
 val children = jobDirListing
-  // Conservative fallback resolution: while an unverified or undeleted fallback
-  // exists, skip ALL destructive terminal-root cleanup for this job.
-  // This preserves every root that might be needed to resolve the fallback.
-  // Uses the same strict fallback evidence checks as strictFallbackEvidence()
-  // so symlink, canonical, and content validation are consistent.
-  val fallbackBlocked = if (fallbackMarker.exists()) {
-    if (!fallbackMarker.isFile) {
-      true // directory or special → blocked
-    } else {
-      val canonicalMarker = try { fallbackMarker.canonicalFile }
+  val fallbackBlocked = when (val fc = classifyMarkerPath(fallbackMarker, jobDir)) {
+    is MarkerPathClassification.Absent -> false
+    is MarkerPathClassification.Valid -> {
+      val fallbackId = try { readFallbackIdentity(fallbackMarker) }
         catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
         catch (oom: OutOfMemoryError) { throw oom }
         catch (td: ThreadDeath) { throw td }
@@ -2419,73 +2421,52 @@ val children = jobDirListing
         catch (ie: InternalError) { throw ie }
         catch (e: Error) { throw e }
         catch (_: Exception) { null }
-      val canonicalJob = try { jobDir.canonicalFile }
-        catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-        catch (oom: OutOfMemoryError) { throw oom }
-        catch (td: ThreadDeath) { throw td }
-        catch (le: LinkageError) { throw le }
-        catch (ie: InternalError) { throw ie }
-        catch (e: Error) { throw e }
-        catch (_: Exception) { null }
-      // Symlink marker or canonicalization failure → not trusted, preserve roots.
-      if (canonicalMarker == null || canonicalMarker != fallbackMarker.absoluteFile) {
-        true
-      } else if (canonicalJob == null || canonicalMarker.parentFile?.canonicalFile != canonicalJob) {
+      if (fallbackId == null) {
         true
       } else {
-        val fallbackId = try { readFallbackIdentity(fallbackMarker) }
-          catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-          catch (oom: OutOfMemoryError) { throw oom }
-          catch (td: ThreadDeath) { throw td }
-          catch (le: LinkageError) { throw le }
-          catch (ie: InternalError) { throw ie }
-          catch (e: Error) { throw e }
-          catch (_: Exception) { null }
-        if (fallbackId == null) {
+        val matchingRoot = children.firstOrNull { it.isDirectory && it.name == fallbackId.second }
+        if (matchingRoot == null) {
           true
         } else {
-          val matchingRoot = children.firstOrNull { it.isDirectory && it.name == fallbackId.second }
-          if (matchingRoot == null) {
+          val classification = classifyTransactionManifest(jobDir, matchingRoot)
+          if (classification !is ManifestClassification.Resolved) {
             true
           } else {
-            val classification = classifyTransactionManifest(jobDir, matchingRoot)
-            if (classification !is ManifestClassification.Resolved) {
+            val manifest = try { loadStrictManifest(File(matchingRoot, REPROCESS_TX_MANIFEST_FILE)) }
+            catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+            catch (oom: OutOfMemoryError) { throw oom }
+            catch (td: ThreadDeath) { throw td }
+            catch (le: LinkageError) { throw le }
+            catch (ie: InternalError) { throw ie }
+            catch (e: Error) { throw e }
+            catch (_: Exception) { null }
+            if (manifest == null ||
+              manifest.transactionId != fallbackId.first ||
+              matchingRoot.name != fallbackId.second ||
+              manifest.createdAt != fallbackId.third
+            ) {
               true
             } else {
-              val manifest = try { loadStrictManifest(File(matchingRoot, REPROCESS_TX_MANIFEST_FILE)) }
-              catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+              val deleted = try {
+                val deleteOp = fallbackDeleteOperation
+                val result = if (deleteOp != null) deleteOp(fallbackMarker) else fallbackMarker.delete()
+                result && !fallbackMarker.exists()
+              } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
               catch (oom: OutOfMemoryError) { throw oom }
               catch (td: ThreadDeath) { throw td }
               catch (le: LinkageError) { throw le }
               catch (ie: InternalError) { throw ie }
               catch (e: Error) { throw e }
-              catch (_: Exception) { null }
-              if (manifest == null ||
-                manifest.transactionId != fallbackId.first ||
-                matchingRoot.name != fallbackId.second ||
-                manifest.createdAt != fallbackId.third
-              ) {
-                true
-              } else {
-                val deleted = try {
-                  val deleteOp = fallbackDeleteOperation
-                  val result = if (deleteOp != null) deleteOp(fallbackMarker) else fallbackMarker.delete()
-                  result && !fallbackMarker.exists()
-                } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-                catch (oom: OutOfMemoryError) { throw oom }
-                catch (td: ThreadDeath) { throw td }
-                catch (le: LinkageError) { throw le }
-                catch (ie: InternalError) { throw ie }
-                catch (e: Error) { throw e }
-                catch (_: Exception) { false }
-                !deleted
-              }
+              catch (_: Exception) { false }
+              !deleted
             }
           }
         }
       }
     }
-  } else false
+    // Symlink, NotRegularFile, NotDirectChild, InspectionError → blocked
+    else -> true
+  }
 
   if (!fallbackBlocked) {
     children.forEach { child ->
@@ -3394,6 +3375,11 @@ internal var cleanupRootDeleteOperation: (File) -> Boolean = { it.delete() }
  *  Reset in `finally`. */
 internal var afterManifestDeleteOperation: ((File) -> Unit)? = null
 
+/** Narrow injectable seam: overrides the manifest restoration logic inside [cleanupBackups].
+ *  When non-null, the result is used directly instead of the real atomic-write + verify path.
+ *  Reset in `finally`. */
+internal var manifestRestoreOperation: (() -> Boolean)? = null
+
 /**
  * Safe backup cleanup, shared by immediate finalization and process-restart recovery.
  *
@@ -3446,6 +3432,8 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
      *  Returns false (best-effort) when restoration or verification fails — this is a
      *  terminal evidence gap but does not escape the caller. */
     fun restoreManifest(): Boolean {
+        val seam = manifestRestoreOperation
+        if (seam != null) return seam()
         return try {
             KeplerJobMetadata.atomicWrite(manifestFile, durable.toJson().toString(2))
             if (!manifestFile.isFile) return false
@@ -3549,18 +3537,27 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     // An unknown file appeared after manifest deletion. Restore terminal evidence.
     // Never recursively remove a file that appeared after the final listing.
     if (!restoreManifest()) {
-      // Manifest restoration failed while an unknown file exists. Leave a durable
-      // empty-root cleanup-debt marker so restart recovery can safely remove it.
+      // Manifest restoration failed while an unknown file exists. Write a job-level
+      // fallback quarantine marker so restart recovery can resolve the orphan root.
       try {
-        val debtFile = File(root, ".reprocess_cleanup_debt")
-        KeplerJobMetadata.atomicWrite(debtFile, durable.transactionId)
+        val jobDir = root.parentFile
+        if (jobDir != null) {
+          val payload = buildString {
+            append("transactionId="); append(transaction.transactionId); append('\n')
+            append("backupRoot="); append(root.name); append('\n')
+            append("createdAt="); append(transaction.manifest.createdAt); append('\n')
+          }
+          KeplerJobMetadata.atomicWrite(
+            File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER), payload
+          )
+        }
       } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
       catch (oom: OutOfMemoryError) { throw oom }
       catch (td: ThreadDeath) { throw td }
       catch (le: LinkageError) { throw le }
       catch (ie: InternalError) { throw ie }
       catch (e: Error) { throw e }
-      catch (_: Exception) { /* best-effort debt marker */ }
+      catch (_: Exception) { /* best-effort fallback marker */ }
     }
     return false
   }
