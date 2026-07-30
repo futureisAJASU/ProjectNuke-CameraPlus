@@ -1,6 +1,7 @@
 package com.projectnuke.keplernightlab
 
 import org.json.JSONObject
+import java.util.Locale
 
 const val CLASSIC_YUV_FUSION_PARAMS_VERSION = "classic_yuv_v1_1"
 
@@ -18,22 +19,43 @@ data class ClassicYuvFusionParams(
     val highlightRollOff: Float
 ) {
     fun clamped(): ClassicYuvFusionParams {
-        val safePresetName = presetName.uppercase().takeIf {
+        val safePresetName = presetName.uppercase(Locale.US).takeIf {
             it in setOf("NATURAL", "CLEAN", "SHARP", "NIGHT_BRIGHT")
         } ?: "NATURAL"
+        val defaults = ClassicYuvFusionPreset.fromName(safePresetName).params
         return copy(
-        presetName = safePresetName,
-        referenceWeight = referenceWeight.coerceIn(1.0f, 3.0f),
-        ghostThreshold = ghostThreshold.coerceIn(12f, 80f),
-        ghostWeight = ghostWeight.coerceIn(0.01f, 0.35f),
-        alignmentRejectThreshold = alignmentRejectThreshold.coerceIn(0.08f, 0.40f),
-        denoiseStrength = denoiseStrength.coerceIn(0f, 0.55f),
-        sharpenAmount = sharpenAmount.coerceIn(0f, 0.55f),
-        localContrastAmount = localContrastAmount.coerceIn(0f, 0.18f),
-        saturationBoost = saturationBoost.coerceIn(0.90f, 1.18f),
-        shadowLift = shadowLift.coerceIn(0f, 0.12f),
-        highlightRollOff = highlightRollOff.coerceIn(0f, 0.35f)
-    )
+            presetName = safePresetName,
+            referenceWeight = referenceWeight
+                .finiteOr(defaults.referenceWeight)
+                .coerceIn(1.0f, 3.0f),
+            ghostThreshold = ghostThreshold
+                .finiteOr(defaults.ghostThreshold)
+                .coerceIn(12f, 80f),
+            ghostWeight = ghostWeight
+                .finiteOr(defaults.ghostWeight)
+                .coerceIn(0.01f, 0.35f),
+            alignmentRejectThreshold = alignmentRejectThreshold
+                .finiteOr(defaults.alignmentRejectThreshold)
+                .coerceIn(0.08f, 0.40f),
+            denoiseStrength = denoiseStrength
+                .finiteOr(defaults.denoiseStrength)
+                .coerceIn(0f, 0.55f),
+            sharpenAmount = sharpenAmount
+                .finiteOr(defaults.sharpenAmount)
+                .coerceIn(0f, 0.55f),
+            localContrastAmount = localContrastAmount
+                .finiteOr(defaults.localContrastAmount)
+                .coerceIn(0f, 0.18f),
+            saturationBoost = saturationBoost
+                .finiteOr(defaults.saturationBoost)
+                .coerceIn(0.90f, 1.18f),
+            shadowLift = shadowLift
+                .finiteOr(defaults.shadowLift)
+                .coerceIn(0f, 0.12f),
+            highlightRollOff = highlightRollOff
+                .finiteOr(defaults.highlightRollOff)
+                .coerceIn(0f, 0.35f)
+        )
     }
 
     fun toJson(): JSONObject = JSONObject()
@@ -73,7 +95,7 @@ enum class ClassicYuvFusionPreset(
 
     companion object {
         fun fromName(name: String?): ClassicYuvFusionPreset =
-            entries.firstOrNull { it.name == name?.uppercase() } ?: NATURAL
+            entries.firstOrNull { it.name == name?.uppercase(Locale.US) } ?: NATURAL
     }
 }
 
@@ -107,3 +129,5 @@ private fun JSONObject.requireFiniteFloat(key: String): Float {
     require(has(key) && !isNull(key)) { "Missing $key" }
     return optDouble(key, Double.NaN).also { require(it.isFinite()) }.toFloat()
 }
+
+private fun Float.finiteOr(fallback: Float): Float = if (isFinite()) this else fallback

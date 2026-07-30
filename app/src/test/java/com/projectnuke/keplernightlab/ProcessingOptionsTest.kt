@@ -79,4 +79,22 @@ class ProcessingOptionsTest {
             )
         )
     }
+    @Test
+    fun nonFiniteSettingsFallBackToPresetDefaults() {
+        val preset = ClassicYuvFusionPreset.CLEAN
+        val normalized = ProcessingSettings(
+            presetName = preset.name,
+            denoiseStrength = Float.NaN,
+            sharpenAmount = Float.POSITIVE_INFINITY,
+            localContrastAmount = Float.NEGATIVE_INFINITY
+        ).normalized()
+
+        assertEquals(preset.params.denoiseStrength, normalized.denoiseStrength, 0.0001f)
+        assertEquals(preset.params.sharpenAmount, normalized.sharpenAmount, 0.0001f)
+        assertEquals(preset.params.localContrastAmount, normalized.localContrastAmount, 0.0001f)
+
+        val clamped = preset.params.copy(denoiseStrength = Float.NaN).clamped()
+        assertTrue(clamped.denoiseStrength.isFinite())
+    }
+
 }

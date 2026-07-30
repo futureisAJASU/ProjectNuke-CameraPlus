@@ -22,11 +22,14 @@ data class ProcessingSettings(
 ) {
     fun normalized(): ProcessingSettings {
         val preset = ClassicYuvFusionPreset.fromName(presetName)
+        val base = preset.params
         return copy(
             presetName = preset.name,
-            denoiseStrength = denoiseStrength.coerceIn(0f, 0.55f),
-            sharpenAmount = sharpenAmount.coerceIn(0f, 0.55f),
-            localContrastAmount = localContrastAmount.coerceIn(0f, 0.18f)
+            denoiseStrength = denoiseStrength.finiteOr(base.denoiseStrength).coerceIn(0f, 0.55f),
+            sharpenAmount = sharpenAmount.finiteOr(base.sharpenAmount).coerceIn(0f, 0.55f),
+            localContrastAmount = localContrastAmount
+                .finiteOr(base.localContrastAmount)
+                .coerceIn(0f, 0.18f)
         )
     }
 
@@ -69,3 +72,5 @@ internal fun isSingleFrameJob(job: org.json.JSONObject): Boolean =
         job.optInt("requestedFrames", 0) == 1 &&
         job.optInt("savedFrames", 0) == 1 &&
         job.optString("fusionEngine").startsWith("single_yuv_isp")
+
+private fun Float.finiteOr(fallback: Float): Float = if (isFinite()) this else fallback

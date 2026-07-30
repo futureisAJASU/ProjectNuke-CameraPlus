@@ -141,8 +141,10 @@ private data class BufferedYuvFrame(
     val vPixelStride: Int
 )
 
+// YUV_420_888 plane buffers may include row padding and interleaved chroma storage.
+// Use a conservative 3 bytes/pixel estimate rather than the tightly packed 1.5 bytes/pixel ideal.
 private fun estimateYuvBufferBytes(width: Int, height: Int): Long =
-    width.toLong() * height.toLong() * 3L / 2L
+    width.toLong() * height.toLong() * 3L
 
 private fun canUseYuvMemoryBuffer(width: Int, height: Int, frameCount: Int): Boolean {
     if (!ENABLE_YUV_MEMORY_BURST_BUFFER) return false

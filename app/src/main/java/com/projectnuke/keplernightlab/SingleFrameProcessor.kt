@@ -5,6 +5,8 @@ import android.graphics.BitmapFactory
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.util.concurrent.CancellationException
 
 internal const val SINGLE_FRAME_OUTPUT_FILE_NAME = "single_frame_processed.png"
@@ -34,6 +36,9 @@ internal fun processSingleFrameJobSync(
 
     var sourceForCleanup: Bitmap? = null
     var processedForCleanup: Bitmap? = null
+    var outputFile: File? = null
+    var outputWritten = false
+    var outputExistedBefore = false
     try {
         val frames = job.optJSONArray("frames")
             ?: error("Single-frame job has no frames array")
@@ -46,10 +51,7 @@ internal fun processSingleFrameJobSync(
                     it.optString("file").isNotBlank()
             }
             ?: error("Single-frame job has no enabled source frame")
-        val sourceFile = File(jobDir, frame.getString("file"))
-        require(sourceFile.isFile && sourceFile.length() > 0L) {
-            "Single-frame source is missing: ${sourceFile.name}"
-        }
+        val sourceFile = resolveSingleFrameSourceFile(jobDir, frame.getString("file"))
 
         onStatus("일반 사진 ISP 후처리 중입니다.")
         cancellation.throwIfCancelled()
@@ -67,18 +69,34 @@ internal fun processSingleFrameJobSync(
         processedForCleanup = processedBitmap
         cancellation.throwIfCancelled()
 
-        val outputFile = File(jobDir, SINGLE_FRAME_OUTPUT_FILE_NAME)
+        outputFile = File(jobDir, SINGLE_FRAME_OUTPUT_FILE_NAME)
+        val outputPath = outputFile.toPath()
+        outputExistedBefore = Files.exists(outputPath, LinkOption.NOFOLLOW_LINKS)
+        require(!Files.isSymbolicLink(outputPath)) {
+            "Single-frame output path must not be a symbolic link"
+        }
+        require(
+            !outputExistedBefore || Files.isRegularFile(outputPath, LinkOption.NOFOLLOW_LINKS)
+        ) {
+            "Single-frame output path is not a regular file"
+        }
         writeBitmapPngAtomically(processedBitmap, outputFile)
+        outputWritten = true
         cancellation.throwIfCancelled()
-        check(outputFile.isFile && outputFile.length() > 0L) {
+        check(
+            !Files.isSymbolicLink(outputPath) &&
+                Files.isRegularFile(outputPath, LinkOption.NOFOLLOW_LINKS) &&
+                Files.size(outputPath) > 0L
+        ) {
             "Single-frame output verification failed"
         }
         val finishedAt = System.currentTimeMillis()
 
+        val completedOutput = requireNotNull(outputFile)
         persistSingleFrameSuccess(
             jobDir = jobDir,
             frame = frame,
-            outputFile = outputFile,
+            outputFile = completedOutput,
             outputWidth = processedBitmap.width,
             outputHeight = processedBitmap.height,
             params = params,
@@ -87,20 +105,132 @@ internal fun processSingleFrameJobSync(
             metadataPolicy = metadataPolicy
         )
         onStatus("일반 사진 후처리가 완료되었습니다.")
-        return outputFile
+        return completedOutput
     } catch (ce: CancellationException) {
+        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            val retainedOutput = cleanupCancelledSingleFrameOutput(
+                outputFile = outputFile,
+                outputWritten = outputWritten,
+                outputExistedBefore = outputExistedBefore
+            )
+            persistSingleFrameCancellation(
+                jobDir = jobDir,
+                params = params,
+                processingStartedAt = processingStartedAt,
+                outputRetained = retainedOutput,
+                cancellation = ce
+            )
+        }
         throw ce
     } catch (oom: OutOfMemoryError) {
-        persistSingleFrameFailure(jobDir, params, processingStartedAt, metadataPolicy, oom)
+        val retainedOutput = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            cleanupCancelledSingleFrameOutput(outputFile, outputWritten, outputExistedBefore)
+        } else {
+            false
+        }
+        persistSingleFrameFailure(
+            jobDir,
+            params,
+            processingStartedAt,
+            metadataPolicy,
+            oom,
+            retainedOutput
+        )
         throw oom
     } catch (e: Exception) {
-        persistSingleFrameFailure(jobDir, params, processingStartedAt, metadataPolicy, e)
+        val retainedOutput = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            cleanupCancelledSingleFrameOutput(outputFile, outputWritten, outputExistedBefore)
+        } else {
+            false
+        }
+        persistSingleFrameFailure(
+            jobDir,
+            params,
+            processingStartedAt,
+            metadataPolicy,
+            e,
+            retainedOutput
+        )
         throw e
     } finally {
         processedForCleanup?.takeIf { !it.isRecycled }?.recycle()
         sourceForCleanup
             ?.takeIf { it !== processedForCleanup && !it.isRecycled }
             ?.recycle()
+    }
+}
+
+private fun resolveSingleFrameSourceFile(jobDir: File, rawName: String): File {
+    require(rawName == rawName.trim()) { "Single-frame source name has surrounding whitespace" }
+    require(rawName.isNotEmpty() && rawName != "." && rawName != "..") {
+        "Single-frame source name is empty or reserved"
+    }
+    require(!rawName.contains('/') && !rawName.contains('\\')) {
+        "Single-frame source must be a direct-child file name"
+    }
+
+    val canonicalJobDir = jobDir.canonicalFile
+    require(canonicalJobDir.isDirectory) { "Single-frame job directory is missing" }
+    val source = File(canonicalJobDir, rawName)
+    val sourcePath = source.toPath()
+    require(source.parentFile == canonicalJobDir) { "Single-frame source escapes job directory" }
+    require(Files.exists(sourcePath, LinkOption.NOFOLLOW_LINKS)) {
+        "Single-frame source is missing: $rawName"
+    }
+    require(!Files.isSymbolicLink(sourcePath)) {
+        "Single-frame source must not be a symbolic link: $rawName"
+    }
+    require(Files.isRegularFile(sourcePath, LinkOption.NOFOLLOW_LINKS)) {
+        "Single-frame source is not a regular file: $rawName"
+    }
+    require(Files.size(sourcePath) > 0L) { "Single-frame source is empty: $rawName" }
+    return source
+}
+
+private fun cleanupCancelledSingleFrameOutput(
+    outputFile: File?,
+    outputWritten: Boolean,
+    outputExistedBefore: Boolean
+): Boolean {
+    val output = outputFile ?: return false
+    if (!outputWritten) return Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)
+    if (outputExistedBefore) return true
+    return try {
+        if (Files.deleteIfExists(output.toPath())) false
+        else Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)
+    } catch (_: Exception) {
+        Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)
+    }
+}
+
+private fun persistSingleFrameCancellation(
+    jobDir: File,
+    params: ClassicYuvFusionParams,
+    processingStartedAt: Long,
+    outputRetained: Boolean,
+    cancellation: CancellationException
+) {
+    runCatching {
+        KeplerJobMetadata.update(jobDir) { current ->
+            current.put("processingStartedAt", processingStartedAt)
+                .put("processingTimeMs", System.currentTimeMillis() - processingStartedAt)
+                .put("singleFrameProcessingPolicy", ReprocessMetadataPolicy.NORMAL.name)
+                .put("fusionPresetName", params.presetName)
+                .put("fusionParams", params.toJson())
+                .put("currentPipelineStage", "CANCELLED")
+                .put("processStatus", "PIPELINE_CANCELLED")
+                .put("processingFailureType", cancellation.javaClass.simpleName)
+                .put("processingFailureMessage", cancellation.message ?: "Single-frame processing cancelled")
+                .put("singleFrameCancelledOutputRetained", outputRetained)
+                .put("galleryDisplayUnavailable", true)
+                .put("finalOutputAvailable", false)
+                .put("userCanMoveDevice", true)
+            current.remove("finalNightFusionFile")
+            current.remove("finalFile")
+            current.remove("galleryDisplayFile")
+            current.remove("galleryThumbnailFile")
+            current.remove("galleryDisplaySource")
+        }
     }
 }
 
@@ -168,6 +298,8 @@ private fun persistSingleFrameSuccess(
                 .put("galleryDisplayFile", outputFile.name)
                 .put("galleryThumbnailFile", outputFile.name)
                 .put("galleryDisplaySource", "single_frame_processed")
+                .put("galleryDisplayUnavailable", false)
+                .put("finalOutputAvailable", true)
                 .put("outputWidth", outputWidth)
                 .put("outputHeight", outputHeight)
                 .put("lumaDenoiseStrength", params.denoiseStrength.toDouble())
@@ -178,6 +310,8 @@ private fun persistSingleFrameSuccess(
                 .put("userCanMoveDevice", true)
             current.remove("processingFailureType")
             current.remove("processingFailureMessage")
+            current.remove("singleFrameCancelledOutputRetained")
+            current.remove("singleFrameFailedOutputRetained")
         }
     }
 }
@@ -187,7 +321,8 @@ private fun persistSingleFrameFailure(
     params: ClassicYuvFusionParams,
     processingStartedAt: Long,
     metadataPolicy: ReprocessMetadataPolicy,
-    failure: Throwable
+    failure: Throwable,
+    outputRetained: Boolean = false
 ) {
     runCatching {
         KeplerJobMetadata.update(jobDir) { current ->
@@ -204,7 +339,15 @@ private fun persistSingleFrameFailure(
                         "processingFailureMessage",
                         failure.message ?: "Single-frame processing failed"
                     )
+                    .put("singleFrameFailedOutputRetained", outputRetained)
+                    .put("galleryDisplayUnavailable", true)
+                    .put("finalOutputAvailable", false)
                     .put("userCanMoveDevice", true)
+                current.remove("finalNightFusionFile")
+                current.remove("finalFile")
+                current.remove("galleryDisplayFile")
+                current.remove("galleryThumbnailFile")
+                current.remove("galleryDisplaySource")
             }
         }
     }

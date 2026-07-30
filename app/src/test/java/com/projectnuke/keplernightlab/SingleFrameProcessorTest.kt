@@ -6,6 +6,7 @@ import android.graphics.Color
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -13,6 +14,7 @@ import org.robolectric.RobolectricTestRunner
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.Files
+import java.util.concurrent.CancellationException
 
 @RunWith(RobolectricTestRunner::class)
 class SingleFrameProcessorTest {
@@ -132,4 +134,114 @@ class SingleFrameProcessorTest {
             jobDir.deleteRecursively()
         }
     }
+    @Test
+    fun cancellationAfterAtomicOutputRemovesOrphanAndMarksJobUnavailable() {
+        val jobDir = Files.createTempDirectory("kepler-single-cancel-").toFile()
+        try {
+            val sourceFile = File(jobDir, "frame_000.png")
+            val source = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888)
+            try {
+                source.eraseColor(Color.rgb(72, 80, 96))
+                FileOutputStream(sourceFile).use { output ->
+                    assertTrue(source.compress(Bitmap.CompressFormat.PNG, 100, output))
+                }
+            } finally {
+                source.recycle()
+            }
+            KeplerJobMetadata.write(
+                jobDir,
+                JSONObject()
+                    .put("jobType", "YUV_SINGLE_FRAME")
+                    .put("captureMode", CaptureMode.SINGLE_FRAME.name)
+                    .put(
+                        "frames",
+                        JSONArray().put(
+                            JSONObject()
+                                .put("index", 0)
+                                .put("file", sourceFile.name)
+                                .put("enabled", true)
+                        )
+                    )
+            )
+            val outputFile = File(jobDir, SINGLE_FRAME_OUTPUT_FILE_NAME)
+            val cancellation = object : KeplerPipelineCancellation {
+                override val isCancelled: Boolean
+                    get() = outputFile.exists()
+
+                override fun throwIfCancelled() {
+                    if (isCancelled) throw CancellationException("cancel after output publish")
+                }
+            }
+
+            var cancelled = false
+            try {
+                processSingleFrameJobSync(
+                    jobDir = jobDir,
+                    requestedParams = ClassicYuvFusionPreset.NATURAL.params,
+                    cancellation = cancellation,
+                    onStatus = {}
+                )
+            } catch (_: CancellationException) {
+                cancelled = true
+            }
+
+            assertTrue(cancelled)
+            assertFalse(outputFile.exists())
+            val job = KeplerJobMetadata.read(jobDir)
+            assertEquals("PIPELINE_CANCELLED", job.getString("processStatus"))
+            assertTrue(job.getBoolean("galleryDisplayUnavailable"))
+            assertFalse(job.getBoolean("finalOutputAvailable"))
+        } finally {
+            jobDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun rejectsSingleFrameSourceOutsideJobDirectory() {
+        val parent = Files.createTempDirectory("kepler-single-unsafe-").toFile()
+        val jobDir = File(parent, "job").apply { mkdirs() }
+        try {
+            val outside = File(parent, "outside.png")
+            val source = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
+            try {
+                source.eraseColor(Color.GRAY)
+                FileOutputStream(outside).use { output ->
+                    assertTrue(source.compress(Bitmap.CompressFormat.PNG, 100, output))
+                }
+            } finally {
+                source.recycle()
+            }
+            KeplerJobMetadata.write(
+                jobDir,
+                JSONObject()
+                    .put("jobType", "YUV_SINGLE_FRAME")
+                    .put(
+                        "frames",
+                        JSONArray().put(
+                            JSONObject()
+                                .put("index", 0)
+                                .put("file", "../outside.png")
+                                .put("enabled", true)
+                        )
+                    )
+            )
+
+            var rejected = false
+            try {
+                processSingleFrameJobSync(
+                    jobDir = jobDir,
+                    requestedParams = ClassicYuvFusionPreset.NATURAL.params,
+                    onStatus = {}
+                )
+            } catch (_: IllegalArgumentException) {
+                rejected = true
+            }
+
+            assertTrue(rejected)
+            assertFalse(File(jobDir, SINGLE_FRAME_OUTPUT_FILE_NAME).exists())
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
 }

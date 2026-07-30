@@ -445,7 +445,6 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
         showResultPreview = false
         latestSceneLuma = null
         latestMotionScore = null
-        processingPreviewBitmap?.takeIf { !it.isRecycled }?.recycle()
         processingPreviewBitmap = null
         processingPreviewStatus = "최근 결과를 촬영하면 설정 미리보기가 표시됩니다."
     }
@@ -524,7 +523,6 @@ LaunchedEffect(Unit) {
 
     LaunchedEffect(currentScreen, latestBitmap, processingSettings) {
         if (currentScreen != MainScreen.SETTINGS) {
-            processingPreviewBitmap?.takeIf { !it.isRecycled }?.recycle()
             processingPreviewBitmap = null
             return@LaunchedEffect
         }
@@ -553,7 +551,6 @@ LaunchedEffect(Unit) {
                 )
             }
             if (currentCoroutineContext()[Job]?.isActive != true) return@LaunchedEffect
-            processingPreviewBitmap?.takeIf { !it.isRecycled }?.recycle()
             processingPreviewBitmap = renderedPreview
             renderedPreview = null
             val preset = ClassicYuvFusionPreset.fromName(processingSettings.presetName)
@@ -1973,11 +1970,7 @@ fun ThreeXSourceDot(
     ) {
         Text(
             text = source.label,
-            color = when {
-                !enabled -> Color.White.copy(alpha = 0.32f)
-                selected -> Color.Black
-                else -> Color.White
-            },
+            color = if (selected) Color.Black else Color.White,
             style = MaterialTheme.typography.labelSmall
         )
     }
@@ -2255,6 +2248,12 @@ fun ProcessingSettingsSection(
     previewBitmap: Bitmap?,
     previewStatus: String
 ) {
+    DisposableEffect(previewBitmap) {
+        onDispose {
+            previewBitmap?.takeIf { !it.isRecycled }?.recycle()
+        }
+    }
+
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(
             text = "ISP 후처리",
