@@ -21,6 +21,8 @@ namespace {
 struct Alignment {
     int proxyDx = 0;
     int proxyDy = 0;
+    int estimatedRawDx = 0;
+    int estimatedRawDy = 0;
     int rawDx = 0;
     int rawDy = 0;
     int64_t validProxyPixels = 0;
@@ -627,8 +629,10 @@ Alignment alignProxy(
     Alignment out;
     out.proxyDx = bestDx;
     out.proxyDy = bestDy;
-    out.rawDx = bestDx * downscale;
-    out.rawDy = bestDy * downscale;
+    out.estimatedRawDx = bestDx * downscale;
+    out.estimatedRawDy = bestDy * downscale;
+    out.rawDx = out.estimatedRawDx;
+    out.rawDy = out.estimatedRawDy;
     if ((out.rawDx & 1) != 0) out.rawDx += out.rawDx > 0 ? -1 : 1;
     if ((out.rawDy & 1) != 0) out.rawDy += out.rawDy > 0 ? -1 : 1;
     out.validProxyPixels = bestCount;
@@ -723,6 +727,8 @@ bool writeAlignmentJson(
                << ", \"dy\": " << a.proxyDy
                << ", \"proxyDx\": " << a.proxyDx
                << ", \"proxyDy\": " << a.proxyDy
+               << ", \"estimatedRawDx\": " << a.estimatedRawDx
+               << ", \"estimatedRawDy\": " << a.estimatedRawDy
                << ", \"rawDx\": " << a.rawDx
                << ", \"rawDy\": " << a.rawDy
                << ", \"validProxyPixels\": " << a.validProxyPixels
@@ -1358,10 +1364,14 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutput(
                 const float localLuma = static_cast<float>(lumaSum / 9.0);
                 const float centerChromaR = centerR - centerLuma;
                 const float centerChromaB = centerB - centerLuma;
-                const float denoisedChromaR = centerChromaR * (1.0f - kChromaDenoiseStrength) +
-                    static_cast<float>(chromaRSum / 9.0) * kChromaDenoiseStrength;
-                const float denoisedChromaB = centerChromaB * (1.0f - kChromaDenoiseStrength) +
-                    static_cast<float>(chromaBSum / 9.0) * kChromaDenoiseStrength;
+                const float denoisedChromaR = kChromaDenoiseStrength <= 0.0f
+                    ? centerChromaR
+                    : centerChromaR * (1.0f - kChromaDenoiseStrength) +
+                        static_cast<float>(chromaRSum / 9.0) * kChromaDenoiseStrength;
+                const float denoisedChromaB = kChromaDenoiseStrength <= 0.0f
+                    ? centerChromaB
+                    : centerChromaB * (1.0f - kChromaDenoiseStrength) +
+                        static_cast<float>(chromaBSum / 9.0) * kChromaDenoiseStrength;
                 const float darkFactor = std::clamp(
                     (centerLuma - 18.0f) / 72.0f,
                     1.0f - kDarkSharpenSuppression,

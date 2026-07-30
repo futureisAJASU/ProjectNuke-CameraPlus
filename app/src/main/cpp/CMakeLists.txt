@@ -10,6 +10,10 @@ add_library(
     fusion_alignment.cpp
 )
 
+# Keep device-debug native timing representative while retaining symbols.
+# Deliberately omit fast-math: NaN/finite behavior is part of the pipeline contract.
+target_compile_options(kepler_raw_engine PRIVATE -O2 -g)
+
 find_library(log-lib log)
 
 target_link_libraries(kepler_raw_engine ${log-lib})

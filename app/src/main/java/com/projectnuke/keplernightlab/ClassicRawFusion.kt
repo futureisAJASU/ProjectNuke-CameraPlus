@@ -46,6 +46,8 @@ private data class ClassicRawFrame(
     var proxy: RawProxy? = null,
     var dx: Int = 0,
     var dy: Int = 0,
+    var estimatedDx: Float = 0f,
+    var estimatedDy: Float = 0f,
     var integerDx: Int = 0,
     var integerDy: Int = 0,
     var subpixelDx: Float = 0f,
@@ -153,8 +155,13 @@ internal fun runClassicRawFusionMerge(
                 cancellation.throwIfCancelled()
                 val alignment = estimateRawTranslation(refProxy, requireNotNull(frame.proxy))
                 cancellation.throwIfCancelled()
-                frame.dx = (alignment.dx * refProxy.sampleStep).roundToInt()
-                frame.dy = (alignment.dy * refProxy.sampleStep).roundToInt()
+                val estimatedDx = alignment.dx * refProxy.sampleStep
+                val estimatedDy = alignment.dy * refProxy.sampleStep
+                val cfaSafe = cfaSafeRawShift(estimatedDx, estimatedDy)
+                frame.estimatedDx = estimatedDx
+                frame.estimatedDy = estimatedDy
+                frame.dx = cfaSafe.appliedDx
+                frame.dy = cfaSafe.appliedDy
                 frame.integerDx = alignment.integerDx * refProxy.sampleStep
                 frame.integerDy = alignment.integerDy * refProxy.sampleStep
                 frame.subpixelDx = alignment.subpixelDx * refProxy.sampleStep
@@ -242,6 +249,10 @@ internal fun runClassicRawFusionMerge(
             .put("readNoiseCoeff", CLASSIC_RAW_READ_NOISE_COEFF)
             .put("rawOutlierRejectedRatio", mergeStats.rejectedRatio)
             .put("rawOutlierDownweightedRatio", mergeStats.downweightedRatio)
+            .put("memoryPlanTileRows", mergeStats.memoryPlan.tileRows)
+            .put("memoryPlanCandidateBatchSize", mergeStats.memoryPlan.candidateBatchSize)
+            .put("memoryPlanEstimatedPeakBytes", mergeStats.memoryPlan.estimatedPeakBytes)
+            .put("memoryPlanFallbackReason", mergeStats.memoryPlan.fallbackReason ?: JSONObject.NULL)
             .put("rawAlignmentSummary", debug.optJSONArray("alignments") ?: JSONArray())
             .put("nativeAlignmentAvailable", NativeFusionAlignment.isAvailable())
             .put("nativeAlignmentUsed", nativeAlignmentUsed)
@@ -297,7 +308,8 @@ internal fun runClassicRawFusionMerge(
 private data class RawMergeStats(
     val rejectedPixels: Long,
     val comparedPixels: Long,
-    val downweightedPixels: Long
+    val downweightedPixels: Long,
+    val memoryPlan: FusionMemoryPlan
 ) {
     val rejectedRatio: Double get() =
         if (comparedPixels > 0L) rejectedPixels.toDouble() / comparedPixels else 0.0
@@ -477,9 +489,22 @@ private fun mergeClassicRawTiles(
     val whiteRange = (sensor.whiteLevel - sensor.blackLevel).coerceAtLeast(1)
     val frameInputs = linkedMapOf<ClassicRawFrame, RandomAccessFile>()
     val sourceRows = frames.associateWith { ShortArray(sensor.width) }
-    val refRows = Array(CLASSIC_RAW_TILE_ROWS) { ShortArray(sensor.width) }
-    val acc = FloatArray(sensor.width * CLASSIC_RAW_TILE_ROWS)
-    val weights = FloatArray(sensor.width * CLASSIC_RAW_TILE_ROWS)
+    val memoryPlan = planFusionMemory(
+        FusionMemoryPlanRequest(
+            width = sensor.width,
+            tileRows = CLASSIC_RAW_TILE_ROWS,
+            candidateFrames = frames.size,
+            availableBytes = Runtime.getRuntime().maxMemory(),
+            javaBytesPerPixel = 6L,
+            nativeBytesPerPixel = 4L
+        )
+    )
+    val mergeTileRows = memoryPlan.tileRows
+    val tileArraySize = sensor.width.toLong() * mergeTileRows.toLong()
+    require(tileArraySize in 1L..Int.MAX_VALUE) { "RAW tile array size exceeds JVM limits" }
+    val refRows = Array(mergeTileRows) { ShortArray(sensor.width) }
+    val acc = FloatArray(tileArraySize.toInt())
+    val weights = FloatArray(tileArraySize.toInt())
     val outRow = ByteArray(sensor.width * 2)
 
     try {
@@ -491,7 +516,7 @@ private fun mergeClassicRawTiles(
             var tileTop = 0
             while (tileTop < sensor.height) {
                 cancellation.throwIfCancelled()
-                val tileRows = min(CLASSIC_RAW_TILE_ROWS, sensor.height - tileTop)
+                val tileRows = min(mergeTileRows, sensor.height - tileTop)
                 acc.fill(0f, 0, sensor.width * tileRows)
                 weights.fill(0f, 0, sensor.width * tileRows)
                 for (row in 0 until tileRows) {
@@ -573,7 +598,7 @@ private fun mergeClassicRawTiles(
     } finally {
         frameInputs.values.forEach { runCatching { it.close() } }
     }
-    return RawMergeStats(rejected, compared, downweighted)
+    return RawMergeStats(rejected, compared, downweighted, memoryPlan)
 }
 
 private fun readRawRow(input: RandomAccessFile, width: Int, y: Int, out: ShortArray) {
@@ -591,6 +616,10 @@ private fun readRawRow(input: RandomAccessFile, width: Int, y: Int, out: ShortAr
 private fun applyRawAlignmentToFrameJson(frame: ClassicRawFrame) {
     frame.input.meta.put("rawAlignDx", frame.dx)
         .put("rawAlignDy", frame.dy)
+        .put("rawAlignEstimatedDx", frame.estimatedDx.toDouble())
+        .put("rawAlignEstimatedDy", frame.estimatedDy.toDouble())
+        .put("rawAlignAppliedCfaDx", frame.dx)
+        .put("rawAlignAppliedCfaDy", frame.dy)
         .put("rawAlignIntegerDx", frame.integerDx)
         .put("rawAlignIntegerDy", frame.integerDy)
         .put("rawAlignSubpixelDx", frame.subpixelDx.toDouble())
@@ -624,6 +653,10 @@ private fun buildRawFusionDebug(
                 .put("file", frame.input.file.name)
                 .put("rawAlignDx", frame.dx)
                 .put("rawAlignDy", frame.dy)
+                .put("rawAlignEstimatedDx", frame.estimatedDx.toDouble())
+                .put("rawAlignEstimatedDy", frame.estimatedDy.toDouble())
+                .put("rawAlignAppliedCfaDx", frame.dx)
+                .put("rawAlignAppliedCfaDy", frame.dy)
                 .put("rawAlignIntegerDx", frame.integerDx)
                 .put("rawAlignIntegerDy", frame.integerDy)
                 .put("rawAlignSubpixelDx", frame.subpixelDx.toDouble())
@@ -651,6 +684,10 @@ private fun buildRawFusionDebug(
         .put("readNoiseCoeff", CLASSIC_RAW_READ_NOISE_COEFF)
         .put("rawOutlierRejectedRatio", mergeStats.rejectedRatio)
         .put("rawOutlierDownweightedRatio", mergeStats.downweightedRatio)
+        .put("memoryPlanTileRows", mergeStats.memoryPlan.tileRows)
+        .put("memoryPlanCandidateBatchSize", mergeStats.memoryPlan.candidateBatchSize)
+        .put("memoryPlanEstimatedPeakBytes", mergeStats.memoryPlan.estimatedPeakBytes)
+        .put("memoryPlanFallbackReason", mergeStats.memoryPlan.fallbackReason ?: JSONObject.NULL)
         .put("rawAlignmentSummary", alignments)
         .put("processingTimeMs", processingTimeMs)
         .put("nativeAlignmentAvailable", NativeFusionAlignment.isAvailable())

@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
+import android.graphics.Color
 import android.graphics.Rect
 import android.os.Environment
 import android.os.Handler
@@ -83,6 +84,7 @@ data class SuperResolutionFusionRequest(
     val targetMegapixels: Double = targetPolicy.defaultTargetMegapixels,
     val maxFrames: Int = 6,
     val processingParams: ClassicYuvFusionParams = ClassicYuvFusionPreset.NATURAL.params,
+    val denoiseAlgorithm: DenoiseAlgorithm = DenoiseAlgorithm.GUIDED,
     val tileSinkFactory: ((File) -> SuperResolutionTileSink)? = null,
     val cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     val status: (String) -> Unit
@@ -298,6 +300,7 @@ fun runSuperResolutionFusion(
             outputHeight = dimensions.second,
             sink = tileSink,
             processingParams = request.processingParams,
+            denoiseAlgorithm = request.denoiseAlgorithm,
             cancellation = request.cancellation
         )
         val actualOutputMegapixels = megapixels(dimensions.first, dimensions.second)
@@ -753,6 +756,7 @@ private fun fuseFramesTiled(
     outputHeight: Int,
     sink: SuperResolutionTileSink,
     processingParams: ClassicYuvFusionParams,
+    denoiseAlgorithm: DenoiseAlgorithm,
     cancellation: KeplerPipelineCancellation
 ): File {
     val scaleX = outputWidth.toFloat() / reference.sourceWidth
@@ -835,6 +839,7 @@ private fun fuseFramesTiled(
                     tileWidth = tileWidth,
                     tileHeight = tileHeight,
                     processingParams = normalizedProcessingParams,
+                    denoiseAlgorithm = denoiseAlgorithm,
                     cancellation = cancellation
                 )
                 cancellation.throwIfCancelled()
@@ -970,6 +975,7 @@ private fun normalizeTile(
     tileWidth: Int,
     tileHeight: Int,
     processingParams: ClassicYuvFusionParams,
+    denoiseAlgorithm: DenoiseAlgorithm,
     cancellation: KeplerPipelineCancellation
 ): IntArray {
     val output = IntArray(weights.size)
@@ -990,6 +996,14 @@ private fun normalizeTile(
             0xff000000.toInt()
         }
     }
+    applySuperResolutionDenoiseInPlace(
+        pixels = output,
+        width = tileWidth,
+        height = tileHeight,
+        strength = processingParams.denoiseStrength,
+        algorithm = denoiseAlgorithm,
+        cancellation = cancellation
+    )
     applySuperResolutionDetailInPlace(
         pixels = output,
         width = tileWidth,
@@ -999,6 +1013,64 @@ private fun normalizeTile(
     )
     return output
 }
+
+internal fun applySuperResolutionDenoiseForTest(
+    pixels: IntArray,
+    width: Int,
+    height: Int,
+    strength: Float,
+    algorithm: DenoiseAlgorithm
+): IntArray {
+    val copy = pixels.copyOf()
+    applySuperResolutionDenoiseInPlace(copy, width, height, strength, algorithm, NoOpKeplerPipelineCancellation)
+    return copy
+}
+
+private fun applySuperResolutionDenoiseInPlace(
+    pixels: IntArray,
+    width: Int,
+    height: Int,
+    strength: Float,
+    algorithm: DenoiseAlgorithm,
+    cancellation: KeplerPipelineCancellation
+) {
+    if (strength <= 0f || width < 3 || height < 3) return
+    val source = pixels.copyOf()
+    for (y in 1 until height - 1) {
+        if ((y and 15) == 0) cancellation.throwIfCancelled()
+        for (x in 1 until width - 1) {
+            val index = y * width + x
+            val center = source[index]
+            val neighbors = intArrayOf(
+                source[index - 1], source[index + 1],
+                source[index - width], source[index + width]
+            )
+            val target = when (algorithm) {
+                DenoiseAlgorithm.GUIDED -> neighbors.averageColor()
+                DenoiseAlgorithm.WAVELET -> {
+                    val diagonal = intArrayOf(source[index - width - 1], source[index - width + 1], source[index + width - 1], source[index + width + 1])
+                    averageColors(neighbors + diagonal)
+                }
+                DenoiseAlgorithm.BILATERAL -> neighbors.minByOrNull { colorDistance(it, center) } ?: center
+            }
+            pixels[index] = blendColor(center, target, strength.coerceIn(0f, 1f))
+        }
+    }
+}
+
+private fun IntArray.averageColor(): Int = averageColors(this)
+private fun averageColors(values: IntArray): Int = Color.rgb(
+    values.map { Color.red(it) }.average().roundToInt(),
+    values.map { Color.green(it) }.average().roundToInt(),
+    values.map { Color.blue(it) }.average().roundToInt()
+)
+private fun colorDistance(a: Int, b: Int): Int =
+    abs(Color.red(a) - Color.red(b)) + abs(Color.green(a) - Color.green(b)) + abs(Color.blue(a) - Color.blue(b))
+private fun blendColor(a: Int, b: Int, amount: Float): Int = Color.rgb(
+    (Color.red(a) * (1f - amount) + Color.red(b) * amount).roundToInt(),
+    (Color.green(a) * (1f - amount) + Color.green(b) * amount).roundToInt(),
+    (Color.blue(a) * (1f - amount) + Color.blue(b) * amount).roundToInt()
+)
 
 private fun applySuperResolutionDetailInPlace(
     pixels: IntArray,

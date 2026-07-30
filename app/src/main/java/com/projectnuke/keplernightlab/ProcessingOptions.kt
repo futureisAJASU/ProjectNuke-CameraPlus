@@ -14,12 +14,24 @@ enum class CaptureMode(
     )
 }
 
+enum class DenoiseAlgorithm { GUIDED, WAVELET, BILATERAL }
+
 data class ProcessingSettings(
     val presetName: String,
+    val denoiseAlgorithm: DenoiseAlgorithm = DenoiseAlgorithm.GUIDED,
     val denoiseStrength: Float,
     val sharpenAmount: Float,
     val localContrastAmount: Float
 ) {
+    fun matchesPreset(preset: ClassicYuvFusionPreset): Boolean {
+        val p = preset.params
+        return denoiseStrength == p.denoiseStrength &&
+            sharpenAmount == p.sharpenAmount &&
+            localContrastAmount == p.localContrastAmount
+    }
+
+    fun isCustom(): Boolean = ClassicYuvFusionPreset.entries.none { matchesPreset(it) }
+
     fun normalized(): ProcessingSettings {
         val preset = ClassicYuvFusionPreset.fromName(presetName)
         val base = preset.params

@@ -71,7 +71,8 @@ private data class AlignmentResult(
 private data class MergeResult(
     val bitmap: Bitmap,
     val rejectedPixels: Long,
-    val comparedPixels: Long
+    val comparedPixels: Long,
+    val memoryPlan: FusionMemoryPlan
 )
 
 private data class ClassicYuvProcessingPreflight(
@@ -347,6 +348,10 @@ internal fun processClassicYuvFusionJob(
             .put("ghostSuppressionEnabled", true)
             .put("ghostRejectedPixelRatio", rejectedRatio!!)
             .put("rejectedGhostSampleRatio", rejectedRatio!!)
+            .put("memoryPlanTileRows", mergeResult!!.memoryPlan.tileRows)
+            .put("memoryPlanCandidateBatchSize", mergeResult!!.memoryPlan.candidateBatchSize)
+            .put("memoryPlanEstimatedPeakBytes", mergeResult!!.memoryPlan.estimatedPeakBytes)
+            .put("memoryPlanFallbackReason", mergeResult!!.memoryPlan.fallbackReason ?: JSONObject.NULL)
             .put("averageColorFile", averageFile.name)
             .put("finalNightFusionFile", finalFile.name)
             .put("finalFile", finalFile.name)
@@ -761,10 +766,19 @@ private fun mergeClassicFrames(
             decoders[frame] = BitmapRegionDecoder.newInstance(frame.file.absolutePath, false)
         }
         output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val memoryPlan = planFusionMemory(
+            FusionMemoryPlanRequest(
+                width = width,
+                tileRows = CLASSIC_FUSION_TILE_ROWS,
+                candidateFrames = frames.size,
+                availableBytes = Runtime.getRuntime().maxMemory()
+            )
+        )
+        val mergeTileRows = memoryPlan.tileRows
         var tileTop = 0
         while (tileTop < height) {
             cancellation.throwIfCancelled()
-            val tileBottom = min(height, tileTop + CLASSIC_FUSION_TILE_ROWS)
+            val tileBottom = min(height, tileTop + mergeTileRows)
             val tileHeight = tileBottom - tileTop
             val pixelCount = width * tileHeight
             val referenceBitmap = decoders.getValue(reference).decodeRegion(
@@ -868,7 +882,7 @@ private fun mergeClassicFrames(
             tileTop = tileBottom
         }
         outputReturned = true
-        return MergeResult(requireNotNull(output), rejectedPixels, comparedPixels)
+        return MergeResult(requireNotNull(output), rejectedPixels, comparedPixels, memoryPlan)
     } finally {
         decoders.values.forEach { it.recycle() }
         if (!outputReturned) output?.recycle()
@@ -906,6 +920,10 @@ internal fun applyClassicYuvPostProcessing(
 ): Bitmap {
     val width = source.width
     val height = source.height
+    if (isIdentityProcessing(params)) {
+        return source.copy(Bitmap.Config.ARGB_8888, true)
+            ?: error("Could not copy identity postprocess source")
+    }
     val outputBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
     fun tone(value: Float): Int {
         val normalized = (value / 255f).coerceIn(0f, 1f)
@@ -987,6 +1005,14 @@ internal fun applyClassicYuvPostProcessing(
         throw t
     }
 }
+
+internal fun isIdentityProcessing(params: ClassicYuvFusionParams): Boolean =
+    params.denoiseStrength <= 0f &&
+        params.sharpenAmount <= 0f &&
+        params.localContrastAmount <= 0f &&
+        params.shadowLift <= 0f &&
+        params.highlightRollOff <= 0f &&
+        params.saturationBoost == 1f
 
 private fun initializeClassicYuvRunMetadata(
     job: JSONObject,

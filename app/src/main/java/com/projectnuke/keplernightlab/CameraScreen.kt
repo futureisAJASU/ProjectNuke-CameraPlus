@@ -430,6 +430,7 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var processingPreviewBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var processingPreviewStatus by remember { mutableStateOf("최근 결과를 촬영하면 설정 미리보기가 표시됩니다.") }
     val refreshMutex = remember { Mutex() }
+    val previewDispatcher = remember { Dispatchers.Default.limitedParallelism(1) }
     val cameraScope = rememberCoroutineScope()
     var refreshGeneration by remember { mutableIntStateOf(0) }
     var refreshJob by remember { mutableStateOf<Job?>(null) }
@@ -521,9 +522,14 @@ LaunchedEffect(Unit) {
         refreshLatestResult()
     }
 
-    LaunchedEffect(currentScreen, latestBitmap, processingSettings) {
+    LaunchedEffect(currentScreen, latestBitmap, processingSettings, captureMode) {
         if (currentScreen != MainScreen.SETTINGS) {
             processingPreviewBitmap = null
+            return@LaunchedEffect
+        }
+        if (captureMode == CaptureMode.SINGLE_FRAME) {
+            processingPreviewBitmap = null
+            processingPreviewStatus = "Single-frame preview uses the ISP path; fusion algorithm controls are inactive."
             return@LaunchedEffect
         }
         delay(120L)
@@ -543,7 +549,7 @@ LaunchedEffect(Unit) {
                 return@LaunchedEffect
             }
             processingPreviewStatus = "최근 결과로 선택한 프리셋을 미리보는 중..."
-            renderedPreview = withContext(Dispatchers.Default) {
+            renderedPreview = withContext(previewDispatcher) {
                 renderProcessingPreview(
                     previewSource!!,
                     processingSettings,
@@ -555,7 +561,7 @@ LaunchedEffect(Unit) {
             renderedPreview = null
             val preset = ClassicYuvFusionPreset.fromName(processingSettings.presetName)
             processingPreviewStatus =
-                "최근 결과 기반 근사 미리보기 · ${preset.displayName} · " +
+                "Approximate double-processed preview · ${preset.displayName} · " +
                     "NR ${"%.2f".format(processingSettings.denoiseStrength)} · " +
                     "Sharp ${"%.2f".format(processingSettings.sharpenAmount)}"
         } catch (ce: CancellationException) {
@@ -619,6 +625,7 @@ LaunchedEffect(Unit) {
         captureMode,
         processingSettings
     ) {
+        delay(250L)
         CameraSettingsStore.save(
             context,
             CameraUiSettings(
@@ -2118,6 +2125,7 @@ fun SettingsScreen(
 
                 ProcessingSettingsSection(
                     settings = processingSettings,
+                    captureMode = captureMode,
                     onSettingsChange = onProcessingSettingsChange,
                     previewBitmap = processingPreviewBitmap,
                     previewStatus = processingPreviewStatus
@@ -2244,6 +2252,7 @@ fun CaptureModeSettingsSection(
 @Composable
 fun ProcessingSettingsSection(
     settings: ProcessingSettings,
+    captureMode: CaptureMode,
     onSettingsChange: (ProcessingSettings) -> Unit,
     previewBitmap: Bitmap?,
     previewStatus: String
@@ -2260,18 +2269,29 @@ fun ProcessingSettingsSection(
             color = Color.White,
             style = MaterialTheme.typography.titleMedium
         )
-        ClassicYuvFusionPreset.entries.chunked(2).forEach { presets ->
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                presets.forEach { preset ->
-                    FrameModeChip(
-                        text = preset.displayName,
-                        selected = settings.presetName == preset.name,
-                        onClick = { onSettingsChange(ProcessingSettings.fromPreset(preset)) }
-                    )
+        if (captureMode == CaptureMode.SINGLE_FRAME) {
+            Text(
+                text = "Fusion presets apply to multi-frame, RAW and 24MP fusion; single-frame uses ISP only.",
+                color = Color.White.copy(alpha = 0.65f),
+                style = MaterialTheme.typography.bodySmall
+            )
+        } else {
+            ClassicYuvFusionPreset.entries.chunked(2).forEach { presets ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    presets.forEach { preset ->
+                        FrameModeChip(
+                            text = preset.displayName,
+                            selected = settings.matchesPreset(preset),
+                            onClick = { onSettingsChange(ProcessingSettings.fromPreset(preset)) }
+                        )
+                    }
                 }
+            }
+            if (settings.isCustom()) {
+                Text("Custom", color = Color(0xFFFFCC80))
             }
         }
 
