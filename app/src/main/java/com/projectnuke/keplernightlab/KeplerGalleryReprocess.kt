@@ -1766,7 +1766,7 @@ private fun performTerminalCleanupDebt(
                 catch (le: LinkageError) { throw le }
                 catch (ie: InternalError) { throw ie }
                 catch (e: Error) { throw e }
-                catch (_: Exception) { false }
+                catch (e: Exception) { false }
                 if (!cleanupOk) {
                     warnings += "Reprocess backup cleanup failed after durable $state."
                 }
@@ -2298,6 +2298,7 @@ private fun readMarkerIdentity(marker: File): Triple<String, String, Long>? {
         parsed[key] = value
     }
     if (parsed.keys != setOf("transactionId", "backupRoot", "createdAt")) return null
+    if (parsed.keys.toList() != listOf("transactionId", "backupRoot", "createdAt")) return null
     val txId = parsed.getValue("transactionId")
     if (txId.isBlank()) return null
     if (txId.any { it.isWhitespace() }) return null
@@ -3389,12 +3390,14 @@ internal fun restoreBackups(jobDir: File, transaction: ReprocessTransaction): Re
 internal class CleanupEvidenceException(
     message: String,
     val triggerDescription: String,
+    val triggerException: Throwable?,
     val manifestError: Throwable?,
     val fallbackError: Throwable?
 ) : IllegalStateException(message) {
     /** Combine all non-null causes into a single descriptive string for warning metadata. */
     fun toWarningDetail(): String = buildString {
         append("Cleanup evidence recovery failed: $triggerDescription")
+        if (triggerException != null) append("; trigger: ${triggerException.message}")
         if (manifestError != null) append("; manifest: ${manifestError.message}")
         if (fallbackError != null) append("; fallback: ${fallbackError.message}")
     }
@@ -3440,7 +3443,8 @@ internal data class ManifestRecoveryOutcome(
     val manifestRestored: Boolean,
     val fallbackEstablished: Boolean,
     val manifestError: Throwable?,
-    val fallbackError: Throwable?
+    val fallbackError: Throwable?,
+    val recoveryWarnings: List<String> = emptyList()
 )
 
 /**
@@ -3459,7 +3463,7 @@ internal data class ManifestRecoveryOutcome(
  */
 internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     val root = transaction.backupRoot
-    if (!root.exists()) {
+    if (!Files.exists(root.toPath(), LinkOption.NOFOLLOW_LINKS)) {
         // Root absent — a resolved transaction with no root is fully cleaned.
         return true
     }
@@ -3491,40 +3495,14 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     }
     val cleanupDelete = cleanupDeleteOperation
     val cleanupList = cleanupListOperation
-    /** Write the terminal manifest via seam or real atomic write. After the write, always run
-     *  common production verification using classification + strict parsing. Returns true only
-     *  when the restored manifest passes every check. */
-    fun restoreManifest(): Boolean {
-        return try {
-            val content = durable.toJson().toString(2)
-            val writeOp = manifestRestoreOperation
-            if (writeOp != null) writeOp(manifestFile, content)
-            else KeplerJobMetadata.atomicWrite(manifestFile, content)
-            when (classifyMarkerPath(manifestFile, root)) {
-                is MarkerPathClassification.Valid -> {
-                    val restored = loadStrictManifest(manifestFile)
-                    restored.transactionId == durable.transactionId &&
-                        restored.createdAt == durable.createdAt &&
-                        restored.hasSameImmutableIdentity(durable) &&
-                        restored.state == durable.state
-                }
-                else -> false
-            }
-        } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-        catch (oom: OutOfMemoryError) { throw oom }
-        catch (td: ThreadDeath) { throw td }
-        catch (le: LinkageError) { throw le }
-        catch (ie: InternalError) { throw ie }
-        catch (e: Error) { throw e }
-        catch (_: Exception) { false }
-    }
 
     /** Shared post-manifest-delete evidence recovery. Attempts manifest restoration with strict
      *  verification; if that fails, calls [ensureDurableFallbackQuarantine]. Preserves structured
-     *  context (trigger description, manifest failure, fallback failure). Throws
-     *  [CleanupEvidenceException] when recovery is completely unsuccessful so the structured
-     *  causes are inspectable in production tests. */
-    fun recoverManifestAndFallback(trigger: String): ManifestRecoveryOutcome {
+     *  context (trigger description, original trigger exception, manifest failure, fallback
+     *  failure). Returns [ManifestRecoveryOutcome] with recovery warnings when manifest fails
+     *  but fallback succeeds. Throws [CleanupEvidenceException] when recovery is completely
+     *  unsuccessful so the structured causes are inspectable in production tests. */
+    fun recoverManifestAndFallback(trigger: String, triggerException: Throwable? = null): ManifestRecoveryOutcome {
         var manifestError: Throwable? = null
         val manifestRestored = try {
             val content = durable.toJson().toString(2)
@@ -3572,11 +3550,18 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
             catch (e: Error) { throw e }
             catch (fb: Exception) { fallbackError = fb }
         }
-        val outcome = ManifestRecoveryOutcome(manifestRestored, fallbackEstablished, manifestError, fallbackError)
+        val warnings = mutableListOf<String>()
+        if (!manifestRestored) {
+            warnings += "Manifest restoration failed after $trigger" +
+                if (manifestError != null) ": ${manifestError.message}" else ""
+        }
+        val outcome = ManifestRecoveryOutcome(
+            manifestRestored, fallbackEstablished, manifestError, fallbackError, warnings.toList()
+        )
         if (!manifestRestored && !fallbackEstablished) {
             throw CleanupEvidenceException(
                 "Manifest restoration and fallback both failed after $trigger",
-                trigger, manifestError, fallbackError
+                trigger, triggerException, manifestError, fallbackError
             )
         }
         return outcome
@@ -3658,16 +3643,27 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
   } catch (e: LinkageError) { throw e
   } catch (e: InternalError) { throw e
   } catch (e: Error) { throw e
-  } catch (_: Exception) {
+  } catch (ex: Exception) {
+    recoverManifestAndFallback("manifest deletion threw exception", ex)
     return false
   }
-  if (classifyMarkerPath(manifestFile, root) !is MarkerPathClassification.Absent) return false
+  when (val postDelete = classifyMarkerPath(manifestFile, root)) {
+    is MarkerPathClassification.Absent -> { /* manifest successfully removed */ }
+    is MarkerPathClassification.Symlink -> {
+      recoverManifestAndFallback("symlink after manifest delete", null)
+      return false
+    }
+    else -> {
+      recoverManifestAndFallback("unexpected file after manifest delete: ${postDelete.javaClass.simpleName}", null)
+      return false
+    }
+  }
   // Seam: simulate a new file appearing after manifest deletion.
   afterManifestDeleteOperation?.invoke(root)
   // 6. Check root existence and re-list. After manifest deletion, the root may be gone.
   //  If root still exists but listing returns null, that is an IO failure — fail closed.
   //  A new/unknown file that appeared after manifest deletion is blocking.
-  if (!root.exists()) return true // root already removed
+  if (!Files.exists(root.toPath(), LinkOption.NOFOLLOW_LINKS)) return true // root already removed
   val afterManifestDelete = listRoot(root) ?: run {
     // Root still exists but listing returned null — IO failure, fail closed.
     recoverManifestAndFallback("null listing after manifest delete")
@@ -3699,7 +3695,7 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     return false
   }
   // Verify root absence. If root persists after successful delete, restore evidence.
-  if (root.exists()) {
+  if (Files.exists(root.toPath(), LinkOption.NOFOLLOW_LINKS)) {
     recoverManifestAndFallback("root still exists after successful delete")
     return false
   }

@@ -2853,6 +2853,42 @@ fun strictRootEvidenceCanonicalizationSeamReturnsInspectionFailed() = runBlockin
 }
 
 @Test
+fun rootStillExistsAfterSuccessfulDeleteDanglingSymlinkRoot() = runBlocking {
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    writeTransactionState(transaction, ReprocessTransactionState.COMMITTED)
+    File(transaction.backupRoot, "final.png.BACKUP").delete()
+    try {
+      val probe = File(directory, "symlink_probe")
+      val missingTarget = File(directory, "nonexistent_root_target")
+      Files.createSymbolicLink(probe.toPath(), missingTarget.toPath())
+      probe.delete()
+    } catch (e: Exception) {
+      assumeTrue("Symlink creation not supported — skipping test", false)
+      return@runBlocking
+    }
+    val previousRootDelete = cleanupRootDeleteOperation
+    cleanupRootDeleteOperation = { file ->
+      file.delete()
+      val danglingLink = File(directory, "dangling_root_link")
+      Files.createSymbolicLink(danglingLink.toPath(), File(directory, "ghost").toPath())
+      // Replace the original root with a dangling symlink
+      danglingLink.renameTo(file)
+      true
+    }
+    try {
+      assertFalse(cleanupBackups(transaction))
+      assertTrue(File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE).isFile)
+    } finally {
+      cleanupRootDeleteOperation = previousRootDelete
+    }
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
 fun danglingFallbackSymlinkBlocksGating() = runBlocking {
   val directory = tempJob()
   try {
@@ -3203,6 +3239,31 @@ fun readMarkerIdentity_backupRootWithoutPrefixReturnsNull() = runBlocking {
   }
 }
 
+@Test
+fun readMarkerIdentity_reorderedLinesReturnsNull() = runBlocking {
+  val directory = tempJob()
+  try {
+    val marker = File(directory, "test_marker")
+    marker.writeText("backupRoot=.reprocess_backup_tx\ncreatedAt=1000\ntransactionId=tx\n")
+    assertNull(readQuarantineMarkerIdentity(marker))
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun readMarkerIdentity_partialReversedOrderReturnsNull() = runBlocking {
+  val directory = tempJob()
+  try {
+    val marker = File(directory, "test_marker")
+    marker.writeText("createdAt=1000\ntransactionId=tx\nbackupRoot=.reprocess_backup_tx\n")
+    assertNull(readQuarantineMarkerIdentity(marker))
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
 fun manifestRestorePlusFallbackFailurePreservesTerminalState() = runBlocking {
   val directory = tempJob()
   try {
@@ -3230,6 +3291,56 @@ fun manifestRestorePlusFallbackFailurePreservesTerminalState() = runBlocking {
       assertNotNull(error.fallbackError)
       assertTrue(File(transaction.backupRoot, "appeared_after_delete.txt").exists())
       assertTrue(transaction.backupRoot.isDirectory)
+    } finally {
+      afterManifestDeleteOperation = previousAfterDelete
+      manifestRestoreOperation = previousRestore
+      fallbackWriteOperation = previousFallbackWrite
+    }
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun finalizeTransactionWithManifestDeleteFailurePreservesTerminalState() = runBlocking {
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    val session = ReprocessTransactionSession(directory)
+    val lease = session.acquireLease() ?: error("no lease")
+    session.transferOwnership(transaction)
+    // Create a real output file so hasUsableOutput is true and the commit
+    // path is taken (not rollback).
+    val outputFile = File(directory, "final_output.png")
+    outputFile.writeText("output content for commit path")
+    // Delete known payload so cleanup proceeds past payload-delete step.
+    File(transaction.backupRoot, "final.png.BACKUP").delete()
+    val previousAfterDelete = afterManifestDeleteOperation
+    val previousRestore = manifestRestoreOperation
+    val previousFallbackWrite = fallbackWriteOperation
+    afterManifestDeleteOperation = { root ->
+      File(root, "appeared_after_finalize.txt").writeText("blocking")
+    }
+    manifestRestoreOperation = { _, _ -> /* write nothing */ }
+    fallbackWriteOperation = { _, _, _ ->
+      throw IOException("finalize fallback failure")
+    }
+    try {
+      val result = finalizeTransaction(
+        session, transaction, directory, ReprocessJobKind.RAW_FUSION,
+        FinalOutputFormat.JPEG, FrameSelectionMode.AUTO_RULE_BASED, emptySet(),
+        terminal = Result.success(ReprocessWorkerOutcome(
+          Result.success(Unit), publicExportCommitted = false,
+          exportVerified = true, finalOutputFile = outputFile
+        ))
+      )
+      // Terminal state preserved despite cleanup evidence failure.
+      // COMMITTED is expected because the cleanup runs under the commit path
+      // and never downgrades terminal state.
+      assertTrue("Expected COMMITTED, got ${result.state}",
+        result.state == ReprocessFinalizationState.COMMITTED)
+      assertTrue(transaction.backupRoot.isDirectory)
+      assertTrue(File(transaction.backupRoot, "appeared_after_finalize.txt").exists())
     } finally {
       afterManifestDeleteOperation = previousAfterDelete
       manifestRestoreOperation = previousRestore
