@@ -1237,21 +1237,27 @@ internal fun strictRootEvidence(jobDir: File, transaction: ReprocessTransaction)
     if (!backupRoot.isDirectory) return RootEvidence.Untrustworthy
 
     // Root identity validation must pass before trusting any marker or manifest.
-    val canonicalJob = try { jobDir.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    // Use canonicalization seam when non-null for test injection.
+    fun resolveCanonical(file: File): File {
+        val seam = strictRootEvidenceCanonicalizationSeam
+        if (seam != null) return seam(file)
+        return file.canonicalFile
+    }
+    val canonicalJob = try { resolveCanonical(jobDir) } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
     catch (oom: OutOfMemoryError) { throw oom }
     catch (td: ThreadDeath) { throw td }
     catch (le: LinkageError) { throw le }
     catch (ie: InternalError) { throw ie }
     catch (e: Error) { throw e }
     catch (ex: Exception) { return RootEvidence.InspectionFailed(ex) }
-    val canonicalRoot = try { backupRoot.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    val canonicalRoot = try { resolveCanonical(backupRoot) } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
     catch (oom: OutOfMemoryError) { throw oom }
     catch (td: ThreadDeath) { throw td }
     catch (le: LinkageError) { throw le }
     catch (ie: InternalError) { throw ie }
     catch (e: Error) { throw e }
     catch (ex: Exception) { return RootEvidence.InspectionFailed(ex) }
-    val parentCanonical = try { canonicalRoot.parentFile?.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    val parentCanonical = try { resolveCanonical(canonicalRoot.parentFile ?: return RootEvidence.Untrustworthy) } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
     catch (oom: OutOfMemoryError) { throw oom }
     catch (td: ThreadDeath) { throw td }
     catch (le: LinkageError) { throw le }
@@ -1751,6 +1757,9 @@ private fun performTerminalCleanupDebt(
             if (fallbackRemoved) {
                 val cleanupOk = try {
                     cleanupBackups(transaction)
+                } catch (ce: CleanupEvidenceException) {
+                    warnings += ce.toWarningDetail()
+                    false
                 } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
                 catch (oom: OutOfMemoryError) { throw oom }
                 catch (td: ThreadDeath) { throw td }
@@ -2297,8 +2306,10 @@ private fun readMarkerIdentity(marker: File): Triple<String, String, Long>? {
     val rootName = parsed.getValue("backupRoot")
     if (rootName.isBlank() || !rootName.startsWith(".reprocess_backup_")) return null
     if (rootName != ".reprocess_backup_$txId") return null
-    val createdAt = parsed.getValue("createdAt").toLongOrNull() ?: return null
+    val createdAtStr = parsed.getValue("createdAt")
+    val createdAt = createdAtStr.toLongOrNull() ?: return null
     if (createdAt <= 0L) return null
+    if (createdAtStr != createdAt.toString()) return null
     return Triple(txId, rootName, createdAt)
 }
 
@@ -3369,6 +3380,26 @@ internal fun restoreBackups(jobDir: File, transaction: ReprocessTransaction): Re
     }
 }
 
+/**
+ * Structured cleanup-evidence exception thrown by [cleanupBackups] when post-manifest-delete
+ * recovery fails (manifest restoration AND fallback both fail). [performTerminalCleanupDebt]
+ * catches this and records the structured causes as warning debt. Never downgrades terminal
+ * COMMITTED/ROLLED_BACK — cleanup debt is observable only via warnings metadata.
+ */
+internal class CleanupEvidenceException(
+    message: String,
+    val triggerDescription: String,
+    val manifestError: Throwable?,
+    val fallbackError: Throwable?
+) : IllegalStateException(message) {
+    /** Combine all non-null causes into a single descriptive string for warning metadata. */
+    fun toWarningDetail(): String = buildString {
+        append("Cleanup evidence recovery failed: $triggerDescription")
+        if (manifestError != null) append("; manifest: ${manifestError.message}")
+        if (fallbackError != null) append("; fallback: ${fallbackError.message}")
+    }
+}
+
 /** Narrow injectable IO seam for file deletion in cleanup. Tests can override and must reset in `finally`. */
 internal var cleanupDeleteOperation: (File) -> Boolean = { it.delete() }
 
@@ -3388,10 +3419,29 @@ internal var cleanupRootDeleteOperation: (File) -> Boolean = { it.delete() }
  *  Reset in `finally`. */
 internal var afterManifestDeleteOperation: ((File) -> Unit)? = null
 
-/** Narrow injectable seam: overrides the manifest restoration logic inside [cleanupBackups].
- *  When non-null, the result is used directly instead of the real atomic-write + verify path.
- *  Reset in `finally`. */
-internal var manifestRestoreOperation: (() -> Boolean)? = null
+/** Narrow injectable seam: overrides canonical file resolution inside [strictRootEvidence].
+ *  When non-null, replaces the `file.canonicalFile` call and may throw a known IOException
+ *  or SecurityException to verify InspectionFailed preserves the exact exception. Reset in
+ *  `finally`. */
+internal var strictRootEvidenceCanonicalizationSeam: ((File) -> File)? = null
+
+/** Narrow injectable seam: overrides only the manifest write step inside [cleanupBackups].
+ *  The write seam receives the manifest file and content; after the seam (or the real atomic
+ *  write), common production verification runs. A seam that writes nothing, writes malformed
+ *  content, writes the wrong state/identity, or installs a symlink is classified as restoration
+ *  failure. Reset in `finally`. */
+internal var manifestRestoreOperation: ((File, String) -> Unit)? = null
+
+/**
+ * Outcome of a manifest recovery attempt inside [cleanupBackups]. Preserves the structured
+ * causes so [performTerminalCleanupDebt] can record them as warning debt.
+ */
+internal data class ManifestRecoveryOutcome(
+    val manifestRestored: Boolean,
+    val fallbackEstablished: Boolean,
+    val manifestError: Throwable?,
+    val fallbackError: Throwable?
+)
 
 /**
  * Safe backup cleanup, shared by immediate finalization and process-restart recovery.
@@ -3418,8 +3468,9 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
         return false
     }
     // Cleanup is allowed only for strictly validated terminal manifests.
+    // Use the same direct-child / no-follow path contract as marker classification.
     val manifestFile = File(root, REPROCESS_TX_MANIFEST_FILE)
-    if (!manifestFile.isFile) return false
+    if (classifyMarkerPath(manifestFile, root) !is MarkerPathClassification.Valid) return false
     val durable = try {
         loadStrictManifest(manifestFile)
     } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
@@ -3440,21 +3491,25 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     }
     val cleanupDelete = cleanupDeleteOperation
     val cleanupList = cleanupListOperation
-    /** Atomically restore the terminal manifest and verify it matches the durable identity.
-     *  Returns true when the restored manifest exists and is strictly valid for this transaction.
-     *  Returns false (best-effort) when restoration or verification fails — this is a
-     *  terminal evidence gap but does not escape the caller. */
+    /** Write the terminal manifest via seam or real atomic write. After the write, always run
+     *  common production verification using classification + strict parsing. Returns true only
+     *  when the restored manifest passes every check. */
     fun restoreManifest(): Boolean {
-        val seam = manifestRestoreOperation
-        if (seam != null) return seam()
         return try {
-            KeplerJobMetadata.atomicWrite(manifestFile, durable.toJson().toString(2))
-            if (!manifestFile.isFile) return false
-            val restored = loadStrictManifest(manifestFile)
-            restored.transactionId == durable.transactionId &&
-                restored.createdAt == durable.createdAt &&
-                restored.hasSameImmutableIdentity(durable) &&
-                restored.state == durable.state
+            val content = durable.toJson().toString(2)
+            val writeOp = manifestRestoreOperation
+            if (writeOp != null) writeOp(manifestFile, content)
+            else KeplerJobMetadata.atomicWrite(manifestFile, content)
+            when (classifyMarkerPath(manifestFile, root)) {
+                is MarkerPathClassification.Valid -> {
+                    val restored = loadStrictManifest(manifestFile)
+                    restored.transactionId == durable.transactionId &&
+                        restored.createdAt == durable.createdAt &&
+                        restored.hasSameImmutableIdentity(durable) &&
+                        restored.state == durable.state
+                }
+                else -> false
+            }
         } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
         catch (oom: OutOfMemoryError) { throw oom }
         catch (td: ThreadDeath) { throw td }
@@ -3462,6 +3517,69 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
         catch (ie: InternalError) { throw ie }
         catch (e: Error) { throw e }
         catch (_: Exception) { false }
+    }
+
+    /** Shared post-manifest-delete evidence recovery. Attempts manifest restoration with strict
+     *  verification; if that fails, calls [ensureDurableFallbackQuarantine]. Preserves structured
+     *  context (trigger description, manifest failure, fallback failure). Throws
+     *  [CleanupEvidenceException] when recovery is completely unsuccessful so the structured
+     *  causes are inspectable in production tests. */
+    fun recoverManifestAndFallback(trigger: String): ManifestRecoveryOutcome {
+        var manifestError: Throwable? = null
+        val manifestRestored = try {
+            val content = durable.toJson().toString(2)
+            val writeOp = manifestRestoreOperation
+            if (writeOp != null) writeOp(manifestFile, content)
+            else KeplerJobMetadata.atomicWrite(manifestFile, content)
+            when (classifyMarkerPath(manifestFile, root)) {
+                is MarkerPathClassification.Valid -> {
+                    val restored = try { loadStrictManifest(manifestFile) }
+                    catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+                    catch (oom: OutOfMemoryError) { throw oom }
+                    catch (td: ThreadDeath) { throw td }
+                    catch (le: LinkageError) { throw le }
+                    catch (ie: InternalError) { throw ie }
+                    catch (e: Error) { throw e }
+                    catch (ex: Exception) { manifestError = ex; null }
+                    if (restored == null) false
+                    else restored.transactionId == durable.transactionId &&
+                        restored.createdAt == durable.createdAt &&
+                        restored.hasSameImmutableIdentity(durable) &&
+                        restored.state == durable.state
+                }
+                else -> { manifestError = IllegalStateException("Manifest not classified as valid after write"); false }
+            }
+        } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+        catch (oom: OutOfMemoryError) { throw oom }
+        catch (td: ThreadDeath) { throw td }
+        catch (le: LinkageError) { throw le }
+        catch (ie: InternalError) { throw ie }
+        catch (e: Error) { throw e }
+        catch (ex: Exception) { manifestError = ex; false }
+        if (manifestRestored) return ManifestRecoveryOutcome(true, false, null, null)
+        var fallbackError: Throwable? = null
+        var fallbackEstablished = false
+        val jobDir = root.parentFile
+        if (jobDir != null) {
+            try {
+                ensureDurableFallbackQuarantine(jobDir, transaction)
+                fallbackEstablished = true
+            } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+            catch (oom: OutOfMemoryError) { throw oom }
+            catch (td: ThreadDeath) { throw td }
+            catch (le: LinkageError) { throw le }
+            catch (ie: InternalError) { throw ie }
+            catch (e: Error) { throw e }
+            catch (fb: Exception) { fallbackError = fb }
+        }
+        val outcome = ManifestRecoveryOutcome(manifestRestored, fallbackEstablished, manifestError, fallbackError)
+        if (!manifestRestored && !fallbackEstablished) {
+            throw CleanupEvidenceException(
+                "Manifest restoration and fallback both failed after $trigger",
+                trigger, manifestError, fallbackError
+            )
+        }
+        return outcome
     }
     fun listRoot(rootDir: File): Array<File>? {
         val seam = cleanupList
@@ -3500,14 +3618,12 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
   if (unknownContents.isNotEmpty()) {
     return false
   }
-  // 3. Remove quarantine marker and verify deletion using classification.
+  // 3. Remove quarantine marker using fail-closed path classification.
+  //    Absent → continue. Valid → delete, require post-delete Absent.
+  //    Symlink, NotRegularFile, NotDirectChild, InspectionError → return false (fail closed).
   val markerFile = File(root, REPROCESS_QUARANTINE_MARKER)
   when (classifyMarkerPath(markerFile, root)) {
-    is MarkerPathClassification.Valid,
-    is MarkerPathClassification.NotRegularFile,
-    is MarkerPathClassification.Symlink,
-    is MarkerPathClassification.NotDirectChild,
-    is MarkerPathClassification.InspectionError -> {
+    is MarkerPathClassification.Valid -> {
       try {
         cleanupDelete(markerFile)
       } catch (e: kotlinx.coroutines.CancellationException) { throw e
@@ -3524,6 +3640,10 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
       }
     }
     is MarkerPathClassification.Absent -> { /* no marker to remove */ }
+    is MarkerPathClassification.Symlink,
+    is MarkerPathClassification.NotRegularFile,
+    is MarkerPathClassification.NotDirectChild,
+    is MarkerPathClassification.InspectionError -> return false
   }
   // 4. Verify only the terminal manifest remains before deleting it as the final file operation.
   val preManifestDelete = listRoot(root) ?: return false
@@ -3550,26 +3670,13 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
   if (!root.exists()) return true // root already removed
   val afterManifestDelete = listRoot(root) ?: run {
     // Root still exists but listing returned null — IO failure, fail closed.
-    restoreManifest()
+    recoverManifestAndFallback("null listing after manifest delete")
     return false
   }
   if (afterManifestDelete.isNotEmpty()) {
     // An unknown file appeared after manifest deletion. Restore terminal evidence.
     // Never recursively remove a file that appeared after the final listing.
-    if (!restoreManifest()) {
-      val jobDir = root.parentFile
-      if (jobDir != null) {
-        try {
-          ensureDurableFallbackQuarantine(jobDir, transaction)
-        } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-        catch (oom: OutOfMemoryError) { throw oom }
-        catch (td: ThreadDeath) { throw td }
-        catch (le: LinkageError) { throw le }
-        catch (ie: InternalError) { throw ie }
-        catch (e: Error) { throw e }
-        catch (_: Exception) { /* best-effort fallback marker */ }
-      }
-    }
+    recoverManifestAndFallback("unknown content after manifest delete")
     return false
   }
   // 7. Delete the now-empty root using non-recursive File.delete(). If root deletion fails,
@@ -3577,7 +3684,7 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
   try {
     val rootDeleted = cleanupRootDeleteOperation(root)
     if (!rootDeleted) {
-      restoreManifest()
+      recoverManifestAndFallback("root deletion returned false")
       return false
     }
   } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
@@ -3588,12 +3695,12 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
   catch (e: Error) { throw e }
   catch (_: Exception) {
     // Root deletion threw: restore and verify terminal manifest.
-    restoreManifest()
+    recoverManifestAndFallback("root deletion threw exception")
     return false
   }
   // Verify root absence. If root persists after successful delete, restore evidence.
   if (root.exists()) {
-    restoreManifest()
+    recoverManifestAndFallback("root still exists after successful delete")
     return false
   }
   return true
