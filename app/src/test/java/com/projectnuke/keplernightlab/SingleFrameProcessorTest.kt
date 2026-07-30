@@ -1,0 +1,135 @@
+package com.projectnuke.keplernightlab
+
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
+import org.json.JSONArray
+import org.json.JSONObject
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import java.io.File
+import java.io.FileOutputStream
+import java.nio.file.Files
+
+@RunWith(RobolectricTestRunner::class)
+class SingleFrameProcessorTest {
+    @Test
+    fun processesOneCapturedFrameWithSharedIspAndPersistsResultMetadata() {
+        val jobDir = Files.createTempDirectory("kepler-single-frame-").toFile()
+        try {
+            val sourceFile = File(jobDir, "frame_000.png")
+            val source = Bitmap.createBitmap(8, 6, Bitmap.Config.ARGB_8888)
+            try {
+                for (y in 0 until source.height) {
+                    for (x in 0 until source.width) {
+                        source.setPixel(
+                            x,
+                            y,
+                            Color.rgb(24 + x * 12, 20 + y * 15, 36 + (x + y) * 8)
+                        )
+                    }
+                }
+                FileOutputStream(sourceFile).use { output ->
+                    assertTrue(source.compress(Bitmap.CompressFormat.PNG, 100, output))
+                }
+            } finally {
+                source.recycle()
+            }
+
+            KeplerJobMetadata.write(
+                jobDir,
+                JSONObject()
+                    .put("jobType", "YUV_SINGLE_FRAME")
+                    .put("captureMode", CaptureMode.SINGLE_FRAME.name)
+                    .put("requestedFrames", 1)
+                    .put("savedFrames", 1)
+                    .put(
+                        "frames",
+                        JSONArray().put(
+                            JSONObject()
+                                .put("index", 0)
+                                .put("file", sourceFile.name)
+                                .put("enabled", true)
+                        )
+                    )
+            )
+
+            val params = ClassicYuvFusionPreset.CLEAN.params
+            val output = processSingleFrameJobSync(
+                jobDir = jobDir,
+                requestedParams = params,
+                onStatus = {}
+            )
+
+            assertEquals(SINGLE_FRAME_OUTPUT_FILE_NAME, output.name)
+            assertTrue(output.isFile && output.length() > 0L)
+            val decoded = requireNotNull(BitmapFactory.decodeFile(output.absolutePath))
+            try {
+                assertEquals(8, decoded.width)
+                assertEquals(6, decoded.height)
+            } finally {
+                decoded.recycle()
+            }
+
+            val job = KeplerJobMetadata.read(jobDir)
+            assertEquals("YUV_SINGLE_FRAME", job.getString("jobType"))
+            assertEquals(CaptureMode.SINGLE_FRAME.name, job.getString("captureMode"))
+            assertEquals("PIPELINE_COMPLETE", job.getString("processStatus"))
+            assertEquals(SINGLE_FRAME_OUTPUT_FILE_NAME, job.getString("finalFile"))
+            assertEquals(params.presetName, job.getString("fusionPresetName"))
+            assertEquals(1, job.getInt("usedFrameCount"))
+        } finally {
+            jobDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun reprocessProgressPolicyDoesNotOverwriteExistingTerminalFields() {
+        val jobDir = Files.createTempDirectory("kepler-single-reprocess-").toFile()
+        try {
+            val sourceFile = File(jobDir, "frame_000.png")
+            val source = Bitmap.createBitmap(3, 3, Bitmap.Config.ARGB_8888)
+            try {
+                source.eraseColor(Color.rgb(64, 72, 80))
+                FileOutputStream(sourceFile).use { output ->
+                    assertTrue(source.compress(Bitmap.CompressFormat.PNG, 100, output))
+                }
+            } finally {
+                source.recycle()
+            }
+            KeplerJobMetadata.write(
+                jobDir,
+                JSONObject()
+                    .put("jobType", "YUV_SINGLE_FRAME")
+                    .put("processStatus", "TERMINAL_SENTINEL")
+                    .put("finalFile", "existing_terminal.png")
+                    .put(
+                        "frames",
+                        JSONArray().put(
+                            JSONObject()
+                                .put("index", 0)
+                                .put("file", sourceFile.name)
+                                .put("enabled", true)
+                        )
+                    )
+            )
+
+            processSingleFrameJobSync(
+                jobDir = jobDir,
+                requestedParams = ClassicYuvFusionPreset.SHARP.params,
+                metadataPolicy = ReprocessMetadataPolicy.REPROCESS_PROGRESS_ONLY,
+                onStatus = {}
+            )
+
+            val job = KeplerJobMetadata.read(jobDir)
+            assertEquals("TERMINAL_SENTINEL", job.getString("processStatus"))
+            assertEquals("existing_terminal.png", job.getString("finalFile"))
+            assertEquals(ClassicYuvFusionPreset.SHARP.name, job.getString("fusionPresetName"))
+        } finally {
+            jobDir.deleteRecursively()
+        }
+    }
+}

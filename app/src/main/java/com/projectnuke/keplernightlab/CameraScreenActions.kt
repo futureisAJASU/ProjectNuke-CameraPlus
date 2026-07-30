@@ -164,9 +164,11 @@ internal fun buildCaptureStartMessage(
     selection: CameraSelection,
     resolutionPlan: ResolutionCapturePlan,
     settings: FrameCountSettings,
-    framePlan: FramePlan
+    framePlan: FramePlan,
+    captureMode: CaptureMode = CaptureMode.MULTI_FRAME
 ): String {
-    return "Night Fusion ${selectedResolution.label}. ${cameraSelectionStatus(selection)} " +
+    val modeLabel = if (captureMode == CaptureMode.SINGLE_FRAME) "Single photo" else "Night Fusion"
+    return "$modeLabel ${selectedResolution.label}. ${cameraSelectionStatus(selection)} " +
         "${resolutionPlan.reason} Frame mode: ${settings.mode.label}, " +
         "capture frames: ${framePlan.framesToCapture}, auto max: ${framePlan.maxFrames}. " +
         "${framePlan.reason}."
@@ -182,11 +184,14 @@ internal fun prepareCaptureAttempt(
         autoMaxFrames = input.autoMaxFrames,
         manualFrames = input.manualFrames
     )
-    val framePlan = estimateFramePlan(
-        settings = settings,
-        selectedModeLabel = input.selectedMode,
-        latestSceneLuma = input.latestSceneLuma,
-        latestMotionScore = input.latestMotionScore
+    val framePlan = effectiveFramePlan(
+        captureMode = input.captureMode,
+        estimated = estimateFramePlan(
+            settings = settings,
+            selectedModeLabel = input.selectedMode,
+            latestSceneLuma = input.latestSceneLuma,
+            latestMotionScore = input.latestMotionScore
+        )
     )
     val selection = input.cameraSelection
     val requestedUiZoomRatio = input.requestedUiZoomRatio
@@ -214,7 +219,8 @@ internal fun prepareCaptureAttempt(
             selection,
             input.resolutionPlan,
             settings,
-            framePlan
+            framePlan,
+            input.captureMode
         )
     )
 }
@@ -288,7 +294,33 @@ internal fun startCapturePipeline(
             "captureZoom=$captureZoomRatio " +
             "finalRoute=$finalRoute fallbackReason=${fallbackReason ?: "none"}"
     )
-    if (request.selectedResolution == CaptureResolutionMode.MP24_FUSION) {
+    if (request.captureMode == CaptureMode.SINGLE_FRAME) {
+        captureProcessExportNightFusion(
+            context = request.context,
+            cameraId = selection.cameraId,
+            frameCount = 1,
+            resolutionMode = CaptureResolutionMode.MP12,
+            finalOutputFormat = request.finalOutputFormat,
+            zoomRatio = captureZoomRatio,
+            requestedUiZoomRatio = requestedUiZoomRatio,
+            physicalCameraId = physicalCameraId,
+            zoomRoute = selection.requestedThreeXSourceMode,
+            previewRoute = finalRoute,
+            routeFallbackReason = fallbackReason,
+            focusAeState = request.focusAeState,
+            cleanupPolicy = CacheCleanupPolicy.KEEP_ALL,
+            frameCountMode = FrameCountMode.MANUAL,
+            autoMinFrames = 1,
+            autoMaxFrames = 1,
+            manualFrames = 1,
+            framePlanReason = "Single-frame capture",
+            captureMode = CaptureMode.SINGLE_FRAME,
+            processingParams = request.processingSettings.resolvedParams(),
+            captureCancellationHandle = request.captureCancellationHandle,
+            cancellation = request.cancellation,
+            onStatus = loggedStatus
+        )
+    } else if (request.selectedResolution == CaptureResolutionMode.MP24_FUSION) {
         captureProcessExportSuperResolutionFusion(
             context = request.context,
             cameraId = selection.cameraId,
@@ -303,6 +335,7 @@ internal fun startCapturePipeline(
             autoMaxFrames = request.prepared.settings.autoMaxFrames,
             manualFrames = request.prepared.settings.manualFrames,
             framePlanReason = request.prepared.framePlan.reason,
+            processingParams = request.processingSettings.resolvedParams(),
             captureCancellationHandle = request.captureCancellationHandle,
             cancellation = request.cancellation,
             onStatus = loggedStatus
@@ -327,6 +360,7 @@ internal fun startCapturePipeline(
             routeFallbackReason = fallbackReason,
             focusAeState = request.focusAeState,
             rawSpeedMode = request.rawSpeedMode,
+            processingParams = request.processingSettings.resolvedParams(),
             captureCancellationHandle = request.captureCancellationHandle,
             cancellation = request.cancellation,
             onStatus = loggedStatus
@@ -351,6 +385,8 @@ internal fun startCapturePipeline(
             autoMaxFrames = request.prepared.settings.autoMaxFrames,
             manualFrames = request.prepared.settings.manualFrames,
             framePlanReason = request.prepared.framePlan.reason,
+            captureMode = CaptureMode.MULTI_FRAME,
+            processingParams = request.processingSettings.resolvedParams(),
             captureCancellationHandle = request.captureCancellationHandle,
             cancellation = request.cancellation,
             onStatus = loggedStatus

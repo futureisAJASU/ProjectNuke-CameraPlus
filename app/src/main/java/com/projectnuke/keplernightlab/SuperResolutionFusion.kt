@@ -82,6 +82,7 @@ data class SuperResolutionFusionRequest(
     val targetPolicy: SuperResolutionTargetPolicy = superResolutionTargetPolicy(sourceMode),
     val targetMegapixels: Double = targetPolicy.defaultTargetMegapixels,
     val maxFrames: Int = 6,
+    val processingParams: ClassicYuvFusionParams = ClassicYuvFusionPreset.NATURAL.params,
     val tileSinkFactory: ((File) -> SuperResolutionTileSink)? = null,
     val cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     val status: (String) -> Unit
@@ -296,6 +297,7 @@ fun runSuperResolutionFusion(
             outputWidth = dimensions.first,
             outputHeight = dimensions.second,
             sink = tileSink,
+            processingParams = request.processingParams,
             cancellation = request.cancellation
         )
         val actualOutputMegapixels = megapixels(dimensions.first, dimensions.second)
@@ -350,6 +352,7 @@ fun captureProcessExportSuperResolutionFusion(
     autoMaxFrames: Int,
     manualFrames: Int,
     framePlanReason: String,
+    processingParams: ClassicYuvFusionParams = ClassicYuvFusionPreset.NATURAL.params,
     captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
@@ -374,6 +377,8 @@ fun captureProcessExportSuperResolutionFusion(
         autoMaxFrames = autoMaxFrames,
         manualFrames = manualFrames,
         framePlanReason = framePlanReason,
+        captureMode = CaptureMode.MULTI_FRAME,
+        processingParams = processingParams,
         captureCancellationHandle = captureCancellationHandle,
         onComplete = { sourceJobDir ->
             try {
@@ -397,6 +402,7 @@ fun captureProcessExportSuperResolutionFusion(
                             outputDir = outputDir,
                             sourceMode = SuperResolutionSourceMode.BINNED_12MP_YUV,
                             maxFrames = captureFrames,
+                            processingParams = processingParams,
                             cancellation = cancellation,
                             status = { post(it) }
                         )
@@ -544,6 +550,7 @@ private fun decodeLumaFrame(
         BitmapFactory.Options().apply {
             inSampleSize = sampleSize
             inPreferredConfig = Bitmap.Config.ARGB_8888
+            inMutable = true
         }
     ) ?: return null
     var proxy: Bitmap? = null
@@ -745,10 +752,12 @@ private fun fuseFramesTiled(
     outputWidth: Int,
     outputHeight: Int,
     sink: SuperResolutionTileSink,
+    processingParams: ClassicYuvFusionParams,
     cancellation: KeplerPipelineCancellation
 ): File {
     val scaleX = outputWidth.toFloat() / reference.sourceWidth
     val scaleY = outputHeight.toFloat() / reference.sourceHeight
+    val normalizedProcessingParams = processingParams.clamped()
     val shiftByIndex = shifts.associateBy { it.index }
     val maximumAcceptedShift = shifts
         .asSequence()
@@ -813,6 +822,7 @@ private fun fuseFramesTiled(
                         accumG = accumG,
                         accumB = accumB,
                         weights = weights,
+                        processingParams = normalizedProcessingParams,
                         cancellation = cancellation
                     )
                 }
@@ -822,6 +832,9 @@ private fun fuseFramesTiled(
                     accumG = accumG,
                     accumB = accumB,
                     weights = weights,
+                    tileWidth = tileWidth,
+                    tileHeight = tileHeight,
+                    processingParams = normalizedProcessingParams,
                     cancellation = cancellation
                 )
                 cancellation.throwIfCancelled()
@@ -869,7 +882,10 @@ private fun decodeTileRegion(
     cancellation.throwIfCancelled()
     val bitmap = decoder.decodeRegion(
         Rect(left, top, right, bottom),
-        BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
+        BitmapFactory.Options().apply {
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+            inMutable = true
+        }
     ) ?: error("Could not decode source strip.")
     return try {
         cancellation.throwIfCancelled()
@@ -898,12 +914,15 @@ private fun accumulateTile(
     accumG: FloatArray,
     accumB: FloatArray,
     weights: FloatArray,
+    processingParams: ClassicYuvFusionParams,
     cancellation: KeplerPipelineCancellation
 ) {
     val alignmentWeight = if (isReference) {
         1f
     } else {
-        (1f - shift.score * 3f).coerceIn(0.35f, 1f)
+        ((1f - shift.score * 3f).coerceIn(0.35f, 1f) *
+            (1f + processingParams.denoiseStrength * 1.25f))
+            .coerceAtMost(1.65f)
     }
     for (localY in 0 until tileHeight) {
         if ((localY and 15) == 0) cancellation.throwIfCancelled()
@@ -948,6 +967,9 @@ private fun normalizeTile(
     accumG: FloatArray,
     accumB: FloatArray,
     weights: FloatArray,
+    tileWidth: Int,
+    tileHeight: Int,
+    processingParams: ClassicYuvFusionParams,
     cancellation: KeplerPipelineCancellation
 ): IntArray {
     val output = IntArray(weights.size)
@@ -958,12 +980,81 @@ private fun normalizeTile(
             val red = (accumR[index] / weight).roundToInt().coerceIn(0, 255)
             val green = (accumG[index] / weight).roundToInt().coerceIn(0, 255)
             val blue = (accumB[index] / weight).roundToInt().coerceIn(0, 255)
-            0xff000000.toInt() or (red shl 16) or (green shl 8) or blue
+            applySuperResolutionTone(
+                red = red,
+                green = green,
+                blue = blue,
+                params = processingParams
+            )
         } else {
             0xff000000.toInt()
         }
     }
+    applySuperResolutionDetailInPlace(
+        pixels = output,
+        width = tileWidth,
+        height = tileHeight,
+        params = processingParams,
+        cancellation = cancellation
+    )
     return output
+}
+
+private fun applySuperResolutionDetailInPlace(
+    pixels: IntArray,
+    width: Int,
+    height: Int,
+    params: ClassicYuvFusionParams,
+    cancellation: KeplerPipelineCancellation
+) {
+    if (width < 3 || height < 3) return
+    val amount = (params.sharpenAmount * 0.42f + params.localContrastAmount * 0.58f)
+        .coerceIn(0f, 0.28f)
+    if (amount <= 0f) return
+    val source = pixels.copyOf()
+    for (y in 1 until height - 1) {
+        if ((y and 31) == 0) cancellation.throwIfCancelled()
+        val row = y * width
+        for (x in 1 until width - 1) {
+            val index = row + x
+            pixels[index] = sharpenPixel(
+                center = source[index],
+                left = source[index - 1],
+                right = source[index + 1],
+                up = source[index - width],
+                down = source[index + width],
+                amount = amount
+            )
+        }
+    }
+}
+
+private fun applySuperResolutionTone(
+    red: Int,
+    green: Int,
+    blue: Int,
+    params: ClassicYuvFusionParams
+): Int {
+    val luma = rgbLuma(red, green, blue)
+    val shadowLift = params.shadowLift * (1f - luma / 255f) * 255f
+    val highlightStart = 190f
+    val highlightCompression = if (luma > highlightStart) {
+        (luma - highlightStart) * params.highlightRollOff
+    } else {
+        0f
+    }
+    val adjustedLuma = (luma + shadowLift - highlightCompression).coerceIn(0f, 255f)
+    val saturation = params.saturationBoost
+
+    fun channel(value: Int): Int {
+        val saturated = adjustedLuma + (value - luma) * saturation
+        return saturated.roundToInt().coerceIn(0, 255)
+    }
+
+    return 0xff000000.toInt() or
+        (channel(red) shl 16) or
+        (channel(green) shl 8) or
+        channel(blue)
 }
 
 private fun bilinearArgb(region: DecodedRegion, sourceX: Float, sourceY: Float): Int {
@@ -1001,50 +1092,68 @@ private fun bilinearChannel(
 
 private fun applyMildUnsharpInPlace(
     bitmap: Bitmap,
+    processingParams: ClassicYuvFusionParams,
     cancellation: KeplerPipelineCancellation
 ) {
-    if (bitmap.width < 3 || bitmap.height < 3) return
+    if (bitmap.width < 1 || bitmap.height < 1) return
+    val params = processingParams.clamped()
     val width = bitmap.width
+    val amount = (params.sharpenAmount * 0.55f + params.localContrastAmount * 0.45f)
+        .coerceIn(0f, 0.28f)
+
+    fun readTonedRow(y: Int): IntArray = IntArray(width).also { row ->
+        bitmap.getPixels(row, 0, width, 0, y, width, 1)
+        for (x in row.indices) {
+            val color = row[x]
+            row[x] = applySuperResolutionTone(
+                red = color shr 16 and 0xff,
+                green = color shr 8 and 0xff,
+                blue = color and 0xff,
+                params = params
+            )
+        }
+    }
+
     var previous = IntArray(width)
-    var current = IntArray(width)
-    var next = IntArray(width)
-    bitmap.getPixels(current, 0, width, 0, 0, width, 1)
-    bitmap.getPixels(next, 0, width, 0, 1, width, 1)
+    var current = readTonedRow(0)
+    var next = if (bitmap.height > 1) readTonedRow(1) else current
 
     for (y in 0 until bitmap.height) {
         if ((y and 31) == 0) cancellation.throwIfCancelled()
         val following = if (y + 1 < bitmap.height) next else current
         val output = current.copyOf()
-        if (y in 1 until bitmap.height - 1) {
+        if (amount > 0f && y in 1 until bitmap.height - 1) {
             for (x in 1 until width - 1) {
                 output[x] = sharpenPixel(
                     center = current[x],
                     left = current[x - 1],
                     right = current[x + 1],
                     up = previous[x],
-                    down = following[x]
+                    down = following[x],
+                    amount = amount
                 )
             }
         }
         bitmap.setPixels(output, 0, width, 0, y, width, 1)
         previous = current
         current = next
-        next = if (y + 2 < bitmap.height) {
-            IntArray(width).also {
-                bitmap.getPixels(it, 0, width, 0, y + 2, width, 1)
-            }
-        } else {
-            current
-        }
+        next = if (y + 2 < bitmap.height) readTonedRow(y + 2) else current
     }
 }
 
-private fun sharpenPixel(center: Int, left: Int, right: Int, up: Int, down: Int): Int {
+private fun sharpenPixel(
+    center: Int,
+    left: Int,
+    right: Int,
+    up: Int,
+    down: Int,
+    amount: Float
+): Int {
     fun channel(shift: Int): Int {
         val centerValue = center shr shift and 0xff
         val neighbors = ((left shr shift and 0xff) + (right shr shift and 0xff) +
             (up shr shift and 0xff) + (down shr shift and 0xff)) / 4f
-        return (centerValue + 0.16f * (centerValue - neighbors))
+        return (centerValue + amount * (centerValue - neighbors))
             .roundToInt()
             .coerceIn(0, 255)
     }
@@ -1074,8 +1183,13 @@ private fun runSingleFrameFallback(
     }
     request.status("${superResolutionStatusLabel(request)}: writing output...")
     request.cancellation.throwIfCancelled()
-    val source = BitmapFactory.decodeFile(reference.file.absolutePath)
-        ?: return failedSuperResolutionResult(
+    val source = BitmapFactory.decodeFile(
+        reference.file.absolutePath,
+        BitmapFactory.Options().apply {
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+            inMutable = true
+        }
+    ) ?: return failedSuperResolutionResult(
             request,
             request.inputFrameFiles.size,
             "Fallback reference decode failed.",
@@ -1086,7 +1200,11 @@ private fun runSingleFrameFallback(
         request.cancellation.throwIfCancelled()
         output = Bitmap.createScaledBitmap(source, targetWidth, targetHeight, true)
         request.cancellation.throwIfCancelled()
-        applyMildUnsharpInPlace(output!!, request.cancellation)
+        applyMildUnsharpInPlace(
+            output!!,
+            request.processingParams,
+            request.cancellation
+        )
         val outputFile = File(
             request.outputDir,
             superResolutionOutputFileName(targetMegapixels)
@@ -1188,6 +1306,11 @@ private fun writeSuperResolutionJob(
         .put("outputResolutionMode", resolutionModeLabelForTarget(result.targetMegapixels))
         .put("sourceResolutionMode", resolutionModeLabelForSource(request.sourceMode))
         .put("sourceMode", request.sourceMode.name)
+        .put("captureMode", CaptureMode.MULTI_FRAME.name)
+        .put("processingPresetName", request.processingParams.clamped().presetName)
+        .put("processingParams", request.processingParams.clamped().toJson())
+        .put("fusionPresetName", request.processingParams.clamped().presetName)
+        .put("fusionParams", request.processingParams.clamped().toJson())
         .put("sourceMegapixels", result.sourceMegapixels)
         .put("targetMegapixels", result.targetMegapixels)
         .put("actualOutputMegapixels", result.actualOutputMegapixels)

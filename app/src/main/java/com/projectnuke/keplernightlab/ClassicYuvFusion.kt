@@ -296,7 +296,7 @@ internal fun processClassicYuvFusionJob(
 
         markStage("YUV_DENOISE_SHARPEN", "노이즈와 선명도를 보정하는 중입니다.")
         cancellation.throwIfCancelled()
-        finalBitmap = finishClassicFusion(merged, params, cancellation)
+        finalBitmap = applyClassicYuvPostProcessing(merged, params, cancellation)
         cancellation.throwIfCancelled()
         val lookDoneAt = System.currentTimeMillis()
         markStage("YUV_EXPORTING", "결과를 저장하는 중입니다.")
@@ -608,6 +608,7 @@ private fun decodeLumaThumbnail(file: File): LumaThumbnail {
         BitmapFactory.Options().apply {
             inSampleSize = sampleSize
             inPreferredConfig = Bitmap.Config.ARGB_8888
+            inMutable = true
         }
     ) ?: error("Could not decode frame: ${file.name}")
     return try {
@@ -898,7 +899,7 @@ private fun ghostWeight(lumaDifference: Float, params: ClassicYuvFusionParams): 
     return (1f - normalized).pow(3).coerceAtLeast(params.ghostWeight)
 }
 
-private fun finishClassicFusion(
+internal fun applyClassicYuvPostProcessing(
     source: Bitmap,
     params: ClassicYuvFusionParams,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
@@ -948,9 +949,14 @@ private fun finishClassicFusion(
                 val centerLuma = luma(center).toFloat()
                 val localLuma = lumaSum / 9f
                 val detail = centerLuma - localLuma
-                val sharpenedLuma = centerLuma +
+                val flatRegionWeight = (1f - abs(detail) / 28f).coerceIn(0f, 1f)
+                val lumaDenoiseWeight = params.denoiseStrength * flatRegionWeight
+                val denoisedLuma =
+                    centerLuma * (1f - lumaDenoiseWeight) + localLuma * lumaDenoiseWeight
+                val sharpenSuppression = (1f - params.denoiseStrength * 0.65f).coerceIn(0.55f, 1f)
+                val sharpenedLuma = denoisedLuma +
                     detail * params.localContrastAmount +
-                    detail * params.sharpenAmount
+                    detail * params.sharpenAmount * sharpenSuppression
                 val centerChromaR = Color.red(center) - centerLuma
                 val centerChromaB = Color.blue(center) - centerLuma
                 val chromaR = (
@@ -1269,7 +1275,7 @@ private fun generateFusionDebugArtifacts(
             mergedBitmap,
             File(jobDir, "yuv_fused_before_denoise_preview.png")
         )
-        val yuvNoSharpenPreview = finishClassicFusion(
+        val yuvNoSharpenPreview = applyClassicYuvPostProcessing(
             yuvBeforeDenoisePreview,
             params.copy(sharpenAmount = 0f, localContrastAmount = 0f)
         )
@@ -1353,6 +1359,7 @@ private fun decodeDebugPreview(file: File): Bitmap {
         BitmapFactory.Options().apply {
             inSampleSize = sampleSize
             inPreferredConfig = Bitmap.Config.ARGB_8888
+            inMutable = true
         }
     ) ?: error("Could not decode debug preview")
 }

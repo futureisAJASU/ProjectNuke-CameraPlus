@@ -1,4 +1,4 @@
-﻿package com.projectnuke.keplernightlab
+package com.projectnuke.keplernightlab
 
 import android.Manifest
 import android.content.Context
@@ -52,6 +52,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
@@ -373,6 +374,19 @@ fun MainCameraScreen(
     var rawSpeedMode by remember {
         mutableStateOf(RawSpeedMode.entries.firstOrNull { it.name == savedSettings.rawSpeedModeName } ?: RawSpeedMode.BALANCED)
     }
+    var captureMode by remember {
+        mutableStateOf(CaptureMode.entries.firstOrNull { it.name == savedSettings.captureModeName } ?: CaptureMode.MULTI_FRAME)
+    }
+    var processingSettings by remember {
+        mutableStateOf(
+            ProcessingSettings(
+                presetName = savedSettings.processingPresetName,
+                denoiseStrength = savedSettings.denoiseStrength,
+                sharpenAmount = savedSettings.sharpenAmount,
+                localContrastAmount = savedSettings.localContrastAmount
+            ).normalized()
+        )
+    }
     var latestSceneLuma by remember { mutableStateOf<Double?>(null) }
     var latestMotionScore by remember { mutableStateOf<Double?>(null) }
     var capabilityRefreshNonce by remember { mutableStateOf(0) }
@@ -413,6 +427,8 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var latestSummary by remember { mutableStateOf("최근 결과 없음") }
     var latestResult by remember { mutableStateOf<LatestKeplerResult?>(null) }
     var showResultPreview by remember { mutableStateOf(false) }
+    var processingPreviewBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var processingPreviewStatus by remember { mutableStateOf("최근 결과를 촬영하면 설정 미리보기가 표시됩니다.") }
     val refreshMutex = remember { Mutex() }
     val cameraScope = rememberCoroutineScope()
     var refreshGeneration by remember { mutableIntStateOf(0) }
@@ -429,6 +445,9 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
         showResultPreview = false
         latestSceneLuma = null
         latestMotionScore = null
+        processingPreviewBitmap?.takeIf { !it.isRecycled }?.recycle()
+        processingPreviewBitmap = null
+        processingPreviewStatus = "최근 결과를 촬영하면 설정 미리보기가 표시됩니다."
     }
 
     fun refreshLatestResult(showPreview: Boolean = false) {
@@ -503,6 +522,55 @@ LaunchedEffect(Unit) {
         refreshLatestResult()
     }
 
+    LaunchedEffect(currentScreen, latestBitmap, processingSettings) {
+        if (currentScreen != MainScreen.SETTINGS) {
+            processingPreviewBitmap?.takeIf { !it.isRecycled }?.recycle()
+            processingPreviewBitmap = null
+            return@LaunchedEffect
+        }
+        delay(120L)
+        var previewSource: Bitmap? = null
+        var renderedPreview: Bitmap? = null
+        val previewCancellation = KeplerPipelineCancellationToken()
+        val previewJob = currentCoroutineContext()[Job]
+        previewJob?.invokeOnCompletion { previewCancellation.cancel() }
+        try {
+            previewSource = refreshMutex.withLock {
+                latestBitmap
+                    ?.takeIf { !it.isRecycled }
+                    ?.let(::createProcessingPreviewSource)
+            }
+            if (previewSource == null) {
+                processingPreviewStatus = "최근 결과를 촬영하면 설정 미리보기가 표시됩니다."
+                return@LaunchedEffect
+            }
+            processingPreviewStatus = "최근 결과로 선택한 프리셋을 미리보는 중..."
+            renderedPreview = withContext(Dispatchers.Default) {
+                renderProcessingPreview(
+                    previewSource!!,
+                    processingSettings,
+                    previewCancellation
+                )
+            }
+            if (currentCoroutineContext()[Job]?.isActive != true) return@LaunchedEffect
+            processingPreviewBitmap?.takeIf { !it.isRecycled }?.recycle()
+            processingPreviewBitmap = renderedPreview
+            renderedPreview = null
+            val preset = ClassicYuvFusionPreset.fromName(processingSettings.presetName)
+            processingPreviewStatus =
+                "최근 결과 기반 근사 미리보기 · ${preset.displayName} · " +
+                    "NR ${"%.2f".format(processingSettings.denoiseStrength)} · " +
+                    "Sharp ${"%.2f".format(processingSettings.sharpenAmount)}"
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            processingPreviewStatus = "미리보기 실패: ${e.javaClass.simpleName}"
+        } finally {
+            renderedPreview?.takeIf { !it.isRecycled }?.recycle()
+            previewSource?.takeIf { !it.isRecycled }?.recycle()
+        }
+    }
+
     LaunchedEffect(isPipelineBusy) {
         Log.i("KeplerPipelineState", if (isPipelineBusy) "busy indicator shown" else "busy indicator hidden")
     }
@@ -528,6 +596,18 @@ LaunchedEffect(Unit) {
         }
     }
 
+    LaunchedEffect(captureMode, selectedResolution, pipelineMode) {
+        if (captureMode == CaptureMode.SINGLE_FRAME) {
+            if (selectedResolution != CaptureResolutionMode.MP12) {
+                selectedResolution = CaptureResolutionMode.MP12
+            }
+            if (pipelineMode != PipelineMode.YUV_NIGHT_FUSION) {
+                pipelineMode = PipelineMode.YUV_NIGHT_FUSION
+            }
+            status = "일반 사진 모드는 12M 단일 YUV 프레임에 공통 ISP 후처리를 적용합니다."
+        }
+    }
+
     LaunchedEffect(
         selectedResolution,
         selectedLensSlot,
@@ -538,7 +618,9 @@ LaunchedEffect(Unit) {
         autoMaxFrames,
         manualFrames,
         zoomUiState.zoomRatio,
-        rawSpeedMode
+        rawSpeedMode,
+        captureMode,
+        processingSettings
     ) {
         CameraSettingsStore.save(
             context,
@@ -552,23 +634,31 @@ LaunchedEffect(Unit) {
                 autoMaxFrames = autoMaxFrames,
                 manualFrames = manualFrames,
                 zoomRatio = zoomUiState.zoomRatio,
-                rawSpeedModeName = rawSpeedMode.name
+                rawSpeedModeName = rawSpeedMode.name,
+                captureModeName = captureMode.name,
+                processingPresetName = processingSettings.presetName,
+                denoiseStrength = processingSettings.denoiseStrength,
+                sharpenAmount = processingSettings.sharpenAmount,
+                localContrastAmount = processingSettings.localContrastAmount
             )
         )
     }
 
-    LaunchedEffect(frameCountMode, autoMinFrames, autoMaxFrames, manualFrames, selectedMode, latestSceneLuma, latestMotionScore) {
+    LaunchedEffect(captureMode, frameCountMode, autoMinFrames, autoMaxFrames, manualFrames, selectedMode, latestSceneLuma, latestMotionScore) {
         val settings = currentFrameCountSettings(
             mode = frameCountMode,
             autoMinFrames = autoMinFrames,
             autoMaxFrames = autoMaxFrames,
             manualFrames = manualFrames
         )
-        latestFramePlan = estimateFramePlan(
-            settings = settings,
-            selectedModeLabel = selectedMode,
-            latestSceneLuma = latestSceneLuma,
-            latestMotionScore = latestMotionScore
+        latestFramePlan = effectiveFramePlan(
+            captureMode = captureMode,
+            estimated = estimateFramePlan(
+                settings = settings,
+                selectedModeLabel = selectedMode,
+                latestSceneLuma = latestSceneLuma,
+                latestMotionScore = latestMotionScore
+            )
         )
     }
 
@@ -938,6 +1028,7 @@ mainHandler.removeCallbacks(watchdog)
                                     autoMaxFrames = autoMaxFrames,
                                     manualFrames = manualFrames,
                                     selectedMode = selectedMode,
+                                    captureMode = captureMode,
                                     latestSceneLuma = latestSceneLuma,
                                     latestMotionScore = latestMotionScore
                                 )
@@ -954,7 +1045,10 @@ mainHandler.removeCallbacks(watchdog)
                             runCameraJob(
                                 startMessage = clickResult.prepared.startMessage,
                                 requestedFrames = clickResult.prepared.framePlan.framesToCapture,
-                                timeoutMillis = if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
+                                timeoutMillis = if (
+                                    captureMode == CaptureMode.MULTI_FRAME &&
+                                    pipelineMode == PipelineMode.RAW_NIGHT_FUSION
+                                ) {
                                     120_000L
                                 } else {
                                     60_000L
@@ -963,13 +1057,19 @@ mainHandler.removeCallbacks(watchdog)
                                 startCapturePipeline(
                                     CapturePipelineRequest(
                                         context = context,
-                                        pipelineMode = pipelineMode,
+                                        pipelineMode = if (captureMode == CaptureMode.SINGLE_FRAME) {
+                                            PipelineMode.YUV_NIGHT_FUSION
+                                        } else {
+                                            pipelineMode
+                                        },
                                         prepared = clickResult.prepared,
                                         selectedResolution = selectedResolution,
                                         resolutionPlan = clickResult.resolutionPlan,
                                         finalOutputFormat = finalOutputFormat,
                                         focusAeState = focusAeState,
                                         rawSpeedMode = rawSpeedMode,
+                                        captureMode = captureMode,
+                                        processingSettings = processingSettings,
                                         captureCancellationHandle = captureCancellation,
                                         cancellation = cancellation
                                     ),
@@ -1047,6 +1147,17 @@ mainHandler.removeCallbacks(watchdog)
                     manualFrames = value.coerceIn(MIN_CAPTURE_FRAMES, MAX_CAPTURE_FRAMES)
                 },
                 latestFramePlan = latestFramePlan,
+                captureMode = captureMode,
+                onCaptureModeChange = { mode ->
+                    captureMode = mode
+                    if (mode == CaptureMode.SINGLE_FRAME) {
+                        selectedResolution = CaptureResolutionMode.MP12
+                    }
+                },
+                processingSettings = processingSettings,
+                onProcessingSettingsChange = { processingSettings = it.normalized() },
+                processingPreviewBitmap = processingPreviewBitmap,
+                processingPreviewStatus = processingPreviewStatus,
                 pipelineMode = pipelineMode,
                 onPipelineModeChange = { pipelineMode = it },
                 rawSpeedMode = rawSpeedMode,
@@ -1862,7 +1973,11 @@ fun ThreeXSourceDot(
     ) {
         Text(
             text = source.label,
-            color = if (selected) Color.Black else Color.White,
+            color = when {
+                !enabled -> Color.White.copy(alpha = 0.32f)
+                selected -> Color.Black
+                else -> Color.White
+            },
             style = MaterialTheme.typography.labelSmall
         )
     }
@@ -1921,6 +2036,12 @@ fun SettingsScreen(
     manualFrames: Int,
     onManualFramesChange: (Int) -> Unit,
     latestFramePlan: FramePlan,
+    captureMode: CaptureMode,
+    onCaptureModeChange: (CaptureMode) -> Unit,
+    processingSettings: ProcessingSettings,
+    onProcessingSettingsChange: (ProcessingSettings) -> Unit,
+    processingPreviewBitmap: Bitmap?,
+    processingPreviewStatus: String,
     pipelineMode: PipelineMode,
     onPipelineModeChange: (PipelineMode) -> Unit,
     rawSpeedMode: RawSpeedMode,
@@ -1997,7 +2118,20 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.bodyMedium
                 )
 
+                CaptureModeSettingsSection(
+                    captureMode = captureMode,
+                    onCaptureModeChange = onCaptureModeChange
+                )
+
+                ProcessingSettingsSection(
+                    settings = processingSettings,
+                    onSettingsChange = onProcessingSettingsChange,
+                    previewBitmap = processingPreviewBitmap,
+                    previewStatus = processingPreviewStatus
+                )
+
                 FrameCountSettingsSection(
+                    captureMode = captureMode,
                     frameCountMode = frameCountMode,
                     onFrameCountModeChange = onFrameCountModeChange,
                     autoMinFrames = autoMinFrames,
@@ -2010,6 +2144,7 @@ fun SettingsScreen(
                 )
 
                 PipelineModeSettingsSection(
+                    captureMode = captureMode,
                     pipelineMode = pipelineMode,
                     onPipelineModeChange = onPipelineModeChange,
                     rawSpeedMode = rawSpeedMode,
@@ -2086,6 +2221,149 @@ fun SettingsScreen(
 }
 
 @Composable
+fun CaptureModeSettingsSection(
+    captureMode: CaptureMode,
+    onCaptureModeChange: (CaptureMode) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(
+            text = "촬영 방식",
+            color = Color.White,
+            style = MaterialTheme.typography.titleMedium
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            CaptureMode.entries.forEach { mode ->
+                FrameModeChip(
+                    text = mode.label,
+                    selected = captureMode == mode,
+                    onClick = { onCaptureModeChange(mode) }
+                )
+            }
+        }
+        Text(
+            text = captureMode.description,
+            color = Color.White.copy(alpha = 0.68f),
+            style = MaterialTheme.typography.bodySmall
+        )
+    }
+}
+
+@Composable
+fun ProcessingSettingsSection(
+    settings: ProcessingSettings,
+    onSettingsChange: (ProcessingSettings) -> Unit,
+    previewBitmap: Bitmap?,
+    previewStatus: String
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(
+            text = "ISP 후처리",
+            color = Color.White,
+            style = MaterialTheme.typography.titleMedium
+        )
+        ClassicYuvFusionPreset.entries.chunked(2).forEach { presets ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                presets.forEach { preset ->
+                    FrameModeChip(
+                        text = preset.displayName,
+                        selected = settings.presetName == preset.name,
+                        onClick = { onSettingsChange(ProcessingSettings.fromPreset(preset)) }
+                    )
+                }
+            }
+        }
+
+        ProcessingSliderRow(
+            label = "노이즈 감소",
+            value = settings.denoiseStrength,
+            valueRange = 0f..0.55f,
+            onValueChange = { onSettingsChange(settings.copy(denoiseStrength = it)) }
+        )
+        ProcessingSliderRow(
+            label = "샤픈",
+            value = settings.sharpenAmount,
+            valueRange = 0f..0.55f,
+            onValueChange = { onSettingsChange(settings.copy(sharpenAmount = it)) }
+        )
+        ProcessingSliderRow(
+            label = "로컬 콘트라스트",
+            value = settings.localContrastAmount,
+            valueRange = 0f..0.18f,
+            onValueChange = { onSettingsChange(settings.copy(localContrastAmount = it)) }
+        )
+
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = Color(0xFF0A0B10),
+            shape = RoundedCornerShape(18.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (previewBitmap != null && !previewBitmap.isRecycled) {
+                    Image(
+                        bitmap = previewBitmap.asImageBitmap(),
+                        contentDescription = "Processing preset preview",
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .aspectRatio(previewBitmap.width.toFloat() / previewBitmap.height.coerceAtLeast(1)),
+                        contentScale = ContentScale.Fit
+                    )
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(120.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "최근 촬영 결과 없음",
+                            color = Color.White.copy(alpha = 0.45f)
+                        )
+                    }
+                }
+                Text(
+                    text = previewStatus,
+                    color = Color.White.copy(alpha = 0.65f),
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProcessingSliderRow(
+    label: String,
+    value: Float,
+    valueRange: ClosedFloatingPointRange<Float>,
+    onValueChange: (Float) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(label, color = Color.White.copy(alpha = 0.82f))
+            Text(
+                text = "%.2f".format(value),
+                color = Color.White.copy(alpha = 0.62f),
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+        Slider(
+            value = value.coerceIn(valueRange.start, valueRange.endInclusive),
+            onValueChange = onValueChange,
+            valueRange = valueRange
+        )
+    }
+}
+
+@Composable
 fun OutputFormatSettingsSection(
     finalOutputFormat: FinalOutputFormat,
     onFinalOutputFormatChange: (FinalOutputFormat) -> Unit
@@ -2138,6 +2416,7 @@ fun OutputFormatSettingsSection(
 
 @Composable
 fun FrameCountSettingsSection(
+    captureMode: CaptureMode,
     frameCountMode: FrameCountMode,
     onFrameCountModeChange: (FrameCountMode) -> Unit,
     autoMinFrames: Int,
@@ -2175,23 +2454,31 @@ fun FrameCountSettingsSection(
         FrameCountStepper(
             label = "Auto min",
             value = autoMinFrames,
-            enabled = frameCountMode == FrameCountMode.AUTO,
+            enabled = captureMode == CaptureMode.MULTI_FRAME && frameCountMode == FrameCountMode.AUTO,
             onChange = onAutoMinFramesChange
         )
 
         FrameCountStepper(
             label = "Auto max",
             value = autoMaxFrames,
-            enabled = frameCountMode == FrameCountMode.AUTO,
+            enabled = captureMode == CaptureMode.MULTI_FRAME && frameCountMode == FrameCountMode.AUTO,
             onChange = onAutoMaxFramesChange
         )
 
         FrameCountStepper(
             label = "Manual",
             value = manualFrames,
-            enabled = frameCountMode == FrameCountMode.MANUAL,
+            enabled = captureMode == CaptureMode.MULTI_FRAME && frameCountMode == FrameCountMode.MANUAL,
             onChange = onManualFramesChange
         )
+
+        if (captureMode == CaptureMode.SINGLE_FRAME) {
+            Text(
+                text = "일반 사진 모드에서는 프레임 수를 1장으로 고정합니다.",
+                color = Color.White.copy(alpha = 0.72f),
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
 
         Text(
             text = "Current plan: ${latestFramePlan.framesToCapture} frames / max ${latestFramePlan.maxFrames}",
@@ -2209,6 +2496,7 @@ fun FrameCountSettingsSection(
 
 @Composable
 fun PipelineModeSettingsSection(
+    captureMode: CaptureMode,
     pipelineMode: PipelineMode,
     onPipelineModeChange: (PipelineMode) -> Unit,
     rawSpeedMode: RawSpeedMode,
@@ -2231,14 +2519,18 @@ fun PipelineModeSettingsSection(
             FrameModeChip(
                 text = "고품질 RAW 야간 모드",
                 selected = pipelineMode == PipelineMode.RAW_NIGHT_FUSION,
+                enabled = captureMode == CaptureMode.MULTI_FRAME,
                 onClick = { onPipelineModeChange(PipelineMode.RAW_NIGHT_FUSION) }
             )
         }
         Text(
-            text = if (pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
-                "RAW 처리는 시간이 더 오래 걸릴 수 있습니다.\nRAW 원본을 합성하여 더 높은 품질을 목표로 처리합니다. 시간이 더 오래 걸릴 수 있습니다."
-            } else {
-                "빠르게 여러 장을 합성하여 노이즈를 줄이고 선명도를 개선합니다."
+            text = when {
+                captureMode == CaptureMode.SINGLE_FRAME ->
+                    "일반 사진은 RAW 합성 없이 한 장의 YUV 프레임에 동일한 ISP 프리셋을 적용합니다."
+                pipelineMode == PipelineMode.RAW_NIGHT_FUSION ->
+                    "RAW 원본을 합성하여 더 높은 품질을 목표로 처리합니다. 시간이 더 오래 걸릴 수 있습니다."
+                else ->
+                    "빠르게 여러 장을 합성하여 노이즈를 줄이고 선명도를 개선합니다."
             },
             color = Color.White.copy(alpha = 0.72f),
             style = MaterialTheme.typography.bodySmall
@@ -2253,6 +2545,8 @@ fun PipelineModeSettingsSection(
                 FrameModeChip(
                     text = mode.label,
                     selected = rawSpeedMode == mode,
+                    enabled = captureMode == CaptureMode.MULTI_FRAME &&
+                        pipelineMode == PipelineMode.RAW_NIGHT_FUSION,
                     onClick = { onRawSpeedModeChange(mode) }
                 )
             }
@@ -2300,13 +2594,20 @@ fun OverlaySettingsSection(
 fun FrameModeChip(
     text: String,
     selected: Boolean,
+    enabled: Boolean = true,
     onClick: () -> Unit
 ) {
     Box(
         modifier = Modifier
             .clip(RoundedCornerShape(16.dp))
-            .background(if (selected) Color.White else Color(0xFF232633))
-            .clickable(onClick = onClick)
+            .background(
+                when {
+                    !enabled -> Color(0xFF171923)
+                    selected -> Color.White
+                    else -> Color(0xFF232633)
+                }
+            )
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 14.dp, vertical = 8.dp),
         contentAlignment = Alignment.Center
     ) {
@@ -2663,6 +2964,7 @@ private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
         job.optString("outputFile", ""),
         job.optString("finalNightFusionFile", ""),
         "sharpened_night_fusion.png",
+        SINGLE_FRAME_OUTPUT_FILE_NAME,
         "raw_fusion_final.png",
         "average_color_rotated.png"
     )

@@ -79,7 +79,10 @@ enum class ClassicYuvFusionPreset(
 
 fun loadClassicYuvFusionParams(job: JSONObject): ClassicYuvFusionParams {
     val json = job.optJSONObject("fusionParams")
-        ?: return ClassicYuvFusionPreset.NATURAL.params
+        ?: job.optJSONObject("processingParams")
+        ?: return ClassicYuvFusionPreset.fromName(
+            job.optString("fusionPresetName", job.optString("processingPresetName", "NATURAL"))
+        ).params
     return runCatching {
         val preset = ClassicYuvFusionPreset.fromName(
             json.optString("presetName", job.optString("fusionPresetName", "NATURAL"))

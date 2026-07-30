@@ -196,6 +196,8 @@ fun captureYuvBurstColorWithMotion(
     autoMaxFrames: Int = 8,
     manualFrames: Int = 4,
     framePlanReason: String = "Default",
+    captureMode: CaptureMode = CaptureMode.MULTI_FRAME,
+    processingParams: ClassicYuvFusionParams = ClassicYuvFusionPreset.NATURAL.params,
     captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     onComplete: (File) -> Unit = {},
     onError: (String) -> Unit = {},
@@ -475,6 +477,8 @@ fun captureYuvBurstColorWithMotion(
             autoMaxFrames = autoMaxFrames,
             manualFrames = manualFrames,
             framePlanReason = framePlanReason,
+            captureMode = captureMode,
+            processingParams = processingParams,
             yuvMemoryBufferUsed = useMemoryBuffer,
             yuvMemoryBufferEstimatedBytes = estimatedBufferBytes,
             selectedRoute = zoomRoute,
@@ -637,6 +641,8 @@ fun captureYuvBurstColorWithMotion(
                                 autoMaxFrames = autoMaxFrames,
                                 manualFrames = manualFrames,
                                 framePlanReason = framePlanReason,
+                                captureMode = captureMode,
+                                processingParams = processingParams,
                                 yuvMemoryBufferUsed = useMemoryBuffer,
                                 yuvMemoryBufferEstimatedBytes = estimatedBufferBytes,
                                 selectedRoute = zoomRoute,
@@ -703,6 +709,8 @@ fun captureYuvBurstColorWithMotion(
                         autoMaxFrames = autoMaxFrames,
                         manualFrames = manualFrames,
                         framePlanReason = framePlanReason,
+                        captureMode = captureMode,
+                        processingParams = processingParams,
                         yuvMemoryBufferUsed = useMemoryBuffer,
                         yuvMemoryBufferEstimatedBytes = estimatedBufferBytes,
                         selectedRoute = zoomRoute,
@@ -757,6 +765,8 @@ fun captureYuvBurstColorWithMotion(
                             autoMaxFrames = autoMaxFrames,
                             manualFrames = manualFrames,
                             framePlanReason = framePlanReason,
+                            captureMode = captureMode,
+                            processingParams = processingParams,
                             yuvMemoryBufferUsed = useMemoryBuffer,
                             yuvMemoryBufferEstimatedBytes = estimatedBufferBytes,
                             selectedRoute = zoomRoute,
@@ -884,6 +894,8 @@ fun captureYuvBurstColorWithMotion(
                                             autoMaxFrames = autoMaxFrames,
                                             manualFrames = manualFrames,
                                             framePlanReason = framePlanReason,
+                                            captureMode = captureMode,
+                                            processingParams = processingParams,
                                             yuvMemoryBufferUsed = useMemoryBuffer,
                                             yuvMemoryBufferEstimatedBytes = estimatedBufferBytes,
                                             selectedRoute = zoomRoute,
@@ -1487,7 +1499,7 @@ fun chooseColorFusionSize(
         }
 
         CaptureResolutionMode.MP24_FUSION -> {
-            // TODO: 24M Fusion is currently placeholder and uses 12MP-ish input.
+            // 24M fusion intentionally captures a high-quality 12MP burst before tiled super-resolution.
             yuvSizes
                 .filter { megapixels(it) <= 14.0 }
                 .maxByOrNull { it.width * it.height }
@@ -1629,6 +1641,8 @@ fun writeColorJobJson(
     autoMaxFrames: Int = 8,
     manualFrames: Int = 4,
     framePlanReason: String = "Default",
+    captureMode: CaptureMode = CaptureMode.MULTI_FRAME,
+    processingParams: ClassicYuvFusionParams = ClassicYuvFusionPreset.NATURAL.params,
     yuvMemoryBufferUsed: Boolean = false,
     yuvMemoryBufferEstimatedBytes: Long = 0L,
     yuvCaptureRequestTemplate: String? = null,
@@ -1681,7 +1695,12 @@ fun writeColorJobJson(
 
     val json = JSONObject()
         .put("app", "Kepler Night Lab")
-        .put("jobType", "YUV_NIGHT_FUSION")
+        .put("jobType", if (captureMode == CaptureMode.SINGLE_FRAME) "YUV_SINGLE_FRAME" else "YUV_NIGHT_FUSION")
+        .put("captureMode", captureMode.name)
+        .put("processingPresetName", processingParams.clamped().presetName)
+        .put("processingParams", processingParams.clamped().toJson())
+        .put("fusionPresetName", processingParams.clamped().presetName)
+        .put("fusionParams", processingParams.clamped().toJson())
         .put("status", status)
         .put("currentPipelineStage", status)
         .put("userCanMoveDevice", status == "CAPTURE_COMPLETE" || status == "PIPELINE_COMPLETE")

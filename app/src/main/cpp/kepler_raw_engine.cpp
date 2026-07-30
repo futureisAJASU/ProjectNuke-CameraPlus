@@ -800,6 +800,7 @@ struct NativeIspRenderParams {
     float denoiseStrength = 0.35f;
     float chromaDenoiseStrength = 0.55f;
     float sharpenAmount = 0.08f;
+    float localContrastAmount = 0.02f;
     float toneTargetMidGray = 0.42f;
     float toneMaxShadowLift = 0.06f;
     float highlightRolloff = 0.16f;
@@ -907,6 +908,7 @@ NativeIspRenderParams parseNativeIspRenderParams(const std::string& metadataPath
     params.denoiseStrength = std::clamp(parseJsonFloat(text, "denoiseStrength", params.denoiseStrength), 0.0f, 0.75f);
     params.chromaDenoiseStrength = std::clamp(parseJsonFloat(text, "chromaDenoiseStrength", params.chromaDenoiseStrength), 0.0f, 0.85f);
     params.sharpenAmount = std::clamp(parseJsonFloat(text, "sharpenAmount", params.sharpenAmount), 0.0f, 0.12f);
+    params.localContrastAmount = std::clamp(parseJsonFloat(text, "localContrastAmount", params.localContrastAmount), 0.0f, 0.18f);
     params.toneTargetMidGray = std::clamp(parseJsonFloat(text, "toneTargetMidGray", params.toneTargetMidGray), 0.20f, 0.50f);
     params.toneMaxShadowLift = std::clamp(parseJsonFloat(text, "toneMaxShadowLift", params.toneMaxShadowLift), 0.0f, 0.06f);
     params.highlightRolloff = std::clamp(parseJsonFloat(text, "highlightRolloff", params.highlightRolloff), 0.02f, 0.35f);
@@ -1877,7 +1879,16 @@ bool renderRaw16NativeIspV2(
                 std::clamp(1.0f - noiseProxy * 5.0f, 0.0f, 1.0f) *
                 darkSuppression *
                 highlightSuppression;
-            const float sharpenedLuma = std::clamp(centerLuma + (centerLuma - localLuma) * adaptiveStrength, 0.0f, 255.0f);
+            const float localContrastStrength = params.localContrastAmount *
+                std::clamp(1.0f - noiseProxy * 3.0f, 0.20f, 1.0f) *
+                (0.50f + 0.50f * darkSuppression) *
+                highlightSuppression;
+            const float detailStrength = localContrastStrength + adaptiveStrength;
+            const float sharpenedLuma = std::clamp(
+                centerLuma + (centerLuma - localLuma) * detailStrength,
+                0.0f,
+                255.0f
+            );
             rgbaRow[out] = clampToByte(sharpenedLuma + denoisedChromaR);
             rgbaRow[out + 1] = clampToByte(sharpenedLuma - 0.5f * denoisedChromaR - 0.5f * denoisedChromaB);
             rgbaRow[out + 2] = clampToByte(sharpenedLuma + denoisedChromaB);
@@ -1974,6 +1985,7 @@ bool writeNativeIspV2DebugJson(
            << "  \"rawRenderShadowLift\": " << params.toneMaxShadowLift << ",\n"
            << "  \"rawRenderHighlightRollOff\": " << params.highlightRolloff << ",\n"
            << "  \"rawRenderSharpenAmount\": " << params.sharpenAmount << ",\n"
+           << "  \"localContrastAmount\": " << params.localContrastAmount << ",\n"
            << "  \"adaptiveSharpenUsed\": " << (stats.adaptiveSharpenUsed ? "true" : "false") << ",\n"
            << "  \"sharpenSuppressionLowConfidenceUsed\": " << (stats.sharpenSuppressionLowConfidenceUsed ? "true" : "false") << ",\n"
            << "  \"hotPixelCount\": " << stats.hotPixelCount << ",\n"

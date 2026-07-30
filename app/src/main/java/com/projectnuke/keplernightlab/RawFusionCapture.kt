@@ -44,9 +44,52 @@ import kotlin.math.min
 
 private const val RAW_RENDER_VERSION = "native_raw_isp_v0.3"
 private const val RAW_RENDER_SHARPEN_AMOUNT = 0.12f
-private const val RAW_RENDER_DENOISE_STRENGTH = 0.35f
-private const val RAW_RENDER_CHROMA_DENOISE_STRENGTH = 0.55f
 private const val RAW_PIPELINE_LOG_TAG = "KeplerRawPipeline"
+
+private data class RawUserProcessingParams(
+    val presetName: String,
+    val denoiseStrength: Float,
+    val chromaDenoiseStrength: Float,
+    val sharpenAmount: Float,
+    val localContrastAmount: Float,
+    val toneTargetMidGray: Float,
+    val toneMaxShadowLift: Float,
+    val highlightRolloff: Float
+)
+
+private fun resolveRawUserProcessingParams(job: JSONObject): RawUserProcessingParams {
+    val json = job.optJSONObject("processingParams") ?: job.optJSONObject("fusionParams")
+    val preset = ClassicYuvFusionPreset.fromName(
+        json?.optString(
+            "presetName",
+            job.optString("processingPresetName", job.optString("fusionPresetName", "NATURAL"))
+        )
+    )
+    fun value(key: String, fallback: Float, min: Float, max: Float): Float =
+        json?.optDouble(key, Double.NaN)
+            ?.takeIf { it.isFinite() }
+            ?.toFloat()
+            ?.coerceIn(min, max)
+            ?: fallback.coerceIn(min, max)
+
+    val denoise = value("denoiseStrength", preset.params.denoiseStrength, 0f, 0.55f)
+    val sharpenUi = value("sharpenAmount", preset.params.sharpenAmount, 0f, 0.55f)
+    val sharpen = (sharpenUi / 0.55f * RAW_RENDER_SHARPEN_AMOUNT)
+        .coerceIn(0f, RAW_RENDER_SHARPEN_AMOUNT)
+    val localContrast = value("localContrastAmount", preset.params.localContrastAmount, 0f, 0.18f)
+    val shadowLift = value("shadowLift", preset.params.shadowLift, 0f, 0.06f)
+    val highlightRolloff = value("highlightRollOff", preset.params.highlightRollOff, 0.02f, 0.35f)
+    return RawUserProcessingParams(
+        presetName = preset.name,
+        denoiseStrength = denoise,
+        chromaDenoiseStrength = (denoise + 0.20f).coerceIn(denoise, 0.75f),
+        sharpenAmount = sharpen,
+        localContrastAmount = localContrast,
+        toneTargetMidGray = (0.40f + preset.params.shadowLift * 0.25f).coerceIn(0.38f, 0.46f),
+        toneMaxShadowLift = shadowLift,
+        highlightRolloff = highlightRolloff
+    )
+}
 
 private data class RawRenderMetadata(
     val cameraWbGains: FloatArray?,
@@ -69,6 +112,7 @@ fun captureRawBurstForFusion(
     routeFallbackReason: String? = null,
     focusAeState: FocusAeState = FocusAeState(),
     rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
+    processingParams: ClassicYuvFusionParams = ClassicYuvFusionPreset.NATURAL.params,
     saveDngSidecars: Boolean = false,
     captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     onStatus: (String) -> Unit,
@@ -263,6 +307,11 @@ fun captureRawBurstForFusion(
         val baseJob = JSONObject()
             .put("app", "Kepler Night Lab")
             .put("jobType", "RAW_NIGHT_FUSION")
+            .put("captureMode", CaptureMode.MULTI_FRAME.name)
+            .put("processingPresetName", processingParams.presetName)
+            .put("processingParams", processingParams.clamped().toJson())
+            .put("fusionPresetName", processingParams.presetName)
+            .put("fusionParams", processingParams.clamped().toJson())
             .put("status", "CAPTURING")
             .put("processStatus", "NOT_PROCESSED")
             .put("currentPipelineStage", "CAPTURE")
@@ -1324,6 +1373,7 @@ private object RawFusionExportCoordinator {
                 "rawRenderColorTransform=${renderMetadata.colorTransform != null}"
         )
         val hasWarnings = nativeWarnings.length() > 0 || warnings.isNotEmpty()
+        val userProcessing = resolveRawUserProcessingParams(context.job)
         val updated = JSONObject()
             .put("rawRenderVersion", RAW_RENDER_VERSION)
             .put("nativeRawIspUsed", true)
@@ -1341,9 +1391,14 @@ private object RawFusionExportCoordinator {
             .put("rawRenderWarnings", nativeWarnings)
             .put("rawRenderColorTransform", renderMetadata.colorTransform?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
             .put("rawRenderCameraWbGains", renderMetadata.cameraWbGains?.let { floatArrayToJson(it) } ?: JSONObject.NULL)
-            .put("rawRenderDenoiseStrength", RAW_RENDER_DENOISE_STRENGTH)
-            .put("rawRenderChromaDenoiseStrength", RAW_RENDER_CHROMA_DENOISE_STRENGTH)
-            .put("rawRenderSharpenAmount", RAW_RENDER_SHARPEN_AMOUNT)
+            .put("processingPresetName", userProcessing.presetName)
+            .put("rawRenderDenoiseStrength", userProcessing.denoiseStrength)
+            .put("rawRenderChromaDenoiseStrength", userProcessing.chromaDenoiseStrength)
+            .put("rawRenderSharpenAmount", userProcessing.sharpenAmount)
+            .put("rawRenderLocalContrastAmount", userProcessing.localContrastAmount)
+            .put("rawRenderToneTargetMidGray", userProcessing.toneTargetMidGray)
+            .put("rawRenderShadowLift", userProcessing.toneMaxShadowLift)
+            .put("rawRenderHighlightRollOff", userProcessing.highlightRolloff)
             .put("demosaicMethod", debug?.optString("demosaicMethod", "MHC_5X5_V0") ?: "MHC_5X5_V0")
             .put("demosaicFallbackPixelCount", debug?.optLong("demosaicFallbackPixelCount", 0L) ?: 0L)
             .put("mhcBoundaryFallbackUsed", debug?.optBoolean("mhcBoundaryFallbackUsed", false) ?: false)
@@ -1956,6 +2011,7 @@ private fun writeRawRenderInputMetadata(
     outputHeight: Int,
     warnings: Set<String>
 ) {
+    val userProcessing = resolveRawUserProcessingParams(context.job)
     val json = JSONObject()
         .put("rawRenderVersion", RAW_RENDER_VERSION)
         .put("cfaPattern", context.sensor.cfa)
@@ -1967,12 +2023,14 @@ private fun writeRawRenderInputMetadata(
         .put("outputWidth", outputWidth)
         .put("outputHeight", outputHeight)
         .put("demosaicMethod", "MHC_5X5_V0")
-        .put("denoiseStrength", RAW_RENDER_DENOISE_STRENGTH)
-        .put("chromaDenoiseStrength", RAW_RENDER_CHROMA_DENOISE_STRENGTH)
-        .put("sharpenAmount", RAW_RENDER_SHARPEN_AMOUNT)
-        .put("toneTargetMidGray", 0.42)
-        .put("toneMaxShadowLift", 0.06)
-        .put("highlightRolloff", 0.16)
+        .put("processingPresetName", userProcessing.presetName)
+        .put("denoiseStrength", userProcessing.denoiseStrength)
+        .put("chromaDenoiseStrength", userProcessing.chromaDenoiseStrength)
+        .put("sharpenAmount", userProcessing.sharpenAmount)
+        .put("localContrastAmount", userProcessing.localContrastAmount)
+        .put("toneTargetMidGray", userProcessing.toneTargetMidGray)
+        .put("toneMaxShadowLift", userProcessing.toneMaxShadowLift)
+        .put("highlightRolloff", userProcessing.highlightRolloff)
         .put("warnings", JSONArray(warnings.toList()))
     file.writeText(json.toString(2))
 }

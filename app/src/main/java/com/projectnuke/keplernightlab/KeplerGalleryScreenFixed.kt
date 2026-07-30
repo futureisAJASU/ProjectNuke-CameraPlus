@@ -1228,6 +1228,7 @@ private fun resolutionTextFixed(job: KeplerGalleryJobSummary): String =
 private fun modeLabelFixed(job: KeplerGalleryJobSummary): String = when (job.jobType) {
     "RAW_NIGHT_FUSION" -> "고품질 RAW"
     "YUV_NIGHT_FUSION" -> "빠른 야간"
+    "YUV_SINGLE_FRAME" -> "일반 사진"
     else -> job.jobType
 }
 

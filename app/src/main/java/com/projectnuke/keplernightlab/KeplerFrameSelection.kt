@@ -274,6 +274,7 @@ internal fun applyFrameSelectionToItems(
 }
 
 internal fun minimumFrameCount(jobType: String?, jobDir: File?): Int = when {
+    jobType == "YUV_SINGLE_FRAME" -> 1
     jobType == "RAW_NIGHT_FUSION" || jobDir?.name?.startsWith("KPL_RAW_FUSION_") == true -> MIN_RAW_FUSION_FRAMES
     jobType == "YUV_NIGHT_FUSION" || jobDir?.name?.startsWith("KPL_YUV_FUSION_") == true -> 2
     else -> 1

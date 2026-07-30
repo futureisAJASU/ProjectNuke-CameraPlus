@@ -39,6 +39,7 @@ internal data class CapturePreparationInput(
     val autoMaxFrames: Int,
     val manualFrames: Int,
     val selectedMode: String,
+    val captureMode: CaptureMode,
     val latestSceneLuma: Double?,
     val latestMotionScore: Double?
 )
@@ -92,6 +93,8 @@ internal data class CapturePipelineRequest(
     val finalOutputFormat: FinalOutputFormat,
     val focusAeState: FocusAeState,
     val rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
+    val captureMode: CaptureMode = CaptureMode.MULTI_FRAME,
+    val processingSettings: ProcessingSettings = ProcessingSettings.default(),
     val captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     val cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
 )

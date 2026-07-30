@@ -17,7 +17,12 @@ data class CameraUiSettings(
     val autoMaxFrames: Int,
     val manualFrames: Int,
     val zoomRatio: Float,
-    val rawSpeedModeName: String
+    val rawSpeedModeName: String,
+    val captureModeName: String,
+    val processingPresetName: String,
+    val denoiseStrength: Float,
+    val sharpenAmount: Float,
+    val localContrastAmount: Float
 )
 
 object CameraSettingsStore {
@@ -45,7 +50,25 @@ object CameraSettingsStore {
             manualFrames = prefs.getInt("manualFrames", 4).coerceIn(MIN_CAPTURE_FRAMES, MAX_CAPTURE_FRAMES),
             zoomRatio = prefs.getFloat("zoomRatio", 1.0f).coerceIn(0.6f, 3.0f),
             rawSpeedModeName = prefs.getString("rawSpeedMode", RawSpeedMode.BALANCED.name)
-                ?: RawSpeedMode.BALANCED.name
+                ?: RawSpeedMode.BALANCED.name,
+            captureModeName = prefs.getString("captureMode", CaptureMode.MULTI_FRAME.name)
+                ?: CaptureMode.MULTI_FRAME.name,
+            processingPresetName = prefs.getString(
+                "processingPreset",
+                ClassicYuvFusionPreset.NATURAL.name
+            ) ?: ClassicYuvFusionPreset.NATURAL.name,
+            denoiseStrength = prefs.getFloat(
+                "denoiseStrength",
+                ClassicYuvFusionPreset.NATURAL.params.denoiseStrength
+            ).coerceIn(0f, 0.55f),
+            sharpenAmount = prefs.getFloat(
+                "sharpenAmount",
+                ClassicYuvFusionPreset.NATURAL.params.sharpenAmount
+            ).coerceIn(0f, 0.55f),
+            localContrastAmount = prefs.getFloat(
+                "localContrastAmount",
+                ClassicYuvFusionPreset.NATURAL.params.localContrastAmount
+            ).coerceIn(0f, 0.18f)
         )
     }
 
@@ -64,6 +87,11 @@ object CameraSettingsStore {
             .putInt("manualFrames", settings.manualFrames.coerceIn(MIN_CAPTURE_FRAMES, MAX_CAPTURE_FRAMES))
             .putFloat("zoomRatio", settings.zoomRatio.coerceIn(0.6f, 3.0f))
             .putString("rawSpeedMode", settings.rawSpeedModeName)
+            .putString("captureMode", settings.captureModeName)
+            .putString("processingPreset", settings.processingPresetName)
+            .putFloat("denoiseStrength", settings.denoiseStrength.coerceIn(0f, 0.55f))
+            .putFloat("sharpenAmount", settings.sharpenAmount.coerceIn(0f, 0.55f))
+            .putFloat("localContrastAmount", settings.localContrastAmount.coerceIn(0f, 0.18f))
             .apply()
     }
 }

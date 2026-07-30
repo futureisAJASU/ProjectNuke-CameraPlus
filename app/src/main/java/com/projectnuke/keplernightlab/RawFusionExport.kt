@@ -434,6 +434,7 @@ fun captureProcessExportRawNightFusion(
     routeFallbackReason: String? = null,
     focusAeState: FocusAeState = FocusAeState(),
     rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
+    processingParams: ClassicYuvFusionParams = ClassicYuvFusionPreset.NATURAL.params,
     captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
@@ -456,6 +457,7 @@ fun captureProcessExportRawNightFusion(
         routeFallbackReason = routeFallbackReason,
         focusAeState = focusAeState,
         rawSpeedMode = rawSpeedMode,
+        processingParams = processingParams,
         saveDngSidecars = finalOutputFormat.shouldExportRawSidecar,
         captureCancellationHandle = captureCancellationHandle,
         onStatus = { post(it) },
@@ -480,6 +482,11 @@ fun captureProcessExportRawNightFusion(
                 }
                 post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 return@captureRawBurstForFusion
+            }
+            KeplerJobMetadata.update(jobDir) { current ->
+                current.put("captureMode", CaptureMode.MULTI_FRAME.name)
+                    .put("processingPresetName", processingParams.presetName)
+                    .put("processingParams", processingParams.clamped().toJson())
             }
             Log.i("KeplerRawPipeline", "PROCESSING_STARTED jobDirAbsolutePath=${jobDir.absolutePath}")
             post("PROCESSING_STARTED: RAW capture complete; processing started.")

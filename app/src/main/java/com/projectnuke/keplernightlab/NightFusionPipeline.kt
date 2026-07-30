@@ -32,6 +32,8 @@ fun captureProcessExportNightFusion(
     autoMaxFrames: Int = 8,
     manualFrames: Int = 4,
     framePlanReason: String = "Default",
+    captureMode: CaptureMode = CaptureMode.MULTI_FRAME,
+    processingParams: ClassicYuvFusionParams = ClassicYuvFusionPreset.NATURAL.params,
     captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
@@ -60,6 +62,8 @@ fun captureProcessExportNightFusion(
         autoMaxFrames = autoMaxFrames,
         manualFrames = manualFrames,
         framePlanReason = framePlanReason,
+        captureMode = captureMode,
+        processingParams = processingParams,
         captureCancellationHandle = captureCancellationHandle,
         onComplete = { jobDir ->
             try {
@@ -68,17 +72,41 @@ fun captureProcessExportNightFusion(
                 post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 return@captureYuvBurstColorWithMotion
             }
+            KeplerJobMetadata.update(jobDir) { current ->
+                current.put("captureMode", captureMode.name)
+                    .put("processingPresetName", processingParams.presetName)
+                    .put("processingParams", processingParams.clamped().toJson())
+                if (captureMode == CaptureMode.SINGLE_FRAME) {
+                    current.put("jobType", "YUV_SINGLE_FRAME")
+                        .put("requestedFrames", 1)
+                        .put("savedFrames", 1)
+                }
+            }
             val workerThread = HandlerThread("KeplerCaptureProcessExportThread").apply { start() }
             Handler(workerThread.looper).post {
                 try {
                     cancellation.throwIfCancelled()
-                    post("Processing Night Fusion...")
+                    post(if (captureMode == CaptureMode.SINGLE_FRAME) {
+                        "Processing single photo..."
+                    } else {
+                        "Processing Night Fusion..."
+                    })
                     cancellation.throwIfCancelled()
-                    val finalFile = processNightFusionJobV02Sync(
-                        jobDir,
-                        onStatus = { post(it) },
-                        cancellation = cancellation
-                    )
+                    val finalFile = if (captureMode == CaptureMode.SINGLE_FRAME) {
+                        processSingleFrameJobSync(
+                            jobDir = jobDir,
+                            requestedParams = processingParams,
+                            cancellation = cancellation,
+                            onStatus = { post(it) }
+                        )
+                    } else {
+                        processNightFusionJobV02Sync(
+                            jobDir,
+                            onStatus = { post(it) },
+                            requestedParams = processingParams,
+                            cancellation = cancellation
+                        )
+                    }
                     cancellation.throwIfCancelled()
 
                     val requestedOutputFormat = requestedOutputFormatForSetting(finalOutputFormat)
@@ -176,7 +204,7 @@ fun captureProcessExportNightFusion(
                 } catch (_: CancellationException) {
                     post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 } catch (e: Exception) {
-                    post("PIPELINE_FAILED: Night Fusion pipeline failed; keeping cache.\n${e.stackTraceToString()}")
+                    post("PIPELINE_FAILED: ${if (captureMode == CaptureMode.SINGLE_FRAME) "Single photo" else "Night Fusion"} pipeline failed; keeping cache.\n${e.stackTraceToString()}")
                 } finally {
                     workerThread.quitSafely()
                 }
@@ -219,6 +247,8 @@ internal fun reprocessYuvJob(
                 applyExplicitYuvFrameSelection(jobDir, selectedFrameIndices)
             }
             val initialJob = JSONObject(jobFile.readText())
+            val singleFrame = isSingleFrameJob(initialJob)
+            val requiredFrames = if (singleFrame) 1 else 2
             val frames = initialJob.optJSONArray("frames")
             totalFrames = frames?.length() ?: 0
             repeat(totalFrames) { index ->
@@ -233,21 +263,37 @@ internal fun reprocessYuvJob(
                     enabledFrames++
                 }
             }
-            if (enabledFrames < 2) {
-                post("Not enough enabled YUV frames to reprocess")
-                terminalResult = Result.failure(IllegalStateException("Not enough enabled YUV frames to reprocess"))
+            if (enabledFrames < requiredFrames) {
+                val message = "Not enough enabled YUV frames to reprocess: required=$requiredFrames actual=$enabledFrames"
+                post(message)
+                terminalResult = Result.failure(IllegalStateException(message))
                 return@post
             }
 
-            post("YUV reprocess: loading enabled frames...")
-            post("YUV reprocess: using $enabledFrames/$totalFrames frames...")
-            val finalFile = processNightFusionJobV02Sync(
-                jobDir = jobDir,
-                onStatus = { post(it) },
-                requestedParams = fusionParams,
-                cancellation = cancellation,
-                metadataPolicy = ReprocessMetadataPolicy.REPROCESS_PROGRESS_ONLY
-            )
+            post(if (singleFrame) {
+                "Single photo reprocess: loading source frame..."
+            } else {
+                "YUV reprocess: loading enabled frames..."
+            })
+            post("${if (singleFrame) "Single photo" else "YUV reprocess"}: using $enabledFrames/$totalFrames frames...")
+            val requestedProcessingParams = fusionParams ?: loadClassicYuvFusionParams(initialJob)
+            val finalFile = if (singleFrame) {
+                processSingleFrameJobSync(
+                    jobDir = jobDir,
+                    requestedParams = requestedProcessingParams,
+                    cancellation = cancellation,
+                    metadataPolicy = ReprocessMetadataPolicy.REPROCESS_PROGRESS_ONLY,
+                    onStatus = { post(it) }
+                )
+            } else {
+                processNightFusionJobV02Sync(
+                    jobDir = jobDir,
+                    onStatus = { post(it) },
+                    requestedParams = requestedProcessingParams,
+                    cancellation = cancellation,
+                    metadataPolicy = ReprocessMetadataPolicy.REPROCESS_PROGRESS_ONLY
+                )
+            }
             finalOutputFile = finalFile.takeIf { it.isFile && it.length() > 0L }
             post("YUV reprocess: exporting...")
             val bitmap = BitmapFactory.decodeFile(finalFile.absolutePath)
@@ -277,8 +323,8 @@ internal fun reprocessYuvJob(
                 error("YUV export verification failed")
             }
             post(
-                "PIPELINE_COMPLETE: YUV reprocess saved ${export.formatUsed.label}; " +
-                    "used $enabledFrames/$totalFrames frames; cache kept."
+                "PIPELINE_COMPLETE: ${if (singleFrame) "Single photo" else "YUV reprocess"} " +
+                    "saved ${export.formatUsed.label}; used $enabledFrames/$totalFrames frames; cache kept."
             )
             terminalResult = Result.success(Unit)
             terminalDisposition = ReprocessTerminalDisposition.VERIFIED_SUCCESS

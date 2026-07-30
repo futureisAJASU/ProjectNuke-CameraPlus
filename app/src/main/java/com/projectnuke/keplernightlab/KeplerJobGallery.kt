@@ -191,7 +191,9 @@ fun summarizeKeplerGalleryStorage(jobs: List<KeplerGalleryJobSummary>): KeplerGa
         debugDiagnosticBytes = jobs.sumOf { it.storage.debugFilesBytes + it.storage.previewFilesBytes },
         cleanableBytes = jobs.sumOf { it.storage.cleanableBytes },
         rawBytes = jobs.filter { it.jobType == "RAW_NIGHT_FUSION" }.sumOf { it.storage.totalJobBytes },
-        yuvBytes = jobs.filter { it.jobType == "YUV_NIGHT_FUSION" }.sumOf { it.storage.totalJobBytes },
+        yuvBytes = jobs.filter {
+            it.jobType == "YUV_NIGHT_FUSION" || it.jobType == "YUV_SINGLE_FRAME"
+        }.sumOf { it.storage.totalJobBytes },
         debugCacheBytes = jobs.sumOf { it.storage.debugFilesBytes + it.storage.cacheFilesBytes },
         jobCount = jobs.size
     )
@@ -352,6 +354,8 @@ fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
     val jobType = when {
         rawType == "RAW_NIGHT_FUSION" || directory.name.startsWith("KPL_RAW_FUSION_") ->
             "RAW_NIGHT_FUSION"
+        rawType == "YUV_SINGLE_FRAME" ->
+            "YUV_SINGLE_FRAME"
         rawType == "YUV_NIGHT_FUSION" || directory.name.startsWith("KPL_YUV_FUSION_") ->
             "YUV_NIGHT_FUSION"
         rawType == "SUPER_RESOLUTION" || rawType == "SUPER_RESOLUTION_FUSION" || directory.name.startsWith("KPL_SUPER_RES_") ->
