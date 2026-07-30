@@ -1243,21 +1243,21 @@ internal fun strictRootEvidence(jobDir: File, transaction: ReprocessTransaction)
     catch (le: LinkageError) { throw le }
     catch (ie: InternalError) { throw ie }
     catch (e: Error) { throw e }
-    catch (_: Exception) { return RootEvidence.Untrustworthy }
+    catch (ex: Exception) { return RootEvidence.InspectionFailed(ex) }
     val canonicalRoot = try { backupRoot.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
     catch (oom: OutOfMemoryError) { throw oom }
     catch (td: ThreadDeath) { throw td }
     catch (le: LinkageError) { throw le }
     catch (ie: InternalError) { throw ie }
     catch (e: Error) { throw e }
-    catch (_: Exception) { return RootEvidence.Untrustworthy }
+    catch (ex: Exception) { return RootEvidence.InspectionFailed(ex) }
     val parentCanonical = try { canonicalRoot.parentFile?.canonicalFile } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
     catch (oom: OutOfMemoryError) { throw oom }
     catch (td: ThreadDeath) { throw td }
     catch (le: LinkageError) { throw le }
     catch (ie: InternalError) { throw ie }
     catch (e: Error) { throw e }
-    catch (_: Exception) { return RootEvidence.Untrustworthy }
+    catch (ex: Exception) { return RootEvidence.InspectionFailed(ex) }
     if (parentCanonical != canonicalJob) return RootEvidence.Untrustworthy
     if (canonicalRoot.name != ".reprocess_backup_${transaction.transactionId}") return RootEvidence.Untrustworthy
 
@@ -2253,8 +2253,12 @@ internal fun ensureDurableFallbackQuarantine(jobDir: File, transaction: Reproces
     val writeOp = fallbackWriteOperation
     if (writeOp != null) writeOp(jobDir, marker, payload)
     else KeplerJobMetadata.atomicWrite(marker, payload)
-    check(readFallbackIdentity(marker) == fallbackIdentity(transaction)) {
-        "Fallback quarantine marker verification failed"
+    check(classifyMarkerPath(marker, jobDir) is MarkerPathClassification.Valid) {
+        "Fallback quarantine marker write produced no valid file: $marker"
+    }
+    val writtenIdentity = readFallbackIdentity(marker)
+    check(writtenIdentity == fallbackIdentity(transaction)) {
+        "Fallback quarantine marker content verification failed: expected ${fallbackIdentity(transaction)}, got $writtenIdentity"
     }
 }
 
@@ -2265,13 +2269,13 @@ private fun fallbackIdentity(transaction: ReprocessTransaction): Triple<String, 
 /** Strict identity parser shared by fallback and quarantine markers. Expects exactly 3
  *  physical lines in `key=value` format with keys: transactionId, backupRoot, createdAt.
  *  Rejects blank lines (leading, trailing, or intermediate), duplicate keys, unknown keys,
- *  blank values, whitespace padding, extra `=` content, non-positive createdAt, and
- *  backupRoot that does not start with `.reprocess_backup_`. Does NOT catch exceptions —
- *  IO/security failures propagate to the caller so the evidence layer can distinguish
- *  InspectionFailed from Untrustworthy. */
+ *  blank values, whitespace padding, extra `=` in value, non-positive createdAt,
+ *  backupRoot that does not start with `.reprocess_backup_`, transactionId with whitespace,
+ *  `/`, `\`, `.` or `..`, and backupRoot that is not exactly `.reprocess_backup_` + transactionId.
+ *  Does NOT catch exceptions — IO/security failures propagate to the caller so the evidence
+ *  layer can distinguish InspectionFailed from Untrustworthy. */
 private fun readMarkerIdentity(marker: File): Triple<String, String, Long>? {
     val lines = marker.readLines()
-    // Require exactly 3 physical lines; reject blank lines anywhere.
     if (lines.size != 3) return null
     if (lines.any { it.isBlank() }) return null
     val parsed = linkedMapOf<String, String>()
@@ -2279,14 +2283,20 @@ private fun readMarkerIdentity(marker: File): Triple<String, String, Long>? {
         val split = line.indexOf('=')
         if (split <= 0 || split == line.length - 1) return null
         val key = line.substring(0, split)
-        if (key.contains('=') || parsed.containsKey(key)) return null
-        parsed[key] = line.substring(split + 1)
+        if (parsed.containsKey(key)) return null
+        val value = line.substring(split + 1)
+        if (value.contains('=')) return null
+        parsed[key] = value
     }
     if (parsed.keys != setOf("transactionId", "backupRoot", "createdAt")) return null
     val txId = parsed.getValue("transactionId")
     if (txId.isBlank()) return null
+    if (txId.any { it.isWhitespace() }) return null
+    if (txId.any { it == '/' || it == '\\' }) return null
+    if (txId == "." || txId == "..") return null
     val rootName = parsed.getValue("backupRoot")
     if (rootName.isBlank() || !rootName.startsWith(".reprocess_backup_")) return null
+    if (rootName != ".reprocess_backup_$txId") return null
     val createdAt = parsed.getValue("createdAt").toLongOrNull() ?: return null
     if (createdAt <= 0L) return null
     return Triple(txId, rootName, createdAt)
@@ -2352,7 +2362,7 @@ internal fun removeMatchingFallbackQuarantine(jobDir: File, transaction: Reproce
             if (readFallbackIdentity(marker) != fallbackIdentity(transaction)) return false
             val deleteOp = fallbackDeleteOperation
             val deleted = if (deleteOp != null) deleteOp(marker) else marker.delete()
-            deleted && !marker.exists()
+            deleted && classifyMarkerPath(marker, jobDir) is MarkerPathClassification.Absent
         }
         else -> false
     }
@@ -2367,7 +2377,10 @@ internal fun removeMatchingFallbackQuarantine(jobDir: File, transaction: Reproce
  */
 internal fun isReprocessQuarantined(jobDir: File): Boolean {
     val fallbackMarker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
-    if (fallbackMarker.exists()) return true
+    when (classifyMarkerPath(fallbackMarker, jobDir)) {
+        is MarkerPathClassification.Absent -> { /* no fallback, continue */ }
+        else -> return true
+    }
     val children = jobDir.listFiles() ?: return true
     children.forEach { child ->
         if (child.isDirectory && child.name.startsWith(".reprocess_backup_")) {
@@ -2450,7 +2463,7 @@ val children = jobDirListing
               val deleted = try {
                 val deleteOp = fallbackDeleteOperation
                 val result = if (deleteOp != null) deleteOp(fallbackMarker) else fallbackMarker.delete()
-                result && !fallbackMarker.exists()
+                result && classifyMarkerPath(fallbackMarker, jobDir) is MarkerPathClassification.Absent
               } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
               catch (oom: OutOfMemoryError) { throw oom }
               catch (td: ThreadDeath) { throw td }
@@ -3487,23 +3500,30 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
   if (unknownContents.isNotEmpty()) {
     return false
   }
-  // 3. Remove quarantine marker and verify deletion.
+  // 3. Remove quarantine marker and verify deletion using classification.
   val markerFile = File(root, REPROCESS_QUARANTINE_MARKER)
-  if (markerFile.exists()) {
-    try {
-      cleanupDelete(markerFile)
-    } catch (e: kotlinx.coroutines.CancellationException) { throw e
-    } catch (e: OutOfMemoryError) { throw e
-    } catch (e: ThreadDeath) { throw e
-    } catch (e: LinkageError) { throw e
-    } catch (e: InternalError) { throw e
-    } catch (e: Error) { throw e
-    } catch (_: Exception) {
-      return false
+  when (classifyMarkerPath(markerFile, root)) {
+    is MarkerPathClassification.Valid,
+    is MarkerPathClassification.NotRegularFile,
+    is MarkerPathClassification.Symlink,
+    is MarkerPathClassification.NotDirectChild,
+    is MarkerPathClassification.InspectionError -> {
+      try {
+        cleanupDelete(markerFile)
+      } catch (e: kotlinx.coroutines.CancellationException) { throw e
+      } catch (e: OutOfMemoryError) { throw e
+      } catch (e: ThreadDeath) { throw e
+      } catch (e: LinkageError) { throw e
+      } catch (e: InternalError) { throw e
+      } catch (e: Error) { throw e
+      } catch (_: Exception) {
+        return false
+      }
+      if (classifyMarkerPath(markerFile, root) !is MarkerPathClassification.Absent) {
+        return false
+      }
     }
-    if (markerFile.exists()) {
-      return false
-    }
+    is MarkerPathClassification.Absent -> { /* no marker to remove */ }
   }
   // 4. Verify only the terminal manifest remains before deleting it as the final file operation.
   val preManifestDelete = listRoot(root) ?: return false
@@ -3521,7 +3541,7 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
   } catch (_: Exception) {
     return false
   }
-  if (manifestFile.exists()) return false
+  if (classifyMarkerPath(manifestFile, root) !is MarkerPathClassification.Absent) return false
   // Seam: simulate a new file appearing after manifest deletion.
   afterManifestDeleteOperation?.invoke(root)
   // 6. Check root existence and re-list. After manifest deletion, the root may be gone.
@@ -3537,27 +3557,18 @@ internal fun cleanupBackups(transaction: ReprocessTransaction): Boolean {
     // An unknown file appeared after manifest deletion. Restore terminal evidence.
     // Never recursively remove a file that appeared after the final listing.
     if (!restoreManifest()) {
-      // Manifest restoration failed while an unknown file exists. Write a job-level
-      // fallback quarantine marker so restart recovery can resolve the orphan root.
-      try {
-        val jobDir = root.parentFile
-        if (jobDir != null) {
-          val payload = buildString {
-            append("transactionId="); append(transaction.transactionId); append('\n')
-            append("backupRoot="); append(root.name); append('\n')
-            append("createdAt="); append(transaction.manifest.createdAt); append('\n')
-          }
-          KeplerJobMetadata.atomicWrite(
-            File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER), payload
-          )
-        }
-      } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-      catch (oom: OutOfMemoryError) { throw oom }
-      catch (td: ThreadDeath) { throw td }
-      catch (le: LinkageError) { throw le }
-      catch (ie: InternalError) { throw ie }
-      catch (e: Error) { throw e }
-      catch (_: Exception) { /* best-effort fallback marker */ }
+      val jobDir = root.parentFile
+      if (jobDir != null) {
+        try {
+          ensureDurableFallbackQuarantine(jobDir, transaction)
+        } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+        catch (oom: OutOfMemoryError) { throw oom }
+        catch (td: ThreadDeath) { throw td }
+        catch (le: LinkageError) { throw le }
+        catch (ie: InternalError) { throw ie }
+        catch (e: Error) { throw e }
+        catch (_: Exception) { /* best-effort fallback marker */ }
+      }
     }
     return false
   }

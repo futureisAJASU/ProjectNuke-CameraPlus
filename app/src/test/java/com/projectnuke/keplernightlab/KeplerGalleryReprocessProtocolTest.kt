@@ -64,7 +64,7 @@ class KeplerGalleryReprocessProtocolTest {
             assertTrue(validateTransactionIdentity(directory, transaction))
 
             val manifest = File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE)
-            manifest.writeText(JSONObject(manifest.readText()).remove("backupEntries").toString())
+            manifest.writeText(JSONObject(manifest.readText()).apply { remove("backupEntries") }.toString())
             assertFalse(validateTransactionIdentity(directory, transaction))
             assertTrue(isReprocessQuarantined(directory))
         } finally {
@@ -442,7 +442,7 @@ class KeplerGalleryReprocessProtocolTest {
         // state failure + marker success → no fallback
         val directory = tempJob()
         try {
-            val root = File(directory, ".reprocess_backup_sf")
+            val root = File(directory, ".reprocess_backup_sf_mem_id")
             root.mkdir()
             // transactionId on disk differs from in-memory → writeTransactionState throws
             val diskManifest = rootManifest("sf_disk_id", root)
@@ -690,14 +690,41 @@ class KeplerGalleryReprocessProtocolTest {
     }
 
     @Test
-    fun cancelledWorkerDeferredIsWorkerFailureWhileCallerActive() = runBlocking {
-        val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
-        terminal.cancel(kotlinx.coroutines.CancellationException("worker cancelled"))
-        val result = acquireWorkerTerminal(
-            ReprocessWorkerRun(terminal) {},
-            callerCancellation = null
-        )
-        assertTrue(result is WorkerTerminalResult.DeferredExceptionalCompletion)
+    fun cancelledWorkerDeferredAutoRetryViaRegisterLateFinalization() = runBlocking {
+        var invocationCount = 0
+        val previousSeam = finalizerFailureSeam
+        val previousCompleteCallback = lateFinalizationCompleteCallback
+        finalizerFailureSeam = {
+            invocationCount++
+            if (invocationCount == 1) IllegalStateException("first finalizer failure") else null
+        }
+        var barrier = CompletableDeferred<Unit>()
+        lateFinalizationCompleteCallback = { barrier.complete(Unit) }
+        lateFinalizationHandoffScope = null
+        val directory = tempJob()
+        try {
+            val transaction = backup(directory, "final.png" to "before")
+            val session = ReprocessTransactionSession(directory)
+            val lease = session.acquireLease() ?: error("no lease")
+            session.transferOwnership(transaction)
+            val workerTerminal = CompletableDeferred<ReprocessWorkerOutcome>()
+            val worker = ReprocessWorkerRun(terminal = workerTerminal, cancel = {})
+            registerLateFinalization(
+                session, worker, directory, ReprocessJobKind.RAW_FUSION,
+                FinalOutputFormat.JPEG, FrameSelectionMode.AUTO_RULE_BASED, emptySet()
+            )
+            workerTerminal.cancel(kotlinx.coroutines.CancellationException("worker cancelled"))
+            withTimeout(5000) { barrier.await() }
+            assertEquals(2, invocationCount)
+            assertEquals(ReprocessTransactionSession.LateState.TERMINAL, session.lateStateForTest())
+            assertFalse(KeplerJobMetadata.isOperationActive(directory))
+            assertTrue(workerTerminal.isCancelled)
+        } finally {
+            finalizerFailureSeam = previousSeam
+            lateFinalizationCompleteCallback = previousCompleteCallback
+            lateFinalizationHandoffScope = null
+            directory.deleteRecursively()
+        }
     }
 
     @Test
@@ -2703,8 +2730,12 @@ fun postManifestListingNullWhileRootExistsReturnsFalse() = runBlocking {
     val transaction = backup(directory, "final.png" to "before")
     writeTransactionState(transaction, ReprocessTransactionState.COMMITTED)
     File(transaction.backupRoot, "final.png.BACKUP").delete()
+    val callCount = java.util.concurrent.atomic.AtomicInteger(0)
     val previousList = cleanupListOperation
-    cleanupListOperation = { _ -> null }
+    cleanupListOperation = { root ->
+      val c = callCount.incrementAndGet()
+      if (c == 4) null else root.listFiles()
+    }
     try {
       assertFalse(cleanupBackups(transaction))
       assertTrue(File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE).isFile)
@@ -2820,33 +2851,161 @@ fun rootDeletionExceptionRestoresStrictTerminalManifest() = runBlocking {
 }
 
 @Test
-fun strictEvidenceInspectionFailedRetainsOriginalException() = runBlocking {
+fun strictRootEvidenceCircularSymlinkReturnsInspectionFailed() = runBlocking {
   val directory = tempJob()
   try {
     val transaction = backup(directory, "final.png" to "content")
-    val externalRoot = Files.createTempDirectory("external-marker-").toFile()
+    val backupLink = File(directory, ".reprocess_backup_link")
     try {
-      val externalMarker = File(externalRoot, ".reprocess_unresolved")
-      externalMarker.writeText("transactionId=${transaction.transactionId}\nbackupRoot=${transaction.backupRoot.name}\ncreatedAt=${transaction.manifest.createdAt}\n")
-      // Create a symlink, delete the target so canonicalization fails with the actual IOException
-      val symlinkMarker = File(directory, ".reprocess_unresolved")
-      try {
-        Files.createSymbolicLink(symlinkMarker.toPath(), externalMarker.toPath())
-      } catch (e: Exception) {
-        assumeTrue("Symlink creation not supported — skipping test", false)
-        return@runBlocking
-      }
-      externalRoot.deleteRecursively()
-      // Now canonicalization of the broken symlink should fail with an IOException
-      val evidence = strictFallbackEvidence(directory, transaction)
-      // Should be InspectionFailed with the original IOException, not a generic "Cannot canonicalize"
-      assertTrue(evidence is FallbackEvidence.InspectionFailed)
-      val cause = (evidence as FallbackEvidence.InspectionFailed).cause
-      assertNotNull(cause)
-      assertTrue("Expected IOException, got ${cause::class.java.simpleName}", cause is IOException)
-    } finally {
-      if (externalRoot.exists()) externalRoot.deleteRecursively()
+      Files.createSymbolicLink(backupLink.toPath(), transaction.backupRoot.toPath())
+    } catch (e: Exception) {
+      assumeTrue("Symlink creation not supported — skipping test", false)
+      return@runBlocking
     }
+    val linkTx = transaction.copy(backupRoot = backupLink)
+    val evidence = strictRootEvidence(directory, linkTx)
+    assertTrue(evidence is RootEvidence.InspectionFailed)
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun danglingFallbackSymlinkBlocksGating() = runBlocking {
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "content")
+    val missingTarget = File(directory, "nonexistent_target")
+    val symlink = File(directory, ".reprocess_unresolved")
+    try {
+      Files.createSymbolicLink(symlink.toPath(), missingTarget.toPath())
+    } catch (e: Exception) {
+      assumeTrue("Symlink creation not supported — skipping test", false)
+      return@runBlocking
+    }
+    assertTrue(isReprocessQuarantined(directory))
+    assertTrue(removeMatchingFallbackQuarantine(directory, transaction).not())
+    assertFalse(File(directory, ".reprocess_unresolved").exists().not())
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun postWriteSymlinkSubstitutionFailsFallbackVerification() = runBlocking {
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "content")
+    ensureDurableFallbackQuarantine(directory, transaction)
+    val marker = File(directory, ".reprocess_unresolved")
+    assertTrue(marker.isFile)
+    marker.delete()
+    val externalTarget = File(directory, "symlink_target")
+    externalTarget.writeText("fake marker content")
+    try {
+      Files.createSymbolicLink(marker.toPath(), externalTarget.toPath())
+    } catch (e: Exception) {
+      assumeTrue("Symlink creation not supported — skipping test", false)
+      return@runBlocking
+    }
+    assertThrows(IllegalStateException::class.java) {
+      ensureDurableFallbackQuarantine(directory, transaction)
+    }
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun postDeleteDanglingSymlinkNotConsideredAbsent() = runBlocking {
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "content")
+    ensureDurableFallbackQuarantine(directory, transaction)
+    val marker = File(directory, ".reprocess_unresolved")
+    assertTrue(marker.isFile)
+    marker.delete()
+    val missingTarget = File(directory, "ghost_target")
+    try {
+      Files.createSymbolicLink(marker.toPath(), missingTarget.toPath())
+    } catch (e: Exception) {
+      assumeTrue("Symlink creation not supported — skipping test", false)
+      return@runBlocking
+    }
+    assertFalse(removeMatchingFallbackQuarantine(directory, transaction))
+    assertTrue(isReprocessQuarantined(directory))
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun readMarkerIdentity_extraEqualsInValueReturnsNull() = runBlocking {
+  val directory = tempJob()
+  try {
+    val marker = File(directory, "test_marker")
+    marker.writeText("transactionId=tx\nbackupRoot=.reprocess_backup_tx\ncreatedAt=1000=extra\n")
+    assertNull(readQuarantineMarkerIdentity(marker))
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun readMarkerIdentity_txIdWithSlashReturnsNull() = runBlocking {
+  val directory = tempJob()
+  try {
+    val marker = File(directory, "test_marker")
+    marker.writeText("transactionId=tx/1\nbackupRoot=.reprocess_backup_tx/1\ncreatedAt=1000\n")
+    assertNull(readQuarantineMarkerIdentity(marker))
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun readMarkerIdentity_txIdWithBackslashReturnsNull() = runBlocking {
+  val directory = tempJob()
+  try {
+    val marker = File(directory, "test_marker")
+    marker.writeText("transactionId=tx\\1\nbackupRoot=.reprocess_backup_tx\\1\ncreatedAt=1000\n")
+    assertNull(readQuarantineMarkerIdentity(marker))
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun readMarkerIdentity_txIdWithDotReturnsNull() = runBlocking {
+  val directory = tempJob()
+  try {
+    val marker = File(directory, "test_marker")
+    marker.writeText("transactionId=..\nbackupRoot=.reprocess_backup_..\ncreatedAt=1000\n")
+    assertNull(readQuarantineMarkerIdentity(marker))
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun readMarkerIdentity_backupRootMismatchTxIdReturnsNull() = runBlocking {
+  val directory = tempJob()
+  try {
+    val marker = File(directory, "test_marker")
+    marker.writeText("transactionId=tx1\nbackupRoot=.reprocess_backup_tx2\ncreatedAt=1000\n")
+    assertNull(readQuarantineMarkerIdentity(marker))
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun readMarkerIdentity_txIdWithWhitespaceReturnsNull() = runBlocking {
+  val directory = tempJob()
+  try {
+    val marker = File(directory, "test_marker")
+    marker.writeText("transactionId=tx 1\nbackupRoot=.reprocess_backup_tx 1\ncreatedAt=1000\n")
+    assertNull(readQuarantineMarkerIdentity(marker))
   } finally {
     directory.deleteRecursively()
   }
@@ -2938,6 +3097,45 @@ fun readMarkerIdentity_backupRootWithoutPrefixReturnsNull() = runBlocking {
     val marker = File(directory, "test_marker")
     marker.writeText("transactionId=tx\nbackupRoot=wrong_name\ncreatedAt=1000\n")
     assertNull(readQuarantineMarkerIdentity(marker))
+  } finally {
+    directory.deleteRecursively()
+  }
+}
+
+@Test
+fun manifestRestorePlusFallbackFailurePreservesTerminalState() = runBlocking {
+  val directory = tempJob()
+  try {
+    val transaction = backup(directory, "final.png" to "before")
+    writeTransactionState(transaction, ReprocessTransactionState.COMMITTED)
+    File(transaction.backupRoot, "final.png.BACKUP").delete()
+    val previousAfterDelete = afterManifestDeleteOperation
+    val previousRestore = manifestRestoreOperation
+    val previousFallbackWrite = fallbackWriteOperation
+    var restoreAttempted = false
+    var fallbackAttempted = false
+    afterManifestDeleteOperation = { root ->
+      File(root, "appeared_after_delete.txt").writeText("blocking")
+    }
+    manifestRestoreOperation = {
+      restoreAttempted = true
+      false
+    }
+    fallbackWriteOperation = { _, _, _ ->
+      fallbackAttempted = true
+      throw IOException("fallback persistence seam failure")
+    }
+    try {
+      assertFalse(cleanupBackups(transaction))
+      assertTrue(restoreAttempted)
+      assertTrue(fallbackAttempted)
+      assertTrue(File(transaction.backupRoot, "appeared_after_delete.txt").exists())
+      assertTrue(transaction.backupRoot.isDirectory)
+    } finally {
+      afterManifestDeleteOperation = previousAfterDelete
+      manifestRestoreOperation = previousRestore
+      fallbackWriteOperation = previousFallbackWrite
+    }
   } finally {
     directory.deleteRecursively()
   }
