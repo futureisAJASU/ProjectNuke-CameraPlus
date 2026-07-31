@@ -892,9 +892,7 @@ fun readJsonFilePretty(file: File): String {
 }
 
 fun folderSizeBytes(file: File): Long {
-    if (!file.exists()) return 0L
-    if (file.isFile) return file.length()
-    return file.listFiles()?.sumOf(::folderSizeBytesNoFollow) ?: 0L
+    return NoFollowFileSystem.size(file)
 }
 
 fun formatBytes(bytes: Long): String {

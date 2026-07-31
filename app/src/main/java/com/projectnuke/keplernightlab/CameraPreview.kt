@@ -155,7 +155,7 @@ private class CameraPreviewController(
         }
 
         val localGeneration = synchronized(lock) {
-            if (previewState == PreviewState.STARTING) return
+            if (previewState == PreviewState.STARTING || previewState == PreviewState.STOPPING) return
             if (previewState == PreviewState.OPEN && backgroundHandler != null && previewSurface != null) return
             generation += 1
             previewState = PreviewState.STARTING
@@ -197,10 +197,11 @@ private class CameraPreviewController(
 
     fun stop() {
         val refs = synchronized(lock) {
+            if (previewState == PreviewState.STOPPED || previewState == PreviewState.STOPPING) return
             previewState = PreviewState.STOPPING
             generation += 1
             Log.d(TAG, "stop generation=$generation")
-            StopRefs(captureSession, cameraDevice, previewSurface, backgroundThread)
+            StopRefs(captureSession, cameraDevice, previewSurface, backgroundThread, backgroundHandler)
                 .also {
                     captureSession = null
                     cameraDevice = null
@@ -209,16 +210,24 @@ private class CameraPreviewController(
                     backgroundThread = null
                     backgroundHandler = null
                     currentPreviewSize = null
-                    previewState = PreviewState.STOPPED
                 }
         }
-
-        runCatching { refs.session?.stopRepeating() }
-        runCatching { refs.session?.close() }
-        runCatching { refs.device?.close() }
-        runCatching { refs.surface?.release() }
-        runCatching { refs.thread?.quitSafely() }
-        runCatching { refs.thread?.join(2000L) }
+        val closeResources = Runnable {
+            runCatching { refs.session?.stopRepeating() }
+            runCatching { refs.session?.close() }
+            runCatching { refs.device?.close() }
+            runCatching { refs.surface?.release() }
+            synchronized(lock) {
+                if (previewState == PreviewState.STOPPING) previewState = PreviewState.STOPPED
+            }
+        }
+        if (refs.handler != null) {
+            refs.handler.post(closeResources)
+            refs.thread?.quitSafely()
+        } else {
+            closeResources.run()
+            refs.thread?.quitSafely()
+        }
     }
 
     fun updateFocusAeState(newState: FocusAeState) {
@@ -255,7 +264,7 @@ private class CameraPreviewController(
 
     fun updateZoomRatio(newZoomRatio: Float) {
         val previous = latestZoomRatio
-        latestZoomRatio = newZoomRatio.coerceAtLeast(0.1f)
+        latestZoomRatio = (if (newZoomRatio.isFinite()) newZoomRatio else 1.0f).coerceAtLeast(0.1f)
         val handler = backgroundHandler ?: return
         val localGeneration = synchronized(lock) { generation }
         handler.post {
@@ -965,7 +974,8 @@ private fun storeCaptureSession(
         val session: CameraCaptureSession?,
         val device: CameraDevice?,
         val surface: Surface?,
-        val thread: HandlerThread?
+        val thread: HandlerThread?,
+        val handler: Handler?
     )
 
     private companion object {

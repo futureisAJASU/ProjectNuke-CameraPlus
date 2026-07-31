@@ -5,8 +5,6 @@
 #include <cstdint>
 
 namespace {
-constexpr float kPi = 3.14159265358979323846f;
-
 inline bool finite(float v) { return std::isfinite(v); }
 inline float clamp01(float v) { return finite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f; }
 inline float luminance(jint p) {

@@ -30,8 +30,8 @@ private const val SUPER_RES_PIPELINE = "SUPER_RESOLUTION_FUSION"
 private const val SUPER_RES_JOB_FILE = "job.json"
 private const val ALIGNMENT_PROXY_MAX_WIDTH = 512
 private const val ALIGNMENT_SEARCH_RADIUS = 24
-private const val FUSION_TILE_WIDTH = 512
-private const val FUSION_TILE_HEIGHT = 512
+private const val FUSION_TILE_WIDTH = 384
+private const val FUSION_TILE_HEIGHT = 384
 private const val BILINEAR_HALO_RADIUS = 2
 private const val OUTLIER_LUMA_THRESHOLD = 35f
 private const val ALIGNMENT_SCORE_LIMIT = 0.16f
@@ -768,7 +768,11 @@ private fun fuseFramesTiled(
         .filter { it.accepted }
         .maxOfOrNull { max(abs(it.dx), abs(it.dy)) }
         ?: 0f
-    val sourceHalo = ceil(maximumAcceptedShift).toInt() + BILINEAR_HALO_RADIUS
+    val algorithmRadius = when (denoiseAlgorithm) {
+        DenoiseAlgorithm.GUIDED -> 1
+        DenoiseAlgorithm.WAVELET, DenoiseAlgorithm.BILATERAL -> 2
+    }
+    val sourceHalo = ceil(maximumAcceptedShift).toInt() + maxOf(BILINEAR_HALO_RADIUS, algorithmRadius)
     val decoders = linkedMapOf<Int, BitmapRegionDecoder>()
     var finished = false
     try {
@@ -1035,7 +1039,9 @@ private fun applySuperResolutionDenoiseInPlace(
     cancellation: KeplerPipelineCancellation
 ) {
     if (strength <= 0f || width < 5 || height < 5) return
-    if (NativeImageEngine.processPixels(pixels, width, height, algorithm, strength, FUSION_TILE_HEIGHT)) {
+    if (NativeImageEngine.processPixels(
+            pixels, width, height, algorithm, strength, FUSION_TILE_HEIGHT, cancellation
+        )) {
         return
     }
     val radius = 2

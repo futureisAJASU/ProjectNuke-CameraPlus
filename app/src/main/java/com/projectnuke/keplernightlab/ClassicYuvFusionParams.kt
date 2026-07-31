@@ -3,7 +3,7 @@ package com.projectnuke.keplernightlab
 import org.json.JSONObject
 import java.util.Locale
 
-const val CLASSIC_YUV_FUSION_PARAMS_VERSION = "classic_yuv_v1_1"
+const val CLASSIC_YUV_FUSION_PARAMS_VERSION = "classic_yuv_v1_2_native_algorithms"
 
 data class ClassicYuvFusionParams(
     val presetName: String,
@@ -16,7 +16,10 @@ data class ClassicYuvFusionParams(
     val localContrastAmount: Float,
     val saturationBoost: Float,
     val shadowLift: Float,
-    val highlightRollOff: Float
+    val highlightRollOff: Float,
+    val denoiseAlgorithm: DenoiseAlgorithm = DenoiseAlgorithm.GUIDED,
+    val fusionAlgorithm: NativeFusionAlgorithm = NativeFusionAlgorithm.ROBUST_REFERENCE,
+    val toneAlgorithm: NativeToneAlgorithm = NativeToneAlgorithm.NATURAL
 ) {
     fun clamped(): ClassicYuvFusionParams {
         val safePresetName = presetName.uppercase(Locale.US).takeIf {
@@ -70,6 +73,9 @@ data class ClassicYuvFusionParams(
         .put("saturationBoost", saturationBoost.toDouble())
         .put("shadowLift", shadowLift.toDouble())
         .put("highlightRollOff", highlightRollOff.toDouble())
+        .put("denoiseAlgorithm", denoiseAlgorithm.name)
+        .put("fusionAlgorithm", fusionAlgorithm.name)
+        .put("toneAlgorithm", toneAlgorithm.name)
 }
 
 enum class ClassicYuvFusionPreset(
@@ -120,7 +126,16 @@ fun loadClassicYuvFusionParams(job: JSONObject): ClassicYuvFusionParams {
             localContrastAmount = json.requireFiniteFloat("localContrastAmount"),
             saturationBoost = json.requireFiniteFloat("saturationBoost"),
             shadowLift = json.requireFiniteFloat("shadowLift"),
-            highlightRollOff = json.requireFiniteFloat("highlightRollOff")
+            highlightRollOff = json.requireFiniteFloat("highlightRollOff"),
+            denoiseAlgorithm = runCatching {
+                    DenoiseAlgorithm.valueOf(json.optString("denoiseAlgorithm", DenoiseAlgorithm.GUIDED.name))
+                }.getOrDefault(DenoiseAlgorithm.GUIDED),
+            fusionAlgorithm = runCatching {
+                NativeFusionAlgorithm.valueOf(json.optString("fusionAlgorithm", NativeFusionAlgorithm.ROBUST_REFERENCE.name))
+            }.getOrDefault(NativeFusionAlgorithm.ROBUST_REFERENCE),
+            toneAlgorithm = runCatching {
+                NativeToneAlgorithm.valueOf(json.optString("toneAlgorithm", NativeToneAlgorithm.NATURAL.name))
+            }.getOrDefault(NativeToneAlgorithm.NATURAL)
         ).clamped()
     }.getOrElse { ClassicYuvFusionPreset.NATURAL.params }
 }

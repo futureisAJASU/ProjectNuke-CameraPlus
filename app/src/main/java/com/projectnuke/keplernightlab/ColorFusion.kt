@@ -36,6 +36,7 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
+import kotlin.math.min
 
 private const val ENABLE_YUV_MEMORY_BURST_BUFFER = true
 private const val MAX_YUV_MEMORY_BUFFER_FRAMES = 6
@@ -145,6 +146,11 @@ private data class BufferedYuvFrame(
 // Use a conservative 3 bytes/pixel estimate rather than the tightly packed 1.5 bytes/pixel ideal.
 private fun estimateYuvBufferBytes(width: Int, height: Int): Long =
     width.toLong() * height.toLong() * 3L
+
+private fun actualYuvPlaneBytes(image: Image): Long = image.planes.fold(0L) { total, plane ->
+    val remaining = plane.buffer.remaining().toLong().coerceAtLeast(0L)
+    if (Long.MAX_VALUE - total < remaining) Long.MAX_VALUE else total + remaining
+}
 
 private fun canUseYuvMemoryBuffer(width: Int, height: Int, frameCount: Int): Boolean {
     if (!ENABLE_YUV_MEMORY_BURST_BUFFER) return false
@@ -431,11 +437,12 @@ fun captureYuvBurstColorWithMotion(
         burstDir = currentBurstDir
         val outputWidth = if (rotationDegrees == 90 || rotationDegrees == 270) yuvSize.height else yuvSize.width
         val outputHeight = if (rotationDegrees == 90 || rotationDegrees == 270) yuvSize.width else yuvSize.height
-        val useMemoryBuffer = canUseYuvMemoryBuffer(
-            yuvSize.width,
-            yuvSize.height,
-            frameCount
-        )
+    var useMemoryBuffer = canUseYuvMemoryBuffer(
+        yuvSize.width,
+        yuvSize.height,
+        frameCount
+    )
+    var bufferedYuvBytes = 0L
         val estimatedBufferBytes =
             estimateYuvBufferBytes(yuvSize.width, yuvSize.height) * frameCount
         val captureTimeoutMs = computeYuvCaptureTimeoutMs(frameCount, resolutionMode)
@@ -496,7 +503,7 @@ fun captureYuvBurstColorWithMotion(
             yuvSize.width,
             yuvSize.height,
             ImageFormat.YUV_420_888,
-            frameCount + 2
+            min(4, maxOf(2, frameCount))
         )
 
         imageReader = reader
@@ -577,6 +584,21 @@ fun captureYuvBurstColorWithMotion(
                     val frameIndex = savedFrames
                     val imageTimestampNs = image.timestamp
 
+                    val actualFrameBytes = actualYuvPlaneBytes(image)
+                    if (useMemoryBuffer &&
+                        (actualFrameBytes > MAX_YUV_MEMORY_BUFFER_BYTES ||
+                            bufferedYuvBytes > MAX_YUV_MEMORY_BUFFER_BYTES - actualFrameBytes)
+                    ) {
+                        image.close()
+                        image = null
+                        finishError(
+                            message = "YUV memory buffer rejected actual plane bytes for frame ${frameIndex + 1}/$frameCount",
+                            source = "captureYuvBurstColorWithMotion.imageReader.memoryBuffer.actualBytes",
+                            failureType = "MemoryPlanError",
+                            failureMessage = "Actual YUV plane buffers exceed the bounded capture budget"
+                        )
+                        return@setOnImageAvailableListener
+                    }
                     if (useMemoryBuffer) {
                         val bufferedFrame = try {
                             copyYuvFrameToMemory(image, frameIndex)
@@ -593,6 +615,7 @@ fun captureYuvBurstColorWithMotion(
                         image.close()
                         image = null
                         bufferedFrames.add(bufferedFrame)
+                        bufferedYuvBytes += actualFrameBytes
                         savedFrames++
                         frameTimestampsNs.add(imageTimestampNs)
                         postStatus("YUV buffered frame $savedFrames/$frameCount")

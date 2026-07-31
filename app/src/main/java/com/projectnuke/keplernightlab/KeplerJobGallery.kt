@@ -123,7 +123,7 @@ fun getEnabledRawFrames(jobDir: File): List<JSONObject> {
                 frame.optBoolean("enabled", true) &&
                 !frame.optBoolean("excludedByUser", false) &&
                 fileName.isNotBlank() &&
-                File(jobDir, fileName).isFile
+                NoFollowFileSystem.resolveDirectChild(jobDir, fileName, requireFile = true) != null
             ) {
                 add(frame)
             }
@@ -133,9 +133,8 @@ fun getEnabledRawFrames(jobDir: File): List<JSONObject> {
 
 fun loadKeplerGalleryJobs(context: Context): List<KeplerGalleryJobSummary> {
     return keplerGalleryRoots(context).flatMap { root ->
-        root.listFiles()
-            ?.filter { it.isDirectory && matchesJobPrefix(root, it.name) }
-            .orEmpty()
+        NoFollowFileSystem.directChildren(root)
+            .filter { NoFollowFileSystem.isRealDirectory(it.toPath()) && matchesJobPrefix(root, it.name) }
     }.onEach {
         recoverValidatedQuarantine(it)
         recoverStaleInterruptedJob(it)
@@ -210,14 +209,12 @@ fun deleteKeplerGalleryJob(context: Context, jobDirectory: File): Result<KeplerJ
         require(target.isDirectory) { "Job directory no longer exists." }
         require(!isReprocessQuarantined(target)) { "Reprocess quarantined job cannot be deleted; it retains pending transaction evidence." }
         val (status, failedPaths) = deleteRecursivelySafe(target)
-        if (failedPaths.isNotEmpty()) {
-            throw IllegalStateException("Safe delete partial: ${failedPaths.size} paths failed")
-        }
-        KeplerJobMetadata.removeLockEntry(target)
+        if (status == CleanupStatus.COMPLETE) KeplerJobMetadata.removeLockEntry(target)
         KeplerJobCleanupResult(
             bytesFreed = 0L,
             failedPaths = failedPaths,
-            metadataWarning = null,
+            metadataWarning = failedPaths.takeIf { it.isNotEmpty() }
+                ?.let { "Cleanup ${status.name}: ${it.size} path(s) failed" },
             cleanupStatus = status
         )
     } finally {
@@ -249,13 +246,13 @@ fun cleanupKeplerGalleryJob(
         throw IllegalStateException("Final output missing; cleanup refused.")
     }
     val filesToDelete = listFilesNoFollow(target)
-        .filter { it.isFile }
+        .filter { NoFollowFileSystem.isRealFile(it.toPath()) }
         .filter { file ->
             when (cleanupType) {
                 KeplerJobCleanupType.DEBUG_ONLY -> isDeletableDebugFile(file, finalFiles)
                 KeplerJobCleanupType.SOURCE_FRAMES_ONLY -> isDeletableSourceOrIntermediate(file, finalFiles)
                 KeplerJobCleanupType.FINAL_ONLY ->
-                    file.name != JOB_JSON_FILE_NAME && file.canonicalFile !in finalFiles.map { it.canonicalFile }.toSet()
+                    file.name != JOB_JSON_FILE_NAME && file !in finalFiles
                 KeplerJobCleanupType.SOURCE_ONLY -> isDeletableForSourceOnly(file, finalFiles)
                 KeplerJobCleanupType.FAILED_JOB_DELETE -> false
             }
@@ -263,11 +260,14 @@ fun cleanupKeplerGalleryJob(
         .toList()
     val failed = mutableListOf<String>()
     filesToDelete.forEach { item ->
-        if (item.exists() && !item.delete()) failed += item.absolutePath
+        if (NoFollowFileSystem.isRealFile(item.toPath()) && !runCatching { java.nio.file.Files.deleteIfExists(item.toPath()) }.getOrDefault(false)) {
+            failed += item.absolutePath
+        }
     }
     val after = folderSizeBytes(target)
-    val sourceAvailable = target.walkTopDown().any { it.isFile && isSourceFrame(it) }
-    val debugAvailable = target.walkTopDown().any { it.isFile && isDebugFile(it, finalFiles.map { f -> f.name }.toSet()) }
+    val remainingFiles = listFilesNoFollow(target).filter { NoFollowFileSystem.isRealFile(it.toPath()) }
+    val sourceAvailable = remainingFiles.any { isSourceFrame(it) }
+    val debugAvailable = remainingFiles.any { isDebugFile(it, finalFiles.map { f -> f.name }.toSet()) }
     val finalOutputAvailable = if (cleanupType == KeplerJobCleanupType.SOURCE_ONLY) {
         false
     } else {
@@ -321,11 +321,12 @@ internal fun cleanupSafeRoots(context: Context): List<File> {
 }
 
 internal fun requireCleanupSafeJobDirectory(context: Context, jobDirectory: File): File {
-    val target = jobDirectory.canonicalFile
-    val allowed = cleanupSafeRoots(context).any { root ->
-        target.parentFile == root.canonicalFile && matchesJobPrefix(root, target.name)
+    val target = cleanupSafeRoots(context).firstNotNullOfOrNull { root ->
+        if (!NoFollowFileSystem.isRealDirectory(root.toPath())) return@firstNotNullOfOrNull null
+        if (!matchesJobPrefix(root, jobDirectory.name)) return@firstNotNullOfOrNull null
+        NoFollowFileSystem.resolveDirectChild(root, jobDirectory.name)
     }
-    require(allowed) { "Refusing to modify directory outside known Kepler job roots." }
+    require(target != null) { "Refusing to modify directory outside known Kepler job roots." }
     return target
 }
 
@@ -338,14 +339,14 @@ internal fun matchesJobPrefix(root: File, name: String): Boolean = when (root.na
 }
 
 fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
-    val job = File(directory, JOB_JSON_FILE_NAME).takeIf { it.isFile }?.let { file ->
+    val job = NoFollowFileSystem.resolveDirectChild(directory, JOB_JSON_FILE_NAME, requireFile = true)?.let { file ->
         runCatching { JSONObject(file.readText()) }.getOrNull()
     }
     val frames = job?.optJSONArray("frames").galleryFrames(directory)
         .orEmpty()
         .ifEmpty {
-            directory.listFiles()
-                ?.filter { it.isFile && isSourceFrame(it) }
+            listFilesNoFollow(directory)
+                .filter { NoFollowFileSystem.isRealFile(it.toPath()) && isSourceFrame(it) }
                 ?.sortedBy { it.name }
                 ?.mapIndexed { index, file ->
                     KeplerGalleryFrame(
@@ -422,7 +423,7 @@ fun computeKeplerJobStorage(
     var cacheBytes = 0L
     var intermediateBytes = 0L
     var cleanableBytes = 0L
-    directory.walkTopDown().forEach { file ->
+    listFilesNoFollow(directory).forEach { file ->
         if (!file.isFile) return@forEach
         val bytes = file.length()
         totalBytes += bytes
@@ -501,11 +502,11 @@ fun finalFilesForCleanup(directory: File, job: JSONObject?): Set<File> {
         job?.optString("outputFile").orEmpty().ifBlank { null },
         resolveFinalPreview(directory, job)?.name
     )
-    return names.mapNotNull { name -> File(directory, name).takeIf { it.isFile }?.canonicalFile }.toSet()
+    return names.mapNotNull { name -> NoFollowFileSystem.resolveDirectChild(directory, name, requireFile = true) }.toSet()
 }
 
 fun isDeletableDebugFile(file: File, finalFiles: Set<File>): Boolean {
-    if (file.name == JOB_JSON_FILE_NAME || file.canonicalFile in finalFiles) return false
+    if (file.name == JOB_JSON_FILE_NAME || file in finalFiles) return false
     val name = file.name.lowercase()
     if (name == "raw_render_debug.json" || name == "fusion_debug.json" || name == "yuv_debug.json") return false
     return isDebugFile(file, finalFiles.map { it.name }.toSet()) ||
@@ -515,14 +516,14 @@ fun isDeletableDebugFile(file: File, finalFiles: Set<File>): Boolean {
 }
 
 fun isDeletableSourceOrIntermediate(file: File, finalFiles: Set<File>): Boolean {
-    if (file.name == JOB_JSON_FILE_NAME || file.canonicalFile in finalFiles) return false
+    if (file.name == JOB_JSON_FILE_NAME || file in finalFiles) return false
     return isSourceFrame(file) || isIntermediateFile(file, finalFiles.map { it.name }.toSet())
 }
 
 fun isDeletableForSourceOnly(file: File, finalFiles: Set<File>): Boolean {
     if (file.name == JOB_JSON_FILE_NAME || isRequiredSourceOnlyMetadata(file) || isSourceFrame(file)) return false
     val name = file.name.lowercase()
-    return file.canonicalFile in finalFiles ||
+    return file in finalFiles ||
         isDeletableDebugFile(file, finalFiles) ||
         isIntermediateFile(file, finalFiles.map { it.name }.toSet()) ||
         isCacheFile(file, finalFiles.map { it.name }.toSet()) ||
@@ -647,18 +648,17 @@ private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
     )
     keys.forEach { key ->
         val name = job?.optString(key).orEmpty()
-        File(directory, name).takeIf {
+        NoFollowFileSystem.resolveDirectChild(directory, name, requireFile = true)?.takeIf {
             name.isNotBlank() &&
-                it.isFile &&
                 isDisplayImageFile(it) &&
                 !isDebugPreviewFinalBlocked(it.name) &&
                 (it.extension.equals("png", true) || it.extension.equals("jpg", true) || it.extension.equals("jpeg", true) || it.extension.equals("heic", true) || it.extension.equals("webp", true))
         }
             ?.let { return it }
     }
-return directory.listFiles()
-        ?.filter {
-                it.isFile &&
+return NoFollowFileSystem.directChildren(directory)
+        .filter {
+                NoFollowFileSystem.isRealFile(it.toPath()) &&
                 isDisplayImageFile(it) &&
                 !isSourceFrame(it) &&
                 !isDebugPreviewFinalBlocked(it.name)
@@ -708,73 +708,13 @@ internal fun isSafeRelativeFilename(name: String): Boolean {
 }
 
 internal fun deleteRecursivelySafe(root: File): Pair<CleanupStatus, List<String>> {
-    if (!root.exists()) return Pair(CleanupStatus.COMPLETE, emptyList())
-    if (!root.isDirectory) {
-        return if (root.delete()) Pair(CleanupStatus.COMPLETE, emptyList())
-        else Pair(CleanupStatus.FAILED, listOf(root.absolutePath))
-    }
-    val failedPaths = mutableListOf<String>()
-    val canonicalRoot = root.canonicalFile
-    val visited = mutableSetOf<String>()
-    fun safeWalk(dir: File) {
-        val canonical = dir.canonicalFile
-        if (!visited.add(canonical.path)) return
-        if (!canonical.path.startsWith(canonicalRoot.path + File.separator) && canonical != canonicalRoot) return
-        if (canonical.absolutePath != canonical.path) return
-        if (java.nio.file.Files.isSymbolicLink(canonical.toPath())) return
-        val children = canonical.listFiles() ?: run {
-            if (!dir.delete()) failedPaths.add(dir.absolutePath)
-            return
-        }
-        children.forEach { safeWalk(it) }
-        if (!dir.delete()) failedPaths.add(dir.absolutePath)
-    }
-    safeWalk(root)
-    return when {
-        failedPaths.isEmpty() -> Pair(CleanupStatus.COMPLETE, emptyList())
-        !root.exists() -> Pair(CleanupStatus.PARTIAL, failedPaths)
-        else -> Pair(CleanupStatus.FAILED, failedPaths)
-    }
+    return NoFollowFileSystem.deleteTree(root)
 }
 
 internal fun listFilesNoFollow(root: File): List<File> {
-    if (!root.isDirectory) return emptyList()
-    val canonical = root.canonicalFile
-    val result = mutableListOf<File>()
-    val visited = mutableSetOf<String>()
-    fun walk(dir: File) {
-        val c = dir.canonicalFile
-        if (!visited.add(c.path)) return
-        if (!c.path.startsWith(canonical.path + File.separator) && c != canonical) return
-        if (c.absolutePath != c.path) return
-        val children = dir.listFiles() ?: return
-        for (child in children) {
-            result.add(child)
-            if (child.isDirectory && !java.nio.file.Files.isSymbolicLink(child.toPath())) {
-                walk(child)
-            }
-        }
-    }
-    walk(root)
-    return result
+    return NoFollowFileSystem.list(root)
 }
 
 internal fun folderSizeBytesNoFollow(file: File): Long {
-    if (!file.exists()) return 0L
-    if (file.isFile) return file.length()
-    var total = 0L
-    val visited = mutableSetOf<String>()
-    val canonicalRoot = file.canonicalFile
-    fun walk(dir: File) {
-        val c = dir.canonicalFile
-        if (!visited.add(c.path)) return
-        if (!c.path.startsWith(canonicalRoot.path + File.separator) && c != canonicalRoot) return
-        if (c.absolutePath != c.path) return
-        val children = dir.listFiles() ?: return
-        for (child in children) {
-            if (child.isDirectory) walk(child) else total += child.length()
-        }
-    }
-walk(file)
-    return total
+    return NoFollowFileSystem.size(file)
 }

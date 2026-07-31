@@ -17,21 +17,44 @@ object NativeImageEngine {
         denoiseStrength: Float,
         sharpen: Float,
         localContrast: Float,
-        tileRows: Int = 64
+        tileRows: Int = 64,
+        cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
     ): Bitmap? {
         if (!loaded || source.width <= 0 || source.height <= 0) return null
-        val input = IntArray(source.width * source.height)
+        val safeRows = tileRows.coerceIn(1, 512)
+        val halo = 2
+        val bufferHeight = (safeRows + halo * 2).coerceAtMost(source.height)
+        val input = IntArray(source.width * bufferHeight)
         val output = IntArray(input.size)
-        source.getPixels(input, 0, source.width, 0, 0, source.width, source.height)
-        nativeProcessArgb(
-            input, output, source.width, source.height,
-            denoise.ordinal, tone.ordinal,
-            denoiseStrength.safeFinite().coerceIn(0f, 1f),
-            sharpen.safeFinite().coerceIn(0f, 1f),
-            localContrast.safeFinite().coerceIn(0f, 1f),
-            tileRows.coerceIn(1, 512)
-        )
-        return Bitmap.createBitmap(output, source.width, source.height, Bitmap.Config.ARGB_8888)
+        val result = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
+        var top = 0
+        while (top < source.height) {
+            cancellation.throwIfCancelled()
+            val bottom = (top + safeRows).coerceAtMost(source.height)
+            val sourceTop = (top - halo).coerceAtLeast(0)
+            val sourceBottom = (bottom + halo).coerceAtMost(source.height)
+            val sourceHeight = sourceBottom - sourceTop
+            source.getPixels(input, 0, source.width, 0, sourceTop, source.width, sourceHeight)
+            nativeProcessArgb(
+                input, output, source.width, sourceHeight,
+                denoise.ordinal, tone.ordinal,
+                denoiseStrength.safeFinite().coerceIn(0f, 1f),
+                sharpen.safeFinite().coerceIn(0f, 1f),
+                localContrast.safeFinite().coerceIn(0f, 1f),
+                safeRows
+            )
+            result.setPixels(
+                output,
+                (top - sourceTop) * source.width,
+                source.width,
+                0,
+                top,
+                source.width,
+                bottom - top
+            )
+            top = bottom
+        }
+        return result
     }
 
     internal fun processPixels(
@@ -40,9 +63,11 @@ object NativeImageEngine {
         height: Int,
         denoise: DenoiseAlgorithm,
         strength: Float,
-        tileRows: Int = 64
+        tileRows: Int = 64,
+        cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
     ): Boolean {
         if (!loaded || width <= 0 || height <= 0 || pixels.size < width * height) return false
+        cancellation.throwIfCancelled()
         val output = IntArray(width * height)
         nativeProcessArgb(
             pixels, output, width, height, denoise.ordinal,

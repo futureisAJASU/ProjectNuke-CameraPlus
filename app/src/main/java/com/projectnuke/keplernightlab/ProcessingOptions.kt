@@ -21,13 +21,18 @@ data class ProcessingSettings(
     val denoiseAlgorithm: DenoiseAlgorithm = DenoiseAlgorithm.GUIDED,
     val denoiseStrength: Float,
     val sharpenAmount: Float,
-    val localContrastAmount: Float
+    val localContrastAmount: Float,
+    val fusionAlgorithm: NativeFusionAlgorithm = NativeFusionAlgorithm.ROBUST_REFERENCE,
+    val toneAlgorithm: NativeToneAlgorithm = NativeToneAlgorithm.NATURAL
 ) {
     fun matchesPreset(preset: ClassicYuvFusionPreset): Boolean {
         val p = preset.params
         return denoiseStrength == p.denoiseStrength &&
             sharpenAmount == p.sharpenAmount &&
-            localContrastAmount == p.localContrastAmount
+            localContrastAmount == p.localContrastAmount &&
+            denoiseAlgorithm == p.denoiseAlgorithm &&
+            fusionAlgorithm == p.fusionAlgorithm &&
+            toneAlgorithm == p.toneAlgorithm
     }
 
     fun isCustom(): Boolean = ClassicYuvFusionPreset.entries.none { matchesPreset(it) }
@@ -41,7 +46,9 @@ data class ProcessingSettings(
             sharpenAmount = sharpenAmount.finiteOr(base.sharpenAmount).coerceIn(0f, 0.55f),
             localContrastAmount = localContrastAmount
                 .finiteOr(base.localContrastAmount)
-                .coerceIn(0f, 0.18f)
+                .coerceIn(0f, 0.18f),
+            fusionAlgorithm = fusionAlgorithm,
+            toneAlgorithm = toneAlgorithm
         )
     }
 
@@ -52,7 +59,10 @@ data class ProcessingSettings(
             presetName = normalized.presetName,
             denoiseStrength = normalized.denoiseStrength,
             sharpenAmount = normalized.sharpenAmount,
-            localContrastAmount = normalized.localContrastAmount
+            localContrastAmount = normalized.localContrastAmount,
+            denoiseAlgorithm = normalized.denoiseAlgorithm,
+            fusionAlgorithm = normalized.fusionAlgorithm,
+            toneAlgorithm = normalized.toneAlgorithm
         ).clamped()
     }
 

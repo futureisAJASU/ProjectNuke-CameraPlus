@@ -816,26 +816,32 @@ frames.forEach { frame ->
             val sumW = FloatArray(pixelCount)
             for (pixel in 0 until pixelCount) {
                 val color = referencePixels[pixel]
-                sumR[pixel] = Color.red(color) * params.referenceWeight
-                sumG[pixel] = Color.green(color) * params.referenceWeight
-                sumB[pixel] = Color.blue(color) * params.referenceWeight
-                sumW[pixel] = params.referenceWeight
+                val referenceWeight = if (params.fusionAlgorithm == NativeFusionAlgorithm.MOTION_SAFE) {
+                    params.referenceWeight * 1.75f
+                } else params.referenceWeight
+                sumR[pixel] = Color.red(color) * referenceWeight
+                sumG[pixel] = Color.green(color) * referenceWeight
+                sumB[pixel] = Color.blue(color) * referenceWeight
+                sumW[pixel] = referenceWeight
             }
 
-    frames.forEachIndexed { frameIndex, frame ->
+            val candidateFrames = frames.filterNot { it === reference }
+            var batchStart = 0
+            while (batchStart < candidateFrames.size) {
+                val batchEnd = min(candidateFrames.size, batchStart + memoryPlan.candidateBatchSize)
+                candidateFrames.subList(batchStart, batchEnd).forEachIndexed frameLoop@ { frameOffset, frame ->
         cancellation.throwIfCancelled()
-        if (frame === reference) return@forEachIndexed
         if (reportedMergeFrames.add(frame.jsonIndex)) {
-            onStatus("Classic YUV fusion: merging frame ${frameIndex + 1}/${frames.size}...")
+            onStatus("Classic YUV fusion: merging frame ${batchStart + frameOffset + 2}/${frames.size}...")
         }
         val sourceLeft = max(0, frame.alignDx)
         val sourceTop = max(0, tileTop + frame.alignDy)
         val sourceRight = min(width, width + frame.alignDx)
         val sourceBottom = min(height, tileBottom + frame.alignDy)
-        if (sourceRight <= sourceLeft || sourceBottom <= sourceTop) return@forEachIndexed
+        if (sourceRight <= sourceLeft || sourceBottom <= sourceTop) return@frameLoop
         val region = Rect(sourceLeft, sourceTop, sourceRight, sourceBottom)
         val frameBitmap = decoders.getValue(frame).decodeRegion(region, decodeOpts)
-            ?: return@forEachIndexed
+            ?: return@frameLoop
                 val (frameWidth, frameHeight, framePixels) = try {
                     val frameWidth = frameBitmap.width
                     val frameHeight = frameBitmap.height
@@ -873,7 +879,14 @@ frames.forEach { frame ->
                         val adjustedLuma = luma(color) * gain
                         val difference = abs(adjustedLuma - luma(refColor))
                         val ghost = ghostWeight(difference, params)
-                        val localWeight = ghost * alignmentWeight * externalWeight
+                        val brightness = (luma(refColor) / 255f).coerceIn(0f, 1f)
+                        val noiseWeight = if (params.fusionAlgorithm == NativeFusionAlgorithm.NOISE_AWARE) {
+                            1f / (1f + 0.85f * (1f - brightness))
+                        } else 1f
+                        val motionWeight = if (params.fusionAlgorithm == NativeFusionAlgorithm.MOTION_SAFE) {
+                            if (difference > params.ghostThreshold * 0.8f) 0.18f else 0.72f
+                        } else 1f
+                        val localWeight = ghost * alignmentWeight * externalWeight * noiseWeight * motionWeight
                         comparedPixels++
                         if (ghost < 0.25f) rejectedPixels++
                         sumR[outputIndex] += Color.red(color) * gain * localWeight
@@ -882,6 +895,8 @@ frames.forEach { frame ->
                         sumW[outputIndex] += localWeight
                     }
                 }
+            }
+                batchStart = batchEnd
             }
 
             val outputPixels = IntArray(pixelCount)
@@ -941,6 +956,16 @@ internal fun applyClassicYuvPostProcessing(
         return source.copy(Bitmap.Config.ARGB_8888, true)
             ?: error("Could not copy identity postprocess source")
     }
+    NativeImageEngine.process(
+        source = source,
+        denoise = params.denoiseAlgorithm,
+        tone = params.toneAlgorithm,
+        denoiseStrength = params.denoiseStrength,
+        sharpen = params.sharpenAmount,
+        localContrast = params.localContrastAmount,
+        tileRows = CLASSIC_FUSION_TILE_ROWS,
+        cancellation = cancellation
+    )?.let { return it }
     val outputBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
     fun tone(value: Float): Int {
         val normalized = (value / 255f).coerceIn(0f, 1f)

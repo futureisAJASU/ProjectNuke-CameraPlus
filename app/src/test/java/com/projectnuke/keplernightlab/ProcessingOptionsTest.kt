@@ -97,4 +97,23 @@ class ProcessingOptionsTest {
         assertTrue(clamped.denoiseStrength.isFinite())
     }
 
+    @Test
+    fun algorithmSelectionsPersistInFusionParamsAndMakePresetCustom() {
+        val settings = ProcessingSettings(
+            presetName = ClassicYuvFusionPreset.NATURAL.name,
+            denoiseAlgorithm = DenoiseAlgorithm.BILATERAL,
+            denoiseStrength = 0.14f,
+            sharpenAmount = 0.10f,
+            localContrastAmount = 0.02f,
+            fusionAlgorithm = NativeFusionAlgorithm.MOTION_SAFE,
+            toneAlgorithm = NativeToneAlgorithm.NIGHT
+        )
+        val params = settings.resolvedParams()
+        val loaded = loadClassicYuvFusionParams(JSONObject().put("fusionParams", params.toJson()))
+        assertTrue(settings.isCustom())
+        assertEquals(DenoiseAlgorithm.BILATERAL, loaded.denoiseAlgorithm)
+        assertEquals(NativeFusionAlgorithm.MOTION_SAFE, loaded.fusionAlgorithm)
+        assertEquals(NativeToneAlgorithm.NIGHT, loaded.toneAlgorithm)
+    }
+
 }

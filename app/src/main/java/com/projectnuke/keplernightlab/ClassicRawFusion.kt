@@ -254,12 +254,12 @@ internal fun runClassicRawFusionMerge(
             .put("rawFusionVersion", CLASSIC_RAW_FUSION_VERSION)
             .put("rawReferenceFrameIndex", reference.input.meta.optInt("index", reference.position))
             .put("rawReferenceFrameReason", selectRawReferenceReason(frames))
-            .put("usedFrameCount", frames.size)
+            .put("usedFrameCount", frames.count { it.skipReason == null && it.alignmentUsed && it.globalWeight > 0f })
             .put("excludedFrameCount", countRawExcludedFrames(job))
             .put(
                 "skippedFrameCount",
                 ((job.optJSONArray("frames")?.length() ?: frames.size) -
-                    countRawExcludedFrames(job) - frames.size).coerceAtLeast(0)
+                    countRawExcludedFrames(job) - frames.count { it.skipReason == null && it.alignmentUsed && it.globalWeight > 0f }).coerceAtLeast(0)
             )
             .put("rawGhostSuppressionUsed", true)
             .put("rawNoiseModelVersion", CLASSIC_RAW_NOISE_MODEL_VERSION)
@@ -347,13 +347,14 @@ private fun buildRawProxy(
     val proxyHeight = max(1, sensor.height / step)
     val luma = ByteArray(proxyWidth * proxyHeight)
     val row = ShortArray(sensor.width)
+    val rowBytes = ByteArray(sensor.width * 2)
     cancellation.throwIfCancelled()
     RandomAccessFile(file, "r").use { input ->
         var out = 0
         var y = 0
         while (y < sensor.height && out < luma.size) {
             if ((y and (step * 31)) == 0) cancellation.throwIfCancelled()
-            readRawRow(input, sensor.width, y, row)
+            readRawRow(input, sensor.width, y, row, rowBytes)
             var x = greenAlignedRawX(sensor.cfa, y, 0)
             var col = 0
             while (col < proxyWidth && out < luma.size) {
@@ -525,6 +526,7 @@ private fun mergeClassicRawTiles(
     val acc = FloatArray(tileArraySize.toInt())
     val weights = FloatArray(tileArraySize.toInt())
     val outRow = ByteArray(sensor.width * 2)
+    val rowBytes = ByteArray(sensor.width * 2)
 
     try {
         frames.forEach { frame ->
@@ -544,7 +546,8 @@ private fun mergeClassicRawTiles(
                         frameInputs.getValue(reference),
                         sensor.width,
                         tileTop + row,
-                        refRows[row]
+                        refRows[row],
+                        rowBytes
                     )
                 }
 
@@ -559,7 +562,7 @@ private fun mergeClassicRawTiles(
                         val y = tileTop + row
                         val sourceY = y + frame.dy
                         if (sourceY !in 0 until sensor.height) continue
-                        readRawRow(raf, sensor.width, sourceY, rowBuffer)
+                        readRawRow(raf, sensor.width, sourceY, rowBuffer, rowBytes)
                         for (x in 0 until sensor.width) {
                             if ((x and 1023) == 0) cancellation.throwIfCancelled()
                             val sourceX = x + frame.dx
@@ -592,6 +595,7 @@ private fun mergeClassicRawTiles(
                                     downweighted++
                                 }
                             }
+                            if (!corrected.isFinite() || !localWeight.isFinite() || localWeight <= 0f) continue
                             acc[index] += corrected * localWeight
                             weights[index] += localWeight
                         }
@@ -603,8 +607,8 @@ private fun mergeClassicRawTiles(
                     for (x in 0 until sensor.width) {
                         if ((x and 1023) == 0) cancellation.throwIfCancelled()
                         val index = row * sensor.width + x
-                        val value = (acc[index] / weights[index].coerceAtLeast(0.001f))
-                            .roundToInt()
+                        val normalized = acc[index] / weights[index].coerceAtLeast(0.001f)
+                        val value = if (normalized.isFinite()) normalized.roundToInt() else 0
                             .coerceIn(0, whiteRange)
                         outRow[out++] = (value and 0xFF).toByte()
                         outRow[out++] = ((value ushr 8) and 0xFF).toByte()
@@ -620,9 +624,15 @@ private fun mergeClassicRawTiles(
     return RawMergeStats(rejected, compared, downweighted, memoryPlan)
 }
 
-private fun readRawRow(input: RandomAccessFile, width: Int, y: Int, out: ShortArray) {
+private fun readRawRow(
+    input: RandomAccessFile,
+    width: Int,
+    y: Int,
+    out: ShortArray,
+    bytes: ByteArray
+) {
     input.seek(y.toLong() * width.toLong() * 2L)
-    val bytes = ByteArray(width * 2)
+    require(bytes.size >= width * 2) { "RAW row buffer is too small" }
     input.readFully(bytes)
     var byteIndex = 0
     for (x in 0 until width) {
@@ -686,7 +696,7 @@ private fun buildRawFusionDebug(
                 .put("rawAlignmentUsedSubpixel", frame.alignmentUsedSubpixel)
                 .put("rawAlignmentFallbackUsed", frame.alignmentFallbackUsed)
                 .put("rawGlobalWeight", frame.globalWeight.toDouble())
-                .put("used", frame.skipReason == null)
+                .put("used", frame.skipReason == null && frame.alignmentUsed && frame.globalWeight > 0f)
                 .put("skipReason", frame.skipReason ?: JSONObject.NULL)
         )
     }
@@ -694,9 +704,9 @@ private fun buildRawFusionDebug(
         .put("rawFusionEngine", "classic_raw_v1")
         .put("rawFusionVersion", CLASSIC_RAW_FUSION_VERSION)
         .put("rawReferenceFrameIndex", reference.input.meta.optInt("index", reference.position))
-        .put("usedFrameCount", frames.size)
+        .put("usedFrameCount", frames.count { it.skipReason == null && it.alignmentUsed && it.globalWeight > 0f })
         .put("excludedFrameCount", countRawExcludedFrames(job))
-        .put("skippedFrameCount", (preparedFrames.savedFrames - frames.size).coerceAtLeast(0))
+        .put("skippedFrameCount", (preparedFrames.savedFrames - frames.count { it.skipReason == null && it.alignmentUsed && it.globalWeight > 0f }).coerceAtLeast(0))
         .put("rawGhostSuppressionUsed", true)
         .put("rawNoiseModelVersion", CLASSIC_RAW_NOISE_MODEL_VERSION)
         .put("shotCoeff", CLASSIC_RAW_SHOT_COEFF)

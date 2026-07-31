@@ -383,7 +383,10 @@ fun MainCameraScreen(
                 presetName = savedSettings.processingPresetName,
                 denoiseStrength = savedSettings.denoiseStrength,
                 sharpenAmount = savedSettings.sharpenAmount,
-                localContrastAmount = savedSettings.localContrastAmount
+                localContrastAmount = savedSettings.localContrastAmount,
+                denoiseAlgorithm = enumNameOrDefault(savedSettings.denoiseAlgorithmName, DenoiseAlgorithm.entries, DenoiseAlgorithm.GUIDED),
+                fusionAlgorithm = enumNameOrDefault(savedSettings.fusionAlgorithmName, NativeFusionAlgorithm.entries, NativeFusionAlgorithm.ROBUST_REFERENCE),
+                toneAlgorithm = enumNameOrDefault(savedSettings.toneAlgorithmName, NativeToneAlgorithm.entries, NativeToneAlgorithm.NATURAL)
             ).normalized()
         )
     }
@@ -536,11 +539,6 @@ LaunchedEffect(Unit) {
             processingPreviewBitmap = null
             return@LaunchedEffect
         }
-        if (captureMode == CaptureMode.SINGLE_FRAME) {
-            processingPreviewBitmap = null
-            processingPreviewStatus = "Single-frame preview uses the ISP path; fusion algorithm controls are inactive."
-            return@LaunchedEffect
-        }
         delay(120L)
         var previewSource: Bitmap? = null
         var renderedPreview: Bitmap? = null
@@ -570,7 +568,7 @@ LaunchedEffect(Unit) {
             renderedPreview = null
             val preset = ClassicYuvFusionPreset.fromName(processingSettings.presetName)
             processingPreviewStatus =
-                "Approximate double-processed preview · ${preset.displayName} · " +
+                "Processing preview · ${preset.displayName} · " +
                     "NR ${"%.2f".format(processingSettings.denoiseStrength)} · " +
                     "Sharp ${"%.2f".format(processingSettings.sharpenAmount)}"
         } catch (ce: CancellationException) {
@@ -652,7 +650,10 @@ LaunchedEffect(Unit) {
                 processingPresetName = processingSettings.presetName,
                 denoiseStrength = processingSettings.denoiseStrength,
                 sharpenAmount = processingSettings.sharpenAmount,
-                localContrastAmount = processingSettings.localContrastAmount
+                localContrastAmount = processingSettings.localContrastAmount,
+                denoiseAlgorithmName = processingSettings.denoiseAlgorithm.name,
+                fusionAlgorithmName = processingSettings.fusionAlgorithm.name,
+                toneAlgorithmName = processingSettings.toneAlgorithm.name
             )
         )
     }
@@ -676,7 +677,8 @@ LaunchedEffect(Unit) {
     }
 
     fun applyZoomRatio(newZoom: Float, explicitLensSlot: LensSlot? = null) {
-        val clamped = newZoom.coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
+        val finiteZoom = if (newZoom.isFinite()) newZoom else zoomUiState.zoomRatio
+        val clamped = finiteZoom.coerceIn(zoomUiState.minZoom, zoomUiState.maxZoom)
         val nextSlot = explicitLensSlot ?: lensSlotForZoomRatioHysteresis(
             zoomRatio = clamped,
             current = selectedLensSlot,
@@ -2323,6 +2325,44 @@ fun ProcessingSettingsSection(
             onValueChange = { onSettingsChange(settings.copy(localContrastAmount = it)) }
         )
 
+        Text("Denoise algorithm", color = Color.White, style = MaterialTheme.typography.labelLarge)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            DenoiseAlgorithm.entries.forEach { algorithm ->
+                FrameModeChip(
+                    text = algorithm.name,
+                    selected = settings.denoiseAlgorithm == algorithm,
+                    onClick = { onSettingsChange(settings.copy(denoiseAlgorithm = algorithm)) }
+                )
+            }
+        }
+        Text("Fusion algorithm", color = Color.White, style = MaterialTheme.typography.labelLarge)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            NativeFusionAlgorithm.entries.forEach { algorithm ->
+                FrameModeChip(
+                    text = algorithm.name,
+                    selected = settings.fusionAlgorithm == algorithm,
+                    onClick = {
+                        if (captureMode != CaptureMode.SINGLE_FRAME) {
+                            onSettingsChange(settings.copy(fusionAlgorithm = algorithm))
+                        }
+                    }
+                )
+            }
+        }
+        if (captureMode == CaptureMode.SINGLE_FRAME) {
+            Text("Fusion algorithm is inactive in single-frame mode.", color = Color.White.copy(alpha = 0.6f))
+        }
+        Text("Tone algorithm", color = Color.White, style = MaterialTheme.typography.labelLarge)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            NativeToneAlgorithm.entries.forEach { algorithm ->
+                FrameModeChip(
+                    text = algorithm.name,
+                    selected = settings.toneAlgorithm == algorithm,
+                    onClick = { onSettingsChange(settings.copy(toneAlgorithm = algorithm)) }
+                )
+            }
+        }
+
         Surface(
             modifier = Modifier.fillMaxWidth(),
             color = Color(0xFF0A0B10),
@@ -2833,9 +2873,12 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
             File(picturesDir, "KeplerRawFusion") to "KPL_RAW_FUSION_",
             File(picturesDir, "KeplerSuperRes") to "KPL_SUPER_RES_"
         ).flatMap { (root, prefix) ->
-            root.listFiles()
-                ?.filter { it.isDirectory && it.name.startsWith(prefix) && File(it, "job.json").exists() }
-                .orEmpty()
+            NoFollowFileSystem.directChildren(root)
+                .filter {
+                    NoFollowFileSystem.isRealDirectory(it.toPath()) &&
+                        it.name.startsWith(prefix) &&
+                        NoFollowFileSystem.resolveDirectChild(it, "job.json", requireFile = true) != null
+                }
         }.sortedByDescending { it.lastModified() }
 
         val latest = latestJobs.firstNotNullOfOrNull { jobDir ->
@@ -2974,7 +3017,7 @@ private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
     )
     val current = currentNames.asSequence()
         .filter { it.isNotBlank() && it != "null" }
-        .map { File(jobDir, it) }
+            .mapNotNull { NoFollowFileSystem.resolveDirectChild(jobDir, it, requireFile = true) }
         .firstOrNull(::isCurrentPreviewFile)
     if (current != null) return current
 
@@ -2999,7 +3042,7 @@ private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
     return names
         .asSequence()
         .filter { it.isNotBlank() && it != "null" }
-        .map { File(jobDir, it) }
+        .mapNotNull { NoFollowFileSystem.resolveDirectChild(jobDir, it, requireFile = true) }
         .filter { it.extension.lowercase() in setOf("png", "jpg", "jpeg", "heic", "webp") }
         .firstOrNull {
             isCurrentPreviewFile(it) &&
@@ -3010,7 +3053,8 @@ private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
 }
 
 private fun isCurrentPreviewFile(file: File): Boolean =
-    file.isFile && file.length() > 0L &&
+    NoFollowFileSystem.isRealFile(file.toPath()) &&
+        (NoFollowFileSystem.attributes(file.toPath())?.size() ?: 0L) > 0L &&
         file.extension.lowercase() in setOf("jpg", "jpeg", "png", "heic", "webp") &&
         !file.name.contains("compare", ignoreCase = true) &&
         !file.name.contains("debug", ignoreCase = true)
@@ -3033,7 +3077,8 @@ private fun decodeNativeRgbaPreview(
 ): Bitmap? {
     if (width <= 0 || height <= 0) return null
     val expectedBytes = width.toLong() * height.toLong() * 4L
-    if (!file.exists() || file.length() != expectedBytes) return null
+    if (!NoFollowFileSystem.isRealFile(file.toPath()) ||
+        NoFollowFileSystem.attributes(file.toPath())?.size() != expectedBytes) return null
     val scale = max(1, max(width, height) / maxDimension)
     val outWidth = max(1, width / scale)
     val outHeight = max(1, height / scale)

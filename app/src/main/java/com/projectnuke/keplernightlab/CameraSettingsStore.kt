@@ -22,7 +22,10 @@ data class CameraUiSettings(
     val processingPresetName: String,
     val denoiseStrength: Float,
     val sharpenAmount: Float,
-    val localContrastAmount: Float
+    val localContrastAmount: Float,
+    val denoiseAlgorithmName: String = DenoiseAlgorithm.GUIDED.name,
+    val fusionAlgorithmName: String = NativeFusionAlgorithm.ROBUST_REFERENCE.name,
+    val toneAlgorithmName: String = NativeToneAlgorithm.NATURAL.name
 )
 
 object CameraSettingsStore {
@@ -48,7 +51,7 @@ object CameraSettingsStore {
             autoMinFrames = autoMin,
             autoMaxFrames = autoMax,
             manualFrames = prefs.getInt("manualFrames", 4).coerceIn(MIN_CAPTURE_FRAMES, MAX_CAPTURE_FRAMES),
-            zoomRatio = prefs.getFloat("zoomRatio", 1.0f).coerceIn(0.6f, 3.0f),
+            zoomRatio = prefs.getFloat("zoomRatio", 1.0f).safeFinite(1.0f).coerceIn(0.6f, 3.0f),
             rawSpeedModeName = prefs.getString("rawSpeedMode", RawSpeedMode.BALANCED.name)
                 ?: RawSpeedMode.BALANCED.name,
             captureModeName = prefs.getString("captureMode", CaptureMode.MULTI_FRAME.name)
@@ -60,15 +63,24 @@ object CameraSettingsStore {
             denoiseStrength = prefs.getFloat(
                 "denoiseStrength",
                 ClassicYuvFusionPreset.NATURAL.params.denoiseStrength
-            ).coerceIn(0f, 0.55f),
+            ).safeFinite(ClassicYuvFusionPreset.NATURAL.params.denoiseStrength).coerceIn(0f, 0.55f),
             sharpenAmount = prefs.getFloat(
                 "sharpenAmount",
                 ClassicYuvFusionPreset.NATURAL.params.sharpenAmount
-            ).coerceIn(0f, 0.55f),
+            ).safeFinite(ClassicYuvFusionPreset.NATURAL.params.sharpenAmount).coerceIn(0f, 0.55f),
             localContrastAmount = prefs.getFloat(
                 "localContrastAmount",
                 ClassicYuvFusionPreset.NATURAL.params.localContrastAmount
-            ).coerceIn(0f, 0.18f)
+            ).safeFinite(CameraSettingsDefaults.localContrast).coerceIn(0f, 0.18f),
+            denoiseAlgorithmName = enumNameOrDefault(
+                prefs.getString("denoiseAlgorithm", null), DenoiseAlgorithm.entries, DenoiseAlgorithm.GUIDED
+            ).name,
+            fusionAlgorithmName = enumNameOrDefault(
+                prefs.getString("fusionAlgorithm", null), NativeFusionAlgorithm.entries, NativeFusionAlgorithm.ROBUST_REFERENCE
+            ).name,
+            toneAlgorithmName = enumNameOrDefault(
+                prefs.getString("toneAlgorithm", null), NativeToneAlgorithm.entries, NativeToneAlgorithm.NATURAL
+            ).name
         )
     }
 
@@ -85,13 +97,24 @@ object CameraSettingsStore {
             .putInt("autoMinFrames", autoMin)
             .putInt("autoMaxFrames", autoMax)
             .putInt("manualFrames", settings.manualFrames.coerceIn(MIN_CAPTURE_FRAMES, MAX_CAPTURE_FRAMES))
-            .putFloat("zoomRatio", settings.zoomRatio.coerceIn(0.6f, 3.0f))
+            .putFloat("zoomRatio", settings.zoomRatio.safeFinite(1.0f).coerceIn(0.6f, 3.0f))
             .putString("rawSpeedMode", settings.rawSpeedModeName)
             .putString("captureMode", settings.captureModeName)
             .putString("processingPreset", settings.processingPresetName)
-            .putFloat("denoiseStrength", settings.denoiseStrength.coerceIn(0f, 0.55f))
-            .putFloat("sharpenAmount", settings.sharpenAmount.coerceIn(0f, 0.55f))
-            .putFloat("localContrastAmount", settings.localContrastAmount.coerceIn(0f, 0.18f))
+            .putFloat("denoiseStrength", settings.denoiseStrength.safeFinite(0.14f).coerceIn(0f, 0.55f))
+            .putFloat("sharpenAmount", settings.sharpenAmount.safeFinite(0.10f).coerceIn(0f, 0.55f))
+            .putFloat("localContrastAmount", settings.localContrastAmount.safeFinite(0.02f).coerceIn(0f, 0.18f))
+            .putString("denoiseAlgorithm", settings.denoiseAlgorithmName)
+            .putString("fusionAlgorithm", settings.fusionAlgorithmName)
+            .putString("toneAlgorithm", settings.toneAlgorithmName)
             .apply()
     }
 }
+
+private object CameraSettingsDefaults { const val localContrast = 0.02f }
+
+internal fun <T : Enum<T>> enumNameOrDefault(
+    raw: String?, values: List<T>, fallback: T
+): T = values.firstOrNull { it.name == raw } ?: fallback
+
+private fun Float.safeFinite(fallback: Float): Float = if (isFinite()) this else fallback
