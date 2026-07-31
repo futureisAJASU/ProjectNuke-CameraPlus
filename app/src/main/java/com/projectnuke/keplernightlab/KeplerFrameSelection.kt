@@ -293,7 +293,7 @@ private fun reviewItemsFromMetadata(
         val index = frame.optInt("index", position)
         val fileName = sourceFrameName(frame, kind)
         if (fileName.isBlank()) return@repeat
-        val file = File(jobDir, fileName)
+        val file = NoFollowFileSystem.optionalDirectChildFile(jobDir, fileName) ?: return@repeat
         if (!isReprocessSourceFrame(file, kind)) return@repeat
         if (isSelectableFrameBlocked(file.name)) return@repeat
         val selectionJson = savedSelectionFrames[index]
@@ -329,8 +329,8 @@ private fun reviewItemsFromFiles(
     savedSelectionFrames: Map<Int, JSONObject>,
     persistedMode: FrameSelectionMode?
 ): List<KeplerFrameReviewItem> {
-    return jobDir.listFiles()
-        ?.filter { it.isFile && isReprocessSourceFrame(it, kind) && !isSelectableFrameBlocked(it.name) }
+    return NoFollowFileSystem.requireDirectChildren(jobDir)
+        .filter { NoFollowFileSystem.isRealFile(it.toPath()) && isReprocessSourceFrame(it, kind) && !isSelectableFrameBlocked(it.name) }
         ?.sortedBy { sourceFrameSortKey(it.name) }
         ?.mapIndexed { position, file ->
             val index = parseFrameIndex(file.name) ?: position
@@ -388,7 +388,9 @@ private fun sourceFrameName(frame: JSONObject, kind: ReprocessJobKind): String =
 
 private fun thumbnailCandidate(jobDir: File, frame: JSONObject?, file: File): File? {
     val explicit = frame?.optString("thumbnailFile").orEmpty()
-    File(jobDir, explicit).takeIf { explicit.isNotBlank() && it.isFile }?.let { return it }
+    if (explicit.isNotBlank()) {
+        NoFollowFileSystem.optionalDirectChildFile(jobDir, explicit)?.let { return it }
+    }
     return file.takeIf { it.extension.lowercase(Locale.US) in setOf("png", "jpg", "jpeg", "webp") }
 }
 

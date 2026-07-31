@@ -1460,15 +1460,14 @@ fun averageLatestYuvBurstGray(
 
             val yuvRoot = File(picturesDir, "KeplerYuvBurst")
 
-            if (!yuvRoot.exists()) {
+            if (NoFollowFileSystem.inspect(yuvRoot.toPath()) is NoFollowInspection.Absent) {
                 postStatus("KeplerYuvBurst 폴더가 없음. 먼저 YUV 4장을 찍어야 함.")
                 workerThread.quitSafely()
                 return@post
             }
 
-            val latestJobDir = yuvRoot
-                .listFiles()
-                ?.filter { it.isDirectory && File(it, "job.json").exists() }
+            val latestJobDir = NoFollowFileSystem.requireDirectChildren(yuvRoot)
+                .filter { it.isDirectory && NoFollowFileSystem.optionalDirectChildFile(it, JOB_JSON_FILE_NAME) != null }
                 ?.maxByOrNull { it.lastModified() }
 
             if (latestJobDir == null) {
@@ -1477,7 +1476,7 @@ fun averageLatestYuvBurstGray(
                 return@post
             }
 
-            val jobFile = File(latestJobDir, "job.json")
+            val jobFile = NoFollowFileSystem.requireDirectChildFile(latestJobDir, JOB_JSON_FILE_NAME)
             val job = JSONObject(jobFile.readText())
 
             val width = job.getInt("width")
@@ -1504,11 +1503,8 @@ fun averageLatestYuvBurstGray(
             for (i in 0 until framesArray.length()) {
                 val frameObj = framesArray.getJSONObject(i)
                 val fileName = frameObj.getString("file")
-                val frameFile = File(latestJobDir, fileName)
-
-                if (!frameFile.exists()) {
-                    continue
-                }
+                val frameFile = NoFollowFileSystem.optionalDirectChildFile(latestJobDir, fileName)
+                    ?: continue
 
                 val bytes = frameFile.readBytes()
 
@@ -1600,15 +1596,14 @@ fun summarizeLatestYuvMotionJob(
 
             val yuvRoot = File(picturesDir, "KeplerYuvBurst")
 
-            if (!yuvRoot.exists()) {
+            if (NoFollowFileSystem.inspect(yuvRoot.toPath()) is NoFollowInspection.Absent) {
                 postStatus("KeplerYuvBurst 폴더가 없음. 먼저 YUV 4장 + 센서를 찍어야 함.")
                 workerThread.quitSafely()
                 return@post
             }
 
-            val latestJobDir = yuvRoot
-                .listFiles()
-                ?.filter { it.isDirectory && File(it, "job.json").exists() }
+            val latestJobDir = NoFollowFileSystem.requireDirectChildren(yuvRoot)
+                .filter { it.isDirectory && NoFollowFileSystem.optionalDirectChildFile(it, JOB_JSON_FILE_NAME) != null }
                 ?.maxByOrNull { it.lastModified() }
 
             if (latestJobDir == null) {
@@ -1617,7 +1612,7 @@ fun summarizeLatestYuvMotionJob(
                 return@post
             }
 
-            val jobFile = File(latestJobDir, "job.json")
+            val jobFile = NoFollowFileSystem.requireDirectChildFile(latestJobDir, JOB_JSON_FILE_NAME)
             val job = JSONObject(jobFile.readText())
 
             val status = job.optString("status", "unknown")
@@ -1863,11 +1858,14 @@ fun writeBurstJobJson(
         .put("frames", framesArray)
         .put("updatedAt", now)
 
-    if (!jobFile.exists()) {
+    val existingJobFile = NoFollowFileSystem.optionalDirectChildFile(
+        jobFile.parentFile ?: error("Job directory missing"), jobFile.name
+    )
+    if (existingJobFile == null) {
         json.put("createdAt", now)
     } else {
         val oldCreatedAt = runCatching {
-            JSONObject(jobFile.readText()).optLong("createdAt", now)
+            JSONObject(existingJobFile.readText()).optLong("createdAt", now)
         }.getOrDefault(now)
 
         json.put("createdAt", oldCreatedAt)
@@ -1928,11 +1926,14 @@ fun writeYuvJobJson(
         .put("motion", motionObject)
         .put("updatedAt", now)
 
-    if (!jobFile.exists()) {
+    val existingJobFile = NoFollowFileSystem.optionalDirectChildFile(
+        jobFile.parentFile ?: error("Job directory missing"), jobFile.name
+    )
+    if (existingJobFile == null) {
         json.put("createdAt", now)
     } else {
         val oldCreatedAt = runCatching {
-            JSONObject(jobFile.readText()).optLong("createdAt", now)
+            JSONObject(existingJobFile.readText()).optLong("createdAt", now)
         }.getOrDefault(now)
 
         json.put("createdAt", oldCreatedAt)

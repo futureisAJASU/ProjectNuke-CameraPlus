@@ -92,6 +92,7 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -431,6 +432,7 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var latestResult by remember { mutableStateOf<LatestKeplerResult?>(null) }
     var showResultPreview by remember { mutableStateOf(false) }
     val latestBitmapRef = remember { AtomicReference<Bitmap?>(null) }
+    val previewUiGeneration = remember { AtomicLong(0L) }
 
     var processingPreviewBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var processingPreviewStatus by remember { mutableStateOf("최근 결과를 촬영하면 설정 미리보기가 표시됩니다.") }
@@ -446,9 +448,12 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
             },
             recycleResult = { bitmap -> if (!bitmap.isRecycled) bitmap.recycle() },
             adopt = { bitmap -> if (!bitmap.isRecycled) bitmap.recycle() },
-            adoptWithGeneration = { _, bitmap ->
+            adoptWithGeneration = { generation, bitmap ->
                 previewMainHandler.post {
-                    if (currentScreen == MainScreen.SETTINGS && !bitmap.isRecycled) {
+                    if (previewUiGeneration.get() == generation &&
+                        currentScreen == MainScreen.SETTINGS &&
+                        !bitmap.isRecycled
+                    ) {
                         processingPreviewBitmap = bitmap
                         processingPreviewStatus = "Processing preview ready"
                     } else if (!bitmap.isRecycled) {
@@ -457,6 +462,11 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
                 }
             }
         )
+    }
+    val settingsPersistence = remember {
+        CameraSettingsPersistenceDebouncer<CameraUiSettings> { settings ->
+            CameraSettingsStore.save(context, settings)
+        }
     }
     val cameraScope = rememberCoroutineScope()
     var refreshGeneration by remember { mutableIntStateOf(0) }
@@ -543,6 +553,8 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
     DisposableEffect(Unit) {
         onDispose {
+            settingsPersistence.flush()
+            previewUiGeneration.incrementAndGet()
             previewWorker.close()
             clearLatestResultState()
         }
@@ -555,6 +567,7 @@ LaunchedEffect(Unit) {
 
     LaunchedEffect(currentScreen, latestBitmap, processingSettings, captureMode) {
         if (currentScreen != MainScreen.SETTINGS) {
+            previewUiGeneration.incrementAndGet()
             previewWorker.invalidate()
             processingPreviewBitmap = null
             return@LaunchedEffect
@@ -566,6 +579,7 @@ LaunchedEffect(Unit) {
                 ?.let(::createProcessingPreviewSource)
         }
         if (previewSource == null) {
+            previewUiGeneration.incrementAndGet()
             previewWorker.invalidate()
             processingPreviewBitmap = null
             processingPreviewStatus = "No processed result available for preview"
@@ -573,6 +587,7 @@ LaunchedEffect(Unit) {
         }
         processingPreviewStatus = "Rendering processing preview"
         try {
+            val uiGeneration = previewUiGeneration.incrementAndGet()
             if (previewSource.isRecycled) {
                 processingPreviewStatus = "최근 결과를 촬영하면 설정 미리보기가 표시됩니다."
                 return@LaunchedEffect
@@ -583,7 +598,8 @@ LaunchedEffect(Unit) {
                     source = previewSource,
                     settings = processingSettings,
                     cancellation = NoOpKeplerPipelineCancellation
-                )
+                ),
+                adoptionGeneration = uiGeneration
             )
             val preset = ClassicYuvFusionPreset.fromName(processingSettings.presetName)
             processingPreviewStatus =
@@ -649,8 +665,7 @@ LaunchedEffect(Unit) {
         processingSettings
     ) {
         delay(250L)
-        CameraSettingsStore.save(
-            context,
+        settingsPersistence.update(
             CameraUiSettings(
                 selectedResolutionName = selectedResolution.name,
                 selectedLensSlotName = selectedLensSlot.name,
@@ -2889,7 +2904,7 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
             File(picturesDir, "KeplerRawFusion") to "KPL_RAW_FUSION_",
             File(picturesDir, "KeplerSuperRes") to "KPL_SUPER_RES_"
         ).flatMap { (root, prefix) ->
-            NoFollowFileSystem.directChildren(root)
+            NoFollowFileSystem.requireDirectChildren(root)
                 .filter {
                     NoFollowFileSystem.isRealDirectory(it.toPath()) &&
                         it.name.startsWith(prefix) &&
@@ -3069,9 +3084,11 @@ private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
 }
 
 private fun isCurrentPreviewFile(file: File): Boolean =
-    NoFollowFileSystem.isRealFile(file.toPath()) &&
-        (NoFollowFileSystem.attributes(file.toPath())?.size() ?: 0L) > 0L &&
-        file.extension.lowercase() in setOf("jpg", "jpeg", "png", "heic", "webp") &&
+    when (val inspection = NoFollowFileSystem.inspect(file.toPath())) {
+        is NoFollowInspection.Present -> inspection.value.isRegularFile &&
+            !inspection.value.isSymbolicLink() && inspection.value.size() > 0L
+        else -> false
+    } && file.extension.lowercase() in setOf("jpg", "jpeg", "png", "heic", "webp") &&
         !file.name.contains("compare", ignoreCase = true) &&
         !file.name.contains("debug", ignoreCase = true)
 
@@ -3093,8 +3110,13 @@ private fun decodeNativeRgbaPreview(
 ): Bitmap? {
     if (width <= 0 || height <= 0) return null
     val expectedBytes = width.toLong() * height.toLong() * 4L
-    if (!NoFollowFileSystem.isRealFile(file.toPath()) ||
-        NoFollowFileSystem.attributes(file.toPath())?.size() != expectedBytes) return null
+    val fileAttributes = when (val inspection = NoFollowFileSystem.inspect(file.toPath())) {
+        is NoFollowInspection.Present -> inspection.value
+        else -> return null
+    }
+    if (!fileAttributes.isRegularFile || fileAttributes.isSymbolicLink() ||
+        fileAttributes.size() != expectedBytes ||
+        !NoFollowFileSystem.revalidate(file.toPath(), fileAttributes)) return null
     val scale = max(1, max(width, height) / maxDimension)
     val outWidth = max(1, width / scale)
     val outHeight = max(1, height / scale)
@@ -3121,12 +3143,23 @@ private fun decodeNativeRgbaPreview(
         bitmap.recycle()
         throw t
     }
+    if (!NoFollowFileSystem.revalidate(file.toPath(), fileAttributes)) {
+        bitmap.recycle()
+        return null
+    }
     return bitmap
 }
 
 private fun decodeLatestResultPreview(file: File, maxDimension: Int = 1280): Bitmap? {
+    val fileAttributes = when (val inspection = NoFollowFileSystem.inspect(file.toPath())) {
+        is NoFollowInspection.Present -> inspection.value
+        else -> return null
+    }
+    if (!fileAttributes.isRegularFile || fileAttributes.isSymbolicLink() ||
+        !NoFollowFileSystem.revalidate(file.toPath(), fileAttributes)) return null
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     BitmapFactory.decodeFile(file.absolutePath, bounds)
+    if (!NoFollowFileSystem.revalidate(file.toPath(), fileAttributes)) return null
     if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
 
     var sampleSize = 1
@@ -3136,8 +3169,13 @@ private fun decodeLatestResultPreview(file: File, maxDimension: Int = 1280): Bit
     ) {
         sampleSize *= 2
     }
-    return BitmapFactory.decodeFile(
+    val bitmap = BitmapFactory.decodeFile(
         file.absolutePath,
         BitmapFactory.Options().apply { inSampleSize = sampleSize }
     )
+    if (bitmap != null && !NoFollowFileSystem.revalidate(file.toPath(), fileAttributes)) {
+        bitmap.recycle()
+        return null
+    }
+    return bitmap
 }

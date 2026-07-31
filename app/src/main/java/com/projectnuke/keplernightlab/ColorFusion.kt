@@ -1175,15 +1175,14 @@ fun averageLatestYuvBurstColor(
 
             val colorRoot = File(picturesDir, "KeplerYuvFusion")
 
-            if (!colorRoot.exists()) {
+            if (NoFollowFileSystem.inspect(colorRoot.toPath()) is NoFollowInspection.Absent) {
                 postStatus("KeplerColorBurst 폴더가 없음. 먼저 Color Fusion 캡처를 해야 함.")
                 workerThread.quitSafely()
                 return@post
             }
 
-            val latestJobDir = colorRoot
-                .listFiles()
-                ?.filter { it.isDirectory && File(it, "job.json").exists() }
+            val latestJobDir = NoFollowFileSystem.requireDirectChildren(colorRoot)
+                .filter { it.isDirectory && NoFollowFileSystem.optionalDirectChildFile(it, JOB_JSON_FILE_NAME) != null }
                 ?.maxByOrNull { it.lastModified() }
 
             if (latestJobDir == null) {
@@ -1192,7 +1191,7 @@ fun averageLatestYuvBurstColor(
                 return@post
             }
 
-            val jobFile = File(latestJobDir, "job.json")
+            val jobFile = NoFollowFileSystem.requireDirectChildFile(latestJobDir, JOB_JSON_FILE_NAME)
             val job = JSONObject(jobFile.readText())
             val framesArray = job.getJSONArray("frames")
 
@@ -1203,7 +1202,8 @@ fun averageLatestYuvBurstColor(
             }
 
             val firstFileName = framesArray.getJSONObject(0).getString("file")
-            val firstBitmap = BitmapFactory.decodeFile(File(latestJobDir, firstFileName).absolutePath)
+            val firstFile = NoFollowFileSystem.requireDirectChildFile(latestJobDir, firstFileName)
+            val firstBitmap = BitmapFactory.decodeFile(firstFile.absolutePath)
 
             if (firstBitmap == null) {
                 postStatus("첫 컬러 프레임을 읽지 못함")
@@ -1232,7 +1232,7 @@ fun averageLatestYuvBurstColor(
             for (i in 0 until framesArray.length()) {
                 val frameObj = framesArray.getJSONObject(i)
                 val fileName = frameObj.getString("file")
-                val frameFile = File(latestJobDir, fileName)
+                val frameFile = NoFollowFileSystem.requireDirectChildFile(latestJobDir, fileName)
 
                 if (!frameFile.exists()) continue
 

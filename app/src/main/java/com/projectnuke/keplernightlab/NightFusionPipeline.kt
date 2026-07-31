@@ -233,7 +233,7 @@ internal fun reprocessYuvJob(
     val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
     val workerThread = HandlerThread("KeplerYuvReprocessThread").apply { start() }
     Handler(workerThread.looper).post {
-        val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
+        val jobFile = NoFollowFileSystem.requireDirectChildFile(jobDir, JOB_JSON_FILE_NAME)
         var totalFrames = 0
         var enabledFrames = 0
         var terminalResult: Result<Unit> = Result.failure(IllegalStateException("YUV reprocess did not reach a terminal state."))
@@ -258,7 +258,7 @@ internal fun reprocessYuvJob(
                     frame.optBoolean("enabled", true) &&
                     !frame.optBoolean("excludedByUser", false) &&
                     fileName.isNotBlank() &&
-                    File(jobDir, fileName).isFile
+                    NoFollowFileSystem.optionalDirectChildFile(jobDir, fileName) != null
                 ) {
                     enabledFrames++
                 }
@@ -383,17 +383,17 @@ fun cleanupNightFusionJobAfterVerifiedExport(
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ): CleanupResult {
-    val jobFile = File(jobDir, "job.json")
-    if (!jobFile.exists()) return CleanupResult(0, 0L, emptyList())
+    val jobFile = NoFollowFileSystem.optionalDirectChildFile(jobDir, JOB_JSON_FILE_NAME)
+        ?: return CleanupResult(0, 0L, emptyList())
 
     val job = JSONObject(jobFile.readText())
     if (!job.optBoolean("exportVerified", false)) {
         onStatus("Cleanup skipped: export not verified.")
-        return CleanupResult(0, 0L, jobDir.listFiles()?.map { it.name }.orEmpty())
+        return CleanupResult(0, 0L, NoFollowFileSystem.requireDirectChildren(jobDir).map { it.name })
     }
     if (policy == CacheCleanupPolicy.KEEP_ALL) {
         updateCleanupMetadata(jobFile, policy, "KEPT_ALL", 0, 0L, false)
-        return CleanupResult(0, 0L, jobDir.listFiles()?.map { it.name }.orEmpty())
+        return CleanupResult(0, 0L, NoFollowFileSystem.requireDirectChildren(jobDir).map { it.name })
     }
 
     val deleteNames = mutableSetOf<String>()
@@ -402,8 +402,8 @@ fun cleanupNightFusionJobAfterVerifiedExport(
         policy == CacheCleanupPolicy.DELETE_INTERMEDIATES_AFTER_VERIFIED_EXPORT ||
         policy == CacheCleanupPolicy.DELETE_ALL_CACHE_AFTER_VERIFIED_EXPORT_KEEP_JOB
     ) {
-        jobDir.listFiles()
-            ?.filter { it.isFile && it.name.matches(Regex("frame_\\d+_color\\.png")) }
+        NoFollowFileSystem.requireDirectChildren(jobDir)
+            .filter { NoFollowFileSystem.isRealFile(it.toPath()) && it.name.matches(Regex("frame_\\d+_color\\.png")) }
             ?.forEach { deleteNames.add(it.name) }
     }
     if (
@@ -425,10 +425,10 @@ fun cleanupNightFusionJobAfterVerifiedExport(
             cancelledDuringCleanup = true
             return@forEach
         }
-        val file = File(jobDir, name)
-        if (file.exists() && file.canonicalPath.startsWith(jobDir.canonicalPath) && file.name != "job.json") {
-            val size = file.length()
-            if (file.delete()) {
+        val file = NoFollowFileSystem.optionalDirectChildFile(jobDir, name)
+        if (file != null && file.name != JOB_JSON_FILE_NAME) {
+            val size = java.nio.file.Files.size(file.toPath())
+            if (java.nio.file.Files.deleteIfExists(file.toPath())) {
                 deleted++
                 freed += size
             }
@@ -438,7 +438,8 @@ fun cleanupNightFusionJobAfterVerifiedExport(
         }
     }
 
-    val sourceDeleted = jobDir.listFiles()?.none { it.name.matches(Regex("frame_\\d+_color\\.png")) } ?: true
+    val sourceDeleted = NoFollowFileSystem.requireDirectChildren(jobDir)
+        .none { it.name.matches(Regex("frame_\\d+_color\\.png")) }
     val status = when {
         cancelledDuringCleanup -> "PARTIAL_CLEANUP"
         sourceDeleted -> "SOURCE_FRAMES_DELETED"
@@ -449,7 +450,7 @@ fun cleanupNightFusionJobAfterVerifiedExport(
     return CleanupResult(
         deletedFiles = deleted,
         freedBytes = freed,
-        keptFiles = jobDir.listFiles()?.map { it.name }.orEmpty()
+        keptFiles = NoFollowFileSystem.requireDirectChildren(jobDir).map { it.name }
     )
 }
 

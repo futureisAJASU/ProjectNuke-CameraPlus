@@ -139,16 +139,75 @@ internal object NoFollowFileSystem {
     }
 
     fun directChildren(root: File): List<File> {
-        if (!isRealDirectory(root.toPath())) return emptyList()
-        val result = ArrayList<File>()
-        val stream = runCatching { Files.newDirectoryStream(root.toPath()) }.getOrNull() ?: return emptyList()
-        stream.use { entries ->
-            for (entry in entries) {
-                val attrs = attributes(entry) ?: continue
-                if (!attrs.isSymbolicLink()) result += entry.toFile()
-            }
+        return when (val result = directChildrenResult(root)) {
+            is NoFollowInspection.Present -> result.value
+            else -> emptyList()
         }
-        return result
+    }
+
+    fun directChildrenResult(root: File): NoFollowInspection<List<File>> {
+        val rootAttrs = when (val inspection = inspect(root.toPath())) {
+            NoFollowInspection.Absent -> return NoFollowInspection.Absent
+            is NoFollowInspection.InspectionFailed -> return inspection
+            is NoFollowInspection.Present -> inspection.value
+        }
+        if (!rootAttrs.isDirectory || rootAttrs.isSymbolicLink()) {
+            return NoFollowInspection.InspectionFailed(
+                IllegalStateException("Expected a real directory: ${root.absolutePath}")
+            )
+        }
+        val result = ArrayList<File>()
+        return try {
+            val stream = Files.newDirectoryStream(root.toPath())
+            if (!revalidate(root.toPath(), rootAttrs)) {
+                stream.close()
+                return NoFollowInspection.InspectionFailed(
+                    java.io.IOException("Directory changed after open: ${root.absolutePath}")
+                )
+            }
+            stream.use { entries ->
+                for (entry in entries) {
+                    when (val inspection = inspect(entry)) {
+                        NoFollowInspection.Absent -> continue
+                        is NoFollowInspection.InspectionFailed -> throw inspection.exception
+                        is NoFollowInspection.Present -> if (!inspection.value.isSymbolicLink()) {
+                            result += entry.toFile()
+                        }
+                    }
+                }
+            }
+            NoFollowInspection.Present(result)
+        } catch (error: Exception) {
+            NoFollowInspection.InspectionFailed(error)
+        }
+    }
+
+    fun requireDirectChildren(root: File): List<File> = when (val result = directChildrenResult(root)) {
+        NoFollowInspection.Absent -> emptyList()
+        is NoFollowInspection.Present -> result.value
+        is NoFollowInspection.InspectionFailed -> throw result.exception
+    }
+
+    fun requireSize(root: File): Long = when (val result = sizeResult(root)) {
+        NoFollowInspection.Absent -> 0L
+        is NoFollowInspection.Present -> result.value
+        is NoFollowInspection.InspectionFailed -> throw result.exception
+    }
+
+    fun requireDirectChildFile(root: File, name: String): File = when (
+        val result = resolveDirectChildResult(root, name, requireFile = true)
+    ) {
+        NoFollowInspection.Absent -> error("Required file is absent: $name")
+        is NoFollowInspection.Present -> result.value
+        is NoFollowInspection.InspectionFailed -> throw result.exception
+    }
+
+    fun optionalDirectChildFile(root: File, name: String): File? = when (
+        val result = resolveDirectChildResult(root, name, requireFile = true)
+    ) {
+        NoFollowInspection.Absent -> null
+        is NoFollowInspection.Present -> result.value
+        is NoFollowInspection.InspectionFailed -> throw result.exception
     }
 
     fun size(root: File): Long {

@@ -231,7 +231,7 @@ fun findLatestColorBurstJobDir(context: Context): File? {
     val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return null
     return listOf(File(picturesDir, "KeplerYuvFusion"), File(picturesDir, "KeplerColorBurst"))
         .flatMap { root ->
-            NoFollowFileSystem.directChildren(root).filter { child ->
+            NoFollowFileSystem.requireDirectChildren(root).filter { child ->
                 NoFollowFileSystem.isRealDirectory(child.toPath()) &&
                     NoFollowFileSystem.resolveDirectChildResult(
                         child, JOB_JSON_FILE_NAME, requireFile = true

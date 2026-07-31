@@ -133,7 +133,7 @@ fun getEnabledRawFrames(jobDir: File): List<JSONObject> {
 
 fun loadKeplerGalleryJobs(context: Context): List<KeplerGalleryJobSummary> {
     return keplerGalleryRoots(context).flatMap { root ->
-        NoFollowFileSystem.directChildren(root)
+        NoFollowFileSystem.requireDirectChildren(root)
             .filter { NoFollowFileSystem.isRealDirectory(it.toPath()) && matchesJobPrefix(root, it.name) }
     }.onEach {
         recoverValidatedQuarantine(it)
@@ -690,7 +690,7 @@ private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
         }
             ?.let { return it }
     }
-return NoFollowFileSystem.directChildren(directory)
+return NoFollowFileSystem.requireDirectChildren(directory)
         .filter {
                 NoFollowFileSystem.isRealFile(it.toPath()) &&
                 isDisplayImageFile(it) &&
@@ -746,9 +746,15 @@ internal fun deleteRecursivelySafe(root: File): Pair<CleanupStatus, List<String>
 }
 
 internal fun listFilesNoFollow(root: File): List<File> {
-    return NoFollowFileSystem.list(root)
+    return NoFollowFileSystem.listResult(root).let { result ->
+        when (result) {
+            NoFollowInspection.Absent -> emptyList()
+            is NoFollowInspection.Present -> result.value
+            is NoFollowInspection.InspectionFailed -> throw result.exception
+        }
+    }
 }
 
 internal fun folderSizeBytesNoFollow(file: File): Long {
-    return NoFollowFileSystem.size(file)
+    return NoFollowFileSystem.requireSize(file)
 }

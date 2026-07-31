@@ -13,6 +13,14 @@ import java.util.concurrent.CancellationException
 internal const val SINGLE_FRAME_OUTPUT_FILE_NAME = "single_frame_processed.png"
 private const val SINGLE_FRAME_PIPELINE_VERSION = "single_yuv_isp_v1"
 
+internal enum class SingleFrameCleanupResult {
+    PREVIOUS_OUTPUT_RESTORED,
+    NEW_OUTPUT_REMOVED,
+    NO_PREVIOUS_OUTPUT,
+    UNCOMMITTED_OUTPUT_REMAINS,
+    CLEANUP_FAILED
+}
+
 internal fun processSingleFrameJobSync(
     jobDir: File,
     requestedParams: ClassicYuvFusionParams,
@@ -124,7 +132,7 @@ internal fun processSingleFrameJobSync(
         return completedOutput
     } catch (ce: CancellationException) {
         if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            val retainedOutput = cleanupCancelledSingleFrameOutput(
+            val settlement = cleanupCancelledSingleFrameOutput(
                 outputFile = outputFile,
                 outputWritten = outputWritten,
                 outputExistedBefore = outputExistedBefore,
@@ -135,16 +143,16 @@ internal fun processSingleFrameJobSync(
                 jobDir = jobDir,
                 params = params,
                 processingStartedAt = processingStartedAt,
-                outputRetained = retainedOutput,
+                settlement = settlement,
                 cancellation = ce
             )
         }
         throw ce
     } catch (oom: OutOfMemoryError) {
-        val retainedOutput = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+        val settlement = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
             cleanupCancelledSingleFrameOutput(outputFile, outputWritten, outputExistedBefore, candidateFile, backupFile)
         } else {
-            false
+            SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
         }
         persistSingleFrameFailure(
             jobDir,
@@ -152,14 +160,14 @@ internal fun processSingleFrameJobSync(
             processingStartedAt,
             metadataPolicy,
             oom,
-            retainedOutput
+            settlement
         )
         throw oom
     } catch (e: Exception) {
-        val retainedOutput = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+        val settlement = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
             cleanupCancelledSingleFrameOutput(outputFile, outputWritten, outputExistedBefore, candidateFile, backupFile)
         } else {
-            false
+            SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
         }
         persistSingleFrameFailure(
             jobDir,
@@ -167,7 +175,7 @@ internal fun processSingleFrameJobSync(
             processingStartedAt,
             metadataPolicy,
             e,
-            retainedOutput
+            settlement
         )
         throw e
     } finally {
@@ -216,29 +224,53 @@ private fun cleanupCancelledSingleFrameOutput(
     outputExistedBefore: Boolean,
     candidateFile: File?,
     backupFile: File?
-): Boolean {
-    candidateFile?.takeIf { it.exists() }?.delete()
-    val output = outputFile ?: return false
+): SingleFrameCleanupResult {
     return try {
-        if (backupFile?.exists() == true) {
-            Files.deleteIfExists(output.toPath())
+        if (candidateFile != null && Files.exists(candidateFile.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+            require(!Files.isSymbolicLink(candidateFile.toPath()))
+            require(Files.deleteIfExists(candidateFile.toPath()))
+        }
+        val output = outputFile ?: return SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
+        if (backupFile != null && Files.exists(backupFile.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+            require(!Files.isSymbolicLink(backupFile.toPath()))
+            if (Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                require(!Files.isSymbolicLink(output.toPath()))
+                Files.deleteIfExists(output.toPath())
+            }
             KeplerJobMetadata.atomicReplace(backupFile, output)
-            false
+            require(isValidSingleFrameOutput(output))
+            SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED
+        } else if (outputExistedBefore && isValidSingleFrameOutput(output)) {
+            SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED
         } else if (outputWritten && !outputExistedBefore) {
-            !Files.deleteIfExists(output.toPath())
+            if (Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                require(!Files.isSymbolicLink(output.toPath()))
+                Files.deleteIfExists(output.toPath())
+            }
+            if (Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                SingleFrameCleanupResult.UNCOMMITTED_OUTPUT_REMAINS
+            } else {
+                SingleFrameCleanupResult.NEW_OUTPUT_REMOVED
+            }
         } else {
-            false
+            SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
         }
     } catch (_: Exception) {
-        true
+        SingleFrameCleanupResult.CLEANUP_FAILED
     }
 }
+
+private fun isValidSingleFrameOutput(file: File): Boolean =
+    Files.exists(file.toPath(), LinkOption.NOFOLLOW_LINKS) &&
+        !Files.isSymbolicLink(file.toPath()) &&
+        Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS) &&
+        Files.size(file.toPath()) > 0L
 
 private fun persistSingleFrameCancellation(
     jobDir: File,
     params: ClassicYuvFusionParams,
     processingStartedAt: Long,
-    outputRetained: Boolean,
+    settlement: SingleFrameCleanupResult,
     cancellation: CancellationException
 ) {
     runCatching {
@@ -252,15 +284,22 @@ private fun persistSingleFrameCancellation(
                 .put("processStatus", "PIPELINE_CANCELLED")
                 .put("processingFailureType", cancellation.javaClass.simpleName)
                 .put("processingFailureMessage", cancellation.message ?: "Single-frame processing cancelled")
-                .put("singleFrameCancelledOutputRetained", outputRetained)
-                .put("galleryDisplayUnavailable", true)
-                .put("finalOutputAvailable", false)
+                .put("singleFrameCleanupResult", settlement.name)
+                .put("singleFrameCancelledOutputRetained", settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED)
                 .put("userCanMoveDevice", true)
-            current.remove("finalNightFusionFile")
-            current.remove("finalFile")
-            current.remove("galleryDisplayFile")
-            current.remove("galleryThumbnailFile")
-            current.remove("galleryDisplaySource")
+            if (settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED) {
+                current.put("galleryDisplayUnavailable", false)
+                    .put("finalOutputAvailable", true)
+                    .put("singleFrameCancelledPriorOutputValid", true)
+            } else {
+                current.put("galleryDisplayUnavailable", true)
+                    .put("finalOutputAvailable", false)
+                current.remove("finalNightFusionFile")
+                current.remove("finalFile")
+                current.remove("galleryDisplayFile")
+                current.remove("galleryThumbnailFile")
+                current.remove("galleryDisplaySource")
+            }
         }
     }
 }
@@ -353,7 +392,7 @@ private fun persistSingleFrameFailure(
     processingStartedAt: Long,
     metadataPolicy: ReprocessMetadataPolicy,
     failure: Throwable,
-    outputRetained: Boolean = false
+    settlement: SingleFrameCleanupResult = SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
 ) {
     runCatching {
         KeplerJobMetadata.update(jobDir) { current ->
@@ -370,15 +409,21 @@ private fun persistSingleFrameFailure(
                         "processingFailureMessage",
                         failure.message ?: "Single-frame processing failed"
                     )
-                    .put("singleFrameFailedOutputRetained", outputRetained)
-                    .put("galleryDisplayUnavailable", true)
-                    .put("finalOutputAvailable", false)
+                    .put("singleFrameCleanupResult", settlement.name)
+                    .put("singleFrameFailedOutputRetained", settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED)
                     .put("userCanMoveDevice", true)
-                current.remove("finalNightFusionFile")
-                current.remove("finalFile")
-                current.remove("galleryDisplayFile")
-                current.remove("galleryThumbnailFile")
-                current.remove("galleryDisplaySource")
+                if (settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED) {
+                    current.put("galleryDisplayUnavailable", false)
+                        .put("finalOutputAvailable", true)
+                } else {
+                    current.put("galleryDisplayUnavailable", true)
+                        .put("finalOutputAvailable", false)
+                    current.remove("finalNightFusionFile")
+                    current.remove("finalFile")
+                    current.remove("galleryDisplayFile")
+                    current.remove("galleryThumbnailFile")
+                    current.remove("galleryDisplaySource")
+                }
             }
         }
     }

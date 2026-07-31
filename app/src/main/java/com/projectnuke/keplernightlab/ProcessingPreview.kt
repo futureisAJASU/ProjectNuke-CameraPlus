@@ -44,16 +44,20 @@ internal class SerializedPreviewWorker<S, R>(
     private val adopt: (R) -> Unit,
     private val adoptWithGeneration: ((Long, R) -> Unit)? = null
 ) {
-    private data class Pending<S>(val generation: Long, val source: S)
+    private data class Pending<S>(
+        val generation: Long,
+        val adoptionGeneration: Long?,
+        val source: S
+    )
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val generation = AtomicLong(0L)
     private var pending: Pending<S>? = null
 
     @Synchronized
-    fun submit(source: S): Long {
+    fun submit(source: S, adoptionGeneration: Long? = null): Long {
         val current = generation.incrementAndGet()
         pending?.let { recycleSource(it.source) }
-        pending = Pending(current, source)
+        pending = Pending(current, adoptionGeneration, source)
         executor.execute {
             val request = synchronized(this) {
                 pending.also { pending = null }
@@ -63,7 +67,10 @@ internal class SerializedPreviewWorker<S, R>(
                 result = render(request.source)
                 if (generation.get() == request.generation) {
                     val adopted = result!!
-                    adoptWithGeneration?.invoke(request.generation, adopted) ?: adopt(adopted)
+                    adoptWithGeneration?.invoke(
+                        request.adoptionGeneration ?: request.generation,
+                        adopted
+                    ) ?: adopt(adopted)
                     result = null
                 }
             } finally {

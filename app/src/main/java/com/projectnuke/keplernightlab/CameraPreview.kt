@@ -220,17 +220,34 @@ private class CameraPreviewController(
             runCatching { refs.session?.close() }
             runCatching { refs.device?.close() }
             runCatching { refs.surface?.release() }
-            synchronized(lock) {
-                if (previewState == PreviewState.STOPPING) previewState = PreviewState.STOPPED
+        }
+        fun markStoppedWhenTerminated() {
+            val thread = refs.thread
+            if (thread == null) {
+                synchronized(lock) {
+                    if (previewState == PreviewState.STOPPING) previewState = PreviewState.STOPPED
+                }
+                return
+            }
+            thread.quitSafely()
+            Thread {
+                runCatching { thread.join() }
+                synchronized(lock) {
+                    if (previewState == PreviewState.STOPPING) previewState = PreviewState.STOPPED
+                }
+            }.apply {
+                name = "KeplerPreviewStopWatcher"
+                isDaemon = true
+                start()
             }
         }
         if (refs.handler != null) {
             val posted = refs.handler.post(closeResources)
             if (!posted) closeResources.run()
-            refs.thread?.quitSafely()
+            markStoppedWhenTerminated()
         } else {
             closeResources.run()
-            refs.thread?.quitSafely()
+            markStoppedWhenTerminated()
         }
     }
 

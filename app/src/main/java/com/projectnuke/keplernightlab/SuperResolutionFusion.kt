@@ -1335,14 +1335,26 @@ private fun applySuperResolutionTone(
     params: ClassicYuvFusionParams
 ): Int {
     val luma = rgbLuma(red, green, blue)
-    val shadowLift = params.shadowLift * (1f - luma / 255f) * 255f
+    val normalized = (luma / 255f).coerceIn(0f, 1f)
+    val toned = when (params.toneAlgorithm) {
+        NativeToneAlgorithm.NATURAL ->
+            normalized * (0.92f + 0.08f * normalized) + 0.015f * (1f - normalized)
+        NativeToneAlgorithm.LOCAL_COMPRESSION ->
+            (normalized * (1f + 0.35f * (1f - normalized))) /
+                (1f + 0.35f * normalized)
+        NativeToneAlgorithm.NIGHT -> {
+            val retained = (normalized - 0.012f).coerceAtLeast(0f) / 0.988f
+            (retained / (retained + 0.22f * (1f - retained))).coerceAtMost(0.985f)
+        }
+    }.coerceIn(0f, 1f)
+    val shadowLift = params.shadowLift * (1f - toned) * 255f
     val highlightStart = 190f
     val highlightCompression = if (luma > highlightStart) {
         (luma - highlightStart) * params.highlightRollOff
     } else {
         0f
     }
-    val adjustedLuma = (luma + shadowLift - highlightCompression).coerceIn(0f, 255f)
+    val adjustedLuma = (toned * 255f + shadowLift - highlightCompression).coerceIn(0f, 255f)
     val saturation = params.saturationBoost
 
     fun channel(value: Int): Int {
@@ -1634,13 +1646,13 @@ private fun writeSuperResolutionJob(
 }
 
 private fun readColorBurstFrameFiles(jobDir: File): List<File> {
-    val jobFile = File(jobDir, SUPER_RES_JOB_FILE)
+    val jobFile = NoFollowFileSystem.requireDirectChildFile(jobDir, SUPER_RES_JOB_FILE)
     val frames = JSONObject(jobFile.readText()).optJSONArray("frames") ?: JSONArray()
     return buildList {
         for (index in 0 until frames.length()) {
             val name = frames.optJSONObject(index)?.optString("file").orEmpty()
             if (name.isNotBlank()) {
-                File(jobDir, name).takeIf { it.isFile }?.let(::add)
+                NoFollowFileSystem.optionalDirectChildFile(jobDir, name)?.let(::add)
             }
         }
     }

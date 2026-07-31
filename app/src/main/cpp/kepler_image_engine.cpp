@@ -103,11 +103,21 @@ float tone_map(float value, int tone, float shadow_lift, float highlight_rolloff
 }
 
 namespace kepler_image {
-void process_argb(const jint* source, jint* output, int width, int height,
-                  int denoise, int tone, float denoise_strength,
-                  float sharpen, float local_contrast, float shadow_lift,
-                  float highlight_rolloff, float saturation, int tile_rows) {
-    if (!source || !output || width <= 0 || height <= 0) return;
+ProcessStatus process_argb(const jint* source, jint* output, int width, int height,
+                           int denoise, int tone, float denoise_strength,
+                           float sharpen, float local_contrast, float shadow_lift,
+                           float highlight_rolloff, float saturation, int tile_rows) {
+    if (!source || !output || width <= 0 || height <= 0 ||
+        denoise < 0 || denoise > 2 || (tone < -1 || tone > 2) ||
+        !std::isfinite(denoise_strength) || !std::isfinite(sharpen) ||
+        !std::isfinite(local_contrast) || !std::isfinite(shadow_lift) ||
+        !std::isfinite(highlight_rolloff) || !std::isfinite(saturation) ||
+        tile_rows <= 0) {
+        return ProcessStatus::INVALID_ARGUMENT;
+    }
+    if (!source || !output || width <= 0 || height <= 0) {
+        return ProcessStatus::INVALID_ARGUMENT;
+    }
     denoise = std::clamp(denoise, 0, 2);
     tone = std::clamp(tone, -1, 2);
     denoise_strength = clamp01(denoise_strength);
@@ -120,7 +130,7 @@ void process_argb(const jint* source, jint* output, int width, int height,
         local_contrast == 0.0f && shadow_lift == 0.0f &&
         highlight_rolloff == 0.0f && saturation == 1.0f && tone == 0) {
         std::copy(source, source + static_cast<size_t>(width) * height, output);
-        return;
+        return ProcessStatus::SUCCESS;
     }
     const int rows = std::max(1, tile_rows);
     for (int top = 0; top < height; top += rows) {
@@ -156,29 +166,46 @@ void process_argb(const jint* source, jint* output, int width, int height,
                 channel(mapped + blueChroma * saturation);
         }
     }
+    return ProcessStatus::SUCCESS;
 }
 }
 
-extern "C" JNIEXPORT void JNICALL
+extern "C" JNIEXPORT jint JNICALL
 Java_com_projectnuke_keplernightlab_NativeImageEngine_nativeProcessArgb(
     JNIEnv* env, jclass, jintArray source, jintArray output, jint width, jint height,
     jint denoise, jint tone, jfloat denoise_strength, jfloat sharpen,
     jfloat local_contrast, jfloat shadow_lift, jfloat highlight_rolloff,
     jfloat saturation, jint tile_rows) {
     if (!source || !output || width <= 0 || height <= 0 ||
-        width > 100000 || height > 100000) return;
+        width > 100000 || height > 100000) {
+        return static_cast<jint>(kepler_image::ProcessStatus::INVALID_ARGUMENT);
+    }
     const int64_t pixel_count = static_cast<int64_t>(width) *
         static_cast<int64_t>(height);
     if (pixel_count <= 0 || pixel_count > static_cast<int64_t>(std::numeric_limits<jsize>::max()) ||
-        pixel_count > static_cast<int64_t>(std::numeric_limits<int>::max())) return;
+        pixel_count > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+        return static_cast<jint>(kepler_image::ProcessStatus::INVALID_ARGUMENT);
+    }
     const jsize expected = static_cast<jsize>(pixel_count);
-    if (expected <= 0 || env->GetArrayLength(source) < expected || env->GetArrayLength(output) < expected) return;
+    if (expected <= 0) return static_cast<jint>(kepler_image::ProcessStatus::INVALID_ARGUMENT);
+    const jsize source_length = env->GetArrayLength(source);
+    const jsize output_length = env->GetArrayLength(output);
+    if (env->ExceptionCheck()) return static_cast<jint>(kepler_image::ProcessStatus::ARRAY_ACQUIRE_FAILED);
+    if (source_length != expected || output_length != expected) {
+        return static_cast<jint>(kepler_image::ProcessStatus::ARRAY_LENGTH_MISMATCH);
+    }
     jint* in = env->GetIntArrayElements(source, nullptr);
     jint* out = env->GetIntArrayElements(output, nullptr);
-    if (!in || !out) { if (in) env->ReleaseIntArrayElements(source, in, JNI_ABORT); if (out) env->ReleaseIntArrayElements(output, out, 0); return; }
-    kepler_image::process_argb(
+    if (!in || !out) {
+        if (in) env->ReleaseIntArrayElements(source, in, JNI_ABORT);
+        if (out) env->ReleaseIntArrayElements(output, out, JNI_ABORT);
+        return static_cast<jint>(kepler_image::ProcessStatus::ARRAY_ACQUIRE_FAILED);
+    }
+    const auto status = kepler_image::process_argb(
         in, out, width, height, denoise, tone, denoise_strength, sharpen,
         local_contrast, shadow_lift, highlight_rolloff, saturation, tile_rows);
     env->ReleaseIntArrayElements(source, in, JNI_ABORT);
-    env->ReleaseIntArrayElements(output, out, 0);
+    env->ReleaseIntArrayElements(output, out,
+        status == kepler_image::ProcessStatus::SUCCESS ? 0 : JNI_ABORT);
+    return static_cast<jint>(status);
 }

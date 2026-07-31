@@ -784,7 +784,7 @@ fun findKeplerJobDirectories(context: Context): List<File> {
     )
     return roots.flatMap { root ->
         val rootDir = File(picturesDir, root)
-        NoFollowFileSystem.directChildren(rootDir).filter { jobDir ->
+        NoFollowFileSystem.requireDirectChildren(rootDir).filter { jobDir ->
             NoFollowFileSystem.isRealDirectory(jobDir.toPath()) &&
                 NoFollowFileSystem.resolveDirectChildResult(
                     jobDir, JOB_JSON_FILE_NAME, requireFile = true
@@ -834,7 +834,7 @@ fun loadKeplerJobDetail(jobDir: File): KeplerJobDetail {
     val (job, jobError) = parseJsonFile(jobFile)
     val (alignment, alignmentError) = parseJsonFile(alignmentFile)
     val (nativePostprocess, nativeError) = parseJsonFile(nativeFile)
-    val files = NoFollowFileSystem.directChildren(jobDir)
+    val files = NoFollowFileSystem.requireDirectChildren(jobDir)
         .filter { NoFollowFileSystem.isRealFile(it.toPath()) }
         .map { file ->
             JobFileEntry(
@@ -911,7 +911,7 @@ fun readJsonFilePretty(file: File): String {
 }
 
 fun folderSizeBytes(file: File): Long {
-    return NoFollowFileSystem.size(file)
+    return NoFollowFileSystem.requireSize(file)
 }
 
 fun formatBytes(bytes: Long): String {

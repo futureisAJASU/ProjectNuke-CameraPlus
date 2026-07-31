@@ -69,9 +69,12 @@ data class ProcessingSettings(
     companion object {
         fun fromPreset(preset: ClassicYuvFusionPreset): ProcessingSettings = ProcessingSettings(
             presetName = preset.name,
+            denoiseAlgorithm = preset.params.denoiseAlgorithm,
             denoiseStrength = preset.params.denoiseStrength,
             sharpenAmount = preset.params.sharpenAmount,
-            localContrastAmount = preset.params.localContrastAmount
+            localContrastAmount = preset.params.localContrastAmount,
+            fusionAlgorithm = preset.params.fusionAlgorithm,
+            toneAlgorithm = preset.params.toneAlgorithm
         )
 
         fun default(): ProcessingSettings = fromPreset(ClassicYuvFusionPreset.NATURAL)

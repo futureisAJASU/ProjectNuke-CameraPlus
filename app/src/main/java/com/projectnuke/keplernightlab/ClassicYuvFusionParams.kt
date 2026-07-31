@@ -84,19 +84,23 @@ enum class ClassicYuvFusionPreset(
 ) {
     NATURAL(
         "Natural",
-        ClassicYuvFusionParams("NATURAL", 1.5f, 34f, 0.04f, 0.20f, 0.14f, 0.10f, 0.020f, 1.01f, 0.014f, 0.08f)
+        ClassicYuvFusionParams("NATURAL", 1.5f, 34f, 0.04f, 0.20f, 0.14f, 0.10f, 0.020f, 1.01f, 0.014f, 0.08f,
+            DenoiseAlgorithm.GUIDED, FusionAlgorithm.ROBUST_REFERENCE, NativeToneAlgorithm.NATURAL)
     ),
     CLEAN(
         "Clean",
-        ClassicYuvFusionParams("CLEAN", 1.65f, 27f, 0.025f, 0.17f, 0.38f, 0.20f, 0.025f, 1.01f, 0.022f, 0.14f)
+        ClassicYuvFusionParams("CLEAN", 1.65f, 27f, 0.025f, 0.17f, 0.38f, 0.20f, 0.025f, 1.01f, 0.022f, 0.14f,
+            DenoiseAlgorithm.WAVELET, FusionAlgorithm.NOISE_AWARE, NativeToneAlgorithm.LOCAL_COMPRESSION)
     ),
     SHARP(
         "Sharp",
-        ClassicYuvFusionParams("SHARP", 1.4f, 36f, 0.06f, 0.22f, 0.14f, 0.42f, 0.10f, 1.06f, 0.012f, 0.08f)
+        ClassicYuvFusionParams("SHARP", 1.4f, 36f, 0.06f, 0.22f, 0.14f, 0.42f, 0.10f, 1.06f, 0.012f, 0.08f,
+            DenoiseAlgorithm.BILATERAL, FusionAlgorithm.ROBUST_REFERENCE, NativeToneAlgorithm.NATURAL)
     ),
     NIGHT_BRIGHT(
         "Night Bright",
-        ClassicYuvFusionParams("NIGHT_BRIGHT", 1.55f, 31f, 0.04f, 0.19f, 0.30f, 0.24f, 0.055f, 1.04f, 0.075f, 0.24f)
+        ClassicYuvFusionParams("NIGHT_BRIGHT", 1.55f, 31f, 0.04f, 0.19f, 0.30f, 0.24f, 0.055f, 1.04f, 0.075f, 0.24f,
+            DenoiseAlgorithm.WAVELET, FusionAlgorithm.MOTION_SAFE, NativeToneAlgorithm.NIGHT)
     );
 
     companion object {
