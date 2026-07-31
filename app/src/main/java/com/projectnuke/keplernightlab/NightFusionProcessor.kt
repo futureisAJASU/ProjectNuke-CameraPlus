@@ -117,19 +117,37 @@ fun processLatestNightFusionV02(
 
 fun estimateLatestColorBurstScene(context: Context): LatestSceneEstimate {
     val jobDir = findLatestColorBurstJobDir(context) ?: return LatestSceneEstimate(null, null)
-    val jobFile = File(jobDir, "job.json")
+    val jobFile = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
+        jobDir, JOB_JSON_FILE_NAME, requireFile = true
+    )) {
+        is NoFollowInspection.Present -> resolved.value
+        else -> return LatestSceneEstimate(null, null)
+    }
     val firstFrame = runCatching {
         val job = JSONObject(jobFile.readText())
         val frames = job.optJSONArray("frames")
         val fileName = frames?.optJSONObject(0)?.optString("file").orEmpty()
-        if (fileName.isBlank()) null else BitmapFactory.decodeFile(File(jobDir, fileName).absolutePath)
+        val frameFile = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
+            jobDir, fileName, requireFile = true
+        )) {
+            is NoFollowInspection.Present -> resolved.value
+            else -> null
+        }
+        frameFile?.let { BitmapFactory.decodeFile(it.absolutePath) }
     }.getOrNull()
     val luma = firstFrame?.let { bitmap ->
         val value = computeMeanLuma(bitmap)
         bitmap.recycle()
         value
     }
-    val gyro = readGyroSamples(File(jobDir, "gyro.csv")).map { it.magnitude }.average().takeIf { !it.isNaN() }
+    val gyroFile = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
+        jobDir, "gyro.csv", requireFile = true
+    )) {
+        is NoFollowInspection.Present -> resolved.value
+        else -> null
+    }
+    val gyro = gyroFile?.let { readGyroSamples(it) }?.map { it.magnitude }?.average()
+        ?.takeIf { !it.isNaN() }
     return LatestSceneEstimate(luma, gyro)
 }
 
@@ -213,9 +231,12 @@ fun findLatestColorBurstJobDir(context: Context): File? {
     val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return null
     return listOf(File(picturesDir, "KeplerYuvFusion"), File(picturesDir, "KeplerColorBurst"))
         .flatMap { root ->
-            root.listFiles()
-                ?.filter { it.isDirectory && File(it, "job.json").exists() }
-                .orEmpty()
+            NoFollowFileSystem.directChildren(root).filter { child ->
+                NoFollowFileSystem.isRealDirectory(child.toPath()) &&
+                    NoFollowFileSystem.resolveDirectChildResult(
+                        child, JOB_JSON_FILE_NAME, requireFile = true
+                    ) is NoFollowInspection.Present
+            }
         }
         .maxByOrNull { it.lastModified() }
 }
@@ -237,7 +258,13 @@ private fun loadColorFrames(jobDir: File, job: JSONObject): List<LoadedColorFram
         val fileName = frameObject.optString("file")
         if (fileName.isBlank()) continue
 
-        val bitmap = BitmapFactory.decodeFile(File(jobDir, fileName).absolutePath) ?: continue
+        val frameFile = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
+            jobDir, fileName, requireFile = true
+        )) {
+            is NoFollowInspection.Present -> resolved.value
+            else -> continue
+        }
+        val bitmap = BitmapFactory.decodeFile(frameFile.absolutePath) ?: continue
         if (width == null || height == null) {
             width = bitmap.width
             height = bitmap.height

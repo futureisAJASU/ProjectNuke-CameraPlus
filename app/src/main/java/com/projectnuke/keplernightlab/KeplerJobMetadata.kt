@@ -6,6 +6,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -42,20 +43,22 @@ object KeplerJobMetadata {
     internal fun setLeaseReleaseCountForTest(value: Int) { leaseReleaseCount = value }
 
     private fun lockFor(jobDir: File): Any = _locks[
-        (jobDir.canonicalPath.hashCode() and Int.MAX_VALUE) % _locks.size
+        (jobDir.toPath().toAbsolutePath().normalize().toString().hashCode() and Int.MAX_VALUE) % _locks.size
     ]
 
     fun acquireOperation(jobDir: File): JobOperationLease? {
-        val key = jobDir.canonicalPath
+        val key = jobDir.toPath().toAbsolutePath().normalize().toString()
         val lease = JobOperationLease(key)
         return if (operationLeases.putIfAbsent(key, lease) == null) lease else null
     }
 
-    fun isOperationActive(jobDir: File): Boolean = operationLeases.containsKey(jobDir.canonicalPath)
+    fun isOperationActive(jobDir: File): Boolean = operationLeases.containsKey(
+        jobDir.toPath().toAbsolutePath().normalize().toString()
+    )
 
     /** True if the given lease is the actual job operation owner. Public for production checks. */
     fun isOperationOwner(jobDir: File, lease: JobOperationLease): Boolean =
-        operationLeases[jobDir.canonicalPath] === lease
+        operationLeases[jobDir.toPath().toAbsolutePath().normalize().toString()] === lease
 
     internal fun releaseOperation(lease: JobOperationLease) {
         operationLeases.remove(lease.key, lease)
@@ -68,8 +71,14 @@ object KeplerJobMetadata {
 
     /** Reads job metadata. Throws [KeplerJobMetadataMissing] if the file does not exist, [KeplerJobMetadataCorrupt] if parse fails. */
     fun read(jobDir: File): JSONObject = synchronized(lockFor(jobDir)) {
-        val file = File(jobDir, JOB_JSON_FILE_NAME)
-        if (!file.isFile) throw KeplerJobMetadataMissing(jobDir)
+        requireRealJobDirectory(jobDir)
+        val file = when (val result = NoFollowFileSystem.resolveDirectChildResult(
+            jobDir, JOB_JSON_FILE_NAME, requireFile = true
+        )) {
+            NoFollowInspection.Absent -> throw KeplerJobMetadataMissing(jobDir)
+            is NoFollowInspection.InspectionFailed -> throw KeplerJobMetadataCorrupt(jobDir, result.exception)
+            is NoFollowInspection.Present -> result.value
+        }
         try {
             JSONObject(file.readText())
         } catch (parseFailure: JSONException) {
@@ -96,8 +105,14 @@ object KeplerJobMetadata {
      * preserved. Use [removeKey] inside the lambda to remove keys.
      */
     fun update(jobDir: File, mutate: (JSONObject) -> Unit): JSONObject = synchronized(lockFor(jobDir)) {
-        val file = File(jobDir, JOB_JSON_FILE_NAME)
-        if (!file.isFile) throw KeplerJobMetadataMissing(jobDir)
+        requireRealJobDirectory(jobDir)
+        val file = when (val result = NoFollowFileSystem.resolveDirectChildResult(
+            jobDir, JOB_JSON_FILE_NAME, requireFile = true
+        )) {
+            NoFollowInspection.Absent -> throw KeplerJobMetadataMissing(jobDir)
+            is NoFollowInspection.InspectionFailed -> throw KeplerJobMetadataCorrupt(jobDir, result.exception)
+            is NoFollowInspection.Present -> result.value
+        }
         val job = try {
             JSONObject(file.readText())
         } catch (parseFailure: JSONException) {
@@ -113,6 +128,8 @@ object KeplerJobMetadata {
 
     fun atomicWrite(file: File, text: String) {
         val parent = file.parentFile ?: error("job metadata parent missing")
+        requireRealJobDirectory(parent)
+        check(!Files.isSymbolicLink(file.toPath())) { "Metadata destination must not be a symbolic link" }
         check(parent.exists() || parent.mkdirs()) { "Could not create ${parent.absolutePath}" }
         val temp = File(parent, ".${file.name}.${System.nanoTime()}.tmp")
         try {
@@ -128,10 +145,19 @@ object KeplerJobMetadata {
     }
 
     fun atomicReplace(temp: File, destination: File) {
+        check(!Files.isSymbolicLink(destination.toPath())) {
+            "Atomic destination must not be a symbolic link"
+        }
         try {
             Files.move(temp.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
         } catch (_: AtomicMoveNotSupportedException) {
             Files.move(temp.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        }
+    }
+
+    private fun requireRealJobDirectory(jobDir: File) {
+        check(NoFollowFileSystem.isRealDirectory(jobDir.toPath())) {
+            "Job directory must be a real directory"
         }
     }
 }

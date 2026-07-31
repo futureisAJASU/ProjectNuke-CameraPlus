@@ -48,6 +48,7 @@ private const val RAW_PIPELINE_LOG_TAG = "KeplerRawPipeline"
 
 private data class RawUserProcessingParams(
     val presetName: String,
+    val fusionAlgorithm: FusionAlgorithm,
     val denoiseStrength: Float,
     val chromaDenoiseStrength: Float,
     val sharpenAmount: Float,
@@ -79,8 +80,15 @@ private fun resolveRawUserProcessingParams(job: JSONObject): RawUserProcessingPa
     val localContrast = value("localContrastAmount", preset.params.localContrastAmount, 0f, 0.18f)
     val shadowLift = value("shadowLift", preset.params.shadowLift, 0f, 0.06f)
     val highlightRolloff = value("highlightRollOff", preset.params.highlightRollOff, 0.02f, 0.35f)
+    val fusionAlgorithm = runCatching {
+        FusionAlgorithm.valueOf(
+            json?.optString("fusionAlgorithm", FusionAlgorithm.ROBUST_REFERENCE.name)
+                ?: FusionAlgorithm.ROBUST_REFERENCE.name
+        )
+    }.getOrDefault(FusionAlgorithm.ROBUST_REFERENCE)
     return RawUserProcessingParams(
         presetName = preset.name,
+        fusionAlgorithm = fusionAlgorithm,
         denoiseStrength = denoise,
         chromaDenoiseStrength = (denoise + 0.20f).coerceIn(denoise, 0.75f),
         sharpenAmount = sharpen,
@@ -1455,7 +1463,13 @@ fun processRawFusionJob(
     metadataPolicy: ReprocessMetadataPolicy = ReprocessMetadataPolicy.NORMAL,
     onStatus: (String) -> Unit
 ): RawFusionProcessResult {
-    val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
+    val jobFile = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
+        jobDir, JOB_JSON_FILE_NAME, requireFile = true
+    )) {
+        is NoFollowInspection.Present -> resolved.value
+        NoFollowInspection.Absent -> error("RAW job metadata is absent")
+        is NoFollowInspection.InspectionFailed -> throw resolved.exception
+    }
 
     /**
      * Keys owned by [processRawFusionJob]'s current run when in `NORMAL` mode: progress,
@@ -1603,6 +1617,7 @@ fun processRawFusionJob(
         val mergedRawFile = File(jobDir, "merged_raw_classic_v1.raw16")
         val alignmentFile = File(jobDir, "raw_fusion_debug.json")
         val files = RawFusionFiles(jobDir, jobFile, mergedRawFile, alignmentFile)
+        val rawProcessing = resolveRawUserProcessingParams(job)
         val classicMerge = runClassicRawFusionMerge(
             jobDir = jobDir,
             job = job,
@@ -1611,6 +1626,7 @@ fun processRawFusionJob(
             blackLevelEstimate = blackLevelEstimate,
             mergedRawFile = mergedRawFile,
             alignmentFile = alignmentFile,
+            fusionAlgorithm = rawProcessing.fusionAlgorithm,
             cancellation = cancellation,
             onStatus = onStatus
         )

@@ -5,6 +5,16 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ClassicRawFusionRejectionTest {
+    @Test
+    fun rawOutputRangeNeverWraps() {
+        assertEquals(0, clampRawOutputValue(-12f, 4095))
+        assertEquals(4095, clampRawOutputValue(5000f, 4095))
+        assertEquals(65535, clampRawOutputValue(70000f, 65535))
+        assertEquals(0, clampRawOutputValue(Float.NaN, 4095))
+        assertEquals(0, clampRawOutputValue(Float.POSITIVE_INFINITY, 4095))
+        assertEquals(0, clampRawOutputValue(0f, 4095))
+    }
+
 
     @Test
     fun `NaN alignment score rejects frame from merge`() {

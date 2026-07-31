@@ -68,8 +68,13 @@ internal fun prepareRawFusionFrames(
         val enabled = frame.optBoolean("enabled", true)
         val excludedByUser = frame.optBoolean("excludedByUser", false)
         if (!enabled || excludedByUser) continue
-        val rawFile = File(jobDir, frame.getString("raw16File"))
-        if (rawFile.exists() && rawFile.length() >= pixelCount * 2L) {
+        val rawFile = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
+            jobDir, frame.optString("raw16File"), requireFile = true
+        )) {
+            is NoFollowInspection.Present -> resolved.value
+            NoFollowInspection.Absent, is NoFollowInspection.InspectionFailed -> null
+        }
+        if (rawFile != null && rawFile.length() == pixelCount.toLong() * 2L) {
             inputs += RawFrameInput(rawFile, frame)
             metadata += frame
         }

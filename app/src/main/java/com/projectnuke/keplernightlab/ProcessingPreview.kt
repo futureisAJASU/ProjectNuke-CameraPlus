@@ -31,11 +31,18 @@ internal fun renderProcessingPreview(
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
 ): Bitmap = applyClassicYuvPostProcessing(source, settings.resolvedParams(), cancellation)
 
+internal data class ProcessingPreviewRequest(
+    val source: Bitmap,
+    val settings: ProcessingSettings,
+    val cancellation: KeplerPipelineCancellation
+)
+
 internal class SerializedPreviewWorker<S, R>(
     private val render: (S) -> R,
     private val recycleSource: (S) -> Unit,
     private val recycleResult: (R) -> Unit,
-    private val adopt: (R) -> Unit
+    private val adopt: (R) -> Unit,
+    private val adoptWithGeneration: ((Long, R) -> Unit)? = null
 ) {
     private data class Pending<S>(val generation: Long, val source: S)
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -55,7 +62,8 @@ internal class SerializedPreviewWorker<S, R>(
             try {
                 result = render(request.source)
                 if (generation.get() == request.generation) {
-                    adopt(result!!)
+                    val adopted = result!!
+                    adoptWithGeneration?.invoke(request.generation, adopted) ?: adopt(adopted)
                     result = null
                 }
             } finally {
@@ -64,6 +72,13 @@ internal class SerializedPreviewWorker<S, R>(
             }
         }
         return current
+    }
+
+    @Synchronized
+    fun invalidate() {
+        generation.incrementAndGet()
+        pending?.let { recycleSource(it.source) }
+        pending = null
     }
 
     @Synchronized

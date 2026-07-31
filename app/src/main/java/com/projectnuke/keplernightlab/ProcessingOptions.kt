@@ -22,7 +22,7 @@ data class ProcessingSettings(
     val denoiseStrength: Float,
     val sharpenAmount: Float,
     val localContrastAmount: Float,
-    val fusionAlgorithm: NativeFusionAlgorithm = NativeFusionAlgorithm.ROBUST_REFERENCE,
+    val fusionAlgorithm: FusionAlgorithm = FusionAlgorithm.ROBUST_REFERENCE,
     val toneAlgorithm: NativeToneAlgorithm = NativeToneAlgorithm.NATURAL
 ) {
     fun matchesPreset(preset: ClassicYuvFusionPreset): Boolean {

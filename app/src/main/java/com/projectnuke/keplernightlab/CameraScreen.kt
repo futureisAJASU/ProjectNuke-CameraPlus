@@ -385,7 +385,7 @@ fun MainCameraScreen(
                 sharpenAmount = savedSettings.sharpenAmount,
                 localContrastAmount = savedSettings.localContrastAmount,
                 denoiseAlgorithm = enumNameOrDefault(savedSettings.denoiseAlgorithmName, DenoiseAlgorithm.entries, DenoiseAlgorithm.GUIDED),
-                fusionAlgorithm = enumNameOrDefault(savedSettings.fusionAlgorithmName, NativeFusionAlgorithm.entries, NativeFusionAlgorithm.ROBUST_REFERENCE),
+                fusionAlgorithm = enumNameOrDefault(savedSettings.fusionAlgorithmName, FusionAlgorithm.entries, FusionAlgorithm.ROBUST_REFERENCE),
                 toneAlgorithm = enumNameOrDefault(savedSettings.toneAlgorithmName, NativeToneAlgorithm.entries, NativeToneAlgorithm.NATURAL)
             ).normalized()
         )
@@ -432,16 +432,32 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var showResultPreview by remember { mutableStateOf(false) }
     val latestBitmapRef = remember { AtomicReference<Bitmap?>(null) }
 
-    DisposableEffect(latestResult) {
-        latestBitmapRef.set(latestResult?.bitmap)
-        onDispose {
-            latestBitmapRef.getAndSet(null)?.let { if (!it.isRecycled) it.recycle() }
-        }
-    }
     var processingPreviewBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var processingPreviewStatus by remember { mutableStateOf("최근 결과를 촬영하면 설정 미리보기가 표시됩니다.") }
     val refreshMutex = remember { Mutex() }
-    val previewDispatcher = remember { Dispatchers.Default.limitedParallelism(1) }
+    val previewMainHandler = remember { Handler(Looper.getMainLooper()) }
+    val previewWorker = remember {
+        SerializedPreviewWorker<ProcessingPreviewRequest, Bitmap>(
+            render = { request ->
+                renderProcessingPreview(request.source, request.settings, request.cancellation)
+            },
+            recycleSource = { request ->
+                request.source.takeIf { !it.isRecycled }?.recycle()
+            },
+            recycleResult = { bitmap -> if (!bitmap.isRecycled) bitmap.recycle() },
+            adopt = { bitmap -> if (!bitmap.isRecycled) bitmap.recycle() },
+            adoptWithGeneration = { _, bitmap ->
+                previewMainHandler.post {
+                    if (currentScreen == MainScreen.SETTINGS && !bitmap.isRecycled) {
+                        processingPreviewBitmap = bitmap
+                        processingPreviewStatus = "Processing preview ready"
+                    } else if (!bitmap.isRecycled) {
+                        bitmap.recycle()
+                    }
+                }
+            }
+        )
+    }
     val cameraScope = rememberCoroutineScope()
     var refreshGeneration by remember { mutableIntStateOf(0) }
     var refreshJob by remember { mutableStateOf<Job?>(null) }
@@ -498,6 +514,7 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
                         }
                         latestBitmap = ownedBitmap
                         latestResult = result!!.copy(bitmap = ownedBitmap)
+                        latestBitmapRef.set(ownedBitmap)
                         ownedBitmap = null
                         adopted = true
                     } else {
@@ -507,6 +524,7 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
                         }
                         latestBitmap = null
                         latestResult = result!!.copy(bitmap = null)
+                        latestBitmapRef.set(null)
                     }
                     latestSummary = result!!.summary
                     latestSceneLuma = estimate!!.meanLuma
@@ -525,6 +543,7 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
     DisposableEffect(Unit) {
         onDispose {
+            previewWorker.close()
             clearLatestResultState()
         }
     }
@@ -536,36 +555,36 @@ LaunchedEffect(Unit) {
 
     LaunchedEffect(currentScreen, latestBitmap, processingSettings, captureMode) {
         if (currentScreen != MainScreen.SETTINGS) {
+            previewWorker.invalidate()
             processingPreviewBitmap = null
             return@LaunchedEffect
         }
         delay(120L)
-        var previewSource: Bitmap? = null
-        var renderedPreview: Bitmap? = null
-        val previewCancellation = KeplerPipelineCancellationToken()
-        val previewJob = currentCoroutineContext()[Job]
-        previewJob?.invokeOnCompletion { previewCancellation.cancel() }
+        val previewSource = refreshMutex.withLock {
+            latestBitmap
+                ?.takeIf { !it.isRecycled }
+                ?.let(::createProcessingPreviewSource)
+        }
+        if (previewSource == null) {
+            previewWorker.invalidate()
+            processingPreviewBitmap = null
+            processingPreviewStatus = "No processed result available for preview"
+            return@LaunchedEffect
+        }
+        processingPreviewStatus = "Rendering processing preview"
         try {
-            previewSource = refreshMutex.withLock {
-                latestBitmap
-                    ?.takeIf { !it.isRecycled }
-                    ?.let(::createProcessingPreviewSource)
-            }
-            if (previewSource == null) {
+            if (previewSource.isRecycled) {
                 processingPreviewStatus = "최근 결과를 촬영하면 설정 미리보기가 표시됩니다."
                 return@LaunchedEffect
             }
             processingPreviewStatus = "최근 결과로 선택한 프리셋을 미리보는 중..."
-            renderedPreview = withContext(previewDispatcher) {
-                renderProcessingPreview(
-                    previewSource!!,
-                    processingSettings,
-                    previewCancellation
+            previewWorker.submit(
+                ProcessingPreviewRequest(
+                    source = previewSource,
+                    settings = processingSettings,
+                    cancellation = NoOpKeplerPipelineCancellation
                 )
-            }
-            if (currentCoroutineContext()[Job]?.isActive != true) return@LaunchedEffect
-            processingPreviewBitmap = renderedPreview
-            renderedPreview = null
+            )
             val preset = ClassicYuvFusionPreset.fromName(processingSettings.presetName)
             processingPreviewStatus =
                 "Processing preview · ${preset.displayName} · " +
@@ -575,9 +594,6 @@ LaunchedEffect(Unit) {
             throw ce
         } catch (e: Exception) {
             processingPreviewStatus = "미리보기 실패: ${e.javaClass.simpleName}"
-        } finally {
-            renderedPreview?.takeIf { !it.isRecycled }?.recycle()
-            previewSource?.takeIf { !it.isRecycled }?.recycle()
         }
     }
 
@@ -2337,7 +2353,7 @@ fun ProcessingSettingsSection(
         }
         Text("Fusion algorithm", color = Color.White, style = MaterialTheme.typography.labelLarge)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            NativeFusionAlgorithm.entries.forEach { algorithm ->
+            FusionAlgorithm.entries.forEach { algorithm ->
                 FrameModeChip(
                     text = algorithm.name,
                     selected = settings.fusionAlgorithm == algorithm,

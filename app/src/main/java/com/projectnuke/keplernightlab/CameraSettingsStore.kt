@@ -24,7 +24,7 @@ data class CameraUiSettings(
     val sharpenAmount: Float,
     val localContrastAmount: Float,
     val denoiseAlgorithmName: String = DenoiseAlgorithm.GUIDED.name,
-    val fusionAlgorithmName: String = NativeFusionAlgorithm.ROBUST_REFERENCE.name,
+    val fusionAlgorithmName: String = FusionAlgorithm.ROBUST_REFERENCE.name,
     val toneAlgorithmName: String = NativeToneAlgorithm.NATURAL.name
 )
 
@@ -76,7 +76,7 @@ object CameraSettingsStore {
                 prefs.getString("denoiseAlgorithm", null), DenoiseAlgorithm.entries, DenoiseAlgorithm.GUIDED
             ).name,
             fusionAlgorithmName = enumNameOrDefault(
-                prefs.getString("fusionAlgorithm", null), NativeFusionAlgorithm.entries, NativeFusionAlgorithm.ROBUST_REFERENCE
+                prefs.getString("fusionAlgorithm", null), FusionAlgorithm.entries, FusionAlgorithm.ROBUST_REFERENCE
             ).name,
             toneAlgorithmName = enumNameOrDefault(
                 prefs.getString("toneAlgorithm", null), NativeToneAlgorithm.entries, NativeToneAlgorithm.NATURAL

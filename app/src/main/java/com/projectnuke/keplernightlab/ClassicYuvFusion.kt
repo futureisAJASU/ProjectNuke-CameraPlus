@@ -102,7 +102,13 @@ internal fun processClassicYuvFusionJob(
 ): File {
     cancellation.throwIfCancelled()
     val processingStartedAt = System.currentTimeMillis()
-    val jobFile = File(jobDir, "job.json")
+    val jobFile = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
+        jobDir, JOB_JSON_FILE_NAME, requireFile = true
+    )) {
+        is NoFollowInspection.Present -> resolved.value
+        NoFollowInspection.Absent -> error("YUV job metadata is absent")
+        is NoFollowInspection.InspectionFailed -> throw resolved.exception
+    }
     val job = JSONObject(jobFile.readText())
     val params = (requestedParams ?: loadClassicYuvFusionParams(job)).clamped()
     initializeClassicYuvRunMetadata(job, params, processingStartedAt, metadataPolicy)
@@ -231,7 +237,11 @@ internal fun processClassicYuvFusionJob(
                 if (alignment.fallbackUsed) fallbackAlignmentCount++
                 if (alignment.confidence < 0.35f) lowConfidenceAlignmentCount++
                 frame.alignmentUsed =
-                    alignment.score.isFinite() &&
+                    alignment.dx.isFinite() && alignment.dy.isFinite() &&
+                        alignment.integerDx.toFloat().isFinite() &&
+                        alignment.integerDy.toFloat().isFinite() &&
+                        alignment.subpixelDx.isFinite() && alignment.subpixelDy.isFinite() &&
+                        alignment.score.isFinite() && alignment.confidence.isFinite() &&
                         alignment.score <= params.alignmentRejectThreshold
             }
             updateAlignmentMetadata(job, frame, params)
@@ -587,8 +597,12 @@ private fun loadClassicFrames(jobDir: File, job: JSONObject): List<ClassicFrame>
                 return@repeat
             }
             val fileName = frame.optString("file")
-            val file = File(jobDir, fileName)
-            if (fileName.isBlank() || !file.isFile) return@repeat
+            val file = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
+                jobDir, fileName, requireFile = true
+            )) {
+                is NoFollowInspection.Present -> resolved.value
+                else -> return@repeat
+            }
             add(
                 ClassicFrame(
                     jsonIndex = index,
@@ -773,20 +787,22 @@ private fun mergeClassicFrames(
     var comparedPixels = 0L
     val reportedMergeFrames = mutableSetOf<Int>()
     try {
-frames.forEach { frame ->
-            cancellation.throwIfCancelled()
-            decoders[frame] = BitmapRegionDecoder.newInstance(frame.file.absolutePath, false)
-        }
-        output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val memoryPlan = planFusionMemory(
             FusionMemoryPlanRequest(
                 width = width,
                 tileRows = CLASSIC_FUSION_TILE_ROWS,
                 candidateFrames = frames.size,
-                availableBytes = currentAvailableJavaHeapBytes()
+                availableBytes = currentAvailableJavaHeapBytes(),
+                fullOutputBitmapBytes = checkedBitmapBytes(width, height),
+                postprocessOutputBitmapBytes = checkedBitmapBytes(width, height)
             )
-            )
+        )
         check(!memoryPlan.cannotFit) { memoryPlan.fallbackReason ?: "CannotFit" }
+        frames.forEach { frame ->
+            cancellation.throwIfCancelled()
+            decoders[frame] = BitmapRegionDecoder.newInstance(frame.file.absolutePath, false)
+        }
+        output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val mergeTileRows = memoryPlan.tileRows
         var tileTop = 0
         val decodeOpts = BitmapFactory.Options().apply {
@@ -797,7 +813,7 @@ frames.forEach { frame ->
             cancellation.throwIfCancelled()
             val tileBottom = min(height, tileTop + mergeTileRows)
             val tileHeight = tileBottom - tileTop
-            val pixelCount = width * tileHeight
+            val pixelCount = Math.multiplyExact(width, tileHeight)
             val referenceBitmap = decoders.getValue(reference).decodeRegion(
                 Rect(0, tileTop, width, tileBottom),
                 decodeOpts
@@ -816,7 +832,7 @@ frames.forEach { frame ->
             val sumW = FloatArray(pixelCount)
             for (pixel in 0 until pixelCount) {
                 val color = referencePixels[pixel]
-                val referenceWeight = if (params.fusionAlgorithm == NativeFusionAlgorithm.MOTION_SAFE) {
+                val referenceWeight = if (params.fusionAlgorithm == FusionAlgorithm.MOTION_SAFE) {
                     params.referenceWeight * 1.75f
                 } else params.referenceWeight
                 sumR[pixel] = Color.red(color) * referenceWeight
@@ -880,11 +896,24 @@ frames.forEach { frame ->
                         val difference = abs(adjustedLuma - luma(refColor))
                         val ghost = ghostWeight(difference, params)
                         val brightness = (luma(refColor) / 255f).coerceIn(0f, 1f)
-                        val noiseWeight = if (params.fusionAlgorithm == NativeFusionAlgorithm.NOISE_AWARE) {
-                            1f / (1f + 0.85f * (1f - brightness))
+                        val noiseWeight = if (params.fusionAlgorithm == FusionAlgorithm.NOISE_AWARE) {
+                            val signal = (brightness * 255f).coerceIn(0f, 255f)
+                            val shotNoise = 0.025f * signal
+                            val readNoise = 4f
+                            val noiseVariance = (readNoise + shotNoise).coerceAtLeast(1f)
+                            val normalizedDifference = difference * difference / noiseVariance
+                            (1f / (1f + normalizedDifference)).coerceIn(0f, 1f)
                         } else 1f
-                        val motionWeight = if (params.fusionAlgorithm == NativeFusionAlgorithm.MOTION_SAFE) {
-                            if (difference > params.ghostThreshold * 0.8f) 0.18f else 0.72f
+                        val motionWeight = if (params.fusionAlgorithm == FusionAlgorithm.MOTION_SAFE) {
+                            val referenceGradient = localGradient(
+                                referencePixels, width, tileHeight, x, tileY
+                            )
+                            val candidateGradient = localGradient(
+                                framePixels, frameWidth, frameHeight, sourceX, sourceY
+                            )
+                            val gradientDisagreement = abs(referenceGradient - candidateGradient)
+                            if (difference > params.ghostThreshold * 0.8f ||
+                                gradientDisagreement > 32f) 0.05f else 0.72f
                         } else 1f
                         val localWeight = ghost * alignmentWeight * externalWeight * noiseWeight * motionWeight
                         comparedPixels++
@@ -945,6 +974,19 @@ private fun ghostWeight(lumaDifference: Float, params: ClassicYuvFusionParams): 
     return (1f - normalized).pow(3).coerceAtLeast(params.ghostWeight)
 }
 
+private fun localGradient(pixels: IntArray, width: Int, height: Int, x: Int, y: Int): Float {
+    if (width <= 0 || height <= 0) return 0f
+    val safeX = x.coerceIn(0, width - 1)
+    val safeY = y.coerceIn(0, height - 1)
+    val center = luma(pixels[safeY * width + safeX]).toFloat()
+    val left = luma(pixels[safeY * width + (safeX - 1).coerceAtLeast(0)]).toFloat()
+    val right = luma(pixels[safeY * width + (safeX + 1).coerceAtMost(width - 1)]).toFloat()
+    val top = luma(pixels[(safeY - 1).coerceAtLeast(0) * width + safeX]).toFloat()
+    val bottom = luma(pixels[(safeY + 1).coerceAtMost(height - 1) * width + safeX]).toFloat()
+    return (abs(left - center) + abs(right - center) +
+        abs(top - center) + abs(bottom - center)).coerceAtMost(1020f)
+}
+
 internal fun applyClassicYuvPostProcessing(
     source: Bitmap,
     params: ClassicYuvFusionParams,
@@ -963,12 +1005,26 @@ internal fun applyClassicYuvPostProcessing(
         denoiseStrength = params.denoiseStrength,
         sharpen = params.sharpenAmount,
         localContrast = params.localContrastAmount,
+        shadowLift = params.shadowLift,
+        highlightRollOff = params.highlightRollOff,
+        saturation = params.saturationBoost,
         tileRows = CLASSIC_FUSION_TILE_ROWS,
         cancellation = cancellation
     )?.let { return it }
     val outputBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
     fun tone(value: Float): Int {
-        val normalized = (value / 255f).coerceIn(0f, 1f)
+        var normalized = (value / 255f).coerceIn(0f, 1f)
+        normalized = when (params.toneAlgorithm) {
+            NativeToneAlgorithm.NATURAL ->
+                normalized * (0.92f + 0.08f * normalized) + 0.015f * (1f - normalized)
+            NativeToneAlgorithm.LOCAL_COMPRESSION ->
+                (normalized * (1f + 0.35f * (1f - normalized))) /
+                    (1f + 0.35f * normalized)
+            NativeToneAlgorithm.NIGHT -> {
+                val retained = (normalized - 0.012f).coerceAtLeast(0f) / 0.988f
+                (retained / (retained + 0.22f * (1f - retained))).coerceAtMost(0.985f)
+            }
+        }
         val lifted = normalized + params.shadowLift * (1f - normalized).pow(2)
         val rolled = lifted -
             params.highlightRollOff * lifted.pow(2) * (1f - lifted)
@@ -1092,7 +1148,13 @@ private fun resetClassicFrameMetadataForCurrentRun(jobDir: File, job: JSONObject
         }
         resetClassicFrameAlignmentFields(frame)
         val fileName = frame.optString("file")
-        if (fileName.isBlank() || !File(jobDir, fileName).isFile) {
+        val sourceIsSafe = fileName.isNotBlank() && when (
+            NoFollowFileSystem.resolveDirectChildResult(jobDir, fileName, requireFile = true)
+        ) {
+            is NoFollowInspection.Present -> true
+            else -> false
+        }
+        if (!sourceIsSafe) {
             clearClassicFrameAlignmentOnDecodeFailure(jobDir, frame, fileName, "MISSING_FILE")
         }
     }
@@ -1111,9 +1173,14 @@ private fun clearClassicFrameAlignmentOnDecodeFailure(jobDir: File, frameJson: J
         frameJson.remove(field)
     }
     // Determine the appropriate failure reason based on the decode failure
-    val frameFile = File(jobDir, fileName)
-    val alignmentFailureReason = if (fileName.isBlank() || !frameFile.isFile) "MISSING_FILE" else reason
-    val fusionSkipReason = if (fileName.isBlank() || !frameFile.isFile) "MISSING_FILE" else "DECODE_FAILED"
+    val sourceIsSafe = fileName.isNotBlank() && when (
+        NoFollowFileSystem.resolveDirectChildResult(jobDir, fileName, requireFile = true)
+    ) {
+        is NoFollowInspection.Present -> true
+        else -> false
+    }
+    val alignmentFailureReason = if (!sourceIsSafe) "MISSING_FILE" else reason
+    val fusionSkipReason = if (!sourceIsSafe) "MISSING_FILE" else "DECODE_FAILED"
 
     frameJson.put("alignmentUsed", false)
         .put("fusionUsed", false)
@@ -1251,7 +1318,9 @@ private fun writeFusionDebugMetadata(
         val skipReason = when {
             frame != null -> null
             !enabled || excluded -> "USER_EXCLUDED"
-            fileName.isBlank() || !File(jobDir, fileName).isFile -> "MISSING_FILE"
+            fileName.isBlank() || NoFollowFileSystem.resolveDirectChildResult(
+                jobDir, fileName, requireFile = true
+            ) !is NoFollowInspection.Present -> "MISSING_FILE"
             source.optString("alignmentFailureReason").isNotBlank() ->
                 source.optString("alignmentFailureReason")
             else -> source.optString("fusionSkipReason").ifBlank { "SKIPPED" }
@@ -1492,8 +1561,13 @@ private fun buildClassicYuvProcessingPreflight(
             missingFrameFiles++
             return@repeat
         }
-        val file = File(jobDir, fileName)
-        if (!file.isFile) {
+        val file = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
+            jobDir, fileName, requireFile = true
+        )) {
+            is NoFollowInspection.Present -> resolved.value
+            else -> null
+        }
+        if (file == null) {
             missingFrameFiles++
             return@repeat
         }
@@ -1872,10 +1946,25 @@ private fun formatClassicFailureMessage(throwable: Throwable?, reason: String): 
 }
 
 private fun saveClassicBitmap(bitmap: Bitmap, file: File) {
-    FileOutputStream(file).use { output ->
-        check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
-            "Could not save ${file.name}"
+    require(file.parentFile?.let { NoFollowFileSystem.isRealDirectory(it.toPath()) } == true) {
+        "Bitmap output parent must be a real directory"
+    }
+    require(!java.nio.file.Files.isSymbolicLink(file.toPath())) {
+        "Bitmap output must not be a symbolic link: ${file.name}"
+    }
+    val candidate = File(file.parentFile, ".${file.name}.${System.nanoTime()}.tmp")
+    require(!java.nio.file.Files.exists(candidate.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+        "Bitmap output candidate already exists"
+    }
+    try {
+        FileOutputStream(candidate).use { output ->
+            check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
+                "Could not save ${file.name}"
+            }
         }
+        KeplerJobMetadata.atomicReplace(candidate, file)
+    } finally {
+        runCatching { if (candidate.exists()) candidate.delete() }
     }
 }
 

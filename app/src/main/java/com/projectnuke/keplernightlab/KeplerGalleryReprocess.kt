@@ -2721,7 +2721,6 @@ internal fun detectJobKind(jobDir: File, job: JSONObject): ReprocessJobKind {
 internal fun countActualSourceFrames(jobDir: File, job: JSONObject, kind: ReprocessJobKind): Int {
     val frames = job.optJSONArray("frames")
     if (frames != null) {
-        val canonicalJobDir = jobDir.canonicalFile
         var count = 0
         repeat(frames.length()) { index ->
             val value = frames.opt(index)
@@ -2742,8 +2741,13 @@ internal fun countActualSourceFrames(jobDir: File, job: JSONObject, kind: Reproc
             }
             for (name in candidates) {
                 if (name.isNotBlank() && name != "null" && isStrictRelativePath(name)) {
-                    val source = File(jobDir, name).canonicalFile
-                    if (isReprocessMetadataSourceFrame(name, kind) && isValidMetadataSourceFile(source, canonicalJobDir)) {
+                    val source = when (val result = NoFollowFileSystem.resolveDirectChildResult(
+                        jobDir, name, requireFile = true
+                    )) {
+                        is NoFollowInspection.Present -> result.value
+                        NoFollowInspection.Absent, is NoFollowInspection.InspectionFailed -> null
+                    }
+                    if (source != null && isReprocessMetadataSourceFrame(name, kind)) {
                         count++
                         return@repeat
                     }
@@ -2760,10 +2764,14 @@ internal fun countActualSourceFrames(jobDir: File, job: JSONObject, kind: Reproc
 /** Shared strict source-path validation used by counting and backup creation.
  * Requires canonical parent == canonical job dir, existing regular file, and no symlink escapes. */
 internal fun isValidMetadataSourceFile(source: File, canonicalJobDir: File): Boolean {
-    val canonicalSource = source.canonicalFile
-    if (canonicalSource.parentFile != canonicalJobDir) return false
-    if (!canonicalSource.isFile) return false
-    return true
+    val resolved = when (val result = NoFollowFileSystem.resolveDirectChildResult(
+        canonicalJobDir, source.name, requireFile = true
+    )) {
+        is NoFollowInspection.Present -> result.value
+        NoFollowInspection.Absent, is NoFollowInspection.InspectionFailed -> return false
+    }
+    return resolved.toPath().toAbsolutePath().normalize() ==
+        source.toPath().toAbsolutePath().normalize()
 }
 
 /** Result of validating the source frames metadata key for capability detection. */
@@ -2782,7 +2790,6 @@ internal fun validateMetadataSourceFrames(jobDir: File, job: JSONObject): Metada
     if (frames.length() == 0) return MetadataSourceValidation.Malformed(
         "No source frames declared in metadata."
     )
-    val canonicalJobDir = jobDir.canonicalFile
     repeat(frames.length()) { index ->
         val value = frames.opt(index)
         if (value !is JSONObject) {
@@ -2810,22 +2817,12 @@ internal fun validateMetadataSourceFrames(jobDir: File, job: JSONObject): Metada
                     "Unsafe source reference: $ref"
                 )
             }
-            val source = File(canonicalJobDir, ref)
-            if (source.parentFile?.canonicalFile != canonicalJobDir) {
-                return MetadataSourceValidation.Malformed(
-                    "Source reference escapes job directory: $ref"
+            when (val result = NoFollowFileSystem.resolveDirectChildResult(jobDir, ref, requireFile = true)) {
+                is NoFollowInspection.Present -> hasValidSource = true
+                NoFollowInspection.Absent -> Unit
+                is NoFollowInspection.InspectionFailed -> return MetadataSourceValidation.Malformed(
+                    "Unsafe or unreadable source reference: $ref"
                 )
-            }
-            if (source.isFile && source.canonicalPath != source.absolutePath) {
-                val canonicalTarget = source.canonicalFile
-                if (canonicalTarget.parentFile != canonicalJobDir) {
-                    return MetadataSourceValidation.Malformed(
-                        "Symlink source reference escapes job directory: $ref"
-                    )
-                }
-            }
-            if (source.isFile) {
-                hasValidSource = true
             }
         }
         if (!hasValidSource) {
@@ -3023,11 +3020,37 @@ internal data class ReprocessTransactionManifest(
  * failure so callers can fail closed. Never falls back to an in-memory snapshot.
  */
 internal fun loadStrictManifest(manifestFile: File): ReprocessTransactionManifest {
-    require(manifestFile.isFile) { "Manifest file missing: ${manifestFile.absolutePath}" }
-    val canonical = manifestFile.canonicalFile
-    require(!java.nio.file.Files.isSymbolicLink(canonical.toPath())) { "Manifest file is a symbolic link: ${canonical.absolutePath}" }
-    require(canonical.absolutePath == canonical.path) { "Manifest file has non-canonical path" }
-    val rawBytes = manifestFile.readBytes()
+    val path = manifestFile.toPath()
+    val attrs = when (val inspection = NoFollowFileSystem.inspect(path)) {
+        NoFollowInspection.Absent -> error("Manifest file missing: ${manifestFile.absolutePath}")
+        is NoFollowInspection.InspectionFailed -> throw inspection.exception
+        is NoFollowInspection.Present -> inspection.value
+    }
+    require(attrs.isRegularFile && !attrs.isSymbolicLink()) {
+        "Manifest file must be a regular non-symlink file: ${manifestFile.absolutePath}"
+    }
+    require(NoFollowFileSystem.revalidate(path, attrs)) {
+        "Manifest file changed before open: ${manifestFile.absolutePath}"
+    }
+    val rawBytes = java.nio.file.Files.newByteChannel(
+        path,
+        java.nio.file.StandardOpenOption.READ,
+        java.nio.file.LinkOption.NOFOLLOW_LINKS
+    ).use { channel ->
+        require(attrs.size() <= Int.MAX_VALUE) { "Manifest file is too large" }
+        val bytes = ByteArray(attrs.size().toInt())
+        var offset = 0
+        while (offset < bytes.size) {
+            val read = channel.read(java.nio.ByteBuffer.wrap(bytes, offset, bytes.size - offset))
+            if (read <= 0) break
+            offset += read
+        }
+        require(offset == bytes.size) { "Manifest file was truncated while reading" }
+        bytes
+    }
+    require(NoFollowFileSystem.revalidate(path, attrs)) {
+        "Manifest file changed while reading: ${manifestFile.absolutePath}"
+    }
     val json = JSONObject(String(rawBytes, Charsets.UTF_8))
     return ReprocessTransactionManifest.fromJson(json)
 }

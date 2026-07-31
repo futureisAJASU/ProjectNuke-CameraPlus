@@ -783,9 +783,13 @@ fun findKeplerJobDirectories(context: Context): List<File> {
         "KeplerRawBurst"
     )
     return roots.flatMap { root ->
-        File(picturesDir, root).listFiles()
-            ?.filter { it.isDirectory && File(it, JOB_JSON_FILE_NAME).exists() }
-            .orEmpty()
+        val rootDir = File(picturesDir, root)
+        NoFollowFileSystem.directChildren(rootDir).filter { jobDir ->
+            NoFollowFileSystem.isRealDirectory(jobDir.toPath()) &&
+                NoFollowFileSystem.resolveDirectChildResult(
+                    jobDir, JOB_JSON_FILE_NAME, requireFile = true
+                ) is NoFollowInspection.Present
+        }
     }.sortedByDescending { it.lastModified() }
 }
 
@@ -821,15 +825,18 @@ fun loadKeplerJobSummaries(context: Context): List<KeplerJobSummary> {
 }
 
 fun loadKeplerJobDetail(jobDir: File): KeplerJobDetail {
-    val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
-    val alignmentFile = File(jobDir, ALIGNMENT_JSON_FILE_NAME)
-    val nativeFile = File(jobDir, NATIVE_POSTPROCESS_JSON_FILE_NAME)
+    val jobFile = NoFollowFileSystem.resolveDirectChild(jobDir, JOB_JSON_FILE_NAME, requireFile = true)
+        ?: File(jobDir, JOB_JSON_FILE_NAME)
+    val alignmentFile = NoFollowFileSystem.resolveDirectChild(jobDir, ALIGNMENT_JSON_FILE_NAME, requireFile = true)
+        ?: File(jobDir, ALIGNMENT_JSON_FILE_NAME)
+    val nativeFile = NoFollowFileSystem.resolveDirectChild(jobDir, NATIVE_POSTPROCESS_JSON_FILE_NAME, requireFile = true)
+        ?: File(jobDir, NATIVE_POSTPROCESS_JSON_FILE_NAME)
     val (job, jobError) = parseJsonFile(jobFile)
     val (alignment, alignmentError) = parseJsonFile(alignmentFile)
     val (nativePostprocess, nativeError) = parseJsonFile(nativeFile)
-    val files = jobDir.listFiles()
-        ?.filter { it.isFile }
-        ?.map { file ->
+    val files = NoFollowFileSystem.directChildren(jobDir)
+        .filter { NoFollowFileSystem.isRealFile(it.toPath()) }
+        .map { file ->
             JobFileEntry(
                 file = file,
                 name = file.name,
@@ -868,10 +875,14 @@ fun loadKeplerJobDetail(jobDir: File): KeplerJobDetail {
         jobJsonPretty = readJsonFilePretty(jobFile),
         jobJsonError = jobError,
         alignment = alignment,
-        alignmentJsonPretty = alignmentFile.takeIf { it.exists() }?.let(::readJsonFilePretty),
+        alignmentJsonPretty = alignmentFile.takeIf {
+            NoFollowFileSystem.isRealFile(it.toPath())
+        }?.let(::readJsonFilePretty),
         alignmentJsonError = alignmentError,
         nativePostprocess = nativePostprocess,
-        nativePostprocessJsonPretty = nativeFile.takeIf { it.exists() }?.let(::readJsonFilePretty),
+        nativePostprocessJsonPretty = nativeFile.takeIf {
+            NoFollowFileSystem.isRealFile(it.toPath())
+        }?.let(::readJsonFilePretty),
         nativePostprocessJsonError = nativeError,
         alignmentFrames = alignmentFrames,
         files = files,
@@ -882,7 +893,15 @@ fun loadKeplerJobDetail(jobDir: File): KeplerJobDetail {
 }
 
 fun readJsonFilePretty(file: File): String {
-    if (!file.exists()) return "File missing: ${file.name}"
+    when (val inspection = NoFollowFileSystem.inspect(file.toPath())) {
+        NoFollowInspection.Absent -> return "File missing: ${file.name}"
+        is NoFollowInspection.InspectionFailed -> {
+            return "Inspection failed: ${file.name}: ${inspection.exception.message}"
+        }
+        is NoFollowInspection.Present -> if (
+            !inspection.value.isRegularFile || inspection.value.isSymbolicLink()
+        ) return "Unsafe file: ${file.name}"
+    }
     val raw = runCatching { file.readText() }
         .getOrElse { return "Read failed: ${it.javaClass.simpleName}: ${it.message}" }
     return runCatching { JSONObject(raw).toString(2) }
@@ -933,7 +952,15 @@ fun loadThumbnailSafe(file: File, maxSizePx: Int): Bitmap? {
 }
 
 private fun parseJsonFile(file: File): Pair<JSONObject?, String?> {
-    if (!file.exists()) return null to null
+    when (val inspection = NoFollowFileSystem.inspect(file.toPath())) {
+        NoFollowInspection.Absent -> return null to null
+        is NoFollowInspection.InspectionFailed -> {
+            return null to "${file.name}: inspection failed: ${inspection.exception.message}"
+        }
+        is NoFollowInspection.Present -> if (
+            !inspection.value.isRegularFile || inspection.value.isSymbolicLink()
+        ) return null to "${file.name}: not a regular non-symlink file"
+    }
     return runCatching { JSONObject(file.readText()) }
         .fold(
             onSuccess = { it to null },
@@ -1001,7 +1028,9 @@ private fun JSONObject?.firstFileName(vararg keys: String): String? {
 }
 
 private fun JSONObject?.resolveExistingFile(jobDir: File, vararg keys: String): File? {
-    return firstFileName(*keys)?.let { File(jobDir, it) }?.takeIf { it.isFile }
+    return firstFileName(*keys)?.let {
+        NoFollowFileSystem.resolveDirectChild(jobDir, it, requireFile = true)
+    }
 }
 
 private fun copyText(clipboard: ClipboardManager, label: String, text: String) {

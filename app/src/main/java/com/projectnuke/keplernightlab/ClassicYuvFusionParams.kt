@@ -18,7 +18,7 @@ data class ClassicYuvFusionParams(
     val shadowLift: Float,
     val highlightRollOff: Float,
     val denoiseAlgorithm: DenoiseAlgorithm = DenoiseAlgorithm.GUIDED,
-    val fusionAlgorithm: NativeFusionAlgorithm = NativeFusionAlgorithm.ROBUST_REFERENCE,
+    val fusionAlgorithm: FusionAlgorithm = FusionAlgorithm.ROBUST_REFERENCE,
     val toneAlgorithm: NativeToneAlgorithm = NativeToneAlgorithm.NATURAL
 ) {
     fun clamped(): ClassicYuvFusionParams {
@@ -131,8 +131,8 @@ fun loadClassicYuvFusionParams(job: JSONObject): ClassicYuvFusionParams {
                     DenoiseAlgorithm.valueOf(json.optString("denoiseAlgorithm", DenoiseAlgorithm.GUIDED.name))
                 }.getOrDefault(DenoiseAlgorithm.GUIDED),
             fusionAlgorithm = runCatching {
-                NativeFusionAlgorithm.valueOf(json.optString("fusionAlgorithm", NativeFusionAlgorithm.ROBUST_REFERENCE.name))
-            }.getOrDefault(NativeFusionAlgorithm.ROBUST_REFERENCE),
+                FusionAlgorithm.valueOf(json.optString("fusionAlgorithm", FusionAlgorithm.ROBUST_REFERENCE.name))
+            }.getOrDefault(FusionAlgorithm.ROBUST_REFERENCE),
             toneAlgorithm = runCatching {
                 NativeToneAlgorithm.valueOf(json.optString("toneAlgorithm", NativeToneAlgorithm.NATURAL.name))
             }.getOrDefault(NativeToneAlgorithm.NATURAL)

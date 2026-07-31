@@ -42,4 +42,41 @@ class NoFollowFileSystemTest {
             outside.deleteRecursively()
         }
     }
+
+    @Test
+    fun inspectedDirectoryReplacementIsRejectedBeforeMutation() {
+        val parent = createTempDirectory("kepler-nofollow-race").toFile()
+        val outside = createTempDirectory("kepler-nofollow-race-target").toFile()
+        try {
+            val child = parent.resolve("job").apply { mkdirs() }
+            val inspected = (NoFollowFileSystem.inspect(child.toPath()) as? NoFollowInspection.Present)
+                ?.value ?: return
+            child.delete()
+            val link = parent.resolve("job").toPath()
+            assumeTrue(runCatching { Files.createSymbolicLink(link, outside.toPath()) }.isSuccess)
+            assertFalse(NoFollowFileSystem.revalidate(link, inspected))
+        } finally {
+            parent.deleteRecursively()
+            outside.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun jobJsonSymlinkIsInspectionFailure() {
+        val parent = createTempDirectory("kepler-nofollow-manifest").toFile()
+        val outside = createTempDirectory("kepler-nofollow-manifest-target").toFile()
+        try {
+            parent.resolve("job").mkdirs()
+            val target = outside.resolve("job.json").apply { writeText("{}") }
+            val link = parent.resolve("job").resolve("job.json").toPath()
+            assumeTrue(runCatching { Files.createSymbolicLink(link, target.toPath()) }.isSuccess)
+            assertTrue(
+                NoFollowFileSystem.resolveDirectChildResult(parent.resolve("job"), "job.json", true)
+                    is NoFollowInspection.InspectionFailed
+            )
+        } finally {
+            parent.deleteRecursively()
+            outside.deleteRecursively()
+        }
+    }
 }

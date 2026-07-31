@@ -1208,9 +1208,17 @@ private fun GalleryFixedQualitySection(job: KeplerGalleryJobSummary) {
         GalleryFixedField("noise", qualitySummaryFixed(metadata, "NoiseEstimate"))
         GalleryFixedField("sharpness drop", metadata.valueFixed("sharpnessDropReferenceToFused") + " / " + metadata.valueFixed("sharpnessDropFusedToFinal"))
         GalleryFixedField("noise reduction", metadata.valueFixed("noiseReductionReferenceToFused") + " / " + metadata.valueFixed("noiseReductionFusedToFinal"))
-        if (compareName.isNotBlank()) {
+        val compareFile = if (compareName.isNotBlank()) {
+            when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
+                job.directory, compareName, requireFile = true
+            )) {
+                is NoFollowInspection.Present -> resolved.value
+                else -> null
+            }
+        } else null
+        if (compareFile != null) {
             AsyncThumbnailImage(
-                file = File(job.directory, compareName),
+                file = compareFile,
                 maxDimension = 960,
                 modifier = Modifier
                     .fillMaxWidth()

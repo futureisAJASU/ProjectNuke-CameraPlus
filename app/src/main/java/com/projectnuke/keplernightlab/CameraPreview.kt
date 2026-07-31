@@ -143,6 +143,7 @@ private class CameraPreviewController(
     @Volatile private var latestMeteringMode: MeteringMode = MeteringModeState.mode
     private enum class PreviewState { STOPPED, STARTING, OPEN, STOPPING }
     @Volatile private var previewState = PreviewState.STOPPED
+    private var openRequestedGeneration: Int? = null
 
     fun start(textureView: TextureView) {
         if (
@@ -158,6 +159,7 @@ private class CameraPreviewController(
             if (previewState == PreviewState.STARTING || previewState == PreviewState.STOPPING) return
             if (previewState == PreviewState.OPEN && backgroundHandler != null && previewSurface != null) return
             generation += 1
+            openRequestedGeneration = null
             previewState = PreviewState.STARTING
             generation
         }
@@ -200,6 +202,7 @@ private class CameraPreviewController(
             if (previewState == PreviewState.STOPPED || previewState == PreviewState.STOPPING) return
             previewState = PreviewState.STOPPING
             generation += 1
+            openRequestedGeneration = null
             Log.d(TAG, "stop generation=$generation")
             StopRefs(captureSession, cameraDevice, previewSurface, backgroundThread, backgroundHandler)
                 .also {
@@ -222,7 +225,8 @@ private class CameraPreviewController(
             }
         }
         if (refs.handler != null) {
-            refs.handler.post(closeResources)
+            val posted = refs.handler.post(closeResources)
+            if (!posted) closeResources.run()
             refs.thread?.quitSafely()
         } else {
             closeResources.run()
@@ -323,6 +327,10 @@ private class CameraPreviewController(
     @SuppressLint("MissingPermission")
     private fun openCamera(textureView: TextureView, localGeneration: Int) {
         if (!isActive(localGeneration) || !textureView.isAvailable) return
+        synchronized(lock) {
+            if (!isActiveLocked(localGeneration) || openRequestedGeneration == localGeneration) return
+            openRequestedGeneration = localGeneration
+        }
 
         val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
 

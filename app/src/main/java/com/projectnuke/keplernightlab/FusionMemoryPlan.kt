@@ -19,6 +19,9 @@ internal data class FusionMemoryPlanRequest(
     val javaBytesPerPixel: Long = 20L,
     val jniCopyBytesPerPixel: Long = 4L,
     val nativeBytesPerPixel: Long = 8L,
+    val fullOutputBitmapBytes: Long = 0L,
+    val postprocessOutputBitmapBytes: Long = 0L,
+    val decoderBytesPerTilePixel: Long = 4L,
     val safetyReserveBytes: Long = 64L * 1024L * 1024L
 )
 
@@ -47,72 +50,80 @@ internal fun planFusionMemory(request: FusionMemoryPlanRequest): FusionMemoryPla
     require(request.width > 0 && request.tileRows > 0 && request.candidateFrames > 0)
     require(request.availableBytes > 0L)
     val budget = request.availableBytes
-    val sourceBytes = checkedMultiply(
-        checkedMultiply(request.width.toLong(), request.tileRows.toLong()),
-        request.sourceBitmapCount.toLong()
+    require(request.sourceBitmapCount >= 0)
+    require(request.fullOutputBitmapBytes >= 0L && request.postprocessOutputBitmapBytes >= 0L)
+    require(request.decoderBytesPerTilePixel >= 0L)
+    val fixedResidency = checkedAdd(
+        request.safetyReserveBytes,
+        checkedAdd(request.fullOutputBitmapBytes, request.postprocessOutputBitmapBytes)
     )
-    val reserveAndResidency = checkedAdd(request.safetyReserveBytes, checkedMultiply(sourceBytes, 4L))
     val perPixel = checkedAdd(
-        checkedAdd(request.javaBytesPerPixel, request.jniCopyBytesPerPixel),
-        request.nativeBytesPerPixel
+        checkedAdd(
+            checkedAdd(request.javaBytesPerPixel, request.jniCopyBytesPerPixel),
+            request.nativeBytesPerPixel
+        ),
+        checkedAdd(
+            checkedMultiply(request.sourceBitmapCount.toLong(), 4L),
+            request.decoderBytesPerTilePixel
+        )
     )
-    if (reserveAndResidency >= budget) {
+    if (fixedResidency >= budget) {
         return FusionMemoryPlan(
             tileRows = 0,
             candidateBatchSize = 0,
-            estimatedPeakBytes = reserveAndResidency,
+            estimatedPeakBytes = fixedResidency,
             budgetBytes = budget,
             fallbackReason = "CannotFit: fixed residency and reserve exceed budget",
             streamingFallback = false,
             cannotFit = true
         )
     }
-    val usable = budget - reserveAndResidency
+    val usable = budget - fixedResidency
     val desiredPixels = checkedMultiply(request.width.toLong(), request.tileRows.toLong())
-    val desiredPacked = checkedAdd(
-        reserveAndResidency,
-        checkedMultiply(checkedMultiply(desiredPixels, perPixel), request.candidateFrames.toLong())
-    )
+    val desiredPacked = checkedAdd(fixedResidency, checkedMultiply(desiredPixels, perPixel))
     if (desiredPacked <= budget) {
         return FusionMemoryPlan(
             request.tileRows,
-            request.candidateFrames,
+            1,
             desiredPacked,
             budget,
-            null,
-            false
+            if (request.candidateFrames > 1) "candidate_streaming_one_at_a_time" else null,
+            request.candidateFrames > 1
         )
     }
 
-    val bytesPerRowPerFrame = checkedMultiply(request.width.toLong(), perPixel)
-    val maxPackedFrames = (usable / bytesPerRowPerFrame)
-        .toInt().coerceAtMost(request.candidateFrames)
-    if (maxPackedFrames < 1) {
+    val bytesPerRow = checkedMultiply(request.width.toLong(), perPixel)
+    if (usable < bytesPerRow) {
         return FusionMemoryPlan(
-            0, 0, reserveAndResidency, budget,
+            0, 0, fixedResidency, budget,
             "CannotFit: one row and one candidate exceed budget", false, true
         )
     }
-    val rowsForBatch = (usable / checkedMultiply(bytesPerRowPerFrame, maxPackedFrames.toLong()))
-        .toInt().coerceAtMost(request.tileRows)
+    val rowsForBatch = (usable / bytesPerRow).toInt().coerceAtMost(request.tileRows)
     if (rowsForBatch < 1) {
-        return FusionMemoryPlan(0, 0, reserveAndResidency, budget,
+        return FusionMemoryPlan(0, 0, fixedResidency, budget,
             "CannotFit: no processable tile", false, true)
     }
-    val streaming = maxPackedFrames == 1 && request.candidateFrames > 1
     val peak = checkedAdd(
-        reserveAndResidency,
+        fixedResidency,
         checkedMultiply(
             checkedMultiply(request.width.toLong(), rowsForBatch.toLong()),
-            checkedMultiply(perPixel, maxPackedFrames.toLong())
+            perPixel
         )
     )
     return FusionMemoryPlan(
         rowsForBatch,
-        maxPackedFrames,
+        1,
         peak,
         budget,
-        if (streaming) "candidate_batch_streaming" else "tile_rows_reduced",
-        streaming
+        if (request.candidateFrames > 1) "tile_rows_reduced_candidate_streaming" else "tile_rows_reduced",
+        request.candidateFrames > 1
+    )
+}
+
+internal fun checkedBitmapBytes(width: Int, height: Int, bytesPerPixel: Long = 4L): Long {
+    require(width > 0 && height > 0 && bytesPerPixel > 0L)
+    return checkedMultiply(
+        checkedMultiply(width.toLong(), height.toLong()), bytesPerPixel
     )
 }

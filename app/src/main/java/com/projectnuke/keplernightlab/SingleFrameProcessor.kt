@@ -22,7 +22,13 @@ internal fun processSingleFrameJobSync(
 ): File {
     cancellation.throwIfCancelled()
     val params = requestedParams.clamped()
-    val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
+    val jobFile = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
+        jobDir, JOB_JSON_FILE_NAME, requireFile = true
+    )) {
+        is NoFollowInspection.Present -> resolved.value
+        NoFollowInspection.Absent -> error("Single-frame job metadata is absent")
+        is NoFollowInspection.InspectionFailed -> throw resolved.exception
+    }
     val job = JSONObject(jobFile.readText())
     val processingStartedAt = System.currentTimeMillis()
 
@@ -40,6 +46,8 @@ internal fun processSingleFrameJobSync(
     var outputFile: File? = null
     var outputWritten = false
     var outputExistedBefore = false
+    var candidateFile: File? = null
+    var backupFile: File? = null
     try {
         val frames = job.optJSONArray("frames")
             ?: error("Single-frame job has no frames array")
@@ -81,7 +89,12 @@ internal fun processSingleFrameJobSync(
         ) {
             "Single-frame output path is not a regular file"
         }
-        writeBitmapPngAtomically(processedBitmap, outputFile)
+        candidateFile = writeBitmapPngCandidate(processedBitmap, outputFile)
+        if (outputExistedBefore) {
+            backupFile = File(jobDir, ".${outputFile.name}.${System.nanoTime()}.bak")
+            KeplerJobMetadata.atomicReplace(outputFile, backupFile)
+        }
+        KeplerJobMetadata.atomicReplace(requireNotNull(candidateFile), outputFile)
         outputWritten = true
         cancellation.throwIfCancelled()
         check(
@@ -105,6 +118,8 @@ internal fun processSingleFrameJobSync(
             finishedAt = finishedAt,
             metadataPolicy = metadataPolicy
         )
+        backupFile?.delete()
+        backupFile = null
         onStatus("일반 사진 후처리가 완료되었습니다.")
         return completedOutput
     } catch (ce: CancellationException) {
@@ -112,7 +127,9 @@ internal fun processSingleFrameJobSync(
             val retainedOutput = cleanupCancelledSingleFrameOutput(
                 outputFile = outputFile,
                 outputWritten = outputWritten,
-                outputExistedBefore = outputExistedBefore
+                outputExistedBefore = outputExistedBefore,
+                candidateFile = candidateFile,
+                backupFile = backupFile
             )
             persistSingleFrameCancellation(
                 jobDir = jobDir,
@@ -125,7 +142,7 @@ internal fun processSingleFrameJobSync(
         throw ce
     } catch (oom: OutOfMemoryError) {
         val retainedOutput = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            cleanupCancelledSingleFrameOutput(outputFile, outputWritten, outputExistedBefore)
+            cleanupCancelledSingleFrameOutput(outputFile, outputWritten, outputExistedBefore, candidateFile, backupFile)
         } else {
             false
         }
@@ -140,7 +157,7 @@ internal fun processSingleFrameJobSync(
         throw oom
     } catch (e: Exception) {
         val retainedOutput = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            cleanupCancelledSingleFrameOutput(outputFile, outputWritten, outputExistedBefore)
+            cleanupCancelledSingleFrameOutput(outputFile, outputWritten, outputExistedBefore, candidateFile, backupFile)
         } else {
             false
         }
@@ -196,16 +213,24 @@ private fun resolveSingleFrameSourceFile(jobDir: File, rawName: String): File {
 private fun cleanupCancelledSingleFrameOutput(
     outputFile: File?,
     outputWritten: Boolean,
-    outputExistedBefore: Boolean
+    outputExistedBefore: Boolean,
+    candidateFile: File?,
+    backupFile: File?
 ): Boolean {
+    candidateFile?.takeIf { it.exists() }?.delete()
     val output = outputFile ?: return false
-    if (!outputWritten) return Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)
-    if (outputExistedBefore) return true
     return try {
-        if (Files.deleteIfExists(output.toPath())) false
-        else Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)
+        if (backupFile?.exists() == true) {
+            Files.deleteIfExists(output.toPath())
+            KeplerJobMetadata.atomicReplace(backupFile, output)
+            false
+        } else if (outputWritten && !outputExistedBefore) {
+            !Files.deleteIfExists(output.toPath())
+        } else {
+            false
+        }
     } catch (_: Exception) {
-        Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)
+        true
     }
 }
 
@@ -359,8 +384,8 @@ private fun persistSingleFrameFailure(
     }
 }
 
-private fun writeBitmapPngAtomically(bitmap: Bitmap, outputFile: File) {
-    val temp = File(outputFile.parentFile, ".${outputFile.name}.${System.nanoTime()}.tmp")
+private fun writeBitmapPngCandidate(bitmap: Bitmap, outputFile: File): File {
+    val temp = File(outputFile.parentFile, ".${outputFile.name}.${System.nanoTime()}.candidate")
     try {
         FileOutputStream(temp).use { stream ->
             check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)) {
@@ -368,8 +393,8 @@ private fun writeBitmapPngAtomically(bitmap: Bitmap, outputFile: File) {
             }
             stream.fd.sync()
         }
-        KeplerJobMetadata.atomicReplace(temp, outputFile)
+        return temp
     } finally {
-        if (temp.exists()) temp.delete()
+        if (!temp.exists()) temp.delete()
     }
 }

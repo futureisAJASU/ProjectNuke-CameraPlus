@@ -13,7 +13,10 @@ import android.os.Looper
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.BufferedOutputStream
 import java.io.FileOutputStream
+import java.util.zip.CRC32
+import java.util.zip.Deflater
 import java.text.SimpleDateFormat
 import java.util.concurrent.CancellationException
 import java.util.Date
@@ -118,6 +121,7 @@ interface SuperResolutionTileSink {
     fun begin(width: Int, height: Int)
     fun writeTile(x: Int, y: Int, width: Int, height: Int, pixels: IntArray)
     fun finish(): File
+    fun abort() {}
 }
 
 class BitmapTileSink(
@@ -148,9 +152,128 @@ class BitmapTileSink(
         }
     }
 
-    internal fun abort() {
+    override fun abort() {
         bitmap?.recycle()
         bitmap = null
+    }
+}
+
+/** Scanline PNG sink used when a full-resolution Bitmap would exceed the heap plan. */
+private class StreamingPngTileSink(
+    private val outputFile: File
+) : SuperResolutionTileSink {
+    private var temporary: File? = null
+    private var stream: BufferedOutputStream? = null
+    private var deflater: Deflater? = null
+    private var width = 0
+    private var height = 0
+    private var nextY = 0
+    private val compressed = ByteArray(64 * 1024)
+    private var row: ByteArray? = null
+
+    override fun begin(width: Int, height: Int) {
+        require(width > 0 && height > 0)
+        this.width = width
+        this.height = height
+        val parent = requireNotNull(outputFile.parentFile)
+        parent.mkdirs()
+        val temp = File(parent, ".${outputFile.name}.${System.nanoTime()}.tmp")
+        temporary = temp
+        val out = BufferedOutputStream(FileOutputStream(temp), 64 * 1024)
+        stream = out
+        deflater = Deflater(Deflater.DEFAULT_COMPRESSION, false)
+        row = ByteArray(Math.addExact(1, Math.multiplyExact(width, 4)))
+        out.write(byteArrayOf(
+            137.toByte(), 80, 78, 71, 13, 10, 26, 10
+        ))
+        val header = ByteArray(13)
+        writeInt(header, 0, width)
+        writeInt(header, 4, height)
+        header[8] = 8
+        header[9] = 6
+        writeChunk(out, "IHDR", header, 0, header.size)
+    }
+
+    override fun writeTile(x: Int, y: Int, width: Int, height: Int, pixels: IntArray) {
+        check(x == 0 && width == this.width && y == nextY)
+        require(height > 0 && pixels.size >= Math.multiplyExact(width, height))
+        val out = requireNotNull(stream)
+        val encoder = requireNotNull(deflater)
+        val scanline = requireNotNull(row)
+        for (rowIndex in 0 until height) {
+            scanline[0] = 0
+            var offset = 1
+            val pixelOffset = rowIndex * width
+            for (column in 0 until width) {
+                val color = pixels[pixelOffset + column]
+                scanline[offset++] = (color ushr 16).toByte()
+                scanline[offset++] = (color ushr 8).toByte()
+                scanline[offset++] = color.toByte()
+                scanline[offset++] = 0xFF.toByte()
+            }
+            encoder.setInput(scanline)
+            while (!encoder.needsInput()) {
+                val count = encoder.deflate(compressed)
+                if (count > 0) writeChunk(out, "IDAT", compressed, 0, count)
+            }
+        }
+        nextY += height
+    }
+
+    override fun finish(): File {
+        check(nextY == height)
+        val out = requireNotNull(stream)
+        val encoder = requireNotNull(deflater)
+        encoder.finish()
+        while (!encoder.finished()) {
+            val count = encoder.deflate(compressed)
+            if (count > 0) writeChunk(out, "IDAT", compressed, 0, count)
+        }
+        writeChunk(out, "IEND", ByteArray(0), 0, 0)
+        out.flush()
+        out.close()
+        temporary?.let { KeplerJobMetadata.atomicReplace(it, outputFile) }
+        encoder.end()
+        stream = null
+        deflater = null
+        temporary = null
+        return outputFile
+    }
+
+    override fun abort() {
+        runCatching { stream?.close() }
+        deflater?.end()
+        temporary?.delete()
+        stream = null
+        deflater = null
+        temporary = null
+    }
+
+    private fun writeInt(target: ByteArray, offset: Int, value: Int) {
+        target[offset] = (value ushr 24).toByte()
+        target[offset + 1] = (value ushr 16).toByte()
+        target[offset + 2] = (value ushr 8).toByte()
+        target[offset + 3] = value.toByte()
+    }
+
+    private fun writeChunk(
+        out: BufferedOutputStream,
+        type: String,
+        data: ByteArray,
+        offset: Int,
+        length: Int
+    ) {
+        val typeBytes = type.toByteArray(Charsets.US_ASCII)
+        val lengthBytes = ByteArray(4)
+        writeInt(lengthBytes, 0, length)
+        out.write(lengthBytes)
+        out.write(typeBytes)
+        out.write(data, offset, length)
+        val crc = CRC32()
+        crc.update(typeBytes)
+        crc.update(data, offset, length)
+        writeInt(lengthBytes, 0, crc.value.toInt())
+        out.write(lengthBytes)
     }
 }
 
@@ -238,21 +361,9 @@ fun runSuperResolutionFusion(
             resolvedTargetMegapixels,
             request.targetPolicy
         )
-        val usesBitmapSink = request.tileSinkFactory == null
-        if (
-            usesBitmapSink &&
-            (
-                resolvedTargetMegapixels > request.targetPolicy.maxSafeTargetMegapixels ||
-                    !canAllocateOutputBitmap(dimensions.first, dimensions.second)
-                )
-        ) {
-            return failedSuperResolutionResult(
-                request = request,
-                inputFrameCount = inputFiles.size,
-                message = "Target requires a streaming tile sink; BitmapTileSink is limited to safe targets.",
-                shifts = shifts
-            )
-        }
+        val bitmapSinkAllowed = request.tileSinkFactory == null &&
+            resolvedTargetMegapixels <= request.targetPolicy.maxSafeTargetMegapixels &&
+            canAllocateOutputBitmap(dimensions.first, dimensions.second)
 
         if (acceptedFrames.size < MIN_FUSION_FRAMES) {
             return runSingleFrameFallback(
@@ -270,7 +381,7 @@ fun runSuperResolutionFusion(
         val requiredBytes = estimateFusionWorkingBytes(
             outputWidth = dimensions.first,
             outputHeight = dimensions.second,
-            includesOutputBitmap = usesBitmapSink
+            includesOutputBitmap = bitmapSinkAllowed
         )
         if (availableHeapBytes() < requiredBytes) {
             return runSingleFrameFallback(
@@ -288,9 +399,14 @@ fun runSuperResolutionFusion(
         request.status("$statusLabel: accumulating detail...")
         val outputFile = File(
             request.outputDir,
-            superResolutionOutputFileName(resolvedTargetMegapixels)
+            if (bitmapSinkAllowed || request.tileSinkFactory != null) {
+                superResolutionOutputFileName(resolvedTargetMegapixels)
+            } else {
+                superResolutionOutputFileName(resolvedTargetMegapixels).removeSuffix(".jpg") + ".png"
+            }
         )
-        val tileSink = request.tileSinkFactory?.invoke(outputFile) ?: BitmapTileSink(outputFile)
+        val tileSink = request.tileSinkFactory?.invoke(outputFile) ?:
+            if (bitmapSinkAllowed) BitmapTileSink(outputFile) else StreamingPngTileSink(outputFile)
         request.status("$statusLabel: writing output...")
         val writtenFile = fuseFramesTiled(
             frames = acceptedFrames,
@@ -772,7 +888,8 @@ private fun fuseFramesTiled(
         DenoiseAlgorithm.GUIDED -> 1
         DenoiseAlgorithm.WAVELET, DenoiseAlgorithm.BILATERAL -> 2
     }
-    val sourceHalo = ceil(maximumAcceptedShift).toInt() + maxOf(BILINEAR_HALO_RADIUS, algorithmRadius)
+    val outputHalo = maxOf(BILINEAR_HALO_RADIUS, algorithmRadius)
+    val sourceHalo = ceil(maximumAcceptedShift).toInt() + outputHalo
     val decoders = linkedMapOf<Int, BitmapRegionDecoder>()
     var finished = false
     try {
@@ -790,8 +907,18 @@ private fun fuseFramesTiled(
             var tileX = 0
             while (tileX < outputWidth) {
                 cancellation.throwIfCancelled()
-                val tileWidth = minOf(FUSION_TILE_WIDTH, outputWidth - tileX)
-                val pixelCount = tileWidth * tileHeight
+                val tileWidth = if (sink is StreamingPngTileSink) {
+                    outputWidth
+                } else {
+                    minOf(FUSION_TILE_WIDTH, outputWidth - tileX)
+                }
+                val expandedX = maxOf(0, tileX - outputHalo)
+                val expandedY = maxOf(0, tileY - outputHalo)
+                val expandedRight = minOf(outputWidth, tileX + tileWidth + outputHalo)
+                val expandedBottom = minOf(outputHeight, tileY + tileHeight + outputHalo)
+                val expandedWidth = expandedRight - expandedX
+                val expandedHeight = expandedBottom - expandedY
+                val pixelCount = Math.multiplyExact(expandedWidth, expandedHeight)
                 val accumR = FloatArray(pixelCount)
                 val accumG = FloatArray(pixelCount)
                 val accumB = FloatArray(pixelCount)
@@ -805,10 +932,10 @@ private fun fuseFramesTiled(
                         decoder = decoders.getValue(frame.index),
                         sourceWidth = reference.sourceWidth,
                         sourceHeight = reference.sourceHeight,
-                        outputTileX = tileX,
-                        outputTileY = tileY,
-                        outputTileWidth = tileWidth,
-                        outputTileHeight = tileHeight,
+                        outputTileX = expandedX,
+                        outputTileY = expandedY,
+                        outputTileWidth = expandedWidth,
+                        outputTileHeight = expandedHeight,
                         scaleX = scaleX,
                         scaleY = scaleY,
                         shift = shift,
@@ -817,10 +944,10 @@ private fun fuseFramesTiled(
                     )
                     accumulateTile(
                         region = region,
-                        tileX = tileX,
-                        tileY = tileY,
-                        tileWidth = tileWidth,
-                        tileHeight = tileHeight,
+                        tileX = expandedX,
+                        tileY = expandedY,
+                        tileWidth = expandedWidth,
+                        tileHeight = expandedHeight,
                         scaleX = scaleX,
                         scaleY = scaleY,
                         shift = shift,
@@ -840,14 +967,23 @@ private fun fuseFramesTiled(
                     accumG = accumG,
                     accumB = accumB,
                     weights = weights,
-                    tileWidth = tileWidth,
-                    tileHeight = tileHeight,
+                    tileWidth = expandedWidth,
+                    tileHeight = expandedHeight,
                     processingParams = normalizedProcessingParams,
                     denoiseAlgorithm = denoiseAlgorithm,
                     cancellation = cancellation
                 )
                 cancellation.throwIfCancelled()
-                sink.writeTile(tileX, tileY, tileWidth, tileHeight, outputPixels)
+                val corePixels = IntArray(Math.multiplyExact(tileWidth, tileHeight))
+                for (coreY in 0 until tileHeight) {
+                    outputPixels.copyInto(
+                        destination = corePixels,
+                        destinationOffset = coreY * tileWidth,
+                        startIndex = (tileY - expandedY + coreY) * expandedWidth + (tileX - expandedX),
+                        endIndex = (tileY - expandedY + coreY) * expandedWidth + (tileX - expandedX) + tileWidth
+                    )
+                }
+                sink.writeTile(tileX, tileY, tileWidth, tileHeight, corePixels)
                 tileX += tileWidth
             }
             tileY += tileHeight
@@ -856,7 +992,7 @@ private fun fuseFramesTiled(
         return sink.finish().also { finished = true }
     } finally {
         decoders.values.forEach { decoder -> runCatching { decoder.recycle() } }
-        if (!finished && sink is BitmapTileSink) sink.abort()
+        if (!finished) sink.abort()
     }
 }
 
@@ -954,12 +1090,28 @@ private fun accumulateTile(
                 1f
             } else {
                 val difference = abs(luma - referenceLuma[index])
-                when {
+                val robustWeight = when {
                     difference > OUTLIER_LUMA_THRESHOLD -> 0f
                     difference > 20f ->
                         alignmentWeight *
                             ((OUTLIER_LUMA_THRESHOLD - difference) / 15f)
                     else -> alignmentWeight
+                }
+                when (processingParams.fusionAlgorithm) {
+                    FusionAlgorithm.ROBUST_REFERENCE -> robustWeight
+                    FusionAlgorithm.NOISE_AWARE -> {
+                        val signal = referenceLuma[index].coerceIn(0f, 255f)
+                        val noiseVariance = (4f + 0.025f * signal).coerceAtLeast(1f)
+                        robustWeight *
+                            (1f / (1f + difference * difference / noiseVariance))
+                    }
+                    FusionAlgorithm.MOTION_SAFE -> {
+                        if (difference > OUTLIER_LUMA_THRESHOLD * 0.65f) {
+                            robustWeight * 0.08f
+                        } else {
+                            robustWeight * 0.72f
+                        }
+                    }
                 }
             }
             if (weight <= 0f) continue
@@ -986,16 +1138,11 @@ private fun normalizeTile(
     for (index in weights.indices) {
         if ((index and 4095) == 0) cancellation.throwIfCancelled()
         val weight = weights[index]
-        output[index] = if (weight > 0f) {
-            val red = (accumR[index] / weight).roundToInt().coerceIn(0, 255)
-            val green = (accumG[index] / weight).roundToInt().coerceIn(0, 255)
-            val blue = (accumB[index] / weight).roundToInt().coerceIn(0, 255)
-            applySuperResolutionTone(
-                red = red,
-                green = green,
-                blue = blue,
-                params = processingParams
-            )
+            output[index] = if (weight > 0f) {
+                val red = (accumR[index] / weight).roundToInt().coerceIn(0, 255)
+                val green = (accumG[index] / weight).roundToInt().coerceIn(0, 255)
+                val blue = (accumB[index] / weight).roundToInt().coerceIn(0, 255)
+                0xff000000.toInt() or (red shl 16) or (green shl 8) or blue
         } else {
             0xff000000.toInt()
         }
@@ -1008,6 +1155,16 @@ private fun normalizeTile(
         algorithm = denoiseAlgorithm,
         cancellation = cancellation
     )
+    for (index in output.indices) {
+        if ((index and 4095) == 0) cancellation.throwIfCancelled()
+        val color = output[index]
+        output[index] = applySuperResolutionTone(
+            red = color shr 16 and 0xff,
+            green = color shr 8 and 0xff,
+            blue = color and 0xff,
+            params = processingParams
+        )
+    }
     applySuperResolutionDetailInPlace(
         pixels = output,
         width = tileWidth,
@@ -1520,21 +1677,21 @@ private fun estimateFusionWorkingBytes(
     outputHeight: Int,
     includesOutputBitmap: Boolean
 ): Long {
-    val outputBytes = if (includesOutputBitmap) {
-        outputWidth.toLong() * outputHeight * 4L
-    } else {
-        0L
-    }
-    val tilePixels =
-        minOf(FUSION_TILE_WIDTH, outputWidth).toLong() *
+    return runCatching {
+        val outputBytes = if (includesOutputBitmap) {
+            checkedBitmapBytes(outputWidth, outputHeight)
+        } else 0L
+        val tilePixels = Math.multiplyExact(
+            minOf(FUSION_TILE_WIDTH, outputWidth),
             minOf(FUSION_TILE_HEIGHT, outputHeight)
-    val tileBytes = tilePixels * 29L
-    return outputBytes + tileBytes + 64L * 1024L * 1024L
+        ).toLong()
+        val tileBytes = Math.multiplyExact(tilePixels, 29L)
+        Math.addExact(Math.addExact(outputBytes, tileBytes), 64L * 1024L * 1024L)
+    }.getOrElse { Long.MAX_VALUE }
 }
 
 private fun availableHeapBytes(): Long {
-    val runtime = Runtime.getRuntime()
-    return runtime.maxMemory() - (runtime.totalMemory() - runtime.freeMemory())
+    return currentAvailableJavaHeapBytes()
 }
 
 private fun rgbLuma(red: Int, green: Int, blue: Int): Float =
@@ -1572,8 +1729,11 @@ private fun detectSourceMegapixels(file: File?): Double {
 }
 
 private fun canAllocateOutputBitmap(outputWidth: Int, outputHeight: Int): Boolean {
-    val outputBytes = outputWidth.toLong() * outputHeight * 4L
-    return availableHeapBytes() >= outputBytes + 64L * 1024L * 1024L
+    val outputBytes = runCatching { checkedBitmapBytes(outputWidth, outputHeight) }
+        .getOrElse { return false }
+    val required = runCatching { Math.addExact(outputBytes, 64L * 1024L * 1024L) }
+        .getOrElse { return false }
+    return availableHeapBytes() >= required
 }
 
 private fun megapixelLabel(megapixels: Double): String =

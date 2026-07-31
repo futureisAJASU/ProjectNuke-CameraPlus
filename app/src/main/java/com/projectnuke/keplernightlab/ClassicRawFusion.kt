@@ -28,6 +28,13 @@ private const val CLASSIC_RAW_NOISE_MODEL_VERSION = "classic_raw_noise_model_v0_
 private const val CLASSIC_RAW_SHOT_COEFF = 0.025f
 private const val CLASSIC_RAW_READ_NOISE_COEFF = 32.0f
 
+internal fun clampRawOutputValue(normalized: Float, whiteRange: Int): Int {
+    require(whiteRange in 1..65535)
+    return (
+        if (normalized.isFinite()) normalized.roundToInt() else 0
+    ).coerceIn(0, whiteRange)
+}
+
 internal data class ClassicRawFusionResult(
     val success: Boolean,
     val mergedRawFile: File?,
@@ -93,6 +100,7 @@ internal fun runClassicRawFusionMerge(
     blackLevelEstimate: BlackLevelEstimate,
     mergedRawFile: File,
     alignmentFile: File,
+    fusionAlgorithm: FusionAlgorithm = FusionAlgorithm.ROBUST_REFERENCE,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ): ClassicRawFusionResult {
@@ -103,15 +111,21 @@ internal fun runClassicRawFusionMerge(
         val frames = preparedFrames.inputs.mapIndexed { index, input ->
             ClassicRawFrame(index, input)
         }.toMutableList()
-        if (frames.size < MIN_RAW_FUSION_FRAMES) {
-            error("Not enough enabled RAW frames to reprocess")
+        if (frames.isEmpty()) error("No enabled RAW frames to reprocess")
+        frames.forEach { frame ->
+            validateRawFrame(frame.input, sensor)?.let { reason ->
+                frame.alignmentUsed = false
+                frame.globalWeight = 0f
+                frame.skipReason = reason
+            }
         }
+        if (frames.none { it.skipReason == null }) error("No structurally valid RAW frames remain")
 
         val alignStartedAt = System.currentTimeMillis()
         Log.i("KeplerRawPipeline", "ALIGN_STARTED jobDirAbsolutePath=${jobDir.absolutePath}")
         onStatus("RAW 프레임을 정렬하는 중입니다.")
         onStatus("Classic RAW fusion: building alignment proxies...")
-        frames.toList().forEach { frame ->
+        frames.filter { it.skipReason == null }.forEach { frame ->
             try {
                 cancellation.throwIfCancelled()
                 frame.proxy = buildRawProxy(frame.input.file, sensor, blackLevelEstimate, cancellation)
@@ -121,26 +135,32 @@ internal fun runClassicRawFusionMerge(
                 throw ce
             } catch (e: Exception) {
                 frame.skipReason = "${e.javaClass.simpleName}: ${e.message}"
-                frames.remove(frame)
+                frame.alignmentUsed = false
+                frame.globalWeight = 0f
             }
         }
-        if (frames.size < MIN_RAW_FUSION_FRAMES) {
-            error("Not enough readable RAW frames for classic fusion")
-        }
-
-        val reference = selectRawReference(frames)
+        val validFrames = frames.filter { it.skipReason == null && it.proxy != null }
+        if (validFrames.isEmpty()) error("No readable RAW frames remain")
+        val reference = selectRawReference(validFrames)
         reference.globalWeight = CLASSIC_RAW_REFERENCE_WEIGHT
         onStatus("Classic RAW fusion: selected reference frame ${reference.position + 1}")
         val refProxy = requireNotNull(reference.proxy)
         val refExposure = exposureProduct(reference.input.meta)
+        require(refExposure.isFinite() && refExposure > 0f) {
+            "REFERENCE_ONLY_FALLBACK: invalid reference exposure product"
+        }
         var nativeAlignmentUsed = false
         var fallbackAlignmentCount = 0
         var lowConfidenceAlignmentCount = 0
-        frames.forEachIndexed { index, frame ->
+        validFrames.forEachIndexed { index, frame ->
             cancellation.throwIfCancelled()
             onStatus("Classic RAW fusion: aligning frame ${index + 1}/${frames.size}...")
-            frame.exposureScale = (refExposure / exposureProduct(frame.input.meta))
-                .coerceIn(0.5f, 2.0f)
+            val candidateExposure = exposureProduct(frame.input.meta)
+            frame.exposureScale = if (candidateExposure.isFinite() && candidateExposure > 0f) {
+                (refExposure / candidateExposure).coerceIn(0.5f, 2.0f)
+            } else {
+                Float.NaN
+            }
             if (frame === reference) {
                 frame.dx = 0
                 frame.dy = 0
@@ -184,6 +204,11 @@ internal fun runClassicRawFusionMerge(
                         .coerceIn(0.12f, 1f)
                 } else 0f
             }
+            if (frame !== reference && (!frame.exposureScale.isFinite() || frame.exposureScale <= 0f)) {
+                frame.alignmentUsed = false
+                frame.globalWeight = 0f
+                frame.skipReason = "NON_FINITE_EXPOSURE_SCALE"
+            }
             applyRawAlignmentToFrameJson(frame)
         }
         val acceptedFrames = frames.filter { frame ->
@@ -199,6 +224,7 @@ internal fun runClassicRawFusionMerge(
             rejectedFrame.skipReason = rejectedFrame.skipReason ?: "NON_FINITE_OR_REJECTED_ALIGNMENT"
             applyRawAlignmentToFrameJson(rejectedFrame)
         }
+        val referenceOnlyFallback = acceptedFrames.size < MIN_RAW_FUSION_FRAMES
         val nativeAlignMs = System.currentTimeMillis() - alignStartedAt
         Log.i("KeplerRawPipeline", "ALIGN_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} nativeAlignMs=$nativeAlignMs")
 
@@ -212,6 +238,7 @@ internal fun runClassicRawFusionMerge(
             sensor = sensor,
             blackLevelEstimate = blackLevelEstimate,
             mergedRawFile = mergedRawFile,
+            fusionAlgorithm = fusionAlgorithm,
             cancellation = cancellation,
             onStatus = onStatus
         )
@@ -254,6 +281,8 @@ internal fun runClassicRawFusionMerge(
             .put("rawFusionVersion", CLASSIC_RAW_FUSION_VERSION)
             .put("rawReferenceFrameIndex", reference.input.meta.optInt("index", reference.position))
             .put("rawReferenceFrameReason", selectRawReferenceReason(frames))
+            .put("fusionAlgorithm", fusionAlgorithm.name)
+            .put("rawFusionFallback", if (referenceOnlyFallback) "REFERENCE_ONLY_FALLBACK" else JSONObject.NULL)
             .put("usedFrameCount", frames.count { it.skipReason == null && it.alignmentUsed && it.globalWeight > 0f })
             .put("excludedFrameCount", countRawExcludedFrames(job))
             .put(
@@ -282,7 +311,10 @@ internal fun runClassicRawFusionMerge(
             .put("mergedRawFile", mergedRawFile.name)
             .put("rawFusionDebugFile", alignmentFile.name)
             .put("alignmentFile", alignmentFile.name)
-            .put("alignmentStatus", "CLASSIC_RAW_FUSION_V1_COMPLETE")
+            .put(
+                "alignmentStatus",
+                if (referenceOnlyFallback) "REFERENCE_ONLY_FALLBACK" else "CLASSIC_RAW_FUSION_V1_COMPLETE"
+            )
             .put("nativeRawMerge", false)
             .put("rawFusionNotes", "Classic RAW v1: downsampled green-channel alignment, tiled RAW-domain robust merge, signal-aware conservative outlier suppression.")
 
@@ -292,7 +324,7 @@ internal fun runClassicRawFusionMerge(
             alignmentFile = alignmentFile,
             referenceIndex = reference.position,
             referenceReason = selectRawReferenceReason(frames),
-            alignmentStatus = "CLASSIC_RAW_FUSION_V1_COMPLETE",
+            alignmentStatus = if (referenceOnlyFallback) "REFERENCE_ONLY_FALLBACK" else "CLASSIC_RAW_FUSION_V1_COMPLETE",
             debugMetadata = debug,
             errorMessage = null
         )
@@ -379,21 +411,23 @@ private fun buildRawProxy(
 
 private fun selectRawReference(frames: List<ClassicRawFrame>): ClassicRawFrame {
     val scored = frames.filter {
-        it.input.meta.has("qualityScore") || it.input.meta.has("sharpnessScore")
+        val quality = it.input.meta.optDouble("qualityScore", Double.NaN)
+        val sharpness = it.input.meta.optDouble("sharpnessScore", Double.NaN)
+        (quality.isFinite() || sharpness.isFinite()) && it.proxy != null && it.skipReason == null
     }
     return scored.maxWithOrNull(
         compareBy<ClassicRawFrame> {
-            it.input.meta.optDouble("qualityScore", -1.0)
+            it.input.meta.optDouble("qualityScore", Double.NEGATIVE_INFINITY)
         }.thenBy {
-            it.input.meta.optDouble("sharpnessScore", -1.0)
+            it.input.meta.optDouble("sharpnessScore", Double.NEGATIVE_INFINITY)
         }
     ) ?: frames[frames.size / 2]
 }
 
 private fun selectRawReferenceReason(frames: List<ClassicRawFrame>): String {
-    return if (frames.any { it.input.meta.has("qualityScore") }) {
+    return if (frames.any { it.input.meta.optDouble("qualityScore", Double.NaN).isFinite() }) {
         "highest_quality_score"
-    } else if (frames.any { it.input.meta.has("sharpnessScore") }) {
+    } else if (frames.any { it.input.meta.optDouble("sharpnessScore", Double.NaN).isFinite() }) {
         "highest_sharpness_score"
     } else {
         "middle_frame"
@@ -499,6 +533,7 @@ private fun mergeClassicRawTiles(
     sensor: RawFusionSensorData,
     blackLevelEstimate: BlackLevelEstimate,
     mergedRawFile: File,
+    fusionAlgorithm: FusionAlgorithm,
     cancellation: KeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ): RawMergeStats {
@@ -506,6 +541,10 @@ private fun mergeClassicRawTiles(
     var downweighted = 0L
     var compared = 0L
     val whiteRange = (sensor.whiteLevel - sensor.blackLevel).coerceAtLeast(1)
+    require(sensor.blackLevel in 0..65535 && sensor.whiteLevel in 1..65535) {
+        "RAW output range is outside the 16-bit contract"
+    }
+    require(whiteRange in 1..65535) { "RAW white range is invalid" }
     val frameInputs = linkedMapOf<ClassicRawFrame, RandomAccessFile>()
     val sourceRows = frames.associateWith { ShortArray(sensor.width) }
     val memoryPlan = planFusionMemory(
@@ -556,7 +595,11 @@ private fun mergeClassicRawTiles(
                     onStatus("Classic RAW fusion: merging RAW tiles ${frameIndex + 1}/${frames.size}")
                     val raf = frameInputs.getValue(frame)
                     val rowBuffer = sourceRows.getValue(frame)
-                    val globalWeight = frame.globalWeight
+                    val globalWeight = if (fusionAlgorithm == FusionAlgorithm.MOTION_SAFE && frame === reference) {
+                        frame.globalWeight * 1.75f
+                    } else {
+                        frame.globalWeight
+                    }
                     for (row in 0 until tileRows) {
                         if ((row and 15) == 0) cancellation.throwIfCancelled()
                         val y = tileTop + row
@@ -583,7 +626,10 @@ private fun mergeClassicRawTiles(
                                 val normalizedResidual = diffAbs / kotlin.math.sqrt(variance.coerceAtLeast(1f))
                                 val diff = diffAbs / whiteRange
                                 compared++
-                                if (normalizedResidual > 5.0f) {
+                                if (fusionAlgorithm == FusionAlgorithm.NOISE_AWARE) {
+                                    localWeight *= (1f / (1f + normalizedResidual * normalizedResidual))
+                                    if (normalizedResidual > 3.0f) downweighted++
+                                } else if (normalizedResidual > 5.0f) {
                                     localWeight *= CLASSIC_RAW_OUTLIER_WEIGHT
                                     rejected++
                                 } else if (normalizedResidual > 2.5f) {
@@ -608,8 +654,7 @@ private fun mergeClassicRawTiles(
                         if ((x and 1023) == 0) cancellation.throwIfCancelled()
                         val index = row * sensor.width + x
                         val normalized = acc[index] / weights[index].coerceAtLeast(0.001f)
-                        val value = if (normalized.isFinite()) normalized.roundToInt() else 0
-                            .coerceIn(0, whiteRange)
+                        val value = clampRawOutputValue(normalized, whiteRange)
                         outRow[out++] = (value and 0xFF).toByte()
                         outRow[out++] = ((value ushr 8) and 0xFF).toByte()
                     }
@@ -645,21 +690,21 @@ private fun readRawRow(
 private fun applyRawAlignmentToFrameJson(frame: ClassicRawFrame) {
     frame.input.meta.put("rawAlignDx", frame.dx)
         .put("rawAlignDy", frame.dy)
-        .put("rawAlignEstimatedDx", frame.estimatedDx.toDouble())
-        .put("rawAlignEstimatedDy", frame.estimatedDy.toDouble())
+        .putFiniteNumber("rawAlignEstimatedDx", frame.estimatedDx)
+        .putFiniteNumber("rawAlignEstimatedDy", frame.estimatedDy)
         .put("rawAlignAppliedCfaDx", frame.dx)
         .put("rawAlignAppliedCfaDy", frame.dy)
         .put("rawAlignIntegerDx", frame.integerDx)
         .put("rawAlignIntegerDy", frame.integerDy)
-        .put("rawAlignSubpixelDx", frame.subpixelDx.toDouble())
-        .put("rawAlignSubpixelDy", frame.subpixelDy.toDouble())
-        .put("rawAlignmentScore", frame.alignmentScore.toDouble())
-        .put("rawAlignmentConfidence", frame.alignmentConfidence.toDouble())
+        .putFiniteNumber("rawAlignSubpixelDx", frame.subpixelDx)
+        .putFiniteNumber("rawAlignSubpixelDy", frame.subpixelDy)
+        .putFiniteNumber("rawAlignmentScore", frame.alignmentScore)
+        .putFiniteNumber("rawAlignmentConfidence", frame.alignmentConfidence)
         .put("rawAlignmentBackend", frame.alignmentBackend)
         .put("rawAlignmentUsedSubpixel", frame.alignmentUsedSubpixel)
         .put("rawAlignmentFallbackUsed", frame.alignmentFallbackUsed)
         .put("rawAlignmentUsed", frame.alignmentUsed)
-        .put("rawGlobalWeight", frame.globalWeight.toDouble())
+        .putFiniteNumber("rawGlobalWeight", frame.globalWeight)
 }
 
 private fun buildRawFusionDebug(
@@ -682,20 +727,20 @@ private fun buildRawFusionDebug(
                 .put("file", frame.input.file.name)
                 .put("rawAlignDx", frame.dx)
                 .put("rawAlignDy", frame.dy)
-                .put("rawAlignEstimatedDx", frame.estimatedDx.toDouble())
-                .put("rawAlignEstimatedDy", frame.estimatedDy.toDouble())
+                .putFiniteNumber("rawAlignEstimatedDx", frame.estimatedDx)
+                .putFiniteNumber("rawAlignEstimatedDy", frame.estimatedDy)
                 .put("rawAlignAppliedCfaDx", frame.dx)
                 .put("rawAlignAppliedCfaDy", frame.dy)
                 .put("rawAlignIntegerDx", frame.integerDx)
                 .put("rawAlignIntegerDy", frame.integerDy)
-                .put("rawAlignSubpixelDx", frame.subpixelDx.toDouble())
-                .put("rawAlignSubpixelDy", frame.subpixelDy.toDouble())
-                .put("rawAlignmentScore", frame.alignmentScore.toDouble())
-                .put("rawAlignmentConfidence", frame.alignmentConfidence.toDouble())
+                .putFiniteNumber("rawAlignSubpixelDx", frame.subpixelDx)
+                .putFiniteNumber("rawAlignSubpixelDy", frame.subpixelDy)
+                .putFiniteNumber("rawAlignmentScore", frame.alignmentScore)
+                .putFiniteNumber("rawAlignmentConfidence", frame.alignmentConfidence)
                 .put("rawAlignmentBackend", frame.alignmentBackend)
                 .put("rawAlignmentUsedSubpixel", frame.alignmentUsedSubpixel)
                 .put("rawAlignmentFallbackUsed", frame.alignmentFallbackUsed)
-                .put("rawGlobalWeight", frame.globalWeight.toDouble())
+                .putFiniteNumber("rawGlobalWeight", frame.globalWeight)
                 .put("used", frame.skipReason == null && frame.alignmentUsed && frame.globalWeight > 0f)
                 .put("skipReason", frame.skipReason ?: JSONObject.NULL)
         )
@@ -799,9 +844,36 @@ private fun saveClassicRawPng(bitmap: Bitmap, file: File) {
 }
 
 private fun exposureProduct(meta: JSONObject): Float {
-    val exposure = meta.optDouble("exposureTimeNs", 1.0).coerceAtLeast(1.0)
-    val iso = meta.optDouble("sensitivityIso", 100.0).coerceAtLeast(1.0)
-    return (exposure * iso).toFloat().coerceAtLeast(1f)
+    val exposure = meta.optDouble("exposureTimeNs", Double.NaN)
+    val iso = meta.optDouble("sensitivityIso", Double.NaN)
+    if (!exposure.isFinite() || exposure <= 0.0 || !iso.isFinite() || iso <= 0.0) {
+        return Float.NaN
+    }
+    val product = exposure * iso
+    return if (product.isFinite() && product > 0.0 && product <= Float.MAX_VALUE) {
+        product.toFloat()
+    } else {
+        Float.NaN
+    }
+}
+
+private fun validateRawFrame(input: RawFrameInput, sensor: RawFusionSensorData): String? {
+    val expectedBytes = sensor.pixelCount.toLong() * 2L
+    if (sensor.width <= 0 || sensor.height <= 0 || sensor.pixelCount <= 0) {
+        return "INVALID_RAW_DIMENSIONS"
+    }
+    if (input.file.length() != expectedBytes) return "INVALID_RAW_FILE_SIZE"
+    val metaWidth = input.meta.optInt("rawWidth", sensor.width)
+    val metaHeight = input.meta.optInt("rawHeight", sensor.height)
+    if (metaWidth != sensor.width || metaHeight != sensor.height) return "RAW_DIMENSION_MISMATCH"
+    val exposure = exposureProduct(input.meta)
+    if (!exposure.isFinite() || exposure <= 0f) return "INVALID_EXPOSURE_PRODUCT"
+    val black = input.meta.optDouble("blackLevel", sensor.blackLevel.toDouble())
+    val white = input.meta.optDouble("whiteLevel", sensor.whiteLevel.toDouble())
+    if (!black.isFinite() || !white.isFinite() || black < 0.0 || white <= black || white > 65535.0) {
+        return "INVALID_RAW_LEVELS"
+    }
+    return null
 }
 
 private fun greenAlignedRawX(cfa: Int, y: Int, proposedX: Int): Int {

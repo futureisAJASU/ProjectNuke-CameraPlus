@@ -34,4 +34,25 @@ class FusionMemoryPlanTest {
         val plan = planFusionMemory(FusionMemoryPlanRequest(4000, 256, 7, 512L * 1024 * 1024))
         assertEquals(512L * 1024 * 1024, plan.budgetBytes)
     }
+
+    @Test fun fullOutputResidencyCanReturnCannotFitBeforeAllocation() {
+        val plan = planFusionMemory(
+            FusionMemoryPlanRequest(
+                width = 4000,
+                tileRows = 128,
+                candidateFrames = 6,
+                availableBytes = 96L * 1024 * 1024,
+                fullOutputBitmapBytes = 64L * 1024 * 1024,
+                postprocessOutputBitmapBytes = 64L * 1024 * 1024
+            )
+        )
+        assertTrue(plan.cannotFit)
+        assertTrue(plan.estimatedPeakBytes > plan.budgetBytes)
+    }
+
+    @Test fun candidatesAreStreamedOneAtATime() {
+        val plan = planFusionMemory(FusionMemoryPlanRequest(4000, 128, 6, 512L * 1024 * 1024))
+        assertEquals(1, plan.candidateBatchSize)
+        assertTrue(plan.estimatedPeakBytes <= plan.budgetBytes)
+    }
 }

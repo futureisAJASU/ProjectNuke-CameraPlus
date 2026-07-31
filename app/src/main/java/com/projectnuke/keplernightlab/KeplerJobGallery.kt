@@ -234,9 +234,14 @@ fun cleanupKeplerGalleryJob(
             throw IllegalStateException("Reprocess quarantined job cannot be cleaned; it retains pending transaction evidence.")
         }
     val before = folderSizeBytes(target)
-    val job = File(target, JOB_JSON_FILE_NAME).takeIf { it.isFile }?.let { file ->
-        runCatching { JSONObject(file.readText()) }.getOrNull()
-    } ?: JSONObject()
+    val job = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
+        target, JOB_JSON_FILE_NAME, requireFile = true
+    )) {
+        is NoFollowInspection.Present -> runCatching { JSONObject(resolved.value.readText()) }
+            .getOrElse { throw IllegalStateException("Cannot read job.json", it) }
+        NoFollowInspection.Absent -> JSONObject()
+        is NoFollowInspection.InspectionFailed -> throw resolved.exception
+    }
     val finalFiles = finalFilesForCleanup(target, job)
     if (
         cleanupType != KeplerJobCleanupType.DEBUG_ONLY &&
@@ -276,10 +281,10 @@ fun cleanupKeplerGalleryJob(
     val metadataWarning = runCatching {
         KeplerJobMetadata.update(target) { j ->
             val updated = computeKeplerJobStorage(target, j, finalFiles.firstOrNull())
-            j.put("cleanupApplied", true)
+            j.put("cleanupApplied", failed.isEmpty())
                 .put("cleanupType", cleanupType.name)
                 .put("cleanupAt", System.currentTimeMillis())
-                .put("bytesFreed", before - after)
+                .put("bytesFreed", (before - after).coerceAtLeast(0L))
                 .put("remainingJobBytes", after)
                 .put("sourceFramesAvailable", sourceAvailable)
                 .put("finalOutputAvailable", finalOutputAvailable)
@@ -290,10 +295,16 @@ fun cleanupKeplerGalleryJob(
             putStorageMetadata(j, updated)
         }
     }.exceptionOrNull()?.let { "${it.javaClass.simpleName}: ${it.message}" }
+    val cleanupStatus = when {
+        metadataWarning != null && failed.isEmpty() -> CleanupStatus.FAILED
+        failed.isNotEmpty() || metadataWarning != null -> CleanupStatus.PARTIAL
+        else -> CleanupStatus.COMPLETE
+    }
     KeplerJobCleanupResult(
-        bytesFreed = before - after,
+        bytesFreed = (before - after).coerceAtLeast(0L),
         failedPaths = failed,
-        metadataWarning = metadataWarning
+        metadataWarning = metadataWarning,
+        cleanupStatus = cleanupStatus
     )
     } finally {
         lease.release()
@@ -339,8 +350,12 @@ internal fun matchesJobPrefix(root: File, name: String): Boolean = when (root.na
 }
 
 fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
-    val job = NoFollowFileSystem.resolveDirectChild(directory, JOB_JSON_FILE_NAME, requireFile = true)?.let { file ->
-        runCatching { JSONObject(file.readText()) }.getOrNull()
+    val job = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
+        directory, JOB_JSON_FILE_NAME, requireFile = true
+    )) {
+        is NoFollowInspection.Present -> JSONObject(resolved.value.readText())
+        NoFollowInspection.Absent -> null
+        is NoFollowInspection.InspectionFailed -> throw resolved.exception
     }
     val frames = job?.optJSONArray("frames").galleryFrames(directory)
         .orEmpty()
@@ -587,7 +602,15 @@ private fun JSONArray?.galleryFrames(directory: File): List<KeplerGalleryFrame> 
             val fileName = frame.optString("raw16File")
                 .ifBlank { frame.optString("file") }
                 .ifBlank { frame.optString("dngFile") }
-            val file = fileName.takeIf { it.isNotBlank() }?.let { File(directory, it) }
+            val file = fileName.takeIf { it.isNotBlank() }?.let {
+                when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
+                    directory, it, requireFile = true
+                )) {
+                    is NoFollowInspection.Present -> resolved.value
+                    NoFollowInspection.Absent -> null
+                    is NoFollowInspection.InspectionFailed -> throw resolved.exception
+                }
+            }
             add(
                 KeplerGalleryFrame(
                     index = frame.optInt("index", position),
@@ -597,7 +620,7 @@ private fun JSONArray?.galleryFrames(directory: File): List<KeplerGalleryFrame> 
                     excludedByUser = frame.optBoolean("excludedByUser", false),
                     excludeReason = frame.optString("excludeReason")
                         .takeIf { it.isNotBlank() && it != "null" },
-                    file = file?.takeIf { it.isFile },
+                    file = file,
                     sharpnessScore = frame.optionalFloat("sharpnessScore"),
                     motionScore = frame.optionalFloat("motionScore"),
                     exposureScore = frame.optionalFloat("exposureScore"),
@@ -619,7 +642,10 @@ private fun JSONArray?.galleryFrames(directory: File): List<KeplerGalleryFrame> 
 
 private fun JSONObject.optionalFloat(key: String): Float? {
     if (!has(key) || isNull(key)) return null
-    return optDouble(key, Double.NaN).takeUnless { it.isNaN() }?.toFloat()
+    return optDouble(key, Double.NaN)
+        .takeIf { it.isFinite() }
+        ?.toFloat()
+        ?.takeIf { it.isFinite() }
 }
 
 private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
@@ -630,8 +656,16 @@ private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
     )
     currentNames.asSequence()
         .filter { it.isNotBlank() && it != "null" }
-        .map { File(directory, it) }
-        .firstOrNull { it.isFile && isDisplayImageFile(it) && !isDebugPreviewFinalBlocked(it.name) }
+        .mapNotNull { name ->
+            when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
+                directory, name, requireFile = true
+            )) {
+                is NoFollowInspection.Present -> resolved.value
+                NoFollowInspection.Absent -> null
+                is NoFollowInspection.InspectionFailed -> throw resolved.exception
+            }
+        }
+        .firstOrNull { isDisplayImageFile(it) && !isDebugPreviewFinalBlocked(it.name) }
         ?.let { return it }
     if (job?.optBoolean("galleryDisplayUnavailable", false) == true ||
         (job?.optBoolean("galleryExportCommitted", false) == true &&
