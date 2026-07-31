@@ -5,6 +5,7 @@ import android.os.Environment
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.nio.file.Files
 
 data class KeplerGalleryJobSummary(
     val id: String,
@@ -46,10 +47,13 @@ enum class KeplerJobCleanupType {
     FAILED_JOB_DELETE
 }
 
+enum class CleanupStatus { COMPLETE, PARTIAL, FAILED }
+
 data class KeplerJobCleanupResult(
     val bytesFreed: Long,
     val failedPaths: List<String>,
-    val metadataWarning: String?
+    val metadataWarning: String?,
+    val cleanupStatus: CleanupStatus = if (failedPaths.isEmpty()) CleanupStatus.COMPLETE else CleanupStatus.PARTIAL
 )
 
 data class KeplerGalleryFrame(
@@ -199,14 +203,23 @@ fun summarizeKeplerGalleryStorage(jobs: List<KeplerGalleryJobSummary>): KeplerGa
     )
 }
 
-fun deleteKeplerGalleryJob(context: Context, jobDirectory: File): Result<Unit> = runCatching {
+fun deleteKeplerGalleryJob(context: Context, jobDirectory: File): Result<KeplerJobCleanupResult> = runCatching {
     val target = requireCleanupSafeJobDirectory(context, jobDirectory)
     val lease = KeplerJobMetadata.acquireOperation(target) ?: error("Job mutation is in progress.")
     try {
         require(target.isDirectory) { "Job directory no longer exists." }
         require(!isReprocessQuarantined(target)) { "Reprocess quarantined job cannot be deleted; it retains pending transaction evidence." }
-        check(target.deleteRecursively()) { "Failed to delete ${target.name}." }
+        val (status, failedPaths) = deleteRecursivelySafe(target)
+        if (failedPaths.isNotEmpty()) {
+            throw IllegalStateException("Safe delete partial: ${failedPaths.size} paths failed")
+        }
         KeplerJobMetadata.removeLockEntry(target)
+        KeplerJobCleanupResult(
+            bytesFreed = 0L,
+            failedPaths = failedPaths,
+            metadataWarning = null,
+            cleanupStatus = status
+        )
     } finally {
         lease.release()
     }
@@ -235,7 +248,7 @@ fun cleanupKeplerGalleryJob(
     ) {
         throw IllegalStateException("Final output missing; cleanup refused.")
     }
-    val filesToDelete = target.walkTopDown()
+    val filesToDelete = listFilesNoFollow(target)
         .filter { it.isFile }
         .filter { file ->
             when (cleanupType) {
@@ -249,8 +262,8 @@ fun cleanupKeplerGalleryJob(
         }
         .toList()
     val failed = mutableListOf<String>()
-    filesToDelete.forEach { file ->
-        if (file.exists() && !file.delete()) failed += file.absolutePath
+    filesToDelete.forEach { item ->
+        if (item.exists() && !item.delete()) failed += item.absolutePath
     }
     val after = folderSizeBytes(target)
     val sourceAvailable = target.walkTopDown().any { it.isFile && isSourceFrame(it) }
@@ -680,4 +693,88 @@ fun isSourceFrame(file: File): Boolean {
     return name.startsWith("frame_") &&
         (name.endsWith(".png") || name.endsWith(".raw16") || name.endsWith(".dng") ||
             name.endsWith(".yuv") || name.endsWith(".nv21") || name.endsWith(".yuv420"))
+}
+
+internal fun isSafeRelativeFilename(name: String): Boolean {
+    if (name.isBlank()) return false
+    if (name.contains("..")) return false
+    if (name.startsWith("/")) return false
+    if (name.startsWith("\\")) return false
+    if (File(name).isAbsolute) return false
+    val normalized = File(name).path.replace("\\", "/")
+    if (normalized.contains("..")) return false
+    if (normalized.startsWith("/")) return false
+    return true
+}
+
+internal fun deleteRecursivelySafe(root: File): Pair<CleanupStatus, List<String>> {
+    if (!root.exists()) return Pair(CleanupStatus.COMPLETE, emptyList())
+    if (!root.isDirectory) {
+        return if (root.delete()) Pair(CleanupStatus.COMPLETE, emptyList())
+        else Pair(CleanupStatus.FAILED, listOf(root.absolutePath))
+    }
+    val failedPaths = mutableListOf<String>()
+    val canonicalRoot = root.canonicalFile
+    val visited = mutableSetOf<String>()
+    fun safeWalk(dir: File) {
+        val canonical = dir.canonicalFile
+        if (!visited.add(canonical.path)) return
+        if (!canonical.path.startsWith(canonicalRoot.path + File.separator) && canonical != canonicalRoot) return
+        if (canonical.absolutePath != canonical.path) return
+        if (java.nio.file.Files.isSymbolicLink(canonical.toPath())) return
+        val children = canonical.listFiles() ?: run {
+            if (!dir.delete()) failedPaths.add(dir.absolutePath)
+            return
+        }
+        children.forEach { safeWalk(it) }
+        if (!dir.delete()) failedPaths.add(dir.absolutePath)
+    }
+    safeWalk(root)
+    return when {
+        failedPaths.isEmpty() -> Pair(CleanupStatus.COMPLETE, emptyList())
+        !root.exists() -> Pair(CleanupStatus.PARTIAL, failedPaths)
+        else -> Pair(CleanupStatus.FAILED, failedPaths)
+    }
+}
+
+internal fun listFilesNoFollow(root: File): List<File> {
+    if (!root.isDirectory) return emptyList()
+    val canonical = root.canonicalFile
+    val result = mutableListOf<File>()
+    val visited = mutableSetOf<String>()
+    fun walk(dir: File) {
+        val c = dir.canonicalFile
+        if (!visited.add(c.path)) return
+        if (!c.path.startsWith(canonical.path + File.separator) && c != canonical) return
+        if (c.absolutePath != c.path) return
+        val children = dir.listFiles() ?: return
+        for (child in children) {
+            result.add(child)
+            if (child.isDirectory && !java.nio.file.Files.isSymbolicLink(child.toPath())) {
+                walk(child)
+            }
+        }
+    }
+    walk(root)
+    return result
+}
+
+internal fun folderSizeBytesNoFollow(file: File): Long {
+    if (!file.exists()) return 0L
+    if (file.isFile) return file.length()
+    var total = 0L
+    val visited = mutableSetOf<String>()
+    val canonicalRoot = file.canonicalFile
+    fun walk(dir: File) {
+        val c = dir.canonicalFile
+        if (!visited.add(c.path)) return
+        if (!c.path.startsWith(canonicalRoot.path + File.separator) && c != canonicalRoot) return
+        if (c.absolutePath != c.path) return
+        val children = dir.listFiles() ?: return
+        for (child in children) {
+            if (child.isDirectory) walk(child) else total += child.length()
+        }
+    }
+walk(file)
+    return total
 }

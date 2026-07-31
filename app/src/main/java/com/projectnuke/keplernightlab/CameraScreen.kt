@@ -427,6 +427,14 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var latestSummary by remember { mutableStateOf("최근 결과 없음") }
     var latestResult by remember { mutableStateOf<LatestKeplerResult?>(null) }
     var showResultPreview by remember { mutableStateOf(false) }
+    val latestBitmapRef = remember { AtomicReference<Bitmap?>(null) }
+
+    DisposableEffect(latestResult) {
+        latestBitmapRef.set(latestResult?.bitmap)
+        onDispose {
+            latestBitmapRef.getAndSet(null)?.let { if (!it.isRecycled) it.recycle() }
+        }
+    }
     var processingPreviewBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var processingPreviewStatus by remember { mutableStateOf("최근 결과를 촬영하면 설정 미리보기가 표시됩니다.") }
     val refreshMutex = remember { Mutex() }
@@ -439,6 +447,7 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
         ++refreshGeneration
         refreshJob?.cancel()
         refreshJob = null
+        latestBitmapRef.getAndSet(null)?.let { if (!it.isRecycled) it.recycle() }
         latestBitmap?.takeIf { !it.isRecycled }?.recycle()
         latestBitmap = null
         latestResult = null
@@ -1115,7 +1124,7 @@ mainHandler.removeCallbacks(watchdog)
                     }
                 },
                 onClear = {
-                    val deleted = deleteKeplerCache(context)
+                    val (deleted, _) = deleteKeplerCache(context)
                     clearLatestResultState()
                     status = "캐시 삭제 완료 ($deleted)"
                 },
@@ -1313,7 +1322,7 @@ mainHandler.removeCallbacks(watchdog)
                     onOpenCacheJobs()
                 },
                 onClearCache = {
-                    val deleted = deleteKeplerCache(context)
+                    val (deleted, _) = deleteKeplerCache(context)
                     clearLatestResultState()
                     status = "캐시 삭제 완료 ($deleted)"
                     currentScreen = MainScreen.CAMERA

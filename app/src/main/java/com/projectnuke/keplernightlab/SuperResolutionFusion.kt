@@ -1034,43 +1034,104 @@ private fun applySuperResolutionDenoiseInPlace(
     algorithm: DenoiseAlgorithm,
     cancellation: KeplerPipelineCancellation
 ) {
-    if (strength <= 0f || width < 3 || height < 3) return
+    if (strength <= 0f || width < 5 || height < 5) return
+    val radius = 2
+    val coreX0 = radius
+    val coreY0 = radius
+    val coreX1 = width - radius
+    val coreY1 = height - radius
+    if (coreX1 <= coreX0 || coreY1 <= coreY0) return
     val source = pixels.copyOf()
-    for (y in 1 until height - 1) {
+    val amount = strength.coerceIn(0f, 1f)
+    for (y in coreY0 until coreY1) {
         if ((y and 15) == 0) cancellation.throwIfCancelled()
-        for (x in 1 until width - 1) {
+        for (x in coreX0 until coreX1) {
             val index = y * width + x
             val center = source[index]
-            val neighbors = intArrayOf(
-                source[index - 1], source[index + 1],
-                source[index - width], source[index + width]
-            )
-            val target = when (algorithm) {
-                DenoiseAlgorithm.GUIDED -> neighbors.averageColor()
-                DenoiseAlgorithm.WAVELET -> {
-                    val diagonal = intArrayOf(source[index - width - 1], source[index - width + 1], source[index + width - 1], source[index + width + 1])
-                    averageColors(neighbors + diagonal)
+            val cr = Color.red(center); val cg = Color.green(center); val cb = Color.blue(center)
+            var sumR = 0; var sumG = 0; var sumB = 0; var count = 0
+            for (dy in -radius..radius) {
+                for (dx in -radius..radius) {
+                    val n = source[(y + dy) * width + (x + dx)]
+                    sumR += Color.red(n); sumG += Color.green(n); sumB += Color.blue(n)
+                    count++
                 }
-                DenoiseAlgorithm.BILATERAL -> neighbors.minByOrNull { colorDistance(it, center) } ?: center
             }
-            pixels[index] = blendColor(center, target, strength.coerceIn(0f, 1f))
+            if (count == 0) continue
+            val meanR = sumR.toFloat() / count
+            val meanG = sumG.toFloat() / count
+            val meanB = sumB.toFloat() / count
+            val target = when (algorithm) {
+                DenoiseAlgorithm.GUIDED -> {
+                    val epsilon = 900f
+                    var vR = 0f; var vG = 0f; var vB = 0f
+                    for (dy2 in -radius..radius) {
+                        for (dx2 in -radius..radius) {
+                            val n2 = source[(y + dy2) * width + (x + dx2)]
+                            val dR = Color.red(n2).toFloat() - meanR
+                            val dG = Color.green(n2).toFloat() - meanG
+                            val dB = Color.blue(n2).toFloat() - meanB
+                            vR += dR * dR; vG += dG * dG; vB += dB * dB
+                        }
+                    }
+                    val aR = vR / (vR + epsilon); val aG = vG / (vG + epsilon); val aB = vB / (vB + epsilon)
+                    val bR = meanR - aR * meanR; val bG = meanG - aG * meanG; val bB = meanB - aB * meanB
+                    Color.rgb(
+                        (aR * cr + bR).roundToInt().coerceIn(0, 255),
+                        (aG * cg + bG).roundToInt().coerceIn(0, 255),
+                        (aB * cb + bB).roundToInt().coerceIn(0, 255)
+                    )
+                }
+                DenoiseAlgorithm.WAVELET -> {
+                    val threshold = 45f
+                    val dR = kotlin.math.abs(cr.toFloat() - meanR)
+                    val dG = kotlin.math.abs(cg.toFloat() - meanG)
+                    val dB = kotlin.math.abs(cb.toFloat() - meanB)
+                    Color.rgb(
+                        (if (dR < threshold) meanR else cr.toFloat()).roundToInt().coerceIn(0, 255),
+                        (if (dG < threshold) meanG else cg.toFloat()).roundToInt().coerceIn(0, 255),
+                        (if (dB < threshold) meanB else cb.toFloat()).roundToInt().coerceIn(0, 255)
+                    )
+                }
+                DenoiseAlgorithm.BILATERAL -> {
+                    val sS2 = 1.5f; val rS2 = 750f
+                    var sumRw = 0f; var sumGw = 0f; var sumBw = 0f; var totalW = 0f
+                    for (dy2 in -radius..radius) {
+                        for (dx2 in -radius..radius) {
+                            val n2 = source[(y + dy2) * width + (x + dx2)]
+                            val ndr = Color.red(n2).toFloat() - cr.toFloat()
+                            val ndg = Color.green(n2).toFloat() - cg.toFloat()
+                            val ndb = Color.blue(n2).toFloat() - cb.toFloat()
+                            val dist2 = (dx2 * dx2 + dy2 * dy2).toFloat() / sS2 +
+                                (2f * ndr * ndr + ndg * ndg + ndb * ndb) / rS2
+                            val w = 1f / (1f + dist2)
+                            sumRw += Color.red(n2).toFloat() * w
+                            sumGw += Color.green(n2).toFloat() * w
+                            sumBw += Color.blue(n2).toFloat() * w
+                            totalW += w
+                        }
+                    }
+                    if (totalW <= 0f) center else Color.rgb(
+                        (sumRw / totalW).roundToInt().coerceIn(0, 255),
+                        (sumGw / totalW).roundToInt().coerceIn(0, 255),
+                        (sumBw / totalW).roundToInt().coerceIn(0, 255)
+                    )
+                }
+            }
+            pixels[index] = blendColorInt(center, target, amount)
         }
     }
 }
 
-private fun IntArray.averageColor(): Int = averageColors(this)
-private fun averageColors(values: IntArray): Int = Color.rgb(
-    values.map { Color.red(it) }.average().roundToInt(),
-    values.map { Color.green(it) }.average().roundToInt(),
-    values.map { Color.blue(it) }.average().roundToInt()
-)
-private fun colorDistance(a: Int, b: Int): Int =
-    abs(Color.red(a) - Color.red(b)) + abs(Color.green(a) - Color.green(b)) + abs(Color.blue(a) - Color.blue(b))
-private fun blendColor(a: Int, b: Int, amount: Float): Int = Color.rgb(
-    (Color.red(a) * (1f - amount) + Color.red(b) * amount).roundToInt(),
-    (Color.green(a) * (1f - amount) + Color.green(b) * amount).roundToInt(),
-    (Color.blue(a) * (1f - amount) + Color.blue(b) * amount).roundToInt()
-)
+private fun blendColorInt(a: Int, b: Int, amount: Float): Int {
+    val clamped = amount.coerceIn(0f, 1f)
+    val inv = 1f - clamped
+    return Color.rgb(
+        (Color.red(a) * inv + Color.red(b) * clamped).roundToInt().coerceIn(0, 255),
+        (Color.green(a) * inv + Color.green(b) * clamped).roundToInt().coerceIn(0, 255),
+        (Color.blue(a) * inv + Color.blue(b) * clamped).roundToInt().coerceIn(0, 255)
+    )
+}
 
 private fun applySuperResolutionDetailInPlace(
     pixels: IntArray,

@@ -141,7 +141,8 @@ private class CameraPreviewController(
     private var lastActivePhysicalLog: String? = null
     @Volatile private var latestFocusAeState: FocusAeState = FocusAeState()
     @Volatile private var latestMeteringMode: MeteringMode = MeteringModeState.mode
-    @Volatile private var started = false
+    private enum class PreviewState { STOPPED, STARTING, OPEN, STOPPING }
+    @Volatile private var previewState = PreviewState.STOPPED
 
     fun start(textureView: TextureView) {
         if (
@@ -154,9 +155,10 @@ private class CameraPreviewController(
         }
 
         val localGeneration = synchronized(lock) {
-            if (started && backgroundHandler != null && previewSurface != null) return
+            if (previewState == PreviewState.STARTING) return
+            if (previewState == PreviewState.OPEN && backgroundHandler != null && previewSurface != null) return
             generation += 1
-            started = true
+            previewState = PreviewState.STARTING
             generation
         }
         Log.d(TAG, "start generation=$localGeneration cameraId=$cameraId zoom=$latestZoomRatio metering=$latestMeteringMode")
@@ -195,8 +197,8 @@ private class CameraPreviewController(
 
     fun stop() {
         val refs = synchronized(lock) {
+            previewState = PreviewState.STOPPING
             generation += 1
-            started = false
             Log.d(TAG, "stop generation=$generation")
             StopRefs(captureSession, cameraDevice, previewSurface, backgroundThread)
                 .also {
@@ -207,6 +209,7 @@ private class CameraPreviewController(
                     backgroundThread = null
                     backgroundHandler = null
                     currentPreviewSize = null
+                    previewState = PreviewState.STOPPED
                 }
         }
 
@@ -215,6 +218,7 @@ private class CameraPreviewController(
         runCatching { refs.device?.close() }
         runCatching { refs.surface?.release() }
         runCatching { refs.thread?.quitSafely() }
+        runCatching { refs.thread?.join(2000L) }
     }
 
     fun updateFocusAeState(newState: FocusAeState) {
@@ -330,13 +334,14 @@ private class CameraPreviewController(
                 thread.quitSafely()
                 return
             }
-            val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
             val aeStep = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
-            onAeCapabilitiesChangedProvider().invoke(
-                aeRange?.lower ?: 0,
-                aeRange?.upper ?: 0,
-                aeStep?.toFloat() ?: 0f
-            )
+            val minIndex = aeRange?.lower ?: 0
+            val maxIndex = aeRange?.upper ?: 0
+            val stepEv = aeStep?.toFloat() ?: 0f
+            Handler(android.os.Looper.getMainLooper()).post {
+                onAeCapabilitiesChangedProvider().invoke(minIndex, maxIndex, stepEv)
+            }
             val previewSize = choosePreviewSize(characteristics)
             if (!storeCurrentPreviewSize(localGeneration, previewSize)) {
                 thread.quitSafely()
@@ -837,7 +842,7 @@ private class CameraPreviewController(
     }
 
     private fun isActiveLocked(localGeneration: Int): Boolean {
-        return started && generation == localGeneration
+        return (previewState == PreviewState.STARTING || previewState == PreviewState.OPEN) && generation == localGeneration
     }
 
     private fun storeCameraCharacteristics(
@@ -876,12 +881,13 @@ private class CameraPreviewController(
         true
     }
 
-    private fun storeCaptureSession(
+private fun storeCaptureSession(
         localGeneration: Int,
         session: CameraCaptureSession
     ): Boolean = synchronized(lock) {
         if (!isActiveLocked(localGeneration)) return false
         captureSession = session
+        previewState = PreviewState.OPEN
         true
     }
 

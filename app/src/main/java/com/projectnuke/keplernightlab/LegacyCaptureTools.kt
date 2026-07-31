@@ -372,7 +372,7 @@ fun KeplerNightLabApp() {
                     Button(
                         modifier = Modifier.fillMaxWidth(),
                         onClick = {
-                            val deleted = deleteKeplerCache(context)
+                            val (deleted, _) = deleteKeplerCache(context)
                             rawStatus = "캐시 삭제 완료\n삭제된 파일/폴더: $deleted 개"
                         }
                     ) {
@@ -1797,9 +1797,9 @@ fun writeYPlaneCompact(image: Image, outFile: File) {
     }
 }
 
-fun deleteKeplerCache(context: Context): Int {
+fun deleteKeplerCache(context: Context): Pair<Int, CleanupStatus> {
     val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
-        ?: return 0
+        ?: return Pair(0, CleanupStatus.FAILED)
 
     val targets = listOf(
         File(picturesDir, "KeplerRaw"),
@@ -1809,26 +1809,24 @@ fun deleteKeplerCache(context: Context): Int {
     )
 
     var deletedCount = 0
-
-    fun deleteRecursive(file: File) {
-        if (!file.exists()) return
-
-        if (file.isDirectory) {
-            file.listFiles()?.forEach { child ->
-                deleteRecursive(child)
-            }
-        }
-
-        if (file.delete()) {
-            deletedCount++
-        }
-    }
+    var allComplete = true
 
     targets.forEach { dir ->
-        deleteRecursive(dir)
+        val (status, failedPaths) = deleteRecursivelySafe(dir)
+        if (failedPaths.isNotEmpty()) deletedCount -= failedPaths.size
+        deletedCount += totalDeletedFromStatus(status, failedPaths)
+        if (status != CleanupStatus.COMPLETE) allComplete = false
     }
 
-    return deletedCount
+    return Pair(deletedCount, if (allComplete) CleanupStatus.COMPLETE else CleanupStatus.PARTIAL)
+}
+
+private fun totalDeletedFromStatus(status: CleanupStatus, failedPaths: List<String>): Int {
+    return when (status) {
+        CleanupStatus.COMPLETE -> 1
+        CleanupStatus.PARTIAL -> maxOf(1 - failedPaths.size, 0)
+        CleanupStatus.FAILED -> 0
+    }
 }
 
 fun writeBurstJobJson(

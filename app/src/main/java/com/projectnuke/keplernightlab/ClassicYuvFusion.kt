@@ -246,20 +246,32 @@ internal fun processClassicYuvFusionJob(
             current.put("yuvProcessingSameSizeFrames", sameSizeFrameCount)
         }
         val acceptedFrames = sameSizeFrames.filter { it === reference || it.alignmentUsed }
-        val compatibleFrames = if (acceptedFrames.size >= 2) acceptedFrames else sameSizeFrames.take(2)
-        compatibleFrameCount = compatibleFrames.size
-        compatibleFrameCountKnown = true
-        job.put("yuvProcessingCompatibleFrames", compatibleFrameCount)
-        KeplerJobMetadata.update(jobDir) { current ->
-            current.put("yuvProcessingCompatibleFrames", compatibleFrameCount)
+        val compatibleFrames: List<ClassicFrame>
+        val singleReferenceFallback: Boolean
+        if (acceptedFrames.size >= 2) {
+            compatibleFrames = acceptedFrames
+            singleReferenceFallback = false
+        } else {
+            // Single-reference fallback: only the reference is usable
+            compatibleFrames = listOf(reference)
+            singleReferenceFallback = true
         }
-        if (compatibleFrames.size < 2) {
+        compatibleFrameCount = compatibleFrames.size
+        sameSizeFrameCountKnown = true
+        compatibleFrameCountKnown = true
+        job.put("yuvProcessingCompatibleFrames", compatibleFrames.size)
+        job.put("yuvSingleReferenceFallback", singleReferenceFallback)
+        KeplerJobMetadata.update(jobDir) { current ->
+            current.put("yuvProcessingCompatibleFrames", compatibleFrames.size)
+            current.put("yuvSingleReferenceFallback", singleReferenceFallback)
+        }
+        if (compatibleFrames.size < 2 && !singleReferenceFallback) {
             error(
                 "Not enough same-size YUV frames to fuse: " +
                     "compatible=${compatibleFrames.size}, sameSize=${sameSizeFrames.size}, decoded=${frames.size}"
             )
         }
-        val activeReference = compatibleFrames.find { it === reference } ?: compatibleFrames.first()
+        val activeReference = compatibleFrames.find { it === reference }!!
         activeReferenceIndex = activeReference.jsonIndex
         activeReference.isReference = true
         compatibleFrames.forEach { frame ->
@@ -761,7 +773,7 @@ private fun mergeClassicFrames(
     var comparedPixels = 0L
     val reportedMergeFrames = mutableSetOf<Int>()
     try {
-        frames.forEach { frame ->
+frames.forEach { frame ->
             cancellation.throwIfCancelled()
             decoders[frame] = BitmapRegionDecoder.newInstance(frame.file.absolutePath, false)
         }
@@ -776,6 +788,10 @@ private fun mergeClassicFrames(
         )
         val mergeTileRows = memoryPlan.tileRows
         var tileTop = 0
+        val decodeOpts = BitmapFactory.Options().apply {
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+            inPremultiplied = false
+        }
         while (tileTop < height) {
             cancellation.throwIfCancelled()
             val tileBottom = min(height, tileTop + mergeTileRows)
@@ -783,7 +799,7 @@ private fun mergeClassicFrames(
             val pixelCount = width * tileHeight
             val referenceBitmap = decoders.getValue(reference).decodeRegion(
                 Rect(0, tileTop, width, tileBottom),
-                BitmapFactory.Options()
+                decodeOpts
             ) ?: error("Could not decode reference tile")
             val referencePixels = try {
                 IntArray(pixelCount).also {
@@ -817,7 +833,7 @@ private fun mergeClassicFrames(
         val sourceBottom = min(height, tileBottom + frame.alignDy)
         if (sourceRight <= sourceLeft || sourceBottom <= sourceTop) return@forEachIndexed
         val region = Rect(sourceLeft, sourceTop, sourceRight, sourceBottom)
-        val frameBitmap = decoders.getValue(frame).decodeRegion(region, BitmapFactory.Options())
+        val frameBitmap = decoders.getValue(frame).decodeRegion(region, decodeOpts)
             ?: return@forEachIndexed
                 val (frameWidth, frameHeight, framePixels) = try {
                     val frameWidth = frameBitmap.width
@@ -900,8 +916,8 @@ private fun resolveExternalFrameWeight(
 }
 
 private fun alignmentWeight(score: Float, rejectThreshold: Float): Float {
-    if (!score.isFinite()) return 0.10f
-    return (1f - score / rejectThreshold).coerceIn(0.12f, 1f)
+    if (!score.isFinite()) return 0f
+    return (1f - score / rejectThreshold).coerceIn(0f, 1f)
 }
 
 private fun ghostWeight(lumaDifference: Float, params: ClassicYuvFusionParams): Float {

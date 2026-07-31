@@ -3024,7 +3024,11 @@ internal data class ReprocessTransactionManifest(
  */
 internal fun loadStrictManifest(manifestFile: File): ReprocessTransactionManifest {
     require(manifestFile.isFile) { "Manifest file missing: ${manifestFile.absolutePath}" }
-    val json = JSONObject(manifestFile.readText())
+    val canonical = manifestFile.canonicalFile
+    require(!java.nio.file.Files.isSymbolicLink(canonical.toPath())) { "Manifest file is a symbolic link: ${canonical.absolutePath}" }
+    require(canonical.absolutePath == canonical.path) { "Manifest file has non-canonical path" }
+    val rawBytes = manifestFile.readBytes()
+    val json = JSONObject(String(rawBytes, Charsets.UTF_8))
     return ReprocessTransactionManifest.fromJson(json)
 }
 
@@ -3951,7 +3955,7 @@ private fun putReprocessAvailability(
     sourceFrameCount: Int,
     finalOutputFile: File?
 ) {
-    val debugAvailable = jobDir.walkTopDown().any { file ->
+    val debugAvailable = listFilesNoFollow(jobDir).any { file ->
         file.isFile && file.name != JOB_JSON_FILE_NAME && file.name.lowercase(Locale.US).let { name ->
             name.contains("debug") || name.contains("compare") || name.endsWith(".log")
         }

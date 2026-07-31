@@ -157,7 +157,7 @@ private fun copyYuvFrameToMemory(image: Image, index: Int): BufferedYuvFrame {
     fun copyPlane(plane: Image.Plane): ByteArray {
         val buffer = plane.buffer.duplicate()
         buffer.position(0)
-        return ByteArray(buffer.limit()).also(buffer::get)
+        return ByteArray(buffer.remaining()).also(buffer::get)
     }
 
     val yPlane = image.planes[0]
