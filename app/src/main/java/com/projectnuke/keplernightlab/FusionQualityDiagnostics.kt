@@ -48,14 +48,14 @@ fun saveBoundedDiagnosticPreview(
 }
 
 fun loadBoundedDiagnosticPreview(file: File, maxDimension: Int = FUSION_DIAG_MAX_DIM): Bitmap? {
-    if (!file.isFile) return null
+    if (!NoFollowFileSystem.isRealFile(file.toPath())) return null
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    BitmapFactory.decodeFile(file.absolutePath, bounds)
+    NoFollowFileSystem.decodeBitmapVerified(file, bounds)
     if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
     var sample = 1
     while (max(bounds.outWidth / sample, bounds.outHeight / sample) > maxDimension) sample *= 2
-    return BitmapFactory.decodeFile(
-        file.absolutePath,
+    return NoFollowFileSystem.decodeBitmapVerified(
+        file,
         BitmapFactory.Options().apply {
             inSampleSize = sample
             inPreferredConfig = Bitmap.Config.ARGB_8888

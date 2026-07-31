@@ -79,6 +79,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -464,9 +467,17 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
         )
     }
     val settingsPersistence = remember {
-        CameraSettingsPersistenceDebouncer<CameraUiSettings> { settings ->
+        CameraSettingsPersistenceDebouncer<CameraUiSettings>(write = { settings ->
             CameraSettingsStore.save(context, settings)
+        })
+    }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, settingsPersistence) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) settingsPersistence.flush()
         }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
     val cameraScope = rememberCoroutineScope()
     var refreshGeneration by remember { mutableIntStateOf(0) }
@@ -553,7 +564,7 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
     DisposableEffect(Unit) {
         onDispose {
-            settingsPersistence.flush()
+            settingsPersistence.close()
             previewUiGeneration.incrementAndGet()
             previewWorker.close()
             clearLatestResultState()

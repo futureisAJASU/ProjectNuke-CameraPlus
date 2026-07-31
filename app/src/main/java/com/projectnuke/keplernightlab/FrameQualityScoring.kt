@@ -210,16 +210,16 @@ private fun greenAlignedX(cfa: Int, y: Int, proposedX: Int): Int {
 }
 
 private fun loadBitmapLumaSample(file: File): QualityLumaSample {
-    require(file.isFile) { "Color frame missing: ${file.name}" }
+    require(NoFollowFileSystem.isRealFile(file.toPath())) { "Color frame missing: ${file.name}" }
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    BitmapFactory.decodeFile(file.absolutePath, bounds)
+    NoFollowFileSystem.decodeBitmapVerified(file, bounds)
     require(bounds.outWidth > 0 && bounds.outHeight > 0) { "Unreadable image: ${file.name}" }
     var sampleSize = 1
     while (max(bounds.outWidth / sampleSize, bounds.outHeight / sampleSize) > QUALITY_MAX_SAMPLE_DIMENSION) {
         sampleSize *= 2
     }
-    val bitmap = BitmapFactory.decodeFile(
-        file.absolutePath,
+    val bitmap = NoFollowFileSystem.decodeBitmapVerified(
+        file,
         BitmapFactory.Options().apply {
             inSampleSize = sampleSize
             inPreferredConfig = Bitmap.Config.ARGB_8888

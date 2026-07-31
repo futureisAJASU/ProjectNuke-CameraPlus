@@ -386,7 +386,7 @@ fun cleanupNightFusionJobAfterVerifiedExport(
     val jobFile = NoFollowFileSystem.optionalDirectChildFile(jobDir, JOB_JSON_FILE_NAME)
         ?: return CleanupResult(0, 0L, emptyList())
 
-    val job = JSONObject(jobFile.readText())
+    val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
     if (!job.optBoolean("exportVerified", false)) {
         onStatus("Cleanup skipped: export not verified.")
         return CleanupResult(0, 0L, NoFollowFileSystem.requireDirectChildren(jobDir).map { it.name })

@@ -37,6 +37,9 @@ import java.util.UUID
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.CancellationException
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.max
@@ -132,6 +135,9 @@ fun captureRawBurstForFusion(
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     val thread = HandlerThread("KeplerRawFusionCaptureThread").apply { start() }
     val handler = Handler(thread.looper)
+    val timeoutScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "KeplerRawFusionTimeout").apply { isDaemon = true }
+    }
     var cameraDevice: CameraDevice? = null
     var session: CameraCaptureSession? = null
     var reader: ImageReader? = null
@@ -162,7 +168,6 @@ fun captureRawBurstForFusion(
 
     fun cleanup() {
         if (!cleanupStarted.compareAndSet(false, true)) return
-        timeoutRunnable?.let { handler.removeCallbacks(it) }
         timeoutRunnable = null
         runCatching { reader?.setOnImageAvailableListener(null, null) }
         imagesByTimestamp.values.forEach { runCatching { it.close() } }
@@ -175,6 +180,7 @@ fun captureRawBurstForFusion(
         try { reader?.close() } catch (_: Exception) {}
         try { cameraDevice?.close() } catch (_: Exception) {}
         try { motionLogger?.stop() } catch (_: Exception) {}
+        timeoutScheduler.shutdownNow()
         try { thread.quitSafely() } catch (_: Exception) {}
     }
 
@@ -734,7 +740,7 @@ fun captureRawBurstForFusion(
                     finishError("CAPTURE_TIMEOUT", message)
                 }
             }
-        }.also { handler.postDelayed(it, max(30_000L, requestedFrames * 8_000L)) }
+        }.also { timeoutScheduler.schedule({ handler.post(it) }, max(30_000L, requestedFrames * 8_000L), TimeUnit.MILLISECONDS) }
 
         imageReader.setOnImageAvailableListener({ r ->
             if (finished.get()) return@setOnImageAvailableListener
@@ -1869,26 +1875,40 @@ private fun writeCompactRaw16(image: Image, file: File) {
     val pixelStride = plane.pixelStride
     val limit = buffer.limit()
     val rowBytes = ByteArray(width * 2)
-    BufferedOutputStream(FileOutputStream(file)).use { output ->
-        for (y in 0 until height) {
-            val row = y * rowStride
-            var out = 0
-            for (x in 0 until width) {
-                val index = row + x * pixelStride
-                if (index + 1 < limit) {
-                    rowBytes[out++] = buffer.get(index)
-                    rowBytes[out++] = buffer.get(index + 1)
-                } else {
-                    rowBytes[out++] = 0
-                    rowBytes[out++] = 0
+    val temp = File(file.parentFile, ".${file.name}.${System.nanoTime()}.tmp")
+    var committed = false
+    try {
+        val fileOutput = FileOutputStream(temp)
+        fileOutput.use { rawOutput ->
+            BufferedOutputStream(rawOutput).use { output ->
+                for (y in 0 until height) {
+                    val row = y * rowStride
+                    var out = 0
+                    for (x in 0 until width) {
+                        val index = row + x * pixelStride
+                        if (index + 1 < limit) {
+                            rowBytes[out++] = buffer.get(index)
+                            rowBytes[out++] = buffer.get(index + 1)
+                        } else {
+                            rowBytes[out++] = 0
+                            rowBytes[out++] = 0
+                        }
+                    }
+                    output.write(rowBytes)
                 }
             }
-            output.write(rowBytes)
+            rawOutput.fd.sync()
         }
-    }
+        KeplerJobMetadata.atomicReplace(temp, file)
+        committed = true
     val expectedSize = width * height * 2L
-    if (!file.exists() || file.length() < expectedSize) {
-        error("RAW16 output invalid: ${file.absolutePath}, size=${file.length()}, expected=$expectedSize")
+        val attrs = NoFollowFileSystem.inspect(file.toPath())
+        val size = (attrs as? NoFollowInspection.Present)?.value?.size() ?: -1L
+        if (size < expectedSize) {
+            error("RAW16 output invalid: ${file.absolutePath}, size=$size, expected=$expectedSize")
+        }
+    } finally {
+        if (!committed) runCatching { temp.delete() }
     }
 }
 

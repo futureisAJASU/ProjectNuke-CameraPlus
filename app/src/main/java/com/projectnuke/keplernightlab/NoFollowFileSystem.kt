@@ -1,5 +1,7 @@
 package com.projectnuke.keplernightlab
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import java.io.File
 import java.nio.file.DirectoryStream
 import java.nio.file.Files
@@ -14,6 +16,35 @@ internal sealed interface NoFollowInspection<out T> {
 }
 
 internal object NoFollowFileSystem {
+    fun readBytesVerified(file: File): ByteArray = when (val inspection = inspect(file.toPath())) {
+        NoFollowInspection.Absent -> throw java.io.FileNotFoundException(file.absolutePath)
+        is NoFollowInspection.InspectionFailed -> throw inspection.exception
+        is NoFollowInspection.Present -> {
+            val attrs = inspection.value
+            require(attrs.isRegularFile && !attrs.isSymbolicLink()) { "Unsafe file: ${file.absolutePath}" }
+            val bytes = Files.newInputStream(file.toPath(), LinkOption.NOFOLLOW_LINKS).use { it.readBytes() }
+            val after = when (val current = inspect(file.toPath())) {
+                is NoFollowInspection.Present -> current.value
+                else -> error("File changed during read: ${file.absolutePath}")
+            }
+            require(
+                after.isRegularFile && !after.isSymbolicLink() &&
+                    ((attrs.fileKey() != null && after.fileKey() != null && attrs.fileKey() == after.fileKey()) ||
+                        (attrs.size() == after.size() && attrs.lastModifiedTime() == after.lastModifiedTime()))
+            ) { "File identity changed during read: ${file.absolutePath}" }
+            bytes
+        }
+    }
+
+    fun readTextVerified(file: File): String = readBytesVerified(file).toString(Charsets.UTF_8)
+
+    fun decodeBitmapVerified(file: File, options: BitmapFactory.Options? = null): Bitmap? {
+        val bytes = readBytesVerified(file)
+        return if (options == null) BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        else BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+    }
+
+    @Deprecated("Use inspect() and handle InspectionFailed explicitly")
     fun attributes(path: Path): BasicFileAttributes? = runCatching {
         Files.readAttributes(path, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
     }.getOrNull()
@@ -33,8 +64,29 @@ internal object NoFollowFileSystem {
         is NoFollowInspection.InspectionFailed -> false
         is NoFollowInspection.Present -> {
             val actual = current.value
-            !actual.isSymbolicLink() && actual.isDirectory == expected.isDirectory &&
-                (expected.fileKey() == null || expected.fileKey() == actual.fileKey())
+            !actual.isSymbolicLink() &&
+                actual.isDirectory == expected.isDirectory &&
+                actual.isRegularFile == expected.isRegularFile &&
+                actual.isOther == expected.isOther &&
+                expected.fileKey() != null &&
+                actual.fileKey() != null &&
+                expected.fileKey() == actual.fileKey()
+        }
+    }
+
+    // Directory-stream providers on some Android/Windows filesystems do not expose file keys.
+    // Traversal still refuses symlinks and type changes; authoritative replacement/read paths
+    // use revalidate(), which remains fail-closed when identity is unavailable.
+    private fun revalidateTraversal(path: Path, expected: BasicFileAttributes): Boolean = when (val current = inspect(path)) {
+        NoFollowInspection.Absent -> false
+        is NoFollowInspection.InspectionFailed -> false
+        is NoFollowInspection.Present -> {
+            val actual = current.value
+            !actual.isSymbolicLink() &&
+                actual.isDirectory == expected.isDirectory &&
+                actual.isRegularFile == expected.isRegularFile &&
+                actual.isOther == expected.isOther &&
+                (expected.fileKey() == null || actual.fileKey() == expected.fileKey())
         }
     }
 
@@ -43,7 +95,15 @@ internal object NoFollowFileSystem {
         name: String,
         requireFile: Boolean = false
     ): NoFollowInspection<File> {
-        if (!isRealDirectory(root.toPath()) || name.isBlank() || name != name.trim() ||
+        val rootAttributes = when (val inspection = inspect(root.toPath())) {
+            NoFollowInspection.Absent -> return NoFollowInspection.Absent
+            is NoFollowInspection.InspectionFailed -> return inspection
+            is NoFollowInspection.Present -> inspection.value
+        }
+        if (!rootAttributes.isDirectory || rootAttributes.isSymbolicLink()) {
+            return NoFollowInspection.InspectionFailed(IllegalStateException("Expected a real directory"))
+        }
+        if (name.isBlank() || name != name.trim() ||
             name == "." || name == ".." || name.contains('/') || name.contains('\\')
         ) return NoFollowInspection.InspectionFailed(
             IllegalArgumentException("Unsafe direct-child path")
@@ -52,7 +112,7 @@ internal object NoFollowFileSystem {
         if (path.parent != root.toPath()) {
             return NoFollowInspection.InspectionFailed(IllegalArgumentException("Path escapes root"))
         }
-        return when (val result = inspect(path)) {
+        val result = when (val result = inspect(path)) {
             NoFollowInspection.Absent -> NoFollowInspection.Absent
             is NoFollowInspection.InspectionFailed -> result
             is NoFollowInspection.Present -> {
@@ -64,31 +124,33 @@ internal object NoFollowFileSystem {
                 }
             }
         }
+        return result
     }
 
-    fun isRealDirectory(path: Path): Boolean = attributes(path)?.let {
-        it.isDirectory && !it.isSymbolicLink()
-    } == true
+    fun isRealDirectory(path: Path): Boolean = when (val result = inspect(path)) {
+        is NoFollowInspection.Present -> result.value.isDirectory && !result.value.isSymbolicLink()
+        else -> false
+    }
 
-    fun isRealFile(path: Path): Boolean = attributes(path)?.let {
-        it.isRegularFile && !it.isSymbolicLink()
-    } == true
+    fun isRealFile(path: Path): Boolean = when (val result = inspect(path)) {
+        is NoFollowInspection.Present -> result.value.isRegularFile && !result.value.isSymbolicLink()
+        else -> false
+    }
 
     fun resolveDirectChild(root: File, name: String, requireFile: Boolean = false): File? {
-        if (!isRealDirectory(root.toPath()) || name.isBlank() || name != name.trim()) return null
-        if (name == "." || name == ".." || name.contains('/') || name.contains('\\')) return null
-        val path = root.toPath().resolve(name).normalize()
-        if (path.parent != root.toPath()) return null
-        val attrs = attributes(path) ?: return null
-        if (attrs.isSymbolicLink()) return null
-        if (requireFile && !attrs.isRegularFile) return null
-        return path.toFile()
+        return when (val result = resolveDirectChildResult(root, name, requireFile)) {
+            NoFollowInspection.Absent -> null
+            is NoFollowInspection.Present -> result.value
+            is NoFollowInspection.InspectionFailed -> null
+        }
     }
 
+    @Deprecated("Use listResult() or requireDirectChildren()")
     fun list(root: File): List<File> {
         return when (val result = listResult(root)) {
             is NoFollowInspection.Present -> result.value
-            else -> emptyList()
+            NoFollowInspection.Absent -> emptyList()
+            is NoFollowInspection.InspectionFailed -> emptyList()
         }
     }
 
@@ -105,7 +167,7 @@ internal object NoFollowFileSystem {
         }
         val result = ArrayList<File>()
         fun visit(dir: Path, expected: BasicFileAttributes) {
-            if (!revalidate(dir, expected)) {
+            if (!revalidateTraversal(dir, expected)) {
                 throw java.io.IOException("Directory changed during no-follow traversal: $dir")
             }
             val stream: DirectoryStream<Path> = try {
@@ -113,7 +175,7 @@ internal object NoFollowFileSystem {
             } catch (error: Exception) {
                 throw error
             }
-            if (!revalidate(dir, expected)) {
+            if (!revalidateTraversal(dir, expected)) {
                 stream.close()
                 throw java.io.IOException("Directory changed after open: $dir")
             }
@@ -138,10 +200,12 @@ internal object NoFollowFileSystem {
         }
     }
 
+    @Deprecated("Use directChildrenResult() or requireDirectChildren()")
     fun directChildren(root: File): List<File> {
         return when (val result = directChildrenResult(root)) {
             is NoFollowInspection.Present -> result.value
-            else -> emptyList()
+            NoFollowInspection.Absent -> emptyList()
+            is NoFollowInspection.InspectionFailed -> emptyList()
         }
     }
 
@@ -159,7 +223,7 @@ internal object NoFollowFileSystem {
         val result = ArrayList<File>()
         return try {
             val stream = Files.newDirectoryStream(root.toPath())
-            if (!revalidate(root.toPath(), rootAttrs)) {
+            if (!revalidateTraversal(root.toPath(), rootAttrs)) {
                 stream.close()
                 return NoFollowInspection.InspectionFailed(
                     java.io.IOException("Directory changed after open: ${root.absolutePath}")
@@ -210,10 +274,12 @@ internal object NoFollowFileSystem {
         is NoFollowInspection.InspectionFailed -> throw result.exception
     }
 
+    @Deprecated("Use sizeResult() or requireSize()")
     fun size(root: File): Long {
         return when (val result = sizeResult(root)) {
             is NoFollowInspection.Present -> result.value
-            else -> 0L
+            NoFollowInspection.Absent -> 0L
+            is NoFollowInspection.InspectionFailed -> 0L
         }
     }
 
@@ -276,21 +342,29 @@ internal object NoFollowFileSystem {
                 val stream = try { Files.newDirectoryStream(path) } catch (_: Exception) {
                     failures += path.toString(); return
                 }
-                if (!revalidate(path, attrs)) {
+                if (!revalidateTraversal(path, attrs)) {
                     stream.close()
                     failures += path.toString()
                     return
                 }
-                stream.use { entries -> entries.forEach(::remove) }
+                stream.use { entries ->
+                    for (entry in entries) {
+                        if (!revalidateTraversal(path, attrs)) {
+                            failures += path.toString()
+                            return
+                        }
+                        remove(entry)
+                    }
+                }
             }
-            if (!revalidate(path, attrs) ||
+            if (!revalidateTraversal(path, attrs) ||
                 !runCatching { Files.deleteIfExists(path) }.getOrDefault(false)
             ) failures += path.toString()
         }
         remove(rootPath)
         val status = when {
             failures.isEmpty() -> CleanupStatus.COMPLETE
-            !Files.exists(rootPath, LinkOption.NOFOLLOW_LINKS) -> CleanupStatus.PARTIAL
+            inspect(rootPath) is NoFollowInspection.Absent -> CleanupStatus.PARTIAL
             else -> CleanupStatus.FAILED
         }
         return status to failures

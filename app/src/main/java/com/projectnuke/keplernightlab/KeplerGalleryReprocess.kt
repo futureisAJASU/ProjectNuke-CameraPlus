@@ -3029,7 +3029,20 @@ internal fun loadStrictManifest(manifestFile: File): ReprocessTransactionManifes
     require(attrs.isRegularFile && !attrs.isSymbolicLink()) {
         "Manifest file must be a regular non-symlink file: ${manifestFile.absolutePath}"
     }
-    require(NoFollowFileSystem.revalidate(path, attrs)) {
+    fun sameManifestIdentity(): Boolean = when (val inspection = NoFollowFileSystem.inspect(path)) {
+        is NoFollowInspection.Present -> {
+            val current = inspection.value
+            current.isRegularFile && !current.isSymbolicLink() &&
+                if (attrs.fileKey() != null && current.fileKey() != null) {
+                    attrs.fileKey() == current.fileKey()
+                } else {
+                    attrs.size() == current.size() &&
+                        attrs.lastModifiedTime() == current.lastModifiedTime()
+                }
+        }
+        else -> false
+    }
+    require(sameManifestIdentity()) {
         "Manifest file changed before open: ${manifestFile.absolutePath}"
     }
     val rawBytes = java.nio.file.Files.newByteChannel(
@@ -3048,7 +3061,7 @@ internal fun loadStrictManifest(manifestFile: File): ReprocessTransactionManifes
         require(offset == bytes.size) { "Manifest file was truncated while reading" }
         bytes
     }
-    require(NoFollowFileSystem.revalidate(path, attrs)) {
+    require(sameManifestIdentity()) {
         "Manifest file changed while reading: ${manifestFile.absolutePath}"
     }
     val json = JSONObject(String(rawBytes, Charsets.UTF_8))

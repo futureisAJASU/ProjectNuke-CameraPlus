@@ -163,6 +163,7 @@ private class StreamingPngTileSink(
     private val outputFile: File
 ) : SuperResolutionTileSink {
     private var temporary: File? = null
+    private var rawOutput: FileOutputStream? = null
     private var stream: BufferedOutputStream? = null
     private var deflater: Deflater? = null
     private var width = 0
@@ -179,7 +180,9 @@ private class StreamingPngTileSink(
         parent.mkdirs()
         val temp = File(parent, ".${outputFile.name}.${System.nanoTime()}.tmp")
         temporary = temp
-        val out = BufferedOutputStream(FileOutputStream(temp), 64 * 1024)
+        val fileOutput = FileOutputStream(temp)
+        rawOutput = fileOutput
+        val out = BufferedOutputStream(fileOutput, 64 * 1024)
         stream = out
         deflater = Deflater(Deflater.DEFAULT_COMPRESSION, false)
         row = ByteArray(Math.addExact(1, Math.multiplyExact(width, 4)))
@@ -231,10 +234,12 @@ private class StreamingPngTileSink(
         }
         writeChunk(out, "IEND", ByteArray(0), 0, 0)
         out.flush()
+        rawOutput?.fd?.sync()
         out.close()
         temporary?.let { KeplerJobMetadata.atomicReplace(it, outputFile) }
         encoder.end()
         stream = null
+        rawOutput = null
         deflater = null
         temporary = null
         return outputFile
@@ -245,6 +250,8 @@ private class StreamingPngTileSink(
         deflater?.end()
         temporary?.delete()
         stream = null
+        runCatching { rawOutput?.close() }
+        rawOutput = null
         deflater = null
         temporary = null
     }
@@ -625,7 +632,7 @@ private fun analyzeFrames(
     val bounds = files.mapIndexedNotNull { index, file ->
         cancellation.throwIfCancelled()
         val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeFile(file.absolutePath, options)
+        NoFollowFileSystem.decodeBitmapVerified(file, options)
         cancellation.throwIfCancelled()
         if (options.outWidth > 0 && options.outHeight > 0) {
             Triple(index, options.outWidth, options.outHeight)
@@ -664,8 +671,8 @@ private fun decodeLumaFrame(
     var sampleSize = 1
     while (sourceWidth / (sampleSize * 2) >= proxyWidth) sampleSize *= 2
     cancellation.throwIfCancelled()
-    val decoded = BitmapFactory.decodeFile(
-        file.absolutePath,
+    val decoded = NoFollowFileSystem.decodeBitmapVerified(
+        file,
         BitmapFactory.Options().apply {
             inSampleSize = sampleSize
             inPreferredConfig = Bitmap.Config.ARGB_8888
@@ -1647,7 +1654,7 @@ private fun writeSuperResolutionJob(
 
 private fun readColorBurstFrameFiles(jobDir: File): List<File> {
     val jobFile = NoFollowFileSystem.requireDirectChildFile(jobDir, SUPER_RES_JOB_FILE)
-    val frames = JSONObject(jobFile.readText()).optJSONArray("frames") ?: JSONArray()
+        val frames = JSONObject(NoFollowFileSystem.readTextVerified(jobFile)).optJSONArray("frames") ?: JSONArray()
     return buildList {
         for (index in 0 until frames.length()) {
             val name = frames.optJSONObject(index)?.optString("file").orEmpty()

@@ -80,7 +80,7 @@ object KeplerJobMetadata {
             is NoFollowInspection.Present -> result.value
         }
         try {
-            JSONObject(file.readText())
+            JSONObject(NoFollowFileSystem.readTextVerified(file))
         } catch (parseFailure: JSONException) {
             throw KeplerJobMetadataCorrupt(jobDir, parseFailure)
         } catch (ioFailure: Exception) {
@@ -114,7 +114,7 @@ object KeplerJobMetadata {
             is NoFollowInspection.Present -> result.value
         }
         val job = try {
-            JSONObject(file.readText())
+            JSONObject(NoFollowFileSystem.readTextVerified(file))
         } catch (parseFailure: JSONException) {
             throw KeplerJobMetadataCorrupt(jobDir, parseFailure)
         } catch (ioFailure: Exception) {

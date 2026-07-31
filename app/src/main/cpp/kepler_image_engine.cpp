@@ -115,9 +115,6 @@ ProcessStatus process_argb(const jint* source, jint* output, int width, int heig
         tile_rows <= 0) {
         return ProcessStatus::INVALID_ARGUMENT;
     }
-    if (!source || !output || width <= 0 || height <= 0) {
-        return ProcessStatus::INVALID_ARGUMENT;
-    }
     denoise = std::clamp(denoise, 0, 2);
     tone = std::clamp(tone, -1, 2);
     denoise_strength = clamp01(denoise_strength);
@@ -191,7 +188,7 @@ Java_com_projectnuke_keplernightlab_NativeImageEngine_nativeProcessArgb(
     const jsize source_length = env->GetArrayLength(source);
     const jsize output_length = env->GetArrayLength(output);
     if (env->ExceptionCheck()) return static_cast<jint>(kepler_image::ProcessStatus::ARRAY_ACQUIRE_FAILED);
-    if (source_length != expected || output_length != expected) {
+    if (source_length < expected || output_length < expected) {
         return static_cast<jint>(kepler_image::ProcessStatus::ARRAY_LENGTH_MISMATCH);
     }
     jint* in = env->GetIntArrayElements(source, nullptr);

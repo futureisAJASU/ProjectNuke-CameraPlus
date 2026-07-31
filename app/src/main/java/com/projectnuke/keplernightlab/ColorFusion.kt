@@ -35,6 +35,9 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.min
 
@@ -91,7 +94,7 @@ private fun persistYuvCaptureFailure(
     val jobFile = snapshot.jobFile ?: return
     runCatching {
         val job = if (jobFile.exists()) {
-            JSONObject(jobFile.readText())
+            JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
         } else {
             JSONObject()
         }
@@ -219,6 +222,9 @@ fun captureYuvBurstColorWithMotion(
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     val backgroundThread = HandlerThread("KeplerColorBurstThread").apply { start() }
     val backgroundHandler = Handler(backgroundThread.looper)
+    val timeoutScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "KeplerColorBurstTimeout").apply { isDaemon = true }
+    }
 
     var motionLogger: MotionLogger? = null
     var cameraDevice: CameraDevice? = null
@@ -260,6 +266,7 @@ fun captureYuvBurstColorWithMotion(
         try { imageReader?.close() } catch (_: Exception) {}
         try { cameraDevice?.close() } catch (_: Exception) {}
         try { motionLogger?.stop() } catch (_: Exception) {}
+        timeoutScheduler.shutdownNow()
         try { backgroundThread.quitSafely() } catch (_: Exception) {}
     }
 
@@ -998,16 +1005,18 @@ fun captureYuvBurstColorWithMotion(
                                             },
                                             backgroundHandler
                                         )
-                                        backgroundHandler.postDelayed({
-                                            if (!finished.get() && savedFrames < frameCount) {
-                                                finishError(
-                                                    message = "YUV capture timeout: saved=$savedFrames/$frameCount, receivedImages=$receivedImages, completedResults=$completedResults, failedCaptures=$failedCaptures",
-                                                    source = "captureYuvBurstColorWithMotion.captureRequest.timeout",
-                                                    failureType = "CaptureTimeout",
-                                                    failureMessage = "No enough YUV frames before timeout"
-                                                )
+                                        timeoutScheduler.schedule({
+                                            backgroundHandler.post {
+                                                if (!finished.get() && savedFrames < frameCount) {
+                                                    finishError(
+                                                        message = "YUV capture timeout: saved=$savedFrames/$frameCount, receivedImages=$receivedImages, completedResults=$completedResults, failedCaptures=$failedCaptures",
+                                                        source = "captureYuvBurstColorWithMotion.captureRequest.timeout",
+                                                        failureType = "CaptureTimeout",
+                                                        failureMessage = "No enough YUV frames before timeout"
+                                                    )
+                                                }
                                             }
-                                        }, captureTimeoutMs)
+                                        }, captureTimeoutMs, TimeUnit.MILLISECONDS)
                                     } catch (e: Exception) {
                                         val templateFailure =
                                             e.message?.contains(
@@ -1192,7 +1201,7 @@ fun averageLatestYuvBurstColor(
             }
 
             val jobFile = NoFollowFileSystem.requireDirectChildFile(latestJobDir, JOB_JSON_FILE_NAME)
-            val job = JSONObject(jobFile.readText())
+            val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
             val framesArray = job.getJSONArray("frames")
 
             if (framesArray.length() == 0) {

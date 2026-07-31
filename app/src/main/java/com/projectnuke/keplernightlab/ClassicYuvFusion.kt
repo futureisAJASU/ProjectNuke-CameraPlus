@@ -109,7 +109,7 @@ internal fun processClassicYuvFusionJob(
         NoFollowInspection.Absent -> error("YUV job metadata is absent")
         is NoFollowInspection.InspectionFailed -> throw resolved.exception
     }
-    val job = JSONObject(jobFile.readText())
+    val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
     val params = (requestedParams ?: loadClassicYuvFusionParams(job)).clamped()
     initializeClassicYuvRunMetadata(job, params, processingStartedAt, metadataPolicy)
     resetClassicFrameMetadataForCurrentRun(jobDir, job)

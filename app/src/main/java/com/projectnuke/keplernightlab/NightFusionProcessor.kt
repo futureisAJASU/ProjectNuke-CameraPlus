@@ -124,7 +124,7 @@ fun estimateLatestColorBurstScene(context: Context): LatestSceneEstimate {
         else -> return LatestSceneEstimate(null, null)
     }
     val firstFrame = runCatching {
-        val job = JSONObject(jobFile.readText())
+        val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
         val frames = job.optJSONArray("frames")
         val fileName = frames?.optJSONObject(0)?.optString("file").orEmpty()
         val frameFile = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(

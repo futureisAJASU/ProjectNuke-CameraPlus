@@ -7,6 +7,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.Files
 import java.nio.file.LinkOption
+import java.security.MessageDigest
 import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.CancellationException
 
@@ -37,7 +38,7 @@ internal fun processSingleFrameJobSync(
         NoFollowInspection.Absent -> error("Single-frame job metadata is absent")
         is NoFollowInspection.InspectionFailed -> throw resolved.exception
     }
-    val job = JSONObject(jobFile.readText())
+    val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
     val processingStartedAt = System.currentTimeMillis()
 
     persistSingleFrameProgress(
@@ -54,6 +55,7 @@ internal fun processSingleFrameJobSync(
     var outputFile: File? = null
     var outputWritten = false
     var outputExistedBefore = false
+    var previousOutputHash: String? = null
     var candidateFile: File? = null
     var backupFile: File? = null
     try {
@@ -72,8 +74,8 @@ internal fun processSingleFrameJobSync(
 
         onStatus("일반 사진 ISP 후처리 중입니다.")
         cancellation.throwIfCancelled()
-        val sourceBitmap = BitmapFactory.decodeFile(
-            sourceFile.absolutePath,
+        val sourceBitmap = NoFollowFileSystem.decodeBitmapVerified(
+            sourceFile,
             BitmapFactory.Options().apply {
                 inPreferredConfig = Bitmap.Config.ARGB_8888
                 inMutable = true
@@ -97,6 +99,7 @@ internal fun processSingleFrameJobSync(
         ) {
             "Single-frame output path is not a regular file"
         }
+        if (outputExistedBefore) previousOutputHash = sha256NoFollow(outputPath)
         candidateFile = writeBitmapPngCandidate(processedBitmap, outputFile)
         if (outputExistedBefore) {
             backupFile = File(jobDir, ".${outputFile.name}.${System.nanoTime()}.bak")
@@ -137,7 +140,8 @@ internal fun processSingleFrameJobSync(
                 outputWritten = outputWritten,
                 outputExistedBefore = outputExistedBefore,
                 candidateFile = candidateFile,
-                backupFile = backupFile
+                backupFile = backupFile,
+                previousOutputHash = previousOutputHash
             )
             persistSingleFrameCancellation(
                 jobDir = jobDir,
@@ -150,7 +154,7 @@ internal fun processSingleFrameJobSync(
         throw ce
     } catch (oom: OutOfMemoryError) {
         val settlement = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            cleanupCancelledSingleFrameOutput(outputFile, outputWritten, outputExistedBefore, candidateFile, backupFile)
+            cleanupCancelledSingleFrameOutput(outputFile, outputWritten, outputExistedBefore, candidateFile, backupFile, previousOutputHash)
         } else {
             SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
         }
@@ -165,7 +169,7 @@ internal fun processSingleFrameJobSync(
         throw oom
     } catch (e: Exception) {
         val settlement = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            cleanupCancelledSingleFrameOutput(outputFile, outputWritten, outputExistedBefore, candidateFile, backupFile)
+            cleanupCancelledSingleFrameOutput(outputFile, outputWritten, outputExistedBefore, candidateFile, backupFile, previousOutputHash)
         } else {
             SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
         }
@@ -223,7 +227,8 @@ private fun cleanupCancelledSingleFrameOutput(
     outputWritten: Boolean,
     outputExistedBefore: Boolean,
     candidateFile: File?,
-    backupFile: File?
+    backupFile: File?,
+    previousOutputHash: String?
 ): SingleFrameCleanupResult {
     return try {
         if (candidateFile != null && Files.exists(candidateFile.toPath(), LinkOption.NOFOLLOW_LINKS)) {
@@ -239,9 +244,22 @@ private fun cleanupCancelledSingleFrameOutput(
             }
             KeplerJobMetadata.atomicReplace(backupFile, output)
             require(isValidSingleFrameOutput(output))
+            if (previousOutputHash != null) require(sha256NoFollow(output.toPath()) == previousOutputHash)
             SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED
-        } else if (outputExistedBefore && isValidSingleFrameOutput(output)) {
+        } else if (outputExistedBefore && isValidSingleFrameOutput(output) &&
+            (previousOutputHash == null || sha256NoFollow(output.toPath()) == previousOutputHash)
+        ) {
             SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED
+        } else if (outputExistedBefore) {
+            if (Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                require(!Files.isSymbolicLink(output.toPath()))
+                Files.deleteIfExists(output.toPath())
+            }
+            if (Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                SingleFrameCleanupResult.UNCOMMITTED_OUTPUT_REMAINS
+            } else {
+                SingleFrameCleanupResult.NEW_OUTPUT_REMOVED
+            }
         } else if (outputWritten && !outputExistedBefore) {
             if (Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)) {
                 require(!Files.isSymbolicLink(output.toPath()))
@@ -431,6 +449,7 @@ private fun persistSingleFrameFailure(
 
 private fun writeBitmapPngCandidate(bitmap: Bitmap, outputFile: File): File {
     val temp = File(outputFile.parentFile, ".${outputFile.name}.${System.nanoTime()}.candidate")
+    var writeSucceeded = false
     try {
         FileOutputStream(temp).use { stream ->
             check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)) {
@@ -438,8 +457,22 @@ private fun writeBitmapPngCandidate(bitmap: Bitmap, outputFile: File): File {
             }
             stream.fd.sync()
         }
+        writeSucceeded = true
         return temp
     } finally {
-        if (!temp.exists()) temp.delete()
+        if (!writeSucceeded && temp.exists()) runCatching { temp.delete() }
     }
+}
+
+private fun sha256NoFollow(path: java.nio.file.Path): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS).use { input ->
+        val buffer = ByteArray(16 * 1024)
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            digest.update(buffer, 0, read)
+        }
+    }
+    return digest.digest().joinToString("") { "%02x".format(it) }
 }
