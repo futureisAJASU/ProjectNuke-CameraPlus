@@ -174,12 +174,30 @@ internal fun runClassicRawFusionMerge(
                 if (alignment.backend == "native_subpixel_v1") nativeAlignmentUsed = true
                 if (alignment.fallbackUsed) fallbackAlignmentCount++
                 if (alignment.confidence < 0.35f) lowConfidenceAlignmentCount++
-                frame.alignmentUsed = alignment.score <= CLASSIC_RAW_ALIGNMENT_REJECT_SCORE
-                frame.globalWeight =
+                frame.alignmentUsed = alignment.score.isFinite() &&
+                    alignment.confidence.isFinite() &&
+                    frame.estimatedDx.isFinite() && frame.estimatedDy.isFinite() &&
+                    frame.exposureScale.isFinite() &&
+                    alignment.score <= CLASSIC_RAW_ALIGNMENT_REJECT_SCORE
+                frame.globalWeight = if (frame.alignmentUsed) {
                     (1f - alignment.score / CLASSIC_RAW_ALIGNMENT_REJECT_SCORE)
                         .coerceIn(0.12f, 1f)
+                } else 0f
             }
             applyRawAlignmentToFrameJson(frame)
+        }
+        val acceptedFrames = frames.filter { frame ->
+            frame === reference || (
+                frame.alignmentUsed && frame.globalWeight.isFinite() && frame.globalWeight > 0f &&
+                    frame.exposureScale.isFinite() &&
+                    frame.alignmentScore.isFinite() && frame.alignmentConfidence.isFinite()
+                )
+        }
+        frames.filterNot { it in acceptedFrames }.forEach { rejectedFrame ->
+            rejectedFrame.alignmentUsed = false
+            rejectedFrame.globalWeight = 0f
+            rejectedFrame.skipReason = rejectedFrame.skipReason ?: "NON_FINITE_OR_REJECTED_ALIGNMENT"
+            applyRawAlignmentToFrameJson(rejectedFrame)
         }
         val nativeAlignMs = System.currentTimeMillis() - alignStartedAt
         Log.i("KeplerRawPipeline", "ALIGN_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} nativeAlignMs=$nativeAlignMs")
@@ -189,7 +207,7 @@ internal fun runClassicRawFusionMerge(
         onStatus("RAW 프레임을 병합하는 중입니다.")
         onStatus("Classic RAW fusion: merging RAW tiles...")
         val mergeStats = mergeClassicRawTiles(
-            frames = frames,
+            frames = acceptedFrames,
             reference = reference,
             sensor = sensor,
             blackLevelEstimate = blackLevelEstimate,
@@ -494,11 +512,12 @@ private fun mergeClassicRawTiles(
             width = sensor.width,
             tileRows = CLASSIC_RAW_TILE_ROWS,
             candidateFrames = frames.size,
-            availableBytes = Runtime.getRuntime().maxMemory(),
+            availableBytes = currentAvailableJavaHeapBytes(),
             javaBytesPerPixel = 6L,
             nativeBytesPerPixel = 4L
         )
     )
+    check(!memoryPlan.cannotFit) { memoryPlan.fallbackReason ?: "CannotFit" }
     val mergeTileRows = memoryPlan.tileRows
     val tileArraySize = sensor.width.toLong() * mergeTileRows.toLong()
     require(tileArraySize in 1L..Int.MAX_VALUE) { "RAW tile array size exceeds JVM limits" }

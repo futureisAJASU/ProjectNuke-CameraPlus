@@ -1035,6 +1035,9 @@ private fun applySuperResolutionDenoiseInPlace(
     cancellation: KeplerPipelineCancellation
 ) {
     if (strength <= 0f || width < 5 || height < 5) return
+    if (NativeImageEngine.processPixels(pixels, width, height, algorithm, strength, FUSION_TILE_HEIGHT)) {
+        return
+    }
     val radius = 2
     val coreX0 = radius
     val coreY0 = radius

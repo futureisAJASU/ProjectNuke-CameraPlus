@@ -1,5 +1,15 @@
 package com.projectnuke.keplernightlab
 
+internal fun currentAvailableJavaHeapBytes(runtime: Runtime = Runtime.getRuntime()): Long {
+    val used = runtime.totalMemory().checkedSubtract(runtime.freeMemory())
+    return runtime.maxMemory().checkedSubtract(used).coerceAtLeast(0L)
+}
+
+private fun Long.checkedSubtract(value: Long): Long {
+    if (value < 0L || this < value) return 0L
+    return this - value
+}
+
 internal data class FusionMemoryPlanRequest(
     val width: Int,
     val tileRows: Int,
@@ -18,7 +28,8 @@ internal data class FusionMemoryPlan(
     val estimatedPeakBytes: Long,
     val budgetBytes: Long,
     val fallbackReason: String?,
-    val streamingFallback: Boolean
+    val streamingFallback: Boolean,
+    val cannotFit: Boolean = false
 )
 
 private fun checkedMultiply(a: Long, b: Long): Long {
@@ -45,7 +56,18 @@ internal fun planFusionMemory(request: FusionMemoryPlanRequest): FusionMemoryPla
         checkedAdd(request.javaBytesPerPixel, request.jniCopyBytesPerPixel),
         request.nativeBytesPerPixel
     )
-    val usable = (budget - reserveAndResidency).coerceAtLeast(1L)
+    if (reserveAndResidency >= budget) {
+        return FusionMemoryPlan(
+            tileRows = 0,
+            candidateBatchSize = 0,
+            estimatedPeakBytes = reserveAndResidency,
+            budgetBytes = budget,
+            fallbackReason = "CannotFit: fixed residency and reserve exceed budget",
+            streamingFallback = false,
+            cannotFit = true
+        )
+    }
+    val usable = budget - reserveAndResidency
     val desiredPixels = checkedMultiply(request.width.toLong(), request.tileRows.toLong())
     val desiredPacked = checkedAdd(
         reserveAndResidency,
@@ -62,10 +84,21 @@ internal fun planFusionMemory(request: FusionMemoryPlanRequest): FusionMemoryPla
         )
     }
 
-    val maxPackedFrames = (usable / checkedMultiply(request.width.toLong(), perPixel))
-        .toInt().coerceAtLeast(1).coerceAtMost(request.candidateFrames)
-    val rowsForBatch = (usable / checkedMultiply(request.width.toLong(), perPixel * maxPackedFrames.toLong()))
-        .toInt().coerceAtLeast(1).coerceAtMost(request.tileRows)
+    val bytesPerRowPerFrame = checkedMultiply(request.width.toLong(), perPixel)
+    val maxPackedFrames = (usable / bytesPerRowPerFrame)
+        .toInt().coerceAtMost(request.candidateFrames)
+    if (maxPackedFrames < 1) {
+        return FusionMemoryPlan(
+            0, 0, reserveAndResidency, budget,
+            "CannotFit: one row and one candidate exceed budget", false, true
+        )
+    }
+    val rowsForBatch = (usable / checkedMultiply(bytesPerRowPerFrame, maxPackedFrames.toLong()))
+        .toInt().coerceAtMost(request.tileRows)
+    if (rowsForBatch < 1) {
+        return FusionMemoryPlan(0, 0, reserveAndResidency, budget,
+            "CannotFit: no processable tile", false, true)
+    }
     val streaming = maxPackedFrames == 1 && request.candidateFrames > 1
     val peak = checkedAdd(
         reserveAndResidency,

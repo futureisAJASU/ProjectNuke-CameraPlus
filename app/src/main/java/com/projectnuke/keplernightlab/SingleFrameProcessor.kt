@@ -7,6 +7,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.Files
 import java.nio.file.LinkOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.CancellationException
 
 internal const val SINGLE_FRAME_OUTPUT_FILE_NAME = "single_frame_processed.png"
@@ -169,11 +170,16 @@ private fun resolveSingleFrameSourceFile(jobDir: File, rawName: String): File {
         "Single-frame source must be a direct-child file name"
     }
 
-    val canonicalJobDir = jobDir.canonicalFile
-    require(canonicalJobDir.isDirectory) { "Single-frame job directory is missing" }
-    val source = File(canonicalJobDir, rawName)
-    val sourcePath = source.toPath()
-    require(source.parentFile == canonicalJobDir) { "Single-frame source escapes job directory" }
+    val jobPath = jobDir.toPath()
+    val jobAttributes = Files.readAttributes(
+        jobPath, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS
+    )
+    require(jobAttributes.isDirectory && !jobAttributes.isSymbolicLink()) {
+        "Single-frame job directory must be a real directory"
+    }
+    val sourcePath = jobPath.resolve(rawName).normalize()
+    require(sourcePath.parent == jobPath) { "Single-frame source escapes job directory" }
+    val source = sourcePath.toFile()
     require(Files.exists(sourcePath, LinkOption.NOFOLLOW_LINKS)) {
         "Single-frame source is missing: $rawName"
     }

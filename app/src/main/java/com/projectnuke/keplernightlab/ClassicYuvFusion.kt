@@ -195,7 +195,7 @@ internal fun processClassicYuvFusionJob(
         KeplerJobMetadata.update(jobDir) { current ->
             current.put("yuvProcessingDecodedUsableFrames", decodedUsableFrameCount)
         }
-        if (frames.size < 2) {
+        if (frames.isEmpty()) {
             error(
                 "Not enough enabled YUV frames to reprocess: " +
                     "enabled=${preflight.enabledFrames}, total=${preflight.totalFrames}, usable=${frames.size}"
@@ -783,9 +783,10 @@ frames.forEach { frame ->
                 width = width,
                 tileRows = CLASSIC_FUSION_TILE_ROWS,
                 candidateFrames = frames.size,
-                availableBytes = Runtime.getRuntime().maxMemory()
+                availableBytes = currentAvailableJavaHeapBytes()
             )
-        )
+            )
+        check(!memoryPlan.cannotFit) { memoryPlan.fallbackReason ?: "CannotFit" }
         val mergeTileRows = memoryPlan.tileRows
         var tileTop = 0
         val decodeOpts = BitmapFactory.Options().apply {

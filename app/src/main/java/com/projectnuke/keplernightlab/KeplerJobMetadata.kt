@@ -7,7 +7,6 @@ import java.io.FileOutputStream
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
-import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -20,8 +19,9 @@ class KeplerJobMetadataCorrupt(jobDir: File, cause: Throwable? = null) : KeplerJ
 
 /** Serializes each job's read-modify-write updates and never truncates a valid job.json. */
 object KeplerJobMetadata {
-    private val lockGuard = Any()
-    private val _locks = WeakHashMap<String, Any>()
+    // Strongly reachable striped locks keep one stable lock choice per job
+    // without a GC-sensitive weak table or an unbounded lock-map leak.
+    private val _locks = Array(64) { Any() }
     private val operationLeases = ConcurrentHashMap<String, JobOperationLease>()
 
     /** Narrow lease/metadata test seam: incremented each time a job metadata write is durably
@@ -41,9 +41,9 @@ object KeplerJobMetadata {
     /** Narrow test-only seam to reset [leaseReleaseCount]. Tests must save/restore prior value. */
     internal fun setLeaseReleaseCountForTest(value: Int) { leaseReleaseCount = value }
 
-    private fun lockFor(jobDir: File): Any = synchronized(_locks) {
-        _locks.computeIfAbsent(jobDir.canonicalPath) { Any() }
-    }
+    private fun lockFor(jobDir: File): Any = _locks[
+        (jobDir.canonicalPath.hashCode() and Int.MAX_VALUE) % _locks.size
+    ]
 
     fun acquireOperation(jobDir: File): JobOperationLease? {
         val key = jobDir.canonicalPath
@@ -63,8 +63,7 @@ object KeplerJobMetadata {
 
     /** Removes the lock entry for a permanently deleted job directory. Safe to call after successful deletion. */
     fun removeLockEntry(jobDir: File) {
-        val key = jobDir.canonicalPath
-        synchronized(_locks) { _locks.remove(key) }
+        // Stripes are process-owned and intentionally retained.
     }
 
     /** Reads job metadata. Throws [KeplerJobMetadataMissing] if the file does not exist, [KeplerJobMetadataCorrupt] if parse fails. */
