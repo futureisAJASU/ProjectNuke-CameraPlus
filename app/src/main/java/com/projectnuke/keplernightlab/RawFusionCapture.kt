@@ -142,6 +142,9 @@ fun captureRawBurstForFusion(
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     val thread = HandlerThread("KeplerRawFusionCaptureThread").apply { start() }
     val handler = Handler(thread.looper)
+    val captureStateOwner = CaptureStateOwner(
+        dispatch = { event -> handler.post(event) }
+    )
     val saveWorker = BoundedCaptureWorker("KeplerRawFusionSave", capacity = 2)
     val saveWorkerThread = ThreadLocal<Boolean>()
     val workerScheduled = AtomicBoolean(false)
@@ -183,6 +186,7 @@ fun captureRawBurstForFusion(
 
     fun cleanup() {
         if (!cleanupStarted.compareAndSet(false, true)) return
+        captureStateOwner.close()
         timeoutRunnable = null
         runCatching { reader?.setOnImageAvailableListener(null, null) }
         synchronized(stateLock) {
@@ -880,7 +884,7 @@ fun captureRawBurstForFusion(
                     )
                 }
             }
-            if (!handler.post(settle)) {
+            if (!captureStateOwner.post(settle)) {
                 Log.e(RAW_PIPELINE_LOG_TAG, "RAW owner handler rejected timeout settlement")
                 finished.set(true)
                 cleanup()

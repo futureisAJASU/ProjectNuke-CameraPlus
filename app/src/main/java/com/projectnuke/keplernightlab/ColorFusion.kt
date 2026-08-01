@@ -229,6 +229,9 @@ fun captureYuvBurstColorWithMotion(
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     val backgroundThread = HandlerThread("KeplerColorBurstThread").apply { start() }
     val backgroundHandler = Handler(backgroundThread.looper)
+    val captureStateOwner = CaptureStateOwner(
+        dispatch = { event -> backgroundHandler.post(event) }
+    )
     val yuvWorkQueue = BoundedCaptureWorker(
         "KeplerColorBurstWorker",
         capacity = maxOf(2, minOf(frameCount, MAX_YUV_MEMORY_BUFFER_FRAMES))
@@ -270,6 +273,7 @@ fun captureYuvBurstColorWithMotion(
 
     fun cleanup() {
         if (!cleanupStarted.compareAndSet(false, true)) return
+        captureStateOwner.close()
         try { imageReader?.setOnImageAvailableListener(null, null) } catch (_: Exception) {}
         try { backgroundHandler.removeCallbacksAndMessages(null) } catch (_: Exception) {}
         try { captureSession?.abortCaptures() } catch (_: Exception) {}
@@ -1119,7 +1123,7 @@ fun captureYuvBurstColorWithMotion(
                                                     )
                                                 }
                                             }
-                                            if (!backgroundHandler.post(settle)) {
+                                            if (!captureStateOwner.post(settle)) {
                                                 // The owner looper is gone. Preserve the claimed terminal
                                                 // state and only perform minimal emergency resource cleanup.
                                                 Log.e(YUV_CAPTURE_LOG_TAG, "YUV owner handler rejected timeout settlement")
