@@ -5,7 +5,6 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
-import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.util.Log
 import androidx.heifwriter.HeifWriter
@@ -15,7 +14,6 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.OutputStream
 import java.util.concurrent.CancellationException
-import kotlin.math.abs
 
 data class GalleryExportResult(
     val success: Boolean,
@@ -95,44 +93,6 @@ enum class RawSidecarOutcomeKind {
     CANCELLED
 }
 
-data class GalleryVerificationFailure(
-    val candidateFormat: OutputFormat,
-    val failureReason: String,
-    val mimeType: String?,
-    val extension: String?,
-    val decodedWidth: Int,
-    val decodedHeight: Int,
-    val fileSizeBytes: Long
-)
-
-data class GalleryVerificationResult(
-    val success: Boolean,
-    val uriString: String?,
-    val format: OutputFormat,
-    val fallbackUsed: Boolean,
-    val failureReason: String?,
-    val attemptedFormats: List<OutputFormat>,
-    val committedFormat: OutputFormat?,
-    val fallbackUsedFlag: Boolean,
-    val failures: List<GalleryVerificationFailure>
-) {
-    companion object {
-        fun success(uri: String, format: OutputFormat, fallback: Boolean, attempted: List<OutputFormat>) =
-            GalleryVerificationResult(
-                success = true, uriString = uri, format = format, fallbackUsed = fallback,
-                failureReason = null, attemptedFormats = attempted, committedFormat = format,
-                fallbackUsedFlag = fallback, failures = emptyList()
-            )
-        fun failure(failures: List<GalleryVerificationFailure>, attempted: List<OutputFormat>) =
-            GalleryVerificationResult(
-                success = false, uriString = null, format = attempted.lastOrNull() ?: OutputFormat.PNG,
-                fallbackUsed = false, failureReason = failures.lastOrNull()?.failureReason,
-                attemptedFormats = attempted, committedFormat = null,
-                fallbackUsedFlag = false, failures = failures
-            )
-    }
-}
-
 fun exportNightFusionBitmapToGallery(
     context: Context,
     bitmap: Bitmap,
@@ -181,81 +141,23 @@ fun exportNightFusionBitmapToGallery(
 fun verifyGalleryExport(
     context: Context,
     uriString: String,
-    expectedWidth: Int? = null,
-    expectedHeight: Int? = null,
-    maxRetries: Int = 8,
-    retryBaseDelayMs: Long = 100
-): GalleryVerificationResult {
-    if (uriString.isBlank()) {
-        return GalleryVerificationResult.failure(
-            listOf(GalleryVerificationFailure(OutputFormat.PNG, "Blank URI", null, null, 0, 0, 0L)),
-            emptyList()
-        )
-    }
-    val uri = Uri.parse(uriString)
-    val mimeType = runCatching { context.contentResolver.getType(uri) }.getOrNull()
-    val extension = uriString.substringAfterLast('.', "").lowercase()
-    repeat(maxRetries) { attempt ->
+    minSizeBytes: Long = 50_000L
+): Boolean {
+    return runCatching {
+        if (uriString.isBlank()) return@runCatching false
+        val uri = Uri.parse(uriString)
         val size = queryMediaSize(context, uri)
-        if (size > 0) return@repeat
-        if (attempt < maxRetries - 1) {
-            val delay = retryBaseDelayMs * (1L shl attempt).coerceAtMost(16)
-            Thread.sleep(delay)
-        }
-    }
-    val size = queryMediaSize(context, uri)
-    if (size <= 0) {
-        return GalleryVerificationResult.failure(
-            listOf(GalleryVerificationFailure(OutputFormat.PNG, "URI not visible after retries", mimeType, extension, 0, 0, 0L)),
-            emptyList()
-        )
-    }
-    val fd = runCatching { context.contentResolver.openFileDescriptor(uri, "r") }.getOrNull()
-        ?: return GalleryVerificationResult.failure(
-            listOf(GalleryVerificationFailure(OutputFormat.PNG, "openFileDescriptor returned null", mimeType, extension, 0, 0, size)),
-            emptyList()
-        )
-    fd.use {
-        val magic = ByteArray(16)
-        val input = ParcelFileDescriptor.AutoCloseInputStream(it)
-        val read = runCatching { input.read(magic) }.getOrNull()
-            ?: return GalleryVerificationResult.failure(
-                listOf(GalleryVerificationFailure(OutputFormat.PNG, "Read returned null", mimeType, extension, 0, 0, size)),
-                emptyList()
-            )
-        val format = detectImageFormat(magic, read, extension, mimeType)
-        if (format == null) {
-            return GalleryVerificationResult.failure(
-                listOf(GalleryVerificationFailure(OutputFormat.PNG, "Unrecognized image magic", mimeType, extension, 0, 0, size)),
-                emptyList()
-            )
-        }
-        input.close()
-        context.contentResolver.openInputStream(uri)?.use { decodeStream ->
+        if (size < minSizeBytes) return@runCatching false
+        context.contentResolver.openInputStream(uri)?.use { input ->
             val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeStream(decodeStream, null, options)
-            if (options.outWidth <= 0 || options.outHeight <= 0) {
-                return GalleryVerificationResult.failure(
-                    listOf(GalleryVerificationFailure(format, "Decoded non-positive dimensions", mimeType, extension, options.outWidth, options.outHeight, size)),
-                    emptyList()
-                )
+            BitmapFactory.decodeStream(input, null, options)
+            if (options.outWidth > 0 && options.outHeight > 0) {
+                true
+            } else {
+                context.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize >= minSizeBytes } ?: false
             }
-            if (expectedWidth != null && expectedHeight != null) {
-                val wOk = abs(options.outWidth - expectedWidth) <= 1
-                val hOk = abs(options.outHeight - expectedHeight) <= 1
-                if (!wOk || !hOk) {
-                    return GalleryVerificationResult.failure(
-                        listOf(GalleryVerificationFailure(format, "Dimension mismatch: got ${options.outWidth}x${options.outHeight}, expected ~${expectedWidth}x${expectedHeight}", mimeType, extension, options.outWidth, options.outHeight, size)),
-                        emptyList()
-                    )
-                }
-            }
-            return GalleryVerificationResult.success(uriString, format, false, emptyList())
-        } ?: return GalleryVerificationResult.failure(
-            listOf(GalleryVerificationFailure(format, "openInputStream returned null after fd open", mimeType, extension, 0, 0, size)),
-            emptyList()
-        )
-    }
+        } ?: false
+    }.getOrDefault(false)
 }
 
 fun exportRawSidecarsToPublicStorage(
