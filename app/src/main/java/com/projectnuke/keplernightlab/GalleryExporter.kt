@@ -776,6 +776,7 @@ private fun insertPublicFile(
     }
 }
 
+@Suppress("RestrictedApi")
 private fun writeHeifViaTempFile(
     context: Context,
     bitmap: Bitmap,

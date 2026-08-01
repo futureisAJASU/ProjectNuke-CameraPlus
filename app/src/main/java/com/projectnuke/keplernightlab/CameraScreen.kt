@@ -1963,7 +1963,7 @@ fun CompactZoomSlider(
     val inactiveTrackColor = Color.White.copy(alpha = 0.24f)
     val thumbColor = Color.White
 
-    BoxWithConstraints(
+    Box(
         modifier = modifier
             .height(CompactSliderHeight)
             .pointerInput(valueRange.start, valueRange.endInclusive) {
