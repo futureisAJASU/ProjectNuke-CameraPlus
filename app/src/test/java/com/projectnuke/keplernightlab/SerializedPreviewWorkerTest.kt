@@ -47,4 +47,54 @@ class SerializedPreviewWorkerTest {
             worker.close()
         }
     }
+
+    @Test fun renderFailureDoesNotPoisonLaterLatestRequest() {
+        val adopted = CountDownLatch(1)
+        val firstStarted = CountDownLatch(1)
+        val errors = mutableListOf<Throwable>()
+        val recycledSources = mutableListOf<Int>()
+        val worker = SerializedPreviewWorker<Int, Int>(
+            render = { value -> if (value == 1) { firstStarted.countDown(); error("expected") } else value },
+            recycleSource = recycledSources::add,
+            recycleResult = {},
+            adopt = { adopted.countDown() },
+            onError = errors::add
+        )
+        try {
+            worker.submit(1)
+            assertTrue(firstStarted.await(2, TimeUnit.SECONDS))
+            worker.submit(2)
+            assertTrue(adopted.await(2, TimeUnit.SECONDS))
+            assertEquals(1, errors.size)
+            assertTrue(recycledSources.containsAll(listOf(1, 2)))
+        } finally {
+            worker.close()
+            assertTrue(worker.awaitClosed())
+        }
+    }
+
+    @Test fun adoptionFailureRecyclesResultAndKeepsWorkerAlive() {
+        val adopted = CountDownLatch(1)
+        val firstAdoption = CountDownLatch(1)
+        val errors = mutableListOf<Throwable>()
+        val recycled = mutableListOf<Int>()
+        val worker = SerializedPreviewWorker<Int, Int>(
+            render = { it },
+            recycleSource = {},
+            recycleResult = recycled::add,
+            adopt = { value -> if (value == 1) { firstAdoption.countDown(); error("adoption") } else adopted.countDown() },
+            onError = errors::add
+        )
+        try {
+            worker.submit(1)
+            assertTrue(firstAdoption.await(2, TimeUnit.SECONDS))
+            worker.submit(2)
+            assertTrue(adopted.await(2, TimeUnit.SECONDS))
+            assertEquals(1, errors.size)
+            assertTrue(recycled.contains(1))
+        } finally {
+            worker.close()
+            assertTrue(worker.awaitClosed())
+        }
+    }
 }

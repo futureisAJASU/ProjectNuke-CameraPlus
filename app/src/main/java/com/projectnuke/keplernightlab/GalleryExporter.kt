@@ -769,8 +769,9 @@ private fun insertPublicFile(
     } catch (ce: CancellationException) {
         uri?.let { runCatching { resolver.delete(it, null, null) } }
         throw ce
-    } catch (_: Exception) {
+    } catch (error: Throwable) {
         uri?.let { runCatching { resolver.delete(it, null, null) } }
+        if (error is Error) throw error
         null
     }
 }
@@ -799,11 +800,11 @@ private fun writeHeifViaTempFile(
         createdWriter.stop(timeoutMs)
         // stop() is the producer settlement point. Re-inspect the owned temp file only after it
         // returns, so a partially written HEIF can never be copied into MediaStore.
-        val tempBytes = NoFollowFileSystem.readBytesVerified(tempFile)
-        check(tempBytes.isNotEmpty()) { "HEIF writer produced an empty temporary file" }
-        output.write(tempBytes)
+        val digest = NoFollowFileSystem.copyVerified(tempFile, output)
+        check(digest.size > 0L) { "HEIF writer produced an empty temporary file" }
         true
-    } catch (error: Exception) {
+    } catch (error: Throwable) {
+        if (error is Error) throw error
         Log.w(
             "KeplerGalleryExporter",
             "HEIF encode failed pixels=${bitmap.width.toLong() * bitmap.height} timeoutMs=$timeoutMs: ${error.message}",

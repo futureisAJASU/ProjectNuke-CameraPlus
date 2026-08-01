@@ -394,6 +394,7 @@ private fun RawFusionProcessResult.loadExportBitmap(jobDir: File): RawFusionExpo
         val rotation = resolveRawExportRotation(jobDir)
         val degrees = (rotation as? ExportOrientationResolution.Resolved)?.degrees
             ?: throw IllegalStateException((rotation as ExportOrientationResolution.Unsupported).reason)
+        ensureSafeRotationAllocation(bitmap, degrees)
         val rotated = rotateBitmapIfNeeded(bitmap, degrees)
         if (rotated !== bitmap) bitmap.recycle()
         return RawFusionExportBitmap(rotated, source, native, degrees)
@@ -431,32 +432,90 @@ private fun RawFusionProcessResult.loadExportBitmap(jobDir: File): RawFusionExpo
     return orient(bitmap, "final_png_decode", false)
 }
 
-private fun resolveRawExportRotation(jobDir: File): ExportOrientationResolution {
+internal fun resolveRawExportRotation(jobDir: File): ExportOrientationResolution {
     val job = runCatching {
         JSONObject(NoFollowFileSystem.readTextVerified(NoFollowFileSystem.requireDirectChildFile(jobDir, JOB_JSON_FILE_NAME)))
     }.getOrElse { return ExportOrientationResolution.Unsupported("Cannot read RAW orientation metadata: ${it.message}") }
-    val sourceState = job.optString("sourceOrientationState")
-    if (sourceState.isBlank()) {
+    val sourceState = when (val value = job.strictOrientationString("sourceOrientationState")) {
+        OrientationJsonValue.Missing -> {
         // Explicit legacy fallback: older jobs did not capture UI rotation. Keep their historical
         // sensor-grid behavior rather than guessing and silently rotating a reprocess.
-        return ExportOrientationResolution.Resolved(0)
+            Log.w("KeplerRawPipeline", "Legacy RAW job has no source orientation metadata; export remains unrotated.")
+            return ExportOrientationResolution.Resolved(0)
+        }
+        OrientationJsonValue.Null -> return ExportOrientationResolution.Unsupported("sourceOrientationState is null")
+        is OrientationJsonValue.Malformed -> return ExportOrientationResolution.Unsupported(value.reason)
+        is OrientationJsonValue.Value -> value.value
     }
-    val sourceWasUpright = job.optBoolean("exportSourceWasDisplayUpright", false)
+    val sensor = job.strictOrientationInt("sensorOrientation")
+    val display = job.strictOrientationInt("displayRotationAtCapture")
+    val facing = job.strictOrientationInt("lensFacing")
+    val upright = job.strictOrientationBoolean("exportSourceWasDisplayUpright")
+    val alreadyApplied = job.strictOrientationBoolean("rotationAppliedAtExportStage")
+    val invalid = listOf(sensor, display, facing, upright, alreadyApplied)
+        .filterNot { it is OrientationJsonValue.Value || it is OrientationJsonValue.Missing }
+        .firstOrNull()
+    if (invalid != null) return ExportOrientationResolution.Unsupported(
+        (invalid as? OrientationJsonValue.Malformed)?.reason ?: "RAW orientation metadata is null"
+    )
     return resolveExportOrientation(
         ExportOrientationInput(
-            sensorOrientationDegrees = job.optInt("sensorOrientation").takeIf { job.has("sensorOrientation") },
-            displayRotation = job.optInt("displayRotationAtCapture").takeIf { job.has("displayRotationAtCapture") },
-            lensFacing = job.optInt("lensFacing").takeIf { job.has("lensFacing") },
-            sourceWasDisplayUpright = sourceWasUpright || sourceState == "DISPLAY_UPRIGHT",
-            rotationAlreadyApplied = sourceState == "DISPLAY_UPRIGHT" && job.optBoolean("rotationAppliedAtExportStage", false)
+            sensorOrientationDegrees = (sensor as? OrientationJsonValue.Value)?.value,
+            displayRotation = (display as? OrientationJsonValue.Value)?.value,
+            lensFacing = (facing as? OrientationJsonValue.Value)?.value,
+            sourceWasDisplayUpright = ((upright as? OrientationJsonValue.Value)?.value ?: false) || sourceState == "DISPLAY_UPRIGHT",
+            rotationAlreadyApplied = sourceState == "DISPLAY_UPRIGHT" && ((alreadyApplied as? OrientationJsonValue.Value)?.value ?: false)
         )
     )
 }
 
-private fun recordRawExportRotation(jobDir: File, degrees: Int) {
+private sealed interface OrientationJsonValue<out T> {
+    data object Missing : OrientationJsonValue<Nothing>
+    data object Null : OrientationJsonValue<Nothing>
+    data class Value<T>(val value: T) : OrientationJsonValue<T>
+    data class Malformed(val reason: String) : OrientationJsonValue<Nothing>
+}
+
+private fun JSONObject.strictOrientationString(key: String): OrientationJsonValue<String> = when {
+    !has(key) -> OrientationJsonValue.Missing
+    isNull(key) -> OrientationJsonValue.Null
+    opt(key) is String -> OrientationJsonValue.Value(getString(key))
+    else -> OrientationJsonValue.Malformed("$key must be a string")
+}
+
+private fun JSONObject.strictOrientationInt(key: String): OrientationJsonValue<Int> = when {
+    !has(key) -> OrientationJsonValue.Missing
+    isNull(key) -> OrientationJsonValue.Null
+    opt(key) is Number -> {
+        val value = (opt(key) as Number).toDouble()
+        if (!value.isFinite() || value != value.toInt().toDouble()) OrientationJsonValue.Malformed("$key must be an integer")
+        else OrientationJsonValue.Value(value.toInt())
+    }
+    else -> OrientationJsonValue.Malformed("$key must be numeric")
+}
+
+private fun JSONObject.strictOrientationBoolean(key: String): OrientationJsonValue<Boolean> = when {
+    !has(key) -> OrientationJsonValue.Missing
+    isNull(key) -> OrientationJsonValue.Null
+    opt(key) is Boolean -> OrientationJsonValue.Value(optBoolean(key))
+    else -> OrientationJsonValue.Malformed("$key must be boolean")
+}
+
+private fun ensureSafeRotationAllocation(bitmap: Bitmap, degrees: Int) {
+    if (degrees == 0) return
+    val bytes = bitmap.width.toLong() * bitmap.height.toLong() * 4L
+    val runtime = Runtime.getRuntime()
+    val available = runtime.maxMemory() - runtime.totalMemory() + runtime.freeMemory()
+    require(bytes <= available / 2L) { "Insufficient heap headroom for full-resolution rotation" }
+}
+
+private fun recordRawExportRotationEstimate(jobDir: File, degrees: Int) {
+    KeplerJobMetadata.update(jobDir) { job -> job.put("estimatedExportRotationDegrees", degrees) }
+}
+
+private fun recordRawExportRotationApplied(jobDir: File, degrees: Int) {
     KeplerJobMetadata.update(jobDir) { job ->
-        job.put("estimatedExportRotationDegrees", degrees)
-            .put("appliedExportRotationDegrees", degrees)
+        job.put("appliedExportRotationDegrees", degrees)
             .put("rotationAppliedAtExportStage", degrees != 0)
     }
 }
@@ -614,10 +673,12 @@ fun captureProcessExportRawNightFusion(
                         return@post
                     }
                     var exportBitmap: Bitmap? = null
+                    var exportRotationDegrees: Int? = null
                     val result = try {
                         cancellation.throwIfCancelled()
                         val loaded = process.loadExportBitmap(jobDir)
                         exportBitmap = loaded.bitmap
+                        exportRotationDegrees = loaded.appliedRotationDegrees
                         val nativePreviewPrepareMs = System.currentTimeMillis() - previewPrepareStartedAt
                         updateRawExportBitmapMetadata(
                             jobDir = jobDir,
@@ -629,7 +690,7 @@ fun captureProcessExportRawNightFusion(
                             exportBitmapHeight = loaded.bitmap.height,
                             nativePreviewPrepareMs = nativePreviewPrepareMs
                         )
-                        recordRawExportRotation(jobDir, loaded.appliedRotationDegrees)
+                        recordRawExportRotationEstimate(jobDir, loaded.appliedRotationDegrees)
                         post("결과를 저장하는 중입니다.")
                         updateRawNativeQualityDiagnostics(jobDir, loaded.bitmap)
                         cancellation.throwIfCancelled()
@@ -768,6 +829,7 @@ fun captureProcessExportRawNightFusion(
                         post("PIPELINE_FAILED: RAW export verification failed; keeping RAW cache.")
                         return@post
                     }
+                    recordRawExportRotationApplied(jobDir, exportRotationDegrees ?: 0)
                     val verifiedPendingOutcome = RawFusionPublicExportOutcome.VerifiedPendingPostWork(
                         base = process,
                         finalOutputFormat = finalOutputFormat,
@@ -1262,9 +1324,11 @@ internal fun reprocessRawJob(
                 return@post
             }
             var exportBitmap: Bitmap? = null
+            var exportRotationDegrees: Int? = null
             val exportAttempted = try {
                 val loaded = process.loadExportBitmap(jobDir)
                 exportBitmap = loaded.bitmap
+                exportRotationDegrees = loaded.appliedRotationDegrees
                 updateRawExportBitmapMetadata(
                     jobDir = jobDir,
                     source = loaded.source,
@@ -1274,7 +1338,7 @@ internal fun reprocessRawJob(
                     exportBitmapWidth = loaded.bitmap.width,
                     exportBitmapHeight = loaded.bitmap.height
                 )
-                recordRawExportRotation(jobDir, loaded.appliedRotationDegrees)
+                recordRawExportRotationEstimate(jobDir, loaded.appliedRotationDegrees)
                 exportNightFusionBitmapToGallery(
                     context = context,
                     bitmap = loaded.bitmap,
@@ -1364,6 +1428,7 @@ internal fun reprocessRawJob(
                 terminalResult = Result.failure(IllegalStateException(reason))
                 return@post
             }
+            recordRawExportRotationApplied(jobDir, exportRotationDegrees ?: 0)
             val verifiedOutcome = RawFusionPublicExportOutcome.VerifiedSuccess(
                 base = process,
                 finalOutputFormat = finalOutputFormat,

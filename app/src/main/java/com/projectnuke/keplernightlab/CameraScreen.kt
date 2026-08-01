@@ -469,7 +469,7 @@ fun MainCameraScreen(
             recycleResult = { bitmap -> if (!bitmap.isRecycled) bitmap.recycle() },
             adopt = { bitmap -> if (!bitmap.isRecycled) bitmap.recycle() },
             adoptWithGeneration = { generation, bitmap ->
-                previewMainHandler.post {
+                val posted = previewMainHandler.post {
                     if (previewUiGeneration.get() == generation &&
                         currentScreen == MainScreen.SETTINGS &&
                         !bitmap.isRecycled
@@ -478,6 +478,14 @@ fun MainCameraScreen(
                         processingPreviewStatus = "Approximate preview from the processed result is ready"
                     } else if (!bitmap.isRecycled) {
                         bitmap.recycle()
+                    }
+                }
+                if (!posted && !bitmap.isRecycled) bitmap.recycle()
+            },
+            onError = { error ->
+                previewMainHandler.post {
+                    if (currentScreen == MainScreen.SETTINGS) {
+                        processingPreviewStatus = "Processing preview failed: ${error.javaClass.simpleName}"
                     }
                 }
             }
@@ -1220,6 +1228,8 @@ mainHandler.removeCallbacks(watchdog)
                     captureMode = mode
                     if (mode == CaptureMode.SINGLE_FRAME) {
                         selectedResolution = CaptureResolutionMode.MP12
+                        finalOutputFormat = finalOutputFormat.imageOnlyEquivalent()
+                        OutputSettingsStore.save(context, finalOutputFormat)
                     }
                 },
                 processingSettings = processingSettings,
@@ -1227,7 +1237,13 @@ mainHandler.removeCallbacks(watchdog)
                 processingPreviewBitmap = processingPreviewBitmap,
                 processingPreviewStatus = processingPreviewStatus,
                 pipelineMode = pipelineMode,
-                onPipelineModeChange = { pipelineMode = it },
+                onPipelineModeChange = { mode ->
+                    pipelineMode = mode
+                    if (mode != PipelineMode.RAW_NIGHT_FUSION) {
+                        finalOutputFormat = finalOutputFormat.imageOnlyEquivalent()
+                        OutputSettingsStore.save(context, finalOutputFormat)
+                    }
+                },
                 rawSpeedMode = rawSpeedMode,
                 onRawSpeedModeChange = { rawSpeedMode = it },
                 finalOutputFormat = finalOutputFormat,
@@ -2218,6 +2234,7 @@ fun SettingsScreen(
 
                 OutputFormatSettingsSection(
                     finalOutputFormat = finalOutputFormat,
+                    rawSidecarSupported = captureMode != CaptureMode.SINGLE_FRAME && pipelineMode == PipelineMode.RAW_NIGHT_FUSION,
                     onFinalOutputFormatChange = onFinalOutputFormatChange
                 )
 
@@ -2481,6 +2498,7 @@ private fun ProcessingSliderRow(
 @Composable
 fun OutputFormatSettingsSection(
     finalOutputFormat: FinalOutputFormat,
+    rawSidecarSupported: Boolean,
     onFinalOutputFormatChange: (FinalOutputFormat) -> Unit
 ) {
     Column(
@@ -2506,20 +2524,24 @@ fun OutputFormatSettingsSection(
                 )
             }
         }
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            listOf(
-                FinalOutputFormat.HEIF_PLUS_RAW,
-                FinalOutputFormat.JPEG_PLUS_RAW
-            ).forEach { format ->
-                FrameModeChip(
-                    text = format.label,
-                    selected = finalOutputFormat == format,
-                    onClick = { onFinalOutputFormatChange(format) }
-                )
+        if (rawSidecarSupported) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                listOf(
+                    FinalOutputFormat.HEIF_PLUS_RAW,
+                    FinalOutputFormat.JPEG_PLUS_RAW
+                ).forEach { format ->
+                    FrameModeChip(
+                        text = format.label,
+                        selected = finalOutputFormat == format,
+                        onClick = { onFinalOutputFormatChange(format) }
+                    )
+                }
             }
+        } else {
+            Text("RAW pipeline only", color = Color.White.copy(alpha = 0.58f), style = MaterialTheme.typography.bodySmall)
         }
         FrameModeChip(
             text = FinalOutputFormat.PNG_DEBUG.label,

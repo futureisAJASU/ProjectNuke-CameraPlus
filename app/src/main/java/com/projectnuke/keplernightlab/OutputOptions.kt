@@ -24,6 +24,12 @@ enum class FinalOutputFormat(
         get() = this == PNG_DEBUG
 }
 
+fun FinalOutputFormat.imageOnlyEquivalent(): FinalOutputFormat = when (this) {
+    FinalOutputFormat.HEIF_PLUS_RAW -> FinalOutputFormat.HEIF
+    FinalOutputFormat.JPEG_PLUS_RAW -> FinalOutputFormat.JPEG
+    else -> this
+}
+
 enum class OutputFormat(
     val label: String,
     val mimeType: String,

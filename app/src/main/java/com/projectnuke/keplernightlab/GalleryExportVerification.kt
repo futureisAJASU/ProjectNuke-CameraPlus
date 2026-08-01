@@ -39,6 +39,8 @@ internal interface GalleryExportVerificationSource {
     fun query(uri: Uri): GalleryMediaColumns?
     fun open(uri: Uri): InputStream?
     fun decodeBounds(uri: Uri): Pair<Int, Int>
+    /** Decodes a sampled pixel payload after bounds/signature checks. */
+    fun decodeProbe(uri: Uri, sampleSize: Int): Boolean = true
 }
 
 internal fun interface GalleryVerificationRetryScheduler {
@@ -79,6 +81,21 @@ private class AndroidGalleryExportVerificationSource(
         val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
         return options.outWidth to options.outHeight
+    }
+
+    override fun decodeProbe(uri: Uri, sampleSize: Int): Boolean {
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize.coerceAtLeast(1)
+            inPreferredConfig = android.graphics.Bitmap.Config.RGB_565
+        }
+        val bitmap = context.contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, options)
+        } ?: return false
+        return try {
+            !bitmap.isRecycled && bitmap.width > 0 && bitmap.height > 0
+        } finally {
+            bitmap.recycle()
+        }
     }
 }
 
@@ -143,6 +160,13 @@ private fun verifyOnce(
         return GalleryExportVerification.RetryableFailure("Bounds decode failed: ${error.javaClass.simpleName}: ${error.message}")
     }
     if (width <= 0 || height <= 0) return GalleryExportVerification.RetryableFailure("Decoded bounds are invalid: ${width}x${height}")
+    val sample = sampledProbeSize(width, height)
+    val pixelsDecoded = try {
+        source.decodeProbe(uri, sample)
+    } catch (error: Exception) {
+        return GalleryExportVerification.RetryableFailure("Pixel decode probe failed: ${error.javaClass.simpleName}: ${error.message}")
+    }
+    if (!pixelsDecoded) return GalleryExportVerification.RetryableFailure("Pixel decode probe returned no image")
 
     val expected = expectation ?: return GalleryExportVerification.Verified(
         format, columns.mimeType.orEmpty(), columns.displayName.orEmpty(), width, height, probe.size
@@ -179,7 +203,9 @@ private fun verifyOnce(
 private data class ImageProbe(val format: OutputFormat?, val complete: Boolean, val size: Long)
 
 private fun probeImageStream(input: InputStream): ImageProbe {
-    val first = ByteArray(64)
+    // ISO-BMFF compatible brands live in the ftyp box. Keep this bounded but large enough for
+    // normal compatible-brand lists; a larger/unreadable declaration fails closed.
+    val first = ByteArray(1024)
     var firstCount = 0
     val tail = ByteArray(16)
     var tailCount = 0
@@ -214,10 +240,35 @@ private fun probeImageStream(input: InputStream): ImageProbe {
     return ImageProbe(format, complete, size)
 }
 
+private fun sampledProbeSize(width: Int, height: Int): Int {
+    var sample = 1
+    while (width / sample > 1024 || height / sample > 1024) sample *= 2
+    return sample
+}
+
 private fun detectFormat(header: ByteArray, count: Int): OutputFormat? = when {
     count >= 3 && header[0] == 0xff.toByte() && header[1] == 0xd8.toByte() && header[2] == 0xff.toByte() -> OutputFormat.JPEG
     count >= 8 && header.copyOfRange(0, 8).contentEquals(byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) -> OutputFormat.PNG
-    count >= 12 && header.copyOfRange(4, 8).toString(Charsets.US_ASCII) == "ftyp" &&
-        header.copyOfRange(8, 12).toString(Charsets.US_ASCII) in setOf("heic", "heix", "hevc", "heim", "heis") -> OutputFormat.HEIF
+    isSupportedHeifFtyp(header, count) -> OutputFormat.HEIF
     else -> null
+}
+
+private fun isSupportedHeifFtyp(header: ByteArray, count: Int): Boolean {
+    if (count < 16 || header.copyOfRange(4, 8).toString(Charsets.US_ASCII) != "ftyp") return false
+    val boxSize = ((header[0].toInt() and 0xff) shl 24) or ((header[1].toInt() and 0xff) shl 16) or
+        ((header[2].toInt() and 0xff) shl 8) or (header[3].toInt() and 0xff)
+    if (boxSize < 16 || boxSize > count) return false
+    fun brand(offset: Int) = header.copyOfRange(offset, offset + 4).toString(Charsets.US_ASCII)
+    val brands = buildSet {
+        add(brand(8))
+        var offset = 16
+        while (offset + 4 <= boxSize) {
+            add(brand(offset))
+            offset += 4
+        }
+    }
+    if ("avif" in brands || "avis" in brands) return false
+    val heifSpecific = setOf("heic", "heix", "hevc", "hevx", "heim", "heis")
+    return brands.any { it in heifSpecific } ||
+        ("mif1" in brands || "msf1" in brands) && brands.any { it in heifSpecific }
 }

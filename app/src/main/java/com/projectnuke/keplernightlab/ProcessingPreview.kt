@@ -42,7 +42,8 @@ internal class SerializedPreviewWorker<S, R>(
     private val recycleSource: (S) -> Unit,
     private val recycleResult: (R) -> Unit,
     private val adopt: (R) -> Unit,
-    private val adoptWithGeneration: ((Long, R) -> Unit)? = null
+    private val adoptWithGeneration: ((Long, R) -> Unit)? = null,
+    private val onError: (Throwable) -> Unit = {}
 ) {
     private data class Pending<S>(
         val generation: Long,
@@ -90,6 +91,14 @@ internal class SerializedPreviewWorker<S, R>(
                     ) ?: adopt(adopted)
                     result = null
                 }
+            } catch (error: Throwable) {
+                if (error is Error) {
+                    synchronized(this) { workerScheduled = false }
+                    throw error
+                }
+                // Cancellation and ordinary render/adoption failures dispose this request and
+                // leave the drain loop alive for the newest queued request.
+                onError(error)
             } finally {
                 recycleSource(request.source)
                 result?.let(recycleResult)
