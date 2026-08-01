@@ -35,6 +35,11 @@ internal class CaptureFrameIdentityOwner(private val requested: Int) {
     fun allocatedCount(): Int = next
 }
 
+/** Queue entries with owned resources must release them when rejected or removed by shutdownNow. */
+internal interface DisposableCaptureTask : Runnable {
+    fun dispose()
+}
+
 /** A single-owner, bounded queue for capture work. */
 internal class BoundedCaptureWorker(
     name: String,
@@ -51,21 +56,26 @@ internal class BoundedCaptureWorker(
 
     fun submit(task: Runnable): Boolean {
         if (closed.get()) {
-            onRejected(task)
+            reject(task)
             return false
         }
         return try {
             executor.execute(task)
             true
         } catch (_: RejectedExecutionException) {
-            onRejected(task)
+            reject(task)
             false
         }
     }
 
     fun shutdownNow() {
         if (!closed.compareAndSet(false, true)) return
-        executor.shutdownNow().forEach(onRejected)
+        executor.shutdownNow().forEach(::reject)
+    }
+
+    private fun reject(task: Runnable) {
+        (task as? DisposableCaptureTask)?.dispose()
+        onRejected(task)
     }
 
     /** Bounded observation only; callers must not treat this as cancellation. */
