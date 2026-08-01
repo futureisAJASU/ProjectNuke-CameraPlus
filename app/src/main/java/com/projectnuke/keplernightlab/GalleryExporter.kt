@@ -14,6 +14,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.OutputStream
 import java.util.concurrent.CancellationException
+import kotlin.math.abs
 
 data class GalleryExportResult(
     val success: Boolean,
@@ -23,7 +24,8 @@ data class GalleryExportResult(
     val fileSizeBytes: Long,
     val formatUsed: OutputFormat,
     val fallbackUsed: Boolean,
-    val errorMessage: String?
+    val errorMessage: String?,
+    val actualCommittedFormat: OutputFormat = formatUsed
 )
 
 data class RawSidecarExportResult(
@@ -143,21 +145,93 @@ fun verifyGalleryExport(
     uriString: String,
     minSizeBytes: Long = 50_000L
 ): Boolean {
-    return runCatching {
-        if (uriString.isBlank()) return@runCatching false
-        val uri = Uri.parse(uriString)
-        val size = queryMediaSize(context, uri)
-        if (size < minSizeBytes) return@runCatching false
-        context.contentResolver.openInputStream(uri)?.use { input ->
-            val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeStream(input, null, options)
-            if (options.outWidth > 0 && options.outHeight > 0) {
+    if (uriString.isBlank()) return false
+    val uri = Uri.parse(uriString)
+    val maxRetries = 3
+    for (attempt in 1..maxRetries) {
+        val size = runCatching { queryMediaSize(context, uri) }.getOrDefault(0L)
+        if (size >= minSizeBytes) {
+            return runCatching {
+                val detectedFormat = detectImageFormat(context, uri) ?: return@runCatching false
+                val (w, h) = decodeBounds(context, uri)
+                if (w <= 0 || h <= 0) return@runCatching false
                 true
-            } else {
-                context.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize >= minSizeBytes } ?: false
+            }.getOrDefault(false)
+        }
+        if (attempt < maxRetries) Thread.sleep(100L * attempt)
+    }
+    return false
+}
+
+private class CandidateVerificationResult(
+    val readable: Boolean,
+    val detectedFormat: OutputFormat?,
+    val decodedWidth: Int,
+    val decodedHeight: Int,
+    val errorMessage: String?
+)
+
+private fun verifyExportCandidate(
+    context: Context,
+    uri: Uri,
+    expectedFormat: OutputFormat,
+    expectedWidth: Int? = null,
+    expectedHeight: Int? = null
+): CandidateVerificationResult {
+    val detectedFormat = detectImageFormat(context, uri)
+        ?: return CandidateVerificationResult(false, null, 0, 0, "Unreadable or unrecognized image format")
+    if (detectedFormat != expectedFormat) {
+        return CandidateVerificationResult(
+            false, detectedFormat, 0, 0,
+            "Format mismatch: expected ${expectedFormat.label}, detected ${detectedFormat.label}"
+        )
+    }
+    val (w, h) = decodeBounds(context, uri)
+    if (w <= 0 || h <= 0) {
+        return CandidateVerificationResult(false, detectedFormat, w, h, "Invalid decoded bounds: ${w}x${h}")
+    }
+    if (expectedWidth != null && expectedHeight != null) {
+        if (abs(w - expectedWidth) > 1 || abs(h - expectedHeight) > 1) {
+            return CandidateVerificationResult(
+                false, detectedFormat, w, h,
+                "Dimension mismatch: expected ${expectedWidth}x${expectedHeight}, decoded ${w}x${h}"
+            )
+        }
+    }
+    return CandidateVerificationResult(true, detectedFormat, w, h, null)
+}
+
+private fun detectImageFormat(context: Context, uri: Uri): OutputFormat? {
+    return runCatching {
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            val header = ByteArray(12)
+            var offset = 0
+            while (offset < header.size) {
+                val read = stream.read(header, offset, header.size - offset)
+                if (read == -1) break
+                offset += read
             }
-        } ?: false
-    }.getOrDefault(false)
+            if (offset < 12) return@use null
+            when {
+                header[4] == 'f'.code.toByte() && header[5] == 't'.code.toByte() &&
+                    header[6] == 'y'.code.toByte() && header[7] == 'p'.code.toByte() -> OutputFormat.HEIF
+                header[0] == 0xFF.toByte() && header[1] == 0xD8.toByte() && header[2] == 0xFF.toByte() -> OutputFormat.JPEG
+                header[0] == 0x89.toByte() && header[1] == 0x50.toByte() &&
+                    header[2] == 0x4E.toByte() && header[3] == 0x47.toByte() -> OutputFormat.PNG
+                else -> null
+            }
+        }
+    }.getOrDefault(null)
+}
+
+private fun decodeBounds(context: Context, uri: Uri): Pair<Int, Int> {
+    return runCatching {
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeStream(stream, null, options)
+            options.outWidth to options.outHeight
+        } ?: (0 to 0)
+    }.getOrDefault(0 to 0)
 }
 
 fun exportRawSidecarsToPublicStorage(
@@ -251,6 +325,12 @@ fun queryMediaSize(context: Context, uri: Uri): Long {
     return runCatching {
         context.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: 0L
     }.getOrDefault(0L).coerceAtLeast(0L)
+        .takeIf { it > 0L }
+        ?: runCatching {
+            if (uri.scheme == "file") {
+                uri.path?.let { java.io.File(it).length() } ?: 0L
+            } else 0L
+        }.getOrDefault(0L)
 }
 
 fun updateExportMetadata(
@@ -554,15 +634,39 @@ private fun writeGalleryBitmap(
         errorMessage = "MediaStore insert/write failed"
     )
 
+    val committedUri = inserted.first
+    val verification = verifyExportCandidate(
+        context = context,
+        uri = committedUri,
+        expectedFormat = format,
+        expectedWidth = bitmap.width,
+        expectedHeight = bitmap.height
+    )
+
+    if (!verification.readable) {
+        runCatching { context.contentResolver.delete(committedUri, null, null) }
+        return GalleryExportResult(
+            success = false,
+            uriString = committedUri.toString(),
+            displayName = displayName,
+            mimeType = format.mimeType,
+            fileSizeBytes = inserted.second,
+            formatUsed = format,
+            fallbackUsed = fallbackUsed,
+            errorMessage = "Verification failed: ${verification.errorMessage}"
+        )
+    }
+
     return GalleryExportResult(
         success = true,
-        uriString = inserted.first.toString(),
+        uriString = committedUri.toString(),
         displayName = displayName,
         mimeType = format.mimeType,
         fileSizeBytes = inserted.second,
         formatUsed = format,
         fallbackUsed = fallbackUsed,
-        errorMessage = null
+        errorMessage = null,
+        actualCommittedFormat = verification.detectedFormat ?: format
     )
 }
 
