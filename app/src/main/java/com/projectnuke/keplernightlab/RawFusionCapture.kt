@@ -542,8 +542,8 @@ fun captureRawBurstForFusion(
         motionLogger = runCatching { MotionLogger(context).also { it.start() } }.getOrNull()
         postCaptureProgress()
 
-        fun finishError(status: String, message: String) {
-            if (!finished.compareAndSet(false, true)) return
+        fun finishError(status: String, message: String, terminalAlreadyClaimed: Boolean = false) {
+            if (!terminalAlreadyClaimed && !finished.compareAndSet(false, true)) return
             if (rawSelection.requiresMaximumResolutionPixelMode && maxResolutionPixelModeFailure == null) {
                 maxResolutionPixelModeFailure = "Maximum-resolution RAW capture failed: $message"
             }
@@ -553,8 +553,12 @@ fun captureRawBurstForFusion(
             cleanup()
         }
 
-        fun finishSuccess(partial: Boolean = false, reason: String? = null) {
-            if (!finished.compareAndSet(false, true)) return
+        fun finishSuccess(
+            partial: Boolean = false,
+            reason: String? = null,
+            terminalAlreadyClaimed: Boolean = false
+        ) {
+            if (!terminalAlreadyClaimed && !finished.compareAndSet(false, true)) return
             val motionFiles = runCatching { motionLogger?.saveToDirectory(jobDir) }.getOrNull()
             val status = if (partial) "CAPTURE_COMPLETE_PARTIAL" else "CAPTURE_COMPLETE"
             val completeness = if (partial) "PARTIAL" else "FULL"
@@ -681,7 +685,7 @@ fun captureRawBurstForFusion(
                                 }
                                 output.fd.sync()
                             }
-                            val tempDigest = NoFollowFileSystem.copyVerified(dngTemp, java.io.OutputStream.nullOutputStream())
+                            val tempDigest = NoFollowFileSystem.digestVerified(dngTemp)
                             check(tempDigest.size > 0L) { "DNG output was empty" }
                             check(isDngTiffHeader(tempDigest.prefix)) { "DNG output header was invalid" }
                             KeplerJobMetadata.atomicReplace(dngTemp, dngFile)
@@ -764,7 +768,24 @@ fun captureRawBurstForFusion(
                     finishError("CAPTURE_TIMEOUT", message)
                 }
             }
-        }.also { timeoutScheduler.schedule({ handler.post(it) }, max(30_000L, requestedFrames * 8_000L), TimeUnit.MILLISECONDS) }
+        }.also { timeoutScheduler.schedule({
+            if (savedFrames >= requestedFrames || !finished.compareAndSet(false, true)) return@schedule
+            handler.post {
+                if (savedFrames >= MIN_RAW_FUSION_FRAMES) {
+                    finishSuccess(
+                        partial = true,
+                        reason = "saved $savedFrames/$requestedFrames frames; timeout; failedCaptures=$failedCaptures; droppedUnmatchedImages=$droppedUnmatchedImages",
+                        terminalAlreadyClaimed = true
+                    )
+                } else {
+                    finishError(
+                        "CAPTURE_TIMEOUT",
+                        "CAPTURE_TIMEOUT: RAW capture saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames, failed $failedCaptures, droppedUnmatchedImages=$droppedUnmatchedImages",
+                        terminalAlreadyClaimed = true
+                    )
+                }
+            }
+        }, max(30_000L, requestedFrames * 8_000L), TimeUnit.MILLISECONDS) }
 
         imageReader.setOnImageAvailableListener({ r ->
             if (finished.get()) return@setOnImageAvailableListener

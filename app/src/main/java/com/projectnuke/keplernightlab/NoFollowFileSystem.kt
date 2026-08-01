@@ -19,6 +19,10 @@ internal sealed interface NoFollowInspection<out T> {
 
 internal object NoFollowFileSystem {
     data class StreamDigest(val size: Long, val sha256: String, val prefix: ByteArray)
+    private object DiscardOutput : OutputStream() {
+        override fun write(b: Int) = Unit
+        override fun write(buffer: ByteArray, offset: Int, length: Int) = Unit
+    }
 
     /** Streams a stable regular file without following links; never loads a RAW/DNG into memory. */
     fun copyVerified(file: File, output: OutputStream): StreamDigest {
@@ -51,6 +55,8 @@ internal object NoFollowFileSystem {
         require(revalidate(path, before)) { "File identity changed during read: ${file.absolutePath}" }
         return StreamDigest(size, digest.digest().joinToString("") { "%02x".format(it) }, prefix.copyOf(prefixCount))
     }
+
+    fun digestVerified(file: File): StreamDigest = copyVerified(file, DiscardOutput)
     fun readBytesVerified(file: File): ByteArray = when (val inspection = inspect(file.toPath())) {
         NoFollowInspection.Absent -> throw java.io.FileNotFoundException(file.absolutePath)
         is NoFollowInspection.InspectionFailed -> throw inspection.exception

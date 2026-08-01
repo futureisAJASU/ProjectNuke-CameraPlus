@@ -293,9 +293,10 @@ fun captureYuvBurstColorWithMotion(
         source: String = "captureYuvBurstColorWithMotion.legacy",
         throwable: Throwable? = null,
         failureType: String? = null,
-        failureMessage: String? = null
+        failureMessage: String? = null,
+        terminalAlreadyClaimed: Boolean = false
     ) {
-        if (!finished.compareAndSet(false, true)) return
+        if (!terminalAlreadyClaimed && !finished.compareAndSet(false, true)) return
         logYuvCaptureFailure(
             stage = source,
             throwable = throwable,
@@ -1006,15 +1007,15 @@ fun captureYuvBurstColorWithMotion(
                                             backgroundHandler
                                         )
                                         timeoutScheduler.schedule({
+                                            if (savedFrames >= frameCount || !finished.compareAndSet(false, true)) return@schedule
                                             backgroundHandler.post {
-                                                if (!finished.get() && savedFrames < frameCount) {
-                                                    finishError(
-                                                        message = "YUV capture timeout: saved=$savedFrames/$frameCount, receivedImages=$receivedImages, completedResults=$completedResults, failedCaptures=$failedCaptures",
-                                                        source = "captureYuvBurstColorWithMotion.captureRequest.timeout",
-                                                        failureType = "CaptureTimeout",
-                                                        failureMessage = "No enough YUV frames before timeout"
-                                                    )
-                                                }
+                                                finishError(
+                                                    message = "YUV capture timeout: saved=$savedFrames/$frameCount, receivedImages=$receivedImages, completedResults=$completedResults, failedCaptures=$failedCaptures",
+                                                    source = "captureYuvBurstColorWithMotion.captureRequest.timeout",
+                                                    failureType = "CaptureTimeout",
+                                                    failureMessage = "No enough YUV frames before timeout",
+                                                    terminalAlreadyClaimed = true
+                                                )
                                             }
                                         }, captureTimeoutMs, TimeUnit.MILLISECONDS)
                                     } catch (e: Exception) {

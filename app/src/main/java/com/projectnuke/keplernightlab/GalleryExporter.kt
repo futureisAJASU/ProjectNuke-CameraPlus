@@ -268,7 +268,7 @@ private fun loadRawSidecarManifest(jobDir: File): RawSidecarManifest {
     val expected = names.map { NoFollowFileSystem.requireDirectChildFile(jobDir, it) }
     val direct = NoFollowFileSystem.requireDirectDirectDngNames(jobDir)
     require(direct == names) { "Unexpected or missing DNG sidecar files" }
-    expected.forEach { file -> require(isDngTiffHeader(NoFollowFileSystem.copyVerified(file, OutputStream.nullOutputStream()).prefix)) { "Malformed local DNG: ${file.name}" } }
+    expected.forEach { file -> require(isDngTiffHeader(NoFollowFileSystem.digestVerified(file).prefix)) { "Malformed local DNG: ${file.name}" } }
     return RawSidecarManifest(expected, failures)
 }
 
@@ -411,6 +411,12 @@ fun updateExportMetadata(
                 else -> rawSidecarResult.status
             })
             .put("rawSidecarExportedFiles", JSONArray(rawSidecarResult?.exportedFiles ?: emptyList<String>()))
+            .put("rawSidecarExpectedCount", rawSidecarResult?.expectedCount ?: 0)
+            .put("rawSidecarLocallySavedCount", rawSidecarResult?.locallySavedCount ?: 0)
+            .put("rawSidecarPublicExportedCount", rawSidecarResult?.publicExportedCount ?: 0)
+            .put("rawSidecarMissingFilenames", JSONArray(rawSidecarResult?.missingFilenames ?: emptyList<String>()))
+            .put("rawSidecarLocalFailures", JSONArray(rawSidecarResult?.localFailures ?: emptyList<String>()))
+            .put("rawSidecarPublicFailures", JSONArray(rawSidecarResult?.publicFailures ?: emptyList<String>()))
             .put("rawSidecarError", when {
                 rawSidecarIgnored -> "RAW sidecar unavailable for YUV pipeline."
                 else -> rawSidecarResult?.errorMessage ?: JSONObject.NULL
@@ -538,6 +544,12 @@ internal fun updateRawPublicExportOutcome(
         }
         job.put("rawSidecarExportStatus", sidecarStatus)
             .put("rawSidecarExportedFiles", JSONArray(sidecarResult?.exportedFiles ?: emptyList<String>()))
+            .put("rawSidecarExpectedCount", sidecarResult?.expectedCount ?: 0)
+            .put("rawSidecarLocallySavedCount", sidecarResult?.locallySavedCount ?: 0)
+            .put("rawSidecarPublicExportedCount", sidecarResult?.publicExportedCount ?: 0)
+            .put("rawSidecarMissingFilenames", JSONArray(sidecarResult?.missingFilenames ?: emptyList<String>()))
+            .put("rawSidecarLocalFailures", JSONArray(sidecarResult?.localFailures ?: emptyList<String>()))
+            .put("rawSidecarPublicFailures", JSONArray(sidecarResult?.publicFailures ?: emptyList<String>()))
             .put("rawSidecarError", sidecarError)
         if (outcome.currentWarning != null) {
             job.put("currentWarning", outcome.currentWarning)

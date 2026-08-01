@@ -475,7 +475,7 @@ fun MainCameraScreen(
                         !bitmap.isRecycled
                     ) {
                         processingPreviewBitmap = bitmap
-                        processingPreviewStatus = "Processing preview ready"
+                        processingPreviewStatus = "Approximate preview from the processed result is ready"
                     } else if (!bitmap.isRecycled) {
                         bitmap.recycle()
                     }
@@ -607,7 +607,7 @@ LaunchedEffect(Unit) {
             processingPreviewStatus = "No processed result available for preview"
             return@LaunchedEffect
         }
-        processingPreviewStatus = "Rendering processing preview"
+        processingPreviewStatus = "Rendering approximate preview from the processed result"
         try {
             val uiGeneration = previewUiGeneration.incrementAndGet()
             if (previewSource.isRecycled) {
