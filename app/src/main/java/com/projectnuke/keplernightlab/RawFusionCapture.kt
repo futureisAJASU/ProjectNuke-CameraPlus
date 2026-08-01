@@ -132,12 +132,20 @@ fun captureRawBurstForFusion(
     onError: (String) -> Unit
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
-    fun post(message: String) = mainHandler.post { onStatus(message) }
+    fun post(message: String): Boolean =
+        mainHandler.post { onStatus(message) }.also { posted ->
+            if (!posted) runCatching { onStatus(message) }
+        }
+    fun postMainOrRun(action: () -> Unit) {
+        if (!mainHandler.post(action)) runCatching(action)
+    }
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     val thread = HandlerThread("KeplerRawFusionCaptureThread").apply { start() }
     val handler = Handler(thread.looper)
     val saveWorker = BoundedCaptureWorker("KeplerRawFusionSave", capacity = 2)
     val saveWorkerThread = ThreadLocal<Boolean>()
+    val workerScheduled = AtomicBoolean(false)
+    val rescanRequested = AtomicBoolean(false)
     val timeoutScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "KeplerRawFusionTimeout").apply { isDaemon = true }
     }
@@ -152,7 +160,9 @@ fun captureRawBurstForFusion(
     var receivedImages = 0
     var completedResults = 0
     val finished = AtomicBoolean(false)
+    val terminalState = CaptureTerminalState()
     val cleanupStarted = AtomicBoolean(false)
+    val stateLock = Any()
     val imagesByTimestamp = mutableMapOf<Long, Image>()
     val imageArrivalMillis = mutableMapOf<Long, Long>()
     val resultsByTimestamp = mutableMapOf<Long, TotalCaptureResult>()
@@ -165,6 +175,7 @@ fun captureRawBurstForFusion(
     val rawCaptureStartedAt = System.currentTimeMillis()
     var rawFirstImageDelayMs: Long? = null
     val rawFrameSaveTimesMs = mutableListOf<Long>()
+    fun frameObjectsSnapshot(): JSONArray = synchronized(stateLock) { JSONArray(frameObjects.toString()) }
     fun postCaptureProgress() {
         post("RAW 캡처 중입니다. 기기를 움직이지 마세요. saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames, failed $failedCaptures")
     }
@@ -173,10 +184,12 @@ fun captureRawBurstForFusion(
         if (!cleanupStarted.compareAndSet(false, true)) return
         timeoutRunnable = null
         runCatching { reader?.setOnImageAvailableListener(null, null) }
-        imagesByTimestamp.values.forEach { runCatching { it.close() } }
-        imagesByTimestamp.clear()
-        imageArrivalMillis.clear()
-        resultsByTimestamp.clear()
+        synchronized(stateLock) {
+            imagesByTimestamp.values.forEach { runCatching { it.close() } }
+            imagesByTimestamp.clear()
+            imageArrivalMillis.clear()
+            resultsByTimestamp.clear()
+        }
         try { session?.abortCaptures() } catch (_: Exception) {}
         try { session?.stopRepeating() } catch (_: Exception) {}
         try { session?.close() } catch (_: Exception) {}
@@ -185,6 +198,9 @@ fun captureRawBurstForFusion(
         try { motionLogger?.stop() } catch (_: Exception) {}
         timeoutScheduler.shutdownNow()
         saveWorker.shutdownNow()
+        if (!saveWorker.awaitTermination(100L)) {
+            Log.w("KeplerCaptureCancel", "RAW save worker did not terminate before cleanup deadline")
+        }
         try { thread.quitSafely() } catch (_: Exception) {}
     }
 
@@ -196,6 +212,7 @@ fun captureRawBurstForFusion(
     }
 
     captureCancellationHandle.registerCleanupAction {
+        terminalState.claim(CaptureTerminalStatus.CANCELLED)
         finished.set(true)
         cleanup()
     }
@@ -220,7 +237,7 @@ fun captureRawBurstForFusion(
                 .put("userCanMoveDevice", false)
                 .put("captureCompleteness", if (savedFrames >= requestedFrames) "FULL" else if (savedFrames >= MIN_RAW_FUSION_FRAMES) "PARTIAL" else "FAILED")
                 .put("partialCapture", savedFrames in MIN_RAW_FUSION_FRAMES until requestedFrames)
-                .put("frames", frameObjects)
+                .put("frames", frameObjectsSnapshot())
                 .put("updatedAt", System.currentTimeMillis())
             if (error != null) job.put("error", error)
             if (maxResolutionPixelModeFailure != null) {
@@ -460,7 +477,7 @@ fun captureRawBurstForFusion(
             .put("attemptedFrames", attemptedFrames)
             .put("captureCompleteness", "FAILED")
             .put("partialCapture", false)
-            .put("frames", frameObjects)
+            .put("frames", frameObjectsSnapshot())
             .put("createdAt", System.currentTimeMillis())
             .put("notes", "True RAW fusion input. Stores RAW_SENSOR DNG backup plus compact raw16 per frame. TODO retry budget: targetFrames=8, maxAttempts=9 or 10, continue until target saved or maxAttempts/timeout.")
         KeplerJobMetadata.write(jobDir, baseJob)
@@ -510,13 +527,14 @@ fun captureRawBurstForFusion(
         ) {
             val reason =
                 "50MP RAW exists only in maximum-resolution map, but SENSOR_PIXEL_MODE request key is unavailable."
-            if (!finished.compareAndSet(false, true)) return
+            if (!terminalState.claim(CaptureTerminalStatus.FAILED)) return
+            finished.set(true)
             if (rawSelection.requiresMaximumResolutionPixelMode && maxResolutionPixelModeFailure == null) {
                 maxResolutionPixelModeFailure = "Maximum-resolution RAW capture failed: PIPELINE_FAILED: $reason"
             }
             writeJobStatus(jobFile, baseJob, "CAPTURE_FAILED", "PIPELINE_FAILED: $reason")
             post("PIPELINE_FAILED: $reason")
-            mainHandler.post { onError("PIPELINE_FAILED: $reason") }
+            postMainOrRun { onError("PIPELINE_FAILED: $reason") }
             cleanup()
             return
         }
@@ -546,13 +564,14 @@ fun captureRawBurstForFusion(
         postCaptureProgress()
 
         fun finishError(status: String, message: String, terminalAlreadyClaimed: Boolean = false) {
-            if (!terminalAlreadyClaimed && !finished.compareAndSet(false, true)) return
+            if (!terminalAlreadyClaimed && !terminalState.claim(CaptureTerminalStatus.FAILED)) return
+            finished.set(true)
             if (rawSelection.requiresMaximumResolutionPixelMode && maxResolutionPixelModeFailure == null) {
                 maxResolutionPixelModeFailure = "Maximum-resolution RAW capture failed: $message"
             }
             writeJobStatus(jobFile, baseJob, status, message)
             post(message)
-            mainHandler.post { onError(message) }
+            postMainOrRun { onError(message) }
             cleanup()
         }
 
@@ -561,7 +580,10 @@ fun captureRawBurstForFusion(
             reason: String? = null,
             terminalAlreadyClaimed: Boolean = false
         ) {
-            if (!terminalAlreadyClaimed && !finished.compareAndSet(false, true)) return
+            if (!terminalAlreadyClaimed && !terminalState.claim(
+                    if (partial) CaptureTerminalStatus.PARTIAL_SUCCESS else CaptureTerminalStatus.SUCCESS
+                )) return
+            finished.set(true)
             val motionFiles = runCatching { motionLogger?.saveToDirectory(jobDir) }.getOrNull()
             val status = if (partial) "CAPTURE_COMPLETE_PARTIAL" else "CAPTURE_COMPLETE"
             val completeness = if (partial) "PARTIAL" else "FULL"
@@ -602,7 +624,7 @@ fun captureRawBurstForFusion(
                 )
                 .put("captureCompleteness", completeness)
                 .put("partialCapture", partial)
-                .put("frames", frameObjects)
+                .put("frames", frameObjectsSnapshot())
                 .put("gyroFile", motionFiles?.first ?: JSONObject.NULL)
                 .put("rotationVectorFile", motionFiles?.second ?: JSONObject.NULL)
                 .put("capturedAt", System.currentTimeMillis())
@@ -615,10 +637,11 @@ fun captureRawBurstForFusion(
                 post("CAPTURE_COMPLETE: 캡처가 완료되었습니다. saved $savedFrames/$requestedFrames frames")
             }
             cleanup()
-            mainHandler.post { onComplete(jobDir) }
+            postMainOrRun { onComplete(jobDir) }
         }
 
         fun closeUnmatchedImages(force: Boolean = false) {
+            synchronized(stateLock) {
             val pendingLimit = if (highResolutionRaw) 3 else min(7, requestedFrames + 1)
             val now = System.currentTimeMillis()
             val stale = imagesByTimestamp.keys
@@ -637,9 +660,11 @@ fun captureRawBurstForFusion(
                 }
                 imageArrivalMillis.remove(timestamp)
             }
+            }
         }
 
         fun evictEmergencyUnmatchedImages(readerCapacity: Int) {
+            synchronized(stateLock) {
             if (imagesByTimestamp.size < readerCapacity) return
             imagesByTimestamp.keys
                 .filter { it !in resultsByTimestamp }
@@ -651,34 +676,53 @@ fun captureRawBurstForFusion(
                     }
                     imageArrivalMillis.remove(timestamp)
                 }
+            }
         }
 
         fun trySaveReadyFrames() {
             if (saveWorkerThread.get() != true) {
-                saveWorker.submit(Runnable {
+                rescanRequested.set(true)
+                if (!workerScheduled.compareAndSet(false, true)) return
+                val accepted = saveWorker.submit(Runnable {
                     saveWorkerThread.set(true)
                     try {
-                        trySaveReadyFrames()
+                        do {
+                            rescanRequested.set(false)
+                            trySaveReadyFrames()
+                        } while (rescanRequested.get())
                     } finally {
                         saveWorkerThread.remove()
+                        workerScheduled.set(false)
+                        if (rescanRequested.get()) trySaveReadyFrames()
                     }
                 })
+                if (!accepted) {
+                    workerScheduled.set(false)
+                    post("RAW save queue saturated; retaining the unmatched pair for terminal cleanup")
+                }
                 return
             }
             if (finished.get()) return
             closeUnmatchedImages()
-            val ready = imagesByTimestamp.keys
-                .filter { it !in savedTimestamps && resultsByTimestamp.containsKey(it) }
-                .sorted()
+            val ready = synchronized(stateLock) {
+                imagesByTimestamp.keys
+                    .filter { it !in savedTimestamps && resultsByTimestamp.containsKey(it) }
+                    .sorted()
+            }
             for (timestamp in ready) {
                 if (savedFrames >= requestedFrames || finished.get()) return
-                val image = imagesByTimestamp.remove(timestamp) ?: continue
-                imageArrivalMillis.remove(timestamp)
-                val result = resultsByTimestamp.remove(timestamp) ?: run {
-                    imagesByTimestamp[timestamp] = image
-                    imageArrivalMillis[timestamp] = System.currentTimeMillis()
-                    continue
+                val pair = synchronized(stateLock) {
+                    val image = imagesByTimestamp.remove(timestamp) ?: return@synchronized null
+                    imageArrivalMillis.remove(timestamp)
+                    val result = resultsByTimestamp.remove(timestamp)
+                    if (result == null) {
+                        imagesByTimestamp[timestamp] = image
+                        imageArrivalMillis[timestamp] = System.currentTimeMillis()
+                        null
+                    } else Pair(image, result)
                 }
+                val image = pair?.first ?: continue
+                val result = pair!!.second
                 savedTimestamps.add(timestamp)
                 val index = savedFrames
                 val raw16Name = "frame_${index.toString().padStart(2, '0')}.raw16"
@@ -686,7 +730,12 @@ fun captureRawBurstForFusion(
                 try {
                     post("RAW saving frame ${index + 1}/$requestedFrames...")
                     val saveStartedAt = System.currentTimeMillis()
-                    writeCompactRaw16(image, File(jobDir, raw16Name))
+                    val raw16File = File(jobDir, raw16Name)
+                    writeCompactRaw16(image, raw16File)
+                    if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+                        runCatching { raw16File.delete() }
+                        return
+                    }
                     var dngSaved = false
                     var dngFailure: String? = null
                     if (shouldSaveDngSidecars) {
@@ -716,10 +765,16 @@ fun captureRawBurstForFusion(
                             runCatching { if (dngTemp.exists()) dngTemp.delete() }
                         }
                     }
+                    if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+                        runCatching { raw16File.delete() }
+                        runCatching { File(jobDir, dngName).delete() }
+                        return
+                    }
                     val dynamicBlackLevel = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
                     val plane = image.planes[0]
-                    frameObjects.put(
-                        JSONObject()
+                    synchronized(stateLock) {
+                        frameObjects.put(
+                            JSONObject()
                             .put("index", index)
                             .put("raw16File", raw16Name)
                             .put("dngFile", if (dngSaved) dngName else JSONObject.NULL)
@@ -751,7 +806,8 @@ fun captureRawBurstForFusion(
                             .put("cropApplied", finalCropApplied)
                             .put("cropActiveArraySource", finalCropSelection.activeArraySource)
                             .put("cropRegion", finalCropSelection.region?.toString() ?: JSONObject.NULL)
-                    )
+                        )
+                    }
                     savedFrames++
                     val saveMs = System.currentTimeMillis() - saveStartedAt
                     rawFrameSaveTimesMs += saveMs
@@ -783,9 +839,16 @@ fun captureRawBurstForFusion(
                 }
             }
         }.also { timeoutScheduler.schedule({
-            if (savedFrames >= requestedFrames || !finished.compareAndSet(false, true)) return@schedule
+            if (!terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) return@schedule
+            finished.set(true)
             val settle = Runnable {
-                if (savedFrames >= MIN_RAW_FUSION_FRAMES) {
+                if (savedFrames >= requestedFrames) {
+                    finishSuccess(
+                        partial = false,
+                        reason = "all RAW frames persisted before timeout settlement",
+                        terminalAlreadyClaimed = true
+                    )
+                } else if (savedFrames >= MIN_RAW_FUSION_FRAMES) {
                     finishSuccess(
                         partial = true,
                         reason = "saved $savedFrames/$requestedFrames frames; timeout; failedCaptures=$failedCaptures; droppedUnmatchedImages=$droppedUnmatchedImages",
@@ -824,9 +887,11 @@ fun captureRawBurstForFusion(
                 rawFirstImageDelayMs = System.currentTimeMillis() - rawCaptureStartedAt
                 post("RAW first image delay: ${rawFirstImageDelayMs}ms")
             }
-            imagesByTimestamp.remove(image.timestamp)?.let { runCatching { it.close() } }
-            imagesByTimestamp[image.timestamp] = image
-            imageArrivalMillis[image.timestamp] = System.currentTimeMillis()
+            synchronized(stateLock) {
+                imagesByTimestamp.remove(image.timestamp)?.let { runCatching { it.close() } }
+                imagesByTimestamp[image.timestamp] = image
+                imageArrivalMillis[image.timestamp] = System.currentTimeMillis()
+            }
             evictEmergencyUnmatchedImages(imageReader.maxImages)
             closeUnmatchedImages()
             postCaptureProgress()
@@ -924,7 +989,9 @@ fun captureRawBurstForFusion(
                                                     "finalRequestZoom=$requestZoomRatio"
                                             )
                                             if (timestamp != null && !finished.get()) {
-                                                resultsByTimestamp[timestamp] = result
+                                                synchronized(stateLock) {
+                                                    resultsByTimestamp[timestamp] = result
+                                                }
                                                 completedResults++
                                                 postCaptureProgress()
                                                 trySaveReadyFrames()
@@ -1009,9 +1076,10 @@ fun captureRawBurstForFusion(
             handler
         )
     } catch (e: Exception) {
-        if (!finished.compareAndSet(false, true)) return
+        if (!terminalState.claim(CaptureTerminalStatus.FAILED)) return
+        finished.set(true)
         post("RAW fusion init failed\n${e.stackTraceToString()}")
-        mainHandler.post { onError("RAW fusion init failed\n${e.stackTraceToString()}") }
+        postMainOrRun { onError("RAW fusion init failed\n${e.stackTraceToString()}") }
         cleanup()
     }
 }

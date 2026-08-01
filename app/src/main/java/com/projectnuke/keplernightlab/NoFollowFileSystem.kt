@@ -11,6 +11,19 @@ import java.nio.file.attribute.BasicFileAttributes
 import java.io.OutputStream
 import java.security.MessageDigest
 
+internal fun noFollowIdentityMatches(
+    expectedFileKey: Any?,
+    actualFileKey: Any?,
+    expectedSize: Long,
+    actualSize: Long,
+    expectedModifiedMillis: Long,
+    actualModifiedMillis: Long
+): Boolean = if (expectedFileKey != null && actualFileKey != null) {
+    expectedFileKey == actualFileKey
+} else {
+    expectedSize == actualSize && expectedModifiedMillis == actualModifiedMillis
+}
+
 internal sealed interface NoFollowInspection<out T> {
     data object Absent : NoFollowInspection<Nothing>
     data class Present<T>(val value: T) : NoFollowInspection<T>
@@ -70,8 +83,10 @@ internal object NoFollowFileSystem {
             }
             require(
                 after.isRegularFile && !after.isSymbolicLink() &&
-                    ((attrs.fileKey() != null && after.fileKey() != null && attrs.fileKey() == after.fileKey()) ||
-                        (attrs.size() == after.size() && attrs.lastModifiedTime() == after.lastModifiedTime()))
+                    noFollowIdentityMatches(
+                        attrs.fileKey(), after.fileKey(), attrs.size(), after.size(),
+                        attrs.lastModifiedTime().toMillis(), after.lastModifiedTime().toMillis()
+                    )
             ) { "File identity changed during read: ${file.absolutePath}" }
             bytes
         }
@@ -109,9 +124,10 @@ internal object NoFollowFileSystem {
                 actual.isDirectory == expected.isDirectory &&
                 actual.isRegularFile == expected.isRegularFile &&
                 actual.isOther == expected.isOther &&
-                expected.fileKey() != null &&
-                actual.fileKey() != null &&
-                expected.fileKey() == actual.fileKey()
+                noFollowIdentityMatches(
+                    expected.fileKey(), actual.fileKey(), expected.size(), actual.size(),
+                    expected.lastModifiedTime().toMillis(), actual.lastModifiedTime().toMillis()
+                )
         }
     }
 

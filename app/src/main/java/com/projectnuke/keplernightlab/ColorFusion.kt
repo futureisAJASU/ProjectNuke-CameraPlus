@@ -36,8 +36,8 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.Executors
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.min
@@ -217,15 +217,16 @@ fun captureYuvBurstColorWithMotion(
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
     fun postStatus(message: String) {
-        mainHandler.post { onStatus(message) }
+        if (!mainHandler.post { onStatus(message) }) runCatching { onStatus(message) }
+    }
+    fun postMainOrRun(action: () -> Unit) {
+        if (!mainHandler.post(action)) runCatching(action)
     }
 
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     val backgroundThread = HandlerThread("KeplerColorBurstThread").apply { start() }
     val backgroundHandler = Handler(backgroundThread.looper)
-    val processingThread = HandlerThread("KeplerColorBurstWorker").apply { start() }
-    val processingHandler = Handler(processingThread.looper)
-    val processingSlots = Semaphore(2)
+    val yuvWorkQueue = BoundedCaptureWorker("KeplerColorBurstWorker", capacity = 2)
     val timeoutScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "KeplerColorBurstTimeout").apply { isDaemon = true }
     }
@@ -236,10 +237,12 @@ fun captureYuvBurstColorWithMotion(
     var imageReader: ImageReader? = null
 
     var savedFrames = 0
+    var bufferedFrameCount = 0
     var receivedImages = 0
     var completedResults = 0
     var failedCaptures = 0
     val finished = AtomicBoolean(false)
+    val terminalState = CaptureTerminalState()
     val cleanupStarted = AtomicBoolean(false)
     var motionSaved = false
     var motionFiles: Pair<String?, String?> = Pair(null, null)
@@ -247,8 +250,8 @@ fun captureYuvBurstColorWithMotion(
     var jobFile: File? = null
     var burstDir: File? = null
 
-    val frameTimestampsNs = mutableListOf<Long>()
-    val savedFrameFiles = mutableListOf<String>()
+    val frameTimestampsNs = CopyOnWriteArrayList<Long>()
+    val savedFrameFiles = CopyOnWriteArrayList<String>()
 
     fun captureFailureSnapshot(): YuvCaptureFailureSnapshot = YuvCaptureFailureSnapshot(
         jobFile = jobFile,
@@ -272,7 +275,10 @@ fun captureYuvBurstColorWithMotion(
         try { motionLogger?.stop() } catch (_: Exception) {}
         timeoutScheduler.shutdownNow()
         try { backgroundThread.quitSafely() } catch (_: Exception) {}
-        try { processingThread.quitSafely() } catch (_: Exception) {}
+        yuvWorkQueue.shutdownNow()
+        if (!yuvWorkQueue.awaitTermination(100L)) {
+            Log.w("KeplerCaptureCancel", "YUV worker did not terminate before cleanup deadline")
+        }
     }
 
     fun logLateCameraCallback(callback: String) {
@@ -283,12 +289,14 @@ fun captureYuvBurstColorWithMotion(
     }
 
     captureCancellationHandle.registerCleanupAction {
+        terminalState.claim(CaptureTerminalStatus.CANCELLED)
         finished.set(true)
         cleanup()
     }
 
     fun finish(message: String) {
-        if (!finished.compareAndSet(false, true)) return
+        if (!terminalState.claim(CaptureTerminalStatus.SUCCESS)) return
+        finished.set(true)
         postStatus(message)
         cleanup()
     }
@@ -301,7 +309,8 @@ fun captureYuvBurstColorWithMotion(
         failureMessage: String? = null,
         terminalAlreadyClaimed: Boolean = false
     ) {
-        if (!terminalAlreadyClaimed && !finished.compareAndSet(false, true)) return
+        if (!terminalAlreadyClaimed && !terminalState.claim(CaptureTerminalStatus.FAILED)) return
+        finished.set(true)
         logYuvCaptureFailure(
             stage = source,
             throwable = throwable,
@@ -315,14 +324,15 @@ fun captureYuvBurstColorWithMotion(
             failureMessage = failureMessage ?: message
         )
         postStatus(message)
-        mainHandler.post { onError(message) }
+        postMainOrRun { onError(message) }
         cleanup()
     }
 
-    fun finishSuccess(jobDir: File, message: String) {
-        if (!finished.compareAndSet(false, true)) return
+    fun finishSuccess(jobDir: File, message: String, terminalAlreadyClaimed: Boolean = false) {
+        if (!terminalAlreadyClaimed && !terminalState.claim(CaptureTerminalStatus.SUCCESS)) return
+        finished.set(true)
         cleanup()
-        mainHandler.post { onComplete(jobDir) }
+        postMainOrRun { onComplete(jobDir) }
         postStatus(message)
     }
 
@@ -575,15 +585,8 @@ fun captureYuvBurstColorWithMotion(
                 "Folder:\n${currentBurstDir.absolutePath}"
         )
 
-        reader.setOnImageAvailableListener(
-            { r ->
+        val processImageAvailable: (ImageReader) -> Unit = setOnImageAvailableListener@{ r ->
                 if (finished.get()) return@setOnImageAvailableListener
-
-                if (!processingSlots.tryAcquire()) {
-                    runCatching { r.acquireNextImage()?.close() }
-                    postStatus("YUV capture backpressure: frame dropped before processing")
-                    return@setOnImageAvailableListener
-                }
 
                 var image: Image? = null
 
@@ -635,14 +638,18 @@ fun captureYuvBurstColorWithMotion(
                         image = null
                         bufferedFrames.add(bufferedFrame)
                         bufferedYuvBytes += actualFrameBytes
-                        savedFrames++
+                        bufferedFrameCount++
                         frameTimestampsNs.add(imageTimestampNs)
-                        postStatus("YUV buffered frame $savedFrames/$frameCount")
+                        postStatus("YUV buffered frame $bufferedFrameCount/$frameCount")
 
-                        if (savedFrames >= frameCount) {
+                        if (bufferedFrameCount >= frameCount) {
                             val savedMotionFiles = saveMotionOnce(currentBurstDir)
                             val finalLogger = motionLogger
                             bufferedFrames.sortedBy { it.index }.forEachIndexed { flushIndex, frame ->
+                                if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+                                    bufferedFrames.clear()
+                                    return@setOnImageAvailableListener
+                                }
                                 val fileName =
                                     "frame_${frame.index.toString().padStart(2, '0')}_color.png"
                                 saveRotatedColorPngFromBufferedYuv(
@@ -651,9 +658,13 @@ fun captureYuvBurstColorWithMotion(
                                     rotationDegrees = rotationDegrees
                                 )
                                 savedFrameFiles.add(fileName)
+                                savedFrames++
                                 postStatus("YUV flushing frame ${flushIndex + 1}/${bufferedFrames.size}")
                             }
                             bufferedFrames.clear()
+                            if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+                                return@setOnImageAvailableListener
+                            }
                             writeColorJobJson(
                                 jobFile = currentJobFile,
                                 status = "CAPTURE_COMPLETE",
@@ -696,13 +707,15 @@ fun captureYuvBurstColorWithMotion(
                                 requestedZoomRatio = zoomRatio
                             )
                             postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
-                            finishSuccess(
-                                currentBurstDir,
-                                "CAPTURE_COMPLETE: Color Burst + Motion complete\n" +
-                                    "Frames: $savedFrames\n" +
-                                    "Output: ${outputWidth}x${outputHeight}\n" +
-                                    "Folder:\n${currentBurstDir.absolutePath}"
-                            )
+                            if (savedFrames >= frameCount) {
+                                finishSuccess(
+                                    currentBurstDir,
+                                    "CAPTURE_COMPLETE: Color Burst + Motion complete\n" +
+                                        "Frames: $savedFrames\n" +
+                                        "Output: ${outputWidth}x${outputHeight}\n" +
+                                        "Folder:\n${currentBurstDir.absolutePath}"
+                                )
+                            }
                         }
                         return@setOnImageAvailableListener
                     }
@@ -721,6 +734,10 @@ fun captureYuvBurstColorWithMotion(
                     frameTimestampsNs.add(imageTimestampNs)
 
                     val logger = motionLogger
+
+                    if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+                        return@setOnImageAvailableListener
+                    }
 
                     writeColorJobJson(
                         jobFile = currentJobFile,
@@ -775,6 +792,9 @@ fun captureYuvBurstColorWithMotion(
                     )
 
                     if (savedFrames >= frameCount) {
+                        if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+                            return@setOnImageAvailableListener
+                        }
                         val savedMotionFiles = saveMotionOnce(currentBurstDir)
                         val finalLogger = motionLogger
 
@@ -851,10 +871,20 @@ fun captureYuvBurstColorWithMotion(
                     )
                 } finally {
                     try { image?.close() } catch (_: Exception) {}
-                    processingSlots.release()
+                }
+            }
+        reader.setOnImageAvailableListener(
+            { r ->
+                if (finished.get()) {
+                    runCatching { r.acquireNextImage()?.close() }
+                    return@setOnImageAvailableListener
+                }
+                if (!yuvWorkQueue.submit(Runnable { processImageAvailable(r) })) {
+                    runCatching { r.acquireNextImage()?.close() }
+                    postStatus("YUV capture backpressure: frame dropped before processing")
                 }
             },
-            processingHandler
+            backgroundHandler
         )
 
         postStatus("Color Fusion 초기화 6/7: 카메라 여는 중...")
@@ -1019,15 +1049,24 @@ fun captureYuvBurstColorWithMotion(
                                             backgroundHandler
                                         )
                                         timeoutScheduler.schedule({
-                                            if (savedFrames >= frameCount || !finished.compareAndSet(false, true)) return@schedule
+                                            if (!terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) return@schedule
+                                            finished.set(true)
                                             val settle = Runnable {
-                                                finishError(
-                                                    message = "YUV capture timeout: saved=$savedFrames/$frameCount, receivedImages=$receivedImages, completedResults=$completedResults, failedCaptures=$failedCaptures",
-                                                    source = "captureYuvBurstColorWithMotion.captureRequest.timeout",
-                                                    failureType = "CaptureTimeout",
-                                                    failureMessage = "No enough YUV frames before timeout",
-                                                    terminalAlreadyClaimed = true
-                                                )
+                                                if (savedFrames >= frameCount) {
+                                                    finishSuccess(
+                                                        currentBurstDir,
+                                                        "YUV capture completed before timeout settlement",
+                                                        terminalAlreadyClaimed = true
+                                                    )
+                                                } else {
+                                                    finishError(
+                                                        message = "YUV capture timeout: saved=$savedFrames/$frameCount, receivedImages=$receivedImages, completedResults=$completedResults, failedCaptures=$failedCaptures",
+                                                        source = "captureYuvBurstColorWithMotion.captureRequest.timeout",
+                                                        failureType = "CaptureTimeout",
+                                                        failureMessage = "No enough YUV frames before timeout",
+                                                        terminalAlreadyClaimed = true
+                                                    )
+                                                }
                                             }
                                             if (!backgroundHandler.post(settle)) settle.run()
                                         }, captureTimeoutMs, TimeUnit.MILLISECONDS)
@@ -1180,7 +1219,7 @@ fun averageLatestYuvBurstColor(
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
     fun postStatus(message: String) {
-        mainHandler.post { onStatus(message) }
+        if (!mainHandler.post { onStatus(message) }) runCatching { onStatus(message) }
     }
 
     val workerThread = HandlerThread("KeplerAverageColorThread").apply { start() }

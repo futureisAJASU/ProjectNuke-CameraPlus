@@ -9,6 +9,11 @@ import org.junit.Test
 
 class NoFollowFileSystemTest {
     @Test
+    fun nullFileKeysUseStableDescriptorFence() {
+        assertTrue(noFollowIdentityMatches(null, null, 12L, 12L, 99L, 99L))
+        assertFalse(noFollowIdentityMatches(null, null, 12L, 13L, 99L, 99L))
+    }
+    @Test
     fun childSymlinkIsNotListedOrCounted() {
         val root = createTempDirectory("kepler-nofollow").toFile()
         try {
