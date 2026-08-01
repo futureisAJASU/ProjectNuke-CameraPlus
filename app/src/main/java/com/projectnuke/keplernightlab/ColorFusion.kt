@@ -37,6 +37,7 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.min
@@ -222,6 +223,9 @@ fun captureYuvBurstColorWithMotion(
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     val backgroundThread = HandlerThread("KeplerColorBurstThread").apply { start() }
     val backgroundHandler = Handler(backgroundThread.looper)
+    val processingThread = HandlerThread("KeplerColorBurstWorker").apply { start() }
+    val processingHandler = Handler(processingThread.looper)
+    val processingSlots = Semaphore(2)
     val timeoutScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "KeplerColorBurstTimeout").apply { isDaemon = true }
     }
@@ -268,6 +272,7 @@ fun captureYuvBurstColorWithMotion(
         try { motionLogger?.stop() } catch (_: Exception) {}
         timeoutScheduler.shutdownNow()
         try { backgroundThread.quitSafely() } catch (_: Exception) {}
+        try { processingThread.quitSafely() } catch (_: Exception) {}
     }
 
     fun logLateCameraCallback(callback: String) {
@@ -574,6 +579,12 @@ fun captureYuvBurstColorWithMotion(
             { r ->
                 if (finished.get()) return@setOnImageAvailableListener
 
+                if (!processingSlots.tryAcquire()) {
+                    runCatching { r.acquireNextImage()?.close() }
+                    postStatus("YUV capture backpressure: frame dropped before processing")
+                    return@setOnImageAvailableListener
+                }
+
                 var image: Image? = null
 
                 try {
@@ -840,9 +851,10 @@ fun captureYuvBurstColorWithMotion(
                     )
                 } finally {
                     try { image?.close() } catch (_: Exception) {}
+                    processingSlots.release()
                 }
             },
-            backgroundHandler
+            processingHandler
         )
 
         postStatus("Color Fusion 초기화 6/7: 카메라 여는 중...")
@@ -1008,7 +1020,7 @@ fun captureYuvBurstColorWithMotion(
                                         )
                                         timeoutScheduler.schedule({
                                             if (savedFrames >= frameCount || !finished.compareAndSet(false, true)) return@schedule
-                                            backgroundHandler.post {
+                                            val settle = Runnable {
                                                 finishError(
                                                     message = "YUV capture timeout: saved=$savedFrames/$frameCount, receivedImages=$receivedImages, completedResults=$completedResults, failedCaptures=$failedCaptures",
                                                     source = "captureYuvBurstColorWithMotion.captureRequest.timeout",
@@ -1017,6 +1029,7 @@ fun captureYuvBurstColorWithMotion(
                                                     terminalAlreadyClaimed = true
                                                 )
                                             }
+                                            if (!backgroundHandler.post(settle)) settle.run()
                                         }, captureTimeoutMs, TimeUnit.MILLISECONDS)
                                     } catch (e: Exception) {
                                         val templateFailure =

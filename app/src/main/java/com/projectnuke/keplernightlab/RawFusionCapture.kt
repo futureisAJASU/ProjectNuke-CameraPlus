@@ -136,6 +136,8 @@ fun captureRawBurstForFusion(
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     val thread = HandlerThread("KeplerRawFusionCaptureThread").apply { start() }
     val handler = Handler(thread.looper)
+    val saveWorker = BoundedCaptureWorker("KeplerRawFusionSave", capacity = 2)
+    val saveWorkerThread = ThreadLocal<Boolean>()
     val timeoutScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "KeplerRawFusionTimeout").apply { isDaemon = true }
     }
@@ -182,6 +184,7 @@ fun captureRawBurstForFusion(
         try { cameraDevice?.close() } catch (_: Exception) {}
         try { motionLogger?.stop() } catch (_: Exception) {}
         timeoutScheduler.shutdownNow()
+        saveWorker.shutdownNow()
         try { thread.quitSafely() } catch (_: Exception) {}
     }
 
@@ -651,6 +654,17 @@ fun captureRawBurstForFusion(
         }
 
         fun trySaveReadyFrames() {
+            if (saveWorkerThread.get() != true) {
+                saveWorker.submit(Runnable {
+                    saveWorkerThread.set(true)
+                    try {
+                        trySaveReadyFrames()
+                    } finally {
+                        saveWorkerThread.remove()
+                    }
+                })
+                return
+            }
             if (finished.get()) return
             closeUnmatchedImages()
             val ready = imagesByTimestamp.keys
@@ -770,7 +784,7 @@ fun captureRawBurstForFusion(
             }
         }.also { timeoutScheduler.schedule({
             if (savedFrames >= requestedFrames || !finished.compareAndSet(false, true)) return@schedule
-            handler.post {
+            val settle = Runnable {
                 if (savedFrames >= MIN_RAW_FUSION_FRAMES) {
                     finishSuccess(
                         partial = true,
@@ -785,6 +799,7 @@ fun captureRawBurstForFusion(
                     )
                 }
             }
+            if (!handler.post(settle)) settle.run()
         }, max(30_000L, requestedFrames * 8_000L), TimeUnit.MILLISECONDS) }
 
         imageReader.setOnImageAvailableListener({ r ->
