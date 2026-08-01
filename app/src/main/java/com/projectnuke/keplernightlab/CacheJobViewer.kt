@@ -47,6 +47,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -265,6 +266,17 @@ fun JobDetailScreen(jobDir: File, onBack: () -> Unit) {
     var showNativeJson by remember(jobDir) { mutableStateOf(false) }
     var isReprocessing by remember(jobDir) { mutableStateOf(false) }
 
+    DisposableEffect(finalThumbnail) {
+        onDispose {
+            finalThumbnail?.takeIf { !it.isRecycled }?.recycle()
+        }
+    }
+    DisposableEffect(previewThumbnail) {
+        onDispose {
+            previewThumbnail?.takeIf { !it.isRecycled }?.recycle()
+        }
+    }
+
     LaunchedEffect(jobDir, refreshKey) {
         loading = true
         loadError = null
@@ -275,25 +287,30 @@ fun JobDetailScreen(jobDir: File, onBack: () -> Unit) {
             null
         }
         detail = loaded
-        val loadedThumbnails = withContext(Dispatchers.IO) {
-            val final = loaded?.finalOutputFile?.let { loadThumbnailSafe(it, 1280) }
-            val preview = loaded?.previewFile?.takeUnless { it == loaded.finalOutputFile }?.let {
-                loadThumbnailSafe(it, 960)
+        var loadedFinal: Bitmap? = null
+        var loadedPreview: Bitmap? = null
+        try {
+            val loadedThumbnails = withContext(Dispatchers.IO) {
+                val final = loaded?.finalOutputFile?.let { loadThumbnailSafe(it, 1280) }
+                val preview = loaded?.previewFile?.takeUnless { it == loaded.finalOutputFile }?.let {
+                    loadThumbnailSafe(it, 960)
+                }
+                final to preview
             }
-            final to preview
-        }
-        finalThumbnail?.takeUnless { it.isRecycled }?.recycle()
-        previewThumbnail?.takeUnless { it.isRecycled }?.recycle()
-        finalThumbnail = loadedThumbnails.first
-        previewThumbnail = loadedThumbnails.second
-        loading = false
-    }
+            loadedFinal = loadedThumbnails.first
+            loadedPreview = loadedThumbnails.second
 
-    DisposableEffect(jobDir) {
-        onDispose {
-            finalThumbnail?.takeUnless { it.isRecycled }?.recycle()
-            previewThumbnail?.takeUnless { it.isRecycled }?.recycle()
+            if (coroutineContext[Job]?.isActive == true) {
+                finalThumbnail = loadedFinal
+                loadedFinal = null
+                previewThumbnail = loadedPreview
+                loadedPreview = null
+            }
+        } finally {
+            loadedFinal?.takeIf { !it.isRecycled }?.recycle()
+            loadedPreview?.takeIf { !it.isRecycled }?.recycle()
         }
+        loading = false
     }
 
     BackHandler { onBack() }

@@ -770,6 +770,7 @@ private fun alignmentMad(
     return difference.toFloat() / count.coerceAtLeast(1) / 255f
 }
 
+@Suppress("DEPRECATION")
 private fun mergeClassicFrames(
     frames: List<ClassicFrame>,
     reference: ClassicFrame,

@@ -538,6 +538,7 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun createNormalPreviewSession(
         camera: CameraDevice,
         surface: Surface,

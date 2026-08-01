@@ -217,6 +217,8 @@ bool readRaw16(const std::string& path, int width, int height, std::vector<uint1
     return true;
 }
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
 bool writeRaw16(const std::string& path, const std::vector<uint16_t>& raw, std::string& error) {
     std::ofstream output(path, std::ios::binary);
     if (!output) {
@@ -238,6 +240,7 @@ bool writeRaw16(const std::string& path, const std::vector<uint16_t>& raw, std::
     }
     return output.good();
 }
+#pragma GCC diagnostic pop
 
 bool validateRaw16Stream(
     std::ifstream& input,
@@ -1716,6 +1719,8 @@ bool renderRaw16NativeIspV2(
         int source = static_cast<int>((static_cast<int64_t>(outputCoordinate) * inputSize) / outputSize);
         return std::clamp((source / 2) * 2 + (outputCoordinate & 1), 0, inputSize - 1);
     };
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
     auto legacyInlineDemosaic = [&](int sx, int sy) -> std::array<float, 3> {
         const int value = rawAt(sx, sy);
         float r = 0.0f;
@@ -1773,6 +1778,7 @@ bool renderRaw16NativeIspV2(
             std::clamp(b / whiteRange, 0.0f, 1.0f)
         };
     };
+#pragma GCC diagnostic pop
     auto applyWbAndMatrix = [&](const std::array<float, 3>& rgb) -> std::array<float, 3> {
         const float wbR = rgb[0] * params.wbR;
         const float wbG = rgb[1] * params.wbG;
@@ -2050,6 +2056,7 @@ Java_com_projectnuke_keplernightlab_NativeRawEngine_processRaw16ToRgbOutputV2(
     jstring outputReferenceDebugRgbaPath,
     jstring outputMergedLinearDebugRgbaPath
 ) {
+    (void)thiz;
     try {
         const std::string metadataPath = getString(env, metadataJsonPath);
         const NativeIspRenderParams params = parseNativeIspRenderParams(metadataPath);

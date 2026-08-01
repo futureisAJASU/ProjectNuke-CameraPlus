@@ -21,6 +21,7 @@ internal fun PhysicalCaptureRoute.finalRequestZoomRatio(normalZoomRatio: Float):
     PhysicalCaptureRoute.PHYSICAL_FAILED_CROP_FALLBACK -> normalZoomRatio
 }
 
+@Suppress("DEPRECATION")
 internal fun createRoutedStillCaptureSession(
     camera: CameraDevice,
     surface: Surface,

@@ -419,6 +419,7 @@ private fun RawFusionProcessResult.loadExportBitmap(): RawFusionExportBitmap {
     return RawFusionExportBitmap(bitmap, "final_png_decode", false)
 }
 
+@Suppress("SENSELESS_COMPARISON")
 fun captureProcessExportRawNightFusion(
     context: Context,
     cameraId: String,
@@ -1135,6 +1136,7 @@ fun captureProcessExportRawNightFusion(
     )
 }
 
+@Suppress("SENSELESS_COMPARISON")
 internal fun reprocessRawJob(
     context: Context,
     jobDir: File,

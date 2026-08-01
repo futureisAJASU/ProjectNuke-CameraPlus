@@ -430,15 +430,27 @@ fun MainCameraScreen(
         logLongReport("KeplerCameraDump", buildFullCameraDumpReport(context))
     }
 
-var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var latestSummary by remember { mutableStateOf("최근 결과 없음") }
     var latestResult by remember { mutableStateOf<LatestKeplerResult?>(null) }
     var showResultPreview by remember { mutableStateOf(false) }
-    val latestBitmapRef = remember { AtomicReference<Bitmap?>(null) }
     val previewUiGeneration = remember { AtomicLong(0L) }
+
+    DisposableEffect(latestBitmap) {
+        onDispose {
+            latestBitmap?.takeIf { !it.isRecycled }?.recycle()
+        }
+    }
 
     var processingPreviewBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var processingPreviewStatus by remember { mutableStateOf("최근 결과를 촬영하면 설정 미리보기가 표시됩니다.") }
+
+    DisposableEffect(processingPreviewBitmap) {
+        onDispose {
+            processingPreviewBitmap?.takeIf { !it.isRecycled }?.recycle()
+        }
+    }
+
     val refreshMutex = remember { Mutex() }
     val previewMainHandler = remember { Handler(Looper.getMainLooper()) }
     val previewWorker = remember {
@@ -487,8 +499,6 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
         ++refreshGeneration
         refreshJob?.cancel()
         refreshJob = null
-        latestBitmapRef.getAndSet(null)?.let { if (!it.isRecycled) it.recycle() }
-        latestBitmap?.takeIf { !it.isRecycled }?.recycle()
         latestBitmap = null
         latestResult = null
         latestSummary = "최근 결과 없음"
@@ -529,23 +539,13 @@ var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
                     }
 
                     if (ownedBitmap != null) {
-                        val oldBitmap = latestBitmap
-                        if (oldBitmap != null && !oldBitmap.isRecycled && oldBitmap !== ownedBitmap) {
-                            oldBitmap.recycle()
-                        }
                         latestBitmap = ownedBitmap
                         latestResult = result!!.copy(bitmap = ownedBitmap)
-                        latestBitmapRef.set(ownedBitmap)
                         ownedBitmap = null
                         adopted = true
                     } else {
-                        val oldBitmap = latestBitmap
-                        if (oldBitmap != null && !oldBitmap.isRecycled) {
-                            oldBitmap.recycle()
-                        }
                         latestBitmap = null
                         latestResult = result!!.copy(bitmap = null)
-                        latestBitmapRef.set(null)
                     }
                     latestSummary = result!!.summary
                     latestSceneLuma = estimate!!.meanLuma

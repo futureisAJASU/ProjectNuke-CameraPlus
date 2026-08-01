@@ -31,10 +31,11 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
+import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -52,6 +53,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -384,7 +386,7 @@ private fun KeplerGalleryJobSummary.isSourceOnlyGalleryJob(): Boolean =
 
 @Composable
 private fun GalleryFixedTabs(selectedTab: Int, onSelect: (Int) -> Unit) {
-    TabRow(selectedTabIndex = selectedTab, containerColor = galleryFixedBackground) {
+    PrimaryTabRow(selectedTabIndex = selectedTab, containerColor = galleryFixedBackground) {
         Tab(selected = selectedTab == TAB_PHOTOS_ONLY, onClick = { onSelect(TAB_PHOTOS_ONLY) }, text = { Text("사진만") })
         Tab(selected = selectedTab == TAB_INFO, onClick = { onSelect(TAB_INFO) }, text = { Text("정보") })
         Tab(selected = selectedTab == TAB_DEBUG, onClick = { onSelect(TAB_DEBUG) }, text = { Text("디버그") })
@@ -434,10 +436,23 @@ private fun AsyncThumbnailImage(
     contentDescription: String? = null
 ) {
     var bitmap by remember(file?.absolutePath, maxDimension) { mutableStateOf<Bitmap?>(null) }
+    DisposableEffect(bitmap) {
+        onDispose {
+            bitmap?.takeIf { !it.isRecycled }?.recycle()
+        }
+    }
     LaunchedEffect(file?.absolutePath, maxDimension) {
-        bitmap = null
-        bitmap = withContext(Dispatchers.IO) {
-            file?.let { loadThumbnailSafe(it, maxDimension) }
+        var loaded: Bitmap? = null
+        try {
+            loaded = withContext(Dispatchers.IO) {
+                file?.let { loadThumbnailSafe(it, maxDimension) }
+            }
+            if (coroutineContext[Job]?.isActive == true && loaded != null && !loaded.isRecycled) {
+                bitmap = loaded
+                loaded = null
+            }
+        } finally {
+            loaded?.takeIf { !it.isRecycled }?.recycle()
         }
     }
     Box(modifier = modifier.background(Color.Black)) {
@@ -813,6 +828,7 @@ private fun GalleryFixedReprocessSection(
     }
 }
 
+@Suppress("DEPRECATION")
 @Composable
 private fun KeplerGalleryDetailScreenFixedV2(
     job: KeplerGalleryJobSummary,

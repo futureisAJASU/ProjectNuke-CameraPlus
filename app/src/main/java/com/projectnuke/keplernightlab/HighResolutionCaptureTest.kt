@@ -33,6 +33,7 @@ private data class Processed50Selection(
 )
 
 @SuppressLint("MissingPermission")
+@Suppress("DEPRECATION")
 fun capture50MpProcessedTest(
     context: Context,
     cameraId: String,

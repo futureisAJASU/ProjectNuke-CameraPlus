@@ -871,6 +871,7 @@ private fun calculateTargetDimensions(
     return width to height
 }
 
+@Suppress("DEPRECATION")
 private fun fuseFramesTiled(
     frames: List<LumaFrame>,
     shifts: List<FrameShift>,
