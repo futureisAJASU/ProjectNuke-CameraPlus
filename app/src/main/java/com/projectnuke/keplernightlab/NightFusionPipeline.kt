@@ -142,7 +142,7 @@ fun captureProcessExportNightFusion(
                     }
 
                     post("Verifying gallery output...")
-                    val verified = verifyGalleryExport(context, export.uriString)
+                    val verified = verifyCommittedGalleryExport(context, export) is GalleryExportVerification.Verified
                     updateExportMetadata(
                         jobDir = jobDir,
                         export = export,
@@ -317,7 +317,7 @@ internal fun reprocessYuvJob(
             }
             publicExportCommitted = true
             committedExport = export
-            val verified = verifyGalleryExport(context, export.uriString)
+            val verified = verifyCommittedGalleryExport(context, export) is GalleryExportVerification.Verified
             if (!verified) {
                 terminalDisposition = ReprocessTerminalDisposition.COMMITTED_PARTIAL
                 error("YUV export verification failed")

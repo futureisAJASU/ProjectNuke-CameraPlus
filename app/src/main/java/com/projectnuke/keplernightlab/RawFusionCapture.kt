@@ -124,6 +124,7 @@ fun captureRawBurstForFusion(
     focusAeState: FocusAeState = FocusAeState(),
     rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
     processingParams: ClassicYuvFusionParams = ClassicYuvFusionPreset.NATURAL.params,
+    displayRotation: Int = android.view.Surface.ROTATION_0,
     saveDngSidecars: Boolean = false,
     captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     onStatus: (String) -> Unit,
@@ -401,6 +402,21 @@ fun captureRawBurstForFusion(
             .put("isHighResolutionSlowPath", rawSelection.isHighResolutionSlowPath)
             .put("rawSizeFallbackReason", rawSelection.fallbackReason ?: JSONObject.NULL)
             .put("sensorOrientation", characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: JSONObject.NULL)
+            .put("displayRotationAtCapture", displayRotation)
+            .put("lensFacing", characteristics.get(CameraCharacteristics.LENS_FACING) ?: JSONObject.NULL)
+            .put("sourceOrientationState", "UNROTATED_RAW_SENSOR_GRID")
+            .put("exportSourceWasDisplayUpright", false)
+            .put("rotationAppliedAtExportStage", false)
+            .put("appliedExportRotationDegrees", 0)
+            .put("estimatedExportRotationDegrees", (resolveExportOrientation(
+                ExportOrientationInput(
+                    sensorOrientationDegrees = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION),
+                    displayRotation = displayRotation,
+                    lensFacing = characteristics.get(CameraCharacteristics.LENS_FACING),
+                    sourceWasDisplayUpright = false,
+                    rotationAlreadyApplied = false
+                )
+            ) as? ExportOrientationResolution.Resolved)?.degrees ?: JSONObject.NULL)
             .put("activeArray", characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)?.toString() ?: JSONObject.NULL)
             .put(
                 "maximumResolutionActiveArray",
@@ -663,9 +679,17 @@ fun captureRawBurstForFusion(
                                 DngCreator(characteristics, result).use { creator ->
                                     creator.writeImage(output, image)
                                 }
+                                output.fd.sync()
                             }
-                            check(dngTemp.length() > 0L) { "DNG output was empty" }
+                            val tempDigest = NoFollowFileSystem.copyVerified(dngTemp, java.io.OutputStream.nullOutputStream())
+                            check(tempDigest.size > 0L) { "DNG output was empty" }
+                            check(isDngTiffHeader(tempDigest.prefix)) { "DNG output header was invalid" }
                             KeplerJobMetadata.atomicReplace(dngTemp, dngFile)
+                            // Some providers do not allow opening a directory channel. That is a
+                            // best-effort durability fence after the atomic replacement.
+                            runCatching {
+                                java.nio.channels.FileChannel.open(jobDir.toPath()).use { it.force(true) }
+                            }
                             dngSaved = true
                         } catch (e: Exception) {
                             dngFailure = "${e.javaClass.simpleName}: ${e.message}"
@@ -682,8 +706,8 @@ fun captureRawBurstForFusion(
                             .put("raw16File", raw16Name)
                             .put("dngFile", if (dngSaved) dngName else JSONObject.NULL)
                             .put("dngSidecarStatus", when {
-                                dngSaved -> "EXPORTED"
-                                dngFailure != null -> "FAILED"
+                                dngSaved -> "LOCAL_SAVED"
+                                dngFailure != null -> "LOCAL_SAVE_FAILED"
                                 else -> "NOT_REQUESTED"
                             })
                             .put("dngSidecarError", dngFailure ?: JSONObject.NULL)

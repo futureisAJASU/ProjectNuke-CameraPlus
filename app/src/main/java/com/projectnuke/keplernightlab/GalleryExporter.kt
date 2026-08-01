@@ -3,7 +3,6 @@ package com.projectnuke.keplernightlab
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.MediaStore
 import android.util.Log
@@ -11,10 +10,9 @@ import androidx.heifwriter.HeifWriter
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.io.FileInputStream
 import java.io.OutputStream
+import java.security.MessageDigest
 import java.util.concurrent.CancellationException
-import kotlin.math.abs
 
 data class GalleryExportResult(
     val success: Boolean,
@@ -25,7 +23,9 @@ data class GalleryExportResult(
     val formatUsed: OutputFormat,
     val fallbackUsed: Boolean,
     val errorMessage: String?,
-    val actualCommittedFormat: OutputFormat = formatUsed
+    val attemptedFormats: List<OutputFormat> = listOf(formatUsed),
+    val candidateFailureReasons: List<String> = emptyList(),
+    val verification: GalleryExportVerification? = null
 )
 
 data class RawSidecarExportResult(
@@ -33,7 +33,13 @@ data class RawSidecarExportResult(
     val exportedFiles: List<String>,
     val errorMessage: String?,
     val kind: RawSidecarOutcomeKind,
-    val cancellationRequested: Boolean = false
+    val cancellationRequested: Boolean = false,
+    val expectedCount: Int = 0,
+    val locallySavedCount: Int = 0,
+    val publicExportedCount: Int = exportedFiles.size,
+    val missingFilenames: List<String> = emptyList(),
+    val localFailures: List<String> = emptyList(),
+    val publicFailures: List<String> = emptyList()
 ) {
     /** Public-export status string persisted alongside the image. */
     val status: String get() = when (kind) {
@@ -125,7 +131,12 @@ fun exportNightFusionBitmapToGallery(
         if (!result.success) {
             cancellation.throwIfCancelled()
         }
-        if (result.success) return result
+        if (result.success) {
+            return result.copy(
+                attemptedFormats = attempts.takeWhile { it != format } + format,
+                candidateFailureReasons = errors.toList()
+            )
+        }
         errors += "${format.label}: ${result.errorMessage}"
     }
     return GalleryExportResult(
@@ -136,102 +147,33 @@ fun exportNightFusionBitmapToGallery(
         fileSizeBytes = 0L,
         formatUsed = requestedFormat,
         fallbackUsed = false,
-        errorMessage = errors.joinToString("; ")
+        errorMessage = errors.joinToString("; "),
+        attemptedFormats = attempts,
+        candidateFailureReasons = errors
     )
 }
 
+/** Compatibility wrapper for callers that do not need structured failure details. */
 fun verifyGalleryExport(
     context: Context,
     uriString: String,
-    minSizeBytes: Long = 50_000L
-): Boolean {
-    if (uriString.isBlank()) return false
-    val uri = Uri.parse(uriString)
-    val maxRetries = 3
-    for (attempt in 1..maxRetries) {
-        val size = runCatching { queryMediaSize(context, uri) }.getOrDefault(0L)
-        if (size >= minSizeBytes) {
-            return runCatching {
-                val detectedFormat = detectImageFormat(context, uri) ?: return@runCatching false
-                val (w, h) = decodeBounds(context, uri)
-                if (w <= 0 || h <= 0) return@runCatching false
-                true
-            }.getOrDefault(false)
-        }
-        if (attempt < maxRetries) Thread.sleep(100L * attempt)
-    }
-    return false
-}
+    @Suppress("UNUSED_PARAMETER") minSizeBytes: Long = 0L
+): Boolean = verifyGalleryExportResult(context, uriString) is GalleryExportVerification.Verified
 
-private class CandidateVerificationResult(
-    val readable: Boolean,
-    val detectedFormat: OutputFormat?,
-    val decodedWidth: Int,
-    val decodedHeight: Int,
-    val errorMessage: String?
-)
-
-private fun verifyExportCandidate(
+internal fun verifyCommittedGalleryExport(
     context: Context,
-    uri: Uri,
-    expectedFormat: OutputFormat,
-    expectedWidth: Int? = null,
-    expectedHeight: Int? = null
-): CandidateVerificationResult {
-    val detectedFormat = detectImageFormat(context, uri)
-        ?: return CandidateVerificationResult(false, null, 0, 0, "Unreadable or unrecognized image format")
-    if (detectedFormat != expectedFormat) {
-        return CandidateVerificationResult(
-            false, detectedFormat, 0, 0,
-            "Format mismatch: expected ${expectedFormat.label}, detected ${detectedFormat.label}"
+    export: GalleryExportResult
+): GalleryExportVerification {
+    val previous = export.verification as? GalleryExportVerification.Verified
+    return verifyGalleryExportResult(
+        context = context,
+        uriString = export.uriString.orEmpty(),
+        expectation = GalleryExportExpectation(
+            format = export.formatUsed,
+            width = previous?.width,
+            height = previous?.height
         )
-    }
-    val (w, h) = decodeBounds(context, uri)
-    if (w <= 0 || h <= 0) {
-        return CandidateVerificationResult(false, detectedFormat, w, h, "Invalid decoded bounds: ${w}x${h}")
-    }
-    if (expectedWidth != null && expectedHeight != null) {
-        if (abs(w - expectedWidth) > 1 || abs(h - expectedHeight) > 1) {
-            return CandidateVerificationResult(
-                false, detectedFormat, w, h,
-                "Dimension mismatch: expected ${expectedWidth}x${expectedHeight}, decoded ${w}x${h}"
-            )
-        }
-    }
-    return CandidateVerificationResult(true, detectedFormat, w, h, null)
-}
-
-private fun detectImageFormat(context: Context, uri: Uri): OutputFormat? {
-    return runCatching {
-        context.contentResolver.openInputStream(uri)?.use { stream ->
-            val header = ByteArray(12)
-            var offset = 0
-            while (offset < header.size) {
-                val read = stream.read(header, offset, header.size - offset)
-                if (read == -1) break
-                offset += read
-            }
-            if (offset < 12) return@use null
-            when {
-                header[4] == 'f'.code.toByte() && header[5] == 't'.code.toByte() &&
-                    header[6] == 'y'.code.toByte() && header[7] == 'p'.code.toByte() -> OutputFormat.HEIF
-                header[0] == 0xFF.toByte() && header[1] == 0xD8.toByte() && header[2] == 0xFF.toByte() -> OutputFormat.JPEG
-                header[0] == 0x89.toByte() && header[1] == 0x50.toByte() &&
-                    header[2] == 0x4E.toByte() && header[3] == 0x47.toByte() -> OutputFormat.PNG
-                else -> null
-            }
-        }
-    }.getOrDefault(null)
-}
-
-private fun decodeBounds(context: Context, uri: Uri): Pair<Int, Int> {
-    return runCatching {
-        context.contentResolver.openInputStream(uri)?.use { stream ->
-            val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeStream(stream, null, options)
-            options.outWidth to options.outHeight
-        } ?: (0 to 0)
-    }.getOrDefault(0 to 0)
+    )
 }
 
 fun exportRawSidecarsToPublicStorage(
@@ -241,19 +183,18 @@ fun exportRawSidecarsToPublicStorage(
     relativeRawPath: String = "Pictures/Kepler/RAW",
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
 ): RawSidecarExportResult {
-    val dngFiles = jobDir.listFiles()
-        ?.filter { it.isFile && it.extension.equals("dng", ignoreCase = true) }
-        ?.sortedBy { it.name }
-        .orEmpty()
-    if (dngFiles.isEmpty()) {
-        return RawSidecarExportResult.failed("No DNG sidecars found")
+    val manifest = runCatching { loadRawSidecarManifest(jobDir) }.getOrElse {
+        return RawSidecarExportResult.failed("Invalid RAW sidecar manifest: ${it.message}")
     }
+    if (manifest.expected.isEmpty()) return RawSidecarExportResult.failed("No locally saved DNG sidecars in job.json")
 
     val exported = mutableListOf<String>()
+    val publicFailures = mutableListOf<String>()
     try {
-        dngFiles.forEachIndexed { index, file ->
+        manifest.expected.forEachIndexed { index, file ->
             cancellation.throwIfCancelled()
             val exportName = "${displayNameBase}_${index.toString().padStart(2, '0')}.dng"
+            var sourceDigest: NoFollowFileSystem.StreamDigest? = null
             val result = insertPublicFile(
                 context = context,
                 displayName = exportName,
@@ -262,7 +203,7 @@ fun exportRawSidecarsToPublicStorage(
                 collectionUri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
                 cancellation = cancellation
             ) { output ->
-                FileInputStream(file).use { input -> input.copyTo(output) }
+                sourceDigest = NoFollowFileSystem.copyVerified(file, output)
             } ?: run {
                 cancellation.throwIfCancelled()
                 insertPublicFile(
@@ -273,40 +214,130 @@ fun exportRawSidecarsToPublicStorage(
                     collectionUri = MediaStore.Downloads.EXTERNAL_CONTENT_URI,
                     cancellation = cancellation
                 ) { output ->
-                    FileInputStream(file).use { input -> input.copyTo(output) }
+                    sourceDigest = NoFollowFileSystem.copyVerified(file, output)
                 }
             }
 
             if (result == null) {
-                return if (exported.isNotEmpty()) {
-                    RawSidecarExportResult.partial(
-                        exportedFiles = exported,
-                        errorMessage = "Failed exporting ${file.name}"
-                    )
-                } else {
-                    RawSidecarExportResult.failed("Failed exporting ${file.name}")
-                }
+                publicFailures += "${file.name}: MediaStore insert/write failed"
+                return@forEachIndexed
             }
-            exported += result.first.toString()
-            val verifiedSize = result.second
-            if (verifiedSize <= 0L || verifiedSize < file.length().coerceAtLeast(1L)) {
-                return RawSidecarExportResult.partial(
-                    exportedFiles = exported,
-                    errorMessage = "Verification failed for ${file.name}: committed size=$verifiedSize sourceSize=${file.length()}"
-                )
+            val verificationError = verifyPublicDng(
+                context = context,
+                uri = result.first,
+                expected = sourceDigest ?: return@forEachIndexed
+            )
+            if (verificationError != null) {
+                runCatching { context.contentResolver.delete(result.first, null, null) }
+                publicFailures += "${file.name}: $verificationError"
+            } else {
+                exported += result.first.toString()
             }
         }
     } catch (ce: CancellationException) {
         if (exported.isNotEmpty()) {
-            return RawSidecarExportResult.partial(
-                exportedFiles = exported,
-                errorMessage = "RAW sidecar export cancelled after partial commit"
-            ).let { it.copy(cancellationRequested = true) }
+            return rawSidecarOutcome(manifest, exported, publicFailures + "Cancellation after partial public commit", true)
         }
         return RawSidecarExportResult.cancelled()
     }
 
-    return RawSidecarExportResult.complete(exportedFiles = exported)
+    return rawSidecarOutcome(manifest, exported, publicFailures)
+}
+
+private data class RawSidecarManifest(
+    val expected: List<File>,
+    val localFailures: List<String>
+)
+
+private fun loadRawSidecarManifest(jobDir: File): RawSidecarManifest {
+    val jobFile = NoFollowFileSystem.requireDirectChildFile(jobDir, "job.json")
+    val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
+    val frames = job.optJSONArray("frames") ?: error("job.json has no RAW frame manifest")
+    val names = linkedSetOf<String>()
+    val failures = mutableListOf<String>()
+    for (index in 0 until frames.length()) {
+        val frame = frames.optJSONObject(index) ?: error("Invalid frame manifest entry $index")
+        val status = frame.optString("dngSidecarStatus")
+        val name = frame.optString("dngFile").takeUnless { it.isBlank() || it == "null" }
+        if (status == "LOCAL_SAVE_FAILED") failures += "frame $index: ${frame.optString("dngSidecarError")}"
+        if (status == "LOCAL_SAVED") {
+            require(name != null && name.lowercase().endsWith(".dng")) { "Invalid locally saved DNG reference at frame $index" }
+            require(names.add(name)) { "Duplicate DNG reference: $name" }
+        }
+    }
+    val expected = names.map { NoFollowFileSystem.requireDirectChildFile(jobDir, it) }
+    val direct = NoFollowFileSystem.requireDirectDirectDngNames(jobDir)
+    require(direct == names) { "Unexpected or missing DNG sidecar files" }
+    expected.forEach { file -> require(isDngTiffHeader(NoFollowFileSystem.copyVerified(file, OutputStream.nullOutputStream()).prefix)) { "Malformed local DNG: ${file.name}" } }
+    return RawSidecarManifest(expected, failures)
+}
+
+private fun NoFollowFileSystem.requireDirectDirectDngNames(root: File): Set<String> =
+    requireDirectChildren(root).filter { it.name.lowercase().endsWith(".dng") }.mapTo(linkedSetOf()) { file ->
+        require(isRealFile(file.toPath())) { "Unsafe DNG sidecar: ${file.name}" }
+        file.name
+    }
+
+private fun verifyPublicDng(
+    context: Context,
+    uri: Uri,
+    expected: NoFollowFileSystem.StreamDigest
+): String? {
+    return try {
+    val digest = MessageDigest.getInstance("SHA-256")
+    val prefix = ByteArray(16)
+    var prefixCount = 0
+    var size = 0L
+    context.contentResolver.openInputStream(uri)?.use { input ->
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        while (true) {
+            val read = input.read(buffer)
+            if (read <= 0) break
+            if (prefixCount < prefix.size) {
+                val copied = minOf(read, prefix.size - prefixCount)
+                buffer.copyInto(prefix, prefixCount, 0, copied)
+                prefixCount += copied
+            }
+            digest.update(buffer, 0, read)
+            size += read
+        }
+    } ?: return "Committed public DNG stream is unavailable"
+    when {
+        !isDngTiffHeader(prefix.copyOf(prefixCount)) -> "Committed public DNG header is invalid"
+        size != expected.size -> "Committed public DNG size mismatch: expected ${expected.size}, actual $size"
+        digest.digest().joinToString("") { "%02x".format(it) } != expected.sha256 -> "Committed public DNG SHA-256 mismatch"
+        else -> null
+    }
+    } catch (error: Exception) {
+        "Committed public DNG verification failed: ${error.javaClass.simpleName}: ${error.message}"
+    }
+}
+
+private fun rawSidecarOutcome(
+    manifest: RawSidecarManifest,
+    exported: List<String>,
+    publicFailures: List<String>,
+    cancelled: Boolean = false
+): RawSidecarExportResult {
+    val complete = exported.size == manifest.expected.size && publicFailures.isEmpty() && manifest.localFailures.isEmpty()
+    val kind = when {
+        complete -> RawSidecarOutcomeKind.COMPLETE
+        exported.isNotEmpty() -> RawSidecarOutcomeKind.PARTIAL
+        else -> RawSidecarOutcomeKind.FAILED
+    }
+    return RawSidecarExportResult(
+        success = kind != RawSidecarOutcomeKind.FAILED,
+        exportedFiles = exported,
+        errorMessage = (manifest.localFailures + publicFailures).takeIf { it.isNotEmpty() }?.joinToString("; "),
+        kind = kind,
+        cancellationRequested = cancelled,
+        expectedCount = manifest.expected.size,
+        locallySavedCount = manifest.expected.size,
+        publicExportedCount = exported.size,
+        missingFilenames = manifest.expected.map { it.name }.drop(exported.size),
+        localFailures = manifest.localFailures,
+        publicFailures = publicFailures
+    )
 }
 
 fun queryMediaSize(context: Context, uri: Uri): Long {
@@ -361,6 +392,12 @@ fun updateExportMetadata(
             .put("exportMimeType", export?.mimeType ?: JSONObject.NULL)
             .put("exportFormatRequested", requestedOutputFormatForSetting(finalOutputFormat).label)
             .put("exportFormatUsed", export?.formatUsed?.label ?: JSONObject.NULL)
+            .put("exportFormatCommitted", export?.formatUsed?.label ?: JSONObject.NULL)
+            .put("exportAttemptedFormats", JSONArray(export?.attemptedFormats?.map { it.label } ?: emptyList<String>()))
+            .put("exportCandidateFailureReasons", JSONArray(export?.candidateFailureReasons ?: emptyList<String>()))
+            .put("exportCommittedMime", (export?.verification as? GalleryExportVerification.Verified)?.mediaStoreMime ?: JSONObject.NULL)
+            .put("exportCommittedWidth", (export?.verification as? GalleryExportVerification.Verified)?.width ?: 0)
+            .put("exportCommittedHeight", (export?.verification as? GalleryExportVerification.Verified)?.height ?: 0)
             .put("exportFallbackUsed", export?.fallbackUsed ?: false)
             .put("exportFileSizeBytes", export?.fileSizeBytes ?: 0L)
             .put("galleryExportCommitted", export?.success == true && !export?.uriString.isNullOrBlank())
@@ -473,6 +510,12 @@ internal fun updateRawPublicExportOutcome(
             .put("exportMimeType", outcome.export?.mimeType ?: JSONObject.NULL)
             .put("exportFormatRequested", requested.label)
             .put("exportFormatUsed", outcome.export?.formatUsed?.label ?: JSONObject.NULL)
+            .put("exportFormatCommitted", outcome.export?.formatUsed?.label ?: JSONObject.NULL)
+            .put("exportAttemptedFormats", JSONArray(outcome.export?.attemptedFormats?.map { it.label } ?: emptyList<String>()))
+            .put("exportCandidateFailureReasons", JSONArray(outcome.export?.candidateFailureReasons ?: emptyList<String>()))
+            .put("exportCommittedMime", (outcome.export?.verification as? GalleryExportVerification.Verified)?.mediaStoreMime ?: JSONObject.NULL)
+            .put("exportCommittedWidth", (outcome.export?.verification as? GalleryExportVerification.Verified)?.width ?: 0)
+            .put("exportCommittedHeight", (outcome.export?.verification as? GalleryExportVerification.Verified)?.height ?: 0)
             .put("exportFallbackUsed", outcome.export?.fallbackUsed ?: false)
             .put("exportFileSizeBytes", outcome.export?.fileSizeBytes ?: 0L)
             .put("galleryExportCommitted", outcome.committed)
@@ -635,15 +678,17 @@ private fun writeGalleryBitmap(
     )
 
     val committedUri = inserted.first
-    val verification = verifyExportCandidate(
+    val verification = verifyGalleryExportResult(
         context = context,
-        uri = committedUri,
-        expectedFormat = format,
-        expectedWidth = bitmap.width,
-        expectedHeight = bitmap.height
+        uriString = committedUri.toString(),
+        expectation = GalleryExportExpectation(
+            format = format,
+            width = bitmap.width,
+            height = bitmap.height
+        )
     )
 
-    if (!verification.readable) {
+    if (verification !is GalleryExportVerification.Verified) {
         runCatching { context.contentResolver.delete(committedUri, null, null) }
         return GalleryExportResult(
             success = false,
@@ -653,7 +698,10 @@ private fun writeGalleryBitmap(
             fileSizeBytes = inserted.second,
             formatUsed = format,
             fallbackUsed = fallbackUsed,
-            errorMessage = "Verification failed: ${verification.errorMessage}"
+            errorMessage = "Verification failed: ${(verification as? GalleryExportVerification.RetryableFailure)?.reason ?: (verification as? GalleryExportVerification.PermanentFailure)?.reason}",
+            attemptedFormats = listOf(format),
+            candidateFailureReasons = listOf((verification as? GalleryExportVerification.RetryableFailure)?.reason ?: (verification as? GalleryExportVerification.PermanentFailure)?.reason.orEmpty()),
+            verification = verification
         )
     }
 
@@ -666,7 +714,8 @@ private fun writeGalleryBitmap(
         formatUsed = format,
         fallbackUsed = fallbackUsed,
         errorMessage = null,
-        actualCommittedFormat = verification.detectedFormat ?: format
+        attemptedFormats = listOf(format),
+        verification = verification
     )
 }
 
@@ -722,6 +771,7 @@ private fun writeHeifViaTempFile(
 ): Boolean {
     val tempFile = File.createTempFile("kepler_export_", ".heic", context.cacheDir)
     var writer: HeifWriter? = null
+    val timeoutMs = heifStopTimeoutMs(bitmap.width, bitmap.height)
     return try {
         val createdWriter = HeifWriter.Builder(
             tempFile.absolutePath,
@@ -734,9 +784,20 @@ private fun writeHeifViaTempFile(
         writer = createdWriter
         createdWriter.start()
         createdWriter.addBitmap(bitmap)
-        createdWriter.stop(5_000)
-        FileInputStream(tempFile).use { input -> input.copyTo(output) }
+        createdWriter.stop(timeoutMs)
+        // stop() is the producer settlement point. Re-inspect the owned temp file only after it
+        // returns, so a partially written HEIF can never be copied into MediaStore.
+        val tempBytes = NoFollowFileSystem.readBytesVerified(tempFile)
+        check(tempBytes.isNotEmpty()) { "HEIF writer produced an empty temporary file" }
+        output.write(tempBytes)
         true
+    } catch (error: Exception) {
+        Log.w(
+            "KeplerGalleryExporter",
+            "HEIF encode failed pixels=${bitmap.width.toLong() * bitmap.height} timeoutMs=$timeoutMs: ${error.message}",
+            error
+        )
+        false
     } finally {
         runCatching { writer?.close() }
             .onFailure { Log.w("KeplerGalleryExporter", "Failed to close HEIF writer.", it) }
@@ -744,4 +805,10 @@ private fun writeHeifViaTempFile(
             Log.w("KeplerGalleryExporter", "Failed to delete temporary HEIF file: ${tempFile.absolutePath}")
         }
     }
+}
+
+/** Resolution-aware upper bound for the asynchronous HeifWriter encoder. */
+internal fun heifStopTimeoutMs(width: Int, height: Int): Long {
+    val pixels = width.toLong().coerceAtLeast(1L) * height.toLong().coerceAtLeast(1L)
+    return (2_000L + pixels / 400L).coerceIn(3_000L, 30_000L)
 }

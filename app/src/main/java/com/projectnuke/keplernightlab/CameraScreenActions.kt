@@ -361,6 +361,7 @@ internal fun startCapturePipeline(
             focusAeState = request.focusAeState,
             rawSpeedMode = request.rawSpeedMode,
             processingParams = request.processingSettings.resolvedParams(),
+            displayRotation = request.displayRotation,
             captureCancellationHandle = request.captureCancellationHandle,
             cancellation = request.cancellation,
             onStatus = loggedStatus

@@ -1,243 +1,75 @@
 package com.projectnuke.keplernightlab
 
-import android.graphics.Bitmap
+import android.net.Uri
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
-import java.io.ByteArrayOutputStream
-import java.io.File
+import java.io.ByteArrayInputStream
+import java.io.InputStream
+import java.util.ArrayDeque
 
 @RunWith(RobolectricTestRunner::class)
 class GalleryExportVerificationTest {
+    private val jpeg = byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0xff.toByte(), 1, 2, 3, 0xff.toByte(), 0xd9.toByte())
+    private val png = byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae.toByte(), 0x42, 0x60, 0x82.toByte())
+    private val heif = byteArrayOf(0, 0, 0, 16, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63, 0, 0, 0, 0)
 
-    private fun createJpegBytes(width: Int = 100, height: Int = 100): ByteArray {
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val stream = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 90, stream)
-        bitmap.recycle()
-        return stream.toByteArray()
+    private class FakeSource(
+        private val bytes: ByteArray,
+        private val columns: GalleryMediaColumns,
+        bounds: List<Pair<Int, Int>> = listOf(32 to 20),
+        private val unavailableStreams: Int = 0
+    ) : GalleryExportVerificationSource {
+        private val queuedBounds = ArrayDeque(bounds)
+        private var opens = 0
+        override fun query(uri: Uri) = columns
+        override fun open(uri: Uri): InputStream? = if (opens++ < unavailableStreams) null else ByteArrayInputStream(bytes)
+        override fun decodeBounds(uri: Uri): Pair<Int, Int> = if (queuedBounds.size > 1) queuedBounds.removeFirst() else queuedBounds.first()
     }
 
-    private fun createPngBytes(width: Int = 100, height: Int = 100): ByteArray {
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val stream = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
-        bitmap.recycle()
-        return stream.toByteArray()
+    private fun verify(
+        bytes: ByteArray,
+        format: OutputFormat,
+        mime: String = format.mimeType,
+        name: String = "final.${format.extension}",
+        bounds: List<Pair<Int, Int>> = listOf(32 to 20),
+        unavailableStreams: Int = 0
+    ): GalleryExportVerification = verifyGalleryExportResult(
+        RuntimeEnvironment.getApplication(),
+        "content://test/final",
+        GalleryExportExpectation(format, 32, 20),
+        FakeSource(bytes, GalleryMediaColumns(mime, name, bytes.size.toLong()), bounds, unavailableStreams),
+        retryScheduler = GalleryVerificationRetryScheduler { }
+    )
+
+    @Test fun validJpeg_isVerified() = assertTrue(verify(jpeg, OutputFormat.JPEG) is GalleryExportVerification.Verified)
+    @Test fun validPng_isVerified() = assertTrue(verify(png, OutputFormat.PNG) is GalleryExportVerification.Verified)
+    @Test fun validHeif_usesInjectableDecoderAndVerifier() = assertTrue(verify(heif, OutputFormat.HEIF) is GalleryExportVerification.Verified)
+    @Test fun truncatedJpeg_isRejected() = assertTrue(verify(jpeg.dropLast(2).toByteArray(), OutputFormat.JPEG) is GalleryExportVerification.PermanentFailure)
+    @Test fun truncatedPng_isRejected() = assertTrue(verify(png.dropLast(12).toByteArray(), OutputFormat.PNG) is GalleryExportVerification.PermanentFailure)
+    @Test fun randomLargeNonImage_isRejected() = assertTrue(verify(ByteArray(100_000) { 0x41 }, OutputFormat.JPEG) is GalleryExportVerification.PermanentFailure)
+    @Test fun avifBrand_isNotHeif() {
+        val avif = heif.clone().also { it[8] = 'a'.code.toByte(); it[9] = 'v'.code.toByte(); it[10] = 'i'.code.toByte(); it[11] = 'f'.code.toByte() }
+        assertTrue(verify(avif, OutputFormat.HEIF) is GalleryExportVerification.PermanentFailure)
     }
-
-    private fun createHeifLikeBytes(): ByteArray {
-        val header = ByteArray(64 * 1024)
-        header[4] = 'f'.code.toByte()
-        header[5] = 't'.code.toByte()
-        header[6] = 'y'.code.toByte()
-        header[7] = 'p'.code.toByte()
-        header[8] = 'h'.code.toByte()
-        header[9] = 'e'.code.toByte()
-        header[10] = 'i'.code.toByte()
-        header[11] = 'c'.code.toByte()
-        return header
+    @Test fun mimeMismatch_isRejected() = assertTrue(verify(jpeg, OutputFormat.JPEG, mime = "image/png") is GalleryExportVerification.PermanentFailure)
+    @Test fun extensionMismatch_isRejected() = assertTrue(verify(jpeg, OutputFormat.JPEG, name = "final.png") is GalleryExportVerification.PermanentFailure)
+    @Test fun dimensionMismatch_isRejected() = assertTrue(verify(jpeg, OutputFormat.JPEG, bounds = listOf(20 to 32)) is GalleryExportVerification.PermanentFailure)
+    @Test fun unavailableStreamOnce_thenRetriesCompleteVerification() = assertTrue(verify(jpeg, OutputFormat.JPEG, unavailableStreams = 1) is GalleryExportVerification.Verified)
+    @Test fun decodeFailureOnce_thenRetriesCompleteVerification() = assertTrue(verify(jpeg, OutputFormat.JPEG, bounds = listOf(0 to 0, 32 to 20)) is GalleryExportVerification.Verified)
+    @Test fun verificationCarriesCommittedTruth() {
+        val verified = verify(png, OutputFormat.PNG) as GalleryExportVerification.Verified
+        assertEquals(OutputFormat.PNG, verified.detectedFormat)
+        assertEquals("image/png", verified.mediaStoreMime)
+        assertEquals("final.png", verified.displayName)
+        assertEquals(32, verified.width)
+        assertEquals(png.size.toLong(), verified.size)
     }
-
-    private fun writeTempFile(bytes: ByteArray, suffix: String): File {
-        val file = File.createTempFile("gallery_test_", suffix)
-        file.deleteOnExit()
-        file.writeBytes(bytes)
-        return file
-    }
-
-    private fun newCancellation() = object : KeplerPipelineCancellation {
-        override val isCancelled: Boolean = false
-        override fun throwIfCancelled() {}
-    }
-
-    @Test
-    fun verifyGalleryExport_blankUri_returnsFalse() {
-        val context = RuntimeEnvironment.getApplication()
-        assertFalse(verifyGalleryExport(context, ""))
-        assertFalse(verifyGalleryExport(context, "   "))
-    }
-
-    @Test
-    fun verifyGalleryExport_nonExistentUri_returnsFalse() {
-        val context = RuntimeEnvironment.getApplication()
-        assertFalse(verifyGalleryExport(context, "content://com.nonexistent.provider/999999"))
-    }
-
-    @Test
-    fun verifyGalleryExport_randomLargeNonImageBytes_returnsFalse() {
-        val randomBytes = ByteArray(100_000)
-        for (i in randomBytes.indices) {
-            randomBytes[i] = (Math.random() * 256).toInt().toByte()
-        }
-        val file = writeTempFile(randomBytes, ".jpg")
-        val context = RuntimeEnvironment.getApplication()
-        assertFalse(verifyGalleryExport(context, "file://${file.absolutePath}"))
-    }
-
-    @Test
-    fun verifyGalleryExport_truncatedJpegLargerThanThreshold_returnsFalse() {
-        val jpegBytes = createJpegBytes()
-        val truncated = jpegBytes.copyOf(100_000)
-        val file = writeTempFile(truncated, ".jpg")
-        val context = RuntimeEnvironment.getApplication()
-        assertFalse(verifyGalleryExport(context, "file://${file.absolutePath}"))
-    }
-
-    @Test
-    fun verifyGalleryExport_minSizeThreshold_rejectsLargeThreshold() {
-        val jpegBytes = createJpegBytes()
-        val file = writeTempFile(jpegBytes, ".jpg")
-        val context = RuntimeEnvironment.getApplication()
-        val uri = "file://${file.absolutePath}"
-        assertFalse(
-            verifyGalleryExport(context, uri, minSizeBytes = Long.MAX_VALUE)
-        )
-    }
-
-    @Test
-    fun verifyGalleryExport_nonImageExtension_returnsFalse() {
-        val textBytes = "This is just text, not an image".repeat(5000).toByteArray()
-        val file = writeTempFile(textBytes, ".bin")
-        val context = RuntimeEnvironment.getApplication()
-        assertFalse(verifyGalleryExport(context, "file://${file.absolutePath}"))
-    }
-
-    @Test
-    fun exportNightFusionBitmapToGallery_heifFallsBack() {
-        val context = RuntimeEnvironment.getApplication()
-        val bitmap = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)
-        val result = exportNightFusionBitmapToGallery(
-            context = context,
-            bitmap = bitmap,
-            displayNameBase = "test_heif_fallback_${System.nanoTime()}",
-            requestedFormat = OutputFormat.HEIF,
-            quality = 90,
-            cancellation = newCancellation()
-        )
-        if (result.success) {
-            assertTrue(
-                result.actualCommittedFormat == OutputFormat.HEIF ||
-                    result.actualCommittedFormat == OutputFormat.JPEG ||
-                    result.actualCommittedFormat == OutputFormat.PNG
-            )
-            assertNotNull(result.uriString)
-            assertTrue(result.fileSizeBytes > 0)
-        }
-        bitmap.recycle()
-    }
-
-    @Test
-    fun exportNightFusionBitmapToGallery_jpegFallbackToPng() {
-        val context = RuntimeEnvironment.getApplication()
-        val bitmap = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)
-        val result = exportNightFusionBitmapToGallery(
-            context = context,
-            bitmap = bitmap,
-            displayNameBase = "test_jpeg_fallback_${System.nanoTime()}",
-            requestedFormat = OutputFormat.JPEG,
-            quality = 90,
-            cancellation = newCancellation()
-        )
-        if (result.success) {
-            assertTrue(
-                result.actualCommittedFormat == OutputFormat.JPEG ||
-                    result.actualCommittedFormat == OutputFormat.PNG
-            )
-        }
-        bitmap.recycle()
-    }
-
-    @Test
-    fun exportNightFusionBitmapToGallery_allCandidatesFails_noSourceCacheCleanup() {
-        val context = RuntimeEnvironment.getApplication()
-        val cacheDir = context.cacheDir
-        val sentinelFile = File(cacheDir, "sentinel_${System.nanoTime()}.txt")
-        sentinelFile.writeText("keep_me")
-        assertTrue("Sentinel file should exist before export", sentinelFile.exists())
-
-        val bitmap = Bitmap.createBitmap(10, 10, Bitmap.Config.ARGB_8888)
-        exportNightFusionBitmapToGallery(
-            context = context,
-            bitmap = bitmap,
-            displayNameBase = "test_all_fail_${System.nanoTime()}",
-            requestedFormat = OutputFormat.PNG,
-            quality = 90,
-            cancellation = newCancellation()
-        )
-        assertTrue("Sentinel file must survive even if export fails", sentinelFile.exists())
-        sentinelFile.delete()
-        bitmap.recycle()
-    }
-
-    @Test
-    fun galleryExportResult_actualCommittedFormat_defaultsToFormatUsed() {
-        val result = GalleryExportResult(
-            success = true,
-            uriString = null,
-            displayName = null,
-            mimeType = null,
-            fileSizeBytes = 0L,
-            formatUsed = OutputFormat.JPEG,
-            fallbackUsed = false,
-            errorMessage = null
-        )
-        assertEquals(OutputFormat.JPEG, result.actualCommittedFormat)
-    }
-
-    @Test
-    fun galleryExportResult_actualCommittedFormat_canBeDifferent() {
-        val result = GalleryExportResult(
-            success = true,
-            uriString = null,
-            displayName = null,
-            mimeType = null,
-            fileSizeBytes = 0L,
-            formatUsed = OutputFormat.HEIF,
-            fallbackUsed = true,
-            errorMessage = null,
-            actualCommittedFormat = OutputFormat.JPEG
-        )
-        assertEquals(OutputFormat.JPEG, result.actualCommittedFormat)
-    }
-
-    @Test
-    fun galleryExportResult_fallbackUsed_trueWhenFallback() {
-        val result = GalleryExportResult(
-            success = true,
-            uriString = null,
-            displayName = null,
-            mimeType = null,
-            fileSizeBytes = 0L,
-            formatUsed = OutputFormat.JPEG,
-            fallbackUsed = true,
-            errorMessage = null,
-            actualCommittedFormat = OutputFormat.JPEG
-        )
-        assertTrue(result.fallbackUsed)
-        assertEquals(result.formatUsed, result.actualCommittedFormat)
-    }
-
-    @Test
-    fun galleryExportResult_failedResult_hasExpectedDefaults() {
-        val result = GalleryExportResult(
-            success = false,
-            uriString = null,
-            displayName = null,
-            mimeType = null,
-            fileSizeBytes = 0L,
-            formatUsed = OutputFormat.PNG,
-            fallbackUsed = false,
-            errorMessage = "test error"
-        )
-        assertFalse(result.success)
-        assertEquals(OutputFormat.PNG, result.formatUsed)
-        assertFalse(result.fallbackUsed)
-        assertEquals("test error", result.errorMessage)
+    @Test fun compatibilityWrapperDoesNotAcceptBlankUri() {
+        assertFalse(verifyGalleryExport(RuntimeEnvironment.getApplication(), ""))
     }
 }

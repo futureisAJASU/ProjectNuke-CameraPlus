@@ -2,7 +2,6 @@ package com.projectnuke.keplernightlab
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
@@ -372,51 +371,94 @@ internal sealed class RawFusionPublicExportOutcome {
 private data class RawFusionExportBitmap(
     val bitmap: Bitmap,
     val source: String,
-    val nativeRgbaDirect: Boolean
+    val nativeRgbaDirect: Boolean,
+    val appliedRotationDegrees: Int
 )
 
 private fun RawFusionProcessResult.validNativeRgbaFile(): File? {
     val file = nativeRgbaFile ?: return null
-    if (nativeRgbaWidth <= 0 || nativeRgbaHeight <= 0 || !file.exists()) return null
+    if (nativeRgbaWidth <= 0 || nativeRgbaHeight <= 0 || !NoFollowFileSystem.isRealFile(file.toPath())) return null
     val expectedBytes = nativeRgbaWidth.toLong() * nativeRgbaHeight.toLong() * 4L
-    return file.takeIf { it.length() == expectedBytes }
+    return file.takeIf { runCatching { NoFollowFileSystem.requireSize(it) }.getOrNull() == expectedBytes }
 }
 
 private fun RawFusionProcessResult.hasExportableBitmapSource(): Boolean {
     return validNativeRgbaFile() != null ||
-        finalPngFile?.let { it.exists() && it.length() > 0L } == true
+        finalPngFile?.let { file ->
+            NoFollowFileSystem.isRealFile(file.toPath()) && runCatching { NoFollowFileSystem.requireSize(file) > 0L }.getOrDefault(false)
+        } == true
 }
 
-private fun RawFusionProcessResult.loadExportBitmap(): RawFusionExportBitmap {
+private fun RawFusionProcessResult.loadExportBitmap(jobDir: File): RawFusionExportBitmap {
+    fun orient(bitmap: Bitmap, source: String, native: Boolean): RawFusionExportBitmap {
+        val rotation = resolveRawExportRotation(jobDir)
+        val degrees = (rotation as? ExportOrientationResolution.Resolved)?.degrees
+            ?: throw IllegalStateException((rotation as ExportOrientationResolution.Unsupported).reason)
+        val rotated = rotateBitmapIfNeeded(bitmap, degrees)
+        if (rotated !== bitmap) bitmap.recycle()
+        return RawFusionExportBitmap(rotated, source, native, degrees)
+    }
     val rgbaFile = validNativeRgbaFile()
     if (rgbaFile != null) {
         try {
-            return RawFusionExportBitmap(
-                bitmap = loadRawRgbaBitmap(rgbaFile, nativeRgbaWidth, nativeRgbaHeight),
-                source = "native_rgba_direct",
-                nativeRgbaDirect = true
-            )
+            return orient(loadRawRgbaBitmap(rgbaFile, nativeRgbaWidth, nativeRgbaHeight), "native_rgba_direct", true)
         } catch (oom: OutOfMemoryError) {
             throw oom
         } catch (nativeError: Exception) {
-            val png = finalPngFile?.takeIf { it.exists() && it.length() > 0L }
+            val png = finalPngFile?.takeIf { file ->
+                NoFollowFileSystem.isRealFile(file.toPath()) &&
+                    runCatching { NoFollowFileSystem.requireSize(file) > 0L }.getOrDefault(false)
+            }
                 ?: throw IllegalStateException(
                     "Native RGBA bitmap load failed and no final PNG fallback exists",
                     nativeError
                 )
-            val bitmap = BitmapFactory.decodeFile(png.absolutePath)
+            val bitmap = NoFollowFileSystem.decodeBitmapVerified(png)
                 ?: throw IllegalStateException(
                     "Final RAW fusion PNG fallback decode failed",
                     nativeError
                 )
-            return RawFusionExportBitmap(bitmap, "final_png_decode", false)
+            return orient(bitmap, "final_png_decode", false)
         }
     }
-    val png = finalPngFile?.takeIf { it.exists() && it.length() > 0L }
+    val png = finalPngFile?.takeIf { file ->
+        NoFollowFileSystem.isRealFile(file.toPath()) &&
+            runCatching { NoFollowFileSystem.requireSize(file) > 0L }.getOrDefault(false)
+    }
         ?: error("No exportable RAW fusion bitmap source")
-    val bitmap = BitmapFactory.decodeFile(png.absolutePath)
+    val bitmap = NoFollowFileSystem.decodeBitmapVerified(png)
         ?: error("Final RAW fusion PNG decode failed")
-    return RawFusionExportBitmap(bitmap, "final_png_decode", false)
+    return orient(bitmap, "final_png_decode", false)
+}
+
+private fun resolveRawExportRotation(jobDir: File): ExportOrientationResolution {
+    val job = runCatching {
+        JSONObject(NoFollowFileSystem.readTextVerified(NoFollowFileSystem.requireDirectChildFile(jobDir, JOB_JSON_FILE_NAME)))
+    }.getOrElse { return ExportOrientationResolution.Unsupported("Cannot read RAW orientation metadata: ${it.message}") }
+    val sourceState = job.optString("sourceOrientationState")
+    if (sourceState.isBlank()) {
+        // Explicit legacy fallback: older jobs did not capture UI rotation. Keep their historical
+        // sensor-grid behavior rather than guessing and silently rotating a reprocess.
+        return ExportOrientationResolution.Resolved(0)
+    }
+    val sourceWasUpright = job.optBoolean("exportSourceWasDisplayUpright", false)
+    return resolveExportOrientation(
+        ExportOrientationInput(
+            sensorOrientationDegrees = job.optInt("sensorOrientation").takeIf { job.has("sensorOrientation") },
+            displayRotation = job.optInt("displayRotationAtCapture").takeIf { job.has("displayRotationAtCapture") },
+            lensFacing = job.optInt("lensFacing").takeIf { job.has("lensFacing") },
+            sourceWasDisplayUpright = sourceWasUpright || sourceState == "DISPLAY_UPRIGHT",
+            rotationAlreadyApplied = sourceState == "DISPLAY_UPRIGHT" && job.optBoolean("rotationAppliedAtExportStage", false)
+        )
+    )
+}
+
+private fun recordRawExportRotation(jobDir: File, degrees: Int) {
+    KeplerJobMetadata.update(jobDir) { job ->
+        job.put("estimatedExportRotationDegrees", degrees)
+            .put("appliedExportRotationDegrees", degrees)
+            .put("rotationAppliedAtExportStage", degrees != 0)
+    }
 }
 
 @Suppress("SENSELESS_COMPARISON")
@@ -436,6 +478,7 @@ fun captureProcessExportRawNightFusion(
     focusAeState: FocusAeState = FocusAeState(),
     rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
     processingParams: ClassicYuvFusionParams = ClassicYuvFusionPreset.NATURAL.params,
+    displayRotation: Int = android.view.Surface.ROTATION_0,
     captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
@@ -459,6 +502,7 @@ fun captureProcessExportRawNightFusion(
         focusAeState = focusAeState,
         rawSpeedMode = rawSpeedMode,
         processingParams = processingParams,
+        displayRotation = displayRotation,
         saveDngSidecars = finalOutputFormat.shouldExportRawSidecar,
         captureCancellationHandle = captureCancellationHandle,
         onStatus = { post(it) },
@@ -572,7 +616,7 @@ fun captureProcessExportRawNightFusion(
                     var exportBitmap: Bitmap? = null
                     val result = try {
                         cancellation.throwIfCancelled()
-                        val loaded = process.loadExportBitmap()
+                        val loaded = process.loadExportBitmap(jobDir)
                         exportBitmap = loaded.bitmap
                         val nativePreviewPrepareMs = System.currentTimeMillis() - previewPrepareStartedAt
                         updateRawExportBitmapMetadata(
@@ -585,6 +629,7 @@ fun captureProcessExportRawNightFusion(
                             exportBitmapHeight = loaded.bitmap.height,
                             nativePreviewPrepareMs = nativePreviewPrepareMs
                         )
+                        recordRawExportRotation(jobDir, loaded.appliedRotationDegrees)
                         post("결과를 저장하는 중입니다.")
                         updateRawNativeQualityDiagnostics(jobDir, loaded.bitmap)
                         cancellation.throwIfCancelled()
@@ -707,7 +752,7 @@ fun captureProcessExportRawNightFusion(
                         return@post
                     }
                     val committedExportUri = committedExport!!.uriString ?: ""
-                    val verified = verifyGalleryExport(context, committedExportUri)
+                    val verified = verifyCommittedGalleryExport(context, committedExport!!) is GalleryExportVerification.Verified
                     exportVerified = verified
                     if (!verified) {
                         val outcome = RawFusionPublicExportOutcome.CommittedVerificationFailure(
@@ -1218,7 +1263,7 @@ internal fun reprocessRawJob(
             }
             var exportBitmap: Bitmap? = null
             val exportAttempted = try {
-                val loaded = process.loadExportBitmap()
+                val loaded = process.loadExportBitmap(jobDir)
                 exportBitmap = loaded.bitmap
                 updateRawExportBitmapMetadata(
                     jobDir = jobDir,
@@ -1229,6 +1274,7 @@ internal fun reprocessRawJob(
                     exportBitmapWidth = loaded.bitmap.width,
                     exportBitmapHeight = loaded.bitmap.height
                 )
+                recordRawExportRotation(jobDir, loaded.appliedRotationDegrees)
                 exportNightFusionBitmapToGallery(
                     context = context,
                     bitmap = loaded.bitmap,
@@ -1302,7 +1348,7 @@ internal fun reprocessRawJob(
                 terminalResult = Result.failure(IllegalStateException("RAW reprocess cancelled after commit, before verification"))
                 return@post
             }
-            val verified = verifyGalleryExport(context, committedExport!!.uriString!!)
+            val verified = verifyCommittedGalleryExport(context, committedExport!!) is GalleryExportVerification.Verified
             if (!verified) {
                 publicOutcome = RawFusionPublicExportOutcome.CommittedVerificationFailure(
                     base = process,

@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Handler
 import android.os.Looper
+import android.view.Surface
 import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -74,6 +75,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -425,6 +427,7 @@ fun MainCameraScreen(
         capabilityRefreshNonce = capabilityRefreshNonce
     )
     val levelState = rememberDeviceLevelState(enabled = overlaySettings.showLevel)
+    val captureDisplayRotation = LocalView.current.display?.rotation ?: Surface.ROTATION_0
 
     LaunchedEffect(Unit) {
         logLongReport("KeplerCameraDump", buildFullCameraDumpReport(context))
@@ -436,18 +439,20 @@ fun MainCameraScreen(
     var showResultPreview by remember { mutableStateOf(false) }
     val previewUiGeneration = remember { AtomicLong(0L) }
 
-    DisposableEffect(latestBitmap) {
+    val ownedLatestBitmap = latestBitmap
+    DisposableEffect(ownedLatestBitmap) {
         onDispose {
-            latestBitmap?.takeIf { !it.isRecycled }?.recycle()
+            ownedLatestBitmap?.takeIf { !it.isRecycled }?.recycle()
         }
     }
 
     var processingPreviewBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var processingPreviewStatus by remember { mutableStateOf("최근 결과를 촬영하면 설정 미리보기가 표시됩니다.") }
 
-    DisposableEffect(processingPreviewBitmap) {
+    val ownedProcessingPreviewBitmap = processingPreviewBitmap
+    DisposableEffect(ownedProcessingPreviewBitmap) {
         onDispose {
-            processingPreviewBitmap?.takeIf { !it.isRecycled }?.recycle()
+            ownedProcessingPreviewBitmap?.takeIf { !it.isRecycled }?.recycle()
         }
     }
 
@@ -490,6 +495,12 @@ fun MainCameraScreen(
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val settingsScreenForFlush = currentScreen
+    DisposableEffect(settingsScreenForFlush, settingsPersistence) {
+        onDispose {
+            if (settingsScreenForFlush == MainScreen.SETTINGS) settingsPersistence.flush()
+        }
     }
     val cameraScope = rememberCoroutineScope()
     var refreshGeneration by remember { mutableIntStateOf(0) }
@@ -675,7 +686,6 @@ LaunchedEffect(Unit) {
         captureMode,
         processingSettings
     ) {
-        delay(250L)
         settingsPersistence.update(
             CameraUiSettings(
                 selectedResolutionName = selectedResolution.name,
@@ -1127,6 +1137,7 @@ mainHandler.removeCallbacks(watchdog)
                                         rawSpeedMode = rawSpeedMode,
                                         captureMode = captureMode,
                                         processingSettings = processingSettings,
+                                        displayRotation = captureDisplayRotation,
                                         captureCancellationHandle = captureCancellation,
                                         cancellation = cancellation
                                     ),
@@ -2310,12 +2321,6 @@ fun ProcessingSettingsSection(
     previewBitmap: Bitmap?,
     previewStatus: String
 ) {
-    DisposableEffect(previewBitmap) {
-        onDispose {
-            previewBitmap?.takeIf { !it.isRecycled }?.recycle()
-        }
-    }
-
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(
             text = "ISP 후처리",

@@ -266,14 +266,16 @@ fun JobDetailScreen(jobDir: File, onBack: () -> Unit) {
     var showNativeJson by remember(jobDir) { mutableStateOf(false) }
     var isReprocessing by remember(jobDir) { mutableStateOf(false) }
 
-    DisposableEffect(finalThumbnail) {
+    val ownedFinalThumbnail = finalThumbnail
+    DisposableEffect(ownedFinalThumbnail) {
         onDispose {
-            finalThumbnail?.takeIf { !it.isRecycled }?.recycle()
+            ownedFinalThumbnail?.takeIf { !it.isRecycled }?.recycle()
         }
     }
-    DisposableEffect(previewThumbnail) {
+    val ownedPreviewThumbnail = previewThumbnail
+    DisposableEffect(ownedPreviewThumbnail) {
         onDispose {
-            previewThumbnail?.takeIf { !it.isRecycled }?.recycle()
+            ownedPreviewThumbnail?.takeIf { !it.isRecycled }?.recycle()
         }
     }
 

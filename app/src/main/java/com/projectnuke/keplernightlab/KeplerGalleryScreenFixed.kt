@@ -436,9 +436,10 @@ private fun AsyncThumbnailImage(
     contentDescription: String? = null
 ) {
     var bitmap by remember(file?.absolutePath, maxDimension) { mutableStateOf<Bitmap?>(null) }
-    DisposableEffect(bitmap) {
+    val ownedBitmap = bitmap
+    DisposableEffect(ownedBitmap) {
         onDispose {
-            bitmap?.takeIf { !it.isRecycled }?.recycle()
+            ownedBitmap?.takeIf { !it.isRecycled }?.recycle()
         }
     }
     LaunchedEffect(file?.absolutePath, maxDimension) {

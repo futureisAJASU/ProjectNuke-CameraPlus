@@ -571,7 +571,7 @@ fun captureProcessExportSuperResolutionFusion(
                         return@post
                     }
 
-                    val verified = verifyGalleryExport(context, export.uriString)
+                    val verified = verifyCommittedGalleryExport(context, export) is GalleryExportVerification.Verified
                     updateExportMetadata(
                         jobDir = outputDir,
                         export = export,

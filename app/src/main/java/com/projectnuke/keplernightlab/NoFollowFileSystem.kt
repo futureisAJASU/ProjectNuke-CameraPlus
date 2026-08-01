@@ -8,6 +8,8 @@ import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.attribute.BasicFileAttributes
+import java.io.OutputStream
+import java.security.MessageDigest
 
 internal sealed interface NoFollowInspection<out T> {
     data object Absent : NoFollowInspection<Nothing>
@@ -16,6 +18,39 @@ internal sealed interface NoFollowInspection<out T> {
 }
 
 internal object NoFollowFileSystem {
+    data class StreamDigest(val size: Long, val sha256: String, val prefix: ByteArray)
+
+    /** Streams a stable regular file without following links; never loads a RAW/DNG into memory. */
+    fun copyVerified(file: File, output: OutputStream): StreamDigest {
+        val path = file.toPath()
+        val before = when (val inspection = inspect(path)) {
+            NoFollowInspection.Absent -> throw java.io.FileNotFoundException(file.absolutePath)
+            is NoFollowInspection.InspectionFailed -> throw inspection.exception
+            is NoFollowInspection.Present -> inspection.value
+        }
+        require(before.isRegularFile && !before.isSymbolicLink()) { "Unsafe file: ${file.absolutePath}" }
+        val digest = MessageDigest.getInstance("SHA-256")
+        val prefix = ByteArray(16)
+        var prefixCount = 0
+        var size = 0L
+        Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS).use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                if (prefixCount < prefix.size) {
+                    val copied = minOf(read, prefix.size - prefixCount)
+                    buffer.copyInto(prefix, prefixCount, 0, copied)
+                    prefixCount += copied
+                }
+                digest.update(buffer, 0, read)
+                output.write(buffer, 0, read)
+                size += read
+            }
+        }
+        require(revalidate(path, before)) { "File identity changed during read: ${file.absolutePath}" }
+        return StreamDigest(size, digest.digest().joinToString("") { "%02x".format(it) }, prefix.copyOf(prefixCount))
+    }
     fun readBytesVerified(file: File): ByteArray = when (val inspection = inspect(file.toPath())) {
         NoFollowInspection.Absent -> throw java.io.FileNotFoundException(file.absolutePath)
         is NoFollowInspection.InspectionFailed -> throw inspection.exception
@@ -370,3 +405,8 @@ internal object NoFollowFileSystem {
         return status to failures
     }
 }
+
+internal fun isDngTiffHeader(prefix: ByteArray): Boolean = prefix.size >= 4 && (
+    prefix.copyOfRange(0, 4).contentEquals(byteArrayOf(0x49, 0x49, 0x2a, 0)) ||
+        prefix.copyOfRange(0, 4).contentEquals(byteArrayOf(0x4d, 0x4d, 0, 0x2a))
+    )

@@ -52,16 +52,33 @@ internal class SerializedPreviewWorker<S, R>(
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val generation = AtomicLong(0L)
     private var pending: Pending<S>? = null
+    private var workerScheduled = false
+    private var closed = false
 
     @Synchronized
     fun submit(source: S, adoptionGeneration: Long? = null): Long {
         val current = generation.incrementAndGet()
+        if (closed) {
+            recycleSource(source)
+            return current
+        }
         pending?.let { recycleSource(it.source) }
         pending = Pending(current, adoptionGeneration, source)
-        executor.execute {
+        if (!workerScheduled) {
+            workerScheduled = true
+            executor.execute(::drainLatestRequests)
+        }
+        return current
+    }
+
+    private fun drainLatestRequests() {
+        while (true) {
             val request = synchronized(this) {
-                pending.also { pending = null }
-            } ?: return@execute
+                pending.also { pending = null } ?: run {
+                    workerScheduled = false
+                    return
+                }
+            }
             var result: R? = null
             try {
                 result = render(request.source)
@@ -78,7 +95,6 @@ internal class SerializedPreviewWorker<S, R>(
                 result?.let(recycleResult)
             }
         }
-        return current
     }
 
     @Synchronized
@@ -91,6 +107,7 @@ internal class SerializedPreviewWorker<S, R>(
     @Synchronized
     fun close() {
         generation.incrementAndGet()
+        closed = true
         pending?.let { recycleSource(it.source) }
         pending = null
         executor.shutdown()

@@ -1478,25 +1478,15 @@ fun calculateResultRotationDegrees(
     characteristics: CameraCharacteristics,
     displayRotation: Int = Surface.ROTATION_0
 ): Int {
-    val sensorOrientation = characteristics.get(
-        CameraCharacteristics.SENSOR_ORIENTATION
-    ) ?: 90
-
-    val lensFacing = characteristics.get(
-        CameraCharacteristics.LENS_FACING
-    )
-
-    val displayDegrees = when (displayRotation) {
-        Surface.ROTATION_90 -> 90
-        Surface.ROTATION_180 -> 180
-        Surface.ROTATION_270 -> 270
-        else -> 0
-    }
-    return if (lensFacing == CameraCharacteristics.LENS_FACING_FRONT) {
-        (sensorOrientation + displayDegrees) % 360
-    } else {
-        (sensorOrientation - displayDegrees + 360) % 360
-    }
+    return (resolveExportOrientation(
+        ExportOrientationInput(
+            sensorOrientationDegrees = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION),
+            displayRotation = displayRotation,
+            lensFacing = characteristics.get(CameraCharacteristics.LENS_FACING),
+            sourceWasDisplayUpright = false,
+            rotationAlreadyApplied = false
+        )
+    ) as? ExportOrientationResolution.Resolved)?.degrees ?: 0
 }
 
 fun chooseColorFusionSize(

@@ -95,6 +95,7 @@ internal data class CapturePipelineRequest(
     val rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
     val captureMode: CaptureMode = CaptureMode.MULTI_FRAME,
     val processingSettings: ProcessingSettings = ProcessingSettings.default(),
+    val displayRotation: Int = android.view.Surface.ROTATION_0,
     val captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     val cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
 )
