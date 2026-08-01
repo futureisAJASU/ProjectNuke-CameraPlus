@@ -20,6 +20,21 @@ internal class CaptureTerminalState {
         state.compareAndSet(CaptureTerminalStatus.ACTIVE, next)
 }
 
+/**
+ * Capture-owner-only frame identity allocator. It deliberately has no atomic or concurrent
+ * collection semantics: callers must invoke it from their serialized capture owner.
+ */
+internal class CaptureFrameIdentityOwner(private val requested: Int) {
+    private var next = 0
+
+    fun nextIdentity(): Int? {
+        if (next >= requested) return null
+        return next++
+    }
+
+    fun allocatedCount(): Int = next
+}
+
 /** A single-owner, bounded queue for capture work. */
 internal class BoundedCaptureWorker(
     name: String,

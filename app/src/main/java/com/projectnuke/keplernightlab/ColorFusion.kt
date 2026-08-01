@@ -36,7 +36,7 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.Executors
-import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
@@ -146,6 +146,28 @@ private data class BufferedYuvFrame(
     val vPixelStride: Int
 )
 
+/** Explicit ownership transfer from the Camera2 callback to the bounded PNG worker. */
+private class YuvPngWorkItem(
+    val index: Int,
+    val timestampNs: Long,
+    val buffered: BufferedYuvFrame? = null,
+    val image: Image? = null
+) {
+    private val released = AtomicBoolean(false)
+
+    fun release() {
+        if (released.compareAndSet(false, true)) {
+            runCatching { image?.close() }
+        }
+    }
+}
+
+private data class YuvPngCompletion(
+    val item: YuvPngWorkItem,
+    val candidate: File?,
+    val failure: Throwable? = null
+)
+
 // YUV_420_888 plane buffers may include row padding and interleaved chroma storage.
 // Use a conservative 3 bytes/pixel estimate rather than the tightly packed 1.5 bytes/pixel ideal.
 private fun estimateYuvBufferBytes(width: Int, height: Int): Long =
@@ -226,7 +248,10 @@ fun captureYuvBurstColorWithMotion(
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     val backgroundThread = HandlerThread("KeplerColorBurstThread").apply { start() }
     val backgroundHandler = Handler(backgroundThread.looper)
-    val yuvWorkQueue = BoundedCaptureWorker("KeplerColorBurstWorker", capacity = 2)
+    val yuvWorkQueue = BoundedCaptureWorker(
+        "KeplerColorBurstWorker",
+        capacity = maxOf(2, minOf(frameCount, MAX_YUV_MEMORY_BUFFER_FRAMES))
+    )
     val timeoutScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "KeplerColorBurstTimeout").apply { isDaemon = true }
     }
@@ -250,8 +275,12 @@ fun captureYuvBurstColorWithMotion(
     var jobFile: File? = null
     var burstDir: File? = null
 
-    val frameTimestampsNs = CopyOnWriteArrayList<Long>()
-    val savedFrameFiles = CopyOnWriteArrayList<String>()
+    // These mutable lists are confined to the capture/worker pipeline; no camera callback
+    // retains them directly and every persisted filename is owner-assigned and immutable.
+    val frameTimestampsNs = mutableListOf<Long>()
+    val savedFrameFiles = mutableListOf<String>()
+    val frameIdentityOwner = CaptureFrameIdentityOwner(frameCount)
+    var discardedLateCompletions = 0
 
     fun captureFailureSnapshot(): YuvCaptureFailureSnapshot = YuvCaptureFailureSnapshot(
         jobFile = jobFile,
@@ -274,11 +303,10 @@ fun captureYuvBurstColorWithMotion(
         try { cameraDevice?.close() } catch (_: Exception) {}
         try { motionLogger?.stop() } catch (_: Exception) {}
         timeoutScheduler.shutdownNow()
-        try { backgroundThread.quitSafely() } catch (_: Exception) {}
         yuvWorkQueue.shutdownNow()
-        if (!yuvWorkQueue.awaitTermination(100L)) {
-            Log.w("KeplerCaptureCancel", "YUV worker did not terminate before cleanup deadline")
-        }
+        // Do not block the camera owner or Main thread waiting for an encoder.  The worker
+        // releases its transferred item in finally; queued items are released by shutdownNow.
+        try { backgroundThread.quitSafely() } catch (_: Exception) {}
     }
 
     fun logLateCameraCallback(callback: String) {
@@ -289,9 +317,10 @@ fun captureYuvBurstColorWithMotion(
     }
 
     captureCancellationHandle.registerCleanupAction {
-        terminalState.claim(CaptureTerminalStatus.CANCELLED)
-        finished.set(true)
-        cleanup()
+        if (terminalState.claim(CaptureTerminalStatus.CANCELLED)) {
+            finished.set(true)
+            cleanup()
+        }
     }
 
     fun finish(message: String) {
@@ -530,6 +559,8 @@ fun captureYuvBurstColorWithMotion(
         )
 
         imageReader = reader
+        // This list is owned exclusively by the bounded YUV worker. The capture owner only
+        // observes persisted files through the owner callback below.
         val bufferedFrames = mutableListOf<BufferedYuvFrame>()
         if (useMemoryBuffer) {
             postStatus(
@@ -585,33 +616,31 @@ fun captureYuvBurstColorWithMotion(
                 "Folder:\n${currentBurstDir.absolutePath}"
         )
 
-        val processImageAvailable: (ImageReader) -> Unit = setOnImageAvailableListener@{ r ->
-                if (finished.get()) return@setOnImageAvailableListener
+        val processImageAvailable: (YuvPngWorkItem) -> Unit = setOnImageAvailableListener@{ item ->
+                if (finished.get()) {
+                    item.release()
+                    return@setOnImageAvailableListener
+                }
 
-                var image: Image? = null
+                var image: Image? = item.image
 
                 try {
-                    image = r.acquireNextImage()
-                    receivedImages++
-
-                    if (image == null) {
+                    if (image == null && item.buffered == null) {
+                        item.release()
                         return@setOnImageAvailableListener
                     }
 
-                    if (savedFrames >= frameCount) {
-                        image.close()
-                        return@setOnImageAvailableListener
+                    val frameIndex = item.index
+                    val imageTimestampNs = item.timestampNs
+
+                    val ownedImage = image
+                    val actualFrameBytes = if (item.buffered != null) 0L else {
+                        actualYuvPlaneBytes(ownedImage ?: error("Missing YUV image"))
                     }
-
-                    val frameIndex = savedFrames
-                    val imageTimestampNs = image.timestamp
-
-                    val actualFrameBytes = actualYuvPlaneBytes(image)
                     if (useMemoryBuffer &&
                         (actualFrameBytes > MAX_YUV_MEMORY_BUFFER_BYTES ||
                             bufferedYuvBytes > MAX_YUV_MEMORY_BUFFER_BYTES - actualFrameBytes)
                     ) {
-                        image.close()
                         image = null
                         finishError(
                             message = "YUV memory buffer rejected actual plane bytes for frame ${frameIndex + 1}/$frameCount",
@@ -623,7 +652,7 @@ fun captureYuvBurstColorWithMotion(
                     }
                     if (useMemoryBuffer) {
                         val bufferedFrame = try {
-                            copyYuvFrameToMemory(image, frameIndex)
+                            item.buffered ?: copyYuvFrameToMemory(ownedImage ?: error("Missing YUV image"), frameIndex)
                         } catch (oom: OutOfMemoryError) {
                             finishError(
                                 message = "YUV memory buffer failed before frame ${frameIndex + 1}/$frameCount",
@@ -634,8 +663,6 @@ fun captureYuvBurstColorWithMotion(
                             )
                             return@setOnImageAvailableListener
                         }
-                        image.close()
-                        image = null
                         bufferedFrames.add(bufferedFrame)
                         bufferedYuvBytes += actualFrameBytes
                         bufferedFrameCount++
@@ -652,11 +679,23 @@ fun captureYuvBurstColorWithMotion(
                                 }
                                 val fileName =
                                     "frame_${frame.index.toString().padStart(2, '0')}_color.png"
+                                val candidate = File(
+                                    currentBurstDir,
+                                    ".${fileName}.${System.nanoTime()}.tmp"
+                                )
                                 saveRotatedColorPngFromBufferedYuv(
                                     frame = frame,
-                                    outFile = File(currentBurstDir, fileName),
+                                    outFile = candidate,
                                     rotationDegrees = rotationDegrees
                                 )
+                                if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+                                    if (candidate.exists() && !candidate.delete()) {
+                                        Log.e(YUV_CAPTURE_LOG_TAG, "Unable to delete late buffered YUV candidate ${candidate.absolutePath}")
+                                    }
+                                    bufferedFrames.clear()
+                                    return@setOnImageAvailableListener
+                                }
+                                KeplerJobMetadata.atomicReplace(candidate, File(currentBurstDir, fileName))
                                 savedFrameFiles.add(fileName)
                                 savedFrames++
                                 postStatus("YUV flushing frame ${flushIndex + 1}/${bufferedFrames.size}")
@@ -722,22 +761,26 @@ fun captureYuvBurstColorWithMotion(
 
                     val fileName = "frame_${frameIndex.toString().padStart(2, '0')}_color.png"
                     val outFile = File(currentBurstDir, fileName)
+                    val candidate = File(currentBurstDir, ".${fileName}.${System.nanoTime()}.tmp")
 
                     saveRotatedColorPngFromYuv(
-                        image = image,
-                        outFile = outFile,
+                        image = ownedImage ?: error("Missing YUV image"),
+                        outFile = candidate,
                         rotationDegrees = rotationDegrees
                     )
 
+                    if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+                        if (candidate.exists() && !candidate.delete()) {
+                            Log.e(YUV_CAPTURE_LOG_TAG, "Unable to delete late YUV candidate ${candidate.absolutePath}")
+                        }
+                        return@setOnImageAvailableListener
+                    }
+                    KeplerJobMetadata.atomicReplace(candidate, outFile)
                     savedFrames++
                     savedFrameFiles.add(fileName)
                     frameTimestampsNs.add(imageTimestampNs)
 
                     val logger = motionLogger
-
-                    if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
-                        return@setOnImageAvailableListener
-                    }
 
                     writeColorJobJson(
                         jobFile = currentJobFile,
@@ -870,7 +913,7 @@ fun captureYuvBurstColorWithMotion(
                         failureMessage = e.message ?: "Failed while saving YUV color frame"
                     )
                 } finally {
-                    try { image?.close() } catch (_: Exception) {}
+                    item.release()
                 }
             }
         reader.setOnImageAvailableListener(
@@ -879,9 +922,50 @@ fun captureYuvBurstColorWithMotion(
                     runCatching { r.acquireNextImage()?.close() }
                     return@setOnImageAvailableListener
                 }
-                if (!yuvWorkQueue.submit(Runnable { processImageAvailable(r) })) {
-                    runCatching { r.acquireNextImage()?.close() }
-                    postStatus("YUV capture backpressure: frame dropped before processing")
+                val image = try {
+                    r.acquireNextImage()
+                } catch (t: Throwable) {
+                    if (t is Error) throw t
+                    failedCaptures++
+                    finishError("YUV acquire failed", "captureYuvBurstColorWithMotion.imageReader.acquire", t)
+                    return@setOnImageAvailableListener
+                } ?: return@setOnImageAvailableListener
+                receivedImages++
+                val frameIndex = frameIdentityOwner.nextIdentity()
+                if (frameIndex == null) {
+                    runCatching { image.close() }
+                    failedCaptures++
+                    return@setOnImageAvailableListener
+                }
+                val item = YuvPngWorkItem(
+                    index = frameIndex,
+                    timestampNs = image.timestamp,
+                    image = image
+                )
+                val ownedItem = if (useMemoryBuffer) {
+                    val bytes = actualYuvPlaneBytes(image)
+                    if (bytes > MAX_YUV_MEMORY_BUFFER_BYTES || bufferedYuvBytes > MAX_YUV_MEMORY_BUFFER_BYTES - bytes) {
+                        item.release()
+                        failedCaptures++
+                        finishError("YUV memory buffer rejected frame ${frameIndex + 1}/$frameCount", "captureYuvBurstColorWithMotion.imageReader.memoryBuffer.actualBytes", failureType = "MemoryPlanError", failureMessage = "Actual YUV plane buffers exceed the bounded capture budget")
+                        return@setOnImageAvailableListener
+                    }
+                    try {
+                        val copied = copyYuvFrameToMemory(image, frameIndex)
+                        item.release()
+                        YuvPngWorkItem(frameIndex, image.timestamp, buffered = copied)
+                    } catch (t: Throwable) {
+                        item.release()
+                        if (t is Error) throw t
+                        failedCaptures++
+                        finishError("YUV memory buffer copy failed", "captureYuvBurstColorWithMotion.imageReader.memoryBuffer", t)
+                        return@setOnImageAvailableListener
+                    }
+                } else item
+                if (!yuvWorkQueue.submit(Runnable { processImageAvailable(ownedItem) })) {
+                    ownedItem.release()
+                    failedCaptures++
+                    postStatus("YUV capture backpressure: frame ${ownedItem.index + 1} dropped")
                 }
             },
             backgroundHandler
@@ -1050,7 +1134,6 @@ fun captureYuvBurstColorWithMotion(
                                         )
                                         timeoutScheduler.schedule({
                                             if (!terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) return@schedule
-                                            finished.set(true)
                                             val settle = Runnable {
                                                 if (savedFrames >= frameCount) {
                                                     finishSuccess(
@@ -1068,7 +1151,13 @@ fun captureYuvBurstColorWithMotion(
                                                     )
                                                 }
                                             }
-                                            if (!backgroundHandler.post(settle)) settle.run()
+                                            if (!backgroundHandler.post(settle)) {
+                                                // The owner looper is gone. Preserve the claimed terminal
+                                                // state and only perform minimal emergency resource cleanup.
+                                                Log.e(YUV_CAPTURE_LOG_TAG, "YUV owner handler rejected timeout settlement")
+                                                finished.set(true)
+                                                cleanup()
+                                            }
                                         }, captureTimeoutMs, TimeUnit.MILLISECONDS)
                                     } catch (e: Exception) {
                                         val templateFailure =
@@ -1752,6 +1841,7 @@ fun writeColorJobJson(
     frameFiles.forEachIndexed { index, fileName ->
         val frameObject = JSONObject()
             .put("index", index)
+            .put("frameIndex", index)
             .put("file", fileName)
 
         if (index < frameTimestampsNs.size) {

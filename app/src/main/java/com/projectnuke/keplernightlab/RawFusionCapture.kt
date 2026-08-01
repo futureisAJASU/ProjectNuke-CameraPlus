@@ -157,6 +157,7 @@ fun captureRawBurstForFusion(
     var requestedFrames = frameCount
     var attemptedFrames = 0
     var savedFrames = 0
+    val frameIdentityOwner = CaptureFrameIdentityOwner(frameCount)
     var receivedImages = 0
     var completedResults = 0
     val finished = AtomicBoolean(false)
@@ -198,9 +199,6 @@ fun captureRawBurstForFusion(
         try { motionLogger?.stop() } catch (_: Exception) {}
         timeoutScheduler.shutdownNow()
         saveWorker.shutdownNow()
-        if (!saveWorker.awaitTermination(100L)) {
-            Log.w("KeplerCaptureCancel", "RAW save worker did not terminate before cleanup deadline")
-        }
         try { thread.quitSafely() } catch (_: Exception) {}
     }
 
@@ -212,9 +210,10 @@ fun captureRawBurstForFusion(
     }
 
     captureCancellationHandle.registerCleanupAction {
-        terminalState.claim(CaptureTerminalStatus.CANCELLED)
-        finished.set(true)
-        cleanup()
+        if (terminalState.claim(CaptureTerminalStatus.CANCELLED)) {
+            finished.set(true)
+            cleanup()
+        }
     }
 
     fun writeJobStatus(jobFile: File?, baseJob: JSONObject?, status: String, error: String? = null) {
@@ -724,14 +723,20 @@ fun captureRawBurstForFusion(
                 val image = pair?.first ?: continue
                 val result = pair!!.second
                 savedTimestamps.add(timestamp)
-                val index = savedFrames
+                val index = frameIdentityOwner.nextIdentity() ?: return
                 val raw16Name = "frame_${index.toString().padStart(2, '0')}.raw16"
                 val dngName = "frame_${index.toString().padStart(2, '0')}.dng"
                 try {
                     post("RAW saving frame ${index + 1}/$requestedFrames...")
                     val saveStartedAt = System.currentTimeMillis()
                     val raw16File = File(jobDir, raw16Name)
-                    writeCompactRaw16(image, raw16File)
+                    val raw16Temp = File(jobDir, ".${raw16Name}.${System.nanoTime()}.tmp")
+                    try {
+                        writeCompactRaw16(image, raw16Temp)
+                        KeplerJobMetadata.atomicReplace(raw16Temp, raw16File)
+                    } finally {
+                        if (raw16Temp.exists()) raw16Temp.delete()
+                    }
                     if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
                         runCatching { raw16File.delete() }
                         return
@@ -776,6 +781,7 @@ fun captureRawBurstForFusion(
                         frameObjects.put(
                             JSONObject()
                             .put("index", index)
+                            .put("frameIndex", index)
                             .put("raw16File", raw16Name)
                             .put("dngFile", if (dngSaved) dngName else JSONObject.NULL)
                             .put("dngSidecarStatus", when {
@@ -821,6 +827,19 @@ fun captureRawBurstForFusion(
                         return
                     }
                 } catch (e: Exception) {
+                    runCatching { File(jobDir, ".${raw16Name}.$index.tmp").delete() }
+                    synchronized(stateLock) {
+                        frameObjects.put(
+                            JSONObject()
+                                .put("index", index)
+                                .put("frameIndex", index)
+                                .put("raw16File", JSONObject.NULL)
+                                .put("dngFile", JSONObject.NULL)
+                                .put("dngSidecarStatus", if (shouldSaveDngSidecars) "LOCAL_SAVE_FAILED" else "NOT_REQUESTED")
+                                .put("dngSidecarError", if (shouldSaveDngSidecars) "${e.javaClass.simpleName}: ${e.message}" else JSONObject.NULL)
+                                .put("timestampNs", timestamp)
+                        )
+                    }
                     finishError("CAPTURE_FAILED", "RAW fusion capture failed\n${e.stackTraceToString()}")
                     return
                 } finally {
@@ -840,7 +859,6 @@ fun captureRawBurstForFusion(
             }
         }.also { timeoutScheduler.schedule({
             if (!terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) return@schedule
-            finished.set(true)
             val settle = Runnable {
                 if (savedFrames >= requestedFrames) {
                     finishSuccess(
@@ -862,7 +880,11 @@ fun captureRawBurstForFusion(
                     )
                 }
             }
-            if (!handler.post(settle)) settle.run()
+            if (!handler.post(settle)) {
+                Log.e(RAW_PIPELINE_LOG_TAG, "RAW owner handler rejected timeout settlement")
+                finished.set(true)
+                cleanup()
+            }
         }, max(30_000L, requestedFrames * 8_000L), TimeUnit.MILLISECONDS) }
 
         imageReader.setOnImageAvailableListener({ r ->

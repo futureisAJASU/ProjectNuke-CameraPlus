@@ -1,6 +1,7 @@
 package com.projectnuke.keplernightlab
 
 import java.nio.file.Files
+import java.io.ByteArrayOutputStream
 import kotlin.io.path.createTempDirectory
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -9,7 +10,21 @@ import org.junit.Test
 
 class NoFollowFileSystemTest {
     @Test
-    fun nullFileKeysUseStableDescriptorFence() {
+    fun verifiedCopyUsesOpenedStreamAndDigestFence() {
+        val root = createTempDirectory("kepler-nofollow-copy").toFile()
+        try {
+            val source = root.resolve("source.dng").apply { writeBytes(byteArrayOf(0x49, 0x49, 0x2a, 0, 1, 2, 3)) }
+            val output = ByteArrayOutputStream()
+            val digest = NoFollowFileSystem.copyVerified(source, output)
+            assertTrue(digest.size == source.length())
+            assertTrue(output.toByteArray().contentEquals(source.readBytes()))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun nullFileKeysRequireStableStatFallback() {
         assertTrue(noFollowIdentityMatches(null, null, 12L, 12L, 99L, 99L))
         assertFalse(noFollowIdentityMatches(null, null, 12L, 13L, 99L, 99L))
     }

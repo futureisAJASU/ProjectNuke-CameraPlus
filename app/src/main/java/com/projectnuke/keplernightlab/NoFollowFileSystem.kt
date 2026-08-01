@@ -9,6 +9,7 @@ import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.attribute.BasicFileAttributes
 import java.io.OutputStream
+import java.io.FileInputStream
 import java.security.MessageDigest
 
 internal fun noFollowIdentityMatches(
@@ -23,6 +24,18 @@ internal fun noFollowIdentityMatches(
 } else {
     expectedSize == actualSize && expectedModifiedMillis == actualModifiedMillis
 }
+
+/** Descriptor identity probe for Android providers that omit BasicFileAttributes.fileKey(). */
+private fun descriptorIdentity(path: Path): String? = runCatching {
+    FileInputStream(path.toFile()).use { stream ->
+        val os = Class.forName("android.system.Os")
+        val stat = os.getMethod("fstat", java.io.FileDescriptor::class.java)
+            .invoke(null, stream.fd)
+        val dev = stat.javaClass.getField("st_dev").getLong(stat)
+        val ino = stat.javaClass.getField("st_ino").getLong(stat)
+        "$dev:$ino"
+    }
+}.getOrNull()
 
 internal sealed interface NoFollowInspection<out T> {
     data object Absent : NoFollowInspection<Nothing>
@@ -46,6 +59,7 @@ internal object NoFollowFileSystem {
             is NoFollowInspection.Present -> inspection.value
         }
         require(before.isRegularFile && !before.isSymbolicLink()) { "Unsafe file: ${file.absolutePath}" }
+        val beforeDescriptor = if (before.fileKey() == null) descriptorIdentity(path) else null
         val digest = MessageDigest.getInstance("SHA-256")
         val prefix = ByteArray(16)
         var prefixCount = 0
@@ -65,8 +79,41 @@ internal object NoFollowFileSystem {
                 size += read
             }
         }
-        require(revalidate(path, before)) { "File identity changed during read: ${file.absolutePath}" }
-        return StreamDigest(size, digest.digest().joinToString("") { "%02x".format(it) }, prefix.copyOf(prefixCount))
+        val digestHex = digest.digest().joinToString("") { "%02x".format(it) }
+        val after = when (val inspection = inspect(path)) {
+            is NoFollowInspection.Present -> inspection.value
+            else -> null
+        }
+        require(after != null && after.isRegularFile && !after.isSymbolicLink()) {
+            "File identity changed during read: ${file.absolutePath}"
+        }
+        val sameStat = noFollowIdentityMatches(
+            before.fileKey(), after.fileKey(), before.size(), after.size(),
+            before.lastModifiedTime().toMillis(), after.lastModifiedTime().toMillis()
+        )
+        // Android providers may omit fileKey(). A descriptor-bound read has already held the
+        // opened inode while streaming; add a bounded post-read fingerprint fence for providers
+        // without keys so same-size/mtime replacement with different content cannot be adopted.
+        val sameContent = if (before.fileKey() == null || after.fileKey() == null) {
+            runCatching {
+                val verify = MessageDigest.getInstance("SHA-256")
+                Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS).use { input ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read <= 0) break
+                        verify.update(buffer, 0, read)
+                    }
+                }
+                verify.digest().joinToString("") { "%02x".format(it) } == digestHex
+            }.getOrDefault(false)
+        } else true
+        val descriptorStable = if (before.fileKey() == null || after.fileKey() == null) {
+            val afterDescriptor = descriptorIdentity(path)
+            if (beforeDescriptor != null && afterDescriptor != null) beforeDescriptor == afterDescriptor else true
+        } else true
+        require(sameStat && sameContent && descriptorStable) { "File identity changed during read: ${file.absolutePath}" }
+        return StreamDigest(size, digestHex, prefix.copyOf(prefixCount))
     }
 
     fun digestVerified(file: File): StreamDigest = copyVerified(file, DiscardOutput)

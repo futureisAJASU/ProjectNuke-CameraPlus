@@ -20,14 +20,16 @@ class RawSidecarAccountingTest {
             publicFailures = listOf("frame_01.dng: public verification failed"),
             requestedCount = 3,
             localFailedCount = 1,
+            publicFailedCount = 1,
             frameResults = listOf(
-                RawSidecarFrameResult(0, true, null, "LOCAL_SAVE_FAILED", "write failed", "NOT_ATTEMPTED", null, null),
-                RawSidecarFrameResult(1, true, "frame_01.dng", "LOCAL_SAVED", null, "PUBLIC_EXPORT_FAILED", null, "hash mismatch"),
-                RawSidecarFrameResult(2, true, "frame_02.dng", "LOCAL_SAVED", null, "PUBLIC_EXPORTED", "content://dng/2", null)
+                RawSidecarFrameResult(10, true, null, "LOCAL_SAVE_FAILED", "write failed", "NOT_ATTEMPTED", null, null),
+                RawSidecarFrameResult(20, true, "frame_20.dng", "LOCAL_SAVED", null, "PUBLIC_EXPORT_FAILED", null, "hash mismatch"),
+                RawSidecarFrameResult(40, true, "frame_40.dng", "LOCAL_SAVED", null, "PUBLIC_EXPORTED", "content://dng/2", null)
             )
         )
         assertEquals(3, result.requestedCount)
         assertEquals(1, result.localFailedCount)
+        assertEquals(1, result.publicFailedCount)
         assertEquals(listOf("frame_00.dng", "frame_01.dng"), result.missingFilenames)
         assertTrue(result.frameResults.any { it.publicStatus == "PUBLIC_EXPORT_FAILED" })
     }

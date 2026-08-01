@@ -42,6 +42,7 @@ data class RawSidecarExportResult(
     val publicFailures: List<String> = emptyList(),
     val requestedCount: Int = expectedCount,
     val localFailedCount: Int = localFailures.size,
+    val publicFailedCount: Int = publicFailures.size,
     val frameResults: List<RawSidecarFrameResult> = emptyList()
 ) {
     /** Public-export status string persisted alongside the image. */
@@ -268,7 +269,7 @@ fun exportRawSidecarsToPublicStorage(
     return rawSidecarOutcome(manifest, exported, publicFailures, false, publicByFrame, publicFailureByFrame)
 }
 
-private data class RawSidecarManifestFrame(
+internal data class RawSidecarManifestFrame(
     val frameIndex: Int,
     val requested: Boolean,
     val localFile: File?,
@@ -277,39 +278,56 @@ private data class RawSidecarManifestFrame(
     val localFailure: String?
 )
 
-private data class RawSidecarManifest(
+internal data class RawSidecarManifest(
     val frames: List<RawSidecarManifestFrame>
 ) {
     val expected: List<RawSidecarManifestFrame> get() = frames.filter { it.localFile != null }
     val localFailures: List<String> get() = frames.mapNotNull { it.localFailure }
 }
 
-private fun loadRawSidecarManifest(jobDir: File): RawSidecarManifest {
+internal fun loadRawSidecarManifest(jobDir: File): RawSidecarManifest {
     val jobFile = NoFollowFileSystem.requireDirectChildFile(jobDir, "job.json")
     val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
     val frames = job.optJSONArray("frames") ?: error("job.json has no RAW frame manifest")
     val names = linkedSetOf<String>()
+    val directDngNames = NoFollowFileSystem.requireDirectDirectDngNames(jobDir)
     val manifestFrames = mutableListOf<RawSidecarManifestFrame>()
     for (index in 0 until frames.length()) {
         val frame = frames.optJSONObject(index) ?: error("Invalid frame manifest entry $index")
+        val frameIdentity = frame.optInt("frameIndex", frame.optInt("index", index))
         val rawStatus = frame.optString("dngSidecarStatus")
         val status = if (rawStatus == "EXPORTED") "LOCAL_SAVED" else rawStatus
         val name = frame.optString("dngFile").takeUnless { it.isBlank() || it == "null" }
         val requested = status != "NOT_REQUESTED" || name != null
-        val failure = if (status == "LOCAL_SAVE_FAILED") {
-            "frame $index: ${frame.optString("dngSidecarError").ifBlank { "local DNG save failed" }}"
+        var effectiveStatus = status
+        var failure = if (status == "LOCAL_SAVE_FAILED") {
+            "frame $frameIdentity: ${frame.optString("dngSidecarError").ifBlank { "local DNG save failed" }}"
         } else null
         if (status == "LOCAL_SAVED") {
-            require(name != null && name.lowercase().endsWith(".dng")) { "Invalid locally saved DNG reference at frame $index" }
+            require(name != null && name.lowercase().endsWith(".dng")) { "Invalid locally saved DNG reference at frame $frameIdentity" }
             require(names.add(name)) { "Duplicate DNG reference: $name" }
+            if (name !in directDngNames) {
+                effectiveStatus = "LOCAL_SAVE_FAILED"
+                failure = "frame $frameIdentity: declared local DNG is missing ($name)"
+            }
         }
-        val localFile = if (status == "LOCAL_SAVED") NoFollowFileSystem.requireDirectChildFile(jobDir, name!!) else null
-        manifestFrames += RawSidecarManifestFrame(index, requested, localFile, name, status, failure)
+        val localFile = if (effectiveStatus == "LOCAL_SAVED") {
+            NoFollowFileSystem.requireDirectChildFile(jobDir, name!!)
+        } else null
+        manifestFrames += RawSidecarManifestFrame(frameIdentity, requested, localFile, name, effectiveStatus, failure)
     }
-    val direct = NoFollowFileSystem.requireDirectDirectDngNames(jobDir)
-    require(direct == names) { "Unexpected or missing DNG sidecar files" }
-    manifestFrames.mapNotNull { it.localFile }.forEach { file -> require(isDngTiffHeader(NoFollowFileSystem.digestVerified(file).prefix)) { "Malformed local DNG: ${file.name}" } }
-    return RawSidecarManifest(manifestFrames)
+    require((directDngNames - names).isEmpty()) { "Unexpected unreferenced DNG sidecar files" }
+    val normalized = manifestFrames.map { frame ->
+        val file = frame.localFile
+        if (file != null && !isDngTiffHeader(NoFollowFileSystem.digestVerified(file).prefix)) {
+            frame.copy(
+                localFile = null,
+                localStatus = "LOCAL_SAVE_FAILED",
+                localFailure = "frame ${frame.frameIndex}: malformed local DNG (${file.name})"
+            )
+        } else frame
+    }
+    return RawSidecarManifest(normalized)
 }
 
 private fun NoFollowFileSystem.requireDirectDirectDngNames(root: File): Set<String> =
@@ -403,6 +421,7 @@ private fun rawSidecarOutcome(
         publicFailures = publicFailures,
         requestedCount = requestedCount,
         localFailedCount = localFailedCount,
+        publicFailedCount = publicFailures.size,
         frameResults = frameResults
     )
 }
@@ -483,6 +502,7 @@ fun updateExportMetadata(
             .put("rawSidecarLocallySavedCount", rawSidecarResult?.locallySavedCount ?: 0)
             .put("rawSidecarLocalFailedCount", rawSidecarResult?.localFailedCount ?: 0)
             .put("rawSidecarPublicExportedCount", rawSidecarResult?.publicExportedCount ?: 0)
+            .put("rawSidecarPublicFailedCount", rawSidecarResult?.publicFailedCount ?: 0)
             .put("rawSidecarMissingFilenames", JSONArray(rawSidecarResult?.missingFilenames ?: emptyList<String>()))
             .put("rawSidecarLocalFailures", JSONArray(rawSidecarResult?.localFailures ?: emptyList<String>()))
             .put("rawSidecarPublicFailures", JSONArray(rawSidecarResult?.publicFailures ?: emptyList<String>()))
@@ -503,11 +523,16 @@ fun updateExportMetadata(
             })
             .put("exportedAt", System.currentTimeMillis())
         rawSidecarResult?.frameResults?.forEach { frameResult ->
-            job.optJSONArray("frames")?.optJSONObject(frameResult.frameIndex)?.apply {
-                put("dngSidecarStatus", frameResult.localStatus)
-                put("dngSidecarPublicStatus", frameResult.publicStatus)
-                put("publicDngUri", frameResult.publicUri ?: JSONObject.NULL)
-                put("publicDngError", frameResult.publicFailure ?: JSONObject.NULL)
+            val frameArray = job.optJSONArray("frames")
+            for (index in 0 until (frameArray?.length() ?: 0)) {
+                val frame = frameArray?.optJSONObject(index) ?: continue
+                val identity = frame.optInt("frameIndex", frame.optInt("index", index))
+                if (identity != frameResult.frameIndex) continue
+                frame.put("dngSidecarStatus", frameResult.localStatus)
+                    .put("dngSidecarPublicStatus", frameResult.publicStatus)
+                    .put("publicDngUri", frameResult.publicUri ?: JSONObject.NULL)
+                    .put("publicDngError", frameResult.publicFailure ?: JSONObject.NULL)
+                break
             }
         }
         val existingPipelineStartedAt = job.optLong("rawCaptureStartedAt", 0L)
@@ -633,12 +658,38 @@ internal fun updateRawPublicExportOutcome(
         job.put("rawSidecarExportStatus", sidecarStatus)
             .put("rawSidecarExportedFiles", JSONArray(sidecarResult?.exportedFiles ?: emptyList<String>()))
             .put("rawSidecarExpectedCount", sidecarResult?.expectedCount ?: 0)
+            .put("rawSidecarRequestedCount", sidecarResult?.requestedCount ?: 0)
             .put("rawSidecarLocallySavedCount", sidecarResult?.locallySavedCount ?: 0)
+            .put("rawSidecarLocalFailedCount", sidecarResult?.localFailedCount ?: 0)
             .put("rawSidecarPublicExportedCount", sidecarResult?.publicExportedCount ?: 0)
+            .put("rawSidecarPublicFailedCount", sidecarResult?.publicFailedCount ?: 0)
             .put("rawSidecarMissingFilenames", JSONArray(sidecarResult?.missingFilenames ?: emptyList<String>()))
             .put("rawSidecarLocalFailures", JSONArray(sidecarResult?.localFailures ?: emptyList<String>()))
             .put("rawSidecarPublicFailures", JSONArray(sidecarResult?.publicFailures ?: emptyList<String>()))
+            .put("rawSidecarFrameManifest", JSONArray(sidecarResult?.frameResults?.map { frame ->
+                JSONObject()
+                    .put("frameIndex", frame.frameIndex)
+                    .put("requested", frame.requested)
+                    .put("localFilename", frame.localFilename ?: JSONObject.NULL)
+                    .put("localStatus", frame.localStatus)
+                    .put("localFailure", frame.localFailure ?: JSONObject.NULL)
+                    .put("publicStatus", frame.publicStatus)
+                    .put("publicUri", frame.publicUri ?: JSONObject.NULL)
+                    .put("publicFailure", frame.publicFailure ?: JSONObject.NULL)
+            } ?: emptyList<JSONObject>()))
             .put("rawSidecarError", sidecarError)
+        sidecarResult?.frameResults?.forEach { frameResult ->
+            val frameArray = job.optJSONArray("frames")
+            for (index in 0 until (frameArray?.length() ?: 0)) {
+                val frame = frameArray?.optJSONObject(index) ?: continue
+                val identity = frame.optInt("frameIndex", frame.optInt("index", index))
+                if (identity != frameResult.frameIndex) continue
+                frame.put("dngSidecarPublicStatus", frameResult.publicStatus)
+                    .put("publicDngUri", frameResult.publicUri ?: JSONObject.NULL)
+                    .put("publicDngError", frameResult.publicFailure ?: JSONObject.NULL)
+                break
+            }
+        }
         if (outcome.currentWarning != null) {
             job.put("currentWarning", outcome.currentWarning)
         } else {
