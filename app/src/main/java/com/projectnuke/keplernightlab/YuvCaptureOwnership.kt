@@ -43,7 +43,7 @@ internal class YuvBufferReservations(private val limitBytes: Long) {
 }
 
 /** Capture accounting shared only through explicit methods until the owner-loop migration. */
-internal class YuvCaptureAccounting {
+internal open class YuvCaptureAccounting {
     private val lock = Any()
     private var received = 0
     private var buffered = 0
@@ -55,11 +55,14 @@ internal class YuvCaptureAccounting {
     /** ImageReader acquisition completed. */
     fun receivedFrame() = synchronized(lock) { received++ }
     /** A copied YUV allocation is retained pending PNG persistence. */
-    fun bufferedFrame() = synchronized(lock) { buffered++ }
+    open fun bufferedFrame() = synchronized(lock) { buffered++ }
     /** A retained allocation is no longer pending. */
-    fun releasedBufferedFrame() = synchronized(lock) { if (buffered > 0) buffered-- }
+    fun releasedBufferedFrame() = synchronized(lock) {
+        check(buffered > 0) { "bufferedFrames released more than once" }
+        buffered--
+    }
     /** Acquired work failed after acceptance. */
-    fun failedFrame() = synchronized(lock) { failed++ }
+    open fun failedFrame() = synchronized(lock) { failed++ }
     /** Acquired work could not enter the bounded pipeline. */
     fun droppedFrame() = synchronized(lock) { dropped++ }
 
@@ -103,6 +106,29 @@ internal class Camera2YuvImageAccess(private val image: Image) : YuvImageAccess 
 }
 
 /**
+ * Production access for direct (non-buffered) YUV work.  Extends [YuvImageAccess] with
+ * [takeImage] so [createDirectYuvWork] can transfer the Image atomically after capturing
+ * immutable metadata.  The Image is closed exactly once by [YuvImageReleaseGuard].
+ */
+internal interface DirectYuvImageAccess : YuvImageAccess {
+    /** Atomically transfers ownership of the underlying Image to the caller. */
+    fun takeImage(): Image?
+}
+
+internal class Camera2DirectYuvImageAccess(private val image: Image) : DirectYuvImageAccess {
+    private var taken = false
+    override fun timestampNs(): Long = image.timestamp
+    override fun allocationBytes(): Long = 0L
+    override fun copy(frameIndex: Int): BufferedYuvFrame = error("direct work does not copy")
+    override fun release() = image.close()
+    override fun takeImage(): Image? {
+        check(!taken) { "DirectYuvImageAccess.takeImage() called twice" }
+        taken = true
+        return image
+    }
+}
+
+/**
  * Copies one ImageReader frame while retaining only immutable metadata after the Image closes.
  * The caller owns the returned work item; rejected and failed creation always release the
  * Camera2 Image and any reservation before returning.
@@ -111,6 +137,58 @@ internal sealed interface BufferedYuvWorkCreation {
     data class Accepted(val item: YuvPngWorkItem) : BufferedYuvWorkCreation
     data object Rejected : BufferedYuvWorkCreation
     data class Failed(val cause: Throwable) : BufferedYuvWorkCreation
+}
+
+/**
+ * Production direct-work creation result.  Either an accepted work item that owns the Image,
+ * or a failed result with the Image already closed exactly once.
+ */
+internal sealed interface DirectYuvWorkCreation {
+    data class Accepted(val item: YuvPngWorkItem) : DirectYuvWorkCreation
+    data class Failed(val cause: Throwable) : DirectYuvWorkCreation
+}
+
+/**
+ * Production factory for direct YUV work items.  Captures the immutable metadata
+ * (timestamp) before the Image is touched by encoding, and transfers Image ownership
+ * atomically: the returned [YuvPngWorkItem] becomes the sole owner of the Image.
+ * If timestamp access fails, the Image is closed exactly once via the release guard
+ * and no work item is returned.
+ *
+ * Requirements satisfied:
+ *  - Image is closed exactly once on any failure.
+ *  - No work item is enqueued when creation fails.
+ *  - `failedFrames` is updated through [account].
+ *  - No later Image property access occurs after release begins.
+ *
+ * The [access] must be a [DirectYuvImageAccess] providing [takeImage] for atomic transfer.
+ */
+internal fun createDirectYuvWork(
+    frameIndex: Int,
+    access: DirectYuvImageAccess,
+    account: YuvCaptureAccounting,
+    onRelease: (() -> Unit)? = null
+): DirectYuvWorkCreation {
+    // Capture timestamp first.  If this fails, release the Image exactly once.
+    val timestampNs = try {
+        access.timestampNs()
+    } catch (t: Throwable) {
+        access.release()
+        account.failedFrame()
+        return DirectYuvWorkCreation.Failed(t)
+    }
+    // Atomically transfer Image ownership to the work item.  The work item becomes
+    // the sole owner; when it disposes, it closes the Image exactly once.
+    val image = try {
+        access.takeImage()
+    } catch (t: Throwable) {
+        access.release()
+        account.failedFrame()
+        return DirectYuvWorkCreation.Failed(t)
+    }
+    return DirectYuvWorkCreation.Accepted(
+        YuvPngWorkItem.direct(frameIndex, timestampNs, image, onRelease)
+    )
 }
 
 /**
@@ -140,7 +218,7 @@ internal fun createBufferedYuvWork(
     var timestampNs = 0L
     var bytes = 0L
     var reserved = false
-    var copied = false
+    var itemOwned = false
     try {
         timestampNs = access.timestampNs()
         bytes = access.allocationBytes()
@@ -150,12 +228,13 @@ internal fun createBufferedYuvWork(
         }
         reserved = true
         val frame = access.copy(frameIndex)
-        copied = true
-        // bufferedFrame() accounting is bumped by [YuvBufferedLifecycle.tryRegister] once the
-        // item becomes a lifecycle-tracked RETAINED unit; we do not double-count here.
-        return BufferedYuvWorkCreation.Accepted(
-            YuvPngWorkItem.buffered(frameIndex, timestampNs, frame, bytes, reservations, onRelease)
-        )
+        // [YuvPngWorkItem.buffered] increments bufferedFrames once via the item's own
+        // accounting token.  That token can only be settled by settleEncoding or dispose.
+        // If the factory throws after the copy but before the item is constructed, the
+        // finally block releases the reservation because itemOwned is still false.
+        val item = YuvPngWorkItem.buffered(frameIndex, timestampNs, frame, bytes, reservations, accounting, onRelease)
+        itemOwned = true
+        return BufferedYuvWorkCreation.Accepted(item)
     } catch (oom: OutOfMemoryError) {
         throw oom
     } catch (t: Throwable) {
@@ -164,7 +243,9 @@ internal fun createBufferedYuvWork(
     } finally {
         // Exactly one release attempt regardless of which path we took.
         releaseGuard.releaseSafely()
-        if (reserved && !copied) {
+        // Release the reservation if the work item never took ownership (copy succeeded
+        // but construction failed).  When itemOwned is true the item owns the reservation.
+        if (reserved && !itemOwned) {
             reservations.release(bytes)
         }
     }
@@ -187,13 +268,34 @@ internal class YuvPngWorkItem private constructor(
     fun bufferedForEncoding(): BufferedYuvFrame? = buffered
     fun retainedBytes(): Long = retainedBytes
 
-    fun releaseBufferedReservation(accounting: YuvCaptureAccounting? = null) {
+    /**
+     * Single authoritative settlement for the buffered-frame accounting token.
+     *
+     * A buffered work item owns its accounting token for the duration of its life:
+     * exactly one call to [settleBufferedAccounting] releases the reservation and
+     * decrements the buffered-frame counter.  The token is settled either by:
+     *  - the lifecycle's [YuvBufferedLifecycle.settleEncoding] (successful encoding path), or
+     *  - [dispose] when the lifecycle never accepted the item (close-race / failure paths).
+     *
+     * [bufferedFrames] is incremented once by [createBufferedYuvWork] (via the constructor's
+     * accounting token) and can only be released through this single path.  Calling
+     * [settleBufferedAccounting] or [dispose] more than once is a no-op after the first call;
+     * a double-settle is detected by the reservation CAS and throws rather than silently
+     * underflowing.
+     */
+    fun settleBufferedAccounting(accounting: YuvCaptureAccounting) {
         if (retainedBytes > 0L && bufferedReleased.compareAndSet(false, true)) {
             reservations?.release(retainedBytes)
-            accounting?.releasedBufferedFrame()
+            accounting.releasedBufferedFrame()
         }
     }
 
+    /**
+     * Disposes the work item exactly once.  For buffered items the accounting token is
+     * settled here only if [settleBufferedAccounting] has not already run (e.g. when the
+     * lifecycle never accepted the item after a close race, or when construction failed
+     * before registration).
+     */
     fun dispose(accounting: YuvCaptureAccounting? = null) {
         if (!released.compareAndSet(false, true)) return
         val ownedImage = image
@@ -202,23 +304,30 @@ internal class YuvPngWorkItem private constructor(
         try {
             ownedImage?.close()
         } finally {
-            releaseBufferedReservation(accounting)
+            if (accounting != null) settleBufferedAccounting(accounting)
             onRelease?.invoke()
         }
     }
 
     companion object {
-        fun direct(frameIndex: Int, timestampNs: Long, image: Image, onRelease: (() -> Unit)? = null) =
+        fun direct(frameIndex: Int, timestampNs: Long, image: Image?, onRelease: (() -> Unit)? = null) =
             YuvPngWorkItem(frameIndex, timestampNs, image, null, 0L, null, onRelease)
 
+        /**
+         * Production factory for buffered work items.  Increments [bufferedFrames] once via
+         * the accounting token captured at construction; that token can only be released
+         * through [settleBufferedAccounting] or [dispose].
+         */
         fun buffered(
             frameIndex: Int,
             timestampNs: Long,
             frame: BufferedYuvFrame,
             retainedBytes: Long,
             reservations: YuvBufferReservations,
+            accounting: YuvCaptureAccounting,
             onRelease: (() -> Unit)? = null
         ) = YuvPngWorkItem(frameIndex, timestampNs, null, frame, retainedBytes, reservations, onRelease)
+            .also { accounting.bufferedFrame() }
 
         /** Ownership-only seam for JVM tests; production Camera2 work always uses [direct]. */
         internal fun ownedForTest(onRelease: () -> Unit) =
@@ -233,6 +342,7 @@ internal class YuvPngWorkItem private constructor(
             timestampNs: Long,
             retainedBytes: Long,
             reservations: YuvBufferReservations,
+            accounting: YuvCaptureAccounting,
             onRelease: (() -> Unit)? = null
         ) = YuvPngWorkItem(
             frameIndex,
@@ -242,7 +352,7 @@ internal class YuvPngWorkItem private constructor(
             retainedBytes,
             reservations,
             onRelease
-        )
+        ).also { accounting.bufferedFrame() }
     }
 }
 

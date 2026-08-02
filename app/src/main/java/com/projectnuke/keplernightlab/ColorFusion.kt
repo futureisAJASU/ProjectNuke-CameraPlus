@@ -638,7 +638,7 @@ fun captureYuvBurstColorWithMotion(
 
                     if (useMemoryBuffer) {
                         check(item.bufferedForEncoding() != null) { "Buffered YUV work lost its copied frame" }
-                        val registered = yuvBufferedLifecycle.tryRegister(item, yuvAccounting)
+                        val registered = yuvBufferedLifecycle.tryRegister(item)
                         if (!registered) {
                             // Cleanup raced past registration; dispose the exact item.
                             item.dispose(yuvAccounting)

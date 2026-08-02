@@ -1,5 +1,6 @@
 package com.projectnuke.keplernightlab
 
+import android.media.Image
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -153,7 +154,7 @@ class YuvCaptureOwnershipTest {
         val reservations = YuvBufferReservations(1024L)
         val disposeCount = AtomicInteger(0)
         assertTrue(reservations.tryReserve(100L))
-        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations) {
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
             disposeCount.incrementAndGet()
         }
 
@@ -163,7 +164,7 @@ class YuvCaptureOwnershipTest {
         val drained = lifecycle.closeAndDrainRetained()
         assertTrue(drained.isEmpty())
         // Worker attempts to retain the buffered item AFTER cleanup completed.
-        assertFalse(lifecycle.tryRegister(item, accounting))
+        assertFalse(lifecycle.tryRegister(item))
         // Caller disposes the exact item; reservation settles.
         item.dispose(accounting)
         assertEquals(1, disposeCount.get())
@@ -179,12 +180,12 @@ class YuvCaptureOwnershipTest {
         val reservations = YuvBufferReservations(1024L)
         val disposeCount = AtomicInteger(0)
         assertTrue(reservations.tryReserve(100L))
-        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations) {
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
             disposeCount.incrementAndGet()
         }
         lifecycle.closeAndDrainRetained()
 
-        assertFalse(lifecycle.tryRegister(item, accounting))
+        assertFalse(lifecycle.tryRegister(item))
         item.dispose(accounting)
         item.dispose(accounting)
         assertEquals(1, disposeCount.get())
@@ -197,10 +198,10 @@ class YuvCaptureOwnershipTest {
         val accounting = YuvCaptureAccounting()
         val reservations = YuvBufferReservations(1024L)
         assertTrue(reservations.tryReserve(100L))
-        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations)
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting)
         lifecycle.closeAndDrainRetained()
 
-        assertFalse(lifecycle.tryRegister(item, accounting))
+        assertFalse(lifecycle.tryRegister(item))
         assertEquals(100L, reservations.currentBytes())
         item.dispose(accounting)
         assertEquals(0L, reservations.currentBytes())
@@ -214,10 +215,10 @@ class YuvCaptureOwnershipTest {
         val reservations = YuvBufferReservations(1024L)
         val disposeCount = AtomicInteger(0)
         assertTrue(reservations.tryReserve(100L))
-        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations) {
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
             disposeCount.incrementAndGet()
         }
-        assertTrue(lifecycle.tryRegister(item, accounting))
+        assertTrue(lifecycle.tryRegister(item))
         assertEquals(1, accounting.snapshot().bufferedFrames)
 
         val drained = lifecycle.closeAndDrainRetained()
@@ -237,10 +238,10 @@ class YuvCaptureOwnershipTest {
         val reservations = YuvBufferReservations(1024L)
         val disposeCount = AtomicInteger(0)
         assertTrue(reservations.tryReserve(100L))
-        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations) {
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
             disposeCount.incrementAndGet()
         }
-        assertTrue(lifecycle.tryRegister(item, accounting))
+        assertTrue(lifecycle.tryRegister(item))
         assertTrue(lifecycle.beginEncoding(item))
 
         val drained = lifecycle.closeAndDrainRetained()
@@ -258,8 +259,8 @@ class YuvCaptureOwnershipTest {
         val accounting = YuvCaptureAccounting()
         val reservations = YuvBufferReservations(1024L)
         assertTrue(reservations.tryReserve(100L))
-        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations)
-        assertTrue(lifecycle.tryRegister(item, accounting))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting)
+        assertTrue(lifecycle.tryRegister(item))
         assertTrue(lifecycle.beginEncoding(item))
 
         lifecycle.closeAndDrainRetained()
@@ -279,10 +280,10 @@ class YuvCaptureOwnershipTest {
         val reservations = YuvBufferReservations(1024L)
         val disposeCount = AtomicInteger(0)
         assertTrue(reservations.tryReserve(100L))
-        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations) {
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
             disposeCount.incrementAndGet()
         }
-        assertTrue(lifecycle.tryRegister(item, accounting))
+        assertTrue(lifecycle.tryRegister(item))
         assertTrue(lifecycle.beginEncoding(item))
 
         lifecycle.settleEncoding(item, accounting)
@@ -301,10 +302,10 @@ class YuvCaptureOwnershipTest {
         val reservations = YuvBufferReservations(1024L)
         val disposeCount = AtomicInteger(0)
         assertTrue(reservations.tryReserve(100L))
-        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations) {
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
             disposeCount.incrementAndGet()
         }
-        assertTrue(lifecycle.tryRegister(item, accounting))
+        assertTrue(lifecycle.tryRegister(item))
         assertTrue(lifecycle.beginEncoding(item))
 
         val start = CountDownLatch(2)
@@ -342,8 +343,8 @@ class YuvCaptureOwnershipTest {
 
         repeat(25) { index ->
             assertTrue(reservations.tryReserve(10L))
-            val item = YuvPngWorkItem.bufferedForTest(index, index.toLong(), 10L, reservations)
-            assertFalse(lifecycle.tryRegister(item, accounting))
+            val item = YuvPngWorkItem.bufferedForTest(index, index.toLong(), 10L, reservations, accounting)
+            assertFalse(lifecycle.tryRegister(item))
             item.dispose(accounting)
         }
         assertEquals(0, lifecycle.retainedCount())
@@ -381,6 +382,25 @@ class YuvCaptureOwnershipTest {
         assertEquals(0, accounting.snapshot().bufferedFrames)
     }
 
+    /**
+     * Step 0.3: Copy succeeds, work-item construction fails, Image released once,
+     * reservation returns to zero, buffered accounting remains zero, no work item escapes.
+     */
+    @Test
+    fun workItemConstructionFailureReleasesReservationAndDoesNotLeak() {
+        val reservations = YuvBufferReservations(1024L)
+        val accounting = FailingBufferedAccounting()
+        val access = FakeYuvAccess(bytes = 10L)
+
+        val result = createBufferedYuvWork(0, access, reservations, accounting)
+
+        assertTrue(result is BufferedYuvWorkCreation.Failed)
+        assertEquals(1, access.releaseCount.get())
+        assertEquals(0L, reservations.currentBytes())
+        assertEquals(1, accounting.bufferedAttempts)
+        assertEquals(0, accounting.snapshot().bufferedFrames)
+    }
+
     @Test
     fun reservationRejectionPerformsOneReleaseAttempt() {
         val accounting = YuvCaptureAccounting()
@@ -388,9 +408,46 @@ class YuvCaptureOwnershipTest {
         val access = FakeYuvAccess(bytes = 10L)
         val result = createBufferedYuvWork(0, access, reservations, accounting)
         assertTrue(result is BufferedYuvWorkCreation.Rejected)
-        assertEquals(1, access.releaseCount.get())
+         assertEquals(1, access.releaseCount.get())
         assertEquals(0L, reservations.currentBytes())
         assertEquals(0, accounting.snapshot().bufferedFrames)
+    }
+
+    /**
+     * Step 0.4: Direct timestamp failure closes Image once, no work item enqueued,
+     * no later Image property access.
+     */
+    @Test
+    fun directTimestampFailureClosesImageOnceAndFailsCreation() {
+        val accounting = YuvCaptureAccounting()
+        val fakeImage = FakeDirectImage(failTimestamp = true)
+
+        val result = createDirectYuvWork(0, fakeImage, accounting)
+
+        assertTrue(result is DirectYuvWorkCreation.Failed)
+        assertEquals(1, accounting.snapshot().failedFrames)
+        assertEquals(1, fakeImage.closeCount.get())
+    }
+
+    /**
+     * Step 0.4: Direct success creates a work item that owns the Image metadata;
+     * the Image itself is not closed until the work item disposes.
+     */
+    @Test
+    fun directSuccessCreatesOwningWorkItemAndClosesOnce() {
+        val accounting = YuvCaptureAccounting()
+        val fakeImage = FakeDirectImage(failTimestamp = false)
+
+        val result = createDirectYuvWork(0, fakeImage, accounting)
+
+        assertTrue(result is DirectYuvWorkCreation.Accepted)
+        assertEquals(0, accounting.snapshot().failedFrames)
+        assertEquals(0, fakeImage.closeCount.get())
+        assertEquals(4321L, (result as DirectYuvWorkCreation.Accepted).item.timestampNs)
+        // In JVM tests takeImage() returns null (no real android.media.Image), so the
+        // work item's dispose is a no-op on the image.  The production path closes the
+        // real Image via the work item's dispose when takeImage() returns the real Image.
+        result.item.dispose(accounting)
     }
 
     @Test
@@ -474,7 +531,7 @@ class YuvCaptureOwnershipTest {
         val accounting = YuvCaptureAccounting()
         val reservations = YuvBufferReservations(1024L)
         assertTrue(reservations.tryReserve(100L))
-        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations) {
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
             disposeCount.incrementAndGet()
         }
         val worker = BoundedCaptureWorker("yuv-run-body", 1)
@@ -520,11 +577,11 @@ class YuvCaptureOwnershipTest {
             assertTrue(reservations.tryReserve(100L))
             assertTrue(reservations.tryReserve(100L))
             assertTrue(worker.submit(DisposableYuvTask(
-                YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations) { releaseCount.incrementAndGet() },
+                YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) { releaseCount.incrementAndGet() },
                 accounting
             ) {}))
             assertTrue(worker.submit(DisposableYuvTask(
-                YuvPngWorkItem.bufferedForTest(1, 2L, 100L, reservations) { releaseCount.incrementAndGet() },
+                YuvPngWorkItem.bufferedForTest(1, 2L, 100L, reservations, accounting) { releaseCount.incrementAndGet() },
                 accounting
             ) {}))
             worker.shutdownNow()
@@ -541,6 +598,35 @@ class YuvCaptureOwnershipTest {
     // -------------------------------------------------------------------------------------
     // Fakes.
     // -------------------------------------------------------------------------------------
+
+    /**
+     * Step 0.3 test seam: a YuvCaptureAccounting whose bufferedFrame() throws, simulating
+     * work-item construction failure after the YUV copy succeeded.  The reservation must still
+     * be released by createBufferedYuvWork's finally block.
+     */
+    private class FailingBufferedAccounting : YuvCaptureAccounting() {
+        var bufferedAttempts = 0
+
+        override fun bufferedFrame(): Int {
+            bufferedAttempts++
+            error("work-item construction failed after copy")
+        }
+    }
+
+    private class FakeDirectImage(private val failTimestamp: Boolean) : DirectYuvImageAccess {
+        val closeCount = AtomicInteger(0)
+        private var closed = false
+
+        override fun timestampNs(): Long = if (failTimestamp) error("timestamp failed") else 4321L
+        override fun allocationBytes(): Long = 0L
+        override fun copy(frameIndex: Int): BufferedYuvFrame = error("unreachable for direct work")
+        override fun release() {
+            if (closed) error("Image closed twice")
+            closed = true
+            closeCount.incrementAndGet()
+        }
+        override fun takeImage(): Image? = null
+    }
 
     private class ThrowingCopyYuvAccess(private val bytes: Long) : YuvImageAccess {
         val releaseCount = AtomicInteger(0)

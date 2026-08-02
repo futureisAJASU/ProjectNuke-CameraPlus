@@ -12,12 +12,22 @@ import java.util.concurrent.atomic.AtomicReference
  * state transitions are atomic so that:
  *
  *  - an item registers before it can remain retained,
- *  - registration after closure fails and the caller must dispose the exact item,
+ *  - registration after closure fails and the caller must dispose the exact item (the item's
+ *    own accounting token remains unsettled until that caller-side dispose, so no double-count),
  *  - cleanup can drain `RETAINED` items but must leave `ENCODING` items alone until the worker
  *    settles them in its `finally`,
- *  - the buffered-frame and retained-byte counters (in [YuvCaptureAccounting] and
- *    [YuvBufferReservations]) move in lockstep with state transitions, so they never reach zero
- *    while an encoder still owns the copied frame.
+ *  - a single owner settles each item exactly once: either [settleEncoding] (worker path) or
+ *    [closeAndDrainRetained] + caller dispose (cleanup path), never both.
+ *
+ * Accounting ownership model (fixes Phase 1B double-settlement):
+ *  - [createBufferedYuvWork] increments `bufferedFrames` via the item's constructor token at creation.
+ *  - That token is settled by exactly one path:
+ *      * ENCODING path: [settleEncoding] calls [YuvPngWorkItem.settleBufferedAccounting].
+ *      * Cleanup path: [closeAndDrainRetained] drains RETAINED items; the caller then calls
+ *        `item.dispose(accounting)` which settles the token for items the lifecycle never
+ *        moved to ENCODING.
+ *  - A close-raced [tryRegister] returns false without touching accounting; the caller-side
+ *    `item.dispose(accounting)` settles the single token.
  */
 internal class YuvBufferedLifecycle {
 
@@ -33,22 +43,22 @@ internal class YuvBufferedLifecycle {
     fun retainedCount(): Int = items.size
 
     /**
-     * Attempts to register [item] in `RETAINED` state. If the lifecycle is already closed (or
-     * closes during registration) the function returns `false` and the caller MUST dispose the
-     * exact item; no accounting side effect is left behind.
+     * Attempts to register [item] in `RETAINED` state.  The caller has already created the
+     * work item (which owns its accounting token).  Registration is purely about lifecycle
+     * tracking — it does NOT bump accounting again.  If the lifecycle is already closed (or
+     * closes during registration) the function returns `false` and the caller MUST dispose
+     * the exact item, which settles the single accounting token.
      */
-    fun tryRegister(item: YuvPngWorkItem, accounting: YuvCaptureAccounting): Boolean {
+    fun tryRegister(item: YuvPngWorkItem): Boolean {
         if (closed.get()) return false
         val entry = Entry(AtomicReference(State.RETAINED))
         val prior = items.putIfAbsent(item, entry)
         if (prior != null) {
             error("YUV work item already tracked by buffered lifecycle")
         }
-        accounting.bufferedFrame()
         if (closed.get()) {
             // Close raced past the put. Remove atomically; either we win or closeAndDrainRetained did.
             if (items.remove(item) != null) {
-                accounting.releasedBufferedFrame()
                 return false
             }
             return false
@@ -67,21 +77,24 @@ internal class YuvBufferedLifecycle {
 
     /**
      * Called by the encoder in its `finally` block. Atomically removes the item from the
-     * lifecycle and invokes [item].dispose, which releases the reservation and adjusts
-     * accounting. Exactly one invocation per item has any effect; subsequent calls are no-ops.
+     * lifecycle and settles its accounting token (reservation + buffered-frame counter)
+     * exactly once.  [YuvPngWorkItem.settleBufferedAccounting] and [YuvPngWorkItem.dispose]
+     * are each idempotent; this method is also safe to call multiple times.
      */
     fun settleEncoding(item: YuvPngWorkItem, accounting: YuvCaptureAccounting) {
         val entry = items.remove(item) ?: return
         entry.state.set(State.RELEASED)
+        item.settleBufferedAccounting(accounting)
         item.dispose(accounting)
     }
 
     /**
-     * Terminal cleanup. Marks the lifecycle closed and atomically drains every `RETAINED` item.
-     * `ENCODING` items are left alone: their encoders still own them and will dispose them
-     * via [settleEncoding] when they return. The returned list contains exactly the items
-     * cleanup must dispose itself; it is empty when no `RETAINED` items remained. The caller is
-     * responsible for calling `item.dispose(accounting)` on every returned item.
+     * Terminal cleanup. Marks the lifecycle closed and atomically drains every `RETAINED`
+     * item.  `ENCODING` items are left alone: their encoders still own them and will settle
+     * them via [settleEncoding] when they return.  The returned list contains exactly the
+     * items cleanup must dispose itself; it is empty when no `RETAINED` items remained.
+     * The caller is responsible for calling `item.dispose(accounting)` on every returned item
+     * to settle their accounting tokens.
      */
     fun closeAndDrainRetained(): List<YuvPngWorkItem> {
         closed.set(true)
