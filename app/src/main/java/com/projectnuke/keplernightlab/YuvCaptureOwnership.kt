@@ -113,6 +113,22 @@ internal sealed interface BufferedYuvWorkCreation {
     data class Failed(val cause: Throwable) : BufferedYuvWorkCreation
 }
 
+/**
+ * Guarantees that an underlying [YuvImageAccess.release] is invoked at most once even when the
+ * first attempt throws after partially closing the Camera2 Image. Used by
+ * [createBufferedYuvWork] so no code path can perform a second release that would double-close
+ * the underlying Image.
+ */
+internal class YuvImageReleaseGuard(private val access: YuvImageAccess) {
+    private val consumed = AtomicBoolean(false)
+
+    fun releaseSafely() {
+        if (consumed.compareAndSet(false, true)) {
+            runCatching { access.release() }
+        }
+    }
+}
+
 internal fun createBufferedYuvWork(
     frameIndex: Int,
     access: YuvImageAccess,
@@ -120,40 +136,37 @@ internal fun createBufferedYuvWork(
     accounting: YuvCaptureAccounting,
     onRelease: (() -> Unit)? = null
 ): BufferedYuvWorkCreation {
-    // Every Image property needed by the worker is captured before release.
-    val timestampNs = try {
-        access.timestampNs()
-    } catch (t: Throwable) {
-        runCatching { access.release() }
-        accounting.failedFrame()
-        return BufferedYuvWorkCreation.Failed(t)
-    }
-    val bytes = try {
-        access.allocationBytes()
-    } catch (t: Throwable) {
-        runCatching { access.release() }
-        accounting.failedFrame()
-        return BufferedYuvWorkCreation.Failed(t)
-    }
-    if (!reservations.tryReserve(bytes)) {
-        access.release()
-        accounting.droppedFrame()
-        return BufferedYuvWorkCreation.Rejected
-    }
-    var released = false
-    return try {
-        val copied = access.copy(frameIndex)
-        access.release()
-        released = true
-        accounting.bufferedFrame()
-        BufferedYuvWorkCreation.Accepted(
-            YuvPngWorkItem.buffered(frameIndex, timestampNs, copied, bytes, reservations, onRelease)
+    val releaseGuard = YuvImageReleaseGuard(access)
+    var timestampNs = 0L
+    var bytes = 0L
+    var reserved = false
+    var copied = false
+    try {
+        timestampNs = access.timestampNs()
+        bytes = access.allocationBytes()
+        if (!reservations.tryReserve(bytes)) {
+            accounting.droppedFrame()
+            return BufferedYuvWorkCreation.Rejected
+        }
+        reserved = true
+        val frame = access.copy(frameIndex)
+        copied = true
+        // bufferedFrame() accounting is bumped by [YuvBufferedLifecycle.tryRegister] once the
+        // item becomes a lifecycle-tracked RETAINED unit; we do not double-count here.
+        return BufferedYuvWorkCreation.Accepted(
+            YuvPngWorkItem.buffered(frameIndex, timestampNs, frame, bytes, reservations, onRelease)
         )
+    } catch (oom: OutOfMemoryError) {
+        throw oom
     } catch (t: Throwable) {
-        if (!released) runCatching { access.release() }
-        reservations.release(bytes)
         accounting.failedFrame()
-        BufferedYuvWorkCreation.Failed(t)
+        return BufferedYuvWorkCreation.Failed(t)
+    } finally {
+        // Exactly one release attempt regardless of which path we took.
+        releaseGuard.releaseSafely()
+        if (reserved && !copied) {
+            reservations.release(bytes)
+        }
     }
 }
 
@@ -210,6 +223,26 @@ internal class YuvPngWorkItem private constructor(
         /** Ownership-only seam for JVM tests; production Camera2 work always uses [direct]. */
         internal fun ownedForTest(onRelease: () -> Unit) =
             YuvPngWorkItem(-1, 0L, null, null, 0L, null, onRelease)
+
+        /**
+         * Buffered ownership seam for JVM tests; production buffered work always uses [buffered]
+         * with a real copied frame and reservations object.
+         */
+        internal fun bufferedForTest(
+            frameIndex: Int,
+            timestampNs: Long,
+            retainedBytes: Long,
+            reservations: YuvBufferReservations,
+            onRelease: (() -> Unit)? = null
+        ) = YuvPngWorkItem(
+            frameIndex,
+            timestampNs,
+            null,
+            BufferedYuvFrame(frameIndex, timestampNs, 1, 1, ByteArray(0), ByteArray(0), ByteArray(0), 1, 1, 1, 1, 1, 1),
+            retainedBytes,
+            reservations,
+            onRelease
+        )
     }
 }
 

@@ -39,7 +39,6 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 import kotlin.math.min
 
@@ -259,7 +258,10 @@ fun captureYuvBurstColorWithMotion(
     // wholesale; no callback/worker shares its counters or retained-byte value directly.
     val yuvAccounting = YuvCaptureAccounting()
     val yuvReservations = YuvBufferReservations(MAX_YUV_MEMORY_BUFFER_BYTES)
-    val retainedBufferedWork = ConcurrentHashMap.newKeySet<YuvPngWorkItem>()
+    // Single authoritative collection for buffered YUV work items. Replaces the prior
+    // bufferedFrames list + retainedBufferedWork set pair that allowed post-cleanup
+    // insertions and races between cleanup and the encoder.
+    val yuvBufferedLifecycle = YuvBufferedLifecycle()
     val frameIdentityOwner = CaptureFrameIdentityOwner(frameCount)
 
     fun captureFailureSnapshot(): YuvCaptureFailureSnapshot = YuvCaptureFailureSnapshot(
@@ -273,21 +275,28 @@ fun captureYuvBurstColorWithMotion(
 
     fun cleanup() {
         if (!cleanupStarted.compareAndSet(false, true)) return
+        // 1. Close owner/event acceptance so no further state mutation is enqueued.
         captureStateOwner.close()
+        // 2. Close buffered-work acceptance and drain safely retained work in one step.
+        val drainedBuffered = yuvBufferedLifecycle.closeAndDrainRetained()
+        // 3. Detach Camera2 callbacks.
         try { imageReader?.setOnImageAvailableListener(null, null) } catch (_: Exception) {}
         try { backgroundHandler.removeCallbacksAndMessages(null) } catch (_: Exception) {}
+        // 4. Camera session / device teardown.
         try { captureSession?.abortCaptures() } catch (_: Exception) {}
         try { captureSession?.stopRepeating() } catch (_: Exception) {}
         try { captureSession?.close() } catch (_: Exception) {}
         try { imageReader?.close() } catch (_: Exception) {}
         try { cameraDevice?.close() } catch (_: Exception) {}
         try { motionLogger?.stop() } catch (_: Exception) {}
+        // 5. Reject/dispose queued tasks. shutdownNow() invokes DisposableYuvTask.dispose()
+        //    on every queued task; the running task is not interrupted.
         timeoutScheduler.shutdownNow()
         yuvWorkQueue.shutdownNow()
-        retainedBufferedWork.forEach { it.dispose(yuvAccounting) }
-        retainedBufferedWork.clear()
-        // Do not block the camera owner or Main thread waiting for an encoder.  The worker
-        // releases its transferred item in finally; queued items are released by shutdownNow.
+        // 6. Dispose safely retained buffered work (lifecycle has already excluded ENCODING
+        //    items; the encoder still owns them and will dispose via settleEncoding).
+        drainedBuffered.forEach { it.dispose(yuvAccounting) }
+        // 7. Request worker/thread shutdown without blocking the Main thread or encoder.
         try { backgroundThread.quitSafely() } catch (_: Exception) {}
     }
 
@@ -539,9 +548,9 @@ fun captureYuvBurstColorWithMotion(
         )
 
         imageReader = reader
-        // This list is owned exclusively by the bounded YUV worker. The capture owner only
-        // observes persisted files through the owner callback below.
-        val bufferedFrames = mutableListOf<YuvPngWorkItem>()
+        // The YUV buffered lifecycle is the single authoritative collection for buffered
+        // work items; see [yuvBufferedLifecycle] for state transitions. The capture owner
+        // only observes persisted files through the owner callback below.
         val yuvWorkProcessor = YuvPngWorkProcessor(
             encoder = object : YuvPngEncoder {
                 override fun encodeDirect(image: Image, candidate: File, rotationDegrees: Int) {
@@ -629,22 +638,26 @@ fun captureYuvBurstColorWithMotion(
 
                     if (useMemoryBuffer) {
                         check(item.bufferedForEncoding() != null) { "Buffered YUV work lost its copied frame" }
-                        bufferedFrames.add(item)
-                        retainedBufferedWork.add(item)
+                        val registered = yuvBufferedLifecycle.tryRegister(item, yuvAccounting)
+                        if (!registered) {
+                            // Cleanup raced past registration; dispose the exact item.
+                            item.dispose(yuvAccounting)
+                            return@setOnImageAvailableListener
+                        }
                         val bufferedFrameCount = yuvAccounting.snapshot().bufferedFrames
                         postStatus("YUV buffered frame $bufferedFrameCount/$frameCount")
 
                         if (bufferedFrameCount >= frameCount) {
                             val savedMotionFiles = saveMotionOnce(currentBurstDir)
                             val finalLogger = motionLogger
-                            bufferedFrames.sortedBy { it.frameIndex }.forEachIndexed { flushIndex, frame ->
+                            val flushItems = yuvBufferedLifecycle.snapshotRetainedByFrameIndex()
+                            flushItems.forEachIndexed { flushIndex, frame ->
                                 if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
-                                    bufferedFrames.forEach {
-                                        retainedBufferedWork.remove(it)
-                                        it.dispose(yuvAccounting)
-                                    }
-                                    bufferedFrames.clear()
                                     return@setOnImageAvailableListener
+                                }
+                                if (!yuvBufferedLifecycle.beginEncoding(frame)) {
+                                    // Item was already drained by cleanup; skip.
+                                    return@forEachIndexed
                                 }
                                 val fileName =
                                     "frame_${frame.frameIndex.toString().padStart(2, '0')}_color.png"
@@ -652,29 +665,24 @@ fun captureYuvBurstColorWithMotion(
                                     currentBurstDir,
                                     ".${fileName}.${System.nanoTime()}.tmp"
                                 )
-                                yuvWorkProcessor.encode(frame, candidate, rotationDegrees)
-                                if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
-                                    if (candidate.exists() && !candidate.delete()) {
-                                        Log.e(YUV_CAPTURE_LOG_TAG, "Unable to delete late buffered YUV candidate ${candidate.absolutePath}")
+                                try {
+                                    yuvWorkProcessor.encode(frame, candidate, rotationDegrees)
+                                    if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+                                        if (candidate.exists() && !candidate.delete()) {
+                                            Log.e(YUV_CAPTURE_LOG_TAG, "Unable to delete late buffered YUV candidate ${candidate.absolutePath}")
+                                        }
+                                        return@forEachIndexed
                                     }
-                                    retainedBufferedWork.remove(frame)
-                                    frame.dispose(yuvAccounting)
-                                    bufferedFrames.filter { it !== frame }.forEach {
-                                        retainedBufferedWork.remove(it)
-                                        it.dispose(yuvAccounting)
+                                    yuvWorkProcessor.commit(candidate, File(currentBurstDir, fileName))
+                                    if (!yuvAccounting.persistedFrame(YuvFrameManifestEntry(frame.frameIndex, fileName, frame.timestampNs, true))) {
+                                        error("Duplicate YUV persisted identity or filename: $fileName")
                                     }
-                                    bufferedFrames.clear()
-                                    return@setOnImageAvailableListener
+                                    postStatus("YUV flushing frame ${flushIndex + 1}/${flushItems.size}")
+                                } finally {
+                                    // Final disposal runs exactly once even if cleanup races.
+                                    yuvBufferedLifecycle.settleEncoding(frame, yuvAccounting)
                                 }
-                                yuvWorkProcessor.commit(candidate, File(currentBurstDir, fileName))
-                                if (!yuvAccounting.persistedFrame(YuvFrameManifestEntry(frame.frameIndex, fileName, frame.timestampNs, true))) {
-                                    error("Duplicate YUV persisted identity or filename: $fileName")
-                                }
-                                retainedBufferedWork.remove(frame)
-                                frame.dispose(yuvAccounting)
-                                postStatus("YUV flushing frame ${flushIndex + 1}/${bufferedFrames.size}")
                             }
-                            bufferedFrames.clear()
                             if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
                                 return@setOnImageAvailableListener
                             }
@@ -865,11 +873,8 @@ fun captureYuvBurstColorWithMotion(
                         )
                     }
                 } catch (oom: OutOfMemoryError) {
-                    bufferedFrames.forEach {
-                        retainedBufferedWork.remove(it)
-                        it.dispose(yuvAccounting)
-                    }
-                    bufferedFrames.clear()
+                    val drained = yuvBufferedLifecycle.closeAndDrainRetained()
+                    drained.forEach { it.dispose(yuvAccounting) }
                     yuvAccounting.failedFrame()
                     finishError(
                         message = "YUV memory buffer failed while copying/flushing; job directory and completed source frames kept.",
@@ -888,7 +893,11 @@ fun captureYuvBurstColorWithMotion(
                         failureMessage = e.message ?: "Failed while saving YUV color frame"
                     )
                 } finally {
-                    if (!useMemoryBuffer || item !in bufferedFrames) item.dispose(yuvAccounting)
+                    // For direct items the worker owns disposal here. For buffered items the
+                    // lifecycle's settleEncoding (called in the flush finally above) has
+                    // already disposed; if the lifecycle never accepted this item the worker
+                    // disposes it directly so no resource leaks.
+                    if (!useMemoryBuffer) item.dispose(yuvAccounting)
                 }
             }
         reader.setOnImageAvailableListener(
