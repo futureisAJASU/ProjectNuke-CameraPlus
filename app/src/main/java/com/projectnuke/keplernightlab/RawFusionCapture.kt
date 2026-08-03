@@ -143,7 +143,7 @@ fun captureRawBurstForFusion(
     val thread = HandlerThread("KeplerRawFusionCaptureThread").apply { start() }
     val handler = Handler(thread.looper)
     val captureStateOwner = CaptureStateOwner(
-        dispatch = { event -> handler.post(event) }
+        dispatch = { event -> handler.post { event.execute() } }
     )
     val saveWorker = BoundedCaptureWorker("KeplerRawFusionSave", capacity = 2)
     val saveWorkerThread = ThreadLocal<Boolean>()
@@ -863,26 +863,29 @@ fun captureRawBurstForFusion(
             }
         }.also { timeoutScheduler.schedule({
             if (!terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) return@schedule
-            val settle = Runnable {
-                if (savedFrames >= requestedFrames) {
-                    finishSuccess(
-                        partial = false,
-                        reason = "all RAW frames persisted before timeout settlement",
-                        terminalAlreadyClaimed = true
-                    )
-                } else if (savedFrames >= MIN_RAW_FUSION_FRAMES) {
-                    finishSuccess(
-                        partial = true,
-                        reason = "saved $savedFrames/$requestedFrames frames; timeout; failedCaptures=$failedCaptures; droppedUnmatchedImages=$droppedUnmatchedImages",
-                        terminalAlreadyClaimed = true
-                    )
-                } else {
-                    finishError(
-                        "CAPTURE_TIMEOUT",
-                        "CAPTURE_TIMEOUT: RAW capture saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames, failed $failedCaptures, droppedUnmatchedImages=$droppedUnmatchedImages",
-                        terminalAlreadyClaimed = true
-                    )
+            val settle = object : CaptureOwnerEvent {
+                override fun execute() {
+                    if (savedFrames >= requestedFrames) {
+                        finishSuccess(
+                            partial = false,
+                            reason = "all RAW frames persisted before timeout settlement",
+                            terminalAlreadyClaimed = true
+                        )
+                    } else if (savedFrames >= MIN_RAW_FUSION_FRAMES) {
+                        finishSuccess(
+                            partial = true,
+                            reason = "saved $savedFrames/$requestedFrames frames; timeout; failedCaptures=$failedCaptures; droppedUnmatchedImages=$droppedUnmatchedImages",
+                            terminalAlreadyClaimed = true
+                        )
+                    } else {
+                        finishError(
+                            "CAPTURE_TIMEOUT",
+                            "CAPTURE_TIMEOUT: RAW capture saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames, failed $failedCaptures, droppedUnmatchedImages=$droppedUnmatchedImages",
+                            terminalAlreadyClaimed = true
+                        )
+                    }
                 }
+                override fun disposeWithoutMutation() {}
             }
             if (!captureStateOwner.post(settle)) {
                 Log.e(RAW_PIPELINE_LOG_TAG, "RAW owner handler rejected timeout settlement")

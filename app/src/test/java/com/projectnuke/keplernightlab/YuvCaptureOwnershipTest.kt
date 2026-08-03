@@ -442,7 +442,9 @@ class YuvCaptureOwnershipTest {
 
         assertTrue(result is DirectYuvWorkCreation.Accepted)
         assertEquals(0, accounting.snapshot().failedFrames)
-        assertEquals(0, fakeImage.closeCount.get())
+        // On success the access releases its wrapper once (ownership of the
+        // Image has transferred to the work item via takeImage).
+        assertEquals(1, fakeImage.closeCount.get())
         assertEquals(4321L, (result as DirectYuvWorkCreation.Accepted).item.timestampNs)
         // In JVM tests takeImage() returns null (no real android.media.Image), so the
         // work item's dispose is a no-op on the image.  The production path closes the

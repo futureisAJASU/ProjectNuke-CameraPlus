@@ -20,10 +20,6 @@ internal class CaptureTerminalState {
         state.compareAndSet(CaptureTerminalStatus.ACTIVE, next)
 }
 
-/**
- * Capture-owner-only frame identity allocator. It deliberately has no atomic or concurrent
- * collection semantics: callers must invoke it from their serialized capture owner.
- */
 internal class CaptureFrameIdentityOwner(private val requested: Int) {
     private var next = 0
 
@@ -35,21 +31,20 @@ internal class CaptureFrameIdentityOwner(private val requested: Int) {
     fun allocatedCount(): Int = next
 }
 
-/** Queue entries with owned resources must release them when rejected or removed by shutdownNow. */
 internal interface DisposableCaptureTask : Runnable {
     fun dispose()
 }
 
-/** A single-owner, bounded queue for capture work. */
 internal class BoundedCaptureWorker(
     name: String,
     capacity: Int,
     private val onRejected: (Runnable) -> Unit = {}
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
+    private val queue = ArrayBlockingQueue<Runnable>(capacity.coerceAtLeast(1))
     private val executor = ThreadPoolExecutor(
         1, 1, 0L, TimeUnit.MILLISECONDS,
-        ArrayBlockingQueue(capacity.coerceAtLeast(1)),
+        queue,
         { runnable -> Thread(runnable, name).apply { isDaemon = true } },
         ThreadPoolExecutor.AbortPolicy()
     )
@@ -78,7 +73,10 @@ internal class BoundedCaptureWorker(
         onRejected(task)
     }
 
-    /** Bounded observation only; callers must not treat this as cancellation. */
+    fun queuedCount(): Int = queue.size
+
+    fun activeCount(): Int = executor.activeCount
+
     fun awaitTermination(timeoutMs: Long): Boolean = try {
         executor.awaitTermination(timeoutMs.coerceAtLeast(0L), TimeUnit.MILLISECONDS)
     } catch (_: InterruptedException) {

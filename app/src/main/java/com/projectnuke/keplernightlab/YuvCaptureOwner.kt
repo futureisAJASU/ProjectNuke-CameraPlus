@@ -1,13 +1,8 @@
-package com.projectnuke.keplernightlab
+﻿package com.projectnuke.keplernightlab
 
-import android.media.Image
-import android.os.Handler
 import android.util.Log
 import java.io.File
-import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Immutable worker completion result.  The worker never mutates owner state; it only
@@ -35,21 +30,27 @@ internal sealed interface YuvWorkerCompletion {
 
 /**
  * A disposable task for buffered YUV encoding that settles the lifecycle item in its
- * finally block and posts the completion back to the owner.
+ * finally block and posts the completion back to the owner.  The owner schedules the
+ * next buffered item after adopting this task's completion ??the task itself never
+ * schedules the next frame.
  */
-internal class DisposableBufferedYuvTask(
+internal class BufferedEncodeTask(
     val item: YuvPngWorkItem,
     private val accounting: YuvCaptureAccounting,
     private val lifecycle: YuvBufferedLifecycle,
-    private val encode: () -> Unit
+    private val encode: () -> YuvWorkerCompletion,
+    private val postCompletion: (YuvWorkerCompletion) -> Unit
 ) : DisposableCaptureTask {
     @Volatile private var settled = false
 
     override fun run() {
-        try {
+        val completion = try {
             encode()
         } catch (t: Throwable) {
-            Log.e("KeplerYuvOwner", "Buffered encode threw", t)
+            YuvWorkerCompletion.Failed(item.frameIndex, item.timestampNs, null, t)
+        }
+        try {
+            postCompletion(completion)
         } finally {
             if (!settled) {
                 settled = true
@@ -63,7 +64,6 @@ internal class DisposableBufferedYuvTask(
             settled = true
             lifecycle.settleEncoding(item, accounting)
         }
-        settled = true
     }
 }
 
@@ -81,261 +81,208 @@ internal class DisposableBufferedYuvTask(
  *  ACTIVE -> SUCCESS | PARTIAL_SUCCESS | FAILED | TIMED_OUT | CANCELLED
  */
 internal class YuvCaptureOwner(
-    private val captureHandler: Handler,
-    private val frameCount: Int,
+    private val captureStateOwner: CaptureStateOwner,
     private val outputDir: File,
     private val rotationDegrees: Int,
+    private val frameCount: Int,
     private val workProcessor: YuvPngWorkProcessor,
     private val reservations: YuvBufferReservations,
     private val accounting: YuvCaptureAccounting,
     private val lifecycle: YuvBufferedLifecycle,
     private val identityOwner: CaptureFrameIdentityOwner,
     private val terminalState: CaptureTerminalState,
-    private val captureStateOwner: CaptureStateOwner,
     private val boundedWorker: BoundedCaptureWorker,
+    private val finished: AtomicBoolean,
     private val postStatus: (String) -> Unit,
     private val postMainOrRun: (Runnable) -> Unit,
     private val writeJobJson: (status: String, savedFrames: Int, manifest: List<YuvFrameManifestEntry>) -> Unit,
     private val saveMotionOnce: (File) -> Pair<String?, String?>,
-    private val motionLogger: MotionLogger?,
-    private val finished: AtomicBoolean,
     private val onCaptureComplete: (File) -> Unit,
     private val onCaptureError: (String) -> Unit
 ) {
 
     private var completedResults = 0
+    private var terminalReason: String? = null
+    private val discardedLateCompletions = mutableListOf<Int>()
     private val callbackFired = AtomicBoolean(false)
 
     // ------------------------------------------------------------------
-    // Camera2 callback entry points
+    // Typed Camera2 callback entry points (no unsafe casts)
     // ------------------------------------------------------------------
 
-    /**
-     * Accepts one frame from the ImageReader.  The caller passes an immutable event
-     * containing the acquired image access and useMemoryBuffer flag.  The owner processes
-     * it on its handler thread.  [emergencyDispose] is called only if the owner cannot
-     * accept the event (e.g. closed), and must release the image exactly once.
-     */
-    fun acceptImage(access: YuvImageAccess, useMemoryBuffer: Boolean, emergencyDispose: () -> Unit) {
-        val accepted = captureStateOwner.post {
-            onImageEnqueued(access, useMemoryBuffer, emergencyDispose)
+    fun acceptBuffered(access: YuvImageAccess) {
+        val event = object : CaptureOwnerEvent {
+            val guard = YuvImageReleaseGuard(access)
+            override fun execute() {
+                if (terminalState.status() != CaptureTerminalStatus.ACTIVE) { guard.releaseSafely(); return }
+                val frameIndex = identityOwner.nextIdentity()
+                if (frameIndex == null) { accounting.droppedFrame(); guard.releaseSafely(); return }
+                accounting.receivedFrame()
+                when (val c = createBufferedYuvWork(frameIndex, access, reservations, accounting)) {
+                    is BufferedYuvWorkCreation.Accepted -> {
+                        if (!lifecycle.tryRegister(c.item)) { c.item.dispose(accounting); return }
+                        postStatus("YUV buffered frame ${accounting.snapshot().bufferedFrames}/$frameCount")
+                        scheduleBufferedEncoding()
+                    }
+                    BufferedYuvWorkCreation.Rejected ->
+                        postStatus("YUV memory buffer dropped frame ${frameIndex + 1}/$frameCount: retained=${reservations.currentBytes()} bytes")
+                    is BufferedYuvWorkCreation.Failed -> {
+                        if (c.cause is Error) throw c.cause
+                        finishError("YUV memory buffer copy failed", cause = c.cause)
+                    }
+                }
+            }
+            override fun disposeWithoutMutation() = guard.releaseSafely()
         }
-        if (!accepted) {
-            emergencyDispose()
-        }
+        if (!captureStateOwner.post(event)) runCatching { access.release() }
     }
 
-    private fun onImageEnqueued(access: YuvImageAccess, useMemoryBuffer: Boolean, emergencyDispose: () -> Unit) {
-        if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
-            access.release()
-            return
+    fun acceptDirect(access: DirectYuvImageAccess) {
+        val event = object : CaptureOwnerEvent {
+            val guard = YuvImageReleaseGuard(access)
+            override fun execute() {
+                if (terminalState.status() != CaptureTerminalStatus.ACTIVE) { guard.releaseSafely(); return }
+                val frameIndex = identityOwner.nextIdentity()
+                if (frameIndex == null) { accounting.droppedFrame(); guard.releaseSafely(); return }
+                accounting.receivedFrame()
+                when (val creation = createDirectYuvWork(frameIndex, access, accounting)) {
+                    is DirectYuvWorkCreation.Accepted -> {
+                        val item = creation.item
+                        val fileName = "frame_${item.frameIndex.toString().padStart(2, '0')}_color.png"
+                        val candidate = File(outputDir, ".${fileName}.${System.nanoTime()}.tmp")
+                        val task = object : DisposableCaptureTask {
+                            override fun run() {
+                                val completion = try {
+                                    workProcessor.encode(item, candidate, rotationDegrees)
+                                    YuvWorkerCompletion.Success(item.frameIndex, item.timestampNs, candidate, fileName, 0L)
+                                } catch (t: Throwable) {
+                                    YuvWorkerCompletion.Failed(item.frameIndex, item.timestampNs, candidate, t)
+                                }
+                                try {
+                                    captureStateOwner.post(object : CaptureOwnerEvent {
+                                        override fun execute() { adoptCompletion(completion) }
+                                        override fun disposeWithoutMutation() {
+                                            if (completion is YuvWorkerCompletion.Success) runCatching { completion.candidate.delete() }
+                                        }
+                                    })
+                                } finally {
+                                    item.dispose()
+                                }
+                            }
+                            override fun dispose() = item.dispose()
+                        }
+                        if (!boundedWorker.submit(task)) {
+                            item.dispose(accounting); accounting.droppedFrame()
+                            postStatus("YUV direct backpressure: frame ${item.frameIndex + 1} dropped")
+                        }
+                    }
+                    is DirectYuvWorkCreation.Failed -> {
+                        if (creation.cause is Error) throw creation.cause
+                        finishError("YUV direct creation failed", cause = creation.cause)
+                    }
+                }
+            }
+            override fun disposeWithoutMutation() = guard.releaseSafely()
         }
-        val frameIndex = identityOwner.nextIdentity()
-        if (frameIndex == null) {
-            accounting.droppedFrame()
-            access.release()
-            return
-        }
-        accounting.receivedFrame()
-        if (useMemoryBuffer) {
-            processBufferedImage(access, frameIndex, emergencyDispose)
-        } else {
-            processDirectImage(access as DirectYuvImageAccess, frameIndex)
-        }
+        if (!captureStateOwner.post(event)) runCatching { access.release() }
     }
 
     fun onCaptureCompletedResult() {
-        completedResults++
+        captureStateOwner.post(object : CaptureOwnerEvent {
+            override fun execute() { completedResults++ }
+            override fun disposeWithoutMutation() {}
+        })
     }
 
     fun onCaptureFailed(cause: Throwable, detail: String) {
-        val posted = captureStateOwner.post {
-            finishError("Color Burst 캡처 실패: $detail", cause = cause)
-        }
-        if (!posted) {
-            Log.e("KeplerYuvOwner", "Owner handler rejected capture failure")
-        }
+        captureStateOwner.post(object : CaptureOwnerEvent {
+            override fun execute() { finishError("Color Burst 罹≪쿂 ?ㅽ뙣: $detail", cause = cause) }
+            override fun disposeWithoutMutation() {}
+        })
     }
 
     // ------------------------------------------------------------------
-    // Image processing (runs on owner handler thread)
-    // ------------------------------------------------------------------
-
-    private fun processBufferedImage(
-        access: YuvImageAccess,
-        frameIndex: Int,
-        emergencyDispose: () -> Unit
-    ) {
-        when (val creation = createBufferedYuvWork(
-            frameIndex = frameIndex,
-            access = access,
-            reservations = reservations,
-            accounting = accounting
-        )) {
-            is BufferedYuvWorkCreation.Accepted -> {
-                val item = creation.item
-                val registered = lifecycle.tryRegister(item)
-                if (!registered) {
-                    item.dispose(accounting)
-                    emergencyDispose()
-                    return
-                }
-                val bufferedCount = accounting.snapshot().bufferedFrames
-                postStatus("YUV buffered frame $bufferedCount/$frameCount")
-                scheduleBufferedEncoding()
-            }
-            BufferedYuvWorkCreation.Rejected -> {
-                postStatus("YUV memory buffer dropped frame ${frameIndex + 1}/$frameCount: retained=${reservations.currentBytes()} bytes")
-                emergencyDispose()
-            }
-            is BufferedYuvWorkCreation.Failed -> {
-                if (creation.cause is Error) throw creation.cause
-                finishError("YUV memory buffer copy failed", cause = creation.cause)
-            }
-        }
-    }
-
-    private fun processDirectImage(access: DirectYuvImageAccess, frameIndex: Int) {
-        when (val creation = createDirectYuvWork(
-            frameIndex = frameIndex,
-            access = access,
-            account = accounting
-        )) {
-            is DirectYuvWorkCreation.Accepted -> {
-                val task = DisposableYuvTask(
-                    creation.item,
-                    accounting,
-                    {
-                        try {
-                            processDirectCompletion(creation.item)
-                        } finally {
-                            creation.item.dispose(accounting)
-                        }
-                    }
-                )
-                if (!boundedWorker.submit(task)) {
-                    accounting.droppedFrame()
-                    postStatus("YUV capture backpressure: frame ${creation.item.frameIndex + 1} dropped")
-                }
-            }
-            is DirectYuvWorkCreation.Failed -> {
-                if (creation.cause is Error) throw creation.cause
-                finishError("YUV direct image creation failed", cause = creation.cause)
-            }
-        }
-    }
-
-    private fun processDirectCompletion(item: YuvPngWorkItem) {
-        val startTime = System.nanoTime()
-        val fileName = "frame_${item.frameIndex.toString().padStart(2, '0')}_color.png"
-        val candidate = File(outputDir, ".${fileName}.${System.nanoTime()}.tmp")
-        val completion = try {
-            workProcessor.encode(item, candidate, rotationDegrees)
-            YuvWorkerCompletion.Success(
-                frameIndex = item.frameIndex,
-                timestampNs = item.timestampNs,
-                candidate = candidate,
-                fileName = fileName,
-                encodeDurationMs = (System.nanoTime() - startTime) / 1_000_000
-            )
-        } catch (t: Throwable) {
-            YuvWorkerCompletion.Failed(item.frameIndex, item.timestampNs, candidate, t)
-        }
-        postCompletion(completion)
-    }
-
-    // ------------------------------------------------------------------
-    // Buffered encoding scheduling
-    // One-at-a-time design: when enough frames are buffered, schedule the next
-    // retained frame after the previous completion returns.
+    // Buffered encoding scheduling (owner-controlled)
     // ------------------------------------------------------------------
 
     private fun scheduleBufferedEncoding() {
-        val flushItems = lifecycle.snapshotRetainedByFrameIndex()
-        if (flushItems.isEmpty()) return
-
-        val frame = flushItems.first()
+        val frame = lifecycle.snapshotRetainedByFrameIndex().firstOrNull() ?: return
         if (!lifecycle.beginEncoding(frame)) return
 
         val fileName = "frame_${frame.frameIndex.toString().padStart(2, '0')}_color.png"
         val candidate = File(outputDir, ".${fileName}.${System.nanoTime()}.tmp")
-        val task = DisposableBufferedYuvTask(
+        val task = BufferedEncodeTask(
             item = frame,
             accounting = accounting,
             lifecycle = lifecycle,
             encode = {
-                val completion = try {
+                try {
                     workProcessor.encode(frame, candidate, rotationDegrees)
-                    YuvWorkerCompletion.Success(
-                        frameIndex = frame.frameIndex,
-                        timestampNs = frame.timestampNs,
-                        candidate = candidate,
-                        fileName = fileName,
-                        encodeDurationMs = 0L
-                    )
+                    YuvWorkerCompletion.Success(frame.frameIndex, frame.timestampNs, candidate, fileName, 0L)
                 } catch (t: Throwable) {
                     YuvWorkerCompletion.Failed(frame.frameIndex, frame.timestampNs, candidate, t)
                 }
-                postCompletion(completion)
-                scheduleBufferedEncoding()
+            },
+            postCompletion = { completion ->
+                captureStateOwner.post(object : CaptureOwnerEvent {
+                    override fun execute() { adoptCompletion(completion) }
+                    override fun disposeWithoutMutation() {
+                        if (completion is YuvWorkerCompletion.Success) runCatching { completion.candidate.delete() }
+                    }
+                })
             }
         )
         if (!boundedWorker.submit(task)) {
             lifecycle.settleEncoding(frame, accounting)
+            accounting.droppedFrame()
             postStatus("YUV backpressure: buffered frame ${frame.frameIndex + 1} dropped")
         }
     }
 
     // ------------------------------------------------------------------
     // Owner-side atomic adoption
-    // Posted back to the owner thread so the ACTIVE check, candidate commit,
-    // manifest append, and persisted accounting are all one serialized decision.
     // ------------------------------------------------------------------
-
-    private fun postCompletion(completion: YuvWorkerCompletion) {
-        val posted = captureStateOwner.post {
-            adoptCompletion(completion)
-        }
-        if (!posted) {
-            when (completion) {
-                is YuvWorkerCompletion.Success -> runCarring { completion.candidate.delete() }
-                is YuvWorkerCompletion.Failed -> {}
-            }
-        }
-    }
 
     private fun adoptCompletion(completion: YuvWorkerCompletion) {
         when (completion) {
             is YuvWorkerCompletion.Success -> adoptSuccess(completion)
             is YuvWorkerCompletion.Failed -> {
                 Log.e("KeplerYuvOwner", "YUV worker failed for frame ${completion.frameIndex}", completion.cause)
-                accounting.failedFrame()
+                completion.candidate?.let { runCatching { it.delete() } }
+                if (terminalState.status() == CaptureTerminalStatus.ACTIVE) accounting.failedFrame()
             }
         }
         checkTerminal()
+        scheduleBufferedEncoding()
     }
 
     private fun adoptSuccess(completion: YuvWorkerCompletion.Success) {
         if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
-            runCarring { completion.candidate.delete() }
+            discardedLateCompletions += completion.frameIndex
+            runCatching { completion.candidate.delete() }
             return
         }
         val finalFile = File(outputDir, completion.fileName)
-        workProcessor.commit(completion.candidate, finalFile)
-        val entry = YuvFrameManifestEntry(
-            frameIndex = completion.frameIndex,
-            filename = completion.fileName,
-            timestampNs = completion.timestampNs,
-            persisted = true
-        )
+        try {
+            workProcessor.commit(completion.candidate, finalFile)
+        } catch (t: Throwable) {
+            Log.e("KeplerYuvOwner", "Commit failed for frame ${completion.frameIndex}", t)
+            completion.candidate.let { runCatching { it.delete() } }
+            finishError("YUV commit failed for frame ${completion.frameIndex}", cause = t)
+            return
+        }
+        if (!finalFile.exists() || !finalFile.canRead()) {
+            Log.w("KeplerYuvOwner", "Final file not readable after commit ${completion.frameIndex}")
+            accounting.failedFrame()
+            return
+        }
+        val entry = YuvFrameManifestEntry(completion.frameIndex, completion.fileName, completion.timestampNs, true)
         if (!accounting.persistedFrame(entry)) {
-            Log.w("KeplerYuvOwner", "Duplicate YUV persisted identity or filename: ${completion.fileName}")
+            Log.w("KeplerYuvOwner", "Duplicate persisted identity or filename: ${completion.fileName}")
         }
         val persistedFrames = accounting.snapshot().persistedFrames
         postStatus("YUV capture: saved $persistedFrames/$frameCount")
-        val snap = accounting.snapshot()
-        val motionFiles = saveMotionOnce(outputDir)
-        writeJobJson("CAPTURING", persistedFrames, snap.manifest)
+        writeJobJson("CAPTURING", persistedFrames, accounting.snapshot().manifest)
     }
 
     // ------------------------------------------------------------------
@@ -350,65 +297,99 @@ internal class YuvCaptureOwner(
     }
 
     fun onDeadlineReached() {
-        val posted = captureStateOwner.post {
-            val snap = accounting.snapshot()
-            if (snap.persistedFrames >= frameCount) {
-                finishSuccess(terminalAlreadyClaimed = true)
-            } else {
-                finishError(
-                    "YUV capture timeout: saved=${snap.persistedFrames}/$frameCount",
-                    source = "YuvCaptureOwner.timeout",
-                    failureType = "CaptureTimeout"
-                )
+        val event = object : CaptureOwnerEvent {
+            override fun execute() {
+                if (!terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) return
+                val snap = accounting.snapshot()
+                when {
+                    snap.persistedFrames >= frameCount -> finishSuccessFromDeadline()
+                    snap.persistedFrames > 0 -> finishPartialFromDeadline(snap)
+                    else -> finishTimeout(snap)
+                }
             }
+            override fun disposeWithoutMutation() {}
         }
-        if (!posted) {
-            Log.e("KeplerYuvOwner", "Owner handler rejected deadline settlement")
+        if (!captureStateOwner.post(event)) {
+            Log.e("KeplerYuvOwner", "Deadline settlement rejected")
             finished.set(true)
             cleanup()
         }
     }
 
     fun onCancellationRequested() {
-        val posted = captureStateOwner.post {
-            if (terminalState.claim(CaptureTerminalStatus.CANCELLED)) {
-                finishCancel()
+        val event = object : CaptureOwnerEvent {
+            override fun execute() {
+                if (terminalState.claim(CaptureTerminalStatus.CANCELLED)) finishCancel()
             }
+            override fun disposeWithoutMutation() {}
         }
-        if (!posted) {
-            Log.e("KeplerYuvOwner", "Owner handler rejected cancellation")
+        if (!captureStateOwner.post(event)) {
+            Log.e("KeplerYuvOwner", "Cancellation rejected")
             finished.set(true)
             cleanup()
         }
     }
 
     // ------------------------------------------------------------------
-    // Terminal settlement — only the owner writes metadata and decides callbacks
+    // Terminal settlement ??only the owner writes metadata and decides callbacks
     // ------------------------------------------------------------------
 
-    private fun finishSuccess(terminalAlreadyClaimed: Boolean = false) {
-        if (!terminalAlreadyClaimed && !terminalState.claim(CaptureTerminalStatus.SUCCESS)) return
+    private fun finishSuccess() {
+        if (!terminalState.claim(CaptureTerminalStatus.SUCCESS)) return
+        terminalReason = "All $frameCount frames persisted"
         if (!callbackFired.compareAndSet(false, true)) return
         finished.set(true)
         val snap = accounting.snapshot()
-        val motionFiles = saveMotionOnce(outputDir)
+        saveMotionOnce(outputDir)
         writeJobJson("CAPTURE_COMPLETE", snap.persistedFrames, snap.manifest)
-        postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
+        postStatus("CAPTURE_COMPLETE: 罹≪쿂媛 ?꾨즺?섏뿀?듬땲??")
         cleanup()
         postMainOrRun { onCaptureComplete(outputDir) }
     }
 
+    private fun finishSuccessFromDeadline() {
+        if (!callbackFired.compareAndSet(false, true)) return
+        finished.set(true)
+        val snap = accounting.snapshot()
+        saveMotionOnce(outputDir)
+        writeJobJson("CAPTURE_COMPLETE", snap.persistedFrames, snap.manifest)
+        postStatus("CAPTURE_COMPLETE")
+        cleanup()
+        postMainOrRun { onCaptureComplete(outputDir) }
+    }
+
+    private fun finishPartialFromDeadline(snap: YuvCaptureAccountingSnapshot) {
+        terminalReason = "Timed out with ${snap.persistedFrames}/$frameCount persisted"
+        if (!callbackFired.compareAndSet(false, true)) return
+        finished.set(true)
+        saveMotionOnce(outputDir)
+        writeJobJson("CAPTURE_COMPLETE", snap.persistedFrames, snap.manifest)
+        postStatus("Captured partial success")
+        cleanup()
+        postMainOrRun { onCaptureComplete(outputDir) }
+    }
+
+    private fun finishTimeout(snap: YuvCaptureAccountingSnapshot) {
+        terminalReason = "YUV timeout: saved=${snap.persistedFrames}/$frameCount"
+        if (!callbackFired.compareAndSet(false, true)) return
+        finished.set(true)
+        Log.e("KeplerYuvOwner", terminalReason ?: "YUV timeout")
+        writeJobJson("CAPTURE_TIMEOUT", snap.persistedFrames, snap.manifest)
+        postStatus(terminalReason!!)
+        cleanup()
+        postMainOrRun { onCaptureError(terminalReason!!) }
+    }
+
     private fun finishError(
         message: String,
-        source: String = "YuvCaptureOwner",
         cause: Throwable? = null,
-        failureType: String? = null,
         terminalAlreadyClaimed: Boolean = false
     ) {
         if (!terminalAlreadyClaimed && !terminalState.claim(CaptureTerminalStatus.FAILED)) return
+        terminalReason = message
         if (!callbackFired.compareAndSet(false, true)) return
         finished.set(true)
-        Log.e("KeplerYuvOwner", "$source: $message", cause)
+        Log.e("KeplerYuvOwner", message, cause)
         val snap = accounting.snapshot()
         writeJobJson("CAPTURE_FAILED", snap.persistedFrames, snap.manifest)
         postStatus(message)
@@ -417,6 +398,7 @@ internal class YuvCaptureOwner(
     }
 
     private fun finishCancel() {
+        terminalReason = "Cancelled"
         if (!callbackFired.compareAndSet(false, true)) return
         finished.set(true)
         val snap = accounting.snapshot()
@@ -435,7 +417,6 @@ internal class YuvCaptureOwner(
         val drained = lifecycle.closeAndDrainRetained()
         drained.forEach { it.dispose(accounting) }
         boundedWorker.shutdownNow()
-        try { captureHandler.looper.quitSafely() } catch (_: Exception) {}
     }
 
     // ------------------------------------------------------------------
@@ -452,11 +433,11 @@ internal class YuvCaptureOwner(
             droppedFrames = snap.droppedFrames,
             manifest = snap.manifest,
             completedResults = completedResults,
-            queuedWork = 0,
-            inFlightWork = 0,
+            queuedWork = boundedWorker.queuedCount(),
+            inFlightWork = boundedWorker.activeCount(),
             terminalStatus = terminalState.status(),
-            terminalReason = null,
-            discardedLateCompletions = emptyList<Int>()
+            terminalReason = terminalReason,
+            discardedLateCompletions = discardedLateCompletions.toList()
         )
     }
 
@@ -476,4 +457,115 @@ internal class YuvCaptureOwner(
     )
 }
 
-private fun <T> runCarring(block: () -> T) { try { block() } catch (_: Exception) {} }
+/**
+ * Production session seam for the YUV color-burst capture pipeline.  Owns the
+ * shared state of one capture (dispatch owner, bounded encoder worker, finished
+ * flag, terminal state, accounting, lifecycle, reservation, identity owner,
+ * and the authoritative [YuvCaptureOwner]) and provides a single close path.
+ *
+ * Construction does NOT start the camera session; the caller wires the
+ * returned components into Camera2 (ImageReader listeners, capture callbacks)
+ * and the timeout scheduler / cancellation handle, then calls
+ * [YuvCaptureOwner.onDeadlineReached] or [YuvCaptureOwner.onCancellationRequested]
+ * from those producers as the only legal way to settle the terminal state.
+ *
+ * Components exposed for the production caller:
+ *  - [captureStateOwner]      : post deadline/cancellation through this.
+ *  - [boundedWorker]          : encoder worker; managed by [close].
+ *  - [finished]               : idempotent flag for late camera callbacks.
+ *  - [terminalState]          : readable terminal status (claim is owner-only).
+ *  - [accounting], [lifecycle], [reservations], [identityOwner]
+ *                              : shared inspection access (mutation is owner-only).
+ *  - [owner]                  : the only legal entry point for ImageReader callbacks
+ *                              and capture-result/failure callbacks.
+ */
+internal class YuvCaptureSession internal constructor(
+    val captureStateOwner: CaptureStateOwner,
+    val boundedWorker: BoundedCaptureWorker,
+    val finished: AtomicBoolean,
+    val terminalState: CaptureTerminalState,
+    val accounting: YuvCaptureAccounting,
+    val lifecycle: YuvBufferedLifecycle,
+    val reservations: YuvBufferReservations,
+    val identityOwner: CaptureFrameIdentityOwner,
+    val owner: YuvCaptureOwner
+) : AutoCloseable {
+    override fun close() {
+        captureStateOwner.close()
+        boundedWorker.shutdownNow()
+    }
+
+    /**
+     * Terminal snapshot at the moment of inspection.  Useful for late camera
+     * callbacks deciding whether to drop a frame.
+     */
+    fun terminalSnapshot(): YuvCaptureOwner.TerminalSnapshot = owner.terminalSnapshot()
+
+    companion object {
+        /**
+         * Build a new capture session.  The factory creates and wires together
+         * the dispatch owner, the bounded encoder worker, the finished flag,
+         * the supporting state (terminalState, accounting, lifecycle,
+         * reservations, identity owner), and the authoritative
+         * [YuvCaptureOwner].  No background work starts until the caller
+         * routes Camera2 / timeout / cancellation events into [owner] or
+         * [captureStateOwner].
+         */
+        fun create(
+            dispatch: (CaptureOwnerEvent) -> Boolean,
+            outputDir: File,
+            frameCount: Int,
+            rotationDegrees: Int,
+            workerCapacity: Int,
+            maxRetainedBytes: Long,
+            workerName: String = "YuvCapture-$frameCount",
+            workProcessor: YuvPngWorkProcessor,
+            postStatus: (String) -> Unit = {},
+            postMainOrRun: (Runnable) -> Unit = {},
+            writeJobJson: (status: String, savedFrames: Int, manifest: List<YuvFrameManifestEntry>) -> Unit = { _, _, _ -> },
+            saveMotionOnce: (File) -> Pair<String?, String?> = { _ -> null to null },
+            onCaptureComplete: (File) -> Unit = {},
+            onCaptureError: (String) -> Unit = {}
+        ): YuvCaptureSession {
+            val captureStateOwner = CaptureStateOwner(dispatch)
+            val boundedWorker = BoundedCaptureWorker(workerName, workerCapacity)
+            val finished = AtomicBoolean(false)
+            val reservations = YuvBufferReservations(maxRetainedBytes)
+            val accounting = YuvCaptureAccounting()
+            val lifecycle = YuvBufferedLifecycle()
+            val identityOwner = CaptureFrameIdentityOwner(frameCount)
+            val terminalState = CaptureTerminalState()
+            val owner = YuvCaptureOwner(
+                captureStateOwner = captureStateOwner,
+                outputDir = outputDir,
+                rotationDegrees = rotationDegrees,
+                frameCount = frameCount,
+                workProcessor = workProcessor,
+                reservations = reservations,
+                accounting = accounting,
+                lifecycle = lifecycle,
+                identityOwner = identityOwner,
+                terminalState = terminalState,
+                boundedWorker = boundedWorker,
+                finished = finished,
+                postStatus = postStatus,
+                postMainOrRun = postMainOrRun,
+                writeJobJson = writeJobJson,
+                saveMotionOnce = saveMotionOnce,
+                onCaptureComplete = onCaptureComplete,
+                onCaptureError = onCaptureError
+            )
+            return YuvCaptureSession(
+                captureStateOwner,
+                boundedWorker,
+                finished,
+                terminalState,
+                accounting,
+                lifecycle,
+                reservations,
+                identityOwner,
+                owner
+            )
+        }
+    }
+}

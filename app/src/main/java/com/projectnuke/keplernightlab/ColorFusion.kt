@@ -229,7 +229,7 @@ fun captureYuvBurstColorWithMotion(
     val backgroundThread = HandlerThread("KeplerColorBurstThread").apply { start() }
     val backgroundHandler = Handler(backgroundThread.looper)
     val captureStateOwner = CaptureStateOwner(
-        dispatch = { event -> backgroundHandler.post(event) }
+        dispatch = { event -> backgroundHandler.post { event.execute() } }
     )
     val yuvWorkQueue = BoundedCaptureWorker(
         "KeplerColorBurstWorker",
@@ -1115,22 +1115,25 @@ fun captureYuvBurstColorWithMotion(
                                         timeoutScheduler.schedule({
                                             if (!terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) return@schedule
                                             val timeoutSnapshot = yuvAccounting.snapshot()
-                                            val settle = Runnable {
-                                                if (timeoutSnapshot.persistedFrames >= frameCount) {
-                                                    finishSuccess(
-                                                        currentBurstDir,
-                                                        "YUV capture completed before timeout settlement",
-                                                        terminalAlreadyClaimed = true
-                                                    )
-                                                } else {
-                                                    finishError(
-                                                        message = "YUV capture timeout: saved=${timeoutSnapshot.persistedFrames}/$frameCount, receivedImages=${timeoutSnapshot.receivedFrames}, completedResults=$completedResults, failedCaptures=${timeoutSnapshot.failedFrames}",
-                                                        source = "captureYuvBurstColorWithMotion.captureRequest.timeout",
-                                                        failureType = "CaptureTimeout",
-                                                        failureMessage = "No enough YUV frames before timeout",
-                                                        terminalAlreadyClaimed = true
-                                                    )
+                                            val settle = object : CaptureOwnerEvent {
+                                                override fun execute() {
+                                                    if (timeoutSnapshot.persistedFrames >= frameCount) {
+                                                        finishSuccess(
+                                                            currentBurstDir,
+                                                            "YUV capture completed before timeout settlement",
+                                                            terminalAlreadyClaimed = true
+                                                        )
+                                                    } else {
+                                                        finishError(
+                                                            message = "YUV capture timeout: saved=${timeoutSnapshot.persistedFrames}/$frameCount, receivedImages=${timeoutSnapshot.receivedFrames}, completedResults=$completedResults, failedCaptures=${timeoutSnapshot.failedFrames}",
+                                                            source = "captureYuvBurstColorWithMotion.captureRequest.timeout",
+                                                            failureType = "CaptureTimeout",
+                                                            failureMessage = "No enough YUV frames before timeout",
+                                                            terminalAlreadyClaimed = true
+                                                        )
+                                                    }
                                                 }
+                                                override fun disposeWithoutMutation() {}
                                             }
                                             if (!captureStateOwner.post(settle)) {
                                                 // The owner looper is gone. Preserve the claimed terminal

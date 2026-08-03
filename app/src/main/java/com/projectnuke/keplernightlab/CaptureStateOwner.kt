@@ -4,134 +4,149 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Minimal serial-owner boundary shared by Camera2 capture implementations.
+ * Resource-aware event envelope.  Every accepted event owns its exact resources and commits
+ * to exactly one settlement path: [execute] (owner-open path) or [disposeWithoutMutation]
+ * (emergency / close path).  No event both executes and disposes.
+ */
+internal interface CaptureOwnerEvent {
+    fun execute()
+    fun disposeWithoutMutation()
+}
+
+/**
+ * Single serial-owner boundary shared by Camera2 capture implementations.
  *
- * Camera callbacks and workers may submit immutable events only.  The supplied dispatcher is
- * the single place where state mutation is allowed.  A rejected event is not executed on the
- * producer thread: the optional emergency action is intentionally limited to resource disposal.
+ * Camera callbacks and workers submit immutable [CaptureOwnerEvent] values only.
+ * The supplied dispatcher is the single place where state mutation is allowed.
  *
- * Every submitted event reaches exactly one settlement: it executes exactly once under a valid
- * owner, or it is emergency-disposed exactly once without executing its state mutation.  An
- * accepted-but-not-yet-run event cannot mutate state after the owner has been closed.
+ * Every submitted event reaches exactly one settlement:
+ *  - PENDING events are transitioned to DISPOSED by [close] and their
+ *    [CaptureOwnerEvent.disposeWithoutMutation] is called (no state mutation).
+ *  - An event that transitions PENDING -> RUNNING in [EventEnvelope.execute]
+ *    either runs [CaptureOwnerEvent.execute] (owner still OPEN) or calls
+ *    [CaptureOwnerEvent.disposeWithoutMutation] (owner CLOSED by the time the
+ *    dispatcher picks it up).  No event both executes and disposes.
  *
- * Settlement atomicity (fixes Phase 1B check-then-run race):
- *  - An accepted event transitions PENDING -> RUNNING when the dispatcher invokes it, then
- *    RUNNING -> EXECUTED if the owner is still open.  The RUNNING transition is atomic with
- *    the decision to execute, so `close()` racing with a not-yet-started event yields either:
- *      * event execution under a valid owner, or
- *      * emergency disposal (if close won the race).
- *  - If `close()` wins the race after RUNNING but before EXECUTED, the event is emergency-
- *    disposed instead of executing its mutation (no double-settlement; no silent loss).
- *  - Executed events are removed from pending tracking at the moment they settle, so they do
- *    not linger until capture cleanup.
- *  - Repeated `close()` calls are idempotent.
- *  - Emergency disposal never runs normal capture-state mutation.
+ * Envelope state machine:
  *
- * Documented rule for an event already executing before close: an event that reached RUNNING
- * and then EXECUTED has fully completed its mutation atomically before `close()` observes
- * CLOSED; an event in RUNNING that has not yet reached EXECUTED when `close()` runs is
- * emergency-disposed — it never begins normal state mutation after close returns.
+ *     post ──> PENDING ──(close)──> DISPOSED   (disposed)
+ *                ||                        |
+ *                || (execute)              |
+ *                \/                        |
+ *             RUNNING --(close race)--> DISPOSED
+ *                ||    (dispatch runs
+ *                ||     after CLOSED)
+ *                ↓
+ *             COMPLETED
+ *             (execute ran)
+ *
+ * The PENDING -> RUNNING transition is atomic via CAS inside [EventEnvelope.execute].
+ * close() only disposes PENDING envelope; RUNNING envelopes already committed to
+ * `processReady` continue but will observe a closed order and dispose without mutation.
+ *
+ * Requirements satisfied:
+ *  - Not-yet-started event may not begin after close() returns.
+ *  - close() racing event start yields exactly one result:
+ *    event was marked RUNNING before close → may finish normal execute path
+ *    event was not RUNNING → disposed and never starts.
+ *  - Running events are gated inside processReady; close does NOT block for them.
+ *  - Completed envelopes are removed from tracking.
+ *  - No event both executes and disposes (CAS guarantee).
+ *  - No event is silently lost.
+ *  - Repeated close is idempotent.
+ *  - Resource-aware: every accepted event owns its exact resources; dispose
+ *    disposes exactly those resources and never runs state mutation.
  */
 internal class CaptureStateOwner(
-    private val dispatch: (Runnable) -> Boolean,
-    private val emergencyDispose: (Runnable) -> Unit = {},
+    private val dispatch: (CaptureOwnerEvent) -> Boolean,
     private val onExecutionBoundary: (() -> Unit)? = null
 ) {
-    private enum class EventState { PENDING, RUNNING, EXECUTED, DISPOSED }
+    private enum class EventState { PENDING, RUNNING, COMPLETED, DISPOSED }
+    private enum class OwnerState { OPEN, CLOSED }
 
     private class EventEnvelope(
         private val owner: CaptureStateOwner,
-        private val event: Runnable,
-        private val emergencyDispose: (Runnable) -> Unit
-    ) : Runnable {
+        private val event: CaptureOwnerEvent
+    ) : CaptureOwnerEvent {
         private val state = AtomicReference(EventState.PENDING)
 
         /**
-         * Invoked by the dispatcher.  Atomically claims RUNNING via CAS; the caller-side
-         * `close()` cannot produce an EXECUTED transition after CLOSED is set because
-         * [EventState.RUNNING] -> [EventState.EXECUTED] is gated on `owner.canExecute()`.
+         * Called by the dispatcher thread to start the envelope.  Atomically claims
+         * RUNNING; the CAS itself acts as the start gate — if close() already drained
+         * this envelope, the CAS fails and the execute() body is never entered.
          */
-        override fun run() {
-            if (!state.compareAndSet(EventState.PENDING, EventState.RUNNING)) return
-            owner.processReady(this)
-        }
-
-        /** Settles the event under the owner's authority. */
-        internal fun settle(): Boolean {
-            return if (state.compareAndSet(EventState.RUNNING, EventState.EXECUTED)) {
-                event.run()
-                true
-            } else {
-                false
+        override fun execute() {
+            if (state.compareAndSet(EventState.PENDING, EventState.RUNNING)) {
+                owner.processReady(this)
             }
         }
 
-        internal fun emergencyDispose(): Boolean {
-            // PENDING -> DISPOSED (not yet running) OR RUNNING -> DISPOSED (close won the race)
-            return state.compareAndSet(EventState.PENDING, EventState.DISPOSED) ||
-                state.compareAndSet(EventState.RUNNING, EventState.DISPOSED)
+        override fun disposeWithoutMutation() {
+            // close() drains PENDING envelopes; the boundary hook drains RUNNING
+            // envelopes that paused before the owner-open check.
+            if (state.compareAndSet(EventState.PENDING, EventState.DISPOSED) ||
+                state.compareAndSet(EventState.RUNNING, EventState.DISPOSED)) {
+                owner.removeEnvelope(this)
+                event.disposeWithoutMutation()
+            }
         }
 
-        internal fun eventForDisposal(): Runnable = event
+        /**
+         * Settles the envelope under a valid open owner.  Must only be called
+         * after processReady confirmed the owner is still OPEN.
+         */
+        internal fun settle() {
+            if (state.compareAndSet(EventState.RUNNING, EventState.COMPLETED)) {
+                owner.removeEnvelope(this)
+                event.execute()
+            }
+        }
 
         internal fun stateForTest(): EventState = state.get()
     }
 
-    /** Owner-side close flag.  Once CLOSED, no event may reach EXECUTED. */
     private val ownerState = AtomicReference(OwnerState.OPEN)
-
-    private enum class OwnerState { OPEN, CLOSED }
-
-    /**
-     * Tracks envelopes that have been accepted for dispatch but have not yet settled
-     * (either executed or disposed).  An envelope is removed at the exact moment it settles,
-     * so there is never lingering retention of executed events.
-     */
     private val pendingEnvelopes = ConcurrentHashMap.newKeySet<EventEnvelope>()
 
+    private fun removeEnvelope(envelope: EventEnvelope) {
+        pendingEnvelopes.remove(envelope)
+    }
+
     /**
-     * Called by an envelope's [EventEnvelope.run] after it has atomically claimed RUNNING.
-     * Decides between execution and emergency disposal based on the owner's close state
-     * without a separate check-then-run window.
+     * Called by [EventEnvelope.execute] after it has atomically claimed RUNNING.
+     * The onExecutionBoundary hook is invoked for test determinism; the owner-open
+     * check occurs after the boundary returns so a paused hook can still race with
+     * close().
      */
     private fun processReady(envelope: EventEnvelope) {
         onExecutionBoundary?.invoke()
-        pendingEnvelopes.remove(envelope)
-        if (canExecute()) {
-            // Owner is still open: execute the event's mutation.  The CAS inside settle()
-            // guarantees this is the only transition to EXECUTED.
+        if (ownerState.get() == OwnerState.OPEN) {
             envelope.settle()
         } else {
-            // Owner has closed between the envelope's PENDING->RUNNING CAS and now.
-            // Emergency-dispose only if we win the state transition (close() may have
-            // already disposed this envelope).  No event is disposed twice.
-            if (envelope.emergencyDispose()) {
-                emergencyDispose(envelope.eventForDisposal())
-            }
+            envelope.disposeWithoutMutation()
         }
     }
 
-    fun post(event: Runnable): Boolean {
+    fun post(event: CaptureOwnerEvent): Boolean {
         if (ownerState.get() == OwnerState.CLOSED) {
-            emergencyDispose(event)
+            event.disposeWithoutMutation()
             return false
         }
-        val envelope = EventEnvelope(this, event, emergencyDispose)
+        val envelope = EventEnvelope(this, event)
         pendingEnvelopes.add(envelope)
         if (ownerState.get() == OwnerState.CLOSED) {
-            // Owner closed between dispatch preparation and offer.
             pendingEnvelopes.remove(envelope)
-            if (envelope.emergencyDispose()) emergencyDispose(event)
+            envelope.disposeWithoutMutation()
             return false
         }
         val accepted = try {
             dispatch(envelope)
-        } catch (t: Throwable) {
+        } catch (_: Throwable) {
             false
         }
         if (!accepted) {
             pendingEnvelopes.remove(envelope)
-            if (envelope.emergencyDispose()) emergencyDispose(event)
+            envelope.disposeWithoutMutation()
             return false
         }
         return true
@@ -139,13 +154,10 @@ internal class CaptureStateOwner(
 
     fun close() {
         if (!ownerState.compareAndSet(OwnerState.OPEN, OwnerState.CLOSED)) return
-        // Drain every envelope accepted before closure.  Envelopes that already settled
-        // themselves (removed from the set) are simply not present.  Remaining envelopes
-        // are emergency-disposed; their CAS ensures each event is disposed exactly once.
-        val settled = pendingEnvelopes.toList()
+        val drained = pendingEnvelopes.toList()
         pendingEnvelopes.clear()
-        settled.forEach { envelope ->
-            if (envelope.emergencyDispose()) emergencyDispose(envelope.eventForDisposal())
+        drained.forEach { envelope ->
+            envelope.disposeWithoutMutation()
         }
     }
 
