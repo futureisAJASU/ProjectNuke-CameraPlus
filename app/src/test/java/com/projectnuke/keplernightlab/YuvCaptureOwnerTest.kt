@@ -160,7 +160,7 @@ class YuvCaptureOwnerTest {
                 onCaptureCompleteCount.incrementAndGet()
                 capturedFile.set(file)
             },
-            onCaptureError = { msg ->
+            onCaptureError = { msg, _ ->
                 onCaptureErrorCount.incrementAndGet()
                 errorMessage.set(msg)
             }

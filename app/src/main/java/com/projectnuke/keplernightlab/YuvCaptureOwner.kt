@@ -2,6 +2,7 @@
 
 import android.util.Log
 import java.io.File
+import java.lang.Runnable
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -98,7 +99,7 @@ internal class YuvCaptureOwner(
     private val writeJobJson: (status: String, savedFrames: Int, manifest: List<YuvFrameManifestEntry>) -> Unit,
     private val saveMotionOnce: (File) -> Pair<String?, String?>,
     private val onCaptureComplete: (File) -> Unit,
-    private val onCaptureError: (String) -> Unit
+    private val onCaptureError: (message: String, cause: Throwable?) -> Unit
 ) {
 
     private var completedResults = 0
@@ -377,7 +378,7 @@ internal class YuvCaptureOwner(
         writeJobJson("CAPTURE_TIMEOUT", snap.persistedFrames, snap.manifest)
         postStatus(terminalReason!!)
         cleanup()
-        postMainOrRun { onCaptureError(terminalReason!!) }
+        postMainOrRun { onCaptureError(terminalReason!!, null) }
     }
 
     private fun finishError(
@@ -394,7 +395,7 @@ internal class YuvCaptureOwner(
         writeJobJson("CAPTURE_FAILED", snap.persistedFrames, snap.manifest)
         postStatus(message)
         cleanup()
-        postMainOrRun { onCaptureError(message) }
+        postMainOrRun { onCaptureError(message, cause) }
     }
 
     private fun finishCancel() {
@@ -422,6 +423,15 @@ internal class YuvCaptureOwner(
     // ------------------------------------------------------------------
     // Snapshot
     // ------------------------------------------------------------------
+
+    /**
+     * Number of [CameraCaptureSession.CaptureCallback.onCaptureCompleted] events received
+     * so far.  Visible to the production caller for failure-snapshot observability; the
+     * counter itself is mutated only on the owner's serialized dispatcher.
+     */
+    fun completedResultsCount(): Int = completedResults
+
+    fun terminalState(): CaptureTerminalState = terminalState
 
     internal fun terminalSnapshot(): TerminalSnapshot {
         val snap = accounting.snapshot()
@@ -455,117 +465,4 @@ internal class YuvCaptureOwner(
         val terminalReason: String?,
         val discardedLateCompletions: List<Int>
     )
-}
-
-/**
- * Production session seam for the YUV color-burst capture pipeline.  Owns the
- * shared state of one capture (dispatch owner, bounded encoder worker, finished
- * flag, terminal state, accounting, lifecycle, reservation, identity owner,
- * and the authoritative [YuvCaptureOwner]) and provides a single close path.
- *
- * Construction does NOT start the camera session; the caller wires the
- * returned components into Camera2 (ImageReader listeners, capture callbacks)
- * and the timeout scheduler / cancellation handle, then calls
- * [YuvCaptureOwner.onDeadlineReached] or [YuvCaptureOwner.onCancellationRequested]
- * from those producers as the only legal way to settle the terminal state.
- *
- * Components exposed for the production caller:
- *  - [captureStateOwner]      : post deadline/cancellation through this.
- *  - [boundedWorker]          : encoder worker; managed by [close].
- *  - [finished]               : idempotent flag for late camera callbacks.
- *  - [terminalState]          : readable terminal status (claim is owner-only).
- *  - [accounting], [lifecycle], [reservations], [identityOwner]
- *                              : shared inspection access (mutation is owner-only).
- *  - [owner]                  : the only legal entry point for ImageReader callbacks
- *                              and capture-result/failure callbacks.
- */
-internal class YuvCaptureSession internal constructor(
-    val captureStateOwner: CaptureStateOwner,
-    val boundedWorker: BoundedCaptureWorker,
-    val finished: AtomicBoolean,
-    val terminalState: CaptureTerminalState,
-    val accounting: YuvCaptureAccounting,
-    val lifecycle: YuvBufferedLifecycle,
-    val reservations: YuvBufferReservations,
-    val identityOwner: CaptureFrameIdentityOwner,
-    val owner: YuvCaptureOwner
-) : AutoCloseable {
-    override fun close() {
-        captureStateOwner.close()
-        boundedWorker.shutdownNow()
-    }
-
-    /**
-     * Terminal snapshot at the moment of inspection.  Useful for late camera
-     * callbacks deciding whether to drop a frame.
-     */
-    fun terminalSnapshot(): YuvCaptureOwner.TerminalSnapshot = owner.terminalSnapshot()
-
-    companion object {
-        /**
-         * Build a new capture session.  The factory creates and wires together
-         * the dispatch owner, the bounded encoder worker, the finished flag,
-         * the supporting state (terminalState, accounting, lifecycle,
-         * reservations, identity owner), and the authoritative
-         * [YuvCaptureOwner].  No background work starts until the caller
-         * routes Camera2 / timeout / cancellation events into [owner] or
-         * [captureStateOwner].
-         */
-        fun create(
-            dispatch: (CaptureOwnerEvent) -> Boolean,
-            outputDir: File,
-            frameCount: Int,
-            rotationDegrees: Int,
-            workerCapacity: Int,
-            maxRetainedBytes: Long,
-            workerName: String = "YuvCapture-$frameCount",
-            workProcessor: YuvPngWorkProcessor,
-            postStatus: (String) -> Unit = {},
-            postMainOrRun: (Runnable) -> Unit = {},
-            writeJobJson: (status: String, savedFrames: Int, manifest: List<YuvFrameManifestEntry>) -> Unit = { _, _, _ -> },
-            saveMotionOnce: (File) -> Pair<String?, String?> = { _ -> null to null },
-            onCaptureComplete: (File) -> Unit = {},
-            onCaptureError: (String) -> Unit = {}
-        ): YuvCaptureSession {
-            val captureStateOwner = CaptureStateOwner(dispatch)
-            val boundedWorker = BoundedCaptureWorker(workerName, workerCapacity)
-            val finished = AtomicBoolean(false)
-            val reservations = YuvBufferReservations(maxRetainedBytes)
-            val accounting = YuvCaptureAccounting()
-            val lifecycle = YuvBufferedLifecycle()
-            val identityOwner = CaptureFrameIdentityOwner(frameCount)
-            val terminalState = CaptureTerminalState()
-            val owner = YuvCaptureOwner(
-                captureStateOwner = captureStateOwner,
-                outputDir = outputDir,
-                rotationDegrees = rotationDegrees,
-                frameCount = frameCount,
-                workProcessor = workProcessor,
-                reservations = reservations,
-                accounting = accounting,
-                lifecycle = lifecycle,
-                identityOwner = identityOwner,
-                terminalState = terminalState,
-                boundedWorker = boundedWorker,
-                finished = finished,
-                postStatus = postStatus,
-                postMainOrRun = postMainOrRun,
-                writeJobJson = writeJobJson,
-                saveMotionOnce = saveMotionOnce,
-                onCaptureComplete = onCaptureComplete,
-                onCaptureError = onCaptureError
-            )
-            return YuvCaptureSession(
-                captureStateOwner,
-                boundedWorker,
-                finished,
-                terminalState,
-                accounting,
-                lifecycle,
-                reservations,
-                identityOwner,
-                owner
-            )
-        }
-    }
 }
