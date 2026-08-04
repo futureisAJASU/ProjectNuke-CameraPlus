@@ -6,6 +6,8 @@ import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
 import android.graphics.Color
 import android.graphics.Rect
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
@@ -466,7 +468,10 @@ fun runSuperResolutionFusion(
 
 fun captureProcessExportSuperResolutionFusion(
     context: Context,
+    cameraManager: CameraManager,
     cameraId: String,
+    characteristics: CameraCharacteristics,
+    outputDir: File,
     frameCount: Int,
     finalOutputFormat: FinalOutputFormat,
     zoomRatio: Float,
@@ -491,22 +496,21 @@ fun captureProcessExportSuperResolutionFusion(
     post("24M Fusion: capturing 12MP burst...")
     captureYuvBurstColorWithMotion(
         context = context,
+        cameraManager = cameraManager,
         cameraId = cameraId,
-        frameCount = captureFrames,
-        resolutionMode = CaptureResolutionMode.MP12,
+        characteristics = characteristics,
+        outputDir = outputDir,
         zoomRatio = zoomRatio,
-        requestedUiZoomRatio = requestedUiZoomRatio,
-        physicalCameraId = physicalCameraId,
         focusAeState = focusAeState,
+        resolutionMode = CaptureResolutionMode.MP12,
+        captureMode = CaptureMode.MULTI_FRAME,
         frameCountMode = frameCountMode,
         autoMinFrames = autoMinFrames,
         autoMaxFrames = autoMaxFrames,
         manualFrames = manualFrames,
-        framePlanReason = framePlanReason,
-        captureMode = CaptureMode.MULTI_FRAME,
         processingParams = processingParams,
-        captureCancellationHandle = captureCancellationHandle,
-        onComplete = { sourceJobDir ->
+        onStatus = onStatus,
+        onComplete = { jobDir, manifest ->
             try {
                 cancellation.throwIfCancelled()
             } catch (_: CancellationException) {
@@ -517,7 +521,7 @@ fun captureProcessExportSuperResolutionFusion(
             Handler(workerThread.looper).post {
                 try {
                     cancellation.throwIfCancelled()
-                    val sourceFrames = readColorBurstFrameFiles(sourceJobDir)
+                    val sourceFrames = readColorBurstFrameFiles(jobDir)
                     cancellation.throwIfCancelled()
                     val outputDir = createSuperResolutionJobDirectory(context)
                     cancellation.throwIfCancelled()
@@ -618,10 +622,9 @@ fun captureProcessExportSuperResolutionFusion(
                 }
             }
         },
-        onError = { error ->
-            post("PIPELINE_FAILED: 24M Fusion capture failed. $error")
-        },
-        onStatus = { message -> post(message) }
+        onError = { error, detail ->
+            post("PIPELINE_FAILED: 24M Fusion capture failed. $error${if (!detail.isNullOrBlank()) ": $detail" else ""}")
+        }
     )
 }
 

@@ -1,7 +1,10 @@
 package com.projectnuke.keplernightlab
 
 import android.content.Context
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.util.Log
+import java.io.File
 
 internal fun lensSlotForZoomRatioHysteresis(
     zoomRatio: Float,
@@ -263,6 +266,9 @@ internal fun handleCaptureClick(input: CaptureClickInput): CaptureClickResult {
 
 internal fun startCapturePipeline(
     request: CapturePipelineRequest,
+    cameraManager: CameraManager,
+    characteristics: CameraCharacteristics,
+    outputDir: File,
     onStatus: (String) -> Unit
 ) {
     val loggedStatus: (String) -> Unit = { newStatus ->
@@ -294,10 +300,13 @@ internal fun startCapturePipeline(
             "captureZoom=$captureZoomRatio " +
             "finalRoute=$finalRoute fallbackReason=${fallbackReason ?: "none"}"
     )
-    if (request.captureMode == CaptureMode.SINGLE_FRAME) {
+if (request.captureMode == CaptureMode.SINGLE_FRAME) {
         captureProcessExportNightFusion(
             context = request.context,
+            cameraManager = cameraManager,
             cameraId = selection.cameraId,
+            characteristics = characteristics,
+            outputDir = outputDir,
             frameCount = 1,
             resolutionMode = CaptureResolutionMode.MP12,
             finalOutputFormat = request.finalOutputFormat,
@@ -323,7 +332,10 @@ internal fun startCapturePipeline(
     } else if (request.selectedResolution == CaptureResolutionMode.MP24_FUSION) {
         captureProcessExportSuperResolutionFusion(
             context = request.context,
+            cameraManager = cameraManager,
             cameraId = selection.cameraId,
+            characteristics = characteristics,
+            outputDir = outputDir,
             frameCount = request.prepared.framePlan.framesToCapture,
             finalOutputFormat = request.finalOutputFormat,
             zoomRatio = captureZoomRatio,
@@ -369,7 +381,10 @@ internal fun startCapturePipeline(
     } else {
         captureProcessExportNightFusion(
             context = request.context,
+            cameraManager = cameraManager,
             cameraId = selection.cameraId,
+            characteristics = characteristics,
+            outputDir = outputDir,
             frameCount = request.prepared.framePlan.framesToCapture,
             resolutionMode = request.selectedResolution,
             finalOutputFormat = request.finalOutputFormat,
