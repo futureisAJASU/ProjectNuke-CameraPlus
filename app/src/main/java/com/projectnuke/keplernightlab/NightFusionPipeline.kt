@@ -2,8 +2,6 @@ package com.projectnuke.keplernightlab
 
 import android.content.Context
 import android.graphics.BitmapFactory
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraManager
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
@@ -17,10 +15,7 @@ import java.util.Locale
 
 fun captureProcessExportNightFusion(
     context: Context,
-    cameraManager: CameraManager,
     cameraId: String,
-    characteristics: CameraCharacteristics,
-    outputDir: File,
     frameCount: Int,
     resolutionMode: CaptureResolutionMode,
     finalOutputFormat: FinalOutputFormat,
@@ -52,21 +47,25 @@ fun captureProcessExportNightFusion(
     post("YUV capture: saved 0/$frameCount")
     captureYuvBurstColorWithMotion(
         context = context,
-        cameraManager = cameraManager,
         cameraId = cameraId,
-        characteristics = characteristics,
-        outputDir = outputDir,
-        zoomRatio = zoomRatio,
-        focusAeState = focusAeState,
+        frameCount = frameCount,
         resolutionMode = resolutionMode,
-        captureMode = captureMode,
+        zoomRatio = zoomRatio,
+        requestedUiZoomRatio = requestedUiZoomRatio,
+        physicalCameraId = physicalCameraId,
+        zoomRoute = zoomRoute,
+        previewRoute = previewRoute,
+        routeFallbackReason = routeFallbackReason,
+        focusAeState = focusAeState,
         frameCountMode = frameCountMode,
         autoMinFrames = autoMinFrames,
         autoMaxFrames = autoMaxFrames,
         manualFrames = manualFrames,
+        framePlanReason = framePlanReason,
+        captureMode = captureMode,
         processingParams = processingParams,
-        onStatus = onStatus,
-        onComplete = { jobDir, manifest ->
+        captureCancellationHandle = captureCancellationHandle,
+        onComplete = { jobDir ->
             try {
                 cancellation.throwIfCancelled()
             } catch (_: CancellationException) {
@@ -211,8 +210,11 @@ fun captureProcessExportNightFusion(
                 }
             }
         },
-        onError = { error, detail ->
-            post("PIPELINE_FAILED: Capture failed; keeping cache.\n$error${if (!detail.isNullOrBlank()) ": $detail" else ""}")
+        onError = { error ->
+            post("PIPELINE_FAILED: Capture failed; keeping cache.\n$error")
+        },
+        onStatus = { message ->
+            post(message)
         }
     )
 }

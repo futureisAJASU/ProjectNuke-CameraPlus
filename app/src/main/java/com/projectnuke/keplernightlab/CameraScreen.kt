@@ -5,8 +5,6 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraManager
 import android.os.Handler
 import android.os.Looper
 import android.view.Surface
@@ -382,7 +380,6 @@ fun MainCameraScreen(
     var rawSpeedMode by remember {
         mutableStateOf(RawSpeedMode.entries.firstOrNull { it.name == savedSettings.rawSpeedModeName } ?: RawSpeedMode.BALANCED)
     }
-
     var captureMode by remember {
         mutableStateOf(CaptureMode.entries.firstOrNull { it.name == savedSettings.captureModeName } ?: CaptureMode.MULTI_FRAME)
     }
@@ -420,14 +417,6 @@ fun MainCameraScreen(
         zoomUiState = zoomUiState,
         capabilityRefreshNonce = capabilityRefreshNonce
     )
-
-    // Camera2 dependencies for YUV capture
-    val cameraManager = remember { context.getSystemService(Context.CAMERA_SERVICE) as CameraManager }
-    val characteristics by remember(cameraState.selection.cameraId) {
-        mutableStateOf(cameraManager.getCameraCharacteristics(cameraState.selection.cameraId))
-    }
-    val outputDir = remember { File(context.getExternalFilesDir(null) ?: context.filesDir, "KeplerNightLab").apply { mkdirs() } }
-
     val resolutionState = rememberResolutionState(
         context = context,
         cameraSelection = cameraState.selection,
@@ -1139,7 +1128,7 @@ mainHandler.removeCallbacks(watchdog)
                                 } else {
                                     60_000L
                                 }
-) { cancellation, captureCancellation, callback ->
+                            ) { cancellation, captureCancellation, callback ->
                                 startCapturePipeline(
                                     CapturePipelineRequest(
                                         context = context,
@@ -1160,9 +1149,6 @@ mainHandler.removeCallbacks(watchdog)
                                         captureCancellationHandle = captureCancellation,
                                         cancellation = cancellation
                                     ),
-                                    cameraManager = cameraManager,
-                                    characteristics = characteristics,
-                                    outputDir = outputDir,
                                     onStatus = callback
                                 )
                             }

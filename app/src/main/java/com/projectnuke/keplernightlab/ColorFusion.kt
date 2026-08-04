@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.ImageFormat
+import android.graphics.Matrix
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -29,8 +30,6 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -196,416 +195,1043 @@ internal fun copyYuvFrameToMemory(image: Image, index: Int): BufferedYuvFrame {
 @SuppressLint("MissingPermission")
 fun captureYuvBurstColorWithMotion(
     context: Context,
-    cameraManager: CameraManager,
     cameraId: String,
-    characteristics: CameraCharacteristics,
-    outputDir: File,
-    zoomRatio: Float,
-    focusAeState: FocusAeState,
-    resolutionMode: CaptureResolutionMode,
-    captureMode: CaptureMode,
-    frameCountMode: FrameCountMode,
-    autoMinFrames: Int,
-    autoMaxFrames: Int,
-    manualFrames: Int,
-    processingParams: ClassicYuvFusionParams,
-    onStatus: (String) -> Unit,
-    onComplete: (File, List<YuvFrameManifestEntry>) -> Unit,
-    onError: (String, String?) -> Unit
+    frameCount: Int = 6,
+    resolutionMode: CaptureResolutionMode = CaptureResolutionMode.MP12,
+    zoomRatio: Float = 1.0f,
+    requestedUiZoomRatio: Float,
+    physicalCameraId: String? = null,
+    zoomRoute: ThreeXSourceMode = ThreeXSourceMode.OPTICAL,
+    previewRoute: String? = null,
+    routeFallbackReason: String? = null,
+    focusAeState: FocusAeState = FocusAeState(),
+    frameCountMode: FrameCountMode = FrameCountMode.AUTO,
+    autoMinFrames: Int = 4,
+    autoMaxFrames: Int = 8,
+    manualFrames: Int = 4,
+    framePlanReason: String = "Default",
+    captureMode: CaptureMode = CaptureMode.MULTI_FRAME,
+    processingParams: ClassicYuvFusionParams = ClassicYuvFusionPreset.NATURAL.params,
+    captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
+    onComplete: (File) -> Unit = {},
+    onError: (String) -> Unit = {},
+    onStatus: (String) -> Unit
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
-    val postStatusMsg: (String) -> Unit = { message ->
+    fun postStatus(message: String) {
         if (!mainHandler.post { onStatus(message) }) runCatching { onStatus(message) }
     }
-
-    fun postError(message: String, detail: String? = null) {
-        logYuvCaptureFailure(message, detail = detail)
-        if (!mainHandler.post { onError(message, detail) }) runCatching { onError(message, detail) }
+    fun postMainOrRun(action: () -> Unit) {
+        if (!mainHandler.post(action)) runCatching(action)
     }
 
-    val workerThread = HandlerThread("KeplerYuvBurstThread").apply { start() }
-    val workerHandler = Handler(workerThread.looper)
+    val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    val backgroundThread = HandlerThread("KeplerColorBurstThread").apply { start() }
+    val backgroundHandler = Handler(backgroundThread.looper)
+    val captureStateOwner = CaptureStateOwner(
+        dispatch = { event -> backgroundHandler.post { event.execute() } }
+    )
+    val yuvWorkQueue = BoundedCaptureWorker(
+        "KeplerColorBurstWorker",
+        capacity = maxOf(2, minOf(frameCount, MAX_YUV_MEMORY_BUFFER_FRAMES))
+    )
+    val timeoutScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "KeplerColorBurstTimeout").apply { isDaemon = true }
+    }
 
-    // --- Variables that need to be captured by lambdas ---
+    var motionLogger: MotionLogger? = null
     var cameraDevice: CameraDevice? = null
-    var burstReader: ImageReader? = null
+    var captureSession: CameraCaptureSession? = null
+    var imageReader: ImageReader? = null
+
+    var completedResults = 0
+    val finished = AtomicBoolean(false)
+    val terminalState = CaptureTerminalState()
+    val cleanupStarted = AtomicBoolean(false)
+    var motionSaved = false
+    var motionFiles: Pair<String?, String?> = Pair(null, null)
+    var motionInfo = "motion_not_started"
     var jobFile: File? = null
-    var manifest = mutableListOf<YuvFrameManifestEntry>()
-    var yuvMemoryBufferUsed = false
-    var yuvMemoryBufferEstimatedBytes = 0L
-    var yuvCaptureRequestTemplate: String? = null
-    var yuvCaptureRequestTemplateFallbackUsed = false
-    var yuvCaptureRequestTemplateFailures = mutableListOf<String>()
-    var plannedFrames = 0
-    var framePlanReason = ""
+    var burstDir: File? = null
 
-    // --- Session reference (owner-based architecture) ---
-    val sessionRef = java.util.concurrent.atomic.AtomicReference<YuvCaptureSession?>(null)
+    // Phase-1 accounting boundary. The later owner-loop migration will move this component
+    // wholesale; no callback/worker shares its counters or retained-byte value directly.
+    val yuvAccounting = YuvCaptureAccounting()
+    val yuvReservations = YuvBufferReservations(MAX_YUV_MEMORY_BUFFER_BYTES)
+    // Single authoritative collection for buffered YUV work items. Replaces the prior
+    // bufferedFrames list + retainedBufferedWork set pair that allowed post-cleanup
+    // insertions and races between cleanup and the encoder.
+    val yuvBufferedLifecycle = YuvBufferedLifecycle()
+    val frameIdentityOwner = CaptureFrameIdentityOwner(frameCount)
 
-    // --- Pre-session failure helper ---
-    fun failInit(stage: String, throwable: Throwable? = null, detail: String? = null) {
-        postError(stage, detail)
-    }
+    fun captureFailureSnapshot(): YuvCaptureFailureSnapshot = YuvCaptureFailureSnapshot(
+        jobFile = jobFile,
+        savedFrames = yuvAccounting.snapshot().persistedFrames,
+        receivedImages = yuvAccounting.snapshot().receivedFrames,
+        completedResults = completedResults,
+        failedCaptures = yuvAccounting.snapshot().failedFrames,
+        frames = yuvAccounting.snapshot().manifest
+    )
 
-    // --- Post-session failure helper ---
-    fun failDuringCapture(stage: String, throwable: Throwable? = null, detail: String? = null) {
-        sessionRef.get()?.owner?.onCaptureFailed(throwable ?: IllegalStateException(stage), detail ?: stage)
-        postError(stage, detail)
-    }
-
-    // --- Cleanup ---
     fun cleanup() {
-        try {
-            sessionRef.get()?.close()
-        } catch (e: Exception) {
-            Log.w(YUV_CAPTURE_LOG_TAG, "Session close failed", e)
-        }
-        try {
-            burstReader?.close()
-            burstReader = null
-        } catch (e: Exception) {
-            Log.w(YUV_CAPTURE_LOG_TAG, "ImageReader close failed", e)
-        }
-        try {
-            cameraDevice?.close()
-            cameraDevice = null
-        } catch (e: Exception) {
-            Log.w(YUV_CAPTURE_LOG_TAG, "CameraDevice close failed", e)
-        }
-        workerThread.quitSafely()
+        if (!cleanupStarted.compareAndSet(false, true)) return
+        // 1. Close owner/event acceptance so no further state mutation is enqueued.
+        captureStateOwner.close()
+        // 2. Close buffered-work acceptance and drain safely retained work in one step.
+        val drainedBuffered = yuvBufferedLifecycle.closeAndDrainRetained()
+        // 3. Detach Camera2 callbacks.
+        try { imageReader?.setOnImageAvailableListener(null, null) } catch (_: Exception) {}
+        try { backgroundHandler.removeCallbacksAndMessages(null) } catch (_: Exception) {}
+        // 4. Camera session / device teardown.
+        try { captureSession?.abortCaptures() } catch (_: Exception) {}
+        try { captureSession?.stopRepeating() } catch (_: Exception) {}
+        try { captureSession?.close() } catch (_: Exception) {}
+        try { imageReader?.close() } catch (_: Exception) {}
+        try { cameraDevice?.close() } catch (_: Exception) {}
+        try { motionLogger?.stop() } catch (_: Exception) {}
+        // 5. Reject/dispose queued tasks. shutdownNow() invokes DisposableYuvTask.dispose()
+        //    on every queued task; the running task is not interrupted.
+        timeoutScheduler.shutdownNow()
+        yuvWorkQueue.shutdownNow()
+        // 6. Dispose safely retained buffered work (lifecycle has already excluded ENCODING
+        //    items; the encoder still owns them and will dispose via settleEncoding).
+        drainedBuffered.forEach { it.dispose(yuvAccounting) }
+        // 7. Request worker/thread shutdown without blocking the Main thread or encoder.
+        try { backgroundThread.quitSafely() } catch (_: Exception) {}
     }
 
-    // --- Late camera callback logging ---
-    fun logLateCameraCallback(source: String, detail: String? = null) {
-        val session = sessionRef.get()
-        val finished = session?.finished?.get() == true
-        val terminal = session?.owner?.terminalState()?.status()
-        val received = session?.owner?.completedResultsCount() ?: 0
-        val frames = session?.accounting?.snapshot()?.receivedFrames ?: 0
-        val workers = session?.boundedWorker?.activeCount() ?: 0
-        val workQueue = session?.boundedWorker?.queuedCount() ?: 0
-        val memo = when (terminal) {
-            CaptureTerminalStatus.SUCCESS -> "terminal=SUCCESS"
-            CaptureTerminalStatus.FAILED -> "terminal=FAILED"
-            CaptureTerminalStatus.CANCELLED -> "terminal=CANCELLED"
-            CaptureTerminalStatus.TIMED_OUT -> "terminal=TIMEOUT"
-            null -> "terminal=null"
-            else -> "terminal=$terminal"
-        }
-        val msg = "LATE_CAMERA_CALLBACK: source=$source finished=$finished $memo received=$received frames=$frames workers=$workers workQueue=$workQueue${if (!detail.isNullOrBlank()) " $detail" else ""}"
-        Log.w(YUV_CAPTURE_LOG_TAG, msg)
-    }
-
-    // --- Cancellation handle ---
-    var captureCancellationHandle: ScheduledExecutorService? = null
-    fun registerCancellation(check: () -> Boolean) {
-        captureCancellationHandle = Executors.newSingleThreadScheduledExecutor()
-        captureCancellationHandle!!.scheduleAtFixedRate({ check() }, 0, 100, TimeUnit.MILLISECONDS)
-    }
-
-    // --- Capture failure snapshot ---
-    fun captureFailureSnapshot(): YuvCaptureFailureSnapshot {
-        val session = sessionRef.get()
-        return YuvCaptureFailureSnapshot(
-            jobFile = jobFile,
-            savedFrames = manifest.count { it.persisted },
-            receivedImages = session?.accounting?.snapshot()?.receivedFrames ?: 0,
-            completedResults = session?.owner?.completedResultsCount() ?: 0,
-            failedCaptures = session?.accounting?.snapshot()?.failedFrames ?: 0,
-            frames = manifest
+    fun logLateCameraCallback(callback: String) {
+        Log.d(
+            "KeplerCaptureCancel",
+            "pipeline=YUV callback=$callback late=true finished=${finished.get()} cleanupStarted=${cleanupStarted.get()}"
         )
     }
 
-    workerHandler.post {
-        try {
-            // ---- Pre-session initialization (same as before) ----
-            val yuvSizes = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                ?.getOutputSizes(ImageFormat.YUV_420_888)
-                ?: emptyArray()
-            val yuvSize = chooseColorFusionSize(yuvSizes, resolutionMode)
-            val width = yuvSize.width
-            val height = yuvSize.height
+    captureCancellationHandle.registerCleanupAction {
+        if (terminalState.claim(CaptureTerminalStatus.CANCELLED)) {
+            finished.set(true)
+            cleanup()
+        }
+    }
 
-            if (!canUseYuvMemoryBuffer(width, height, 8)) {
-                yuvMemoryBufferUsed = false
-                yuvMemoryBufferEstimatedBytes = 0
+    fun finish(message: String) {
+        if (!terminalState.claim(CaptureTerminalStatus.SUCCESS)) return
+        finished.set(true)
+        postStatus(message)
+        cleanup()
+    }
+
+    fun finishError(
+        message: String,
+        source: String = "captureYuvBurstColorWithMotion.legacy",
+        throwable: Throwable? = null,
+        failureType: String? = null,
+        failureMessage: String? = null,
+        terminalAlreadyClaimed: Boolean = false
+    ) {
+        if (!terminalAlreadyClaimed && !terminalState.claim(CaptureTerminalStatus.FAILED)) return
+        finished.set(true)
+        logYuvCaptureFailure(
+            stage = source,
+            throwable = throwable,
+            detail = failureMessage ?: message
+        )
+        persistYuvCaptureFailure(
+            snapshot = captureFailureSnapshot(),
+            source = source,
+            throwable = throwable,
+            failureType = failureType,
+            failureMessage = failureMessage ?: message
+        )
+        postStatus(message)
+        postMainOrRun { onError(message) }
+        cleanup()
+    }
+
+    fun finishSuccess(jobDir: File, message: String, terminalAlreadyClaimed: Boolean = false) {
+        if (!terminalAlreadyClaimed && !terminalState.claim(CaptureTerminalStatus.SUCCESS)) return
+        finished.set(true)
+        cleanup()
+        postMainOrRun { onComplete(jobDir) }
+        postStatus(message)
+    }
+
+    fun saveMotionOnce(dir: File): Pair<String?, String?> {
+        if (motionSaved) return motionFiles
+
+        return try {
+            val logger = motionLogger
+            if (logger == null) {
+                motionSaved = true
+                motionFiles = Pair(null, null)
+                motionFiles
+            } else {
+                logger.stop()
+                motionFiles = logger.saveToDirectory(dir)
+                motionSaved = true
+                motionFiles
             }
+        } catch (e: Exception) {
+            motionSaved = true
+            motionFiles = Pair(null, null)
+            postStatus("Motion 저장 실패, 컬러 프레임은 유지\n${e.stackTraceToString()}")
+            motionFiles
+        }
+    }
 
-            val requestedFrames = when (frameCountMode) {
-                FrameCountMode.AUTO -> {
-                    plannedFrames = (autoMinFrames + autoMaxFrames) / 2
-                    framePlanReason = "Auto: middle of [$autoMinFrames, $autoMaxFrames]"
-                    plannedFrames
-                }
-                FrameCountMode.MANUAL -> {
-                    plannedFrames = manualFrames
-                    framePlanReason = "Manual: $manualFrames"
-                    plannedFrames
-                }
-            }
+    try {
+        postStatus("Color Fusion 초기화 1/7: 카메라 특성 확인 중...")
 
-            // Create job directory
-            val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-            val jobDir = File(outputDir, "YUV_NIGHT_FUSION_$timestamp")
-            if (!jobDir.mkdirs()) {
-                failInit("jobDir.mkdirs_failed")
-                cleanup()
-                return@post
-            }
-            jobFile = File(jobDir, JOB_JSON_FILE_NAME)
-            val jobId = UUID.randomUUID().toString()
+        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
 
-            // Initial job metadata
-            val initialJob = JSONObject().apply {
-                put("jobId", jobId)
-                put("status", "CAPTURE_INIT")
-                put("currentPipelineStage", "CAPTURE_INIT")
-                put("processStatus", "CAPTURE_INIT")
-                put("cameraId", cameraId)
-                put("yuvWidth", width)
-                put("yuvHeight", height)
-                put("requestedFrames", requestedFrames)
-                put("yuvMemoryBufferUsed", yuvMemoryBufferUsed)
-                put("yuvMemoryBufferEstimatedBytes", yuvMemoryBufferEstimatedBytes)
-                put("createdAt", System.currentTimeMillis())
-                put("updatedAt", System.currentTimeMillis())
-            }
-            KeplerJobMetadata.write(jobDir, initialJob)
-
-            postStatusMsg("YUV 버스트 캡처 준비 중... (${width}x$height, ${plannedFrames}프레임)")
-
-            // Create ImageReader
-            val readerFormat = if (yuvMemoryBufferUsed) ImageFormat.YUV_420_888 else ImageFormat.YUV_420_888
-            val maxImages = if (yuvMemoryBufferUsed) MAX_YUV_MEMORY_BUFFER_FRAMES else plannedFrames + 2
-            burstReader = ImageReader.newInstance(width, height, readerFormat, maxImages)
-
-            val rotationDegrees = calculateResultRotationDegrees(characteristics)
-            val maxRetainedBytes = if (yuvMemoryBufferUsed) MAX_YUV_MEMORY_BUFFER_BYTES else 0L
-
-            // ---- SESSION CONSTRUCTION (owner-based) ----
-            val session = YuvCaptureSession.create(
-                dispatch = { event -> workerHandler.post { event.execute() }; true },
-                outputDir = jobDir,
-                frameCount = plannedFrames,
-                rotationDegrees = rotationDegrees,
-                workerCapacity = plannedFrames,
-                maxRetainedBytes = maxRetainedBytes,
-                workProcessor = YuvPngWorkProcessor(
-                    encoder = object : YuvPngEncoder {
-                        override fun encodeDirect(image: Image, candidate: File, rotationDegrees: Int) {
-                            val bitmap = yuv420ToBitmap(image)
-                            val rotated = rotateBitmapIfNeeded(bitmap, rotationDegrees)
-                            try {
-                                FileOutputStream(candidate).use { output ->
-                                    if (!rotated.compress(Bitmap.CompressFormat.PNG, 100, output)) {
-                                        throw IllegalStateException("Bitmap PNG compression returned false")
-                                    }
-                                    output.fd.sync()
-                                }
-                            } finally {
-                                if (rotated !== bitmap) rotated.recycle()
-                                bitmap.recycle()
-                            }
-                        }
-
-                        override fun encodeBuffered(frame: BufferedYuvFrame, candidate: File, rotationDegrees: Int) {
-                            val bitmap = yuv420BufferToBitmap(frame)
-                            val rotated = rotateBitmapIfNeeded(bitmap, rotationDegrees)
-                            try {
-                                FileOutputStream(candidate).use { output ->
-                                    if (!rotated.compress(Bitmap.CompressFormat.PNG, 100, output)) {
-                                        throw IllegalStateException("Bitmap PNG compression returned false")
-                                    }
-                                    output.fd.sync()
-                                }
-                            } finally {
-                                if (rotated !== bitmap) rotated.recycle()
-                                bitmap.recycle()
-                            }
-                        }
-                    },
-                    committer = { candidate, finalFile ->
-                        KeplerJobMetadata.atomicReplace(candidate, finalFile)
-                    }
-                ),
-postStatus = postStatusMsg,
-                postMainOrRun = { runnable -> if (!mainHandler.post(runnable)) runnable.run() },
-                writeJobJson = { status, savedFrames, manifest ->
-                    KeplerJobMetadata.update(jobDir) { current ->
-                        current.put("status", status)
-                            .put("currentPipelineStage", status)
-                            .put("processStatus", status)
-                            .put("savedFrames", savedFrames)
-                            .put("updatedAt", System.currentTimeMillis())
-                    }
-                },
-                saveMotionOnce = { dir ->
-                    // Motion files are handled elsewhere; return null for now
-                    null to null
-                },
-                onCaptureComplete = { finalJobDir ->
-                    val finalFrames = sessionRef.get()?.accounting?.snapshot()?.manifest ?: emptyList()
-                    mainHandler.post {
-                        onComplete(finalJobDir, finalFrames)
-                    }
-                },
-                onCaptureError = { message, cause ->
-                    val msg = "YUV_CAPTURE_FAILED: $message"
-                    logYuvCaptureFailure("capture_error", cause, message)
-                    if (!mainHandler.post { onError(msg, message) }) runCatching { onError(msg, message) }
-                }
+        if (map == null) {
+            finishError(
+                message = "Color Fusion 초기화 실패: StreamConfigurationMap이 null임",
+                source = "captureYuvBurstColorWithMotion.init",
+                failureType = "ConfigurationError",
+                failureMessage = "StreamConfigurationMap is null"
             )
-            sessionRef.set(session)
+            return
+        }
 
-            // ImageReader listener routes through owner
-            burstReader!!.setOnImageAvailableListener({ reader ->
-                val session = sessionRef.get() ?: return@setOnImageAvailableListener
-                val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-                if (session.finished.get()) {
-                    image.close()
+        val yuvSizes = map.getOutputSizes(ImageFormat.YUV_420_888)
+
+        if (yuvSizes.isNullOrEmpty()) {
+            finishError(
+                message = "Color Fusion 초기화 실패: YUV_420_888 출력 크기를 찾지 못함",
+                source = "captureYuvBurstColorWithMotion.init",
+                failureType = "ConfigurationError",
+                failureMessage = "No YUV_420_888 output sizes"
+            )
+            return
+        }
+
+        val yuvSize = chooseColorFusionSize(yuvSizes, resolutionMode)
+        val yuvMegapixels = yuvSize.width.toDouble() * yuvSize.height.toDouble() / 1_000_000.0
+        val resolutionFallbackNote = if (
+            resolutionMode == CaptureResolutionMode.MP50 &&
+            yuvMegapixels < 40.0
+        ) {
+            "50M requested, but selected camera only exposed ${yuvSize.width}x${yuvSize.height}. Using max available."
+        } else {
+            null
+        }
+        val cropApplied = zoomRatio > 1f && buildCenterCropRegion(characteristics, zoomRatio) != null
+        var finalRequestZoom = zoomRatio
+        var finalCropApplied = cropApplied
+        var actualCaptureRoute: PhysicalCaptureRoute? = null
+        fun actualPhysicalCameraId(): String? =
+            if (actualCaptureRoute == PhysicalCaptureRoute.PHYSICAL) physicalCameraId else null
+        val rotationDegrees = calculateResultRotationDegrees(
+            characteristics,
+            context.display?.rotation ?: Surface.ROTATION_0
+        )
+
+        postStatus("Color Fusion 초기화 2/7: 저장 폴더 준비 중...")
+
+        val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+
+        if (picturesDir == null) {
+            finishError(
+                message = "Color Fusion 초기화 실패: Pictures 폴더가 null임",
+                source = "captureYuvBurstColorWithMotion.init",
+                failureType = "StorageError",
+                failureMessage = "Pictures directory is null"
+            )
+            return
+        }
+
+        val keplerDir = File(picturesDir, "KeplerYuvFusion").apply {
+            if (!exists()) {
+                val ok = mkdirs()
+                if (!ok && !exists()) {
+                    finishError(
+                        message = "Color Fusion 초기화 실패: KeplerColorBurst 폴더 생성 실패\n$absolutePath",
+                        source = "captureYuvBurstColorWithMotion.init",
+                        failureType = "StorageError",
+                        failureMessage = "Failed to create KeplerYuvFusion directory"
+                    )
+                    return
+                }
+            }
+        }
+
+        val burstTimestamp = SimpleDateFormat(
+            "yyyyMMdd_HHmmss_SSS",
+            Locale.US
+        ).format(Date())
+
+        val currentBurstDir = File(keplerDir, "KPL_YUV_FUSION_${burstTimestamp}_${UUID.randomUUID().toString().take(8)}").apply {
+            if (!exists()) {
+                val ok = mkdirs()
+                if (!ok && !exists()) {
+                    finishError(
+                        message = "Color Fusion 초기화 실패: Burst 폴더 생성 실패\n$absolutePath",
+                        source = "captureYuvBurstColorWithMotion.init.storage.burstDir",
+                        failureType = "StorageError",
+                        failureMessage = "Failed to create KPL_YUV_FUSION burst directory"
+                    )
+                    return
+                }
+            }
+        }
+
+        burstDir = currentBurstDir
+        val outputWidth = if (rotationDegrees == 90 || rotationDegrees == 270) yuvSize.height else yuvSize.width
+        val outputHeight = if (rotationDegrees == 90 || rotationDegrees == 270) yuvSize.width else yuvSize.height
+    var useMemoryBuffer = canUseYuvMemoryBuffer(
+        yuvSize.width,
+        yuvSize.height,
+        frameCount
+    )
+        val estimatedBufferBytes =
+            estimateYuvBufferBytes(yuvSize.width, yuvSize.height) * frameCount
+        val captureTimeoutMs = computeYuvCaptureTimeoutMs(frameCount, resolutionMode)
+
+        val currentJobFile = File(currentBurstDir, "job.json")
+        jobFile = currentJobFile
+        var yuvCaptureRequestTemplate = "UNSELECTED"
+        var yuvCaptureRequestTemplateFallbackUsed = false
+        val yuvCaptureRequestTemplateFailures = mutableListOf<String>()
+
+        postStatus("Color Fusion 초기화 3/7: job.json 생성 중...")
+
+        writeColorJobJson(
+            jobFile = currentJobFile,
+            status = "CAPTURING",
+            cameraId = cameraId,
+            width = yuvSize.width,
+            height = yuvSize.height,
+            outputWidth = outputWidth,
+            outputHeight = outputHeight,
+            rotationDegrees = rotationDegrees,
+            requestedFrames = frameCount,
+            savedFrames = 0,
+            frameManifest = emptyList(),
+            gyroFile = null,
+            rotationVectorFile = null,
+            gyroSampleCount = 0,
+            rotationVectorSampleCount = 0,
+            motionInfo = "not_started",
+            resolutionMode = resolutionMode,
+            zoomRatio = zoomRatio,
+            cropApplied = cropApplied,
+            physicalCameraId = null,
+            zoomRoute = zoomRoute,
+            previewRoute = previewRoute,
+            routeFallbackReason = routeFallbackReason,
+            frameCountMode = frameCountMode,
+            plannedFrames = frameCount,
+            autoMinFrames = autoMinFrames,
+            autoMaxFrames = autoMaxFrames,
+            manualFrames = manualFrames,
+            framePlanReason = framePlanReason,
+            captureMode = captureMode,
+            processingParams = processingParams,
+            yuvMemoryBufferUsed = useMemoryBuffer,
+            yuvMemoryBufferEstimatedBytes = estimatedBufferBytes,
+            selectedRoute = zoomRoute,
+            actualRoute = actualCaptureRoute?.name,
+            requestedPhysicalCameraId = physicalCameraId,
+            finalRequestZoom = finalRequestZoom,
+            requestedZoomRatio = zoomRatio
+        )
+
+        postStatus("Color Fusion 초기화 4/7: ImageReader 생성 중...")
+
+        val reader = ImageReader.newInstance(
+            yuvSize.width,
+            yuvSize.height,
+            ImageFormat.YUV_420_888,
+            min(4, maxOf(2, frameCount))
+        )
+
+        imageReader = reader
+        // The YUV buffered lifecycle is the single authoritative collection for buffered
+        // work items; see [yuvBufferedLifecycle] for state transitions. The capture owner
+        // only observes persisted files through the owner callback below.
+        val yuvWorkProcessor = YuvPngWorkProcessor(
+            encoder = object : YuvPngEncoder {
+                override fun encodeDirect(image: Image, candidate: File, rotationDegrees: Int) {
+                    saveRotatedColorPngFromYuv(image, candidate, rotationDegrees)
+                }
+
+                override fun encodeBuffered(frame: BufferedYuvFrame, candidate: File, rotationDegrees: Int) {
+                    saveRotatedColorPngFromBufferedYuv(frame, candidate, rotationDegrees)
+                }
+            },
+            committer = YuvCandidateCommitter { candidate, finalFile ->
+                KeplerJobMetadata.atomicReplace(candidate, finalFile)
+            }
+        )
+        if (useMemoryBuffer) {
+            postStatus(
+                "YUV memory buffer enabled: frames=$frameCount " +
+                    "estimated=${estimatedBufferBytes / 1024L / 1024L}MB"
+            )
+            Log.i(
+                "KeplerCaptureStatus",
+                "YUV memory buffer enabled: frames=$frameCount " +
+                    "estimated=${estimatedBufferBytes / 1024L / 1024L}MB"
+            )
+        } else {
+            postStatus("YUV memory buffer disabled; using direct PNG save")
+            Log.i(
+                "KeplerCaptureStatus",
+                "YUV memory buffer disabled; using direct PNG save"
+            )
+        }
+        postStatus("YUV capture: saved 0/$frameCount")
+        if (!ensureSufficientSpaceForYuvBurstPngs(currentBurstDir, frameCount, outputWidth, outputHeight)) {
+            finishError(
+                message = "YUV capture failed: insufficient free space for burst frame PNGs",
+                source = "captureYuvBurstColorWithMotion.storage.freeSpace",
+                failureType = "StorageError",
+                failureMessage = "Insufficient free space before saving YUV burst PNG frames"
+            )
+            return
+        }
+        postStatus("YUV 캡처 중입니다. 기기를 움직이지 마세요.")
+
+        postStatus("Color Fusion 초기화 5/7: 모션 센서 시작 중...")
+
+        motionLogger = try {
+            MotionLogger(context).also { logger ->
+                motionInfo = logger.start()
+            }
+        } catch (e: Exception) {
+            motionInfo = "motion_failed_but_continue: ${e.javaClass.simpleName}: ${e.message}"
+            null
+        }
+
+        postStatus(
+            "Color Fusion 준비 완료\n" +
+                "Camera $cameraId\n" +
+                "Resolution: ${resolutionMode.label}\n" +
+                "Input: ${yuvSize.width}x${yuvSize.height}\n" +
+                (resolutionFallbackNote?.let { "$it\n" } ?: "") +
+                "Zoom: ${zoomRatio}x, cropApplied=$cropApplied\n" +
+                "Output: ${outputWidth}x${outputHeight}\n" +
+                "Rotation: ${rotationDegrees}도\n" +
+                "Frames: $frameCount\n" +
+                "Motion: $motionInfo\n" +
+                "Folder:\n${currentBurstDir.absolutePath}"
+        )
+
+        val processImageAvailable: (YuvPngWorkItem) -> Unit = setOnImageAvailableListener@{ item ->
+                if (finished.get()) {
+                    item.dispose(yuvAccounting)
                     return@setOnImageAvailableListener
                 }
-                val frameIndex = session.accounting.snapshot().receivedFrames
-                val isBuffered = yuvMemoryBufferUsed && frameIndex < MAX_YUV_MEMORY_BUFFER_FRAMES
-                if (isBuffered) {
-                    session.owner.acceptBuffered(Camera2YuvImageAccess(image))
-                } else {
-                    session.owner.acceptDirect(Camera2DirectYuvImageAccess(image))
-                }
-            }, workerHandler)
 
-            // Open camera
-            val stateCallback = object : CameraDevice.StateCallback() {
+                val image = item.imageForEncoding()
+
+                try {
+                    if (image == null && item.bufferedForEncoding() == null) {
+                        item.dispose(yuvAccounting)
+                        return@setOnImageAvailableListener
+                    }
+
+                    val frameIndex = item.frameIndex
+                    val imageTimestampNs = item.timestampNs
+
+                    if (useMemoryBuffer) {
+                        check(item.bufferedForEncoding() != null) { "Buffered YUV work lost its copied frame" }
+                        val registered = yuvBufferedLifecycle.tryRegister(item)
+                        if (!registered) {
+                            // Cleanup raced past registration; dispose the exact item.
+                            item.dispose(yuvAccounting)
+                            return@setOnImageAvailableListener
+                        }
+                        val bufferedFrameCount = yuvAccounting.snapshot().bufferedFrames
+                        postStatus("YUV buffered frame $bufferedFrameCount/$frameCount")
+
+                        if (bufferedFrameCount >= frameCount) {
+                            val savedMotionFiles = saveMotionOnce(currentBurstDir)
+                            val finalLogger = motionLogger
+                            val flushItems = yuvBufferedLifecycle.snapshotRetainedByFrameIndex()
+                            flushItems.forEachIndexed { flushIndex, frame ->
+                                if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+                                    return@setOnImageAvailableListener
+                                }
+                                if (!yuvBufferedLifecycle.beginEncoding(frame)) {
+                                    // Item was already drained by cleanup; skip.
+                                    return@forEachIndexed
+                                }
+                                val fileName =
+                                    "frame_${frame.frameIndex.toString().padStart(2, '0')}_color.png"
+                                val candidate = File(
+                                    currentBurstDir,
+                                    ".${fileName}.${System.nanoTime()}.tmp"
+                                )
+                                try {
+                                    yuvWorkProcessor.encode(frame, candidate, rotationDegrees)
+                                    if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+                                        if (candidate.exists() && !candidate.delete()) {
+                                            Log.e(YUV_CAPTURE_LOG_TAG, "Unable to delete late buffered YUV candidate ${candidate.absolutePath}")
+                                        }
+                                        return@forEachIndexed
+                                    }
+                                    yuvWorkProcessor.commit(candidate, File(currentBurstDir, fileName))
+                                    if (!yuvAccounting.persistedFrame(YuvFrameManifestEntry(frame.frameIndex, fileName, frame.timestampNs, true))) {
+                                        error("Duplicate YUV persisted identity or filename: $fileName")
+                                    }
+                                    postStatus("YUV flushing frame ${flushIndex + 1}/${flushItems.size}")
+                                } finally {
+                                    // Final disposal runs exactly once even if cleanup races.
+                                    yuvBufferedLifecycle.settleEncoding(frame, yuvAccounting)
+                                }
+                            }
+                            if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+                                return@setOnImageAvailableListener
+                            }
+                            val persistedFrames = yuvAccounting.snapshot().persistedFrames
+                            writeColorJobJson(
+                                jobFile = currentJobFile,
+                                status = "CAPTURE_COMPLETE",
+                                cameraId = cameraId,
+                                width = yuvSize.width,
+                                height = yuvSize.height,
+                                outputWidth = outputWidth,
+                                outputHeight = outputHeight,
+                                rotationDegrees = rotationDegrees,
+                                requestedFrames = frameCount,
+                                savedFrames = persistedFrames,
+                                frameManifest = yuvAccounting.snapshot().manifest,
+                                gyroFile = savedMotionFiles.first,
+                                rotationVectorFile = savedMotionFiles.second,
+                                gyroSampleCount = finalLogger?.gyroCount() ?: 0,
+                                rotationVectorSampleCount = finalLogger?.rotationVectorCount() ?: 0,
+                                motionInfo = motionInfo,
+                                resolutionMode = resolutionMode,
+                                zoomRatio = finalRequestZoom,
+                                cropApplied = finalCropApplied,
+                                physicalCameraId = actualPhysicalCameraId(),
+                                zoomRoute = zoomRoute,
+                                previewRoute = previewRoute,
+                                routeFallbackReason = routeFallbackReason,
+                                frameCountMode = frameCountMode,
+                                plannedFrames = frameCount,
+                                autoMinFrames = autoMinFrames,
+                                autoMaxFrames = autoMaxFrames,
+                                manualFrames = manualFrames,
+                                framePlanReason = framePlanReason,
+                                captureMode = captureMode,
+                                processingParams = processingParams,
+                                yuvMemoryBufferUsed = useMemoryBuffer,
+                                yuvMemoryBufferEstimatedBytes = estimatedBufferBytes,
+                                selectedRoute = zoomRoute,
+                                actualRoute = actualCaptureRoute?.name,
+                                requestedPhysicalCameraId = physicalCameraId,
+                                finalRequestZoom = finalRequestZoom,
+                                requestedZoomRatio = zoomRatio
+                            )
+                            postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
+                            if (persistedFrames >= frameCount) {
+                                finishSuccess(
+                                    currentBurstDir,
+                                    "CAPTURE_COMPLETE: Color Burst + Motion complete\n" +
+                                        "Frames: $persistedFrames\n" +
+                                        "Output: ${outputWidth}x${outputHeight}\n" +
+                                        "Folder:\n${currentBurstDir.absolutePath}"
+                                )
+                            }
+                        }
+                        return@setOnImageAvailableListener
+                    }
+
+                    val fileName = "frame_${frameIndex.toString().padStart(2, '0')}_color.png"
+                    val outFile = File(currentBurstDir, fileName)
+                    val candidate = File(currentBurstDir, ".${fileName}.${System.nanoTime()}.tmp")
+
+                    yuvWorkProcessor.encode(item, candidate, rotationDegrees)
+
+                    if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+                        if (candidate.exists() && !candidate.delete()) {
+                            Log.e(YUV_CAPTURE_LOG_TAG, "Unable to delete late YUV candidate ${candidate.absolutePath}")
+                        }
+                        return@setOnImageAvailableListener
+                    }
+                    yuvWorkProcessor.commit(candidate, outFile)
+                    if (!yuvAccounting.persistedFrame(YuvFrameManifestEntry(frameIndex, fileName, imageTimestampNs, true))) {
+                        error("Duplicate YUV persisted identity or filename: $fileName")
+                    }
+                    val persistedFrames = yuvAccounting.snapshot().persistedFrames
+
+                    val logger = motionLogger
+
+                    writeColorJobJson(
+                        jobFile = currentJobFile,
+                        status = "CAPTURING",
+                        cameraId = cameraId,
+                        width = yuvSize.width,
+                        height = yuvSize.height,
+                        outputWidth = outputWidth,
+                        outputHeight = outputHeight,
+                        rotationDegrees = rotationDegrees,
+                        requestedFrames = frameCount,
+                        savedFrames = persistedFrames,
+                        frameManifest = yuvAccounting.snapshot().manifest,
+                        gyroFile = null,
+                        rotationVectorFile = null,
+                        gyroSampleCount = logger?.gyroCount() ?: 0,
+                        rotationVectorSampleCount = logger?.rotationVectorCount() ?: 0,
+                        motionInfo = motionInfo,
+                        resolutionMode = resolutionMode,
+                        zoomRatio = finalRequestZoom,
+                        cropApplied = finalCropApplied,
+                        physicalCameraId = actualPhysicalCameraId(),
+                        zoomRoute = zoomRoute,
+                        previewRoute = previewRoute,
+                        routeFallbackReason = routeFallbackReason,
+                        frameCountMode = frameCountMode,
+                        plannedFrames = frameCount,
+                        autoMinFrames = autoMinFrames,
+                        autoMaxFrames = autoMaxFrames,
+                        manualFrames = manualFrames,
+                        framePlanReason = framePlanReason,
+                        captureMode = captureMode,
+                        processingParams = processingParams,
+                        yuvMemoryBufferUsed = useMemoryBuffer,
+                        yuvMemoryBufferEstimatedBytes = estimatedBufferBytes,
+                        selectedRoute = zoomRoute,
+                        actualRoute = actualCaptureRoute?.name,
+                        requestedPhysicalCameraId = physicalCameraId,
+                        finalRequestZoom = finalRequestZoom
+                    )
+
+                    postStatus("YUV capture: saved $persistedFrames/$frameCount")
+
+                    postStatus(
+                        "컬러 프레임 저장 중...\n" +
+                            "저장: $persistedFrames / $frameCount\n" +
+                            "timestampNs: $imageTimestampNs\n" +
+                            "gyro samples: ${logger?.gyroCount() ?: 0}\n" +
+                            "rotation samples: ${logger?.rotationVectorCount() ?: 0}\n" +
+                            "폴더:\n${currentBurstDir.absolutePath}"
+                    )
+
+                    if (persistedFrames >= frameCount) {
+                        if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+                            return@setOnImageAvailableListener
+                        }
+                        val savedMotionFiles = saveMotionOnce(currentBurstDir)
+                        val finalLogger = motionLogger
+
+                        writeColorJobJson(
+                            jobFile = currentJobFile,
+                            status = "CAPTURE_COMPLETE",
+                            cameraId = cameraId,
+                            width = yuvSize.width,
+                            height = yuvSize.height,
+                            outputWidth = outputWidth,
+                            outputHeight = outputHeight,
+                            rotationDegrees = rotationDegrees,
+                            requestedFrames = frameCount,
+                            savedFrames = persistedFrames,
+                            frameManifest = yuvAccounting.snapshot().manifest,
+                            gyroFile = savedMotionFiles.first,
+                            rotationVectorFile = savedMotionFiles.second,
+                            gyroSampleCount = finalLogger?.gyroCount() ?: 0,
+                            rotationVectorSampleCount = finalLogger?.rotationVectorCount() ?: 0,
+                            motionInfo = motionInfo,
+                            resolutionMode = resolutionMode,
+                            zoomRatio = finalRequestZoom,
+                            cropApplied = finalCropApplied,
+                            physicalCameraId = actualPhysicalCameraId(),
+                            zoomRoute = zoomRoute,
+                            previewRoute = previewRoute,
+                            routeFallbackReason = routeFallbackReason,
+                            frameCountMode = frameCountMode,
+                            plannedFrames = frameCount,
+                            autoMinFrames = autoMinFrames,
+                            autoMaxFrames = autoMaxFrames,
+                            manualFrames = manualFrames,
+                            framePlanReason = framePlanReason,
+                            captureMode = captureMode,
+                            processingParams = processingParams,
+                            yuvMemoryBufferUsed = useMemoryBuffer,
+                            yuvMemoryBufferEstimatedBytes = estimatedBufferBytes,
+                            selectedRoute = zoomRoute,
+                            actualRoute = actualCaptureRoute?.name,
+                            requestedPhysicalCameraId = physicalCameraId,
+                            finalRequestZoom = finalRequestZoom,
+                            requestedZoomRatio = zoomRatio
+                        )
+
+                        postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
+                        finishSuccess(
+                            currentBurstDir,
+                            "CAPTURE_COMPLETE: Color Burst + Motion 저장 완료\n" +
+                                "프레임: $persistedFrames 장\n" +
+                                "출력: ${outputWidth}x${outputHeight}\n" +
+                                "rotation: ${rotationDegrees}도\n" +
+                                "gyro samples: ${finalLogger?.gyroCount() ?: 0}\n" +
+                                "rotation samples: ${finalLogger?.rotationVectorCount() ?: 0}\n" +
+                                "폴더:\n${currentBurstDir.absolutePath}"
+                        )
+                    }
+                } catch (oom: OutOfMemoryError) {
+                    val drained = yuvBufferedLifecycle.closeAndDrainRetained()
+                    drained.forEach { it.dispose(yuvAccounting) }
+                    yuvAccounting.failedFrame()
+                    finishError(
+                        message = "YUV memory buffer failed while copying/flushing; job directory and completed source frames kept.",
+                        source = "captureYuvBurstColorWithMotion.imageReader.memoryBuffer.oom",
+                        throwable = oom,
+                        failureType = "CaptureRequestError",
+                        failureMessage = "OutOfMemoryError while copying or flushing buffered YUV frames"
+                    )
+                } catch (e: Exception) {
+                    yuvAccounting.failedFrame()
+                    finishError(
+                        message = "컬러 프레임 저장 실패",
+                        source = "captureYuvBurstColorWithMotion.imageReader.save",
+                        throwable = e,
+                        failureType = "CaptureRequestError",
+                        failureMessage = e.message ?: "Failed while saving YUV color frame"
+                    )
+                } finally {
+                    // For direct items the worker owns disposal here. For buffered items the
+                    // lifecycle's settleEncoding (called in the flush finally above) has
+                    // already disposed; if the lifecycle never accepted this item the worker
+                    // disposes it directly so no resource leaks.
+                    if (!useMemoryBuffer) item.dispose(yuvAccounting)
+                }
+            }
+        reader.setOnImageAvailableListener(
+            { r ->
+                if (finished.get()) {
+                    runCatching { r.acquireNextImage()?.close() }
+                    return@setOnImageAvailableListener
+                }
+                val image = try {
+                    r.acquireNextImage()
+                } catch (t: Throwable) {
+                    if (t is Error) throw t
+                    yuvAccounting.failedFrame()
+                    finishError("YUV acquire failed", "captureYuvBurstColorWithMotion.imageReader.acquire", t)
+                    return@setOnImageAvailableListener
+                } ?: return@setOnImageAvailableListener
+                yuvAccounting.receivedFrame()
+                val frameIndex = frameIdentityOwner.nextIdentity()
+                if (frameIndex == null) {
+                    runCatching { image.close() }
+                    yuvAccounting.droppedFrame()
+                    return@setOnImageAvailableListener
+                }
+                val ownedItem = if (useMemoryBuffer) {
+                    when (val creation = createBufferedYuvWork(
+                        frameIndex = frameIndex,
+                        access = Camera2YuvImageAccess(image),
+                        reservations = yuvReservations,
+                        accounting = yuvAccounting
+                    )) {
+                        is BufferedYuvWorkCreation.Accepted -> creation.item
+                        BufferedYuvWorkCreation.Rejected -> {
+                            postStatus("YUV memory buffer dropped frame ${frameIndex + 1}/$frameCount: retained=${yuvReservations.currentBytes()} bytes")
+                            return@setOnImageAvailableListener
+                        }
+                        is BufferedYuvWorkCreation.Failed -> {
+                            if (creation.cause is Error) throw creation.cause
+                            finishError("YUV memory buffer copy failed", "captureYuvBurstColorWithMotion.imageReader.memoryBuffer", creation.cause)
+                            return@setOnImageAvailableListener
+                        }
+                    }
+                } else {
+                    // Direct workers own this Image until their exact task is disposed.
+                    YuvPngWorkItem.direct(frameIndex, image.timestamp, image)
+                }
+                val task = DisposableYuvTask(ownedItem, yuvAccounting) { processImageAvailable(ownedItem) }
+                if (!yuvWorkQueue.submit(task)) {
+                    yuvAccounting.droppedFrame()
+                    postStatus("YUV capture backpressure: frame ${ownedItem.frameIndex + 1} dropped")
+                }
+            },
+            backgroundHandler
+        )
+
+        postStatus("Color Fusion 초기화 6/7: 카메라 여는 중...")
+
+        cameraManager.openCamera(
+            cameraId,
+            object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
-                    cameraDevice = camera
-                    if (sessionRef.get()?.finished?.get() == true) {
-                        logLateCameraCallback("onOpened", "session already finished")
+                    if (finished.get()) {
+                        logLateCameraCallback("CameraDevice.onOpened.beforeAssign")
                         camera.close()
                         return
                     }
-                    postStatusMsg("카메라 열림 - YUV 버스트 시작")
+                    cameraDevice = camera
+                    if (finished.get()) {
+                        logLateCameraCallback("CameraDevice.onOpened.afterAssign")
+                        camera.close()
+                        return
+                    }
+                    postStatus("카메라 열림. Color Burst 세션 생성 중...")
+
                     try {
-                        val (requestBuilder, template) = createYuvBurstCaptureRequestBuilder(
+                        createRoutedStillCaptureSession(
                             camera = camera,
-                            readerSurface = burstReader!!.surface,
-                            characteristics = characteristics,
-                            zoomRatio = zoomRatio,
-                            focusAeState = focusAeState,
-cameraId = cameraId,
-                            postStatusMsg = postStatusMsg,
-                            failureMessages = yuvCaptureRequestTemplateFailures
+                            surface = reader.surface,
+                            cameraId = cameraId,
+                            physicalCameraId = physicalCameraId,
+                            requestedUiZoomRatio = requestedUiZoomRatio,
+                            requestedCaptureZoomRatio = zoomRatio,
+                            selectedRoute = zoomRoute,
+                            handler = backgroundHandler,
+                            pipelineName = "YUV",
+                            isFinished = { finished.get() },
+                            onConfigured = { session, captureRoute ->
+                                    if (finished.get()) {
+                                        logLateCameraCallback("CameraCaptureSession.onConfigured.beforeAssign")
+                                        session.close()
+                                        return@createRoutedStillCaptureSession
+                                    }
+                                    captureSession = session
+                                    if (finished.get()) {
+                                        logLateCameraCallback("CameraCaptureSession.onConfigured.afterAssign")
+                                        session.close()
+                                        return@createRoutedStillCaptureSession
+                                    }
+                                    postStatus("Color Fusion 초기화 7/7: 세션 준비 완료. $frameCount 장 촬영 중...")
+
+                                    try {
+                                        actualCaptureRoute = captureRoute
+                                        finalRequestZoom = captureRoute.finalRequestZoomRatio(zoomRatio)
+                                        finalCropApplied = finalRequestZoom > 1f &&
+                                            buildCenterCropRegion(characteristics, finalRequestZoom) != null
+                                        val requestZoomRatio = finalRequestZoom
+                                        writeColorJobJson(
+                                            jobFile = currentJobFile,
+                                            status = "CAPTURING",
+                                            cameraId = cameraId,
+                                            width = yuvSize.width,
+                                            height = yuvSize.height,
+                                            outputWidth = outputWidth,
+                                            outputHeight = outputHeight,
+                                            rotationDegrees = rotationDegrees,
+                                            requestedFrames = frameCount,
+                                            savedFrames = yuvAccounting.snapshot().persistedFrames,
+                                            frameManifest = yuvAccounting.snapshot().manifest,
+                                            gyroFile = null,
+                                            rotationVectorFile = null,
+                                            gyroSampleCount = motionLogger?.gyroCount() ?: 0,
+                                            rotationVectorSampleCount = motionLogger?.rotationVectorCount() ?: 0,
+                                            motionInfo = motionInfo,
+                                            resolutionMode = resolutionMode,
+                                            zoomRatio = finalRequestZoom,
+                                            cropApplied = finalCropApplied,
+                                            physicalCameraId = actualPhysicalCameraId(),
+                                            zoomRoute = zoomRoute,
+                                            previewRoute = previewRoute,
+                                            routeFallbackReason = routeFallbackReason,
+                                            frameCountMode = frameCountMode,
+                                            plannedFrames = frameCount,
+                                            autoMinFrames = autoMinFrames,
+                                            autoMaxFrames = autoMaxFrames,
+                                            manualFrames = manualFrames,
+                                            framePlanReason = framePlanReason,
+                                            captureMode = captureMode,
+                                            processingParams = processingParams,
+                                            yuvMemoryBufferUsed = useMemoryBuffer,
+                                            yuvMemoryBufferEstimatedBytes = estimatedBufferBytes,
+                                            selectedRoute = zoomRoute,
+                                            actualRoute = actualCaptureRoute?.name,
+                                            requestedPhysicalCameraId = physicalCameraId,
+                                            finalRequestZoom = finalRequestZoom,
+                                            requestedZoomRatio = zoomRatio
+                                        )
+                                        val requests = List(frameCount) {
+                                            val (builder, selectedTemplate) =
+                                                createYuvBurstCaptureRequestBuilder(
+                                                    camera = camera,
+                                                    readerSurface = reader.surface,
+                                                    characteristics = characteristics,
+                                                    zoomRatio = requestZoomRatio,
+                                                    focusAeState = focusAeState,
+                                                    cameraId = cameraId,
+                                                    postStatus = ::postStatus,
+                                                    failureMessages = yuvCaptureRequestTemplateFailures
+                                                )
+                                            yuvCaptureRequestTemplate =
+                                                yuvTemplateLabel(selectedTemplate)
+                                            yuvCaptureRequestTemplateFallbackUsed =
+                                                selectedTemplate != CameraDevice.TEMPLATE_STILL_CAPTURE
+                                            builder.build()
+                                        }
+                                        updateYuvCaptureRequestTemplateMetadata(
+                                            jobFile = currentJobFile,
+                                            template = yuvCaptureRequestTemplate,
+                                            fallbackUsed = yuvCaptureRequestTemplateFallbackUsed,
+                                            failures = yuvCaptureRequestTemplateFailures
+                                        )
+                                        Log.i(
+                                            "KeplerCaptureStatus",
+                                            "YUV capture request template selected: " +
+                                                yuvCaptureRequestTemplate
+                                        )
+                                        postStatus(
+                                            "YUV capture request template selected: " +
+                                                yuvCaptureRequestTemplate
+                                        )
+
+                                        session.captureBurst(
+                                            requests,
+                                            object : CameraCaptureSession.CaptureCallback() {
+                                                override fun onCaptureCompleted(
+                                                    session: CameraCaptureSession,
+                                                    request: CaptureRequest,
+                                                    result: TotalCaptureResult
+                                                ) {
+                                                    completedResults++
+                                                    Log.i(
+                                                        "KeplerPhysicalRoute",
+                                                        "capture completed selectedRoute=$zoomRoute actualRoute=$captureRoute " +
+                                                            "requestedUiZoomRatio=$requestedUiZoomRatio " +
+                                                            "requestedPhysicalCameraId=$physicalCameraId " +
+                                                            "activePhysicalId=${result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)} " +
+                                                            "finalRequestZoom=$requestZoomRatio"
+                                                    )
+                                                }
+
+                                                override fun onCaptureFailed(
+                                                    session: CameraCaptureSession,
+                                                    request: CaptureRequest,
+                                                    failure: CaptureFailure
+                                                ) {
+                                                    yuvAccounting.failedFrame()
+                                                    finishError(
+                                                        message = "Color Burst 캡처 실패",
+                                                        source = "captureYuvBurstColorWithMotion.captureRequest.failed",
+                                                        failureType = "CaptureFailure",
+                                                        failureMessage = "reason=${failure.reason}, sequenceId=${failure.sequenceId}, frameNumber=${failure.frameNumber}, wasImageCaptured=${failure.wasImageCaptured()}"
+                                                    )
+                                                }
+                                            },
+                                            backgroundHandler
+                                        )
+                                        timeoutScheduler.schedule({
+                                            if (!terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) return@schedule
+                                            val timeoutSnapshot = yuvAccounting.snapshot()
+                                            val settle = object : CaptureOwnerEvent {
+                                                override fun execute() {
+                                                    if (timeoutSnapshot.persistedFrames >= frameCount) {
+                                                        finishSuccess(
+                                                            currentBurstDir,
+                                                            "YUV capture completed before timeout settlement",
+                                                            terminalAlreadyClaimed = true
+                                                        )
+                                                    } else {
+                                                        finishError(
+                                                            message = "YUV capture timeout: saved=${timeoutSnapshot.persistedFrames}/$frameCount, receivedImages=${timeoutSnapshot.receivedFrames}, completedResults=$completedResults, failedCaptures=${timeoutSnapshot.failedFrames}",
+                                                            source = "captureYuvBurstColorWithMotion.captureRequest.timeout",
+                                                            failureType = "CaptureTimeout",
+                                                            failureMessage = "No enough YUV frames before timeout",
+                                                            terminalAlreadyClaimed = true
+                                                        )
+                                                    }
+                                                }
+                                                override fun disposeWithoutMutation() {}
+                                            }
+                                            if (!captureStateOwner.post(settle)) {
+                                                // The owner looper is gone. Preserve the claimed terminal
+                                                // state and only perform minimal emergency resource cleanup.
+                                                Log.e(YUV_CAPTURE_LOG_TAG, "YUV owner handler rejected timeout settlement")
+                                                finished.set(true)
+                                                cleanup()
+                                            }
+                                        }, captureTimeoutMs, TimeUnit.MILLISECONDS)
+                                    } catch (e: Exception) {
+                                        val templateFailure =
+                                            e.message?.contains(
+                                                "YUV capture request template creation failed"
+                                            ) == true
+                                        if (templateFailure) {
+                                            finishError(
+                                                message = "PIPELINE_FAILED: ${e.message}",
+                                                source = "captureYuvBurstColorWithMotion.captureRequest.template",
+                                                throwable = e,
+                                                failureType = "CaptureRequestError",
+                                                failureMessage = yuvCaptureRequestTemplateFailures.joinToString(" | ").ifBlank {
+                                                    e.message ?: "YUV capture request template creation failed"
+                                                }
+                                            )
+                                        } else {
+                                            finishError(
+                                                message = "Color Burst 캡처 요청 실패",
+                                                source = "captureYuvBurstColorWithMotion.captureRequest.submit",
+                                                throwable = e,
+                                                failureType = "CaptureRequestError",
+                                                failureMessage = e.message ?: "Capture request submission failed"
+                                            )
+                                        }
+                                    }
+                            },
+
+                            onFailed = { reason ->
+                                    if (finished.get()) {
+                                        logLateCameraCallback("CameraCaptureSession.onConfigureFailed")
+                                        return@createRoutedStillCaptureSession
+                                    }
+                                    finishError(
+                                        message = "Color Burst 세션 구성 실패: $reason",
+                                        source = "captureYuvBurstColorWithMotion.session.configure",
+                                        failureType = "SessionConfigurationFailed",
+                                        failureMessage = reason
+                                    )
+                            }
                         )
-                        yuvCaptureRequestTemplate = yuvTemplateLabel(template)
-                        yuvCaptureRequestTemplateFallbackUsed = (template != CameraDevice.TEMPLATE_STILL_CAPTURE)
-                        updateYuvCaptureRequestTemplateMetadata(
-                            jobFile!!, yuvCaptureRequestTemplate!!, yuvCaptureRequestTemplateFallbackUsed, yuvCaptureRequestTemplateFailures
-                        )
-
-                        val captureRequest = requestBuilder.build()
-                        val captureCallback = object : CameraCaptureSession.CaptureCallback() {
-                            override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                                val s = sessionRef.get() ?: return
-                                if (s.finished.get()) {
-                                    logLateCameraCallback("onCaptureCompleted", "session finished")
-                                    return
-                                }
-                                s.owner.onCaptureCompletedResult()
-                            }
-
-                            override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
-                                val s = sessionRef.get() ?: return
-                                if (s.finished.get()) {
-                                    logLateCameraCallback("onCaptureFailed", "session finished")
-                                    return
-                                }
-                                val cause = IllegalStateException("Capture failed: reason=${failure.reason}")
-                                s.owner.onCaptureFailed(cause, "captureRequest.failed")
-                            }
-
-                            override fun onCaptureSequenceCompleted(session: CameraCaptureSession, sequenceId: Int, frameNumber: Long) {
-                                // no-op
-                            }
-
-                            override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
-                                val s = sessionRef.get() ?: return
-                                if (s.finished.get()) {
-                                    logLateCameraCallback("onCaptureSequenceAborted", "session finished")
-                                    return
-                                }
-                                s.owner.onCaptureFailed(IllegalStateException("Capture sequence aborted"), "captureSequenceAborted")
-                            }
-                        }
-
-                        camera.createCaptureSession(listOf(burstReader!!.surface), object : CameraCaptureSession.StateCallback() {
-                            override fun onConfigured(session: CameraCaptureSession) {
-                                if (sessionRef.get()?.finished?.get() == true) {
-                                    logLateCameraCallback("onConfigured", "session finished")
-                                    session.close()
-                                    return
-                                }
-                                try {
-                                    session.setRepeatingBurst(listOf(captureRequest), captureCallback, workerHandler)
-                                } catch (e: Exception) {
-                                    val s = sessionRef.get() ?: return
-                                    s.owner.onCaptureFailed(e, "repeatingBurst.startFailed")
-                                }
-                            }
-
-                            override fun onConfigureFailed(session: CameraCaptureSession) {
-                                val s = sessionRef.get() ?: return
-                                s.owner.onCaptureFailed(IllegalStateException("Capture session configure failed"), "captureSession.configureFailed")
-                            }
-                        }, workerHandler)
                     } catch (e: Exception) {
-                        val s = sessionRef.get() ?: return
-                        s.owner.onCaptureFailed(e, "captureRequest.buildFailed")
+                        finishError(
+                            message = "Color Burst 세션 생성 실패",
+                            source = "captureYuvBurstColorWithMotion.session.create",
+                            throwable = e,
+                            failureType = "SessionConfigurationFailed",
+                            failureMessage = e.message ?: "Failed to create capture session"
+                        )
                     }
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
                     camera.close()
-                    cameraDevice = null
-                    val s = sessionRef.get() ?: return
-                    if (!s.finished.get()) {
-                        s.owner.onCaptureFailed(IllegalStateException("Camera disconnected"), "cameraDisconnected")
+                    if (finished.get()) {
+                        logLateCameraCallback("CameraDevice.onDisconnected")
+                        return
                     }
+                    finishError(
+                        message = "카메라 연결 해제됨",
+                        source = "captureYuvBurstColorWithMotion.camera.disconnected",
+                        failureType = "CameraDisconnected",
+                        failureMessage = "CameraDevice disconnected during YUV capture"
+                    )
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
                     camera.close()
-                    cameraDevice = null
-                    val s = sessionRef.get() ?: return
-                    if (!s.finished.get()) {
-                        s.owner.onCaptureFailed(IllegalStateException("Camera error: $error"), "cameraError:$error")
+                    if (finished.get()) {
+                        logLateCameraCallback("CameraDevice.onError")
+                        return
                     }
+                    finishError(
+                        message = "카메라 오류: $error",
+                        source = "captureYuvBurstColorWithMotion.camera.error",
+                        failureType = "CameraDeviceError",
+                        failureMessage = "CameraDevice onError($error)"
+                    )
                 }
-            }
-
-            cameraManager.openCamera(cameraId, stateCallback, workerHandler)
-
-            // Timeout
-            val timeoutMs = computeYuvCaptureTimeoutMs(plannedFrames, resolutionMode)
-            val timeoutExecutor = Executors.newSingleThreadScheduledExecutor()
-            timeoutExecutor.schedule({
-                val s = sessionRef.get() ?: return@schedule
-                if (!s.finished.get()) {
-                    s.owner.onDeadlineReached()
-                }
-            }, timeoutMs, TimeUnit.MILLISECONDS)
-
-            // Cancellation check
-            registerCancellation {
-                val s = sessionRef.get() ?: return@registerCancellation true
-                if (!s.finished.get()) {
-                    s.owner.onCancellationRequested()
-                }
-                true
-            }
-
-        } catch (e: Exception) {
-            failInit("captureYuvBurstColorWithMotion.setupFailed", e)
-            cleanup()
-        }
+            },
+            backgroundHandler
+        )
+    } catch (e: Exception) {
+        finishError(
+            message = "Color Fusion 초기화 실패",
+            source = "captureYuvBurstColorWithMotion.init.catch",
+            throwable = e,
+            failureType = "CaptureRequestError",
+            failureMessage = e.message ?: "Unexpected initialization failure"
+        )
     }
 }
 
@@ -665,7 +1291,7 @@ fun averageLatestYuvBurstColor(
     onStatus: (String) -> Unit
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
-    fun postStatusMsg(message: String) {
+    fun postStatus(message: String) {
         if (!mainHandler.post { onStatus(message) }) runCatching { onStatus(message) }
     }
 
@@ -677,7 +1303,7 @@ fun averageLatestYuvBurstColor(
             val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
 
             if (picturesDir == null) {
-                postStatusMsg("Pictures 폴더를 찾지 못함")
+                postStatus("Pictures 폴더를 찾지 못함")
                 workerThread.quitSafely()
                 return@post
             }
@@ -685,7 +1311,7 @@ fun averageLatestYuvBurstColor(
             val colorRoot = File(picturesDir, "KeplerYuvFusion")
 
             if (NoFollowFileSystem.inspect(colorRoot.toPath()) is NoFollowInspection.Absent) {
-                postStatusMsg("KeplerColorBurst 폴더가 없음. 먼저 Color Fusion 캡처를 해야 함.")
+                postStatus("KeplerColorBurst 폴더가 없음. 먼저 Color Fusion 캡처를 해야 함.")
                 workerThread.quitSafely()
                 return@post
             }
@@ -695,7 +1321,7 @@ fun averageLatestYuvBurstColor(
                 ?.maxByOrNull { it.lastModified() }
 
             if (latestJobDir == null) {
-                postStatusMsg("Color Fusion job을 찾지 못함")
+                postStatus("Color Fusion job을 찾지 못함")
                 workerThread.quitSafely()
                 return@post
             }
@@ -705,7 +1331,7 @@ fun averageLatestYuvBurstColor(
             val framesArray = job.getJSONArray("frames")
 
             if (framesArray.length() == 0) {
-                postStatusMsg("job.json에 컬러 프레임이 없음")
+                postStatus("job.json에 컬러 프레임이 없음")
                 workerThread.quitSafely()
                 return@post
             }
@@ -715,7 +1341,7 @@ fun averageLatestYuvBurstColor(
             val firstBitmap = BitmapFactory.decodeFile(firstFile.absolutePath)
 
             if (firstBitmap == null) {
-                postStatusMsg("첫 컬러 프레임을 읽지 못함")
+                postStatus("첫 컬러 프레임을 읽지 못함")
                 workerThread.quitSafely()
                 return@post
             }
@@ -731,7 +1357,7 @@ fun averageLatestYuvBurstColor(
 
             var usedFrames = 0
 
-            postStatusMsg(
+            postStatus(
                 "컬러 평균 합성 준비\n" +
                     "폴더: ${latestJobDir.name}\n" +
                     "해상도: ${width}x${height}\n" +
@@ -765,14 +1391,14 @@ fun averageLatestYuvBurstColor(
                 bitmap.recycle()
                 usedFrames++
 
-                postStatusMsg(
+                postStatus(
                     "컬러 평균 합성 중...\n" +
                         "사용 프레임: $usedFrames / ${framesArray.length()}"
                 )
             }
 
             if (usedFrames == 0) {
-                postStatusMsg("사용 가능한 컬러 프레임이 없음")
+                postStatus("사용 가능한 컬러 프레임이 없음")
                 workerThread.quitSafely()
                 return@post
             }
@@ -803,21 +1429,21 @@ fun averageLatestYuvBurstColor(
                 .put("averageUsedFrames", usedFrames)
                 .put("processedAt", System.currentTimeMillis())
 
-            KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
-                current.put("processStatus", updatedJob.get("processStatus"))
-                    .put("averageColorFile", updatedJob.get("averageColorFile"))
-                    .put("averageUsedFrames", updatedJob.get("averageUsedFrames"))
-                    .put("processedAt", updatedJob.get("processedAt"))
-            }
+        KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
+            current.put("processStatus", updatedJob.get("processStatus"))
+                .put("averageColorFile", updatedJob.get("averageColorFile"))
+                .put("averageUsedFrames", updatedJob.get("averageUsedFrames"))
+                .put("processedAt", updatedJob.get("processedAt"))
+        }
 
-            postStatusMsg(
+            postStatus(
                 "컬러 평균 합성 완료\n" +
                     "사용 프레임: $usedFrames 장\n" +
                     "결과:\n${outFile.absolutePath}\n" +
                     "크기: ${outFile.length() / 1024 / 1024} MB"
             )
         } catch (e: Exception) {
-            postStatusMsg("컬러 평균 합성 실패\n${e.stackTraceToString()}")
+            postStatus("컬러 평균 합성 실패\n${e.stackTraceToString()}")
         } finally {
             workerThread.quitSafely()
         }
@@ -959,7 +1585,7 @@ fun rotateBitmapIfNeeded(
 
     if (normalized == 0) return bitmap
 
-    val matrix = android.graphics.Matrix().apply {
+    val matrix = Matrix().apply {
         postRotate(normalized.toFloat())
     }
 
@@ -1041,7 +1667,7 @@ private fun createYuvBurstCaptureRequestBuilder(
     zoomRatio: Float,
     focusAeState: FocusAeState,
     cameraId: String,
-    postStatusMsg: (String) -> Unit,
+    postStatus: (String) -> Unit,
     failureMessages: MutableList<String>? = null
 ): Pair<CaptureRequest.Builder, Int> {
     val templates = listOf(
@@ -1061,7 +1687,7 @@ private fun createYuvBurstCaptureRequestBuilder(
             Log.w("KeplerCaptureStatus", "YUV capture request template failed: $message")
             val next = templates.dropWhile { it != template }.drop(1).firstOrNull()
             if (next != null) {
-                postStatusMsg(
+                postStatus(
                     "YUV capture request template ${yuvTemplateShortName(template)} failed; " +
                         "trying ${yuvTemplateShortName(next)}..."
                 )
