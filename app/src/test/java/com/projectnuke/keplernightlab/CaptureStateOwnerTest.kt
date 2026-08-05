@@ -297,12 +297,41 @@ class CaptureStateOwnerTest {
         assertEquals(1, event.disposals.get())
     }
 
-    // ---- false-return racing PENDING -> RUNNING ----
+    // ---- DISPOSED acceptance defect tests (dispatcher closes owner + false/throw) ----
+
+    @Test
+    fun dispatcherClosesOwnerThenReturnsFalsePostReturnsFalse() {
+        val event = TestEvent()
+        var ownerRef: CaptureStateOwner? = null
+        val owner = CaptureStateOwner(dispatch = { ownerRef!!.close(); false })
+        ownerRef = owner
+        assertFalse(owner.post(event))
+        assertEquals(0, event.executions.get())
+        assertEquals(1, event.disposals.get())
+        assertEquals(0, owner.pendingCount())
+        assertEquals(0, owner.trackingSize())
+    }
+
+    @Test
+    fun dispatcherClosesOwnerThenThrowsPostReturnsFalse() {
+        val event = TestEvent()
+        var ownerRef: CaptureStateOwner? = null
+        val owner = CaptureStateOwner(dispatch = { ownerRef!!.close(); error("close-then-throw") })
+        ownerRef = owner
+        assertFalse(owner.post(event))
+        assertEquals(0, event.executions.get())
+        assertEquals(1, event.disposals.get())
+        assertEquals(0, owner.pendingCount())
+        assertEquals(0, owner.trackingSize())
+    }
+
+    // ---- false/throw racing PENDING -> RUNNING (deterministic with latches + join) ----
 
     @Test
     fun falseReturnRacingPendingToRunningReportsAccepted() {
         val eventStarted = CountDownLatch(1)
         val allowEventToFinish = CountDownLatch(1)
+        val executionFinished = CountDownLatch(1)
         val executionCount = AtomicInteger(0)
         val disposalCount = AtomicInteger(0)
 
@@ -311,12 +340,14 @@ class CaptureStateOwnerTest {
                 eventStarted.countDown()
                 assertTrue(allowEventToFinish.await(2, TimeUnit.SECONDS))
                 executionCount.incrementAndGet()
+                executionFinished.countDown()
             }
             override fun disposeWithoutMutation() { disposalCount.incrementAndGet() }
         }
 
+        val execThread = AtomicReference<Thread>()
         val owner = CaptureStateOwner(dispatch = { e ->
-            Thread { e.execute() }.start()
+            val t = Thread { e.execute() }; execThread.set(t); t.start()
             assertTrue(eventStarted.await(2, TimeUnit.SECONDS))
             false
         })
@@ -324,39 +355,36 @@ class CaptureStateOwnerTest {
         assertTrue(owner.post(event))
         assertEquals(0, disposalCount.get())
         allowEventToFinish.countDown()
-
-        val deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(5)
-        while (System.currentTimeMillis() < deadline && executionCount.get() == 0) {
-            Thread.yield()
-        }
+        assertTrue(executionFinished.await(5, TimeUnit.SECONDS))
+        execThread.get()?.join(2_000)
         assertEquals(1, executionCount.get())
         assertEquals(0, disposalCount.get())
         assertEquals(0, owner.pendingCount())
         assertEquals(0, owner.runningCount())
+        assertEquals(0, owner.trackingSize())
     }
 
     @Test
     fun throwRacingPendingToRunningReportsAccepted() {
         val eventStarted = CountDownLatch(1)
         val allowEventToFinish = CountDownLatch(1)
+        val executionFinished = CountDownLatch(1)
         val executionCount = AtomicInteger(0)
         val disposalCount = AtomicInteger(0)
 
         val event = object : CaptureOwnerEvent {
             override fun execute() {
                 eventStarted.countDown()
-                try {
-                    allowEventToFinish.await(2, TimeUnit.SECONDS)
-                } catch (_: InterruptedException) {
-                    return
-                }
+                assertTrue(allowEventToFinish.await(2, TimeUnit.SECONDS))
                 executionCount.incrementAndGet()
+                executionFinished.countDown()
             }
             override fun disposeWithoutMutation() { disposalCount.incrementAndGet() }
         }
 
+        val eventThread = AtomicReference<Thread>()
         val owner = CaptureStateOwner(dispatch = { e ->
-            Thread { e.execute() }.start()
+            val t = Thread { e.execute() }; eventThread.set(t); t.start()
             assertTrue(eventStarted.await(2, TimeUnit.SECONDS))
             error("dispatch threw late")
         })
@@ -364,45 +392,37 @@ class CaptureStateOwnerTest {
         assertTrue(owner.post(event))
         assertEquals(0, disposalCount.get())
         allowEventToFinish.countDown()
-
-        val deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(5)
-        while (System.currentTimeMillis() < deadline && executionCount.get() == 0) {
-            Thread.yield()
-        }
+        assertTrue(executionFinished.await(5, TimeUnit.SECONDS))
+        eventThread.get()?.join(1_000)
         assertEquals(1, executionCount.get())
         assertEquals(0, disposalCount.get())
         assertEquals(0, owner.pendingCount())
         assertEquals(0, owner.runningCount())
+        assertEquals(0, owner.trackingSize())
     }
 
-    // ---- queued-then-throw -> disposed exactly once and later execute is no-op ----
-    // (This was already covered above; adding one more for clarity)
+    @Test
+    fun falseRacingPendingToCompletedReportsAccepted() {
+        val event = TestEvent()
+        val owner = CaptureStateOwner(dispatch = { it.execute(); false })
+        assertTrue(owner.post(event))
+        assertEquals(1, event.executions.get())
+        assertEquals(0, event.disposals.get())
+        assertEquals(0, owner.pendingCount())
+        assertEquals(0, owner.runningCount())
+        assertEquals(0, owner.trackingSize())
+    }
 
     @Test
-    fun queuedThenThrowReportsRejectedAndLaterExecuteIsNoop() {
-        val executionCount = AtomicInteger(0)
-        val disposalCount = AtomicInteger(0)
-        val infos = mutableListOf<CaptureOwnerEvent>()
-
-        val event = object : CaptureOwnerEvent {
-            override fun execute() { executionCount.incrementAndGet() }
-            override fun disposeWithoutMutation() { disposalCount.incrementAndGet() }
-        }
-
-        val owner = CaptureStateOwner(dispatch = { e ->
-            infos.add(e)
-            error("dispatch threw after queueing")
-        })
-
-        assertFalse(owner.post(event))
-        assertEquals(0, executionCount.get())
-        assertEquals(1, disposalCount.get())
+    fun throwRacingPendingToCompletedReportsAccepted() {
+        val event = TestEvent()
+        val owner = CaptureStateOwner(dispatch = { it.execute(); error("after") })
+        assertTrue(owner.post(event))
+        assertEquals(1, event.executions.get())
+        assertEquals(0, event.disposals.get())
         assertEquals(0, owner.pendingCount())
-
-        // Later, execute is a no-op (already disposed)
-        infos.first().execute()
-        assertEquals(0, executionCount.get())
-        assertEquals(1, disposalCount.get())
+        assertEquals(0, owner.runningCount())
+        assertEquals(0, owner.trackingSize())
     }
 
     // ---- blocking disposer does not hold owner lock ----
@@ -500,9 +520,11 @@ class CaptureStateOwnerTest {
     fun runningEventRemainsTrackedAfterClose() {
         val started = CountDownLatch(1)
         val block = CountDownLatch(1)
+        val executionDone = CountDownLatch(1)
         val event = BlockingTestEvent(started, block)
+        val execThread = AtomicReference<Thread>()
         val owner = CaptureStateOwner(dispatch = { env ->
-            Thread { env.execute() }.start()
+            val t = Thread { env.execute(); executionDone.countDown() }; execThread.set(t); t.start()
             true
         })
         assertTrue(owner.post(event))
@@ -515,11 +537,8 @@ class CaptureStateOwnerTest {
         assertEquals(0, event.disposals.get())
 
         block.countDown()
-        // Spin flush until body exits
-        val deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(5)
-        while (System.currentTimeMillis() < deadline && owner.runningCount() > 0) {
-            Thread.yield()
-        }
+        assertTrue(executionDone.await(5, TimeUnit.SECONDS))
+        execThread.get()?.join(2_000)
         assertEquals(0, owner.runningCount())
         assertEquals(1, event.executions.get())
         assertEquals(0, event.disposals.get())
@@ -556,4 +575,97 @@ class CaptureStateOwnerTest {
         assertEquals(0, e1.executions.get())
         assertEquals(0, e2.executions.get())
     }
-}
+
+    // ======================== disposal-hook failure containment ========================
+
+    // onDisposalFailure throws but close continues to drain remaining events
+    @Test
+    fun firstCloseDrainedEventThrowsDuringDisposalSecondStillDisposes() {
+        val e1 = object : CaptureOwnerEvent {
+            val disposals = AtomicInteger(0)
+            override fun execute() {}
+            override fun disposeWithoutMutation() { disposals.incrementAndGet(); error("disposal A failed") }
+        }
+        val e2 = object : CaptureOwnerEvent {
+            val disposals = AtomicInteger(0)
+            override fun execute() {}
+            override fun disposeWithoutMutation() { disposals.incrementAndGet() }
+        }
+        val hookFailures = AtomicInteger(0)
+        val internalFailures = AtomicInteger(0)
+        val owner = CaptureStateOwner(
+            dispatch = { true },
+            onDisposalFailure = { _, _ -> hookFailures.incrementAndGet() },
+            onOwnerInternalFailure = { _, _, _ -> internalFailures.incrementAndGet() }
+        )
+        assertTrue(owner.post(e1))
+        assertTrue(owner.post(e2))
+        owner.close()
+        assertEquals(1, e1.disposals.get())
+        assertEquals(1, e2.disposals.get())
+        assertEquals(1, hookFailures.get())
+        assertEquals(0, internalFailures.get())
+        assertEquals(0, owner.trackingSize())
+    }
+
+    // onDisposalFailure throws and onOwnerInternalFailure catches it
+    @Test
+    fun onDisposalFailureThrowsInternalFailureReported() {
+        val e = object : CaptureOwnerEvent {
+            val disposals = AtomicInteger(0)
+            override fun execute() {}
+            override fun disposeWithoutMutation() { disposals.incrementAndGet(); error("X") }
+        }
+        val internalFailures = AtomicInteger(0)
+        val owner = CaptureStateOwner(
+            dispatch = { false },
+            onDisposalFailure = { _, _ -> error("hook threw") },
+            onOwnerInternalFailure = { _, _, _ -> internalFailures.incrementAndGet() }
+        )
+        assertFalse(owner.post(e))
+        assertEquals(1, e.disposals.get())
+        assertEquals(1, internalFailures.get())
+        assertEquals(0, owner.trackingSize())
+    }
+
+    @Test
+    fun postAfterCloseDisposerAndHookBothThrowPostReturnsFalse() {
+        val e = object : CaptureOwnerEvent {
+            val disposals = AtomicInteger(0)
+            override fun execute() {}
+            override fun disposeWithoutMutation() { disposals.incrementAndGet(); error("X") }
+        }
+        val internalFailures = AtomicInteger(0)
+        val owner = CaptureStateOwner(
+            dispatch = { true },
+            onDisposalFailure = { _, _ -> error("hook threw") },
+            onOwnerInternalFailure = { _, _, _ -> internalFailures.incrementAndGet() }
+        )
+        owner.close()
+        assertFalse(owner.post(e))
+        assertEquals(1, e.disposals.get())
+        assertEquals(1, internalFailures.get())
+    }
+
+    // tracking empty after all disposal failure cases
+    @Test
+    fun trackingCleanAfterAllDisposalFailureVariants() {
+        val internalFailures = AtomicInteger(0)
+        val owner = CaptureStateOwner(
+            dispatch = { true },
+            onDisposalFailure = { _, _ -> error("hook threw") },
+            onOwnerInternalFailure = { _, _, _ -> internalFailures.incrementAndGet() }
+        )
+        owner.close()
+        assertFalse(owner.post(object : CaptureOwnerEvent {
+            val disposals = AtomicInteger(0)
+            override fun execute() {}
+            override fun disposeWithoutMutation() { disposals.incrementAndGet(); error("X") }
+        }))
+        assertEquals(0, owner.pendingCount())
+        assertEquals(0, owner.runningCount())
+        assertEquals(0, owner.trackingSize())
+        assertEquals(1, internalFailures.get())
+    }
+
+    }

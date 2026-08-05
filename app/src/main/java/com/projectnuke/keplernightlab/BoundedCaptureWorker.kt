@@ -66,24 +66,51 @@ internal class BoundedCaptureWorker(
     data class CleanupReport(
         val queuedTasksRemoved: Int,
         val queuedDisposableTasksDisposed: Int,
-        val activeWorkersAtShutdown: Int
+        val queuedNonDisposableTasksRemoved: Int,
+        val activeWorkersAtStart: Int,
+        val taskDisposalFailures: List<String>,
+        val rejectionCallbackFailures: List<String>,
+        val shutdownAlreadyRequested: Boolean
     )
 
     fun shutdownNow(): CleanupReport {
+        val activeBeforeDrain = executor.activeCount
         if (!closed.compareAndSet(false, true)) {
-            return CleanupReport(0, 0, executor.activeCount)
+            return CleanupReport(0, 0, 0, activeBeforeDrain, emptyList(), emptyList(), true)
         }
         val drained = executor.shutdownNow()
-        var disposed = 0
-        val activeBeforeDrain = executor.activeCount
-        drained.forEach { task ->
+        val taskFailures = mutableListOf<String>()
+        var disposableDisposed = 0
+        var nonDisposable = 0
+        for (task in drained) {
             if (task is DisposableCaptureTask) {
-                task.dispose()
-                disposed++
+                try {
+                    task.dispose()
+                    disposableDisposed++
+                } catch (t: Throwable) {
+                    taskFailures.add("taskDispose: ${t.message}")
+                }
+            } else {
+                nonDisposable++
             }
         }
-        drained.forEach { onRejected(it) }
-        return CleanupReport(drained.size, disposed, activeBeforeDrain)
+        val rejectionFailures = mutableListOf<String>()
+        for (task in drained) {
+            try {
+                onRejected(task)
+            } catch (t: Throwable) {
+                rejectionFailures.add("rejectionCallback: ${t.message}")
+            }
+        }
+        return CleanupReport(
+            queuedTasksRemoved = drained.size,
+            queuedDisposableTasksDisposed = disposableDisposed,
+            queuedNonDisposableTasksRemoved = nonDisposable,
+            activeWorkersAtStart = activeBeforeDrain,
+            taskDisposalFailures = taskFailures,
+            rejectionCallbackFailures = rejectionFailures,
+            shutdownAlreadyRequested = false
+        )
     }
 
     private fun reject(task: Runnable) {

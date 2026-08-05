@@ -8,10 +8,19 @@ internal interface CaptureOwnerEvent {
 internal enum class EnvelopeState { PENDING, RUNNING, COMPLETED, DISPOSED }
 internal enum class GateResult { STARTED, ALREADY_SETTLED, DISPOSED_BY_GATE }
 
+internal enum class PostDispatchOutcome {
+    ACCEPTED_RUNNING,
+    ACCEPTED_COMPLETED,
+    ACCEPTED_PENDING,
+    REJECTED_AND_DISPOSE,
+    ALREADY_DISPOSED
+}
+
 internal class CaptureStateOwner(
     private val dispatch: (CaptureOwnerEvent) -> Boolean,
     private val onEventFailure: (CaptureOwnerEvent, Throwable) -> Unit = { _, _ -> },
-    private val onDisposalFailure: (CaptureOwnerEvent, Throwable) -> Unit = { _, _ -> }
+    private val onDisposalFailure: (CaptureOwnerEvent, Throwable) -> Unit = { _, _ -> },
+    private val onOwnerInternalFailure: (String, CaptureOwnerEvent?, Throwable) -> Unit = { _, _, _ -> }
 ) {
     internal class Envelope(
         val event: CaptureOwnerEvent,
@@ -23,7 +32,7 @@ internal class CaptureStateOwner(
             when (owner.startGate(this)) {
                 GateResult.STARTED -> {
                     try { event.execute() } catch (t: Throwable) {
-                        try { owner.onEventFailure(event, t) } catch (_: Throwable) {}
+                        ignore { owner.onEventFailure(event, t) }
                     }
                     finally { owner.complete(this) }
                 }
@@ -37,8 +46,6 @@ internal class CaptureStateOwner(
         override fun disposeWithoutMutation() =
             error("disposeWithoutMutation called directly on Envelope")
     }
-
-    // --------------- internal helpers --------------------------------
 
     private val lock = Any()
     private var closed = false
@@ -67,11 +74,6 @@ internal class CaptureStateOwner(
         tracking -= env
     }
 
-    // --------------------------------------------------------------
-    //  post  —  returns true if event was / will be executed,
-    //           false when it was rejected (disposed).
-    // --------------------------------------------------------------
-
     fun post(event: CaptureOwnerEvent): Boolean {
         val env = synchronized(lock) {
             if (closed) return@synchronized null
@@ -82,40 +84,45 @@ internal class CaptureStateOwner(
         }
 
         val accepted = try { dispatch(env) } catch (_: Throwable) { false }
-
-        // If the dispatcher already started (RUNNING) or even finished (COMPLETED)
-        // the body, post reports accepted regardless of what dispatch returned.
-        if (env.state != EnvelopeState.PENDING) return true
-
-        if (accepted) return true
-
-        // Dispatch rejected (false / threw) and the envelope is still PENDING.
-        // Atomically decide the outcome under the lock.
-        val shouldDispose = synchronized(lock) {
-            when (env.state) {
-                EnvelopeState.PENDING -> {
-                    env.state = EnvelopeState.DISPOSED
-                    tracking -= env
-                    true
-                }
-                // Raced: some other thread started (RUNNING) or completed (COMPLETED)
-                EnvelopeState.RUNNING, EnvelopeState.COMPLETED -> false
-                EnvelopeState.DISPOSED -> false
-            }
-        }
-        if (shouldDispose) {
-            disposeEvent(event)
-        }
-        return !shouldDispose
+        val outcome = settleDispatchOutcome(env, accepted)
+        return finalizePost(outcome, event)
     }
 
-    // --------------------------------------------------------------
-    //  close  —  drain all PENDING envelopes, leave RUNNING alone.
-    // --------------------------------------------------------------
+    private fun settleDispatchOutcome(env: Envelope, accepted: Boolean): PostDispatchOutcome =
+        synchronized(lock) {
+            when (env.state) {
+                EnvelopeState.PENDING -> {
+                    if (accepted) {
+                        PostDispatchOutcome.ACCEPTED_PENDING
+                    } else {
+                        env.state = EnvelopeState.DISPOSED
+                        tracking -= env
+                        PostDispatchOutcome.REJECTED_AND_DISPOSE
+                    }
+                }
+                EnvelopeState.RUNNING -> PostDispatchOutcome.ACCEPTED_RUNNING
+                EnvelopeState.COMPLETED -> PostDispatchOutcome.ACCEPTED_COMPLETED
+                EnvelopeState.DISPOSED -> PostDispatchOutcome.ALREADY_DISPOSED
+            }
+        }
+
+    private fun finalizePost(
+        outcome: PostDispatchOutcome,
+        event: CaptureOwnerEvent
+    ): Boolean = when (outcome) {
+        PostDispatchOutcome.REJECTED_AND_DISPOSE -> {
+            disposeEvent(event)
+            false
+        }
+        PostDispatchOutcome.ALREADY_DISPOSED -> false
+        PostDispatchOutcome.ACCEPTED_RUNNING,
+        PostDispatchOutcome.ACCEPTED_COMPLETED,
+        PostDispatchOutcome.ACCEPTED_PENDING -> true
+    }
 
     fun close() {
-        val drained = synchronized(lock) {
-            if (closed) return@synchronized listOf<Envelope>()
+        val drained: List<Envelope> = synchronized(lock) {
+            if (closed) return@synchronized listOf()
             closed = true
             val list = mutableListOf<Envelope>()
             val iter = tracking.iterator()
@@ -129,16 +136,20 @@ internal class CaptureStateOwner(
             }
             list
         }
-        drained.forEach { env -> disposeEvent(env.event) }
+        for (env in drained) {
+            disposeEvent(env.event)
+        }
     }
 
-    // --------------------------------------------------------------
-    //  helpers
-    // --------------------------------------------------------------
-
     internal fun disposeEvent(event: CaptureOwnerEvent) {
-        try { event.disposeWithoutMutation() } catch (t: Throwable) {
-            onDisposalFailure(event, t)
+        try {
+            event.disposeWithoutMutation()
+        } catch (disposalError: Throwable) {
+            try {
+                onDisposalFailure(event, disposalError)
+            } catch (hookError: Throwable) {
+                ignore { onOwnerInternalFailure("disposal", event, hookError) }
+            }
         }
     }
 
@@ -146,4 +157,8 @@ internal class CaptureStateOwner(
     fun pendingCount(): Int = synchronized(lock) { tracking.count { it.state == EnvelopeState.PENDING } }
     fun runningCount(): Int = synchronized(lock) { tracking.count { it.state == EnvelopeState.RUNNING } }
     fun trackingSize(): Int = synchronized(lock) { tracking.size }
+}
+
+private inline fun ignore(block: () -> Unit) {
+    try { block() } catch (_: Throwable) {}
 }
