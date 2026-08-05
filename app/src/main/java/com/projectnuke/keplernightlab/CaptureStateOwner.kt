@@ -5,84 +5,63 @@ internal interface CaptureOwnerEvent {
     fun disposeWithoutMutation()
 }
 
+internal enum class EnvelopeState { PENDING, RUNNING, COMPLETED, DISPOSED }
 internal enum class GateResult { STARTED, ALREADY_SETTLED, DISPOSED_BY_GATE }
 
-/**
- * Serial owner boundary. All state (open/closed, envelope registration,
- * PENDING->RUNNING, PENDING->DISPOSED, RUNNING->COMPLETED, tracking list)
- * is coordinated under ONE lock. Body execution is outside that lock.
- *
- * Invariants:
- * - A PENDING event either starts or disposes, never both.
- * - A RUNNING event never transitions to DISPOSED.
- * - close() never disposes a RUNNING event.
- * - close() does not erase RUNNING from tracking.
- * - No event body begins after close returns unless RUNNING before close.
- * - COMPLETED flows from RUNNING after body returns (including exception).
- * - COMPLETED and DISPOSED events are removed from tracking.
- * - Repeated close is idempotent.
- * - Event body exception is not a dispatcher rejection; post reports true
- *   and the failure is sent to injectable onEventFailure.
- */
 internal class CaptureStateOwner(
     private val dispatch: (CaptureOwnerEvent) -> Boolean,
-    private val onEventFailure: (CaptureOwnerEvent, Throwable) -> Unit = { _, _ -> }
+    private val onEventFailure: (CaptureOwnerEvent, Throwable) -> Unit = { _, _ -> },
+    private val onDisposalFailure: (CaptureOwnerEvent, Throwable) -> Unit = { _, _ -> }
 ) {
-
     internal class Envelope(
         val event: CaptureOwnerEvent,
         private val owner: CaptureStateOwner
     ) : CaptureOwnerEvent {
-
-        @Volatile var started = false
+        @Volatile var state: EnvelopeState = EnvelopeState.PENDING
 
         override fun execute() {
-            // execute() is called by the dispatcher on a serialized thread.
-            val gate = owner.startGate(this)
-            when (gate) {
+            when (owner.startGate(this)) {
                 GateResult.STARTED -> {
-                    try { event.execute() } catch (t: Throwable) {
-                        owner.onEventFailure(event, t)
-                    } finally {
-                        owner.complete(this)
+                    try { event.execute() } catch (t: Throwable) { owner.onEventFailure(event, t) }
+                    finally { owner.complete(this) }
+                }
+                GateResult.DISPOSED_BY_GATE -> {
+                    try { event.disposeWithoutMutation() } catch (t: Throwable) {
+                        owner.onDisposalFailure(event, t)
                     }
                 }
-                GateResult.DISPOSED_BY_GATE -> event.disposeWithoutMutation()
-                GateResult.ALREADY_SETTLED -> { /* noop */ }
+                GateResult.ALREADY_SETTLED -> {}
             }
         }
 
-        override fun disposeWithoutMutation() {
+        override fun disposeWithoutMutation() =
             error("disposeWithoutMutation called directly on Envelope")
-        }
-
-        fun disposeEvent() = event.disposeWithoutMutation()
     }
 
-    // ── State under lock ──────────────────────────────────────────
     private val lock = Any()
     private var closed = false
     private val tracking = linkedSetOf<Envelope>()
 
-    /**
-     * Atomically transition a PENDING envelope to RUNNING if the owner
-     * is OPEN, otherwise to DISPOSED.  Returns the gate result.
-     */
     internal fun startGate(env: Envelope): GateResult = synchronized(lock) {
-        if (env.started) return@synchronized GateResult.ALREADY_SETTLED
-        env.started = true
-        if (closed) {
-            tracking -= env
-            GateResult.DISPOSED_BY_GATE
-        } else {
-            GateResult.STARTED
+        when (env.state) {
+            EnvelopeState.PENDING -> {
+                if (closed) {
+                    env.state = EnvelopeState.DISPOSED
+                    tracking -= env
+                    GateResult.DISPOSED_BY_GATE
+                } else {
+                    env.state = EnvelopeState.RUNNING
+                    GateResult.STARTED
+                }
+            }
+            EnvelopeState.RUNNING, EnvelopeState.COMPLETED, EnvelopeState.DISPOSED ->
+                GateResult.ALREADY_SETTLED
         }
     }
 
-    /**
-     * Mark a RUNNING event as COMPLETED and remove it from tracking.
-     */
     internal fun complete(env: Envelope) = synchronized(lock) {
+        check(env.state == EnvelopeState.RUNNING) { "complete from ${env.state}" }
+        env.state = EnvelopeState.COMPLETED
         tracking -= env
     }
 
@@ -92,25 +71,24 @@ internal class CaptureStateOwner(
             Envelope(event, this).also { tracking += it }
         } ?: run { event.disposeWithoutMutation(); return false }
 
-        val dispatchAccepted = try {
-            dispatch(env)
-        } catch (_: Throwable) {
-            false
-        }
+        val accepted = try { dispatch(env) } catch (_: Throwable) { false }
 
-        if (!dispatchAccepted) {
-            // The dispatcher did NOT queue/execute the envelope.
-            // If the envelope is still PENDING (not started via a sync dispatch),
-            // remove it from tracking and dispose the event.
-            val notStarted = synchronized(lock) {
-                if (env in tracking && !env.started) {
-                    tracking -= env
-                    true
-                } else false
+        // If dispatch started the body synchronously (RUNNING or COMPLETED),
+        // post must report accepted regardless of dispatch return value.
+        if (env.state != EnvelopeState.PENDING) return true
+
+        if (accepted) return true
+
+        // Dispatch returned false or threw, and the envelope is still PENDING.
+        // Atomically transition to DISPOSED.
+        synchronized(lock) {
+            if (env in tracking && env.state == EnvelopeState.PENDING) {
+                env.state = EnvelopeState.DISPOSED
+                tracking -= env
+                event.disposeWithoutMutation()
             }
-            if (notStarted) event.disposeWithoutMutation()
         }
-        return dispatchAccepted
+        return false
     }
 
     fun close() {
@@ -121,26 +99,23 @@ internal class CaptureStateOwner(
             val iter = tracking.iterator()
             while (iter.hasNext()) {
                 val env = iter.next()
-                if (!env.started) {
-                    env.started = true // prevent re-disposal if execute called later
+                if (env.state == EnvelopeState.PENDING) {
+                    env.state = EnvelopeState.DISPOSED
                     iter.remove()
                     list += env
                 }
             }
             list
         }
-        for (env in drained) env.disposeEvent()
+        drained.forEach { env ->
+            try { env.event.disposeWithoutMutation() } catch (t: Throwable) {
+                onDisposalFailure(env.event, t)
+            }
+        }
     }
 
     fun isClosed(): Boolean = synchronized(lock) { closed }
-
-    fun pendingCount(): Int = synchronized(lock) {
-        tracking.count { !it.started }
-    }
-
-    fun runningCount(): Int = synchronized(lock) {
-        tracking.count { it.started }
-    }
-
+    fun pendingCount(): Int = synchronized(lock) { tracking.count { it.state == EnvelopeState.PENDING } }
+    fun runningCount(): Int = synchronized(lock) { tracking.count { it.state == EnvelopeState.RUNNING } }
     fun trackingSize(): Int = synchronized(lock) { tracking.size }
 }

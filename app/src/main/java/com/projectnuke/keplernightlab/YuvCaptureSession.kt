@@ -12,13 +12,9 @@ internal class YuvCaptureSession internal constructor(
     val lifecycle: YuvBufferedLifecycle,
     val reservations: YuvBufferReservations,
     val identityOwner: CaptureFrameIdentityOwner,
-    val owner: YuvCaptureOwner
+    val owner: YuvCaptureOwner,
+    val cleanupCoordinator: YuvCleanupCoordinator
 ) : AutoCloseable {
-
-    private val cleanupCoordinator by lazy {
-        YuvCleanupCoordinator(captureStateOwner, lifecycle, accounting, reservations, boundedWorker)
-    }
-
     override fun close() {
         cleanupCoordinator.perform()
     }
@@ -50,6 +46,9 @@ internal class YuvCaptureSession internal constructor(
             val lifecycle = YuvBufferedLifecycle()
             val identityOwner = CaptureFrameIdentityOwner(frameCount)
             val terminalState = CaptureTerminalState()
+            val cleanupCoordinator = YuvCleanupCoordinator(
+                captureStateOwner, lifecycle, accounting, reservations, boundedWorker
+            )
             val owner = YuvCaptureOwner(
                 captureStateOwner = captureStateOwner,
                 outputDir = outputDir,
@@ -68,7 +67,8 @@ internal class YuvCaptureSession internal constructor(
                 writeJobJson = writeJobJson,
                 saveMotionOnce = saveMotionOnce,
                 onCaptureComplete = onCaptureComplete,
-                onCaptureError = onCaptureError
+                onCaptureError = onCaptureError,
+                cleanupCoordinator = cleanupCoordinator
             )
             return YuvCaptureSession(
                 captureStateOwner,
@@ -79,7 +79,8 @@ internal class YuvCaptureSession internal constructor(
                 lifecycle,
                 reservations,
                 identityOwner,
-                owner
+                owner,
+                cleanupCoordinator
             )
         }
     }

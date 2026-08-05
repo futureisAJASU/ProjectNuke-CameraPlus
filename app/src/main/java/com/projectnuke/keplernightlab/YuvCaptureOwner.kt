@@ -42,7 +42,7 @@ internal class BufferedEncodeTask(
     private val encode: () -> YuvWorkerCompletion,
     private val postCompletion: (YuvWorkerCompletion) -> Unit
 ) : DisposableCaptureTask {
-    @Volatile private var settled = false
+    private val settled = AtomicBoolean(false)
 
     override fun run() {
         val completion = try {
@@ -53,16 +53,14 @@ internal class BufferedEncodeTask(
         try {
             postCompletion(completion)
         } finally {
-            if (!settled) {
-                settled = true
+            if (settled.compareAndSet(false, true)) {
                 lifecycle.settleEncoding(item, accounting)
             }
         }
     }
 
     override fun dispose() {
-        if (!settled) {
-            settled = true
+        if (settled.compareAndSet(false, true)) {
             lifecycle.settleEncoding(item, accounting)
         }
     }
@@ -99,16 +97,14 @@ internal class YuvCaptureOwner(
     private val writeJobJson: (status: String, savedFrames: Int, manifest: List<YuvFrameManifestEntry>) -> Unit,
     private val saveMotionOnce: (File) -> Pair<String?, String?>,
     private val onCaptureComplete: (File) -> Unit,
-    private val onCaptureError: (message: String, cause: Throwable?) -> Unit
+    private val onCaptureError: (message: String, cause: Throwable?) -> Unit,
+    private val cleanupCoordinator: YuvCleanupCoordinator
 ) {
 
     private var completedResults = 0
     private var terminalReason: String? = null
     private val discardedLateCompletions = mutableListOf<Int>()
     private val callbackFired = AtomicBoolean(false)
-    private val cleanupCoordinator by lazy {
-        YuvCleanupCoordinator(captureStateOwner, lifecycle, accounting, reservations, boundedWorker)
-    }
 
     // ------------------------------------------------------------------
     // Typed Camera2 callback entry points (no unsafe casts)
@@ -179,7 +175,9 @@ internal class YuvCaptureOwner(
                             override fun dispose() = item.dispose()
                         }
                         if (!boundedWorker.submit(task)) {
-                            item.dispose(accounting); accounting.droppedFrame()
+                            // Worker already called task.dispose() which calls item.dispose().
+                            // Do NOT double-dispose.
+                            accounting.droppedFrame()
                             postStatus("YUV direct backpressure: frame ${item.frameIndex + 1} dropped")
                         }
                     }
@@ -240,7 +238,8 @@ internal class YuvCaptureOwner(
             }
         )
         if (!boundedWorker.submit(task)) {
-            lifecycle.settleEncoding(frame, accounting)
+            // Worker already called task.dispose() which calls lifecycle.settleEncoding.
+            // Do NOT double-settle or double-dispose the item.
             accounting.droppedFrame()
             postStatus("YUV backpressure: buffered frame ${frame.frameIndex + 1} dropped")
         }
@@ -269,37 +268,58 @@ internal class YuvCaptureOwner(
             runCatching { completion.candidate.delete() }
             return
         }
-        // Reserve frame identity + filename before committing.
         val entry = YuvFrameManifestEntry(completion.frameIndex, completion.fileName, completion.timestampNs, true)
-        if (!accounting.tryReserveAdoption(entry)) {
-            // Duplicate identity or filename; reject this completion.
-            completion.candidate.let { runCatching { it.delete() } }
+        val token = accounting.tryReserveAdoption(entry) ?: run {
+            runCatching { completion.candidate.delete() }
             accounting.failedFrame()
             return
         }
         val finalFile = File(outputDir, completion.fileName)
+
+        // Fail-closed filesystem validation: reject unexpected pre-existing final file
+        if (finalFile.exists() && !finalFile.canRead()) {
+            Log.w("KeplerYuvOwner", "Pre-existing unreadable final file for ${completion.frameIndex}")
+            // Remove the bad file so we can retry, or quarantine it.
+            runCatching { finalFile.delete() }
+        }
+        if (finalFile.exists()) {
+            Log.w("KeplerYuvOwner", "Unexpected pre-existing final file for ${completion.frameIndex}")
+            accounting.rollbackAdoption(token)
+            runCatching { completion.candidate.delete() }
+            accounting.failedFrame()
+            return
+        }
+
         try {
             workProcessor.commit(completion.candidate, finalFile)
         } catch (t: Throwable) {
             Log.e("KeplerYuvOwner", "Commit failed for frame ${completion.frameIndex}", t)
-            accounting.rollbackReservedAdoption(entry)
-            completion.candidate.let { runCatching { it.delete() } }
+            accounting.rollbackAdoption(token)
+            runCatching { completion.candidate.delete() }
             accounting.failedFrame()
             finishError("YUV commit failed for frame ${completion.frameIndex}", cause = t)
             return
         }
         if (!finalFile.exists() || !finalFile.canRead()) {
             Log.w("KeplerYuvOwner", "Final file not readable after commit ${completion.frameIndex}")
-            accounting.rollbackReservedAdoption(entry)
+            accounting.rollbackAdoption(token)
+            removeCreatedFinal(finalFile)
             accounting.failedFrame()
             return
         }
-        // Commit successful; adopt the reserved identity.
-        accounting.commitReservedAdoption(entry)
+        if (!accounting.commitAdoption(token)) {
+            Log.w("KeplerYuvOwner", "Adoption commit failed for frame ${completion.frameIndex}")
+            runCatching { completion.candidate.delete() }
+            removeCreatedFinal(finalFile)
+            accounting.failedFrame()
+            return
+        }
         val persistedFrames = accounting.snapshot().persistedFrames
         postStatus("YUV capture: saved $persistedFrames/$frameCount")
         writeJobJson("CAPTURING", persistedFrames, accounting.snapshot().manifest)
     }
+
+    private fun removeCreatedFinal(file: File) { runCatching { if (file.exists()) file.delete() } }
 
     // ------------------------------------------------------------------
     // Terminal state and deadline settlement

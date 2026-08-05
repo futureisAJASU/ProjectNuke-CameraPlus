@@ -110,19 +110,20 @@ internal open class YuvCaptureAccounting {
         true
     }
 
-    fun tryReserveAdoption(entry: YuvFrameManifestEntry): Boolean = synchronized(lock) {
+    fun tryReserveAdoption(entry: YuvFrameManifestEntry): AdoptionToken? = synchronized(lock) {
         if (manifest.containsKey(entry.frameIndex) ||
             manifest.values.any { it.filename == entry.filename } ||
             reservedIndices.contains(entry.frameIndex) ||
             reservedFilenames.contains(entry.filename)) {
-            return@synchronized false
+            return@synchronized null
         }
         reservedIndices.add(entry.frameIndex)
         reservedFilenames.add(entry.filename)
-        true
+        AdoptionToken(entry)
     }
 
-    fun commitReservedAdoption(entry: YuvFrameManifestEntry): Boolean = synchronized(lock) {
+    fun commitAdoption(token: AdoptionToken): Boolean = synchronized(lock) {
+        val entry = token.reservedEntry
         if (!reservedIndices.remove(entry.frameIndex) || !reservedFilenames.remove(entry.filename)) {
             return@synchronized false
         }
@@ -132,7 +133,8 @@ internal open class YuvCaptureAccounting {
         true
     }
 
-    fun rollbackReservedAdoption(entry: YuvFrameManifestEntry) = synchronized(lock) {
+    fun rollbackAdoption(token: AdoptionToken) = synchronized(lock) {
+        val entry = token.reservedEntry
         reservedIndices.remove(entry.frameIndex)
         reservedFilenames.remove(entry.filename)
     }
