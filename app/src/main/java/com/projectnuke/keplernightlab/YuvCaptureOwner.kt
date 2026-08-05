@@ -135,7 +135,10 @@ internal class YuvCaptureOwner(
             }
             override fun disposeWithoutMutation() = guard.releaseSafely()
         }
-        if (!captureStateOwner.post(event)) runCatching { access.release() }
+        // post() either accepted (event settled by owner) or rejected (event
+        // already disposed via disposeWithoutMutation).  NEVER release access
+        // after a rejected post — the envelope already disposed it.
+        captureStateOwner.post(event)
     }
 
     fun acceptDirect(access: DirectYuvImageAccess) {
@@ -185,7 +188,7 @@ internal class YuvCaptureOwner(
             }
             override fun disposeWithoutMutation() = guard.releaseSafely()
         }
-        if (!captureStateOwner.post(event)) runCatching { access.release() }
+        captureStateOwner.post(event)
     }
 
     fun onCaptureCompletedResult() {
@@ -263,12 +266,21 @@ internal class YuvCaptureOwner(
             runCatching { completion.candidate.delete() }
             return
         }
+        // Reserve frame identity + filename before committing.
+        val entry = YuvFrameManifestEntry(completion.frameIndex, completion.fileName, completion.timestampNs, true)
+        if (!accounting.reserveForAdoption(entry)) {
+            // Duplicate identity or filename; reject this completion.
+            completion.candidate.let { runCatching { it.delete() } }
+            accounting.failedFrame()
+            return
+        }
         val finalFile = File(outputDir, completion.fileName)
         try {
             workProcessor.commit(completion.candidate, finalFile)
         } catch (t: Throwable) {
             Log.e("KeplerYuvOwner", "Commit failed for frame ${completion.frameIndex}", t)
             completion.candidate.let { runCatching { it.delete() } }
+            accounting.failedFrame()
             finishError("YUV commit failed for frame ${completion.frameIndex}", cause = t)
             return
         }
@@ -277,10 +289,8 @@ internal class YuvCaptureOwner(
             accounting.failedFrame()
             return
         }
-        val entry = YuvFrameManifestEntry(completion.frameIndex, completion.fileName, completion.timestampNs, true)
-        if (!accounting.persistedFrame(entry)) {
-            Log.w("KeplerYuvOwner", "Duplicate persisted identity or filename: ${completion.fileName}")
-        }
+        // Commit successful; adopt the reserved identity.
+        accounting.adoptReserved(entry)
         val persistedFrames = accounting.snapshot().persistedFrames
         postStatus("YUV capture: saved $persistedFrames/$frameCount")
         writeJobJson("CAPTURING", persistedFrames, accounting.snapshot().manifest)
@@ -300,12 +310,18 @@ internal class YuvCaptureOwner(
     fun onDeadlineReached() {
         val event = object : CaptureOwnerEvent {
             override fun execute() {
-                if (!terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) return
+                // Compute outcome from ONE snapshot, then claim the exact terminal state.
                 val snap = accounting.snapshot()
                 when {
-                    snap.persistedFrames >= frameCount -> finishSuccessFromDeadline()
-                    snap.persistedFrames > 0 -> finishPartialFromDeadline(snap)
-                    else -> finishTimeout(snap)
+                    snap.persistedFrames >= frameCount -> {
+                        if (terminalState.claim(CaptureTerminalStatus.SUCCESS)) finishSuccess()
+                    }
+                    snap.persistedFrames > 0 -> {
+                        if (terminalState.claim(CaptureTerminalStatus.PARTIAL_SUCCESS)) finishPartial(snap)
+                    }
+                    else -> {
+                        if (terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) finishTimeout(snap)
+                    }
                 }
             }
             override fun disposeWithoutMutation() {}
@@ -348,23 +364,12 @@ internal class YuvCaptureOwner(
         postMainOrRun { onCaptureComplete(outputDir) }
     }
 
-    private fun finishSuccessFromDeadline() {
-        if (!callbackFired.compareAndSet(false, true)) return
-        finished.set(true)
-        val snap = accounting.snapshot()
-        saveMotionOnce(outputDir)
-        writeJobJson("CAPTURE_COMPLETE", snap.persistedFrames, snap.manifest)
-        postStatus("CAPTURE_COMPLETE")
-        cleanup()
-        postMainOrRun { onCaptureComplete(outputDir) }
-    }
-
-    private fun finishPartialFromDeadline(snap: YuvCaptureAccountingSnapshot) {
-        terminalReason = "Timed out with ${snap.persistedFrames}/$frameCount persisted"
+    private fun finishPartial(snap: YuvCaptureAccountingSnapshot) {
+        terminalReason = "Partial success: ${snap.persistedFrames}/$frameCount persisted"
         if (!callbackFired.compareAndSet(false, true)) return
         finished.set(true)
         saveMotionOnce(outputDir)
-        writeJobJson("CAPTURE_COMPLETE", snap.persistedFrames, snap.manifest)
+        writeJobJson("CAPTURE_PARTIAL", snap.persistedFrames, snap.manifest)
         postStatus("Captured partial success")
         cleanup()
         postMainOrRun { onCaptureComplete(outputDir) }
@@ -406,7 +411,7 @@ internal class YuvCaptureOwner(
         writeJobJson("CAPTURE_CANCELLED", snap.persistedFrames, snap.manifest)
         postStatus("CAPTURE_CANCELLED: YUV capture cancelled")
         cleanup()
-        postMainOrRun { onCaptureComplete(outputDir) }
+        postMainOrRun { onCaptureError(terminalReason!!, null) }
     }
 
     // ------------------------------------------------------------------

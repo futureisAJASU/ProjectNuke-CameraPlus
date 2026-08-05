@@ -64,6 +64,29 @@ internal open class YuvCaptureAccounting {
         true
     }
 
+    /**
+     * Reserve a frame identity and filename for pending adoption.
+     * Returns true if the reservation is unique; false if a collision exists.
+     * The caller must followed up with [adoptReserved] after successful commit.
+     */
+    fun reserveForAdoption(entry: YuvFrameManifestEntry): Boolean = synchronized(lock) {
+        if (manifest.containsKey(entry.frameIndex) || manifest.values.any { it.filename == entry.filename }) {
+            return@synchronized false
+        }
+        manifest[entry.frameIndex] = entry
+        true
+    }
+
+    /**
+     * Adopt a previously reserved identity. The reservation must have been
+     * committed successfully (file exists and is readable).
+     * [persistedFrames] is incremented exactly once here.
+     */
+    fun adoptReserved(entry: YuvFrameManifestEntry) = synchronized(lock) {
+        check(manifest[entry.frameIndex]?.filename == entry.filename) { "adoptReserved: reserved entry not found or filename mismatch" }
+        persisted++
+    }
+
     fun snapshot(): YuvCaptureAccountingSnapshot = synchronized(lock) {
         YuvCaptureAccountingSnapshot(received, buffered, persisted, failed, dropped, manifest.values.sortedBy { it.frameIndex })
     }

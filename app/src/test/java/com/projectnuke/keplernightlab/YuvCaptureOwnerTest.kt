@@ -173,13 +173,11 @@ class YuvCaptureOwnerTest {
             return session.terminalState.status()
         }
 
-        /** Wait for `target` persisted frames (writeJobJson reports `saved`). */
+        /** Wait for `target` persisted frames deterministically via handler flushes. */
         fun awaitPersisted(target: Int, timeoutSec: Long = 10) {
             val deadline = System.currentTimeMillis() + timeoutSec * 1000
-            while (System.currentTimeMillis() < deadline) {
+            while (System.currentTimeMillis() < deadline && persistedFrames.get() < target) {
                 flushHandler()
-                if (persistedFrames.get() >= target) return
-                Thread.sleep(5)
             }
             assertEquals(target, persistedFrames.get())
         }
@@ -392,8 +390,8 @@ class YuvCaptureOwnerTest {
             encodeLatch.release()
             val status = harness.awaitTerminal()
             assertEquals(CaptureTerminalStatus.CANCELLED, status)
-            assertEquals(1, harness.onCaptureCompleteCount.get())
-            assertEquals(0, harness.onCaptureErrorCount.get())
+            assertEquals(0, harness.onCaptureCompleteCount.get())
+            assertEquals(1, harness.onCaptureErrorCount.get())
         } finally {
             harness.shutdown()
         }
