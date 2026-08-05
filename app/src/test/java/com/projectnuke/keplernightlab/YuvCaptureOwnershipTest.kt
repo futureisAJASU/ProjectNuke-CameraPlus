@@ -8,6 +8,7 @@ import java.util.Base64
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import javax.imageio.ImageIO
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -247,7 +248,7 @@ class YuvCaptureOwnershipTest {
         val drained = lifecycle.closeAndDrainRetained()
         assertTrue(drained.isEmpty())
         assertEquals(0, disposeCount.get())
-        assertEquals(1, lifecycle.retainedCount())
+        assertEquals(1, lifecycle.encodingCount())
         lifecycle.settleEncoding(item, accounting)
         assertEquals(1, disposeCount.get())
         assertEquals(0L, reservations.currentBytes())
@@ -349,6 +350,117 @@ class YuvCaptureOwnershipTest {
         }
         assertEquals(0, lifecycle.retainedCount())
         assertEquals(0, accounting.snapshot().bufferedFrames)
+        assertEquals(0L, reservations.currentBytes())
+    }
+
+    // ---- additional lifecycle tests (Phase 2A-P1) ----
+
+    @Test
+    fun beginEncodingRacingCloseRetainsCorrectOwnership() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting)
+        assertTrue(lifecycle.tryRegister(item))
+
+        val started = CountDownLatch(2)
+        val done = CountDownLatch(2)
+        val encodingWon = AtomicInteger(0)
+        val drained = AtomicReference<List<YuvPngWorkItem>?>()
+
+        val encoder = Thread {
+            started.countDown(); started.await(5, TimeUnit.SECONDS)
+            if (lifecycle.beginEncoding(item)) encodingWon.incrementAndGet()
+            done.countDown()
+        }
+        val closer = Thread {
+            started.countDown(); started.await(5, TimeUnit.SECONDS)
+            drained.set(lifecycle.closeAndDrainRetained())
+            done.countDown()
+        }
+        encoder.start(); closer.start()
+        assertTrue(done.await(5, TimeUnit.SECONDS))
+        encoder.join(5_000); closer.join(5_000)
+
+        // Exactly one side claims the item
+        assertEquals(1, encodingWon.get() + (drained.get()?.size ?: 0))
+
+        // If encoding won, settleEncoding removes it
+        lifecycle.settleEncoding(item, accounting)
+        // If drained won, dispose the item
+        drained.get()?.forEach { it.dispose(accounting) }
+
+        assertEquals(0, lifecycle.retainedCount())
+        assertEquals(0, lifecycle.encodingCount())
+        assertEquals(0, lifecycle.trackedCount())
+        assertEquals(0L, reservations.currentBytes())
+        assertEquals(0, accounting.snapshot().bufferedFrames)
+    }
+
+    @Test
+    fun repeatedCloseReturnsNoItemTwice() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting)
+        assertTrue(lifecycle.tryRegister(item))
+
+        val first = lifecycle.closeAndDrainRetained()
+        assertEquals(listOf(item), first)
+        val second = lifecycle.closeAndDrainRetained()
+        assertTrue(second.isEmpty())
+
+        first.forEach { it.dispose(accounting) }
+        assertEquals(0L, reservations.currentBytes())
+    }
+
+    @Test
+    fun encodingItemRemainsTrackedThroughClose() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting)
+        assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
+
+        assertEquals(0, lifecycle.retainedCount())
+        assertEquals(1, lifecycle.encodingCount())
+        assertEquals(1, lifecycle.trackedCount())
+
+        val drained = lifecycle.closeAndDrainRetained()
+        assertTrue(drained.isEmpty())
+        assertEquals(0, lifecycle.retainedCount())
+        assertEquals(1, lifecycle.encodingCount())
+        assertEquals(1, lifecycle.trackedCount())
+
+        lifecycle.settleEncoding(item, accounting)
+        assertEquals(0, lifecycle.trackedCount())
+        assertEquals(0L, reservations.currentBytes())
+    }
+
+    @Test
+    fun registryCountsDistinguishRetainedAndEncoding() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        assertTrue(reservations.tryReserve(200L))
+        val rItem = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting)
+        val eItem = YuvPngWorkItem.bufferedForTest(1, 2L, 100L, reservations, accounting)
+        assertTrue(lifecycle.tryRegister(rItem))
+        assertTrue(lifecycle.tryRegister(eItem))
+        assertTrue(lifecycle.beginEncoding(eItem))
+
+        assertEquals(1, lifecycle.retainedCount())
+        assertEquals(1, lifecycle.encodingCount())
+        assertEquals(2, lifecycle.trackedCount())
+
+        lifecycle.closeAndDrainRetained().forEach { it.dispose(accounting) }
+        lifecycle.settleEncoding(eItem, accounting)
+
+        assertEquals(0, lifecycle.trackedCount())
         assertEquals(0L, reservations.currentBytes())
     }
 

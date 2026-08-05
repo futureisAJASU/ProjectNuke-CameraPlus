@@ -22,13 +22,13 @@ internal class CaptureStateOwner(
         override fun execute() {
             when (owner.startGate(this)) {
                 GateResult.STARTED -> {
-                    try { event.execute() } catch (t: Throwable) { owner.onEventFailure(event, t) }
+                    try { event.execute() } catch (t: Throwable) {
+                        try { owner.onEventFailure(event, t) } catch (_: Throwable) {}
+                    }
                     finally { owner.complete(this) }
                 }
                 GateResult.DISPOSED_BY_GATE -> {
-                    try { event.disposeWithoutMutation() } catch (t: Throwable) {
-                        owner.onDisposalFailure(event, t)
-                    }
+                    owner.disposeEvent(event)
                 }
                 GateResult.ALREADY_SETTLED -> {}
             }
@@ -37,6 +37,8 @@ internal class CaptureStateOwner(
         override fun disposeWithoutMutation() =
             error("disposeWithoutMutation called directly on Envelope")
     }
+
+    // --------------- internal helpers --------------------------------
 
     private val lock = Any()
     private var closed = false
@@ -65,31 +67,51 @@ internal class CaptureStateOwner(
         tracking -= env
     }
 
+    // --------------------------------------------------------------
+    //  post  —  returns true if event was / will be executed,
+    //           false when it was rejected (disposed).
+    // --------------------------------------------------------------
+
     fun post(event: CaptureOwnerEvent): Boolean {
         val env = synchronized(lock) {
             if (closed) return@synchronized null
             Envelope(event, this).also { tracking += it }
-        } ?: run { event.disposeWithoutMutation(); return false }
+        } ?: run {
+            disposeEvent(event)
+            return false
+        }
 
         val accepted = try { dispatch(env) } catch (_: Throwable) { false }
 
-        // If dispatch started the body synchronously (RUNNING or COMPLETED),
-        // post must report accepted regardless of dispatch return value.
+        // If the dispatcher already started (RUNNING) or even finished (COMPLETED)
+        // the body, post reports accepted regardless of what dispatch returned.
         if (env.state != EnvelopeState.PENDING) return true
 
         if (accepted) return true
 
-        // Dispatch returned false or threw, and the envelope is still PENDING.
-        // Atomically transition to DISPOSED.
-        synchronized(lock) {
-            if (env in tracking && env.state == EnvelopeState.PENDING) {
-                env.state = EnvelopeState.DISPOSED
-                tracking -= env
-                event.disposeWithoutMutation()
+        // Dispatch rejected (false / threw) and the envelope is still PENDING.
+        // Atomically decide the outcome under the lock.
+        val shouldDispose = synchronized(lock) {
+            when (env.state) {
+                EnvelopeState.PENDING -> {
+                    env.state = EnvelopeState.DISPOSED
+                    tracking -= env
+                    true
+                }
+                // Raced: some other thread started (RUNNING) or completed (COMPLETED)
+                EnvelopeState.RUNNING, EnvelopeState.COMPLETED -> false
+                EnvelopeState.DISPOSED -> false
             }
         }
-        return false
+        if (shouldDispose) {
+            disposeEvent(event)
+        }
+        return !shouldDispose
     }
+
+    // --------------------------------------------------------------
+    //  close  —  drain all PENDING envelopes, leave RUNNING alone.
+    // --------------------------------------------------------------
 
     fun close() {
         val drained = synchronized(lock) {
@@ -107,10 +129,16 @@ internal class CaptureStateOwner(
             }
             list
         }
-        drained.forEach { env ->
-            try { env.event.disposeWithoutMutation() } catch (t: Throwable) {
-                onDisposalFailure(env.event, t)
-            }
+        drained.forEach { env -> disposeEvent(env.event) }
+    }
+
+    // --------------------------------------------------------------
+    //  helpers
+    // --------------------------------------------------------------
+
+    internal fun disposeEvent(event: CaptureOwnerEvent) {
+        try { event.disposeWithoutMutation() } catch (t: Throwable) {
+            onDisposalFailure(event, t)
         }
     }
 

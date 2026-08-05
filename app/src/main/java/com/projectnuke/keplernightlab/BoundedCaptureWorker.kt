@@ -63,9 +63,27 @@ internal class BoundedCaptureWorker(
         }
     }
 
-    fun shutdownNow() {
-        if (!closed.compareAndSet(false, true)) return
-        executor.shutdownNow().forEach(::reject)
+    data class CleanupReport(
+        val queuedTasksRemoved: Int,
+        val queuedDisposableTasksDisposed: Int,
+        val activeWorkersAtShutdown: Int
+    )
+
+    fun shutdownNow(): CleanupReport {
+        if (!closed.compareAndSet(false, true)) {
+            return CleanupReport(0, 0, executor.activeCount)
+        }
+        val drained = executor.shutdownNow()
+        var disposed = 0
+        val activeBeforeDrain = executor.activeCount
+        drained.forEach { task ->
+            if (task is DisposableCaptureTask) {
+                task.dispose()
+                disposed++
+            }
+        }
+        drained.forEach { onRejected(it) }
+        return CleanupReport(drained.size, disposed, activeBeforeDrain)
     }
 
     private fun reject(task: Runnable) {
@@ -84,5 +102,5 @@ internal class BoundedCaptureWorker(
         false
     }
 
-    override fun close() = shutdownNow()
+    override fun close() { shutdownNow() }
 }

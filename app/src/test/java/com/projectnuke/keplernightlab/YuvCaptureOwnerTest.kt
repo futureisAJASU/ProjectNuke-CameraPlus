@@ -491,7 +491,7 @@ class YuvCaptureOwnerTest {
         assertTrue(lifecycle.beginEncoding(item1))
         val drained = lifecycle.closeAndDrainRetained()
         assertEquals(listOf(item2), drained)
-        assertEquals(1, lifecycle.retainedCount())
+        assertEquals(1, lifecycle.encodingCount())
         lifecycle.settleEncoding(item1, accounting)
         item2.dispose(accounting)
         assertEquals(0, accounting.snapshot().bufferedFrames)

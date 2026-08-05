@@ -405,10 +405,17 @@ internal class DisposableYuvTask(
 // ═══ Cleanup coordinator ═══════════════════════════════════════════════
 
 internal data class YuvCleanupResult(
-    val drainedBufferedItems: Int,
-    val remainingBufferedFrames: Int,
-    val remainingReservationBytes: Long,
-    val workerShutdown: Boolean
+    val cleanupStarted: Boolean,
+    val ownerClosed: Boolean,
+    val drainedRetainedItems: Int,
+    val queuedItemsDisposed: Int,
+    val workerShutdownRequested: Boolean,
+    val activeWorkersAtStart: Int,
+    val currentRetainedItems: Int,
+    val currentEncodingItems: Int,
+    val currentBufferedFrames: Int,
+    val currentReservedBytes: Long,
+    val cleanupFailures: List<String>
 )
 
 internal class YuvCleanupCoordinator(
@@ -419,17 +426,65 @@ internal class YuvCleanupCoordinator(
     private val boundedWorker: BoundedCaptureWorker
 ) {
     private val ran = AtomicBoolean(false)
+    private val failures = mutableListOf<String>()
 
     fun perform(): YuvCleanupResult {
         if (!ran.compareAndSet(false, true)) {
             val snap = accounting.snapshot()
-            return YuvCleanupResult(0, snap.bufferedFrames, reservations.currentBytes(), false)
+            return YuvCleanupResult(
+                cleanupStarted = true,
+                ownerClosed = true,
+                drainedRetainedItems = 0,
+                queuedItemsDisposed = 0,
+                workerShutdownRequested = false,
+                activeWorkersAtStart = boundedWorker.activeCount(),
+                currentRetainedItems = lifecycle.retainedCount(),
+                currentEncodingItems = lifecycle.encodingCount(),
+                currentBufferedFrames = snap.bufferedFrames,
+                currentReservedBytes = reservations.currentBytes(),
+                cleanupFailures = failures.toList()
+            )
         }
+
         captureStateOwner.close()
+
         val drained = lifecycle.closeAndDrainRetained()
-        drained.forEach { it.dispose(accounting) }
-        boundedWorker.shutdownNow()
+        runCatching {
+            drained.forEach { it.dispose(accounting) }
+        }.onFailure { failures.add("drainDispose: ${it.message}") }
+
+        val report = boundedWorker.shutdownNow()
+
         val snap = accounting.snapshot()
-        return YuvCleanupResult(drained.size, snap.bufferedFrames, reservations.currentBytes(), true)
+        return YuvCleanupResult(
+            cleanupStarted = true,
+            ownerClosed = true,
+            drainedRetainedItems = drained.size,
+            queuedItemsDisposed = report.queuedTasksRemoved,
+            workerShutdownRequested = true,
+            activeWorkersAtStart = report.activeWorkersAtShutdown,
+            currentRetainedItems = lifecycle.retainedCount(),
+            currentEncodingItems = lifecycle.encodingCount(),
+            currentBufferedFrames = snap.bufferedFrames,
+            currentReservedBytes = reservations.currentBytes(),
+            cleanupFailures = failures.toList()
+        )
+    }
+
+    fun snapshot(): YuvCleanupResult {
+        val snap = accounting.snapshot()
+        return YuvCleanupResult(
+            cleanupStarted = ran.get(),
+            ownerClosed = captureStateOwner.isClosed(),
+            drainedRetainedItems = 0,
+            queuedItemsDisposed = boundedWorker.queuedCount(),
+            workerShutdownRequested = ran.get(),
+            activeWorkersAtStart = boundedWorker.activeCount(),
+            currentRetainedItems = lifecycle.retainedCount(),
+            currentEncodingItems = lifecycle.encodingCount(),
+            currentBufferedFrames = snap.bufferedFrames,
+            currentReservedBytes = reservations.currentBytes(),
+            cleanupFailures = failures.toList()
+        )
     }
 }
