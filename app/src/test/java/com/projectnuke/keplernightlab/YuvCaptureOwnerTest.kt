@@ -173,20 +173,11 @@ class YuvCaptureOwnerTest {
             return session.terminalState.status()
         }
 
-        /** Wait for `target` persisted frames deterministically via handler flushes. */
-        fun awaitPersisted(target: Int, timeoutSec: Long = 10) {
-            val deadline = System.currentTimeMillis() + timeoutSec * 1000
-            while (System.currentTimeMillis() < deadline && persistedFrames.get() < target) {
-                flushHandler()
-            }
-            assertEquals(target, persistedFrames.get())
-        }
-
         /** Run posted tasks on the test handler thread to make latches advance. */
         fun flushHandler() {
             val latch = CountDownLatch(1)
-            handler.post { latch.countDown() }
-            latch.await(2, TimeUnit.SECONDS)
+            assertTrue("handler flush did not complete", handler.post { latch.countDown() })
+            assertTrue(latch.await(2, TimeUnit.SECONDS))
         }
 
         fun shutdown() {
@@ -294,8 +285,8 @@ class YuvCaptureOwnerTest {
             // state remains ACTIVE until the caller triggers the deadline.
             harness.session.owner.acceptDirect(access)
             harness.flushHandler()
-            // Give the worker thread a brief deterministic wait to settle the failure.
-            harness.session.boundedWorker.awaitTermination(2_000L)
+            harness.session.boundedWorker.close()
+            assertTrue(harness.session.boundedWorker.awaitTermination(2_000L))
             harness.flushHandler()
             assertEquals(1, access.closeCount.get())
             assertTrue(harness.session.accounting.snapshot().failedFrames >= 1)
@@ -312,7 +303,8 @@ class YuvCaptureOwnerTest {
         try {
             val access = FakeDirectAccess()
             harness.session.owner.acceptDirect(access)
-            harness.session.boundedWorker.awaitTermination(2_000L)
+            harness.session.boundedWorker.close()
+            assertTrue(harness.session.boundedWorker.awaitTermination(2_000L))
             harness.flushHandler()
             harness.session.owner.onDeadlineReached()
             val status = harness.awaitTerminal()
@@ -471,6 +463,7 @@ class YuvCaptureOwnerTest {
         assertTrue(reservations.tryReserve(100L))
         val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting)
         assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
         assertEquals(1, accounting.snapshot().bufferedFrames)
         lifecycle.settleEncoding(item, accounting)
         lifecycle.settleEncoding(item, accounting)
@@ -494,8 +487,10 @@ class YuvCaptureOwnerTest {
         assertEquals(1, lifecycle.encodingCount())
         lifecycle.settleEncoding(item1, accounting)
         item2.dispose(accounting)
+        lifecycle.finishDrain(item2)
         assertEquals(0, accounting.snapshot().bufferedFrames)
         assertEquals(0L, reservations.currentBytes())
+        assertEquals(0, lifecycle.trackedCount())
     }
 
     // ------------------------------------------------------------------

@@ -38,7 +38,9 @@ internal interface DisposableCaptureTask : Runnable {
 internal class BoundedCaptureWorker(
     name: String,
     capacity: Int,
-    private val onRejected: (Runnable) -> Unit = {}
+    private val onTaskDisposalFailure: (Runnable, Throwable) -> Unit = { _, _ -> },
+    private val onRejectionNotificationFailure: (Runnable, Throwable) -> Unit = { _, _ -> },
+    onRejected: (Runnable) -> Unit = {}
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
     private val queue = ArrayBlockingQueue<Runnable>(capacity.coerceAtLeast(1))
@@ -48,6 +50,7 @@ internal class BoundedCaptureWorker(
         { runnable -> Thread(runnable, name).apply { isDaemon = true } },
         ThreadPoolExecutor.AbortPolicy()
     )
+    private val notificationHook = onRejected
 
     fun submit(task: Runnable): Boolean {
         if (closed.get()) {
@@ -65,30 +68,34 @@ internal class BoundedCaptureWorker(
 
     data class CleanupReport(
         val queuedTasksRemoved: Int,
-        val queuedDisposableTasksDisposed: Int,
+        val queuedDisposableTasksDisposalAttempted: Int,
+        val queuedDisposableTasksDisposedSuccessfully: Int,
         val queuedNonDisposableTasksRemoved: Int,
         val activeWorkersAtStart: Int,
         val taskDisposalFailures: List<String>,
-        val rejectionCallbackFailures: List<String>,
+        val rejectionNotificationFailures: List<String>,
         val shutdownAlreadyRequested: Boolean
     )
 
     fun shutdownNow(): CleanupReport {
         val activeBeforeDrain = executor.activeCount
         if (!closed.compareAndSet(false, true)) {
-            return CleanupReport(0, 0, 0, activeBeforeDrain, emptyList(), emptyList(), true)
+            return CleanupReport(0, 0, 0, 0, activeBeforeDrain, emptyList(), emptyList(), true)
         }
         val drained = executor.shutdownNow()
         val taskFailures = mutableListOf<String>()
-        var disposableDisposed = 0
+        var disposableAttempted = 0
+        var disposableSucceeded = 0
         var nonDisposable = 0
         for (task in drained) {
             if (task is DisposableCaptureTask) {
+                disposableAttempted++
                 try {
                     task.dispose()
-                    disposableDisposed++
+                    disposableSucceeded++
                 } catch (t: Throwable) {
                     taskFailures.add("taskDispose: ${t.message}")
+                    ignore { onTaskDisposalFailure(task, t) }
                 }
             } else {
                 nonDisposable++
@@ -97,25 +104,35 @@ internal class BoundedCaptureWorker(
         val rejectionFailures = mutableListOf<String>()
         for (task in drained) {
             try {
-                onRejected(task)
+                notificationHook(task)
             } catch (t: Throwable) {
-                rejectionFailures.add("rejectionCallback: ${t.message}")
+                rejectionFailures.add("rejectionNotification: ${t.message}")
+                ignore { onRejectionNotificationFailure(task, t) }
             }
         }
         return CleanupReport(
             queuedTasksRemoved = drained.size,
-            queuedDisposableTasksDisposed = disposableDisposed,
+            queuedDisposableTasksDisposalAttempted = disposableAttempted,
+            queuedDisposableTasksDisposedSuccessfully = disposableSucceeded,
             queuedNonDisposableTasksRemoved = nonDisposable,
             activeWorkersAtStart = activeBeforeDrain,
             taskDisposalFailures = taskFailures,
-            rejectionCallbackFailures = rejectionFailures,
+            rejectionNotificationFailures = rejectionFailures,
             shutdownAlreadyRequested = false
         )
     }
 
     private fun reject(task: Runnable) {
-        (task as? DisposableCaptureTask)?.dispose()
-        onRejected(task)
+        if (task is DisposableCaptureTask) {
+            try { task.dispose() } catch (t: Throwable) {
+                ignore { onTaskDisposalFailure(task, t) }
+            }
+        }
+        try {
+            notificationHook(task)
+        } catch (t: Throwable) {
+            ignore { onRejectionNotificationFailure(task, t) }
+        }
     }
 
     fun queuedCount(): Int = queue.size

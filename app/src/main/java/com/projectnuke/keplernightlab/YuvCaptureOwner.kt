@@ -40,7 +40,8 @@ internal class BufferedEncodeTask(
     private val accounting: YuvCaptureAccounting,
     private val lifecycle: YuvBufferedLifecycle,
     private val encode: () -> YuvWorkerCompletion,
-    private val postCompletion: (YuvWorkerCompletion) -> Unit
+    private val postCompletion: (YuvWorkerCompletion) -> Unit,
+    private val onSettlementFailure: ((YuvPngWorkItem, Throwable) -> Unit)? = null
 ) : DisposableCaptureTask {
     private val settled = AtomicBoolean(false)
 
@@ -54,14 +55,23 @@ internal class BufferedEncodeTask(
             postCompletion(completion)
         } finally {
             if (settled.compareAndSet(false, true)) {
-                lifecycle.settleEncoding(item, accounting)
+                settleItem()
             }
         }
     }
 
     override fun dispose() {
         if (settled.compareAndSet(false, true)) {
-            lifecycle.settleEncoding(item, accounting)
+            settleItem()
+        }
+    }
+
+    private fun settleItem() {
+        val outcome = lifecycle.settleEncoding(item, accounting)
+        if (outcome.failure != null) {
+            onSettlementFailure?.let { hook ->
+                try { hook(item, outcome.failure!!) } catch (_: Throwable) {}
+            }
         }
     }
 }
@@ -216,11 +226,11 @@ internal class YuvCaptureOwner(
 
         val fileName = "frame_${frame.frameIndex.toString().padStart(2, '0')}_color.png"
         val candidate = File(outputDir, ".${fileName}.${System.nanoTime()}.tmp")
-        val task = BufferedEncodeTask(
-            item = frame,
-            accounting = accounting,
-            lifecycle = lifecycle,
-            encode = {
+            val task = BufferedEncodeTask(
+                item = frame,
+                accounting = accounting,
+                lifecycle = lifecycle,
+                encode = {
                 try {
                     workProcessor.encode(frame, candidate, rotationDegrees)
                     YuvWorkerCompletion.Success(frame.frameIndex, frame.timestampNs, candidate, fileName, 0L)

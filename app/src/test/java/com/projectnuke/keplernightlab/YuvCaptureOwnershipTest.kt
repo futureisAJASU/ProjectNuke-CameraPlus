@@ -321,13 +321,19 @@ class YuvCaptureOwnershipTest {
             Thread {
                 start.countDown()
                 start.await(5, TimeUnit.SECONDS)
-                lifecycle.closeAndDrainRetained().forEach { it.dispose(accounting) }
+                lifecycle.closeAndDrainRetained().forEach {
+                    it.dispose(accounting)
+                    lifecycle.finishDrain(it)
+                }
                 done.countDown()
             }
         )
         threads.forEach { it.start() }
         assertTrue(done.await(5, TimeUnit.SECONDS))
-        threads.forEach { it.join(5_000) }
+        threads.forEach {
+            it.join(5_000)
+            assertFalse("${it.name} still alive", it.isAlive)
+        }
 
         assertEquals(1, disposeCount.get())
         assertEquals(0L, reservations.currentBytes())
@@ -381,15 +387,21 @@ class YuvCaptureOwnershipTest {
         }
         encoder.start(); closer.start()
         assertTrue(done.await(5, TimeUnit.SECONDS))
-        encoder.join(5_000); closer.join(5_000)
+        encoder.join(5_000)
+        assertFalse("encoder still alive", encoder.isAlive)
+        closer.join(5_000)
+        assertFalse("closer still alive", closer.isAlive)
 
         // Exactly one side claims the item
         assertEquals(1, encodingWon.get() + (drained.get()?.size ?: 0))
 
         // If encoding won, settleEncoding removes it
         lifecycle.settleEncoding(item, accounting)
-        // If drained won, dispose the item
-        drained.get()?.forEach { it.dispose(accounting) }
+        // If drained won, dispose the item and finish its drain
+        drained.get()?.forEach {
+            it.dispose(accounting)
+            lifecycle.finishDrain(it)
+        }
 
         assertEquals(0, lifecycle.retainedCount())
         assertEquals(0, lifecycle.encodingCount())
@@ -457,7 +469,10 @@ class YuvCaptureOwnershipTest {
         assertEquals(1, lifecycle.encodingCount())
         assertEquals(2, lifecycle.trackedCount())
 
-        lifecycle.closeAndDrainRetained().forEach { it.dispose(accounting) }
+        lifecycle.closeAndDrainRetained().forEach {
+            it.dispose(accounting)
+            lifecycle.finishDrain(it)
+        }
         lifecycle.settleEncoding(eItem, accounting)
 
         assertEquals(0, lifecycle.trackedCount())
@@ -630,7 +645,7 @@ class YuvCaptureOwnershipTest {
             worker.shutdownNow()
             assertEquals(0, runningDisposed.get())
             block.countDown()
-            worker.awaitTermination(5_000)
+            assertTrue(worker.awaitTermination(5_000))
             assertEquals(0, runningDisposed.get())
         } finally {
             worker.close()
@@ -666,7 +681,7 @@ class YuvCaptureOwnershipTest {
             assertEquals(0, disposeCount.get())
             worker.shutdownNow()
             // shutdownNow interrupts the body; the body's own finally performs the disposal.
-            worker.awaitTermination(5_000)
+            assertTrue(worker.awaitTermination(5_000))
             assertEquals(1, disposeCount.get())
             assertEquals(0L, reservations.currentBytes())
         } finally {
@@ -700,7 +715,7 @@ class YuvCaptureOwnershipTest {
             ) {}))
             worker.shutdownNow()
             block.countDown()
-            worker.awaitTermination(5_000)
+            assertTrue(worker.awaitTermination(5_000))
             assertEquals(2, releaseCount.get())
             assertEquals(0L, reservations.currentBytes())
             assertEquals(0, accounting.snapshot().bufferedFrames)

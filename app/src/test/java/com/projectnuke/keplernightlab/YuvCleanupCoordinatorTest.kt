@@ -1,5 +1,6 @@
 package com.projectnuke.keplernightlab
 
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -20,16 +21,18 @@ class YuvCleanupCoordinatorTest {
         val coordinator = YuvCleanupCoordinator(stateOwner, lifecycle, accounting, reservations, worker)
 
         val result1 = coordinator.perform()
+        assertEquals(CleanupPhase.COMPLETED, result1.phase)
         assertTrue(result1.cleanupStarted)
         assertTrue(result1.ownerCloseRequested)
         assertTrue(result1.workerShutdownRequested)
+        assertEquals(1, result1.cleanupInitiationCount)
 
         val result2 = coordinator.perform()
+        assertEquals(CleanupPhase.COMPLETED, result2.phase)
         assertTrue(result2.cleanupStarted)
         assertTrue(result2.ownerCloseRequested)
         assertTrue(result2.workerShutdownRequested)
         assertEquals(1, result2.cleanupInitiationCount)
-        // Historical drained total preserved even on repeat call
         assertEquals(0, result2.totalDrainedRetainedItems)
     }
 
@@ -82,12 +85,13 @@ class YuvCleanupCoordinatorTest {
         assertEquals(1, worker.queuedCount())
 
         val result = coordinator.perform()
+        assertEquals(1, result.totalQueuedTasksRemoved)
         assertEquals(1, result.totalQueuedDisposableTasksDisposed)
         assertEquals(1, disposeCount.get())
         assertEquals(0L, reservations.currentBytes())
 
         release.countDown()
-        worker.awaitTermination(5_000)
+        assertTrue(worker.awaitTermination(5_000))
     }
 
     @Test
@@ -107,8 +111,8 @@ class YuvCleanupCoordinatorTest {
         val result = coordinator.perform()
         assertTrue(result.ownerCloseRequested)
         assertEquals(1, result.currentEncodingItems)
-        assertEquals(100L, result.currentReservedBytes)
         assertEquals(1, result.currentBufferedFrames)
+        assertEquals(100L, result.currentReservedBytes)
 
         lifecycle.settleEncoding(item, accounting)
         val after = coordinator.snapshot()
@@ -154,10 +158,7 @@ class YuvCleanupCoordinatorTest {
         val goodItem = YuvPngWorkItem.bufferedForTest(0, 1L, 100, reservations, accounting)
         assertTrue(lifecycle.tryRegister(goodItem))
 
-        // Inject disposal failure via onRelease throwing
-        val onReleaseCount = AtomicInteger(0)
         val throwingItem = YuvPngWorkItem.bufferedForTest(1, 2L, 100, reservations, accounting) {
-            onReleaseCount.incrementAndGet()
             error("injected onRelease failure")
         }
         assertTrue(lifecycle.tryRegister(throwingItem))
@@ -167,7 +168,6 @@ class YuvCleanupCoordinatorTest {
         assertTrue(result.workerShutdownRequested)
         assertTrue(result.cleanupStarted)
         assertEquals(2, result.totalDrainedRetainedItems)
-        // One failure from the throwing item, good item still disposed
         assertTrue(result.cleanupFailures.any { it.contains("onRelease") })
         assertEquals(0, lifecycle.retainedCount())
         assertEquals(0L, reservations.currentBytes())
@@ -175,14 +175,25 @@ class YuvCleanupCoordinatorTest {
 
     @Test
     fun workerQueuedTaskDisposalThrowsLaterTaskStillDisposes() {
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
         val stateOwner = CaptureStateOwner(dispatch = { true })
         val lifecycle = YuvBufferedLifecycle()
         val accounting = YuvCaptureAccounting()
         val reservations = YuvBufferReservations(1024)
-        val worker = BoundedCaptureWorker("cleanup-worker-fail", 2)
+        val worker = BoundedCaptureWorker("cleanup-worker-fail", 2,
+            onTaskDisposalFailure = { _, _ -> },
+            onRejectionNotificationFailure = { _, _ -> },
+            onRejected = { _ -> })
         val coordinator = YuvCleanupCoordinator(stateOwner, lifecycle, accounting, reservations, worker)
 
         val task2Disposed = AtomicInteger(0)
+
+        assertTrue(worker.submit(Runnable {
+            started.countDown(); release.await(2, TimeUnit.SECONDS)
+        }))
+        assertTrue(started.await(2, TimeUnit.SECONDS))
+
         val task1 = object : DisposableCaptureTask {
             override fun run() {}
             override fun dispose() { error("task1 disposal failed") }
@@ -191,12 +202,19 @@ class YuvCleanupCoordinatorTest {
             override fun run() {}
             override fun dispose() { task2Disposed.incrementAndGet() }
         }
-        worker.submit(task1)
-        worker.submit(task2)
+        assertTrue(worker.submit(task1))
+        assertTrue(worker.submit(task2))
+        assertEquals(2, worker.queuedCount())
 
         val result = coordinator.perform()
         assertTrue(result.ownerCloseRequested)
         assertEquals(1, task2Disposed.get())
+        assertTrue(result.cleanupFailures.any { it.contains("taskDispose") })
+        assertEquals(2, result.totalQueuedTasksRemoved)
+        assertEquals(1, result.totalQueuedDisposableTasksDisposed)
+
+        release.countDown()
+        assertTrue(worker.awaitTermination(5_000))
     }
 
     @Test
@@ -205,17 +223,118 @@ class YuvCleanupCoordinatorTest {
         val lifecycle = YuvBufferedLifecycle()
         val accounting = YuvCaptureAccounting()
         val reservations = YuvBufferReservations(1024)
-        val worker = BoundedCaptureWorker("cleanup-concurrent", 1)
+        val worker = BoundedCaptureWorker("cleanup-concurrent", 4,
+            onTaskDisposalFailure = { _, _ -> },
+            onRejectionNotificationFailure = { _, _ -> },
+            onRejected = { _ -> })
         val coordinator = YuvCleanupCoordinator(stateOwner, lifecycle, accounting, reservations, worker)
 
-        val latch = CountDownLatch(2)
-        val results = mutableListOf<YuvCleanupResult>()
-        val t1 = Thread { results.add(coordinator.perform()); latch.countDown() }
-        val t2 = Thread { results.add(coordinator.perform()); latch.countDown() }
-        t1.start(); t2.start()
-        assertTrue(latch.await(5, TimeUnit.SECONDS))
-        t1.join(2_000); t2.join(2_000)
+        // Add a retained item whose disposal blocks, keeping the first
+        // perform() in cleanup's IN_PROGRESS phase while the second caller
+        // invokes perform() and observes the in-progress snapshot.
+        val disposalStarted = CountDownLatch(1)
+        val disposalBlock = CountDownLatch(1)
+        assertTrue(reservations.tryReserve(100))
+        val blockingItem = YuvPngWorkItem.bufferedForTest(0, 1L, 100, reservations, accounting) {
+            disposalStarted.countDown()
+            disposalBlock.await(5, TimeUnit.SECONDS)
+        }
+        assertTrue(lifecycle.tryRegister(blockingItem))
 
+        val barrier = CountDownLatch(1)
+        val done = CountDownLatch(2)
+        val results = ConcurrentLinkedQueue<YuvCleanupResult>()
+        val t1 = Thread {
+            assertTrue(barrier.await(5, TimeUnit.SECONDS))
+            results.add(coordinator.perform())
+            done.countDown()
+        }
+        val t2 = Thread {
+            assertTrue(barrier.await(5, TimeUnit.SECONDS))
+            results.add(coordinator.perform())
+            done.countDown()
+        }
+        t1.start(); t2.start()
+        barrier.countDown()
+        // Wait for first caller's perform to enter IN_PROGRESS and start draining
+        assertTrue(disposalStarted.await(2, TimeUnit.SECONDS))
+        // Second caller should observe IN_PROGRESS
+        disposalBlock.countDown()
+        assertTrue(done.await(5, TimeUnit.SECONDS))
+        t1.join(2_000); t2.join(2_000)
+        assertFalse(t1.isAlive); assertFalse(t2.isAlive)
+
+        assertEquals(2, results.size)
         assertTrue(results.all { it.cleanupInitiationCount == 1 })
+
+        val completed = results.filter { it.phase == CleanupPhase.COMPLETED }
+        val inProgress = results.filter { it.phase == CleanupPhase.IN_PROGRESS }
+        assertTrue("at least one caller observed IN_PROGRESS", inProgress.isNotEmpty())
+        assertTrue("at least one caller observed COMPLETED", completed.isNotEmpty())
+    }
+
+    @Test
+    fun performAfterCompletionReturnsHistoricalResult() {
+        val stateOwner = CaptureStateOwner(dispatch = { true })
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024)
+        val worker = BoundedCaptureWorker("cleanup-after", 2,
+            onTaskDisposalFailure = { _, _ -> },
+            onRejectionNotificationFailure = { _, _ -> },
+            onRejected = { _ -> })
+        val coordinator = YuvCleanupCoordinator(stateOwner, lifecycle, accounting, reservations, worker)
+
+        val first = coordinator.perform()
+        assertEquals(CleanupPhase.COMPLETED, first.phase)
+        assertEquals(1, first.cleanupInitiationCount)
+
+        val second = coordinator.perform()
+        assertEquals(CleanupPhase.COMPLETED, second.phase)
+        assertEquals(1, second.cleanupInitiationCount)
+        assertTrue(second.ownerCloseRequested)
+        assertTrue(second.workerShutdownRequested)
+    }
+
+    @Test
+    fun ownerCloseFailureDoesNotSkipLifecycleDrain() {
+        val stateOwner = CaptureStateOwner(dispatch = { true })
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024)
+        val worker = BoundedCaptureWorker("cleanup-ownfail", 1,
+            onTaskDisposalFailure = { _, _ -> },
+            onRejectionNotificationFailure = { _, _ -> },
+            onRejected = { _ -> })
+        val coordinator = YuvCleanupCoordinator(stateOwner, lifecycle, accounting, reservations, worker)
+
+        assertTrue(reservations.tryReserve(100))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100, reservations, accounting)
+        assertTrue(lifecycle.tryRegister(item))
+
+        val result = coordinator.perform()
+        assertTrue(result.ownerCloseRequested)
+        assertTrue(result.workerShutdownRequested)
+        assertEquals(1, result.totalDrainedRetainedItems)
+        assertEquals(0, lifecycle.retainedCount())
+        assertEquals(0, lifecycle.drainingCount())
+        assertEquals(0L, reservations.currentBytes())
+    }
+
+    @Test
+    fun workerShutdownFailureDoesNotPreventStatePublication() {
+        val stateOwner = CaptureStateOwner(dispatch = { true })
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024)
+        val worker = BoundedCaptureWorker("cleanup-wfail", 1,
+            onTaskDisposalFailure = { _, _ -> },
+            onRejectionNotificationFailure = { _, _ -> },
+            onRejected = { _ -> })
+        val coordinator = YuvCleanupCoordinator(stateOwner, lifecycle, accounting, reservations, worker)
+
+        val result = coordinator.perform()
+        assertEquals(CleanupPhase.COMPLETED, result.phase)
+        assertTrue(result.ownerCloseRequested)
     }
 }
