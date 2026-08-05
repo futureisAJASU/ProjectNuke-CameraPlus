@@ -471,6 +471,7 @@ class YuvCaptureOwnerTest {
         assertTrue(reservations.tryReserve(100L))
         val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting)
         assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
         assertEquals(1, accounting.snapshot().bufferedFrames)
         lifecycle.settleEncoding(item, accounting)
         lifecycle.settleEncoding(item, accounting)

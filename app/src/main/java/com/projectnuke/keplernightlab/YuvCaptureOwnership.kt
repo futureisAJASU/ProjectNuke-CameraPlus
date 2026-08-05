@@ -4,6 +4,7 @@ import android.media.Image
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 // ── Serializable manifest entry ────────────────────────────────────
 data class YuvFrameManifestEntry(
@@ -481,12 +482,12 @@ internal class YuvCleanupCoordinator(
                 history = history.copy(
                     workerShutdownRequested = true,
                     drainedRetainedItems = drained.size,
-                    queuedTasksRemoved = report.queuedTasksRemoved + report.queuedNonDisposableTasksRemoved,
-                    queuedDisposableTasksDisposed = report.queuedDisposableTasksDisposed,
+                    queuedTasksRemoved = report.queuedTasksRemoved,
+                    queuedDisposableTasksDisposed = report.queuedDisposableTasksDisposedSuccessfully,
                     activeWorkersAtStart = report.activeWorkersAtStart
                 )
             }
-            val merged = (mutableFailures + report.taskDisposalFailures + report.rejectionCallbackFailures).toList()
+            val merged = (mutableFailures + report.taskDisposalFailures + report.rejectionNotificationFailures).toList()
             failures = merged
             return buildSnapshot(merged)
         } catch (t: Throwable) {

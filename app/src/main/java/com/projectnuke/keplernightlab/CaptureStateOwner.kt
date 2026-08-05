@@ -159,6 +159,6 @@ internal class CaptureStateOwner(
     fun trackingSize(): Int = synchronized(lock) { tracking.size }
 }
 
-private inline fun ignore(block: () -> Unit) {
+internal inline fun ignore(block: () -> Unit) {
     try { block() } catch (_: Throwable) {}
 }
