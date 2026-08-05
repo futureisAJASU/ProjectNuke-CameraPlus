@@ -5,12 +5,160 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
+// ── Serializable manifest entry ────────────────────────────────────
 data class YuvFrameManifestEntry(
     val frameIndex: Int,
     val filename: String,
     val timestampNs: Long,
     val persisted: Boolean,
     val failure: String? = null
+)
+
+// ── Candidate ownership state ──────────────────────────────────────
+internal enum class CandidateOwnership {
+    UNSETTLED, ADOPTED, DISCARDED, QUARANTINED
+}
+
+internal data class CandidateOwnershipToken(
+    val frameIndex: Int,
+    val fileName: String,
+    val timestampNs: Long,
+    val candidate: File
+) {
+    @Volatile var ownership: CandidateOwnership = CandidateOwnership.UNSETTLED
+}
+
+// ── Adoption token for reservation → commit/rollback ───────────────
+internal data class AdoptionToken(
+    val reservedEntry: YuvFrameManifestEntry
+)
+
+// ── Owned direct YUV source abstraction ────────────────────────────
+internal interface OwnedDirectYuvSource {
+    val timestampNs: Long
+    fun encodeTo(encoder: YuvPngEncoder, candidate: File, rotationDegrees: Int)
+    fun release()
+}
+
+internal class AndroidOwnedDirectYuvSource(
+    private val image: Image,
+    override val timestampNs: Long
+) : OwnedDirectYuvSource {
+    private val released = AtomicBoolean(false)
+
+    override fun encodeTo(encoder: YuvPngEncoder, candidate: File, rotationDegrees: Int) {
+        encoder.encodeDirect(image, candidate, rotationDegrees)
+    }
+
+    override fun release() {
+        if (released.compareAndSet(false, true)) {
+            image.close()
+        }
+    }
+}
+
+internal class FakeOwnedDirectYuvSource : OwnedDirectYuvSource {
+    @Volatile var released = false
+    val encodeCount = java.util.concurrent.atomic.AtomicInteger(0)
+    override val timestampNs: Long = 4321L
+
+    override fun encodeTo(encoder: YuvPngEncoder, candidate: File, rotationDegrees: Int) {
+        encodeCount.incrementAndGet()
+        candidate.writeBytes(PNG_1X1_BYTES)
+    }
+
+    override fun release() {
+        released = true
+    }
+
+    companion object {
+        val PNG_1X1_BYTES: ByteArray = java.util.Base64.getDecoder().decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+    }
+}
+
+// ── YuvCaptureAccounting ───────────────────────────────────────────
+internal open class YuvCaptureAccounting {
+    private val lock = Any()
+    private var received = 0
+    private var buffered = 0
+    private var persisted = 0
+    private var failed = 0
+    private var dropped = 0
+    private val manifest = linkedMapOf<Int, YuvFrameManifestEntry>()
+    private val reservedIndices = mutableSetOf<Int>()
+    private val reservedFilenames = mutableSetOf<String>()
+
+    fun receivedFrame() = synchronized(lock) { received++ }
+    open fun bufferedFrame() = synchronized(lock) { buffered++ }
+    fun releasedBufferedFrame() = synchronized(lock) {
+        check(buffered > 0) { "bufferedFrames released more than once" }
+        buffered--
+    }
+    open fun failedFrame() = synchronized(lock) { failed++ }
+    fun droppedFrame() = synchronized(lock) { dropped++ }
+
+    // Legacy / ColorFusion compat
+    fun persistedFrame(entry: YuvFrameManifestEntry): Boolean = synchronized(lock) {
+        if (!entry.persisted || manifest.containsKey(entry.frameIndex)
+            || manifest.values.any { it.filename == entry.filename }) {
+            return@synchronized false
+        }
+        manifest[entry.frameIndex] = entry
+        persisted++
+        true
+    }
+
+    fun tryReserveAdoption(entry: YuvFrameManifestEntry): Boolean = synchronized(lock) {
+        if (manifest.containsKey(entry.frameIndex) ||
+            manifest.values.any { it.filename == entry.filename } ||
+            reservedIndices.contains(entry.frameIndex) ||
+            reservedFilenames.contains(entry.filename)) {
+            return@synchronized false
+        }
+        reservedIndices.add(entry.frameIndex)
+        reservedFilenames.add(entry.filename)
+        true
+    }
+
+    fun commitReservedAdoption(entry: YuvFrameManifestEntry): Boolean = synchronized(lock) {
+        if (!reservedIndices.remove(entry.frameIndex) || !reservedFilenames.remove(entry.filename)) {
+            return@synchronized false
+        }
+        manifest[entry.frameIndex] = entry
+        persisted++
+        check(persisted == manifest.size) { "persisted=$persisted manifest=${manifest.size}" }
+        true
+    }
+
+    fun rollbackReservedAdoption(entry: YuvFrameManifestEntry) = synchronized(lock) {
+        reservedIndices.remove(entry.frameIndex)
+        reservedFilenames.remove(entry.filename)
+    }
+
+    fun snapshot(): YuvCaptureAccountingSnapshot = synchronized(lock) {
+        check(persisted == manifest.size) { "persisted=$persisted manifest=${manifest.size}" }
+        YuvCaptureAccountingSnapshot(
+            receivedFrames = received,
+            bufferedFrames = buffered,
+            persistedFrames = persisted,
+            failedFrames = failed,
+            droppedFrames = dropped,
+            manifest = manifest.values.sortedBy { it.frameIndex },
+            reservedCount = reservedIndices.size
+        )
+    }
+}
+
+data class YuvCaptureAccountingSnapshot(
+    val receivedFrames: Int,
+    val bufferedFrames: Int,
+    val persistedFrames: Int,
+    val failedFrames: Int,
+    val droppedFrames: Int,
+    val manifest: List<YuvFrameManifestEntry>,
+    val reservedCount: Int = 0
 )
 
 internal class YuvBufferReservations(private val limitBytes: Long) {
@@ -29,7 +177,7 @@ internal class YuvBufferReservations(private val limitBytes: Long) {
         if (bytes <= 0L) return
         while (true) {
             val current = retained.get()
-            check(current >= bytes) { "YUV reservation released more than once" }
+            check(current >= bytes) { "reservation released more than once" }
             if (retained.compareAndSet(current, current - bytes)) return
         }
     }
@@ -37,71 +185,6 @@ internal class YuvBufferReservations(private val limitBytes: Long) {
     fun currentBytes(): Long = retained.get()
 }
 
-internal open class YuvCaptureAccounting {
-    private val lock = Any()
-    private var received = 0
-    private var buffered = 0
-    private var persisted = 0
-    private var failed = 0
-    private var dropped = 0
-    private val manifest = linkedMapOf<Int, YuvFrameManifestEntry>()
-
-    fun receivedFrame() = synchronized(lock) { received++ }
-    open fun bufferedFrame() = synchronized(lock) { buffered++ }
-    fun releasedBufferedFrame() = synchronized(lock) {
-        check(buffered > 0) { "bufferedFrames released more than once" }
-        buffered--
-    }
-    open fun failedFrame() = synchronized(lock) { failed++ }
-    fun droppedFrame() = synchronized(lock) { dropped++ }
-
-    fun persistedFrame(entry: YuvFrameManifestEntry): Boolean = synchronized(lock) {
-        if (!entry.persisted || manifest.containsKey(entry.frameIndex) || manifest.values.any { it.filename == entry.filename }) {
-            return@synchronized false
-        }
-        manifest[entry.frameIndex] = entry
-        persisted++
-        true
-    }
-
-    /**
-     * Reserve a frame identity and filename for pending adoption.
-     * Returns true if the reservation is unique; false if a collision exists.
-     * The caller must followed up with [adoptReserved] after successful commit.
-     */
-    fun reserveForAdoption(entry: YuvFrameManifestEntry): Boolean = synchronized(lock) {
-        if (manifest.containsKey(entry.frameIndex) || manifest.values.any { it.filename == entry.filename }) {
-            return@synchronized false
-        }
-        manifest[entry.frameIndex] = entry
-        true
-    }
-
-    /**
-     * Adopt a previously reserved identity. The reservation must have been
-     * committed successfully (file exists and is readable).
-     * [persistedFrames] is incremented exactly once here.
-     */
-    fun adoptReserved(entry: YuvFrameManifestEntry) = synchronized(lock) {
-        check(manifest[entry.frameIndex]?.filename == entry.filename) { "adoptReserved: reserved entry not found or filename mismatch" }
-        persisted++
-    }
-
-    fun snapshot(): YuvCaptureAccountingSnapshot = synchronized(lock) {
-        YuvCaptureAccountingSnapshot(received, buffered, persisted, failed, dropped, manifest.values.sortedBy { it.frameIndex })
-    }
-}
-
-internal data class YuvCaptureAccountingSnapshot(
-    val receivedFrames: Int,
-    val bufferedFrames: Int,
-    val persistedFrames: Int,
-    val failedFrames: Int,
-    val droppedFrames: Int,
-    val manifest: List<YuvFrameManifestEntry>
-)
-
-/** Testable Camera2 access seam for buffered (copy-based) work. */
 internal interface YuvImageAccess {
     fun timestampNs(): Long
     fun allocationBytes(): Long
@@ -116,11 +199,6 @@ internal class Camera2YuvImageAccess(private val image: Image) : YuvImageAccess 
     override fun release() = image.close()
 }
 
-/**
- * Production access for direct (non-buffered) YUV work.
- * The caller must use typed methods [createDirectYuvWork] to transfer the Image
- * atomically; no unsafe `access as DirectYuvImageAccess` cast occurs anywhere.
- */
 internal interface DirectYuvImageAccess : YuvImageAccess {
     fun takeImage(): Image?
 }
@@ -130,22 +208,12 @@ internal class Camera2DirectYuvImageAccess(private val image: Image) : DirectYuv
     override fun timestampNs(): Long = image.timestamp
     override fun allocationBytes(): Long = 0L
     override fun copy(frameIndex: Int): BufferedYuvFrame = error("direct work does not copy")
-    override fun release() {
-        // Ownership of the Image transfers to the work item on takeImage().
-        // Once taken, release must not close the Image: the item owns it.
-        if (!taken) image.close()
-    }
+    override fun release() { if (!taken) image.close() }
     override fun takeImage(): Image? {
         check(!taken) { "DirectYuvImageAccess.takeImage() called twice" }
         taken = true
         return image
     }
-}
-
-internal sealed interface BufferedYuvWorkCreation {
-    data class Accepted(val item: YuvPngWorkItem) : BufferedYuvWorkCreation
-    data object Rejected : BufferedYuvWorkCreation
-    data class Failed(val cause: Throwable) : BufferedYuvWorkCreation
 }
 
 internal sealed interface DirectYuvWorkCreation {
@@ -173,22 +241,22 @@ internal fun createDirectYuvWork(
         account.failedFrame()
         return DirectYuvWorkCreation.Failed(t)
     }
-    // On success, transfer of ownership is complete.  The access no longer
-    // owns the image; it must release its wrapper state to avoid a leak in
-    // the underlying ImageReader pool.
     runCatching { access.release() }
     return DirectYuvWorkCreation.Accepted(
         YuvPngWorkItem.direct(frameIndex, timestampNs, image, onRelease)
     )
 }
 
+internal sealed interface BufferedYuvWorkCreation {
+    data class Accepted(val item: YuvPngWorkItem) : BufferedYuvWorkCreation
+    data object Rejected : BufferedYuvWorkCreation
+    data class Failed(val cause: Throwable) : BufferedYuvWorkCreation
+}
+
 internal class YuvImageReleaseGuard(private val access: YuvImageAccess) {
     private val consumed = AtomicBoolean(false)
-
     fun releaseSafely() {
-        if (consumed.compareAndSet(false, true)) {
-            runCatching { access.release() }
-        }
+        if (consumed.compareAndSet(false, true)) runCatching { access.release() }
     }
 }
 
@@ -199,11 +267,11 @@ internal fun createBufferedYuvWork(
     accounting: YuvCaptureAccounting,
     onRelease: (() -> Unit)? = null
 ): BufferedYuvWorkCreation {
-    val releaseGuard = YuvImageReleaseGuard(access)
+    val guard = YuvImageReleaseGuard(access)
     var timestampNs = 0L
     var bytes = 0L
     var reserved = false
-    var itemOwned = false
+    var itemOwner = false
     try {
         timestampNs = access.timestampNs()
         bytes = access.allocationBytes()
@@ -214,7 +282,7 @@ internal fun createBufferedYuvWork(
         reserved = true
         val frame = access.copy(frameIndex)
         val item = YuvPngWorkItem.buffered(frameIndex, timestampNs, frame, bytes, reservations, accounting, onRelease)
-        itemOwned = true
+        itemOwner = true
         return BufferedYuvWorkCreation.Accepted(item)
     } catch (oom: OutOfMemoryError) {
         throw oom
@@ -222,8 +290,8 @@ internal fun createBufferedYuvWork(
         accounting.failedFrame()
         return BufferedYuvWorkCreation.Failed(t)
     } finally {
-        releaseGuard.releaseSafely()
-        if (reserved && !itemOwned) {
+        guard.releaseSafely()
+        if (reserved && !itemOwner) {
             reservations.release(bytes)
         }
     }
@@ -233,6 +301,7 @@ internal class YuvPngWorkItem private constructor(
     val frameIndex: Int,
     val timestampNs: Long,
     private var image: Image?,
+    private var directSource: OwnedDirectYuvSource?,
     private var buffered: BufferedYuvFrame?,
     private val retainedBytes: Long,
     private val reservations: YuvBufferReservations?,
@@ -242,8 +311,8 @@ internal class YuvPngWorkItem private constructor(
     private val bufferedReleased = AtomicBoolean(false)
 
     fun imageForEncoding(): Image? = image
+    fun directSourceForEncoding(): OwnedDirectYuvSource? = directSource
     fun bufferedForEncoding(): BufferedYuvFrame? = buffered
-    fun retainedBytes(): Long = retainedBytes
 
     fun settleBufferedAccounting(accounting: YuvCaptureAccounting) {
         if (retainedBytes > 0L && bufferedReleased.compareAndSet(false, true)) {
@@ -254,11 +323,12 @@ internal class YuvPngWorkItem private constructor(
 
     fun dispose(accounting: YuvCaptureAccounting? = null) {
         if (!released.compareAndSet(false, true)) return
-        val ownedImage = image
-        image = null
-        buffered = null
+        val img = image; image = null
+        val src = directSource; directSource = null
+        val buf = buffered; buffered = null
         try {
-            ownedImage?.close()
+            img?.close()
+            src?.release()
         } finally {
             if (accounting != null) settleBufferedAccounting(accounting)
             onRelease?.invoke()
@@ -266,39 +336,31 @@ internal class YuvPngWorkItem private constructor(
     }
 
     companion object {
-        fun direct(frameIndex: Int, timestampNs: Long, image: Image?, onRelease: (() -> Unit)? = null) =
-            YuvPngWorkItem(frameIndex, timestampNs, image, null, 0L, null, onRelease)
-
+        fun direct(frameIndex: Int, timestampNs: Long, image: Image?, onRelease: (() -> Unit)? = null): YuvPngWorkItem {
+            return YuvPngWorkItem(frameIndex, timestampNs, image, null, null, 0L, null, onRelease)
+        }
         fun buffered(
-            frameIndex: Int,
-            timestampNs: Long,
-            frame: BufferedYuvFrame,
-            retainedBytes: Long,
-            reservations: YuvBufferReservations,
-            accounting: YuvCaptureAccounting,
-            onRelease: (() -> Unit)? = null
-        ) = YuvPngWorkItem(frameIndex, timestampNs, null, frame, retainedBytes, reservations, onRelease)
-            .also { accounting.bufferedFrame() }
-
-        internal fun ownedForTest(onRelease: () -> Unit) =
-            YuvPngWorkItem(-1, 0L, null, null, 0L, null, onRelease)
-
+            frameIndex: Int, timestampNs: Long, frame: BufferedYuvFrame,
+            retainedBytes: Long, reservations: YuvBufferReservations,
+            accounting: YuvCaptureAccounting, onRelease: (() -> Unit)? = null
+        ): YuvPngWorkItem {
+            val item = YuvPngWorkItem(frameIndex, timestampNs, null, null, frame, retainedBytes, reservations, onRelease)
+            accounting.bufferedFrame()
+            return item
+        }
+        internal fun ownedForTest(onRelease: () -> Unit): YuvPngWorkItem {
+            return YuvPngWorkItem(-1, 0L, null, null, null, 0L, null, onRelease)
+        }
         internal fun bufferedForTest(
-            frameIndex: Int,
-            timestampNs: Long,
-            retainedBytes: Long,
-            reservations: YuvBufferReservations,
-            accounting: YuvCaptureAccounting,
+            frameIndex: Int, timestampNs: Long, retainedBytes: Long,
+            reservations: YuvBufferReservations, accounting: YuvCaptureAccounting,
             onRelease: (() -> Unit)? = null
-        ) = YuvPngWorkItem(
-            frameIndex,
-            timestampNs,
-            null,
-            BufferedYuvFrame(frameIndex, timestampNs, 1, 1, ByteArray(0), ByteArray(0), ByteArray(0), 1, 1, 1, 1, 1, 1),
-            retainedBytes,
-            reservations,
-            onRelease
-        ).also { accounting.bufferedFrame() }
+        ): YuvPngWorkItem {
+            val f = BufferedYuvFrame(frameIndex, timestampNs, 1, 1, ByteArray(0), ByteArray(0), ByteArray(0), 1, 1, 1, 1, 1, 1)
+            val item = YuvPngWorkItem(frameIndex, timestampNs, null, null, f, retainedBytes, reservations, onRelease)
+            accounting.bufferedFrame()
+            return item
+        }
     }
 }
 
@@ -316,18 +378,18 @@ internal class YuvPngWorkProcessor(
     private val committer: YuvCandidateCommitter
 ) {
     fun encode(item: YuvPngWorkItem, candidate: File, rotationDegrees: Int) {
+        val source = item.directSourceForEncoding()
+        if (source != null) { source.encodeTo(encoder, candidate, rotationDegrees); return }
         val image = item.imageForEncoding()
-        if (image != null) {
-            encoder.encodeDirect(image, candidate, rotationDegrees)
-            return
-        }
-        val buffered = item.bufferedForEncoding()
-            ?: error("YUV work item has no owned source")
+        if (image != null) { encoder.encodeDirect(image, candidate, rotationDegrees); return }
+        val buffered = item.bufferedForEncoding() ?: error("YUV work item has no owned source")
         encoder.encodeBuffered(buffered, candidate, rotationDegrees)
     }
 
     fun commit(candidate: File, finalFile: File) = committer.commit(candidate, finalFile)
 }
+
+
 
 internal class DisposableYuvTask(
     val item: YuvPngWorkItem,
@@ -336,4 +398,36 @@ internal class DisposableYuvTask(
 ) : DisposableCaptureTask {
     override fun run() = body()
     override fun dispose() = item.dispose(accounting)
+}
+
+// ═══ Cleanup coordinator ═══════════════════════════════════════════════
+
+internal data class YuvCleanupResult(
+    val drainedBufferedItems: Int,
+    val remainingBufferedFrames: Int,
+    val remainingReservationBytes: Long,
+    val workerShutdown: Boolean
+)
+
+internal class YuvCleanupCoordinator(
+    private val captureStateOwner: CaptureStateOwner,
+    private val lifecycle: YuvBufferedLifecycle,
+    private val accounting: YuvCaptureAccounting,
+    private val reservations: YuvBufferReservations,
+    private val boundedWorker: BoundedCaptureWorker
+) {
+    private val ran = AtomicBoolean(false)
+
+    fun perform(): YuvCleanupResult {
+        if (!ran.compareAndSet(false, true)) {
+            val snap = accounting.snapshot()
+            return YuvCleanupResult(0, snap.bufferedFrames, reservations.currentBytes(), false)
+        }
+        captureStateOwner.close()
+        val drained = lifecycle.closeAndDrainRetained()
+        drained.forEach { it.dispose(accounting) }
+        boundedWorker.shutdownNow()
+        val snap = accounting.snapshot()
+        return YuvCleanupResult(drained.size, snap.bufferedFrames, reservations.currentBytes(), true)
+    }
 }

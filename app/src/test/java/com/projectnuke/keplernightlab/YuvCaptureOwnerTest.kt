@@ -196,7 +196,7 @@ class YuvCaptureOwnerTest {
 
         companion object {
             private val TERMINAL_JOB_STATUSES = setOf(
-                "CAPTURE_COMPLETE", "CAPTURE_FAILED", "CAPTURE_TIMEOUT", "CAPTURE_CANCELLED"
+                "CAPTURE_COMPLETE", "CAPTURE_PARTIAL", "CAPTURE_FAILED", "CAPTURE_TIMEOUT", "CAPTURE_CANCELLED"
             )
         }
     }

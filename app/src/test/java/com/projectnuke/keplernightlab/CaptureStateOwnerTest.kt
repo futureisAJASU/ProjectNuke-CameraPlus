@@ -4,6 +4,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -32,29 +33,81 @@ class CaptureStateOwnerTest {
         override fun disposeWithoutMutation() { disposals.incrementAndGet() }
     }
 
+    private class ThrowingTestEvent : CaptureOwnerEvent {
+        val executions = AtomicInteger(0)
+        override fun execute() { executions.incrementAndGet(); error("forced failure") }
+        override fun disposeWithoutMutation() {}
+    }
+
     // ------------------------------------------------------------------
-    // Rejection and closure
+    // Open / RUNNING vs close interleaving
     // ------------------------------------------------------------------
 
     @Test
-    fun rejectedDispatchDisposesEventWithoutMutation() {
+    fun postWithSynchronousDispatchExecutesAndReportsAccepted() {
         val event = TestEvent()
-        val owner = CaptureStateOwner(dispatch = { false })
+        val owner = CaptureStateOwner(dispatch = { it.execute(); true })
+        assertTrue(owner.post(event))
+        assertEquals(1, event.executions.get())
+        assertEquals(0, event.disposals.get())
+        assertEquals(0, owner.pendingCount())
+        assertEquals(0, owner.runningCount())
+    }
+
+    @Test
+    fun postAfterCloseDisposesWithoutMutation() {
+        val event = TestEvent()
+        val owner = CaptureStateOwner(dispatch = { it.execute(); true })
+        owner.close()
         assertFalse(owner.post(event))
         assertEquals(0, event.executions.get())
         assertEquals(1, event.disposals.get())
     }
 
     @Test
-    fun postAfterCloseDisposesWithoutMutation() {
-        val e1 = TestEvent(); val e2 = TestEvent()
-        val owner = CaptureStateOwner(dispatch = { it.execute(); true })
+    fun closeDrainsPendingEventsButNotRunningOnes() {
+        val queue = LinkedBlockingQueue<CaptureOwnerEvent>()
+        val owner = CaptureStateOwner(dispatch = { queue.offer(it); true })
+        val e1 = TestEvent()
+        assertTrue(owner.post(e1))
+        assertEquals(1, queue.size)
         owner.close()
-        assertFalse(owner.post(e1))
-        assertFalse(owner.post(e2))
-        assertEquals(0, e1.executions.get() + e2.executions.get())
+
+        // e1 was pending when close ran and should be disposed
+        assertEquals(0, e1.executions.get())
         assertEquals(1, e1.disposals.get())
-        assertEquals(1, e2.disposals.get())
+
+        // verify the deferred dispatch does NOTHING to already-drained evt
+        queue.poll()!!.execute()
+        assertEquals(0, e1.executions.get())
+        assertEquals(1, e1.disposals.get())
+    }
+
+    @Test
+    fun runningBeforeCloseMayFinish() {
+        val started = CountDownLatch(1)
+        val block = CountDownLatch(1)
+        val executionDone = CountDownLatch(1)
+        val event = BlockingTestEvent(started, block)
+        val owner = CaptureStateOwner(dispatch = { envelope: CaptureOwnerEvent ->
+            Thread {
+                envelope.execute()
+                executionDone.countDown()
+            }.start()
+            true
+        })
+        assertTrue(owner.post(event))
+        assertTrue(started.await(2, TimeUnit.SECONDS))
+
+        // Event is RUNNING now. Close must not touch it.
+        owner.close()
+        assertTrue(owner.isClosed())
+        assertEquals(0, event.disposals.get())
+
+        block.countDown()
+        assertTrue(executionDone.await(5, TimeUnit.SECONDS))
+        assertEquals(1, event.executions.get())
+        assertEquals(0, event.disposals.get())
     }
 
     @Test
@@ -62,74 +115,28 @@ class CaptureStateOwnerTest {
         val event = TestEvent()
         val owner = CaptureStateOwner(dispatch = { true })
         assertTrue(owner.post(event))
-        owner.close()
-        owner.close()
-        owner.close()
-        assertEquals(0, event.executions.get())
-        assertEquals(1, event.disposals.get())
-        val postClose = TestEvent()
-        assertFalse(owner.post(postClose))
-        assertEquals(0, postClose.executions.get())
-        assertEquals(1, postClose.disposals.get())
-    }
-
-    // ------------------------------------------------------------------
-    // Exactly-one execution
-    // ------------------------------------------------------------------
-
-    @Test
-    fun acceptedEventExecutesExactlyOnce() {
-        val event = TestEvent()
-        val owner = CaptureStateOwner(dispatch = { it.execute(); true })
-        assertTrue(owner.post(event))
-        assertEquals(1, event.executions.get())
-        assertEquals(0, event.disposals.get())
-    }
-
-    @Test
-    fun closeBeforeDispatchDrainsPendingEvent() {
-        val queue = LinkedBlockingQueue<CaptureOwnerEvent>()
-        val owner = CaptureStateOwner(dispatch = { queue.offer(it); true })
-        val event = TestEvent()
-        assertTrue(owner.post(event))
-        assertEquals(1, queue.size)
-        owner.close()
-        // close drained the pending event; dispatch thread never started it
-        assertEquals(0, event.executions.get())
-        assertEquals(1, event.disposals.get())
-    }
-
-    @Test
-    fun dispatchedBeforeCloseExecutesNotDisposes() {
-        val queue = LinkedBlockingQueue<CaptureOwnerEvent>()
-        val owner = CaptureStateOwner(dispatch = { queue.offer(it); true })
-        val event = TestEvent()
-        assertTrue(owner.post(event))
-        val envelope = queue.poll()!!
-        envelope.execute() // runs before close
-        assertEquals(1, event.executions.get())
+        assertEquals(0, event.executions.get()) // async, not executed
         assertEquals(0, event.disposals.get())
         owner.close()
-        assertEquals(1, event.executions.get())
-        assertEquals(0, event.disposals.get())
+        owner.close()
+        owner.close()
+        val postCloseEvent = TestEvent()
+        assertFalse(owner.post(postCloseEvent))
+        assertEquals(1, postCloseEvent.disposals.get())
     }
-
-    // ------------------------------------------------------------------
-    // Close-vs-start race
-    // ------------------------------------------------------------------
 
     @Test
     fun closeReadyPostYieldsExactlyOneSettlementPerEvent() {
         val queue = LinkedBlockingQueue<CaptureOwnerEvent>()
         val events = mutableListOf<TestEvent>()
         val owner = CaptureStateOwner(dispatch = { queue.offer(it); true })
-        val posts = 200
+        val m = 200
         val startLatch = CountDownLatch(2)
         val doneLatch = CountDownLatch(2)
 
         val poster = Thread {
             startLatch.countDown(); startLatch.await(5, TimeUnit.SECONDS)
-            repeat(posts) { events += TestEvent().also(owner::post) }
+            repeat(m) { events += TestEvent().also(owner::post) }
             doneLatch.countDown()
         }
         val closer = Thread {
@@ -142,60 +149,58 @@ class CaptureStateOwnerTest {
         poster.join(5_000); closer.join(5_000)
 
         while (true) { (queue.poll() ?: break).execute() }
-        events.forEach {
-            assertEquals("event must settle exactly once", 1, it.executions.get() + it.disposals.get())
-        }
-        assertEquals(posts, events.sumOf { it.executions.get() + it.disposals.get() })
+        events.forEach { assertEquals(1, it.executions.get() + it.disposals.get()) }
+        assertEquals(m, events.sumOf { it.executions.get() + it.disposals.get() })
     }
 
     @Test
-    fun dispatchWhileOwnerClosedDoesNotExecuteBody() {
+    fun eventCannotBothExecuteAndDispose() {
+        val events = mutableListOf<TestEvent>()
         val queue = LinkedBlockingQueue<CaptureOwnerEvent>()
         val owner = CaptureStateOwner(dispatch = { queue.offer(it); true })
-        val event = TestEvent()
-        assertTrue(owner.post(event))
-        assertEquals(1, queue.size)
-        owner.close()
-        // Now dispatch the deferred event. Gate result is ALREADY_SETTLED
-        // because close drained it.
-        queue.poll()!!.execute()
-        assertEquals(0, event.executions.get())
-        assertEquals(1, event.disposals.get())
-    }
+        repeat(100) { events += TestEvent(); owner.post(events.last()) }
 
-    @Test
-    fun eventRunningBeforeCloseMayFinish() {
-        val started = CountDownLatch(1)
-        val block = CountDownLatch(1)
-        val executionDone = CountDownLatch(1)
-        val event = BlockingTestEvent(started, block)
-        val owner = CaptureStateOwner(dispatch = { e ->
-            Thread {
-                e.execute(); executionDone.countDown()
-            }.start()
-            true
-        })
-        assertTrue(owner.post(event))
-        assertTrue(started.await(2, TimeUnit.SECONDS))
-        // The event is RUNNING now on its thread.
+        // Close some to race
         owner.close()
-        // Close must not block RUNNING events.
-        block.countDown()
-        assertTrue(executionDone.await(5, TimeUnit.SECONDS))
-        assertEquals(1, event.executions.get())
-        assertEquals(0, event.disposals.get())
-    }
-
-    @Test
-    fun throwingEventSettles() {
-        val event = object : CaptureOwnerEvent {
-            override fun execute() { error("forced") }
-            override fun disposeWithoutMutation() {}
+        // Execute remaining queue
+        while (true) { (queue.poll() ?: break).execute() }
+        events.forEach { event ->
+            assertTrue("event settled exactly one way", event.executions.get() + event.disposals.get() == 1)
         }
-        val owner = CaptureStateOwner(dispatch = { it.execute(); true })
-        try { owner.post(event) } catch (_: Exception) {}
-        assertEquals(0, owner.pendingCount())
-        assertEquals(0, owner.runningCount())
+    }
+
+    @Test
+    fun synchronousDispatcherPlusThrowingEventDoesNotMakePostReportRejection() {
+        val failures = mutableListOf<Pair<CaptureOwnerEvent, Throwable>>()
+        val owner = CaptureStateOwner(dispatch = { it.execute(); true },
+            onEventFailure = { event, error -> failures += event to error })
+        val event = ThrowingTestEvent()
+
+        assertTrue(owner.post(event))
+        assertEquals(1, event.executions.get())
+        assertEquals(1, failures.size)
+        assertEquals("forced failure", failures[0].second.message)
+    }
+
+    @Test
+    fun eventFailureHookReceivesExceptionOnce() {
+        val failures = AtomicInteger(0)
+        val owner = CaptureStateOwner(dispatch = { it.execute(); true },
+            onEventFailure = { _, _ -> failures.incrementAndGet() })
+
+        val queue = LinkedBlockingQueue<CaptureOwnerEvent>()
+        val asyncOwner = CaptureStateOwner(dispatch = { queue.offer(it); true },
+            onEventFailure = { _, _ -> failures.incrementAndGet() })
+
+        val event = ThrowingTestEvent()
+        assertTrue(owner.post(event))
+        assertEquals(1, failures.get())
+
+        val event2 = ThrowingTestEvent()
+        assertTrue(asyncOwner.post(event2))
+        val env = queue.poll(2, TimeUnit.SECONDS)
+        env.execute()
+        assertEquals(2, failures.get())
     }
 
     @Test
@@ -204,6 +209,22 @@ class CaptureStateOwnerTest {
         repeat(50) { assertTrue(owner.post(TestEvent())) }
         assertEquals(0, owner.pendingCount())
         assertEquals(0, owner.runningCount())
+        assertEquals(0, owner.trackingSize())
+    }
+
+    @Test
+    fun dispatchedBeforeCloseExecutesNotDisposes() {
+        val queue = LinkedBlockingQueue<CaptureOwnerEvent>()
+        val owner = CaptureStateOwner(dispatch = { queue.offer(it); true })
+        val event = TestEvent()
+        assertTrue(owner.post(event))
+        val envelope = queue.poll(1, TimeUnit.SECONDS)!!
+        envelope.execute()
+        assertEquals(1, event.executions.get())
+        assertEquals(0, event.disposals.get())
+        owner.close()
+        assertEquals(1, event.executions.get())
+        assertEquals(0, event.disposals.get())
     }
 
     @Test
@@ -214,5 +235,15 @@ class CaptureStateOwnerTest {
         assertEquals(0, event.executions.get())
         assertEquals(1, event.disposals.get())
         assertEquals(0, owner.pendingCount())
+    }
+
+    @Test
+    fun dispatcherThrowingBeforeDispatchDisposesOnce() {
+        val event = TestEvent()
+        val owner = CaptureStateOwner(dispatch = { error("dispatch threw") })
+        val result = owner.post(event)
+        assertFalse(result)
+        assertEquals(0, event.executions.get())
+        assertEquals(1, event.disposals.get())
     }
 }

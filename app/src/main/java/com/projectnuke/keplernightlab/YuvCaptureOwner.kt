@@ -106,6 +106,9 @@ internal class YuvCaptureOwner(
     private var terminalReason: String? = null
     private val discardedLateCompletions = mutableListOf<Int>()
     private val callbackFired = AtomicBoolean(false)
+    private val cleanupCoordinator by lazy {
+        YuvCleanupCoordinator(captureStateOwner, lifecycle, accounting, reservations, boundedWorker)
+    }
 
     // ------------------------------------------------------------------
     // Typed Camera2 callback entry points (no unsafe casts)
@@ -268,7 +271,7 @@ internal class YuvCaptureOwner(
         }
         // Reserve frame identity + filename before committing.
         val entry = YuvFrameManifestEntry(completion.frameIndex, completion.fileName, completion.timestampNs, true)
-        if (!accounting.reserveForAdoption(entry)) {
+        if (!accounting.tryReserveAdoption(entry)) {
             // Duplicate identity or filename; reject this completion.
             completion.candidate.let { runCatching { it.delete() } }
             accounting.failedFrame()
@@ -279,6 +282,7 @@ internal class YuvCaptureOwner(
             workProcessor.commit(completion.candidate, finalFile)
         } catch (t: Throwable) {
             Log.e("KeplerYuvOwner", "Commit failed for frame ${completion.frameIndex}", t)
+            accounting.rollbackReservedAdoption(entry)
             completion.candidate.let { runCatching { it.delete() } }
             accounting.failedFrame()
             finishError("YUV commit failed for frame ${completion.frameIndex}", cause = t)
@@ -286,11 +290,12 @@ internal class YuvCaptureOwner(
         }
         if (!finalFile.exists() || !finalFile.canRead()) {
             Log.w("KeplerYuvOwner", "Final file not readable after commit ${completion.frameIndex}")
+            accounting.rollbackReservedAdoption(entry)
             accounting.failedFrame()
             return
         }
         // Commit successful; adopt the reserved identity.
-        accounting.adoptReserved(entry)
+        accounting.commitReservedAdoption(entry)
         val persistedFrames = accounting.snapshot().persistedFrames
         postStatus("YUV capture: saved $persistedFrames/$frameCount")
         writeJobJson("CAPTURING", persistedFrames, accounting.snapshot().manifest)
@@ -302,8 +307,8 @@ internal class YuvCaptureOwner(
 
     private fun checkTerminal() {
         val snap = accounting.snapshot()
-        if (snap.persistedFrames >= frameCount) {
-            finishSuccess()
+        if (snap.persistedFrames >= frameCount && terminalState.claim(CaptureTerminalStatus.SUCCESS)) {
+            completeSuccess()
         }
     }
 
@@ -314,13 +319,13 @@ internal class YuvCaptureOwner(
                 val snap = accounting.snapshot()
                 when {
                     snap.persistedFrames >= frameCount -> {
-                        if (terminalState.claim(CaptureTerminalStatus.SUCCESS)) finishSuccess()
+                        if (terminalState.claim(CaptureTerminalStatus.SUCCESS)) completeSuccess()
                     }
                     snap.persistedFrames > 0 -> {
-                        if (terminalState.claim(CaptureTerminalStatus.PARTIAL_SUCCESS)) finishPartial(snap)
+                        if (terminalState.claim(CaptureTerminalStatus.PARTIAL_SUCCESS)) completePartial(snap)
                     }
                     else -> {
-                        if (terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) finishTimeout(snap)
+                        if (terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) completeTimeout(snap)
                     }
                 }
             }
@@ -329,21 +334,21 @@ internal class YuvCaptureOwner(
         if (!captureStateOwner.post(event)) {
             Log.e("KeplerYuvOwner", "Deadline settlement rejected")
             finished.set(true)
-            cleanup()
+            cleanupCoordinator.perform()
         }
     }
 
     fun onCancellationRequested() {
         val event = object : CaptureOwnerEvent {
             override fun execute() {
-                if (terminalState.claim(CaptureTerminalStatus.CANCELLED)) finishCancel()
+                if (terminalState.claim(CaptureTerminalStatus.CANCELLED)) completeCancel()
             }
             override fun disposeWithoutMutation() {}
         }
         if (!captureStateOwner.post(event)) {
             Log.e("KeplerYuvOwner", "Cancellation rejected")
             finished.set(true)
-            cleanup()
+            cleanupCoordinator.perform()
         }
     }
 
@@ -351,8 +356,7 @@ internal class YuvCaptureOwner(
     // Terminal settlement ??only the owner writes metadata and decides callbacks
     // ------------------------------------------------------------------
 
-    private fun finishSuccess() {
-        if (!terminalState.claim(CaptureTerminalStatus.SUCCESS)) return
+    private fun completeSuccess() {
         terminalReason = "All $frameCount frames persisted"
         if (!callbackFired.compareAndSet(false, true)) return
         finished.set(true)
@@ -364,7 +368,7 @@ internal class YuvCaptureOwner(
         postMainOrRun { onCaptureComplete(outputDir) }
     }
 
-    private fun finishPartial(snap: YuvCaptureAccountingSnapshot) {
+    private fun completePartial(snap: YuvCaptureAccountingSnapshot) {
         terminalReason = "Partial success: ${snap.persistedFrames}/$frameCount persisted"
         if (!callbackFired.compareAndSet(false, true)) return
         finished.set(true)
@@ -375,7 +379,7 @@ internal class YuvCaptureOwner(
         postMainOrRun { onCaptureComplete(outputDir) }
     }
 
-    private fun finishTimeout(snap: YuvCaptureAccountingSnapshot) {
+    private fun completeTimeout(snap: YuvCaptureAccountingSnapshot) {
         terminalReason = "YUV timeout: saved=${snap.persistedFrames}/$frameCount"
         if (!callbackFired.compareAndSet(false, true)) return
         finished.set(true)
@@ -403,7 +407,7 @@ internal class YuvCaptureOwner(
         postMainOrRun { onCaptureError(message, cause) }
     }
 
-    private fun finishCancel() {
+    private fun completeCancel() {
         terminalReason = "Cancelled"
         if (!callbackFired.compareAndSet(false, true)) return
         finished.set(true)
@@ -419,10 +423,7 @@ internal class YuvCaptureOwner(
     // ------------------------------------------------------------------
 
     private fun cleanup() {
-        captureStateOwner.close()
-        val drained = lifecycle.closeAndDrainRetained()
-        drained.forEach { it.dispose(accounting) }
-        boundedWorker.shutdownNow()
+        cleanupCoordinator.perform()
     }
 
     // ------------------------------------------------------------------

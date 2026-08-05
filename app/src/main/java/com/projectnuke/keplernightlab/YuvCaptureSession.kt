@@ -3,28 +3,6 @@ package com.projectnuke.keplernightlab
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
-/**
- * Production session seam for the YUV color-burst capture pipeline. Owns the
- * shared state of one capture (dispatch owner, bounded encoder worker, finished
- * flag, terminal state, accounting, lifecycle, reservation, identity owner,
- * and the authoritative [YuvCaptureOwner]) and provides a single close path.
- *
- * Construction does NOT start the camera session; the caller wires the
- * returned components into Camera2 (ImageReader listeners, capture callbacks)
- * and the timeout scheduler / cancellation handle, then calls
- * [YuvCaptureOwner.onDeadlineReached] or [YuvCaptureOwner.onCancellationRequested]
- * from those producers as the only legal way to settle the terminal state.
- *
- * Components exposed for the production caller:
- * - [captureStateOwner] : post deadline/cancellation through this.
- * - [boundedWorker] : encoder worker; managed by [close].
- * - [finished] : idempotent flag for late camera callbacks.
- * - [terminalState] : readable terminal status (claim is owner-only).
- * - [accounting], [lifecycle], [reservations], [identityOwner]
- * : shared inspection access (mutation is owner-only).
- * - [owner] : the only legal entry point for ImageReader callbacks
- * and capture-result/failure callbacks.
- */
 internal class YuvCaptureSession internal constructor(
     val captureStateOwner: CaptureStateOwner,
     val boundedWorker: BoundedCaptureWorker,
@@ -36,9 +14,13 @@ internal class YuvCaptureSession internal constructor(
     val identityOwner: CaptureFrameIdentityOwner,
     val owner: YuvCaptureOwner
 ) : AutoCloseable {
+
+    private val cleanupCoordinator by lazy {
+        YuvCleanupCoordinator(captureStateOwner, lifecycle, accounting, reservations, boundedWorker)
+    }
+
     override fun close() {
-        captureStateOwner.close()
-        boundedWorker.shutdownNow()
+        cleanupCoordinator.perform()
     }
 
     fun terminalSnapshot(): YuvCaptureOwner.TerminalSnapshot = owner.terminalSnapshot()
