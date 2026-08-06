@@ -129,7 +129,11 @@ class BoundedCaptureWorkerTest {
         assertEquals(0, r.queuedNonDisposableTasksRemoved)
         assertEquals(1, r.activeWorkersAtStart)
         block.countDown()
+<<<<<<< HEAD
         assertTrue(worker.awaitTermination(5_000))
+=======
+        worker.awaitTermination(5_000)
+>>>>>>> be11772742d7dc65106ec7fa4b18531fad76e07f
     }
 
     @Test
@@ -201,6 +205,7 @@ class BoundedCaptureWorkerTest {
         assertEquals(0, r.queuedDisposableTasksDisposedSuccessfully)
         assertEquals(1, r.activeWorkersAtStart)
         block.countDown()
+<<<<<<< HEAD
         assertTrue(worker.awaitTermination(5_000))
     }
 
@@ -303,5 +308,8 @@ class BoundedCaptureWorkerTest {
 
         block.countDown()
         assertTrue(worker.awaitTermination(5_000))
+=======
+        worker.awaitTermination(5_000)
+>>>>>>> be11772742d7dc65106ec7fa4b18531fad76e07f
     }
 }
