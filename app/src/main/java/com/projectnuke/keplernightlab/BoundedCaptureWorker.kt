@@ -35,7 +35,7 @@ internal interface DisposableCaptureTask : Runnable {
     fun dispose()
 }
 
-internal class BoundedCaptureWorker(
+internal open class BoundedCaptureWorker(
     name: String,
     capacity: Int,
     private val onTaskDisposalFailure: (Runnable, Throwable) -> Unit = { _, _ -> },
@@ -77,7 +77,12 @@ internal class BoundedCaptureWorker(
         val shutdownAlreadyRequested: Boolean
     )
 
-    fun shutdownNow(): CleanupReport {
+    /**
+     * Drains and disposes queued tasks and shuts the executor down.  Returns a
+     * [CleanupReport] with exact attempt/success counts.  Open for deterministic
+     * failure injection in tests.
+     */
+    internal open fun shutdownNow(): CleanupReport {
         val activeBeforeDrain = executor.activeCount
         if (!closed.compareAndSet(false, true)) {
             return CleanupReport(0, 0, 0, 0, activeBeforeDrain, emptyList(), emptyList(), true)

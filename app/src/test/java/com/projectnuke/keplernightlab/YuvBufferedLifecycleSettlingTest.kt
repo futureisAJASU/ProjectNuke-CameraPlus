@@ -1,5 +1,6 @@
 package com.projectnuke.keplernightlab
 
+import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
@@ -11,6 +12,17 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class YuvBufferedLifecycleSettlingTest {
+
+    // ── Failure-injection lifecycle seams ──────────────────────────────
+
+    private class ThrowingFinishSettlingLifecycle : YuvBufferedLifecycle() {
+        override fun finishSettling(item: YuvPngWorkItem): Boolean =
+            error("injected finishSettling failure")
+    }
+
+    private class FalseFinishSettlingLifecycle : YuvBufferedLifecycle() {
+        override fun finishSettling(item: YuvPngWorkItem): Boolean = false
+    }
 
     // ── settleEncoding: outcome and resource correctness ────────────────
 
@@ -74,7 +86,7 @@ class YuvBufferedLifecycleSettlingTest {
     }
 
     @Test
-    fun settledItemReturnsAlreadyReleasedOnSecondSettle() {
+    fun settledItemReturnsUnknownOnSecondSettle() {
         val lifecycle = YuvBufferedLifecycle()
         val accounting = YuvCaptureAccounting()
         val reservations = YuvBufferReservations(1024L)
@@ -215,6 +227,79 @@ class YuvBufferedLifecycleSettlingTest {
     }
 
     @Test
+    fun settleEncodingPreservesBothDisposalAndLifecycleReleaseFailures() {
+        val lifecycle = ThrowingFinishSettlingLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
+            error("onRelease threw")
+        }
+        assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
+
+        val outcome = lifecycle.settleEncoding(item, accounting)
+        assertEquals(YuvBufferedLifecycle.EncodingSettlementStatus.SETTLED, outcome.status)
+        assertFalse(outcome.itemDisposed)
+        assertFalse(outcome.lifecycleReleased)
+        assertEquals("onRelease threw", outcome.failure?.message)
+        assertEquals("injected finishSettling failure", outcome.lifecycleReleaseFailure?.message)
+
+        // Reservation settled inside dispose's finally even though dispose failed.
+        assertEquals(0L, reservations.currentBytes())
+        assertEquals(0, accounting.snapshot().bufferedFrames)
+        // Lifecycle release failed: the item remains truthfully tracked as SETTLING.
+        assertEquals(1, lifecycle.settlingCount())
+        assertEquals(1, lifecycle.trackedCount())
+    }
+
+    @Test
+    fun settleEncodingReportsReleaseFailureWithDisposalSuccess() {
+        val lifecycle = ThrowingFinishSettlingLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        val disposeCount = AtomicInteger(0)
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
+            disposeCount.incrementAndGet()
+        }
+        assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
+
+        val outcome = lifecycle.settleEncoding(item, accounting)
+        assertEquals(YuvBufferedLifecycle.EncodingSettlementStatus.SETTLED, outcome.status)
+        assertTrue(outcome.itemDisposed)
+        assertFalse(outcome.lifecycleReleased)
+        assertNull(outcome.failure)
+        assertEquals("injected finishSettling failure", outcome.lifecycleReleaseFailure?.message)
+        assertEquals(1, disposeCount.get())
+        assertEquals(1, lifecycle.settlingCount())
+        assertEquals(1, lifecycle.trackedCount())
+    }
+
+    @Test
+    fun settleEncodingReportsInvariantFailureWhenFinishSettlingReturnsFalse() {
+        val lifecycle = FalseFinishSettlingLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting)
+        assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
+
+        val outcome = lifecycle.settleEncoding(item, accounting)
+        assertEquals(YuvBufferedLifecycle.EncodingSettlementStatus.SETTLED, outcome.status)
+        assertTrue(outcome.itemDisposed)
+        assertFalse(outcome.lifecycleReleased)
+        assertNull(outcome.failure)
+        assertTrue(outcome.lifecycleReleaseFailure != null)
+        assertTrue(outcome.lifecycleReleaseFailure!!.message!!.contains("finishSettling returned false"))
+        // Item was never removed: still truthfully tracked.
+        assertEquals(1, lifecycle.settlingCount())
+        assertEquals(1, lifecycle.trackedCount())
+    }
+
+    @Test
     fun settleBufferedAccountingFailureDoesNotSkipItemDisposal() {
         val lifecycle = YuvBufferedLifecycle()
         val accounting = YuvCaptureAccounting()
@@ -335,5 +420,196 @@ class YuvBufferedLifecycleSettlingTest {
         assertEquals(0, lifecycle.trackedCount())
         assertEquals(0L, reservations.currentBytes())
         assertEquals(0, accounting.snapshot().bufferedFrames)
+    }
+
+    // ── BufferedEncodeTask consumes every settlement outcome ───────────
+
+    private fun encodeTask(
+        item: YuvPngWorkItem,
+        lifecycle: YuvBufferedLifecycle,
+        accounting: YuvCaptureAccounting,
+        issues: MutableList<YuvBufferedLifecycle.EncodingSettlementOutcome>
+    ): BufferedEncodeTask {
+        return BufferedEncodeTask(
+            item = item,
+            accounting = accounting,
+            lifecycle = lifecycle,
+            encode = {
+                YuvWorkerCompletion.Success(item.frameIndex, item.timestampNs, File("candidate.tmp"), "frame_00_color.png", 0L)
+            },
+            postCompletion = { _ -> },
+            onSettlementIssue = { _, outcome -> issues.add(outcome) }
+        )
+    }
+
+    @Test
+    fun bufferedEncodeTaskSettledCleanlyDoesNotReportIssue() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        val issues = CopyOnWriteArrayList<YuvBufferedLifecycle.EncodingSettlementOutcome>()
+        val disposeCount = AtomicInteger(0)
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
+            disposeCount.incrementAndGet()
+        }
+        assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
+
+        encodeTask(item, lifecycle, accounting, issues).run()
+
+        assertTrue(issues.isEmpty())
+        assertEquals(1, disposeCount.get())
+        assertEquals(0, lifecycle.trackedCount())
+        assertEquals(0L, reservations.currentBytes())
+        assertEquals(0, accounting.snapshot().bufferedFrames)
+    }
+
+    @Test
+    fun bufferedEncodeTaskReportsInvalidStateOnce() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        val issues = CopyOnWriteArrayList<YuvBufferedLifecycle.EncodingSettlementOutcome>()
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) { }
+        // Registered but never began encoding -> RETAINED -> INVALID_STATE.
+        assertTrue(lifecycle.tryRegister(item))
+
+        encodeTask(item, lifecycle, accounting, issues).run()
+
+        assertEquals(1, issues.size)
+        assertEquals(YuvBufferedLifecycle.EncodingSettlementStatus.INVALID_STATE, issues[0].status)
+        assertFalse(issues[0].itemDisposed)
+        // Nothing was disposed: the item is still truthfully retained.
+        assertEquals(1, lifecycle.retainedCount())
+        assertEquals(100L, reservations.currentBytes())
+
+        lifecycle.closeAndDrainRetained().forEach { it.dispose(accounting) }
+    }
+
+    @Test
+    fun bufferedEncodeTaskReportsUnknownOnce() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val issues = CopyOnWriteArrayList<YuvBufferedLifecycle.EncodingSettlementOutcome>()
+        val onReleaseCount = AtomicInteger(0)
+        // Never registered in the lifecycle -> UNKNOWN.
+        val item = YuvPngWorkItem.ownedForTest { onReleaseCount.incrementAndGet() }
+
+        encodeTask(item, lifecycle, accounting, issues).run()
+
+        assertEquals(1, issues.size)
+        assertEquals(YuvBufferedLifecycle.EncodingSettlementStatus.UNKNOWN, issues[0].status)
+        assertFalse(issues[0].itemDisposed)
+        assertEquals(0, onReleaseCount.get())
+    }
+
+    @Test
+    fun bufferedEncodeTaskReportsAlreadySettlingOnce() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        val issues = CopyOnWriteArrayList<YuvBufferedLifecycle.EncodingSettlementOutcome>()
+        val disposeCount = AtomicInteger(0)
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
+            disposeCount.incrementAndGet()
+        }
+        assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
+        // External transition to SETTLING before the task settles.
+        assertEquals(YuvBufferedLifecycle.SettlementResult.STARTED, lifecycle.startSettling(item))
+
+        encodeTask(item, lifecycle, accounting, issues).run()
+
+        assertEquals(1, issues.size)
+        assertEquals(YuvBufferedLifecycle.EncodingSettlementStatus.ALREADY_SETTLING, issues[0].status)
+        // The task did not double-settle the already-settling item.
+        assertEquals(0, disposeCount.get())
+        assertEquals(1, lifecycle.settlingCount())
+        assertEquals(1, lifecycle.trackedCount())
+
+        item.dispose(accounting)
+        lifecycle.finishSettling(item)
+        assertEquals(0, lifecycle.trackedCount())
+        assertEquals(0L, reservations.currentBytes())
+    }
+
+    @Test
+    fun bufferedEncodeTaskReportsResourceFailureOnceWithOriginalFailure() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        val issues = CopyOnWriteArrayList<YuvBufferedLifecycle.EncodingSettlementOutcome>()
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
+            error("onRelease threw")
+        }
+        assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
+
+        encodeTask(item, lifecycle, accounting, issues).run()
+
+        assertEquals(1, issues.size)
+        assertEquals(YuvBufferedLifecycle.EncodingSettlementStatus.SETTLED, issues[0].status)
+        assertEquals("onRelease threw", issues[0].failure?.message)
+        assertFalse(issues[0].itemDisposed)
+        assertTrue(issues[0].lifecycleReleased)
+        // Item was released from tracking despite disposal failure.
+        assertEquals(0, lifecycle.trackedCount())
+        assertEquals(0L, reservations.currentBytes())
+    }
+
+    @Test
+    fun bufferedEncodeTaskSurfacesDisposalAndReleaseFailures() {
+        val lifecycle = ThrowingFinishSettlingLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        val issues = CopyOnWriteArrayList<YuvBufferedLifecycle.EncodingSettlementOutcome>()
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
+            error("onRelease threw")
+        }
+        assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
+
+        encodeTask(item, lifecycle, accounting, issues).run()
+
+        assertEquals(1, issues.size)
+        assertEquals(YuvBufferedLifecycle.EncodingSettlementStatus.SETTLED, issues[0].status)
+        assertEquals("onRelease threw", issues[0].failure?.message)
+        assertEquals("injected finishSettling failure", issues[0].lifecycleReleaseFailure?.message)
+        assertEquals(1, lifecycle.settlingCount())
+    }
+
+    @Test
+    fun bufferedEncodeTaskIssueHookThrowDoesNotEscapeIntoWorkerCleanup() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        val hookCalls = AtomicInteger(0)
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) { }
+        assertTrue(lifecycle.tryRegister(item))
+
+        val task = BufferedEncodeTask(
+            item = item,
+            accounting = accounting,
+            lifecycle = lifecycle,
+            encode = {
+                YuvWorkerCompletion.Success(item.frameIndex, item.timestampNs, File("candidate.tmp"), "frame_00_color.png", 0L)
+            },
+            postCompletion = { _ -> },
+            onSettlementIssue = { _, _ ->
+                hookCalls.incrementAndGet()
+                error("issue hook threw")
+            }
+        )
+        // RETAINED -> INVALID_STATE: the hook throws but run() must not propagate it.
+        task.run()
+        assertEquals(1, hookCalls.get())
+
+        lifecycle.closeAndDrainRetained().forEach { it.dispose(accounting) }
     }
 }

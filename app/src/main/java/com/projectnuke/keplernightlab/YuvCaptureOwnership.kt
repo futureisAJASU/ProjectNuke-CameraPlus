@@ -415,7 +415,9 @@ internal data class YuvCleanupResult(
     val workerShutdownRequested: Boolean,
     val totalDrainedRetainedItems: Int,
     val totalQueuedTasksRemoved: Int,
-    val totalQueuedDisposableTasksDisposed: Int,
+    val totalQueuedDisposableDisposalAttempts: Int,
+    val totalQueuedDisposableDisposalsSucceeded: Int,
+    val totalQueuedNonDisposableTasksRemoved: Int,
     val activeWorkersAtCleanupStart: Int,
     val currentRetainedItems: Int,
     val currentEncodingItems: Int,
@@ -423,7 +425,9 @@ internal data class YuvCleanupResult(
     val currentDrainingItems: Int,
     val currentBufferedFrames: Int,
     val currentReservedBytes: Long,
-    val cleanupFailures: List<String>
+    val cleanupFailures: List<String>,
+    val workerTaskDisposalFailures: List<String>,
+    val workerRejectionNotificationFailures: List<String>
 )
 
 internal class YuvCleanupCoordinator(
@@ -439,8 +443,12 @@ internal class YuvCleanupCoordinator(
         val workerShutdownRequested: Boolean = false,
         val drainedRetainedItems: Int = 0,
         val queuedTasksRemoved: Int = 0,
-        val queuedDisposableTasksDisposed: Int = 0,
+        val queuedDisposableDisposalAttempted: Int = 0,
+        val queuedDisposableDisposalsSucceeded: Int = 0,
+        val queuedNonDisposableTasksRemoved: Int = 0,
         val activeWorkersAtStart: Int = 0,
+        val workerTaskDisposalFailures: List<String> = emptyList(),
+        val workerRejectionNotificationFailures: List<String> = emptyList(),
         val failures: List<String> = emptyList()
     )
 
@@ -457,7 +465,9 @@ internal class YuvCleanupCoordinator(
             workerShutdownRequested = s.workerShutdownRequested,
             totalDrainedRetainedItems = s.drainedRetainedItems,
             totalQueuedTasksRemoved = s.queuedTasksRemoved,
-            totalQueuedDisposableTasksDisposed = s.queuedDisposableTasksDisposed,
+            totalQueuedDisposableDisposalAttempts = s.queuedDisposableDisposalAttempted,
+            totalQueuedDisposableDisposalsSucceeded = s.queuedDisposableDisposalsSucceeded,
+            totalQueuedNonDisposableTasksRemoved = s.queuedNonDisposableTasksRemoved,
             activeWorkersAtCleanupStart = s.activeWorkersAtStart,
             currentRetainedItems = lifecycle.retainedCount(),
             currentEncodingItems = lifecycle.encodingCount(),
@@ -465,10 +475,29 @@ internal class YuvCleanupCoordinator(
             currentDrainingItems = lifecycle.drainingCount(),
             currentBufferedFrames = snap.bufferedFrames,
             currentReservedBytes = reservations.currentBytes(),
-            cleanupFailures = s.failures
+            // Copy failure collections: the published snapshot is immutable.
+            cleanupFailures = s.failures.toList(),
+            workerTaskDisposalFailures = s.workerTaskDisposalFailures.toList(),
+            workerRejectionNotificationFailures = s.workerRejectionNotificationFailures.toList()
         )
     }
 
+    /**
+     * Runs the cleanup sequence exactly once.  Every safety stage has its own failure
+     * boundary so one stage's failure never skips a later stage:
+     *
+     * 1. close CaptureStateOwner
+     * 2. close/claim retained lifecycle items (closeAndDrainRetained)
+     * 3. dispose each drained item independently, then finish each drain item
+     *    independently (one failure never skips later items)
+     * 4. request BoundedCaptureWorker shutdown
+     * 5. merge worker cleanup failures
+     * 6. publish COMPLETED state
+     *
+     * Every failure is recorded with its stage and item/frame identity where available.
+     * A concurrent call observes IN_PROGRESS (cleanup not completed); a repeated call
+     * after completion returns the same historical totals.
+     */
     fun perform(): YuvCleanupResult {
         val mutableFailures = mutableListOf<String>()
 
@@ -494,45 +523,61 @@ internal class YuvCleanupCoordinator(
             mutableFailures.add("ownerClose: ${t.message}")
         }
 
-        // Step 2: drain lifecycle — claim RETAINED items for drain
-        val drained = lifecycle.closeAndDrainRetained()
+        // Step 2: claim retained lifecycle items (independent failure boundary).
+        // A failure here must NOT skip worker shutdown or final state publication.
+        val drained = try {
+            lifecycle.closeAndDrainRetained()
+        } catch (t: Throwable) {
+            mutableFailures.add("closeAndDrainRetained: ${t.message}")
+            emptyList()
+        }
 
-        // Step 3: dispose each drained item independently, then finish drain
-        var drainedCount = 0
+        // Step 3: dispose each drained item independently, then finish each drain item
+        // independently.  One disposal or finishDrain failure never skips later items.
         for (item in drained) {
             try {
                 item.dispose(accounting)
             } catch (t: Throwable) {
                 mutableFailures.add("drainDispose[${item.frameIndex}]: ${t.message}")
             }
-            lifecycle.finishDrain(item)
-            drainedCount++
-        }
-        stateRef.getAndUpdate { it.copy(drainedRetainedItems = drainedCount) }
-
-        // Step 4: shut down worker (independent failure boundary)
-        try {
-            val report = boundedWorker.shutdownNow()
-            stateRef.getAndUpdate { current ->
-                current.copy(
-                    workerShutdownRequested = true,
-                    queuedTasksRemoved = report.queuedTasksRemoved,
-                    queuedDisposableTasksDisposed = report.queuedDisposableTasksDisposedSuccessfully,
-                    failures = (mutableFailures +
-                        report.taskDisposalFailures +
-                        report.rejectionNotificationFailures).toList()
-                )
+            try {
+                if (!lifecycle.finishDrain(item)) {
+                    mutableFailures.add("drainFinish[${item.frameIndex}]: item not in DRAINING state")
+                }
+            } catch (t: Throwable) {
+                mutableFailures.add("drainFinish[${item.frameIndex}]: ${t.message}")
             }
+        }
+
+        // Step 4: request worker shutdown (independent failure boundary)
+        var workerReport: BoundedCaptureWorker.CleanupReport? = null
+        try {
+            workerReport = boundedWorker.shutdownNow()
         } catch (t: Throwable) {
             mutableFailures.add("workerShutdown: ${t.message}")
-            stateRef.getAndUpdate { current ->
-                current.copy(
-                    workerShutdownRequested = true,
-                    failures = mutableFailures.toList()
-                )
-            }
         }
 
+        // Step 5: merge worker cleanup failures
+        val report = workerReport
+        if (report != null) {
+            mutableFailures.addAll(report.taskDisposalFailures)
+            mutableFailures.addAll(report.rejectionNotificationFailures)
+        }
+
+        // Step 6: publish COMPLETED state in one immutable snapshot
+        stateRef.getAndUpdate { current ->
+            current.copy(
+                workerShutdownRequested = true,
+                drainedRetainedItems = drained.size,
+                queuedTasksRemoved = report?.queuedTasksRemoved ?: 0,
+                queuedDisposableDisposalAttempted = report?.queuedDisposableTasksDisposalAttempted ?: 0,
+                queuedDisposableDisposalsSucceeded = report?.queuedDisposableTasksDisposedSuccessfully ?: 0,
+                queuedNonDisposableTasksRemoved = report?.queuedNonDisposableTasksRemoved ?: 0,
+                workerTaskDisposalFailures = report?.taskDisposalFailures ?: emptyList(),
+                workerRejectionNotificationFailures = report?.rejectionNotificationFailures ?: emptyList(),
+                failures = mutableFailures.toList()
+            )
+        }
         stateRef.getAndUpdate { it.copy(phase = CleanupPhase.COMPLETED) }
         return buildSnapshot()
     }

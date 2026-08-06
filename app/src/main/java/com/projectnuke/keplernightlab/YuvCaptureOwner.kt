@@ -32,8 +32,18 @@ internal sealed interface YuvWorkerCompletion {
 /**
  * A disposable task for buffered YUV encoding that settles the lifecycle item in its
  * finally block and posts the completion back to the owner.  The owner schedules the
- * next buffered item after adopting this task's completion ??the task itself never
+ * next buffered item after adopting this task's completion — the task itself never
  * schedules the next frame.
+ *
+ * Settlement-result consumption: the AtomicBoolean [settled] guard resolves the
+ * run()/dispose() race so at most ONE settleEncoding attempt is made per task.  A
+ * single-task settlement can only legitimately observe SETTLED, so every other outcome
+ * is a genuine anomaly (e.g. the lifecycle was externally released or never started)
+ * and is surfaced through [onSettlementIssue] exactly once.  In particular
+ * ALREADY_SETTLING and ALREADY_RELEASED are NOT treated as accepted idempotent
+ * outcomes — with the CAS guard they indicate the lifecycle state was already
+ * inconsistent with this task's own settlement, and surfacing them is the only way
+ * a lost release can be detected.
  */
 internal class BufferedEncodeTask(
     val item: YuvPngWorkItem,
@@ -41,7 +51,7 @@ internal class BufferedEncodeTask(
     private val lifecycle: YuvBufferedLifecycle,
     private val encode: () -> YuvWorkerCompletion,
     private val postCompletion: (YuvWorkerCompletion) -> Unit,
-    private val onSettlementFailure: ((YuvPngWorkItem, Throwable) -> Unit)? = null
+    private val onSettlementIssue: ((YuvPngWorkItem, YuvBufferedLifecycle.EncodingSettlementOutcome) -> Unit)? = null
 ) : DisposableCaptureTask {
     private val settled = AtomicBoolean(false)
 
@@ -68,9 +78,14 @@ internal class BufferedEncodeTask(
 
     private fun settleItem() {
         val outcome = lifecycle.settleEncoding(item, accounting)
-        if (outcome.failure != null) {
-            onSettlementFailure?.let { hook ->
-                try { hook(item, outcome.failure!!) } catch (_: Throwable) {}
+        val settledCleanly = outcome.status == YuvBufferedLifecycle.EncodingSettlementStatus.SETTLED &&
+            outcome.failure == null && outcome.lifecycleReleaseFailure == null
+        if (settledCleanly) return
+        onSettlementIssue?.let { hook ->
+            try {
+                hook(item, outcome)
+            } catch (_: Throwable) {
+                // The issue hook must never throw into worker cleanup.
             }
         }
     }
@@ -245,6 +260,14 @@ internal class YuvCaptureOwner(
                         if (completion is YuvWorkerCompletion.Success) runCatching { completion.candidate.delete() }
                     }
                 })
+            },
+            onSettlementIssue = { issueItem, outcome ->
+                val cause: Throwable? = outcome.failure ?: outcome.lifecycleReleaseFailure
+                if (cause != null) {
+                    Log.w("KeplerYuvOwner", "YUV settlement issue frame=${issueItem.frameIndex}: ${outcome.status}", cause)
+                } else {
+                    Log.w("KeplerYuvOwner", "YUV settlement issue frame=${issueItem.frameIndex}: ${outcome.status}")
+                }
             }
         )
         if (!boundedWorker.submit(task)) {

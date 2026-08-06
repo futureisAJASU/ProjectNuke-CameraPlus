@@ -16,7 +16,7 @@ package com.projectnuke.keplernightlab
  *   settlingCount / drainingCount / trackedCount so cleanup-coordinator
  *   snapshots are truthful.
  */
-internal class YuvBufferedLifecycle {
+internal open class YuvBufferedLifecycle {
 
     enum class State { RETAINED, ENCODING, SETTLING, DRAINING, RELEASED }
 
@@ -30,12 +30,21 @@ internal class YuvBufferedLifecycle {
         UNKNOWN
     }
 
+    /**
+     * Result of one settlement attempt for a buffered work item.
+     *
+     * [lifecycleReleased] is truthful: it reflects the actual result of the
+     * [finishSettling] attempt (never hardcoded).  If resource disposal and lifecycle
+     * release BOTH fail, both failures are preserved: [failure] carries the disposal
+     * failure and [lifecycleReleaseFailure] carries the release failure.
+     */
     data class EncodingSettlementOutcome(
         val status: EncodingSettlementStatus,
         val previousState: State,
         val itemDisposed: Boolean,
         val lifecycleReleased: Boolean,
-        val failure: Throwable? = null
+        val failure: Throwable? = null,
+        val lifecycleReleaseFailure: Throwable? = null
     )
 
     private data class Entry(var state: State = State.RETAINED)
@@ -95,7 +104,12 @@ internal class YuvBufferedLifecycle {
         }
     }
 
-    fun finishSettling(item: YuvPngWorkItem): Boolean = synchronized(lock) {
+    /**
+     * Removes a SETTLING item from the active registry.  Returns false (no throw) when
+     * the item is not in SETTLING state, which is an invariant violation for the
+     * normal settleEncoding flow.  Open for deterministic failure injection in tests.
+     */
+    internal open fun finishSettling(item: YuvPngWorkItem): Boolean = synchronized(lock) {
         val entry = items[item] ?: return@synchronized false
         if (entry.state != State.SETTLING) return@synchronized false
         items.remove(item)
@@ -109,7 +123,11 @@ internal class YuvBufferedLifecycle {
         true
     }
 
-    fun finishDrain(item: YuvPngWorkItem): Boolean = synchronized(lock) {
+    /**
+     * Removes a DRAINING item from the active registry.  Returns false (no throw) when
+     * the item is not in DRAINING state.  Open for deterministic failure injection in tests.
+     */
+    internal open fun finishDrain(item: YuvPngWorkItem): Boolean = synchronized(lock) {
         val entry = items[item] ?: return@synchronized false
         if (entry.state != State.DRAINING) return@synchronized false
         items.remove(item)
@@ -163,30 +181,38 @@ internal class YuvBufferedLifecycle {
             disposed = true
         } catch (t: Throwable) {
             failure = t
-        } finally {
-            finishSettling(item)
         }
 
-        if (failure != null) {
-            return EncodingSettlementOutcome(
-                status = EncodingSettlementStatus.SETTLED,
-                previousState = prevState,
-                itemDisposed = disposed,
-                lifecycleReleased = true,
-                failure = failure
-            )
+        var releaseFailure: Throwable? = null
+        val released = try {
+            if (finishSettling(item)) {
+                true
+            } else {
+                releaseFailure = IllegalStateException(
+                    "finishSettling returned false for frame ${item.frameIndex}: not in SETTLING state"
+                )
+                false
+            }
+        } catch (t: Throwable) {
+            releaseFailure = t
+            false
         }
 
         return EncodingSettlementOutcome(
             status = EncodingSettlementStatus.SETTLED,
             previousState = prevState,
-            itemDisposed = true,
-            lifecycleReleased = true,
-            failure = null
+            itemDisposed = disposed,
+            lifecycleReleased = released,
+            failure = failure,
+            lifecycleReleaseFailure = releaseFailure
         )
     }
 
-    fun closeAndDrainRetained(): List<YuvPngWorkItem> = synchronized(lock) {
+    /**
+     * Claims RETAINED items as DRAINING (never ENCODING or SETTLING items) and marks
+     * the lifecycle closed.  Open for deterministic failure injection in tests.
+     */
+    internal open fun closeAndDrainRetained(): List<YuvPngWorkItem> = synchronized(lock) {
         closed = true
         val drained = mutableListOf<YuvPngWorkItem>()
         for ((item, entry) in items) {

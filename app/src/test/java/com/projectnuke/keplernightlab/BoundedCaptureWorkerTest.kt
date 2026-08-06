@@ -26,6 +26,8 @@ class BoundedCaptureWorkerTest {
             assertFalse(worker.submit(Runnable { }))
             assertEquals(1, rejected.get())
             release.countDown()
+            worker.close()
+            assertTrue(worker.awaitTermination(5_000))
         } finally {
             worker.close()
         }
@@ -50,6 +52,7 @@ class BoundedCaptureWorkerTest {
         release.countDown()
         assertEquals(0, ran.get())
         assertTrue(rejected.get() >= 1)
+        assertTrue(worker.awaitTermination(5_000))
     }
 
     @Test
@@ -74,6 +77,8 @@ class BoundedCaptureWorkerTest {
             assertFalse(worker.submit(disposable))
             assertEquals(1, notified.get())
             release.countDown()
+            worker.close()
+            assertTrue(worker.awaitTermination(5_000))
         } finally {
             worker.close()
         }
@@ -177,6 +182,7 @@ class BoundedCaptureWorkerTest {
         assertEquals(1, r.queuedDisposableTasksDisposalAttempted)
         assertEquals(1, r.queuedNonDisposableTasksRemoved)
         block.countDown()
+        assertTrue(worker.awaitTermination(5_000))
     }
 
     @Test

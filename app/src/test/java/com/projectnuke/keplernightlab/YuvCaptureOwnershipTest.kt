@@ -67,6 +67,7 @@ class YuvCaptureOwnershipTest {
             assertTrue(worker.submit(queued))
             worker.shutdownNow()
             release.countDown()
+            assertTrue(worker.awaitTermination(5_000))
             assertEquals(1, queuedRelease.get())
             assertFalse(worker.submit(DisposableYuvTask(YuvPngWorkItem.ownedForTest { queuedRelease.incrementAndGet() }, accounting) { }))
             assertEquals(2, queuedRelease.get())
@@ -91,6 +92,8 @@ class YuvCaptureOwnershipTest {
             assertEquals(1, rejectedRelease.get())
             assertEquals(0, queuedRelease.get())
             release.countDown()
+            worker.close()
+            assertTrue(worker.awaitTermination(5_000))
         } finally {
             worker.close()
         }
@@ -314,13 +317,13 @@ class YuvCaptureOwnershipTest {
         val threads = listOf(
             Thread {
                 start.countDown()
-                start.await(5, TimeUnit.SECONDS)
+                assertTrue(start.await(5, TimeUnit.SECONDS))
                 lifecycle.settleEncoding(item, accounting)
                 done.countDown()
             },
             Thread {
                 start.countDown()
-                start.await(5, TimeUnit.SECONDS)
+                assertTrue(start.await(5, TimeUnit.SECONDS))
                 lifecycle.closeAndDrainRetained().forEach {
                     it.dispose(accounting)
                     lifecycle.finishDrain(it)
@@ -376,12 +379,12 @@ class YuvCaptureOwnershipTest {
         val drained = AtomicReference<List<YuvPngWorkItem>?>()
 
         val encoder = Thread {
-            started.countDown(); started.await(5, TimeUnit.SECONDS)
+            started.countDown(); assertTrue(started.await(5, TimeUnit.SECONDS))
             if (lifecycle.beginEncoding(item)) encodingWon.incrementAndGet()
             done.countDown()
         }
         val closer = Thread {
-            started.countDown(); started.await(5, TimeUnit.SECONDS)
+            started.countDown(); assertTrue(started.await(5, TimeUnit.SECONDS))
             drained.set(lifecycle.closeAndDrainRetained())
             done.countDown()
         }
