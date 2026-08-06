@@ -516,7 +516,6 @@ internal class YuvCleanupCoordinator(
             stateRef.getAndUpdate { current ->
                 current.copy(
                     workerShutdownRequested = true,
-<<<<<<< HEAD
                     queuedTasksRemoved = report.queuedTasksRemoved,
                     queuedDisposableTasksDisposed = report.queuedDisposableTasksDisposedSuccessfully,
                     failures = (mutableFailures +
@@ -524,17 +523,6 @@ internal class YuvCleanupCoordinator(
                         report.rejectionNotificationFailures).toList()
                 )
             }
-=======
-                    drainedRetainedItems = drained.size,
-                    queuedTasksRemoved = report.queuedTasksRemoved,
-                    queuedDisposableTasksDisposed = report.queuedDisposableTasksDisposedSuccessfully,
-                    activeWorkersAtStart = report.activeWorkersAtStart
-                )
-            }
-            val merged = (mutableFailures + report.taskDisposalFailures + report.rejectionNotificationFailures).toList()
-            failures = merged
-            return buildSnapshot(merged)
->>>>>>> be11772742d7dc65106ec7fa4b18531fad76e07f
         } catch (t: Throwable) {
             mutableFailures.add("workerShutdown: ${t.message}")
             stateRef.getAndUpdate { current ->

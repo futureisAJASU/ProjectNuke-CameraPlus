@@ -18,7 +18,6 @@ package com.projectnuke.keplernightlab
  */
 internal class YuvBufferedLifecycle {
 
-<<<<<<< HEAD
     enum class State { RETAINED, ENCODING, SETTLING, DRAINING, RELEASED }
 
     enum class SettlementResult { STARTED, ALREADY_SETTLING, ALREADY_RELEASED, INVALID_STATE, UNKNOWN }
@@ -38,11 +37,6 @@ internal class YuvBufferedLifecycle {
         val lifecycleReleased: Boolean,
         val failure: Throwable? = null
     )
-=======
-    enum class State { RETAINED, ENCODING, SETTLING, RELEASED }
-
-    enum class SettlementResult { STARTED, ALREADY_SETTLING, ALREADY_RELEASED, INVALID_STATE, UNKNOWN }
->>>>>>> be11772742d7dc65106ec7fa4b18531fad76e07f
 
     private data class Entry(var state: State = State.RETAINED)
 
@@ -64,24 +58,15 @@ internal class YuvBufferedLifecycle {
         items.count { it.value.state == State.SETTLING }
     }
 
-<<<<<<< HEAD
     fun drainingCount(): Int = synchronized(lock) {
         items.count { it.value.state == State.DRAINING }
     }
 
-=======
->>>>>>> be11772742d7dc65106ec7fa4b18531fad76e07f
     fun activeEncodingOwnershipCount(): Int = synchronized(lock) {
         items.count { it.value.state == State.ENCODING || it.value.state == State.SETTLING }
     }
 
-<<<<<<< HEAD
     fun trackedCount(): Int = synchronized(lock) { items.size }
-=======
-    fun trackedCount(): Int = synchronized(lock) {
-        items.count { it.value.state != State.RELEASED }
-    }
->>>>>>> be11772742d7dc65106ec7fa4b18531fad76e07f
 
     fun tryRegister(item: YuvPngWorkItem): Boolean = synchronized(lock) {
         if (closed) return@synchronized false
@@ -98,20 +83,14 @@ internal class YuvBufferedLifecycle {
     }
 
     fun startSettling(item: YuvPngWorkItem): SettlementResult = synchronized(lock) {
-<<<<<<< HEAD
         val entry = items[item] ?: return@synchronized SettlementResult.UNKNOWN
         when (entry.state) {
-=======
-        val entry = items[item]
-        when (entry?.state) {
->>>>>>> be11772742d7dc65106ec7fa4b18531fad76e07f
             State.ENCODING -> {
                 entry.state = State.SETTLING
                 SettlementResult.STARTED
             }
             State.SETTLING -> SettlementResult.ALREADY_SETTLING
             State.RELEASED -> SettlementResult.ALREADY_RELEASED
-<<<<<<< HEAD
             State.RETAINED, State.DRAINING -> SettlementResult.INVALID_STATE
         }
     }
@@ -205,30 +184,6 @@ internal class YuvBufferedLifecycle {
             lifecycleReleased = true,
             failure = null
         )
-=======
-            State.RETAINED -> SettlementResult.INVALID_STATE
-            null -> SettlementResult.UNKNOWN
-        }
-    }
-
-    fun finishSettling(item: YuvPngWorkItem): Boolean = synchronized(lock) {
-        val entry = items[item] ?: return@synchronized false
-        check(entry.state == State.SETTLING) { "finishSettling from ${entry.state}" }
-        entry.state = State.RELEASED
-        true
-    }
-
-    @Deprecated("Use startSettling + finishSettling pair", ReplaceWith("startSettling/finishSettling"))
-    fun settleEncoding(item: YuvPngWorkItem, accounting: YuvCaptureAccounting) {
-        val result = startSettling(item)
-        if (result != SettlementResult.STARTED) return
-        try {
-            item.settleBufferedAccounting(accounting)
-            item.dispose(accounting)
-        } finally {
-            finishSettling(item)
-        }
->>>>>>> be11772742d7dc65106ec7fa4b18531fad76e07f
     }
 
     fun closeAndDrainRetained(): List<YuvPngWorkItem> = synchronized(lock) {
@@ -236,11 +191,7 @@ internal class YuvBufferedLifecycle {
         val drained = mutableListOf<YuvPngWorkItem>()
         for ((item, entry) in items) {
             if (entry.state == State.RETAINED) {
-<<<<<<< HEAD
                 entry.state = State.DRAINING
-=======
-                entry.state = State.RELEASED
->>>>>>> be11772742d7dc65106ec7fa4b18531fad76e07f
                 drained.add(item)
             }
         }
