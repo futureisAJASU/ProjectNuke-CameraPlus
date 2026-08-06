@@ -7,6 +7,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -605,7 +606,7 @@ class YuvBufferedLifecycleSettlingTest {
     }
 
     @Test
-    fun disposeAndFinishRecordsDisposalFailureAndStillSettles() {
+    fun disposeAndFinishWithUncleanDisposalFailsWithoutFinishingDrain() {
         val lifecycle = YuvBufferedLifecycle()
         val accounting = YuvCaptureAccounting()
         val reservations = YuvBufferReservations(1024L)
@@ -618,18 +619,28 @@ class YuvBufferedLifecycleSettlingTest {
         val claim = lifecycle.claimRetainedForDrain().single()
         val outcome = claim.disposeAndFinish(accounting)
 
-        // The lifecycle release still succeeds; the disposal failure is not silently lost.
-        assertEquals(DrainSettlementStatus.SETTLED, outcome.status)
-        assertTrue(outcome.lifecycleReleased)
-        assertEquals(listOf("onRelease threw"), outcome.disposal.failures().map { it.message })
+        // Unclean disposal: finishDrain must NOT run, the claim fails and the item
+        // remains DRAINING; the disposal failure stays observable, never settled over.
+        assertEquals(DrainSettlementStatus.FAILED, outcome.status)
+        assertFalse(outcome.lifecycleReleased)
+        assertNull(outcome.lifecycleReleaseFailure)
         assertFalse(outcome.disposal.isClean)
-        assertEquals(0, lifecycle.trackedCount())
+        assertEquals(listOf("onRelease threw"), outcome.disposal.failures().map { it.message })
+        assertEquals(1, lifecycle.drainingCount())
+        assertEquals(1, lifecycle.trackedCount())
+        assertEquals(YuvDrainClaim.State.FAILED, claim.claimState())
+        // The reservation/accounting were settled by dispose before the observer threw.
         assertEquals(0L, reservations.currentBytes())
         assertEquals(0, accounting.snapshot().bufferedFrames)
+        // A repeated settlement mirrors the original failure diagnostics.
+        val again = claim.disposeAndFinish(accounting)
+        assertEquals(DrainSettlementStatus.ALREADY_FAILED, again.status)
+        assertEquals(listOf("onRelease threw"), again.disposal.failures().map { it.message })
+        assertTrue(again.disposal.alreadySettled)
     }
 
     @Test
-    fun disposeAndFinishWithoutAccountingStillReleasesLifecycle() {
+    fun disposeAndFinishWithoutAccountingFailsBeforeDisposing() {
         val lifecycle = YuvBufferedLifecycle()
         val accounting = YuvCaptureAccounting()
         val reservations = YuvBufferReservations(1024L)
@@ -643,13 +654,23 @@ class YuvBufferedLifecycleSettlingTest {
         val claim = lifecycle.claimRetainedForDrain().single()
         val outcome = claim.disposeAndFinish(accounting = null)
 
-        assertEquals(DrainSettlementStatus.SETTLED, outcome.status)
-        assertEquals(1, disposeCount.get())
-        assertEquals(0, lifecycle.trackedCount())
-        // Without accounting the reservation cannot settle; the accounting debt is the
-        // caller's responsibility.  The lifecycle itself is fully released.
+        // A coordinated buffered claim requires accounting: the claim fails BEFORE any
+        // disposal runs, and the item remains DRAINING with the debt observable.
+        assertEquals(DrainSettlementStatus.FAILED, outcome.status)
+        assertEquals(0, disposeCount.get())
+        assertFalse(outcome.disposal.disposalAttempted)
+        assertFalse(outcome.lifecycleReleased)
+        assertNotNull(outcome.lifecycleReleaseFailure)
+        assertTrue(outcome.lifecycleReleaseFailure!!.message!!.contains("accounting"))
+        assertEquals(1, lifecycle.drainingCount())
+        assertEquals(1, lifecycle.trackedCount())
+        assertEquals(YuvDrainClaim.State.FAILED, claim.claimState())
         assertEquals(100L, reservations.currentBytes())
         assertEquals(1, accounting.snapshot().bufferedFrames)
+        // Repeats report the same failed settlement without disposing.
+        assertEquals(DrainSettlementStatus.ALREADY_FAILED, claim.disposeAndFinish(null).status)
+        assertEquals(0, disposeCount.get())
+        // The claim can be recovered by settling the item through the normal path.
         item.settleBufferedAccounting(accounting)
         assertEquals(0L, reservations.currentBytes())
         assertEquals(0, accounting.snapshot().bufferedFrames)

@@ -310,4 +310,122 @@ class BoundedCaptureWorkerTest {
         block.countDown()
         assertTrue(worker.awaitTermination(5_000))
     }
+
+    @Test
+    fun shutdownNowCountsOnlyCleanOutcomeDisposalsAsSuccessful() {
+        val started = CountDownLatch(1)
+        val block = CountDownLatch(1)
+        val disposalFailures = mutableListOf<Pair<Runnable, Throwable>>()
+        val worker = BoundedCaptureWorker("shutdown-outcome", capacity = 3,
+            onTaskDisposalFailure = { task, t -> disposalFailures += task to t },
+            onRejectionNotificationFailure = { _, _ -> },
+            onRejected = { _ -> })
+
+        assertTrue(worker.submit(Runnable {
+            started.countDown(); block.await(5, TimeUnit.SECONDS)
+        }))
+        assertTrue(started.await(2, TimeUnit.SECONDS))
+
+        val uncleanTask = object : OutcomeDisposableCaptureTask {
+            override fun run() {}
+            override fun dispose() {}
+            override fun disposeWithOutcome() = CaptureTaskDisposalOutcome.Unclean(
+                workDisposal = null,
+                description = "buffered item disposal unclean"
+            )
+        }
+        val cleanTask = object : OutcomeDisposableCaptureTask {
+            override fun run() {}
+            override fun dispose() {}
+            override fun disposeWithOutcome() = CaptureTaskDisposalOutcome.Clean
+        }
+        worker.submit(uncleanTask)
+        worker.submit(cleanTask)
+
+        val r = worker.shutdownNow()
+
+        // The unclean outcome is NOT counted as a successful disposal; its description
+        // reaches the failure sink, and the hook is invoked with a non-throwing callback.
+        assertEquals(2, r.queuedDisposableTasksDisposalAttempted)
+        assertEquals(1, r.queuedDisposableTasksDisposedSuccessfully)
+        assertEquals(1, r.taskDisposalFailures.size)
+        assertTrue(r.taskDisposalFailures[0].contains("taskDisposeUnclean"))
+        assertTrue(r.taskDisposalFailures[0].contains("buffered item disposal unclean"))
+        assertEquals(1, disposalFailures.size)
+        assertSame(uncleanTask, disposalFailures[0].first)
+
+        block.countDown()
+        assertTrue(worker.awaitTermination(5_000))
+    }
+
+    @Test
+    fun shutdownNowFailedOutcomeDisposalCountsAsFailureNotSuccess() {
+        val started = CountDownLatch(1)
+        val block = CountDownLatch(1)
+        val disposalFailures = mutableListOf<Pair<Runnable, Throwable>>()
+        val worker = BoundedCaptureWorker("shutdown-failed-outcome", capacity = 2,
+            onTaskDisposalFailure = { task, t -> disposalFailures += task to t },
+            onRejectionNotificationFailure = { _, _ -> },
+            onRejected = { _ -> })
+
+        assertTrue(worker.submit(Runnable {
+            started.countDown(); block.await(5, TimeUnit.SECONDS)
+        }))
+        assertTrue(started.await(2, TimeUnit.SECONDS))
+
+        val failedTask = object : OutcomeDisposableCaptureTask {
+            override fun run() {}
+            override fun dispose() {}
+            override fun disposeWithOutcome() =
+                CaptureTaskDisposalOutcome.Failed(IllegalStateException("outcome disposal failed"))
+        }
+        worker.submit(failedTask)
+
+        val r = worker.shutdownNow()
+
+        assertEquals(1, r.queuedDisposableTasksDisposalAttempted)
+        assertEquals(0, r.queuedDisposableTasksDisposedSuccessfully)
+        assertEquals(1, r.taskDisposalFailures.size)
+        assertEquals("outcome disposal failed", disposalFailures[0].second.message)
+
+        block.countDown()
+        assertTrue(worker.awaitTermination(5_000))
+    }
+
+    @Test
+    fun rejectionOfOutcomeDisposableTaskNotifiesUncleanWithoutCountingSuccess() {
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val notified = AtomicInteger(0)
+        val disposalFailures = mutableListOf<Pair<Runnable, Throwable>>()
+        val worker = BoundedCaptureWorker("reject-outcome", capacity = 1,
+            onTaskDisposalFailure = { task, t -> disposalFailures += task to t },
+            onRejectionNotificationFailure = { _, _ -> },
+            onRejected = { _ -> notified.incrementAndGet() })
+
+        assertTrue(worker.submit(Runnable {
+            started.countDown(); release.await(2, TimeUnit.SECONDS)
+        }))
+        assertTrue(started.await(2, TimeUnit.SECONDS))
+        assertTrue(worker.submit(Runnable {}))
+
+        val rejectedTask = object : OutcomeDisposableCaptureTask {
+            override fun run() {}
+            override fun dispose() {}
+            override fun disposeWithOutcome() = CaptureTaskDisposalOutcome.Unclean(
+                workDisposal = null,
+                description = "rejected direct item disposal unclean"
+            )
+        }
+        assertFalse(worker.submit(rejectedTask))
+
+        assertEquals(1, notified.get())
+        assertEquals(1, disposalFailures.size)
+        assertSame(rejectedTask, disposalFailures[0].first)
+        assertTrue(disposalFailures[0].second.message!!.contains("rejected direct item disposal unclean"))
+
+        release.countDown()
+        worker.close()
+        assertTrue(worker.awaitTermination(5_000))
+    }
 }

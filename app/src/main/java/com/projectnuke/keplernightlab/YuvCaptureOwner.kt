@@ -68,7 +68,7 @@ internal class BufferedEncodeTask(
     private val encode: () -> YuvWorkerCompletion,
     private val postCompletion: (YuvWorkerCompletion) -> Unit,
     private val onSettlementIssue: ((YuvPngWorkItem, YuvBufferedLifecycle.EncodingSettlementOutcome) -> Unit)? = null
-) : DisposableCaptureTask {
+) : OutcomeDisposableCaptureTask {
     private val settled = AtomicBoolean(false)
 
     override fun run() {
@@ -81,22 +81,23 @@ internal class BufferedEncodeTask(
             postCompletion(completion)
         } finally {
             if (settled.compareAndSet(false, true)) {
-                settleItem()
+                settleItemAndReport()
             }
         }
     }
 
-    override fun dispose() {
-        if (settled.compareAndSet(false, true)) {
-            settleItem()
-        }
+    override fun dispose() { disposeWithOutcome() }
+
+    override fun disposeWithOutcome(): CaptureTaskDisposalOutcome {
+        if (!settled.compareAndSet(false, true)) return CaptureTaskDisposalOutcome.Clean
+        return settleItemAndReport()
     }
 
-    private fun settleItem() {
+    private fun settleItemAndReport(): CaptureTaskDisposalOutcome {
         val outcome = lifecycle.settleEncoding(item, accounting)
         val settledCleanly = outcome.status == YuvBufferedLifecycle.EncodingSettlementStatus.SETTLED &&
             outcome.failure == null && outcome.lifecycleReleaseFailure == null
-        if (settledCleanly) return
+        if (settledCleanly) return CaptureTaskDisposalOutcome.Clean
         onSettlementIssue?.let { hook ->
             try {
                 hook(item, outcome)
@@ -104,6 +105,12 @@ internal class BufferedEncodeTask(
                 // The issue hook must never throw into worker cleanup.
             }
         }
+        val detail = listOfNotNull(outcome.failure, outcome.lifecycleReleaseFailure)
+            .joinToString("; ") { "${it::class.java.simpleName}: ${it.message}" }
+        return CaptureTaskDisposalOutcome.Unclean(
+            item.disposalOutcome(),
+            "bufferedTaskDispose frame=${item.frameIndex}: ${outcome.status} $detail"
+        )
     }
 }
 
@@ -167,6 +174,21 @@ internal class YuvCaptureOwner(
         }
     }
 
+    /**
+     * Records an unclean work-item disposal as observable cleanup debt.  Never throws:
+     * the description is pre-built from the outcome's preserved failure diagnostics.
+     */
+    private fun recordWorkDisposalDebt(item: YuvPngWorkItem, outcome: YuvWorkDisposalOutcome) {
+        if (outcome.isClean || outcome.failures().isEmpty()) return
+        val description = disposalDescription(outcome, item.frameIndex)
+        candidateCleanupDebts.add(description)
+        Log.e("KeplerYuvOwner", description)
+    }
+
+    private fun recordDisposalIfUnclean(item: YuvPngWorkItem, outcome: YuvWorkDisposalOutcome) {
+        recordWorkDisposalDebt(item, outcome)
+    }
+
     // ------------------------------------------------------------------
     // Typed Camera2 callback entry points (no unsafe casts)
     // ------------------------------------------------------------------
@@ -176,12 +198,17 @@ internal class YuvCaptureOwner(
             val guard = YuvImageReleaseGuard(access)
             override fun execute() {
                 if (terminalState.status() != CaptureTerminalStatus.ACTIVE) { guard.releaseSafely(); return }
+                // receivedFrames counts the acquired access as soon as owner processing
+                // begins — even when no frame identity remains (then dropped++ too).
+                accounting.receivedFrame()
                 val frameIndex = identityOwner.nextIdentity()
                 if (frameIndex == null) { accounting.droppedFrame(); guard.releaseSafely(); return }
-                accounting.receivedFrame()
                 when (val c = createBufferedYuvWork(frameIndex, access, reservations, accounting)) {
                     is BufferedYuvWorkCreation.Accepted -> {
-                        if (!lifecycle.tryRegister(c.item)) { c.item.dispose(accounting); return }
+                        if (!lifecycle.tryRegister(c.item)) {
+                            recordDisposalIfUnclean(c.item, c.item.dispose(accounting))
+                            return
+                        }
                         postStatus("YUV buffered frame ${accounting.snapshot().bufferedFrames}/$frameCount")
                         scheduleBufferedEncoding()
                     }
@@ -206,15 +233,17 @@ internal class YuvCaptureOwner(
             val guard = YuvImageReleaseGuard(access)
             override fun execute() {
                 if (terminalState.status() != CaptureTerminalStatus.ACTIVE) { guard.releaseSafely(); return }
+                // receivedFrames counts the acquired access as soon as owner processing
+                // begins — even when no frame identity remains (then dropped++ too).
+                accounting.receivedFrame()
                 val frameIndex = identityOwner.nextIdentity()
                 if (frameIndex == null) { accounting.droppedFrame(); guard.releaseSafely(); return }
-                accounting.receivedFrame()
                 when (val creation = createDirectYuvWork(frameIndex, access, accounting)) {
                     is DirectYuvWorkCreation.Accepted -> {
                         val item = creation.item
                         val fileName = "frame_${item.frameIndex.toString().padStart(2, '0')}_color.png"
                         val candidate = File(outputDir, ".${fileName}.${System.nanoTime()}.tmp")
-                        val task = object : DisposableCaptureTask {
+                        val task = object : OutcomeDisposableCaptureTask {
                             override fun run() {
                                 val completion = try {
                                     workProcessor.encode(item, candidate, rotationDegrees)
@@ -238,14 +267,25 @@ internal class YuvCaptureOwner(
                                         }
                                     })
                                 } finally {
-                                    item.dispose()
+                                    disposeWithOutcome()
                                 }
                             }
-                            override fun dispose() { item.dispose() }
+                            override fun dispose() { disposeWithOutcome() }
+                            override fun disposeWithOutcome(): CaptureTaskDisposalOutcome {
+                                val outcome = item.dispose()
+                                return if (outcome.isClean) {
+                                    CaptureTaskDisposalOutcome.Clean
+                                } else {
+                                    recordWorkDisposalDebt(item, outcome)
+                                    CaptureTaskDisposalOutcome.Unclean(
+                                        outcome, disposalDescription(outcome, item.frameIndex)
+                                    )
+                                }
+                            }
                         }
                         if (!boundedWorker.submit(task)) {
-                            // Worker already called task.dispose() which calls item.dispose().
-                            // Do NOT double-dispose.
+                            // Worker already disposed the rejected task (disposeWithOutcome);
+                            // the drop is recorded here exactly once.
                             accounting.droppedFrame()
                             postStatus("YUV direct backpressure: frame ${item.frameIndex + 1} dropped")
                         }
@@ -353,13 +393,18 @@ internal class YuvCaptureOwner(
     }
 
     /**
-     * Fail-closed adoption pipeline (owner event, serialized):
-     * validate candidate -> reserve identity+filename -> collision policy (preserve
-     * pre-existing final files) -> commit -> verify final -> commit manifest entry ->
-     * settle candidate ADOPTED.  Every failure rolls back the reservation, preserves
-     * pre-existing files, removes/quarantines only newly created invalid finals,
-     * settles the candidate, and records the exact failure/cleanup debt.  An untracked
-     * final PNG can never be left behind.
+     * Fail-closed, transactional adoption pipeline (owner event, serialized):
+     *
+     *   candidate verifier -> exclusive adoption claim (ADOPTING) -> reservation
+     *   -> collision policy (preserve pre-existing finals) -> commit -> final verifier
+     *   -> token commit (manifest+persistedFrames) -> candidate ADOPTED.
+     *
+     * Every injected stage is treated as throwable and contained; every failure
+     * rolls back the reservation, removes/quarantines ONLY newly created finals
+     * ([destinationExistedBeforeAttempt] / [destinationCreatedByAttempt] tracking),
+     * settles the candidate through the claim (never leaving it ADOPTING/UNSETTLED),
+     * records failedFrame and the exact failure/cleanup debt.  An untracked final PNG
+     * is never left behind and a pre-existing final is never deleted or quarantined.
      */
     private fun adoptSuccess(completion: YuvWorkerCompletion.Success) {
         val handle = completion.candidateHandle
@@ -370,74 +415,115 @@ internal class YuvCaptureOwner(
             return
         }
         val entry = YuvFrameManifestEntry(completion.frameIndex, completion.fileName, completion.timestampNs, true)
+        val finalFile = File(outputDir, completion.fileName)
+        val destinationExistedBeforeAttempt = finalFile.exists()
 
-        // 1. Fail-closed candidate validation (injectable verifier seam)
-        if (!candidateVerifier.verify(handle.file, completion.frameIndex)) {
+        // 1. Fail-closed candidate validation (a THROWING verifier fails closed: the
+        //    throwable is contained and reported, the candidate is settled).
+        val candidateValid = try {
+            candidateVerifier.verify(handle.file, completion.frameIndex)
+        } catch (t: Throwable) {
+            Log.e("KeplerYuvOwner", "Candidate verifier threw for frame ${completion.frameIndex}", t)
+            false
+        }
+        if (!candidateValid) {
             Log.e("KeplerYuvOwner", "Candidate validation failed for frame ${completion.frameIndex}: ${handle.file}")
             recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
             return
         }
 
-        // 2. Reserve frame identity + final filename atomically (reservation alone
+        // 2. Exclusive adoption claim: UNSETTLED -> ADOPTING.  The candidate is now
+        //    immune to concurrent discard until the claim is completed or aborted.
+        val claim = handle.tryBeginAdoption() ?: run {
+            Log.e("KeplerYuvOwner", "Candidate adoption claim rejected for frame ${completion.frameIndex}")
+            recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
+            accounting.failedFrame()
+            return
+        }
+
+        // 3. Reserve frame identity + final filename atomically (reservation alone
         //    never touches the manifest or persistedFrames)
         val token = accounting.tryReserveAdoption(entry) ?: run {
-            // Duplicate/late completion: settle the candidate without touching any
-            // adopted final file.
             Log.w("KeplerYuvOwner", "Duplicate adoption reservation rejected for frame ${completion.frameIndex}")
-            recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
+            recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
             return
         }
-        val finalFile = File(outputDir, completion.fileName)
 
-        // 3. Fail-closed collision policy: preserve ANY unexpected pre-existing final
-        //    file (never delete it); roll back and discard/quarantine the candidate.
-        if (finalFile.exists()) {
+        // 4. Fail-closed collision policy: preserve ANY pre-existing final file
+        //    (never delete it); roll back and settle the candidate through the claim.
+        if (destinationExistedBeforeAttempt) {
             Log.w("KeplerYuvOwner", "Unexpected pre-existing final file for frame ${completion.frameIndex}: ${finalFile.path}")
             token.rollback()
-            recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
+            recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
             return
         }
 
-        // 4. Commit candidate -> final
-        try {
+        // 5. Commit candidate -> final (contained).  If the committer throws AFTER
+        //    creating the final file (partial side effect), the newly created
+        //    untracked final is removed/quarantined; the pre-existing-only rule is
+        //    respected because destinationExistedBeforeAttempt is false here.
+        val commitFailure = try {
             workProcessor.commit(handle.file, finalFile)
+            null
         } catch (t: Throwable) {
-            Log.e("KeplerYuvOwner", "Commit failed for frame ${completion.frameIndex}", t)
+            t
+        }
+        val destinationCreatedByAttempt = finalFile.exists()
+        if (commitFailure != null) {
+            Log.e("KeplerYuvOwner", "Commit failed for frame ${completion.frameIndex}", commitFailure)
+            if (destinationCreatedByAttempt) removeOrQuarantineCreatedFinal(finalFile)
             token.rollback()
-            recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
+            recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
-            finishError("YUV commit failed for frame ${completion.frameIndex}", cause = t)
+            finishError("YUV commit failed for frame ${completion.frameIndex}", cause = commitFailure)
             return
         }
 
-        // 5. Fail-closed verification of the newly created final file; only the newly
+        // 6. Fail-closed verification of the newly created final file (a THROWING
+        //    final verifier is the same as verification failure).  Only the newly
         //    created file may be removed/quarantined.
-        if (!finalFileVerifier.verify(finalFile, completion.frameIndex)) {
+        val finalVerified = try {
+            finalFileVerifier.verify(finalFile, completion.frameIndex)
+        } catch (t: Throwable) {
+            Log.e("KeplerYuvOwner", "Final verifier threw for frame ${completion.frameIndex}", t)
+            false
+        }
+        if (!finalVerified) {
             Log.w("KeplerYuvOwner", "Final file verification failed after commit for frame ${completion.frameIndex}")
             token.rollback()
-            removeOrQuarantineCreatedFinal(finalFile)
-            // The candidate was consumed by the commit; the handle settles as DISCARDED
-            // (file absent) via the same polymorphic settlement path.
-            recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
+            if (destinationCreatedByAttempt) removeOrQuarantineCreatedFinal(finalFile)
+            recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
             return
         }
 
-        // 6. Commit manifest entry + persistedFrames (exactly-once token commit)
+        // 7. Commit manifest entry + persistedFrames.  COMMITTED is only visible after
+        //    the accounting mutation completed.  If the token commit fails after final
+        //    creation, the final is UNTRACKED: it is removed/quarantined, any remaining
+        //    reservation is rolled back, and the candidate is settled.
         if (!token.commit()) {
-            Log.w("KeplerYuvOwner", "Adoption commit failed for frame ${completion.frameIndex}")
-            // The token is already settled; never delete an adopted/uncertain final.
-            recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
+            Log.e("KeplerYuvOwner", "Adoption commit failed for frame ${completion.frameIndex}", token.failure)
+            if (destinationCreatedByAttempt) removeOrQuarantineCreatedFinal(finalFile)
+            accounting.releaseReservations(entry)
+            recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
+            finishError("YUV adoption commit failed for frame ${completion.frameIndex}", cause = token.failure)
             return
         }
 
-        // 7. Settle the candidate ADOPTED (exactly-once UNSETTLED -> ADOPTED)
-        if (!handle.adopt()) {
-            Log.w("KeplerYuvOwner", "Candidate settle to ADOPTED failed for frame ${completion.frameIndex}")
+        // 8. Settle the candidate ADOPTED through the exclusive claim.  The claim
+        //    makes any other settlement impossible, so this can only fail on a
+        //    defensive invariant violation; it is recorded as debt, never swallowed.
+        if (!handle.completeAdoption(claim)) {
+            val description = "candidate adoption completion failed frame=${completion.frameIndex} " +
+                "file=${handle.file} state=${handle.state()}"
+            candidateCleanupDebts.add(description)
+            Log.e("KeplerYuvOwner", description)
+            accounting.failedFrame()
+            return
         }
         val persistedFrames = accounting.snapshot().persistedFrames
         postStatus("YUV capture: saved $persistedFrames/$frameCount")
@@ -446,19 +532,33 @@ internal class YuvCaptureOwner(
 
     /**
      * Removes/quarantines ONLY the newly created invalid final file (never a
-     * pre-existing one).  A failed removal records the cleanup debt explicitly.
+     * pre-existing one).  Both operations are contained independently: a throwing
+     * filesystem implementation is converted into an explicit result and a failed
+     * removal records the cleanup debt explicitly.
      */
     private fun removeOrQuarantineCreatedFinal(file: File) {
-        val deleteResult = candidateFilesystem.delete(file)
+        val deleteResult = try {
+            candidateFilesystem.delete(file)
+        } catch (t: Throwable) {
+            CandidateFileOperationResult.DELETE_THREW(t)
+        }
         if (deleteResult != CandidateFileOperationResult.DELETED &&
             deleteResult != CandidateFileOperationResult.FILE_ABSENT) {
-            val quarantineResult = candidateFilesystem.quarantine(file)
-            if (quarantineResult != CandidateFileOperationResult.QUARANTINED) {
-                val description =
-                    "final-file cleanup debt file=$file delete=$deleteResult quarantine=$quarantineResult"
-                candidateCleanupDebts.add(description)
-                Log.e("KeplerYuvOwner", description)
+            val quarantineResult = try {
+                candidateFilesystem.quarantine(file)
+            } catch (t: Throwable) {
+                CandidateFileOperationResult.QUARANTINE_FAILED(t)
             }
+            if (quarantineResult !is CandidateFileOperationResult.QUARANTINE_FAILED) return
+            val deleteFailure = deleteResult.failure
+            val quarantineFailure = quarantineResult.failure
+            val description = "final-file cleanup debt file=$file" +
+                " delete=${deleteResult.describe()}" +
+                " quarantine=${quarantineResult.describe()}" +
+                (if (deleteFailure == null) "" else " deleteThrowable=" + deleteFailure::class.java.simpleName + ": " + deleteFailure.message) +
+                (if (quarantineFailure == null) "" else " quarantineThrowable=" + quarantineFailure::class.java.simpleName + ": " + quarantineFailure.message)
+            candidateCleanupDebts.add(description)
+            Log.e("KeplerYuvOwner", description)
         }
     }
 

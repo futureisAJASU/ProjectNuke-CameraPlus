@@ -16,23 +16,73 @@ data class YuvFrameManifestEntry(
 )
 
 // ── Candidate ownership: file handle + exactly-once settlement ─────
+/**
+ * Atomic candidate ownership state machine:
+ *
+ *   UNSETTLED -> ADOPTING -> ADOPTED          (exclusive adoption claim)
+ *   UNSETTLED -> DISCARDING -> DISCARDED      (settlement, delete succeeded/absent)
+ *   UNSETTLED -> DISCARDING -> QUARANTINED    (settlement, delete failed + quarantine)
+ *   ADOPTING  -> DISCARDING -> DISCARDED      (adoption abort)
+ *   ADOPTING  -> DISCARDING -> QUARANTINED    (adoption abort)
+ *
+ * Adoption and discard compete for the SAME atomic ownership claim: only one
+ * transition out of UNSETTLED ever wins, a DISCARDING candidate can never become
+ * ADOPTED, an ADOPTING candidate can never be deleted/quarantined by a concurrent
+ * settlement, intermediate states are observable, and no terminal state is ever
+ * overwritten by another terminal state.
+ */
 internal enum class CandidateOwnership {
-    UNSETTLED, ADOPTED, DISCARDED, QUARANTINED
+    UNSETTLED, ADOPTING, DISCARDING, ADOPTED, DISCARDED, QUARANTINED
 }
 
 /**
  * Result of a candidate file operation through the injectable [YuvCandidateFilesystem]
  * seam.  Every outcome is explicit so owner-side cleanup never depends on
  * runCatching/boolean delete conventions and deterministic JVM tests can simulate
- * every failure mode.
+ * every failure mode.  Thrown exceptions from injected implementations are CONTAINED
+ * by the handle and converted into [DELETE_THREW] / [QUARANTINE_FAILED] results that
+ * carry the original throwable.
  */
-internal enum class CandidateFileOperationResult {
-    FILE_ABSENT, DELETED, DELETE_RETURNED_FALSE, DELETE_THREW, QUARANTINED, QUARANTINE_FAILED
+internal sealed class CandidateFileOperationResult {
+    /** Contained throwable for a throwing implementation, or null. */
+    abstract val failure: Throwable?
+
+    data object FILE_ABSENT : CandidateFileOperationResult() {
+        override val failure: Throwable? = null
+    }
+
+    data object DELETED : CandidateFileOperationResult() {
+        override val failure: Throwable? = null
+    }
+
+    data object DELETE_RETURNED_FALSE : CandidateFileOperationResult() {
+        override val failure: Throwable? = null
+    }
+
+    data class DELETE_THREW(override val failure: Throwable) : CandidateFileOperationResult()
+
+    data object QUARANTINED : CandidateFileOperationResult() {
+        override val failure: Throwable? = null
+    }
+
+    data class QUARANTINE_FAILED(override val failure: Throwable? = null) : CandidateFileOperationResult()
+
+    /** Stable token for debt descriptions (independent of carried throwables). */
+    fun describe(): String = when (this) {
+        FILE_ABSENT -> "FILE_ABSENT"
+        DELETED -> "DELETED"
+        DELETE_RETURNED_FALSE -> "DELETE_RETURNED_FALSE"
+        is DELETE_THREW -> "DELETE_THREW"
+        QUARANTINED -> "QUARANTINED"
+        is QUARANTINE_FAILED -> "QUARANTINE_FAILED"
+    }
 }
 
 /**
- * Injectable filesystem operator for candidate cleanup.  Implementations must never
- * throw; delete/quarantine outcomes are returned as explicit results.
+ * Injectable filesystem operator for candidate cleanup.  Implementations are expected
+ * to return explicit results, but even a THROWING implementation is contained by the
+ * candidate handle: the throwable is captured into [CandidateFileOperationResult]
+ * and the candidate still reaches a terminal cleanup-debt state.
  */
 internal interface YuvCandidateFilesystem {
     fun delete(candidate: File): CandidateFileOperationResult
@@ -46,7 +96,7 @@ internal object RealYuvCandidateFilesystem : YuvCandidateFilesystem {
             if (candidate.delete()) CandidateFileOperationResult.DELETED
             else CandidateFileOperationResult.DELETE_RETURNED_FALSE
         } catch (t: Throwable) {
-            CandidateFileOperationResult.DELETE_THREW
+            CandidateFileOperationResult.DELETE_THREW(t)
         }
     }
 
@@ -56,10 +106,10 @@ internal object RealYuvCandidateFilesystem : YuvCandidateFilesystem {
             if (candidate.renameTo(File(candidate.path + ".quarantined"))) {
                 CandidateFileOperationResult.QUARANTINED
             } else {
-                CandidateFileOperationResult.QUARANTINE_FAILED
+                CandidateFileOperationResult.QUARANTINE_FAILED()
             }
         } catch (t: Throwable) {
-            CandidateFileOperationResult.QUARANTINE_FAILED
+            CandidateFileOperationResult.QUARANTINE_FAILED(t)
         }
     }
 }
@@ -105,7 +155,9 @@ internal object RealYuvFinalFileVerifier : YuvFinalFileVerifier {
 /**
  * Owner-side result of a candidate settlement.  [cleanupFailed] is true exactly when
  * the candidate could neither be deleted nor quarantined: the file remains and the
- * cleanup debt stays observable ([CandidateDisposalOutcome.failureDescription]).
+ * cleanup debt stays observable ([CandidateDisposalOutcome.failureDescription]),
+ * preserving frame identity, candidate path, failed operations, throwable
+ * type/message and the final candidate state.
  */
 internal class CandidateDisposalOutcome(
     val finalState: CandidateOwnership,
@@ -115,87 +167,165 @@ internal class CandidateDisposalOutcome(
 ) {
     val cleanupFailed: Boolean
         get() = !alreadySettled && finalState == CandidateOwnership.QUARANTINED &&
-            quarantineResult == CandidateFileOperationResult.QUARANTINE_FAILED
+            quarantineResult is CandidateFileOperationResult.QUARANTINE_FAILED
 
-    fun failureDescription(frameIndex: Int, file: File): String? = when {
-        alreadySettled -> null
-        quarantineResult == CandidateFileOperationResult.QUARANTINE_FAILED ->
-            "candidate cleanup debt frame=$frameIndex file=$file delete=$deleteResult quarantine=QUARANTINE_FAILED"
-        else -> null
+    fun failureDescription(frameIndex: Int, file: File): String? {
+        if (alreadySettled) return null
+        val quarantine = quarantineResult
+        if (quarantine !is CandidateFileOperationResult.QUARANTINE_FAILED) return null
+        val delete = deleteResult
+        val deleteDetail = if (delete != null) {
+            " delete=${delete.describe()}" + throwableDetail("deleteThrowable", delete.failure)
+        } else {
+            ""
+        }
+        val quarantineDetail = " quarantine=${quarantine.describe()}" +
+            throwableDetail("quarantineThrowable", quarantine.failure)
+        return "candidate cleanup debt frame=$frameIndex file=$file" +
+            deleteDetail + quarantineDetail + " state=${finalState}"
+    }
+
+    companion object {
+        private fun throwableDetail(label: String, failure: Throwable?): String =
+            if (failure == null) ""
+            else "; $label=${failure::class.java.simpleName}: ${failure.message}"
     }
 }
 
 /**
- * Exactly-once candidate ownership handle.  A candidate file is owned from creation
- * until it settles exactly one way: ADOPTED (owner committed it to a final PNG),
- * DISCARDED (cleanup removed it, or it was already absent), or QUARANTINED (cleanup
- * could not remove it; the debt stays observable).  Repeated settlement attempts are
- * idempotent and never perform a second file operation.
+ * Exclusive adoption claim granted by [YuvCandidateHandle.tryBeginAdoption].
+ * Completion ([YuvCandidateHandle.completeAdoption]) and abort
+ * ([YuvCandidateHandle.abortAdoption]) are only accepted for the exact claim that
+ * won the UNSETTLED -> ADOPTING transition, so adoption and discard share one
+ * atomic ownership claim and a DISCARDING candidate can never become ADOPTED.
+ */
+internal class CandidateAdoptionClaim internal constructor(
+    val handle: YuvCandidateHandle
+)
+
+/**
+ * Exactly-once candidate ownership handle backed by one atomic state machine.  A
+ * candidate file is owned from creation until it settles exactly one way: ADOPTED
+ * (owner committed it to a final PNG), DISCARDED (cleanup removed it, or it was
+ * already absent), or QUARANTINED (cleanup could not remove it; the debt stays
+ * observable).  Repeated/concurrent settlement attempts are idempotent and never
+ * perform a second file operation; filesystem throws are contained with the
+ * throwable preserved.
  */
 internal class YuvCandidateHandle(
     val frameIndex: Int,
     val file: File
 ) {
     private val state = AtomicReference(CandidateOwnership.UNSETTLED)
-    private val settling = AtomicBoolean(false)
 
     fun state(): CandidateOwnership = state.get()
 
-    /** Exactly-once UNSETTLED -> ADOPTED (caller has committed the candidate). */
-    fun adopt(): Boolean = state.compareAndSet(CandidateOwnership.UNSETTLED, CandidateOwnership.ADOPTED)
+    /**
+     * Exactly-once UNSETTLED -> ADOPTING.  The winner receives the exclusive
+     * [CandidateAdoptionClaim]; a concurrent discard is rejected for as long as the
+     * claim is held.  Returns null when the candidate is already claimed or settled.
+     */
+    fun tryBeginAdoption(): CandidateAdoptionClaim? =
+        if (state.compareAndSet(CandidateOwnership.UNSETTLED, CandidateOwnership.ADOPTING)) {
+            CandidateAdoptionClaim(this)
+        } else {
+            null
+        }
 
     /**
-     * Exactly-once UNSETTLED -> DISCARDED/QUARANTINED settlement: the first caller
-     * performs the file operation; concurrent/repeated callers observe the settled
-     * state and never touch the file again.
+     * Exactly-once ADOPTING -> ADOPTED for the holder of [claim].  Only the claim
+     * owner may complete; the ADOPTING intermediate makes a completion-race with
+     * any discard impossible.
      */
-    fun discardOrQuarantine(filesystem: YuvCandidateFilesystem): CandidateDisposalOutcome {
-        if (state.get() != CandidateOwnership.UNSETTLED) {
+    fun completeAdoption(claim: CandidateAdoptionClaim): Boolean {
+        if (claim.handle !== this) return false
+        return state.compareAndSet(CandidateOwnership.ADOPTING, CandidateOwnership.ADOPTED)
+    }
+
+    /**
+     * Exactly-once ADOPTING -> DISCARDING -> DISCARDED/QUARANTINED for the holder of
+     * [claim]: the failed adoption settles the candidate through the normal
+     * settlement path (delete, quarantine on failure), never leaving it ADOPTING or
+     * UNSETTLED.  Filesystem throws are contained.
+     */
+    fun abortAdoption(
+        claim: CandidateAdoptionClaim,
+        filesystem: YuvCandidateFilesystem
+    ): CandidateDisposalOutcome {
+        if (claim.handle !== this) return CandidateDisposalOutcome(state.get(), alreadySettled = true)
+        if (!state.compareAndSet(CandidateOwnership.ADOPTING, CandidateOwnership.DISCARDING)) {
             return CandidateDisposalOutcome(state.get(), alreadySettled = true)
         }
-        if (!settling.compareAndSet(false, true)) {
-            // A concurrent settlement is in flight: observe it without touching the file.
-            return CandidateDisposalOutcome(
-                state.get(),
-                alreadySettled = state.get() != CandidateOwnership.UNSETTLED
-            )
-        }
-        try {
-            if (state.get() != CandidateOwnership.UNSETTLED) {
-                return CandidateDisposalOutcome(state.get(), alreadySettled = true)
-            }
-            val deleteResult = filesystem.delete(file)
-            val finalState: CandidateOwnership
-            val quarantineResult: CandidateFileOperationResult?
-            when (deleteResult) {
-                CandidateFileOperationResult.FILE_ABSENT,
-                CandidateFileOperationResult.DELETED -> {
-                    finalState = CandidateOwnership.DISCARDED
-                    quarantineResult = null
-                }
-                else -> {
-                    quarantineResult = filesystem.quarantine(file)
-                    finalState = CandidateOwnership.QUARANTINED
-                }
-            }
-            state.set(finalState)
-            return CandidateDisposalOutcome(finalState, deleteResult, quarantineResult)
-        } finally {
-            settling.set(false)
-        }
+        return settleFromDiscarding(filesystem)
     }
+
+    /**
+     * Exactly-once UNSETTLED -> DISCARDING -> DISCARDED/QUARANTINED settlement: the
+     * first caller performs the file operations; concurrent/repeated callers observe
+     * the settled (or in-flight) state and never touch the file again.
+     */
+    fun discardOrQuarantine(filesystem: YuvCandidateFilesystem): CandidateDisposalOutcome {
+        if (!state.compareAndSet(CandidateOwnership.UNSETTLED, CandidateOwnership.DISCARDING)) {
+            return CandidateDisposalOutcome(state.get(), alreadySettled = true)
+        }
+        return settleFromDiscarding(filesystem)
+    }
+
+    private fun settleFromDiscarding(filesystem: YuvCandidateFilesystem): CandidateDisposalOutcome {
+        val deleteResult = containedDelete(filesystem)
+        val quarantineResult: CandidateFileOperationResult?
+        val finalState: CandidateOwnership
+        when (deleteResult) {
+            CandidateFileOperationResult.FILE_ABSENT,
+            CandidateFileOperationResult.DELETED -> {
+                quarantineResult = null
+                finalState = CandidateOwnership.DISCARDED
+            }
+            else -> {
+                quarantineResult = containedQuarantine(filesystem)
+                finalState = CandidateOwnership.QUARANTINED
+            }
+        }
+        state.set(finalState)
+        return CandidateDisposalOutcome(finalState, deleteResult, quarantineResult)
+    }
+
+    /** Contain a throwing delete implementation; the throwable is preserved. */
+    private fun containedDelete(filesystem: YuvCandidateFilesystem): CandidateFileOperationResult =
+        try {
+            filesystem.delete(file)
+        } catch (t: Throwable) {
+            CandidateFileOperationResult.DELETE_THREW(t)
+        }
+
+    /** Contain a throwing quarantine implementation; the throwable is preserved. */
+    private fun containedQuarantine(filesystem: YuvCandidateFilesystem): CandidateFileOperationResult =
+        try {
+            filesystem.quarantine(file)
+        } catch (t: Throwable) {
+            CandidateFileOperationResult.QUARANTINE_FAILED(t)
+        }
 }
 
 // ── Adoption token: stateful exactly-once reservation → commit/rollback ──
-internal enum class AdoptionTokenState { RESERVED, COMMITTED, ROLLED_BACK }
+/**
+ * Truthful token states: COMMITTED is published only AFTER the accounting commit
+ * (manifest + persistedFrames) succeeded; ROLLED_BACK only after both reservations
+ * were released; FAILED means neither success may be claimed and the exact failure
+ * stays observable via [AdoptionToken.failure].
+ */
+internal enum class AdoptionTokenState {
+    RESERVED, COMMITTING, COMMITTED, ROLLING_BACK, ROLLED_BACK, FAILED
+}
 
 /**
  * Stateful adoption token created by [YuvCaptureAccounting.tryReserveAdoption].
  * Reservation alone never touches the manifest or persistedFrames; the frame index
  * and final filename become committed (manifest entry + persistedFrames++) via
- * exactly-one [commit], or are released via exactly-one [rollback].  Commit/rollback
- * CAS the internal state and are gated again by the accounting reservation sets, so
- * double settlement is rejected from any caller.
+ * exactly-one [commit], or are released via exactly-one [rollback].  While COMMITTING
+ * / ROLLING_BACK the accounting mutation happens under the token's exclusive claim
+ * and the terminal state is published only afterwards.  A concurrent commit/rollback
+ * still has exactly one owner (single CAS out of RESERVED).
  */
 internal class AdoptionToken internal constructor(
     val reservedEntry: YuvFrameManifestEntry,
@@ -203,22 +333,53 @@ internal class AdoptionToken internal constructor(
 ) {
     private val state = AtomicReference(AdoptionTokenState.RESERVED)
 
+    @Volatile
+    var failure: Throwable? = null
+        private set
+
     fun state(): AdoptionTokenState = state.get()
 
-    /** Exactly-once RESERVED -> COMMITTED.  False when the token was already settled. */
+    /**
+     * Exactly-once RESERVED -> COMMITTING -> COMMITTED.  COMMITTED is only visible
+     * after the manifest/persisted mutation completed; an accounting failure leaves
+     * the token in [AdoptionTokenState.FAILED] with [failure] set.  False when the
+     * token was already settled.
+     */
     fun commit(): Boolean {
-        if (!state.compareAndSet(AdoptionTokenState.RESERVED, AdoptionTokenState.COMMITTED)) return false
-        if (!accounting.commitAdoption(this)) {
-            state.set(AdoptionTokenState.ROLLED_BACK)
+        if (!state.compareAndSet(AdoptionTokenState.RESERVED, AdoptionTokenState.COMMITTING)) return false
+        val ok = try {
+            accounting.commitAdoption(this)
+        } catch (t: Throwable) {
+            failure = t
+            false
+        }
+        if (!ok) {
+            state.set(AdoptionTokenState.FAILED)
             return false
         }
+        state.set(AdoptionTokenState.COMMITTED)
         return true
     }
 
-    /** Exactly-once RESERVED -> ROLLED_BACK.  False when the token was already settled. */
+    /**
+     * Exactly-once RESERVED -> ROLLING_BACK -> ROLLED_BACK.  ROLLED_BACK is only
+     * visible after both reservations were released; an accounting failure leaves
+     * the token in [AdoptionTokenState.FAILED] with [failure] set.  False when the
+     * token was already settled.
+     */
     fun rollback(): Boolean {
-        if (!state.compareAndSet(AdoptionTokenState.RESERVED, AdoptionTokenState.ROLLED_BACK)) return false
-        accounting.rollbackAdoption(this)
+        if (!state.compareAndSet(AdoptionTokenState.RESERVED, AdoptionTokenState.ROLLING_BACK)) return false
+        val ok = try {
+            accounting.rollbackAdoption(this)
+        } catch (t: Throwable) {
+            failure = t
+            false
+        }
+        if (!ok) {
+            state.set(AdoptionTokenState.FAILED)
+            return false
+        }
+        state.set(AdoptionTokenState.ROLLED_BACK)
         return true
     }
 }
@@ -249,15 +410,17 @@ internal class AndroidOwnedDirectYuvSource(
 
 // ── YuvCaptureAccounting ───────────────────────────────────────────
 internal open class YuvCaptureAccounting {
-    private val lock = Any()
+    // Protected for deterministic invariant-failure injection in tests.
+    protected val lock = Any()
+    protected val reservedIndices = mutableSetOf<Int>()
+    protected val reservedFilenames = mutableSetOf<String>()
+
     private var received = 0
     private var buffered = 0
     private var persisted = 0
     private var failed = 0
     private var dropped = 0
     private val manifest = linkedMapOf<Int, YuvFrameManifestEntry>()
-    private val reservedIndices = mutableSetOf<Int>()
-    private val reservedFilenames = mutableSetOf<String>()
 
     fun receivedFrame() = synchronized(lock) { received++ }
     open fun bufferedFrame() = synchronized(lock) { buffered++ }
@@ -291,19 +454,47 @@ internal open class YuvCaptureAccounting {
         AdoptionToken(entry, this)
     }
 
-    fun commitAdoption(token: AdoptionToken): Boolean = synchronized(lock) {
+    /**
+     * Atomic reservation removal: BOTH reservations must exist; neither set is
+     * mutated until both checks pass; both are removed inside this single
+     * synchronized operation.  On any invariant failure both sets are left unchanged
+     * and false is returned.  Open for deterministic failure injection in tests.
+     */
+    open fun commitAdoption(token: AdoptionToken): Boolean = synchronized(lock) {
         val entry = token.reservedEntry
-        if (!reservedIndices.remove(entry.frameIndex) || !reservedFilenames.remove(entry.filename)) {
+        if (!reservedIndices.contains(entry.frameIndex) || !reservedFilenames.contains(entry.filename)) {
             return@synchronized false
         }
+        reservedIndices.remove(entry.frameIndex)
+        reservedFilenames.remove(entry.filename)
         manifest[entry.frameIndex] = entry
         persisted++
         check(persisted == manifest.size) { "persisted=$persisted manifest=${manifest.size}" }
         true
     }
 
-    fun rollbackAdoption(token: AdoptionToken) = synchronized(lock) {
+    /**
+     * Atomic reservation removal (rollback): BOTH reservations must exist; neither
+     * set is mutated until both checks pass; both are removed inside this single
+     * synchronized operation.  On any invariant failure both sets are left unchanged
+     * and false is returned.  Open for deterministic failure injection in tests.
+     */
+    open fun rollbackAdoption(token: AdoptionToken): Boolean = synchronized(lock) {
         val entry = token.reservedEntry
+        if (!reservedIndices.contains(entry.frameIndex) || !reservedFilenames.contains(entry.filename)) {
+            return@synchronized false
+        }
+        reservedIndices.remove(entry.frameIndex)
+        reservedFilenames.remove(entry.filename)
+        true
+    }
+
+    /**
+     * Recovery used only after a token commit failure: releases whatever remains of
+     * the token's reservations (idempotent).  Keeps both sets symmetric when both
+     * reservations exist.
+     */
+    internal fun releaseReservations(entry: YuvFrameManifestEntry) = synchronized(lock) {
         reservedIndices.remove(entry.frameIndex)
         reservedFilenames.remove(entry.filename)
     }
@@ -317,7 +508,9 @@ internal open class YuvCaptureAccounting {
             failedFrames = failed,
             droppedFrames = dropped,
             manifest = manifest.values.sortedBy { it.frameIndex },
-            reservedCount = reservedIndices.size
+            reservedCount = reservedIndices.size,
+            reservedIndexCount = reservedIndices.size,
+            reservedFilenameCount = reservedFilenames.size
         )
     }
 }
@@ -329,7 +522,9 @@ data class YuvCaptureAccountingSnapshot(
     val failedFrames: Int,
     val droppedFrames: Int,
     val manifest: List<YuvFrameManifestEntry>,
-    val reservedCount: Int = 0
+    val reservedCount: Int = 0,
+    val reservedIndexCount: Int = 0,
+    val reservedFilenameCount: Int = 0
 )
 
 internal class YuvBufferReservations(private val limitBytes: Long) {
@@ -389,7 +584,18 @@ internal class Camera2DirectYuvImageAccess(private val image: Image) : DirectYuv
 
 internal sealed interface DirectYuvWorkCreation {
     data class Accepted(val item: YuvPngWorkItem) : DirectYuvWorkCreation
-    data class Failed(val cause: Throwable) : DirectYuvWorkCreation
+
+    /**
+     * Creation failure with full cleanup diagnostics: [cause] is the primary failure
+     * and [releaseFailure] (when non-null) is the ownership-release failure that
+     * happened while cleaning up (e.g. access.release / Image.close / source.release
+     * throwing).  Every failure path performs AT MOST one release attempt, and a
+     * release failure is never silently discarded.
+     */
+    data class Failed(
+        val cause: Throwable,
+        val releaseFailure: Throwable? = null
+    ) : DirectYuvWorkCreation
 }
 
 /**
@@ -398,8 +604,10 @@ internal sealed interface DirectYuvWorkCreation {
  *
  * Every failure path (timestamp access, takeImage throwing, takeImage returning null,
  * source-adapter construction, work-item construction) releases the Image exactly
- * once.  The adapter/item factories are injectable for deterministic JVM tests; the
- * production defaults wrap the real Camera2 Image in [AndroidOwnedDirectYuvSource].
+ * once — and if that release itself throws, the failure is CONTAINED and reported in
+ * [DirectYuvWorkCreation.Failed.releaseFailure] instead of being discarded.  The
+ * adapter/item factories are injectable for deterministic JVM tests; the production
+ * defaults wrap the real Camera2 Image in [AndroidOwnedDirectYuvSource].
  */
 internal fun createDirectYuvWork(
     frameIndex: Int,
@@ -416,40 +624,50 @@ internal fun createDirectYuvWork(
     val timestampNs = try {
         access.timestampNs()
     } catch (t: Throwable) {
-        access.release()
+        val releaseFailure = containedRelease { access.release() }
         account.failedFrame()
-        return DirectYuvWorkCreation.Failed(t)
+        return DirectYuvWorkCreation.Failed(t, releaseFailure)
     }
     val image = try {
         access.takeImage()
     } catch (t: Throwable) {
-        access.release()
+        val releaseFailure = containedRelease { access.release() }
         account.failedFrame()
-        return DirectYuvWorkCreation.Failed(t)
+        return DirectYuvWorkCreation.Failed(t, releaseFailure)
     }
     if (image == null) {
         // takeImage() returning null is a failure: there is never a valid-null direct item.
-        access.release()
+        val releaseFailure = containedRelease { access.release() }
         account.failedFrame()
         return DirectYuvWorkCreation.Failed(
-            NullPointerException("DirectYuvImageAccess.takeImage() returned null for frame $frameIndex")
+            NullPointerException("DirectYuvImageAccess.takeImage() returned null for frame $frameIndex"),
+            releaseFailure
         )
     }
     val source = try {
         sourceFactory(image, timestampNs)
     } catch (t: Throwable) {
-        runCatching { image.close() }
+        // The access was consumed by takeImage: the raw Image is released exactly once.
+        val releaseFailure = containedRelease { image.close() }
         account.failedFrame()
-        return DirectYuvWorkCreation.Failed(t)
+        return DirectYuvWorkCreation.Failed(t, releaseFailure)
     }
     val item = try {
         itemFactory(frameIndex, timestampNs, source, onRelease)
     } catch (t: Throwable) {
-        runCatching { source.release() }
+        val releaseFailure = containedRelease { source.release() }
         account.failedFrame()
-        return DirectYuvWorkCreation.Failed(t)
+        return DirectYuvWorkCreation.Failed(t, releaseFailure)
     }
     return DirectYuvWorkCreation.Accepted(item)
+}
+
+/** Runs [release] at most once; returns the throwable it threw, or null on success. */
+private inline fun containedRelease(release: () -> Unit): Throwable? = try {
+    release()
+    null
+} catch (t: Throwable) {
+    t
 }
 
 internal sealed interface BufferedYuvWorkCreation {
@@ -515,49 +733,100 @@ internal sealed interface YuvOwnedSource {
 
 /**
  * Explicit result of one [YuvPngWorkItem.dispose] attempt.  Every sub-settlement is
- * independent: a failure in one never skips the others, and repeated dispose is
- * idempotent (later calls return [disposalAttempted]=false and perform nothing).
+ * independent: a failure in one never skips the others.  Requirement fields
+ * (sourceReleaseRequired, reservationReleaseRequired,
+ * bufferedAccountingReleaseRequired, releaseObserverRequired) are truthful: a
+ * settlement that was required but not attempted/completed makes [isClean] false —
+ * for example `dispose(null)` on a buffered item can never be clean.  Repeated
+ * dispose returns an already-settled mirror ([alreadySettled]) that preserves the
+ * ORIGINAL outcome's failures ([originalOutcome]) instead of losing diagnostics.
  */
 internal class YuvWorkDisposalOutcome(
     val disposalAttempted: Boolean,
+    val alreadySettled: Boolean = false,
+    val originalOutcome: YuvWorkDisposalOutcome? = null,
+    val sourceReleaseRequired: Boolean,
     val sourceReleaseAttempted: Boolean,
     val sourceReleased: Boolean,
     val sourceReleaseFailure: Throwable? = null,
+    val reservationReleaseRequired: Boolean,
     val reservationReleaseAttempted: Boolean,
     val reservationReleased: Boolean,
     val reservationReleaseFailure: Throwable? = null,
+    val bufferedAccountingReleaseRequired: Boolean,
+    val bufferedAccountingReleaseAttempted: Boolean,
     val bufferedAccountingReleased: Boolean,
     val bufferedAccountingFailure: Throwable? = null,
+    val releaseObserverRequired: Boolean,
     val releaseObserverAttempted: Boolean,
     val releaseObserverCompleted: Boolean,
     val releaseObserverFailure: Throwable? = null
 ) {
     val failed: Boolean
-        get() = sourceReleaseFailure != null || reservationReleaseFailure != null ||
-            bufferedAccountingFailure != null || releaseObserverFailure != null
+        get() = failures().isNotEmpty()
 
     fun failures(): List<Throwable> = listOfNotNull(
         sourceReleaseFailure, reservationReleaseFailure, bufferedAccountingFailure, releaseObserverFailure
     )
 
-    /** True when every sub-settlement that was required for this item succeeded. */
+    /**
+     * True when every REQUIRED settlement was attempted AND completed by this call
+     * (or, for an already-settled mirror, by the original settlement).
+     */
     val isClean: Boolean
-        get() = !failed &&
-            (!sourceReleaseAttempted || sourceReleased) &&
-            (!reservationReleaseAttempted || reservationReleased) &&
-            (!releaseObserverAttempted || releaseObserverCompleted)
+        get() = originalOutcome?.isClean ?: (
+            !failed &&
+                (!sourceReleaseRequired || (sourceReleaseAttempted && sourceReleased)) &&
+                (!reservationReleaseRequired || (reservationReleaseAttempted && reservationReleased)) &&
+                (!bufferedAccountingReleaseRequired ||
+                    (bufferedAccountingReleaseAttempted && bufferedAccountingReleased)) &&
+                (!releaseObserverRequired || (releaseObserverAttempted && releaseObserverCompleted))
+            )
 
     companion object {
         fun notAttempted(): YuvWorkDisposalOutcome = YuvWorkDisposalOutcome(
             disposalAttempted = false,
+            sourceReleaseRequired = false,
             sourceReleaseAttempted = false,
             sourceReleased = false,
+            reservationReleaseRequired = false,
             reservationReleaseAttempted = false,
             reservationReleased = false,
+            bufferedAccountingReleaseRequired = false,
+            bufferedAccountingReleaseAttempted = false,
             bufferedAccountingReleased = false,
+            releaseObserverRequired = false,
             releaseObserverAttempted = false,
             releaseObserverCompleted = false
         )
+
+        /**
+         * Mirror of the FIRST settlement for repeated dispose: this call performed no
+         * new attempt, but every original failure diagnostic is preserved so a lost
+         * cleanup failure can never be hidden by an empty not-attempted result.
+         */
+        internal fun alreadySettled(first: YuvWorkDisposalOutcome): YuvWorkDisposalOutcome =
+            YuvWorkDisposalOutcome(
+                disposalAttempted = false,
+                alreadySettled = true,
+                originalOutcome = first,
+                sourceReleaseRequired = first.sourceReleaseRequired,
+                sourceReleaseAttempted = false,
+                sourceReleased = false,
+                sourceReleaseFailure = first.sourceReleaseFailure,
+                reservationReleaseRequired = first.reservationReleaseRequired,
+                reservationReleaseAttempted = false,
+                reservationReleased = false,
+                reservationReleaseFailure = first.reservationReleaseFailure,
+                bufferedAccountingReleaseRequired = first.bufferedAccountingReleaseRequired,
+                bufferedAccountingReleaseAttempted = false,
+                bufferedAccountingReleased = false,
+                bufferedAccountingFailure = first.bufferedAccountingFailure,
+                releaseObserverRequired = first.releaseObserverRequired,
+                releaseObserverAttempted = false,
+                releaseObserverCompleted = false,
+                releaseObserverFailure = first.releaseObserverFailure
+            )
     }
 }
 
@@ -571,6 +840,10 @@ internal class YuvPngWorkItem private constructor(
 ) {
     private val released = AtomicBoolean(false)
     private val bufferedReleased = AtomicBoolean(false)
+    private val firstOutcome = AtomicReference<YuvWorkDisposalOutcome?>(null)
+
+    internal val isBuffered: Boolean
+        get() = source is YuvOwnedSource.Buffered
 
     fun sourceForEncoding(): YuvOwnedSource = source
 
@@ -593,19 +866,31 @@ internal class YuvPngWorkItem private constructor(
         }
     }
 
+    /** The FIRST disposal outcome, or null when this item has never been disposed. */
+    internal fun disposalOutcome(): YuvWorkDisposalOutcome? = firstOutcome.get()
+
     /**
      * Exactly-once disposal with an explicit [YuvWorkDisposalOutcome]: the owned source
      * (direct release / buffered reservation + accounting) and the release observer are
-     * each settled independently so a failure never skips other cleanup.  Repeated
-     * calls return an outcome with [YuvWorkDisposalOutcome.disposalAttempted]=false.
+     * each settled independently so a failure never skips other cleanup.  The FIRST
+     * outcome is preserved: repeated calls return an already-settled mirror carrying
+     * [YuvWorkDisposalOutcome.alreadySettled] and [YuvWorkDisposalOutcome.originalOutcome].
      */
     fun dispose(accounting: YuvCaptureAccounting? = null): YuvWorkDisposalOutcome {
-        if (!released.compareAndSet(false, true)) return YuvWorkDisposalOutcome.notAttempted()
+        if (!released.compareAndSet(false, true)) {
+            val first = firstOutcome.get()
+            return if (first == null) YuvWorkDisposalOutcome.notAttempted()
+            else YuvWorkDisposalOutcome.alreadySettled(first)
+        }
+
+        val isDirect = source is YuvOwnedSource.Direct
+        val isBufferedItem = source is YuvOwnedSource.Buffered
+        val bufferedSettlementRequired = isBufferedItem && retainedBytes > 0L
 
         var sourceReleaseAttempted = false
         var sourceReleased = false
         var sourceReleaseFailure: Throwable? = null
-        if (source is YuvOwnedSource.Direct) {
+        if (isDirect) {
             sourceReleaseAttempted = true
             try {
                 source.source.release()
@@ -618,12 +903,14 @@ internal class YuvPngWorkItem private constructor(
         var reservationReleaseAttempted = false
         var reservationReleased = false
         var reservationReleaseFailure: Throwable? = null
+        var bufferedAccountingReleaseAttempted = false
         var bufferedAccountingReleased = false
         var bufferedAccountingFailure: Throwable? = null
-        // P1-compatible: buffered accounting settlement requires the accounting handle;
-        // dispose(null) is a pure release-observer path for direct items.
-        if (accounting != null && source is YuvOwnedSource.Buffered &&
-            retainedBytes > 0L && bufferedReleased.compareAndSet(false, true)) {
+        // Buffered accounting settlement requires the accounting handle AND an
+        // unreleased reservation; dispose(null) on a buffered item cannot settle the
+        // reservation, so the outcome is (truthfully) not clean.
+        if (bufferedSettlementRequired && accounting != null &&
+            bufferedReleased.compareAndSet(false, true)) {
             reservationReleaseAttempted = true
             try {
                 reservations?.release(retainedBytes)
@@ -631,6 +918,7 @@ internal class YuvPngWorkItem private constructor(
             } catch (t: Throwable) {
                 reservationReleaseFailure = t
             }
+            bufferedAccountingReleaseAttempted = true
             try {
                 accounting.releasedBufferedFrame()
                 bufferedAccountingReleased = true
@@ -653,20 +941,27 @@ internal class YuvPngWorkItem private constructor(
             }
         }
 
-        return YuvWorkDisposalOutcome(
+        val outcome = YuvWorkDisposalOutcome(
             disposalAttempted = true,
+            sourceReleaseRequired = isDirect,
             sourceReleaseAttempted = sourceReleaseAttempted,
             sourceReleased = sourceReleased,
             sourceReleaseFailure = sourceReleaseFailure,
+            reservationReleaseRequired = bufferedSettlementRequired,
             reservationReleaseAttempted = reservationReleaseAttempted,
             reservationReleased = reservationReleased,
             reservationReleaseFailure = reservationReleaseFailure,
+            bufferedAccountingReleaseRequired = bufferedSettlementRequired,
+            bufferedAccountingReleaseAttempted = bufferedAccountingReleaseAttempted,
             bufferedAccountingReleased = bufferedAccountingReleased,
             bufferedAccountingFailure = bufferedAccountingFailure,
+            releaseObserverRequired = observer != null,
             releaseObserverAttempted = releaseObserverAttempted,
             releaseObserverCompleted = releaseObserverCompleted,
             releaseObserverFailure = releaseObserverFailure
         )
+        firstOutcome.set(outcome)
+        return outcome
     }
 
     companion object {
@@ -762,10 +1057,29 @@ internal class DisposableYuvTask(
     val item: YuvPngWorkItem,
     private val accounting: YuvCaptureAccounting,
     private val body: () -> Unit
-) : DisposableCaptureTask {
+) : OutcomeDisposableCaptureTask {
     override fun run() = body()
-    override fun dispose() { item.dispose(accounting) }
+    override fun dispose() { disposeWithOutcome() }
+
+    override fun disposeWithOutcome(): CaptureTaskDisposalOutcome {
+        val outcome = item.dispose(accounting)
+        return if (outcome.isClean) {
+            CaptureTaskDisposalOutcome.Clean
+        } else {
+            CaptureTaskDisposalOutcome.Unclean(
+                outcome,
+                disposalDescription(outcome, item.frameIndex)
+            )
+        }
+    }
 }
+
+/** Stable description of an unclean item disposal for debt reporting. */
+internal fun disposalDescription(outcome: YuvWorkDisposalOutcome, frameIndex: Int): String =
+    "work-item disposal unclean frame=$frameIndex: " +
+        outcome.failures().joinToString("; ") {
+            "${it::class.java.simpleName}: ${it.message}"
+        }
 
 // ═══ Cleanup coordinator ═══════════════════════════════════════════════
 
@@ -932,8 +1246,10 @@ internal class YuvCleanupCoordinator(
                 )
             }
             if (outcome.status == DrainSettlementStatus.FAILED) {
+                val reason = outcome.lifecycleReleaseFailure?.message?.let { "lifecycle release failed: $it" }
+                    ?: "item disposal unclean"
                 mutableFailures.add(
-                    "drainSettle[${claim.frameIndex}]: lifecycle release failed; item remains DRAINING"
+                    "drainSettle[${claim.frameIndex}]: $reason; item remains DRAINING"
                 )
             }
             outcome.disposal.failures().forEach {

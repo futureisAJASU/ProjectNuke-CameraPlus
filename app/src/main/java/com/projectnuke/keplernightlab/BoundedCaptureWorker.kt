@@ -35,6 +35,30 @@ internal interface DisposableCaptureTask : Runnable {
     fun dispose()
 }
 
+/**
+ * A disposable task whose disposal reports an explicit [CaptureTaskDisposalOutcome]
+ * instead of silently returning Unit: an unclean work-item disposal can never be
+ * counted as a successful task disposal.  Generic Unit-disposal tasks keep working
+ * through [DisposableCaptureTask].
+ */
+internal interface OutcomeDisposableCaptureTask : DisposableCaptureTask {
+    fun disposeWithOutcome(): CaptureTaskDisposalOutcome
+}
+
+internal sealed interface CaptureTaskDisposalOutcome {
+    /** The task's work item was disposed cleanly (all required settlements done). */
+    data object Clean : CaptureTaskDisposalOutcome
+
+    /** Disposal ran but returned an unclean work-item outcome (cleanup debt). */
+    data class Unclean(
+        val workDisposal: YuvWorkDisposalOutcome?,
+        val description: String
+    ) : CaptureTaskDisposalOutcome
+
+    /** The disposal attempt itself threw; [failure] is the contained throwable. */
+    data class Failed(val failure: Throwable) : CaptureTaskDisposalOutcome
+}
+
 internal open class BoundedCaptureWorker(
     name: String,
     capacity: Int,
@@ -79,8 +103,10 @@ internal open class BoundedCaptureWorker(
 
     /**
      * Drains and disposes queued tasks and shuts the executor down.  Returns a
-     * [CleanupReport] with exact attempt/success counts.  Open for deterministic
-     * failure injection in tests.
+     * [CleanupReport] with exact attempt/success counts.  An outcome-disposable task
+     * is counted as disposed successfully ONLY when its disposal is clean; an unclean
+     * or failed disposal is reported through the task-disposal failure list (and the
+     * [onTaskDisposalFailure] hook).  Open for deterministic failure injection in tests.
      */
     internal open fun shutdownNow(): CleanupReport {
         val activeBeforeDrain = executor.activeCount
@@ -93,17 +119,38 @@ internal open class BoundedCaptureWorker(
         var disposableSucceeded = 0
         var nonDisposable = 0
         for (task in drained) {
-            if (task is DisposableCaptureTask) {
-                disposableAttempted++
-                try {
-                    task.dispose()
-                    disposableSucceeded++
-                } catch (t: Throwable) {
-                    taskFailures.add("taskDispose: ${t.message}")
-                    ignore { onTaskDisposalFailure(task, t) }
+            when (task) {
+                is OutcomeDisposableCaptureTask -> {
+                    disposableAttempted++
+                    try {
+                        when (val outcome = task.disposeWithOutcome()) {
+                            CaptureTaskDisposalOutcome.Clean -> disposableSucceeded++
+                            is CaptureTaskDisposalOutcome.Unclean -> {
+                                val description = "taskDisposeUnclean: ${outcome.description}"
+                                taskFailures.add(description)
+                                ignore { onTaskDisposalFailure(task, IllegalStateException(description)) }
+                            }
+                            is CaptureTaskDisposalOutcome.Failed -> {
+                                taskFailures.add("taskDispose: ${outcome.failure.message}")
+                                ignore { onTaskDisposalFailure(task, outcome.failure) }
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        taskFailures.add("taskDispose: ${t.message}")
+                        ignore { onTaskDisposalFailure(task, t) }
+                    }
                 }
-            } else {
-                nonDisposable++
+                is DisposableCaptureTask -> {
+                    disposableAttempted++
+                    try {
+                        task.dispose()
+                        disposableSucceeded++
+                    } catch (t: Throwable) {
+                        taskFailures.add("taskDispose: ${t.message}")
+                        ignore { onTaskDisposalFailure(task, t) }
+                    }
+                }
+                else -> nonDisposable++
             }
         }
         val rejectionFailures = mutableListOf<String>()
@@ -128,10 +175,28 @@ internal open class BoundedCaptureWorker(
     }
 
     private fun reject(task: Runnable) {
-        if (task is DisposableCaptureTask) {
-            try { task.dispose() } catch (t: Throwable) {
-                ignore { onTaskDisposalFailure(task, t) }
+        when (task) {
+            is OutcomeDisposableCaptureTask -> {
+                try {
+                    when (val outcome = task.disposeWithOutcome()) {
+                        CaptureTaskDisposalOutcome.Clean -> Unit
+                        is CaptureTaskDisposalOutcome.Unclean -> {
+                            val description = "taskDisposeUnclean: ${outcome.description}"
+                            ignore { onTaskDisposalFailure(task, IllegalStateException(description)) }
+                        }
+                        is CaptureTaskDisposalOutcome.Failed ->
+                            ignore { onTaskDisposalFailure(task, outcome.failure) }
+                    }
+                } catch (t: Throwable) {
+                    ignore { onTaskDisposalFailure(task, t) }
+                }
             }
+            is DisposableCaptureTask -> {
+                try { task.dispose() } catch (t: Throwable) {
+                    ignore { onTaskDisposalFailure(task, t) }
+                }
+            }
+            else -> Unit
         }
         try {
             notificationHook(task)

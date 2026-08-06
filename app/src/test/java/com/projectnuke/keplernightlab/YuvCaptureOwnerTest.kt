@@ -263,7 +263,11 @@ class YuvCaptureOwnerTest {
             harness.session.owner.acceptBuffered(bigAccess)
             harness.flushHandler()
             assertEquals(1, bigAccess.releaseCount.get())
-            assertEquals(1, harness.session.accounting.snapshot().droppedFrames)
+            val snap = harness.session.accounting.snapshot()
+            // The frame was received by the owner BEFORE the reservation rejection
+            // dropped it: both counters are truthful.
+            assertEquals(1, snap.receivedFrames)
+            assertEquals(1, snap.droppedFrames)
         } finally {
             harness.shutdown()
         }
@@ -405,9 +409,34 @@ class YuvCaptureOwnerTest {
             harness.flushHandler()
             // Rejected task was disposed by the worker: the image is closed exactly once.
             assertEquals(1, access.lastImage.get()!!.closeCount.get())
-            assertEquals(1, harness.session.accounting.snapshot().droppedFrames)
+            val snap = harness.session.accounting.snapshot()
+            assertEquals(1, snap.receivedFrames)
+            assertEquals(1, snap.droppedFrames)
         } finally {
             release.countDown()
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun frameWithoutRemainingIdentityCountsReceivedAndDroppedExactlyOnce() {
+        val encodeLatch = EncodeLatch()
+        val harness = Harness(frameCount = 1, encodeLatch = encodeLatch)
+        try {
+            harness.session.owner.acceptDirect(FakeDirectAccess())
+            encodeLatch.awaitStart()
+            // Identity exhausted (frameCount=1) while the first frame is still
+            // encoding: the second acquire is counted as received AND dropped, and
+            // released exactly once.
+            val second = FakeDirectAccess()
+            harness.session.owner.acceptDirect(second)
+            harness.flushHandler()
+            assertEquals(1, second.closeCount.get())
+            val snap = harness.session.accounting.snapshot()
+            assertEquals(2, snap.receivedFrames)
+            assertEquals(1, snap.droppedFrames)
+        } finally {
+            encodeLatch.release()
             harness.shutdown()
         }
     }

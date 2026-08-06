@@ -61,7 +61,7 @@ class YuvAdoptionFilesystemTest {
             else CandidateFileOperationResult.DELETE_RETURNED_FALSE
         override fun quarantine(candidate: File) =
             if (!candidate.exists()) CandidateFileOperationResult.FILE_ABSENT
-            else CandidateFileOperationResult.QUARANTINE_FAILED
+            else CandidateFileOperationResult.QUARANTINE_FAILED()
     }
 
     /**
@@ -98,6 +98,8 @@ class YuvAdoptionFilesystemTest {
         private val candidateVerifier: YuvCandidateVerifier = RealYuvCandidateVerifier,
         private val finalFileVerifier: YuvFinalFileVerifier = RealYuvFinalFileVerifier,
         private val committerFailure: Throwable? = null,
+        private val committerOverride: YuvCandidateCommitter? = null,
+        private val accounting: YuvCaptureAccounting = YuvCaptureAccounting(),
         private val encodeBody: (File) -> Unit = { candidate -> Files.write(candidate.toPath(), PNG_1X1) }
     ) {
         val dir: File = Files.createTempDirectory("yuv-adopt-test").toFile()
@@ -132,7 +134,7 @@ class YuvAdoptionFilesystemTest {
                         gate.signalDone()
                     }
                 },
-                committer = YuvCandidateCommitter { candidate, final ->
+                committer = committerOverride ?: YuvCandidateCommitter { candidate, final ->
                     if (committerFailure != null) throw committerFailure
                     Files.move(candidate.toPath(), final.toPath(), StandardCopyOption.ATOMIC_MOVE)
                 }
@@ -147,7 +149,8 @@ class YuvAdoptionFilesystemTest {
             },
             candidateFilesystem = filesystem,
             candidateVerifier = candidateVerifier,
-            finalFileVerifier = finalFileVerifier
+            finalFileVerifier = finalFileVerifier,
+            accounting = accounting
         )
 
         fun finalFile(frame: Int = 0): File = File(dir, "frame_%02d_color.png".format(frame))
@@ -297,6 +300,65 @@ class YuvAdoptionFilesystemTest {
             assertEquals(1, harness.onCaptureErrorCount.get())
             assertNotNull(harness.errorMessage.get())
             assertTrue(harness.errorMessage.get()!!.contains("YUV commit failed for frame 0"))
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun committerMovedFileThenThrewLeavesNoUntrackedFinal() {
+        // The committer moves the candidate to the final path and THEN throws: the
+        // new final file is untracked (never added to the manifest) and must be
+        // removed, the reservation rolled back, and the candidate settled.
+        val harness = Harness(
+            committerOverride = YuvCandidateCommitter { candidate, final ->
+                Files.move(candidate.toPath(), final.toPath(), StandardCopyOption.ATOMIC_MOVE)
+                throw IllegalStateException("commit boom after move")
+            }
+        )
+        try {
+            harness.acceptDirectAndSettle()
+            val status = harness.awaitTerminal()
+            assertEquals(CaptureTerminalStatus.FAILED, status)
+            val snap = harness.session.accounting.snapshot()
+            assertEquals(1, snap.failedFrames)
+            assertEquals(0, snap.persistedFrames)
+            assertTrue(snap.manifest.isEmpty())
+            assertEquals(0, snap.reservedIndexCount)
+            assertEquals(0, snap.reservedFilenameCount)
+            // The untracked final must have been removed; no candidate remains either.
+            assertFalse(harness.finalFile().exists())
+            assertTrue(harness.leftoverTmpFiles().isEmpty())
+            assertTrue(harness.session.owner.candidateCleanupDebt().isEmpty())
+            assertNotNull(harness.errorMessage.get())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun tokenCommitFailureRemovesUntrackedFinalAndReleasesReservation() {
+        // The accounting commit (manifest mutation) throws after the file was
+        // committed: the final is untracked, so the owner must remove it, release
+        // the reservation, settle the candidate, and record failedFrame.
+        val boom = IllegalStateException("manifest commit boom")
+        val failingAccounting = object : YuvCaptureAccounting() {
+            override fun commitAdoption(token: AdoptionToken): Boolean = throw boom
+        }
+        val harness = Harness(accounting = failingAccounting)
+        try {
+            harness.acceptDirectAndSettle()
+            val snap = harness.session.accounting.snapshot()
+            assertEquals(1, snap.failedFrames)
+            assertEquals(0, snap.persistedFrames)
+            assertTrue(snap.manifest.isEmpty())
+            assertEquals(0, snap.reservedIndexCount)
+            assertEquals(0, snap.reservedFilenameCount)
+            assertFalse(harness.finalFile().exists())
+            assertTrue(harness.leftoverTmpFiles().isEmpty())
+            assertTrue(harness.session.owner.candidateCleanupDebt().isEmpty())
+            assertEquals(1, harness.onCaptureErrorCount.get())
+            assertNotNull(harness.errorMessage.get())
         } finally {
             harness.shutdown()
         }

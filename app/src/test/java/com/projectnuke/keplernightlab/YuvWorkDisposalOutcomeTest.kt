@@ -6,6 +6,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -13,7 +14,8 @@ import org.junit.Test
  * Phase 2A-P2 disposal outcome: [YuvPngWorkItem.dispose] reports every sub-settlement
  * (source release, reservation release, buffered accounting release, release observer)
  * independently — a failure in one never skips the others, and repeated dispose is
- * idempotent (later calls return notAttempted()).
+ * idempotent: the FIRST outcome is preserved and later calls return an already-settled
+ * mirror ([YuvWorkDisposalOutcome.alreadySettled]) that keeps every failure visible.
  */
 class YuvWorkDisposalOutcomeTest {
 
@@ -137,7 +139,7 @@ class YuvWorkDisposalOutcomeTest {
     }
 
     @Test
-    fun repeatedDisposeIsIdempotentAndReportsNotAttempted() {
+    fun repeatedDisposeReturnsTruthfulAlreadySettledMirror() {
         val source = RecordingDirectSource()
         val observer = AtomicInteger(0)
         val item = YuvPngWorkItem.directOwned(0, 0L, source) { observer.incrementAndGet() }
@@ -147,12 +149,65 @@ class YuvWorkDisposalOutcomeTest {
 
         assertTrue(first.disposalAttempted)
         assertFalse(second.disposalAttempted)
+        assertTrue(second.alreadySettled)
+        assertSame(first, second.originalOutcome)
         assertFalse(second.sourceReleaseAttempted)
         assertNull(second.sourceReleaseFailure)
         assertTrue(second.failures().isEmpty())
-        // notAttempted(): no sub-settlement was required, so nothing failed — isClean.
+        // The mirror delegates cleanliness to the ORIGINAL outcome: no failure occurred.
         assertTrue(second.isClean)
         assertEquals(1, source.released.get())
         assertEquals(1, observer.get())
+    }
+
+    @Test
+    fun repeatedDisposePreservesOriginalFailureDiagnostics() {
+        val source = RecordingDirectSource()
+        val observer = AtomicInteger(0)
+        val item = YuvPngWorkItem.directOwned(0, 0L, ThrowingDirectSource()) {
+            observer.incrementAndGet()
+        }
+
+        val first = item.dispose()
+        val second = item.dispose()
+
+        assertTrue(first.failed)
+        assertFalse(first.isClean)
+        assertTrue(second.alreadySettled)
+        assertSame(first, second.originalOutcome)
+        // The original failure is preserved in the mirror: never an empty outcome.
+        assertEquals(listOf("source release failed"), second.failures().map { it.message })
+        assertFalse(second.isClean)
+        assertEquals(1, observer.get())
+    }
+
+    @Test
+    fun bufferedDisposeWithoutAccountingIsTruthfullyNotClean() {
+        val reservations = YuvBufferReservations(1024L)
+        assertTrue(reservations.tryReserve(100L))
+        val accounting = YuvCaptureAccounting()
+        val observer = AtomicInteger(0)
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
+            observer.incrementAndGet()
+        }
+
+        val outcome = item.dispose(accounting = null)
+
+        // The reservation was REQUIRED but could never settle without the accounting
+        // handle: the outcome says so instead of pretending to be clean.
+        assertTrue(outcome.disposalAttempted)
+        assertTrue(outcome.reservationReleaseRequired)
+        assertFalse(outcome.reservationReleaseAttempted)
+        assertFalse(outcome.reservationReleased)
+        assertFalse(outcome.isClean)
+        assertTrue(outcome.failures().isEmpty())
+        // The reservation/accounting debt stays with the caller; the observer still ran.
+        assertEquals(100L, reservations.currentBytes())
+        assertEquals(1, accounting.snapshot().bufferedFrames)
+        assertEquals(1, observer.get())
+        // The caller can settle the debt through the normal path.
+        item.settleBufferedAccounting(accounting)
+        assertEquals(0L, reservations.currentBytes())
+        assertEquals(0, accounting.snapshot().bufferedFrames)
     }
 }

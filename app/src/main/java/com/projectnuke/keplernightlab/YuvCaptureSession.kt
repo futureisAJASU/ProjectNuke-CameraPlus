@@ -39,13 +39,14 @@ internal class YuvCaptureSession internal constructor(
             onCaptureError: (message: String, cause: Throwable?) -> Unit = { _, _ -> },
             candidateFilesystem: YuvCandidateFilesystem = RealYuvCandidateFilesystem,
             candidateVerifier: YuvCandidateVerifier = RealYuvCandidateVerifier,
-            finalFileVerifier: YuvFinalFileVerifier = RealYuvFinalFileVerifier
+            finalFileVerifier: YuvFinalFileVerifier = RealYuvFinalFileVerifier,
+            accounting: YuvCaptureAccounting? = null
         ): YuvCaptureSession {
             val captureStateOwner = CaptureStateOwner(dispatch)
             val boundedWorker = BoundedCaptureWorker(workerName, workerCapacity)
             val finished = AtomicBoolean(false)
             val reservations = YuvBufferReservations(maxRetainedBytes)
-            val accounting = YuvCaptureAccounting()
+            val accounting = accounting ?: YuvCaptureAccounting()
             val lifecycle = YuvBufferedLifecycle()
             val identityOwner = CaptureFrameIdentityOwner(frameCount)
             val terminalState = CaptureTerminalState()

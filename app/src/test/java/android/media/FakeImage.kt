@@ -11,7 +11,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * tests can assert exactly-once release; all other members are inert.
  */
 class FakeImage(
-    private val timestamp: Long = 4321L
+    private val timestamp: Long = 4321L,
+    private val closeThrows: Boolean = false
 ) : Image() {
     val closeCount = AtomicInteger(0)
 
@@ -20,5 +21,8 @@ class FakeImage(
     override fun getWidth(): Int = 1
     override fun getTimestamp(): Long = timestamp
     override fun getPlanes(): Array<Image.Plane> = emptyArray()
-    override fun close() { closeCount.incrementAndGet() }
+    override fun close() {
+        closeCount.incrementAndGet()
+        if (closeThrows) error("image close failed")
+    }
 }

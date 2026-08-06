@@ -339,26 +339,55 @@ internal class YuvDrainClaim(
     fun lifecycleState(): YuvBufferedLifecycle.State? = lifecycle.stateOf(item)
 
     /**
-     * Disposal-aware exactly-once settlement: disposes the claimed item, then removes
-     * it from the lifecycle registry.  Only the first caller performs the settlement;
-     * concurrent/repeated callers observe the already-settled state without touching
-     * the item again.
+     * Disposal-aware exactly-once settlement:
+     *
+     * - A coordinated buffered claim REQUIRES non-null accounting: without it the
+     *   reservation/accounting could never settle, so the claim fails BEFORE any
+     *   disposal is started and the item remains DRAINING.
+     * - An unclean item disposal NEVER calls finishDrain: the claim fails, the item
+     *   remains DRAINING and the cleanup debt stays observable.
+     * - Only a clean disposal proceeds to finishDrain: success -> SETTLED (item
+     *   removed); finish failure -> FAILED (item remains DRAINING).
+     * - Exactly-one settlement: concurrent/repeated callers observe the settled state
+     *   and perform nothing; repeated outcomes preserve the original disposal
+     *   diagnostics via [YuvWorkDisposalOutcome.originalOutcome].
      */
     fun disposeAndFinish(accounting: YuvCaptureAccounting?): DrainSettlementOutcome {
         if (!state.compareAndSet(State.CLAIMED, State.DISPOSING)) {
+            val first = item.disposalOutcome()
+            val disposal = if (first == null) YuvWorkDisposalOutcome.notAttempted()
+            else YuvWorkDisposalOutcome.alreadySettled(first)
             return when (state.get()) {
                 State.SETTLED -> DrainSettlementOutcome(
-                    DrainSettlementStatus.ALREADY_SETTLED, YuvWorkDisposalOutcome.notAttempted(), lifecycleReleased = true
+                    DrainSettlementStatus.ALREADY_SETTLED, disposal, lifecycleReleased = true
                 )
                 State.FAILED -> DrainSettlementOutcome(
-                    DrainSettlementStatus.ALREADY_FAILED, YuvWorkDisposalOutcome.notAttempted(), lifecycleReleased = false
+                    DrainSettlementStatus.ALREADY_FAILED, disposal, lifecycleReleased = false
                 )
                 else -> DrainSettlementOutcome(
-                    DrainSettlementStatus.ALREADY_DISPOSING, YuvWorkDisposalOutcome.notAttempted(), lifecycleReleased = false
+                    DrainSettlementStatus.ALREADY_DISPOSING, disposal, lifecycleReleased = false
                 )
             }
         }
+        if (accounting == null && item.isBuffered) {
+            state.set(State.FAILED)
+            return DrainSettlementOutcome(
+                DrainSettlementStatus.FAILED,
+                YuvWorkDisposalOutcome.notAttempted(),
+                lifecycleReleased = false,
+                lifecycleReleaseFailure = IllegalStateException(
+                    "buffered coordinated drain requires accounting (frame $frameIndex)"
+                )
+            )
+        }
         val disposal = item.dispose(accounting)
+        if (!disposal.isClean) {
+            // Unclean disposal: finishDrain must NOT run; the item remains DRAINING.
+            state.set(State.FAILED)
+            return DrainSettlementOutcome(
+                DrainSettlementStatus.FAILED, disposal, lifecycleReleased = false
+            )
+        }
         val released = try {
             lifecycle.finishDrain(item)
         } catch (t: Throwable) {

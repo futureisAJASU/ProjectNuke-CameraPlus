@@ -648,6 +648,88 @@ class YuvCaptureOwnershipTest {
         assertEquals(1, fakeImage.lastImage.get()!!.closeCount.get())
     }
 
+    // ── Combined-failure release diagnostics (spec: every failure path performs at
+    // most one release attempt and a release failure is reported, never discarded)
+
+    @Test
+    fun timestampFailureWithThrowingReleaseReportsBothFailures() {
+        val accounting = YuvCaptureAccounting()
+        val fakeImage = FakeDirectImage(failTimestamp = true, throwOnRelease = true)
+
+        val failed = createDirectYuvWork(0, fakeImage, accounting) as DirectYuvWorkCreation.Failed
+
+        assertEquals("timestamp failed", failed.cause.message)
+        assertNotNull(failed.releaseFailure)
+        assertEquals("access release failed", failed.releaseFailure!!.message)
+        assertEquals(1, accounting.snapshot().failedFrames)
+    }
+
+    @Test
+    fun takeImageThrowWithThrowingReleaseReportsBothFailures() {
+        val accounting = YuvCaptureAccounting()
+        val fakeImage = FakeDirectImage(throwOnTake = true, throwOnRelease = true)
+
+        val failed = createDirectYuvWork(0, fakeImage, accounting) as DirectYuvWorkCreation.Failed
+
+        assertEquals("takeImage failed", failed.cause.message)
+        assertNotNull(failed.releaseFailure)
+        assertEquals("access release failed", failed.releaseFailure!!.message)
+        assertEquals(1, accounting.snapshot().failedFrames)
+    }
+
+    @Test
+    fun nullTakeImageWithThrowingReleaseReportsBothFailures() {
+        val accounting = YuvCaptureAccounting()
+        val fakeImage = FakeDirectImage(nullImage = true, throwOnRelease = true)
+
+        val failed = createDirectYuvWork(0, fakeImage, accounting) as DirectYuvWorkCreation.Failed
+
+        assertTrue(failed.cause is NullPointerException)
+        assertNotNull(failed.releaseFailure)
+        assertEquals("access release failed", failed.releaseFailure!!.message)
+        assertEquals(1, accounting.snapshot().failedFrames)
+    }
+
+    @Test
+    fun sourceAdapterFailureWithThrowingImageCloseReportsBothFailures() {
+        val accounting = YuvCaptureAccounting()
+        val fakeImage = FakeDirectImage(closeThrows = true)
+
+        val failed = createDirectYuvWork(
+            0, fakeImage, accounting,
+            sourceFactory = { _, _ -> error("source adapter failed") }
+        ) as DirectYuvWorkCreation.Failed
+
+        assertEquals("source adapter failed", failed.cause.message)
+        assertNotNull(failed.releaseFailure)
+        assertEquals("image close failed", failed.releaseFailure!!.message)
+        assertEquals(1, accounting.snapshot().failedFrames)
+        assertEquals(1, fakeImage.lastImage.get()!!.closeCount.get())
+    }
+
+    @Test
+    fun itemConstructionFailureWithThrowingSourceReleaseReportsBothFailures() {
+        val accounting = YuvCaptureAccounting()
+        val fakeImage = FakeDirectImage()
+        val throwingSource = object : OwnedDirectYuvSource {
+            override val timestampNs: Long = 4321L
+            override fun encodeTo(encoder: YuvPngEncoder, candidate: File, rotationDegrees: Int) =
+                error("unreachable")
+            override fun release() { error("source release failed") }
+        }
+
+        val failed = createDirectYuvWork(
+            0, fakeImage, accounting,
+            sourceFactory = { _, _ -> throwingSource },
+            itemFactory = { _, _, _, _ -> error("work item construction failed") }
+        ) as DirectYuvWorkCreation.Failed
+
+        assertEquals("work item construction failed", failed.cause.message)
+        assertNotNull(failed.releaseFailure)
+        assertEquals("source release failed", failed.releaseFailure!!.message)
+        assertEquals(1, accounting.snapshot().failedFrames)
+    }
+
     @Test
     fun directImageFactoryWrapsImageAndClosesExactlyOnceOnDispose() {
         val image = FakeImage()
@@ -861,7 +943,9 @@ class YuvCaptureOwnershipTest {
     private class FakeDirectImage(
         private val failTimestamp: Boolean = false,
         private val nullImage: Boolean = false,
-        private val throwOnTake: Boolean = false
+        private val throwOnTake: Boolean = false,
+        private val throwOnRelease: Boolean = false,
+        private val closeThrows: Boolean = false
     ) : DirectYuvImageAccess {
         val closeCount = AtomicInteger(0)
         val lastImage = AtomicReference<FakeImage?>()
@@ -876,6 +960,7 @@ class YuvCaptureOwnershipTest {
             if (closed) error("Image closed twice")
             closed = true
             closeCount.incrementAndGet()
+            if (throwOnRelease) error("access release failed")
         }
         override fun takeImage(): Image? {
             if (taken) error("takeImage called twice")
@@ -884,7 +969,7 @@ class YuvCaptureOwnershipTest {
             // Ownership only transfers on a successful, non-null take: for null/throw
             // paths the access was NOT consumed, so release() still closes it.
             taken = true
-            return FakeImage().also { lastImage.set(it) }
+            return FakeImage(closeThrows = closeThrows).also { lastImage.set(it) }
         }
     }
 
