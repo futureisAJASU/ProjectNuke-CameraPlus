@@ -1,5 +1,6 @@
 package com.projectnuke.keplernightlab
 
+import android.media.FakeImage
 import android.media.Image
 import java.io.File
 import java.nio.file.Files
@@ -325,8 +326,7 @@ class YuvCaptureOwnershipTest {
                 start.countDown()
                 assertTrue(start.await(5, TimeUnit.SECONDS))
                 lifecycle.claimRetainedForDrain().forEach { claim ->
-                    claim.item.dispose(accounting)
-                    claim.finish()
+                    claim.disposeAndFinish(accounting)
                 }
                 done.countDown()
             }
@@ -477,8 +477,7 @@ class YuvCaptureOwnershipTest {
         assertEquals(2, lifecycle.trackedCount())
 
         lifecycle.claimRetainedForDrain().forEach { claim ->
-            claim.item.dispose(accounting)
-            claim.finish()
+            claim.disposeAndFinish(accounting)
         }
         lifecycle.settleEncoding(eItem, accounting)
 
@@ -564,26 +563,132 @@ class YuvCaptureOwnershipTest {
     }
 
     /**
-     * Step 0.4: Direct success creates a work item that owns the Image metadata;
-     * the Image itself is not closed until the work item disposes.
+     * Phase 2A-P2: Direct success transfers Image ownership to the work item.  The
+     * access wrapper is consumed by takeImage (no further access release), the item
+     * owns the [OwnedDirectYuvSource], and dispose() closes the Image exactly once.
      */
     @Test
-    fun directSuccessCreatesOwningWorkItemAndClosesOnce() {
+    fun directSuccessTransfersImageOwnershipToWorkItemAndClosesExactlyOnce() {
         val accounting = YuvCaptureAccounting()
-        val fakeImage = FakeDirectImage(failTimestamp = false)
+        val fakeImage = FakeDirectImage()
 
         val result = createDirectYuvWork(0, fakeImage, accounting)
 
         assertTrue(result is DirectYuvWorkCreation.Accepted)
         assertEquals(0, accounting.snapshot().failedFrames)
-        // On success the access releases its wrapper once (ownership of the
-        // Image has transferred to the work item via takeImage).
+        // takeImage consumed the access wrapper: ownership moved to the item's source.
+        assertEquals(0, fakeImage.closeCount.get())
+        val item = (result as DirectYuvWorkCreation.Accepted).item
+        assertEquals(4321L, item.timestampNs)
+        val wrapped = item.imageForEncoding() as? FakeImage
+        assertNotNull(wrapped)
+        assertEquals(0, wrapped!!.closeCount.get())
+        item.dispose(accounting)
+        assertEquals(1, wrapped.closeCount.get())
+        item.dispose(accounting)
+        assertEquals(1, wrapped.closeCount.get())
+    }
+
+    /**
+     * Phase 2A-P2: takeImage() returning null is a FAILURE (never a valid-null direct
+     * item); the Image is released exactly once.
+     */
+    @Test
+    fun directNullTakeImageFailsAndClosesOnce() {
+        val accounting = YuvCaptureAccounting()
+        val fakeImage = FakeDirectImage(nullImage = true)
+
+        val result = createDirectYuvWork(0, fakeImage, accounting)
+
+        assertTrue(result is DirectYuvWorkCreation.Failed)
+        assertEquals(1, accounting.snapshot().failedFrames)
         assertEquals(1, fakeImage.closeCount.get())
-        assertEquals(4321L, (result as DirectYuvWorkCreation.Accepted).item.timestampNs)
-        // In JVM tests takeImage() returns null (no real android.media.Image), so the
-        // work item's dispose is a no-op on the image.  The production path closes the
-        // real Image via the work item's dispose when takeImage() returns the real Image.
-        result.item.dispose(accounting)
+        assertTrue((result as DirectYuvWorkCreation.Failed).cause is NullPointerException)
+    }
+
+    @Test
+    fun directTakeImageThrowsFailsAndClosesOnce() {
+        val accounting = YuvCaptureAccounting()
+        val fakeImage = FakeDirectImage(throwOnTake = true)
+
+        val result = createDirectYuvWork(0, fakeImage, accounting)
+
+        assertTrue(result is DirectYuvWorkCreation.Failed)
+        assertEquals(1, accounting.snapshot().failedFrames)
+        assertEquals(1, fakeImage.closeCount.get())
+    }
+
+    @Test
+    fun directSourceAdapterFailureClosesImageOnce() {
+        val accounting = YuvCaptureAccounting()
+        val fakeImage = FakeDirectImage()
+
+        val result = createDirectYuvWork(
+            0, fakeImage, accounting,
+            sourceFactory = { _, _ -> error("source adapter failed") }
+        )
+
+        assertTrue(result is DirectYuvWorkCreation.Failed)
+        assertEquals(1, accounting.snapshot().failedFrames)
+        assertEquals(1, fakeImage.lastImage.get()!!.closeCount.get())
+    }
+
+    @Test
+    fun directWorkItemConstructionFailureReleasesSourceOnce() {
+        val accounting = YuvCaptureAccounting()
+        val fakeImage = FakeDirectImage()
+
+        val result = createDirectYuvWork(
+            0, fakeImage, accounting,
+            itemFactory = { _, _, _, _ -> error("work item construction failed") }
+        )
+
+        assertTrue(result is DirectYuvWorkCreation.Failed)
+        assertEquals(1, accounting.snapshot().failedFrames)
+        assertEquals(1, fakeImage.lastImage.get()!!.closeCount.get())
+    }
+
+    @Test
+    fun directImageFactoryWrapsImageAndClosesExactlyOnceOnDispose() {
+        val image = FakeImage()
+        val item = YuvPngWorkItem.direct(0, 4321L, image)
+        assertEquals(0, image.closeCount.get())
+        item.dispose(null)
+        assertEquals(1, image.closeCount.get())
+        item.dispose(null)
+        assertEquals(1, image.closeCount.get())
+    }
+
+    /**
+     * Phase 2A-P2: a valid (fake) direct source enters the SAME production
+     * YuvPngWorkProcessor direct encode path — typed dispatch over the sealed
+     * owned source, never via nullable probing.
+     */
+    @Test
+    fun directSourceEntersProcessorDirectEncodePathThroughOwnedSource() {
+        val dir = Files.createTempDirectory("yuv-direct-encode").toFile()
+        try {
+            val source = TestOwnedDirectYuvSource()
+            val item = YuvPngWorkItem.directOwned(0, 4321L, source)
+            val processor = YuvPngWorkProcessor(
+                encoder = object : YuvPngEncoder {
+                    override fun encodeDirect(image: Image, candidate: File, rotationDegrees: Int) =
+                        error("encoder direct must not be reached for owned sources")
+                    override fun encodeBuffered(frame: BufferedYuvFrame, candidate: File, rotationDegrees: Int) =
+                        error("buffered encode must not be reached")
+                },
+                committer = YuvCandidateCommitter { _, _ -> }
+            )
+
+            processor.encode(item, File(dir, "candidate.tmp"), 0)
+
+            assertEquals(1, source.encodeCount.get())
+            assertFalse(source.released)
+            item.dispose(null)
+            assertTrue(source.released)
+        } finally {
+            dir.deleteRecursively()
+        }
     }
 
     @Test
@@ -749,19 +854,49 @@ class YuvCaptureOwnershipTest {
         }
     }
 
-    private class FakeDirectImage(private val failTimestamp: Boolean) : DirectYuvImageAccess {
+    /**
+     * Mirrors Camera2DirectYuvImageAccess semantics: release after takeImage is a
+     * no-op; the image handed over by takeImage is owned by the work item.
+     */
+    private class FakeDirectImage(
+        private val failTimestamp: Boolean = false,
+        private val nullImage: Boolean = false,
+        private val throwOnTake: Boolean = false
+    ) : DirectYuvImageAccess {
         val closeCount = AtomicInteger(0)
+        val lastImage = AtomicReference<FakeImage?>()
+        private var taken = false
         private var closed = false
 
         override fun timestampNs(): Long = if (failTimestamp) error("timestamp failed") else 4321L
         override fun allocationBytes(): Long = 0L
         override fun copy(frameIndex: Int): BufferedYuvFrame = error("unreachable for direct work")
         override fun release() {
+            if (taken) return
             if (closed) error("Image closed twice")
             closed = true
             closeCount.incrementAndGet()
         }
-        override fun takeImage(): Image? = null
+        override fun takeImage(): Image? {
+            if (taken) error("takeImage called twice")
+            if (throwOnTake) error("takeImage failed")
+            if (nullImage) return null
+            // Ownership only transfers on a successful, non-null take: for null/throw
+            // paths the access was NOT consumed, so release() still closes it.
+            taken = true
+            return FakeImage().also { lastImage.set(it) }
+        }
+    }
+
+    /** Test-owned direct source: released by the work item's dispose, encoded by the processor. */
+    private class TestOwnedDirectYuvSource : OwnedDirectYuvSource {
+        val encodeCount = AtomicInteger(0)
+        @Volatile var released = false
+        override val timestampNs: Long = 4321L
+        override fun encodeTo(encoder: YuvPngEncoder, candidate: File, rotationDegrees: Int) {
+            encodeCount.incrementAndGet()
+        }
+        override fun release() { released = true }
     }
 
     private class ThrowingCopyYuvAccess(private val bytes: Long) : YuvImageAccess {

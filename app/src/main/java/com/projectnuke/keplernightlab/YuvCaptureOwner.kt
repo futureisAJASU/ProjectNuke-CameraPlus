@@ -8,6 +8,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Immutable worker completion result.  The worker never mutates owner state; it only
  * encodes a temporary candidate and returns this result for owner-side adoption.
+ *
+ * Candidate ownership: [Success] ALWAYS carries a [YuvCandidateHandle]; [Failed]
+ * carries one exactly when encoding created a partial candidate file (absent
+ * otherwise).  [settleForOwnerRejection] is the single polymorphic emergency
+ * settlement used when the owner event is rejected/disposed: it discards or
+ * quarantines the candidate file exactly once through the filesystem operator.
  */
 internal sealed interface YuvWorkerCompletion {
     val frameIndex: Int
@@ -16,7 +22,7 @@ internal sealed interface YuvWorkerCompletion {
     data class Success(
         override val frameIndex: Int,
         override val timestampNs: Long,
-        val candidate: File,
+        val candidateHandle: YuvCandidateHandle,
         val fileName: String,
         val encodeDurationMs: Long
     ) : YuvWorkerCompletion
@@ -24,9 +30,18 @@ internal sealed interface YuvWorkerCompletion {
     data class Failed(
         override val frameIndex: Int,
         override val timestampNs: Long,
-        val candidate: File?,
+        val candidateHandle: YuvCandidateHandle?,
         val cause: Throwable
     ) : YuvWorkerCompletion
+
+    /** Emergency settlement for owner-event rejection/disposal: exactly-once cleanup. */
+    fun settleForOwnerRejection(filesystem: YuvCandidateFilesystem): CandidateDisposalOutcome? {
+        val handle = when (this) {
+            is Success -> candidateHandle
+            is Failed -> candidateHandle
+        }
+        return handle?.discardOrQuarantine(filesystem)
+    }
 }
 
 /**
@@ -49,6 +64,7 @@ internal class BufferedEncodeTask(
     val item: YuvPngWorkItem,
     private val accounting: YuvCaptureAccounting,
     private val lifecycle: YuvBufferedLifecycle,
+    private val candidateFilesystem: YuvCandidateFilesystem,
     private val encode: () -> YuvWorkerCompletion,
     private val postCompletion: (YuvWorkerCompletion) -> Unit,
     private val onSettlementIssue: ((YuvPngWorkItem, YuvBufferedLifecycle.EncodingSettlementOutcome) -> Unit)? = null
@@ -123,13 +139,33 @@ internal class YuvCaptureOwner(
     private val saveMotionOnce: (File) -> Pair<String?, String?>,
     private val onCaptureComplete: (File) -> Unit,
     private val onCaptureError: (message: String, cause: Throwable?) -> Unit,
-    private val cleanupCoordinator: YuvCleanupCoordinator
+    private val cleanupCoordinator: YuvCleanupCoordinator,
+    private val candidateFilesystem: YuvCandidateFilesystem = RealYuvCandidateFilesystem,
+    private val candidateVerifier: YuvCandidateVerifier = RealYuvCandidateVerifier,
+    private val finalFileVerifier: YuvFinalFileVerifier = RealYuvFinalFileVerifier
 ) {
 
     private var completedResults = 0
     private var terminalReason: String? = null
     private val discardedLateCompletions = mutableListOf<Int>()
     private val callbackFired = AtomicBoolean(false)
+
+    /**
+     * Cleanup debt recorded for candidates/final files that could neither be deleted
+     * nor quarantined (or whose removal failed).  Thread-safe because the emergency
+     * settlement path (owner-event rejection) runs off the owner dispatcher.
+     */
+    private val candidateCleanupDebts = java.util.concurrent.CopyOnWriteArrayList<String>()
+
+    internal fun candidateCleanupDebt(): List<String> = candidateCleanupDebts.toList()
+
+    private fun recordCandidateDebt(settlement: CandidateDisposalOutcome, frameIndex: Int, file: File) {
+        val description = settlement.failureDescription(frameIndex, file)
+        if (description != null) {
+            candidateCleanupDebts.add(description)
+            Log.e("KeplerYuvOwner", description)
+        }
+    }
 
     // ------------------------------------------------------------------
     // Typed Camera2 callback entry points (no unsafe casts)
@@ -182,22 +218,30 @@ internal class YuvCaptureOwner(
                             override fun run() {
                                 val completion = try {
                                     workProcessor.encode(item, candidate, rotationDegrees)
-                                    YuvWorkerCompletion.Success(item.frameIndex, item.timestampNs, candidate, fileName, 0L)
+                                    YuvWorkerCompletion.Success(
+                                        item.frameIndex, item.timestampNs,
+                                        YuvCandidateHandle(item.frameIndex, candidate),
+                                        fileName, 0L
+                                    )
                                 } catch (t: Throwable) {
-                                    YuvWorkerCompletion.Failed(item.frameIndex, item.timestampNs, candidate, t)
+                                    YuvWorkerCompletion.Failed(
+                                        item.frameIndex, item.timestampNs,
+                                        if (candidate.exists()) YuvCandidateHandle(item.frameIndex, candidate) else null,
+                                        t
+                                    )
                                 }
                                 try {
                                     captureStateOwner.post(object : CaptureOwnerEvent {
                                         override fun execute() { adoptCompletion(completion) }
                                         override fun disposeWithoutMutation() {
-                                            if (completion is YuvWorkerCompletion.Success) runCatching { completion.candidate.delete() }
+                                            completion.settleForOwnerRejection(candidateFilesystem)
                                         }
                                     })
                                 } finally {
                                     item.dispose()
                                 }
                             }
-                            override fun dispose() = item.dispose()
+                            override fun dispose() { item.dispose() }
                         }
                         if (!boundedWorker.submit(task)) {
                             // Worker already called task.dispose() which calls item.dispose().
@@ -245,19 +289,28 @@ internal class YuvCaptureOwner(
                 item = frame,
                 accounting = accounting,
                 lifecycle = lifecycle,
+                candidateFilesystem = candidateFilesystem,
                 encode = {
                 try {
                     workProcessor.encode(frame, candidate, rotationDegrees)
-                    YuvWorkerCompletion.Success(frame.frameIndex, frame.timestampNs, candidate, fileName, 0L)
+                    YuvWorkerCompletion.Success(
+                        frame.frameIndex, frame.timestampNs,
+                        YuvCandidateHandle(frame.frameIndex, candidate),
+                        fileName, 0L
+                    )
                 } catch (t: Throwable) {
-                    YuvWorkerCompletion.Failed(frame.frameIndex, frame.timestampNs, candidate, t)
+                    YuvWorkerCompletion.Failed(
+                        frame.frameIndex, frame.timestampNs,
+                        if (candidate.exists()) YuvCandidateHandle(frame.frameIndex, candidate) else null,
+                        t
+                    )
                 }
             },
             postCompletion = { completion ->
                 captureStateOwner.post(object : CaptureOwnerEvent {
                     override fun execute() { adoptCompletion(completion) }
                     override fun disposeWithoutMutation() {
-                        if (completion is YuvWorkerCompletion.Success) runCatching { completion.candidate.delete() }
+                        completion.settleForOwnerRejection(candidateFilesystem)
                     }
                 })
             },
@@ -287,7 +340,11 @@ internal class YuvCaptureOwner(
             is YuvWorkerCompletion.Success -> adoptSuccess(completion)
             is YuvWorkerCompletion.Failed -> {
                 Log.e("KeplerYuvOwner", "YUV worker failed for frame ${completion.frameIndex}", completion.cause)
-                completion.candidate?.let { runCatching { it.delete() } }
+                // Partial candidates (encode failed after creating a file) are settled
+                // through the same candidate path as Success candidates.
+                completion.candidateHandle?.let { handle ->
+                    recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
+                }
                 if (terminalState.status() == CaptureTerminalStatus.ACTIVE) accounting.failedFrame()
             }
         }
@@ -295,64 +352,115 @@ internal class YuvCaptureOwner(
         scheduleBufferedEncoding()
     }
 
+    /**
+     * Fail-closed adoption pipeline (owner event, serialized):
+     * validate candidate -> reserve identity+filename -> collision policy (preserve
+     * pre-existing final files) -> commit -> verify final -> commit manifest entry ->
+     * settle candidate ADOPTED.  Every failure rolls back the reservation, preserves
+     * pre-existing files, removes/quarantines only newly created invalid finals,
+     * settles the candidate, and records the exact failure/cleanup debt.  An untracked
+     * final PNG can never be left behind.
+     */
     private fun adoptSuccess(completion: YuvWorkerCompletion.Success) {
+        val handle = completion.candidateHandle
         if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+            // Late completion: settle the candidate (discard/quarantine), never adopt.
             discardedLateCompletions += completion.frameIndex
-            runCatching { completion.candidate.delete() }
+            recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
             return
         }
         val entry = YuvFrameManifestEntry(completion.frameIndex, completion.fileName, completion.timestampNs, true)
+
+        // 1. Fail-closed candidate validation (injectable verifier seam)
+        if (!candidateVerifier.verify(handle.file, completion.frameIndex)) {
+            Log.e("KeplerYuvOwner", "Candidate validation failed for frame ${completion.frameIndex}: ${handle.file}")
+            recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
+            accounting.failedFrame()
+            return
+        }
+
+        // 2. Reserve frame identity + final filename atomically (reservation alone
+        //    never touches the manifest or persistedFrames)
         val token = accounting.tryReserveAdoption(entry) ?: run {
-            runCatching { completion.candidate.delete() }
+            // Duplicate/late completion: settle the candidate without touching any
+            // adopted final file.
+            Log.w("KeplerYuvOwner", "Duplicate adoption reservation rejected for frame ${completion.frameIndex}")
+            recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
             return
         }
         val finalFile = File(outputDir, completion.fileName)
 
-        // Fail-closed filesystem validation: reject unexpected pre-existing final file
-        if (finalFile.exists() && !finalFile.canRead()) {
-            Log.w("KeplerYuvOwner", "Pre-existing unreadable final file for ${completion.frameIndex}")
-            // Remove the bad file so we can retry, or quarantine it.
-            runCatching { finalFile.delete() }
-        }
+        // 3. Fail-closed collision policy: preserve ANY unexpected pre-existing final
+        //    file (never delete it); roll back and discard/quarantine the candidate.
         if (finalFile.exists()) {
-            Log.w("KeplerYuvOwner", "Unexpected pre-existing final file for ${completion.frameIndex}")
-            accounting.rollbackAdoption(token)
-            runCatching { completion.candidate.delete() }
+            Log.w("KeplerYuvOwner", "Unexpected pre-existing final file for frame ${completion.frameIndex}: ${finalFile.path}")
+            token.rollback()
+            recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
             return
         }
 
+        // 4. Commit candidate -> final
         try {
-            workProcessor.commit(completion.candidate, finalFile)
+            workProcessor.commit(handle.file, finalFile)
         } catch (t: Throwable) {
             Log.e("KeplerYuvOwner", "Commit failed for frame ${completion.frameIndex}", t)
-            accounting.rollbackAdoption(token)
-            runCatching { completion.candidate.delete() }
+            token.rollback()
+            recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
             finishError("YUV commit failed for frame ${completion.frameIndex}", cause = t)
             return
         }
-        if (!finalFile.exists() || !finalFile.canRead()) {
-            Log.w("KeplerYuvOwner", "Final file not readable after commit ${completion.frameIndex}")
-            accounting.rollbackAdoption(token)
-            removeCreatedFinal(finalFile)
+
+        // 5. Fail-closed verification of the newly created final file; only the newly
+        //    created file may be removed/quarantined.
+        if (!finalFileVerifier.verify(finalFile, completion.frameIndex)) {
+            Log.w("KeplerYuvOwner", "Final file verification failed after commit for frame ${completion.frameIndex}")
+            token.rollback()
+            removeOrQuarantineCreatedFinal(finalFile)
+            // The candidate was consumed by the commit; the handle settles as DISCARDED
+            // (file absent) via the same polymorphic settlement path.
+            recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
             return
         }
-        if (!accounting.commitAdoption(token)) {
+
+        // 6. Commit manifest entry + persistedFrames (exactly-once token commit)
+        if (!token.commit()) {
             Log.w("KeplerYuvOwner", "Adoption commit failed for frame ${completion.frameIndex}")
-            runCatching { completion.candidate.delete() }
-            removeCreatedFinal(finalFile)
+            // The token is already settled; never delete an adopted/uncertain final.
+            recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
             return
+        }
+
+        // 7. Settle the candidate ADOPTED (exactly-once UNSETTLED -> ADOPTED)
+        if (!handle.adopt()) {
+            Log.w("KeplerYuvOwner", "Candidate settle to ADOPTED failed for frame ${completion.frameIndex}")
         }
         val persistedFrames = accounting.snapshot().persistedFrames
         postStatus("YUV capture: saved $persistedFrames/$frameCount")
         writeJobJson("CAPTURING", persistedFrames, accounting.snapshot().manifest)
     }
 
-    private fun removeCreatedFinal(file: File) { runCatching { if (file.exists()) file.delete() } }
+    /**
+     * Removes/quarantines ONLY the newly created invalid final file (never a
+     * pre-existing one).  A failed removal records the cleanup debt explicitly.
+     */
+    private fun removeOrQuarantineCreatedFinal(file: File) {
+        val deleteResult = candidateFilesystem.delete(file)
+        if (deleteResult != CandidateFileOperationResult.DELETED &&
+            deleteResult != CandidateFileOperationResult.FILE_ABSENT) {
+            val quarantineResult = candidateFilesystem.quarantine(file)
+            if (quarantineResult != CandidateFileOperationResult.QUARANTINED) {
+                val description =
+                    "final-file cleanup debt file=$file delete=$deleteResult quarantine=$quarantineResult"
+                candidateCleanupDebts.add(description)
+                Log.e("KeplerYuvOwner", description)
+            }
+        }
+    }
 
     // ------------------------------------------------------------------
     // Terminal state and deadline settlement

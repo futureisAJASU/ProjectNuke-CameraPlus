@@ -1,5 +1,7 @@
 package com.projectnuke.keplernightlab
 
+import java.util.concurrent.atomic.AtomicReference
+
 /**
  * Buffered-lifecycle state machine for YUV work items.
  *
@@ -14,7 +16,8 @@ package com.projectnuke.keplernightlab
  * - [claimRetainedForDrain] (coordinator): closes acceptance and atomically claims
  *   every RETAINED item as DRAINING, returning [YuvDrainClaim] tokens.  The item
  *   stays tracked (drainingCount / trackedCount stay truthful) until
- *   `claim.finish()` removes it after external disposal.
+ *   `claim.disposeAndFinish(accounting)` disposes the item and removes it from the
+ *   registry in one exactly-once, disposal-aware settlement.
  *
  * Contract:
  * - Only ENCODING items may startSettling.
@@ -205,12 +208,12 @@ internal open class YuvBufferedLifecycle {
 
         var failure: Throwable? = null
         var disposed = false
-        try {
-            item.dispose(accounting)
-            disposed = true
-        } catch (t: Throwable) {
-            failure = t
-        }
+        // dispose() reports an explicit YuvWorkDisposalOutcome and never throws: a
+        // sub-settlement failure (source/reservation/observer) is preserved in the
+        // outcome while every other sub-settlement still runs.
+        val disposal = item.dispose(accounting)
+        disposed = disposal.isClean
+        failure = disposal.failures().firstOrNull()
 
         var releaseFailure: Throwable? = null
         val released = try {
@@ -299,19 +302,83 @@ internal open class YuvBufferedLifecycle {
  * Exactly-once coordinated drain settlement capability.
  *
  * Created by [YuvBufferedLifecycle.claimRetainedForDrain]: the claimed [item] is
- * DRAINING and remains tracked until [finish] succeeds (which removes it from the
- * active registry).  A failed [finish] (false or thrown) leaves the item DRAINING
- * and the cleanup debt observable via the lifecycle draining/tracked counts.
+ * DRAINING and remains tracked until [disposeAndFinish] succeeds.  Settlement is
+ * disposal-aware:
+ * - [disposeAndFinish] disposes the item first and only then attempts the lifecycle
+ *   release; there is no way to finish a claim before disposal was attempted.
+ * - Exactly-one settlement: a second [disposeAndFinish] returns ALREADY_SETTLED /
+ *   ALREADY_FAILED / ALREADY_DISPOSING and performs nothing.
+ * - On FAILED settlement the item remains DRAINING and the cleanup debt stays
+ *   observable via the lifecycle draining/tracked counts; the outcome preserves the
+ *   item-disposal [YuvWorkDisposalOutcome] and any lifecycle release failure.
  */
+internal enum class DrainSettlementStatus {
+    SETTLED, FAILED, ALREADY_SETTLED, ALREADY_FAILED, ALREADY_DISPOSING
+}
+
+internal class DrainSettlementOutcome(
+    val status: DrainSettlementStatus,
+    val disposal: YuvWorkDisposalOutcome,
+    val lifecycleReleased: Boolean,
+    val lifecycleReleaseFailure: Throwable? = null
+)
+
 internal class YuvDrainClaim(
     val item: YuvPngWorkItem,
     private val lifecycle: YuvBufferedLifecycle
 ) {
+    enum class State { CLAIMED, DISPOSING, SETTLED, FAILED }
+
     val frameIndex: Int = item.frameIndex
 
-    /** Current lifecycle state of the claimed item, or `null` once finished/removed. */
-    fun state(): YuvBufferedLifecycle.State? = lifecycle.stateOf(item)
+    private val state = AtomicReference(State.CLAIMED)
 
-    /** Exactly-once lifecycle settlement: true when the item was removed from the registry. */
-    fun finish(): Boolean = lifecycle.finishDrain(item)
+    fun claimState(): State = state.get()
+
+    /** Current lifecycle state of the claimed item, or `null` once finished/removed. */
+    fun lifecycleState(): YuvBufferedLifecycle.State? = lifecycle.stateOf(item)
+
+    /**
+     * Disposal-aware exactly-once settlement: disposes the claimed item, then removes
+     * it from the lifecycle registry.  Only the first caller performs the settlement;
+     * concurrent/repeated callers observe the already-settled state without touching
+     * the item again.
+     */
+    fun disposeAndFinish(accounting: YuvCaptureAccounting?): DrainSettlementOutcome {
+        if (!state.compareAndSet(State.CLAIMED, State.DISPOSING)) {
+            return when (state.get()) {
+                State.SETTLED -> DrainSettlementOutcome(
+                    DrainSettlementStatus.ALREADY_SETTLED, YuvWorkDisposalOutcome.notAttempted(), lifecycleReleased = true
+                )
+                State.FAILED -> DrainSettlementOutcome(
+                    DrainSettlementStatus.ALREADY_FAILED, YuvWorkDisposalOutcome.notAttempted(), lifecycleReleased = false
+                )
+                else -> DrainSettlementOutcome(
+                    DrainSettlementStatus.ALREADY_DISPOSING, YuvWorkDisposalOutcome.notAttempted(), lifecycleReleased = false
+                )
+            }
+        }
+        val disposal = item.dispose(accounting)
+        val released = try {
+            lifecycle.finishDrain(item)
+        } catch (t: Throwable) {
+            state.set(State.FAILED)
+            return DrainSettlementOutcome(
+                DrainSettlementStatus.FAILED, disposal, lifecycleReleased = false, lifecycleReleaseFailure = t
+            )
+        }
+        if (!released) {
+            state.set(State.FAILED)
+            return DrainSettlementOutcome(
+                DrainSettlementStatus.FAILED, disposal, lifecycleReleased = false,
+                lifecycleReleaseFailure = IllegalStateException(
+                    "finishDrain returned false for frame $frameIndex: item not in DRAINING state"
+                )
+            )
+        }
+        state.set(State.SETTLED)
+        return DrainSettlementOutcome(
+            DrainSettlementStatus.SETTLED, disposal, lifecycleReleased = true
+        )
+    }
 }

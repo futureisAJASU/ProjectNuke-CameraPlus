@@ -34,7 +34,7 @@ class YuvCleanupCoordinatorTest {
         assertTrue(result2.ownerCloseRequested)
         assertTrue(result2.workerShutdownRequested)
         assertEquals(1, result2.cleanupInitiationCount)
-        assertEquals(0, result2.totalDrainedRetainedItems)
+        assertEquals(0, result2.totalDrainClaims)
     }
 
     @Test
@@ -53,7 +53,11 @@ class YuvCleanupCoordinatorTest {
         assertEquals(100L, reservations.currentBytes())
 
         val result = coordinator.perform()
-        assertEquals(1, result.totalDrainedRetainedItems)
+        assertEquals(1, result.totalDrainClaims)
+        assertEquals(1, result.totalDrainDisposalAttempts)
+        assertEquals(1, result.totalDrainDisposalsSucceeded)
+        assertEquals(1, result.totalDrainSettlementsSucceeded)
+        assertEquals(0, result.totalDrainSettlementsFailed)
         assertEquals(0, accounting.snapshot().bufferedFrames)
         assertEquals(0L, reservations.currentBytes())
         assertEquals(0, lifecycle.retainedCount())
@@ -169,7 +173,10 @@ class YuvCleanupCoordinatorTest {
         assertTrue(result.ownerCloseRequested)
         assertTrue(result.workerShutdownRequested)
         assertTrue(result.cleanupStarted)
-        assertEquals(2, result.totalDrainedRetainedItems)
+        assertEquals(2, result.totalDrainClaims)
+        assertEquals(2, result.totalDrainDisposalAttempts)
+        assertEquals(1, result.totalDrainDisposalsSucceeded)
+        assertEquals(2, result.totalDrainSettlementsSucceeded)
         assertTrue(result.cleanupFailures.any { it.contains("onRelease") })
         assertEquals(0, lifecycle.retainedCount())
         assertEquals(0L, reservations.currentBytes())
@@ -286,8 +293,12 @@ class YuvCleanupCoordinatorTest {
         assertEquals(1, inProgress.currentDrainingItems)
         assertEquals(0, inProgress.currentBufferedFrames)
         assertEquals(0L, inProgress.currentReservedBytes)
-        assertEquals(0, inProgress.totalDrainedRetainedItems)
-        assertEquals(1, completed.totalDrainedRetainedItems)
+        assertEquals(0, inProgress.totalDrainClaims)
+        assertEquals(1, completed.totalDrainClaims)
+        assertEquals(1, completed.totalDrainDisposalAttempts)
+        assertEquals(1, completed.totalDrainDisposalsSucceeded)
+        assertEquals(1, completed.totalDrainSettlementsSucceeded)
+        assertEquals(0, completed.totalDrainSettlementsFailed)
         assertEquals(0, completed.currentDrainingItems)
     }
 
@@ -439,7 +450,7 @@ class YuvCleanupCoordinatorTest {
         assertEquals(CleanupPhase.COMPLETED, result.phase)
         assertTrue(result.ownerCloseRequested)
         assertTrue(result.workerShutdownRequested)
-        assertEquals(0, result.totalDrainedRetainedItems)
+        assertEquals(0, result.totalDrainClaims)
         assertTrue(result.cleanupFailures.any { it.contains("claimRetainedForDrain") })
 
         assertTrue(worker.awaitTermination(5_000))
@@ -469,8 +480,10 @@ class YuvCleanupCoordinatorTest {
         assertTrue(lifecycle.tryRegister(second))
 
         val result = coordinator.perform()
-        assertEquals(2, result.totalDrainedRetainedItems)
-        assertTrue(result.cleanupFailures.any { it.contains("drainFinish[0]") })
+        assertEquals(2, result.totalDrainClaims)
+        assertEquals(1, result.totalDrainSettlementsSucceeded)
+        assertEquals(1, result.totalDrainSettlementsFailed)
+        assertTrue(result.cleanupFailures.any { it.contains("drainSettle[0]") })
         assertTrue(result.workerShutdownRequested)
         assertEquals(CleanupPhase.COMPLETED, result.phase)
         // Both items were disposed (independent disposal boundaries)...
@@ -515,7 +528,7 @@ class YuvCleanupCoordinatorTest {
         val result = coordinator.perform()
         assertTrue(result.ownerCloseRequested)
         assertTrue(result.workerShutdownRequested)
-        assertEquals(1, result.totalDrainedRetainedItems)
+        assertEquals(1, result.totalDrainClaims)
         assertEquals(0, lifecycle.retainedCount())
         assertEquals(0, lifecycle.drainingCount())
         assertEquals(0L, reservations.currentBytes())

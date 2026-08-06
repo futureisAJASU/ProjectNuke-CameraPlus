@@ -15,24 +15,213 @@ data class YuvFrameManifestEntry(
     val failure: String? = null
 )
 
-// ── Candidate ownership state ──────────────────────────────────────
+// ── Candidate ownership: file handle + exactly-once settlement ─────
 internal enum class CandidateOwnership {
     UNSETTLED, ADOPTED, DISCARDED, QUARANTINED
 }
 
-internal data class CandidateOwnershipToken(
-    val frameIndex: Int,
-    val fileName: String,
-    val timestampNs: Long,
-    val candidate: File
-) {
-    @Volatile var ownership: CandidateOwnership = CandidateOwnership.UNSETTLED
+/**
+ * Result of a candidate file operation through the injectable [YuvCandidateFilesystem]
+ * seam.  Every outcome is explicit so owner-side cleanup never depends on
+ * runCatching/boolean delete conventions and deterministic JVM tests can simulate
+ * every failure mode.
+ */
+internal enum class CandidateFileOperationResult {
+    FILE_ABSENT, DELETED, DELETE_RETURNED_FALSE, DELETE_THREW, QUARANTINED, QUARANTINE_FAILED
 }
 
-// ── Adoption token for reservation → commit/rollback ───────────────
-internal data class AdoptionToken(
-    val reservedEntry: YuvFrameManifestEntry
-)
+/**
+ * Injectable filesystem operator for candidate cleanup.  Implementations must never
+ * throw; delete/quarantine outcomes are returned as explicit results.
+ */
+internal interface YuvCandidateFilesystem {
+    fun delete(candidate: File): CandidateFileOperationResult
+    fun quarantine(candidate: File): CandidateFileOperationResult
+}
+
+internal object RealYuvCandidateFilesystem : YuvCandidateFilesystem {
+    override fun delete(candidate: File): CandidateFileOperationResult {
+        if (!candidate.exists()) return CandidateFileOperationResult.FILE_ABSENT
+        return try {
+            if (candidate.delete()) CandidateFileOperationResult.DELETED
+            else CandidateFileOperationResult.DELETE_RETURNED_FALSE
+        } catch (t: Throwable) {
+            CandidateFileOperationResult.DELETE_THREW
+        }
+    }
+
+    override fun quarantine(candidate: File): CandidateFileOperationResult {
+        if (!candidate.exists()) return CandidateFileOperationResult.FILE_ABSENT
+        return try {
+            if (candidate.renameTo(File(candidate.path + ".quarantined"))) {
+                CandidateFileOperationResult.QUARANTINED
+            } else {
+                CandidateFileOperationResult.QUARANTINE_FAILED
+            }
+        } catch (t: Throwable) {
+            CandidateFileOperationResult.QUARANTINE_FAILED
+        }
+    }
+}
+
+/**
+ * Injectable fail-closed candidate validation seam (owner side, before reservation).
+ * The default production verifier requires an existing, regular, readable file.
+ */
+internal fun interface YuvCandidateVerifier {
+    fun verify(candidate: File, frameIndex: Int): Boolean
+}
+
+internal object RealYuvCandidateVerifier : YuvCandidateVerifier {
+    override fun verify(candidate: File, frameIndex: Int): Boolean =
+        candidate.exists() && candidate.isFile && candidate.canRead()
+}
+
+/**
+ * Injectable fail-closed final-file verifier used AFTER a successful commit.  The
+ * default production verifier requires a readable regular file carrying the PNG
+ * signature; [frameIndex] allows deterministic per-frame test failure injection.
+ */
+internal fun interface YuvFinalFileVerifier {
+    fun verify(finalFile: File, frameIndex: Int): Boolean
+}
+
+internal object RealYuvFinalFileVerifier : YuvFinalFileVerifier {
+    private val PNG_SIGNATURE = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+
+    override fun verify(finalFile: File, frameIndex: Int): Boolean {
+        if (!finalFile.exists() || !finalFile.isFile || !finalFile.canRead()) return false
+        return try {
+            finalFile.inputStream().use { input ->
+                val header = ByteArray(8)
+                input.read(header) == 8 && header.contentEquals(PNG_SIGNATURE)
+            }
+        } catch (t: Throwable) {
+            false
+        }
+    }
+}
+
+/**
+ * Owner-side result of a candidate settlement.  [cleanupFailed] is true exactly when
+ * the candidate could neither be deleted nor quarantined: the file remains and the
+ * cleanup debt stays observable ([CandidateDisposalOutcome.failureDescription]).
+ */
+internal class CandidateDisposalOutcome(
+    val finalState: CandidateOwnership,
+    val deleteResult: CandidateFileOperationResult? = null,
+    val quarantineResult: CandidateFileOperationResult? = null,
+    val alreadySettled: Boolean = false
+) {
+    val cleanupFailed: Boolean
+        get() = !alreadySettled && finalState == CandidateOwnership.QUARANTINED &&
+            quarantineResult == CandidateFileOperationResult.QUARANTINE_FAILED
+
+    fun failureDescription(frameIndex: Int, file: File): String? = when {
+        alreadySettled -> null
+        quarantineResult == CandidateFileOperationResult.QUARANTINE_FAILED ->
+            "candidate cleanup debt frame=$frameIndex file=$file delete=$deleteResult quarantine=QUARANTINE_FAILED"
+        else -> null
+    }
+}
+
+/**
+ * Exactly-once candidate ownership handle.  A candidate file is owned from creation
+ * until it settles exactly one way: ADOPTED (owner committed it to a final PNG),
+ * DISCARDED (cleanup removed it, or it was already absent), or QUARANTINED (cleanup
+ * could not remove it; the debt stays observable).  Repeated settlement attempts are
+ * idempotent and never perform a second file operation.
+ */
+internal class YuvCandidateHandle(
+    val frameIndex: Int,
+    val file: File
+) {
+    private val state = AtomicReference(CandidateOwnership.UNSETTLED)
+    private val settling = AtomicBoolean(false)
+
+    fun state(): CandidateOwnership = state.get()
+
+    /** Exactly-once UNSETTLED -> ADOPTED (caller has committed the candidate). */
+    fun adopt(): Boolean = state.compareAndSet(CandidateOwnership.UNSETTLED, CandidateOwnership.ADOPTED)
+
+    /**
+     * Exactly-once UNSETTLED -> DISCARDED/QUARANTINED settlement: the first caller
+     * performs the file operation; concurrent/repeated callers observe the settled
+     * state and never touch the file again.
+     */
+    fun discardOrQuarantine(filesystem: YuvCandidateFilesystem): CandidateDisposalOutcome {
+        if (state.get() != CandidateOwnership.UNSETTLED) {
+            return CandidateDisposalOutcome(state.get(), alreadySettled = true)
+        }
+        if (!settling.compareAndSet(false, true)) {
+            // A concurrent settlement is in flight: observe it without touching the file.
+            return CandidateDisposalOutcome(
+                state.get(),
+                alreadySettled = state.get() != CandidateOwnership.UNSETTLED
+            )
+        }
+        try {
+            if (state.get() != CandidateOwnership.UNSETTLED) {
+                return CandidateDisposalOutcome(state.get(), alreadySettled = true)
+            }
+            val deleteResult = filesystem.delete(file)
+            val finalState: CandidateOwnership
+            val quarantineResult: CandidateFileOperationResult?
+            when (deleteResult) {
+                CandidateFileOperationResult.FILE_ABSENT,
+                CandidateFileOperationResult.DELETED -> {
+                    finalState = CandidateOwnership.DISCARDED
+                    quarantineResult = null
+                }
+                else -> {
+                    quarantineResult = filesystem.quarantine(file)
+                    finalState = CandidateOwnership.QUARANTINED
+                }
+            }
+            state.set(finalState)
+            return CandidateDisposalOutcome(finalState, deleteResult, quarantineResult)
+        } finally {
+            settling.set(false)
+        }
+    }
+}
+
+// ── Adoption token: stateful exactly-once reservation → commit/rollback ──
+internal enum class AdoptionTokenState { RESERVED, COMMITTED, ROLLED_BACK }
+
+/**
+ * Stateful adoption token created by [YuvCaptureAccounting.tryReserveAdoption].
+ * Reservation alone never touches the manifest or persistedFrames; the frame index
+ * and final filename become committed (manifest entry + persistedFrames++) via
+ * exactly-one [commit], or are released via exactly-one [rollback].  Commit/rollback
+ * CAS the internal state and are gated again by the accounting reservation sets, so
+ * double settlement is rejected from any caller.
+ */
+internal class AdoptionToken internal constructor(
+    val reservedEntry: YuvFrameManifestEntry,
+    private val accounting: YuvCaptureAccounting
+) {
+    private val state = AtomicReference(AdoptionTokenState.RESERVED)
+
+    fun state(): AdoptionTokenState = state.get()
+
+    /** Exactly-once RESERVED -> COMMITTED.  False when the token was already settled. */
+    fun commit(): Boolean {
+        if (!state.compareAndSet(AdoptionTokenState.RESERVED, AdoptionTokenState.COMMITTED)) return false
+        if (!accounting.commitAdoption(this)) {
+            state.set(AdoptionTokenState.ROLLED_BACK)
+            return false
+        }
+        return true
+    }
+
+    /** Exactly-once RESERVED -> ROLLED_BACK.  False when the token was already settled. */
+    fun rollback(): Boolean {
+        if (!state.compareAndSet(AdoptionTokenState.RESERVED, AdoptionTokenState.ROLLED_BACK)) return false
+        accounting.rollbackAdoption(this)
+        return true
+    }
+}
 
 // ── Owned direct YUV source abstraction ────────────────────────────
 internal interface OwnedDirectYuvSource {
@@ -42,7 +231,7 @@ internal interface OwnedDirectYuvSource {
 }
 
 internal class AndroidOwnedDirectYuvSource(
-    private val image: Image,
+    val image: Image,
     override val timestampNs: Long
 ) : OwnedDirectYuvSource {
     private val released = AtomicBoolean(false)
@@ -55,27 +244,6 @@ internal class AndroidOwnedDirectYuvSource(
         if (released.compareAndSet(false, true)) {
             image.close()
         }
-    }
-}
-
-internal class FakeOwnedDirectYuvSource : OwnedDirectYuvSource {
-    @Volatile var released = false
-    val encodeCount = java.util.concurrent.atomic.AtomicInteger(0)
-    override val timestampNs: Long = 4321L
-
-    override fun encodeTo(encoder: YuvPngEncoder, candidate: File, rotationDegrees: Int) {
-        encodeCount.incrementAndGet()
-        candidate.writeBytes(PNG_1X1_BYTES)
-    }
-
-    override fun release() {
-        released = true
-    }
-
-    companion object {
-        val PNG_1X1_BYTES: ByteArray = java.util.Base64.getDecoder().decode(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
-        )
     }
 }
 
@@ -120,7 +288,7 @@ internal open class YuvCaptureAccounting {
         }
         reservedIndices.add(entry.frameIndex)
         reservedFilenames.add(entry.filename)
-        AdoptionToken(entry)
+        AdoptionToken(entry, this)
     }
 
     fun commitAdoption(token: AdoptionToken): Boolean = synchronized(lock) {
@@ -224,11 +392,26 @@ internal sealed interface DirectYuvWorkCreation {
     data class Failed(val cause: Throwable) : DirectYuvWorkCreation
 }
 
+/**
+ * Direct work creation with exactly-once ownership transfer:
+ * [DirectYuvImageAccess] -> [OwnedDirectYuvSource] -> [YuvPngWorkItem] -> worker.
+ *
+ * Every failure path (timestamp access, takeImage throwing, takeImage returning null,
+ * source-adapter construction, work-item construction) releases the Image exactly
+ * once.  The adapter/item factories are injectable for deterministic JVM tests; the
+ * production defaults wrap the real Camera2 Image in [AndroidOwnedDirectYuvSource].
+ */
 internal fun createDirectYuvWork(
     frameIndex: Int,
     access: DirectYuvImageAccess,
     account: YuvCaptureAccounting,
-    onRelease: (() -> Unit)? = null
+    onRelease: (() -> Unit)? = null,
+    sourceFactory: (Image, Long) -> OwnedDirectYuvSource = { image, ts ->
+        AndroidOwnedDirectYuvSource(image, ts)
+    },
+    itemFactory: (Int, Long, OwnedDirectYuvSource, (() -> Unit)?) -> YuvPngWorkItem = { i, ts, src, release ->
+        YuvPngWorkItem.directOwned(i, ts, src, release)
+    }
 ): DirectYuvWorkCreation {
     val timestampNs = try {
         access.timestampNs()
@@ -244,10 +427,29 @@ internal fun createDirectYuvWork(
         account.failedFrame()
         return DirectYuvWorkCreation.Failed(t)
     }
-    runCatching { access.release() }
-    return DirectYuvWorkCreation.Accepted(
-        YuvPngWorkItem.direct(frameIndex, timestampNs, image, onRelease)
-    )
+    if (image == null) {
+        // takeImage() returning null is a failure: there is never a valid-null direct item.
+        access.release()
+        account.failedFrame()
+        return DirectYuvWorkCreation.Failed(
+            NullPointerException("DirectYuvImageAccess.takeImage() returned null for frame $frameIndex")
+        )
+    }
+    val source = try {
+        sourceFactory(image, timestampNs)
+    } catch (t: Throwable) {
+        runCatching { image.close() }
+        account.failedFrame()
+        return DirectYuvWorkCreation.Failed(t)
+    }
+    val item = try {
+        itemFactory(frameIndex, timestampNs, source, onRelease)
+    } catch (t: Throwable) {
+        runCatching { source.release() }
+        account.failedFrame()
+        return DirectYuvWorkCreation.Failed(t)
+    }
+    return DirectYuvWorkCreation.Accepted(item)
 }
 
 internal sealed interface BufferedYuvWorkCreation {
@@ -300,12 +502,69 @@ internal fun createBufferedYuvWork(
     }
 }
 
+/**
+ * Sealed owned-source model: exactly one source per work item.  Direct items own an
+ * [OwnedDirectYuvSource] (production: [AndroidOwnedDirectYuvSource] wrapping the real
+ * Camera2 Image); buffered items own the copied [BufferedYuvFrame].  Mixed or absent
+ * sources are unrepresentable.
+ */
+internal sealed interface YuvOwnedSource {
+    data class Direct(val source: OwnedDirectYuvSource) : YuvOwnedSource
+    data class Buffered(val frame: BufferedYuvFrame) : YuvOwnedSource
+}
+
+/**
+ * Explicit result of one [YuvPngWorkItem.dispose] attempt.  Every sub-settlement is
+ * independent: a failure in one never skips the others, and repeated dispose is
+ * idempotent (later calls return [disposalAttempted]=false and perform nothing).
+ */
+internal class YuvWorkDisposalOutcome(
+    val disposalAttempted: Boolean,
+    val sourceReleaseAttempted: Boolean,
+    val sourceReleased: Boolean,
+    val sourceReleaseFailure: Throwable? = null,
+    val reservationReleaseAttempted: Boolean,
+    val reservationReleased: Boolean,
+    val reservationReleaseFailure: Throwable? = null,
+    val bufferedAccountingReleased: Boolean,
+    val bufferedAccountingFailure: Throwable? = null,
+    val releaseObserverAttempted: Boolean,
+    val releaseObserverCompleted: Boolean,
+    val releaseObserverFailure: Throwable? = null
+) {
+    val failed: Boolean
+        get() = sourceReleaseFailure != null || reservationReleaseFailure != null ||
+            bufferedAccountingFailure != null || releaseObserverFailure != null
+
+    fun failures(): List<Throwable> = listOfNotNull(
+        sourceReleaseFailure, reservationReleaseFailure, bufferedAccountingFailure, releaseObserverFailure
+    )
+
+    /** True when every sub-settlement that was required for this item succeeded. */
+    val isClean: Boolean
+        get() = !failed &&
+            (!sourceReleaseAttempted || sourceReleased) &&
+            (!reservationReleaseAttempted || reservationReleased) &&
+            (!releaseObserverAttempted || releaseObserverCompleted)
+
+    companion object {
+        fun notAttempted(): YuvWorkDisposalOutcome = YuvWorkDisposalOutcome(
+            disposalAttempted = false,
+            sourceReleaseAttempted = false,
+            sourceReleased = false,
+            reservationReleaseAttempted = false,
+            reservationReleased = false,
+            bufferedAccountingReleased = false,
+            releaseObserverAttempted = false,
+            releaseObserverCompleted = false
+        )
+    }
+}
+
 internal class YuvPngWorkItem private constructor(
     val frameIndex: Int,
     val timestampNs: Long,
-    private var image: Image?,
-    private var directSource: OwnedDirectYuvSource?,
-    private var buffered: BufferedYuvFrame?,
+    private val source: YuvOwnedSource,
     private val retainedBytes: Long,
     private val reservations: YuvBufferReservations?,
     private val onRelease: (() -> Unit)?
@@ -313,9 +572,19 @@ internal class YuvPngWorkItem private constructor(
     private val released = AtomicBoolean(false)
     private val bufferedReleased = AtomicBoolean(false)
 
-    fun imageForEncoding(): Image? = image
-    fun directSourceForEncoding(): OwnedDirectYuvSource? = directSource
-    fun bufferedForEncoding(): BufferedYuvFrame? = buffered
+    fun sourceForEncoding(): YuvOwnedSource = source
+
+    /**
+     * ColorFusion-compatible view: the underlying Image for a production direct item,
+     * or null for buffered items and test-owned direct sources.  Never the mutable
+     * ownership field it used to be — the sealed source is the single owner.
+     */
+    fun imageForEncoding(): Image? = (source as? YuvOwnedSource.Direct)
+        ?.source
+        ?.let { it as? AndroidOwnedDirectYuvSource }
+        ?.image
+
+    fun bufferedForEncoding(): BufferedYuvFrame? = (source as? YuvOwnedSource.Buffered)?.frame
 
     fun settleBufferedAccounting(accounting: YuvCaptureAccounting) {
         if (retainedBytes > 0L && bufferedReleased.compareAndSet(false, true)) {
@@ -324,46 +593,141 @@ internal class YuvPngWorkItem private constructor(
         }
     }
 
-    fun dispose(accounting: YuvCaptureAccounting? = null) {
-        if (!released.compareAndSet(false, true)) return
-        val img = image; image = null
-        val src = directSource; directSource = null
-        val buf = buffered; buffered = null
-        try {
-            img?.close()
-            src?.release()
-        } finally {
-            if (accounting != null) settleBufferedAccounting(accounting)
-            onRelease?.invoke()
+    /**
+     * Exactly-once disposal with an explicit [YuvWorkDisposalOutcome]: the owned source
+     * (direct release / buffered reservation + accounting) and the release observer are
+     * each settled independently so a failure never skips other cleanup.  Repeated
+     * calls return an outcome with [YuvWorkDisposalOutcome.disposalAttempted]=false.
+     */
+    fun dispose(accounting: YuvCaptureAccounting? = null): YuvWorkDisposalOutcome {
+        if (!released.compareAndSet(false, true)) return YuvWorkDisposalOutcome.notAttempted()
+
+        var sourceReleaseAttempted = false
+        var sourceReleased = false
+        var sourceReleaseFailure: Throwable? = null
+        if (source is YuvOwnedSource.Direct) {
+            sourceReleaseAttempted = true
+            try {
+                source.source.release()
+                sourceReleased = true
+            } catch (t: Throwable) {
+                sourceReleaseFailure = t
+            }
         }
+
+        var reservationReleaseAttempted = false
+        var reservationReleased = false
+        var reservationReleaseFailure: Throwable? = null
+        var bufferedAccountingReleased = false
+        var bufferedAccountingFailure: Throwable? = null
+        // P1-compatible: buffered accounting settlement requires the accounting handle;
+        // dispose(null) is a pure release-observer path for direct items.
+        if (accounting != null && source is YuvOwnedSource.Buffered &&
+            retainedBytes > 0L && bufferedReleased.compareAndSet(false, true)) {
+            reservationReleaseAttempted = true
+            try {
+                reservations?.release(retainedBytes)
+                reservationReleased = true
+            } catch (t: Throwable) {
+                reservationReleaseFailure = t
+            }
+            try {
+                accounting.releasedBufferedFrame()
+                bufferedAccountingReleased = true
+            } catch (t: Throwable) {
+                bufferedAccountingFailure = t
+            }
+        }
+
+        var releaseObserverAttempted = false
+        var releaseObserverCompleted = false
+        var releaseObserverFailure: Throwable? = null
+        val observer = onRelease
+        if (observer != null) {
+            releaseObserverAttempted = true
+            try {
+                observer.invoke()
+                releaseObserverCompleted = true
+            } catch (t: Throwable) {
+                releaseObserverFailure = t
+            }
+        }
+
+        return YuvWorkDisposalOutcome(
+            disposalAttempted = true,
+            sourceReleaseAttempted = sourceReleaseAttempted,
+            sourceReleased = sourceReleased,
+            sourceReleaseFailure = sourceReleaseFailure,
+            reservationReleaseAttempted = reservationReleaseAttempted,
+            reservationReleased = reservationReleased,
+            reservationReleaseFailure = reservationReleaseFailure,
+            bufferedAccountingReleased = bufferedAccountingReleased,
+            bufferedAccountingFailure = bufferedAccountingFailure,
+            releaseObserverAttempted = releaseObserverAttempted,
+            releaseObserverCompleted = releaseObserverCompleted,
+            releaseObserverFailure = releaseObserverFailure
+        )
     }
 
     companion object {
-        fun direct(frameIndex: Int, timestampNs: Long, image: Image?, onRelease: (() -> Unit)? = null): YuvPngWorkItem {
-            return YuvPngWorkItem(frameIndex, timestampNs, image, null, null, 0L, null, onRelease)
-        }
+        /**
+         * ColorFusion-compatible direct factory: wraps the (non-null) Camera2 Image in
+         * an [AndroidOwnedDirectYuvSource] that is released exactly once by dispose().
+         */
+        fun direct(
+            frameIndex: Int,
+            timestampNs: Long,
+            image: Image,
+            onRelease: (() -> Unit)? = null
+        ): YuvPngWorkItem = directOwned(
+            frameIndex, timestampNs, AndroidOwnedDirectYuvSource(image, timestampNs), onRelease
+        )
+
+        fun directOwned(
+            frameIndex: Int,
+            timestampNs: Long,
+            source: OwnedDirectYuvSource,
+            onRelease: (() -> Unit)? = null
+        ): YuvPngWorkItem =
+            YuvPngWorkItem(frameIndex, timestampNs, YuvOwnedSource.Direct(source), 0L, null, onRelease)
+
         fun buffered(
             frameIndex: Int, timestampNs: Long, frame: BufferedYuvFrame,
             retainedBytes: Long, reservations: YuvBufferReservations,
             accounting: YuvCaptureAccounting, onRelease: (() -> Unit)? = null
         ): YuvPngWorkItem {
-            val item = YuvPngWorkItem(frameIndex, timestampNs, null, null, frame, retainedBytes, reservations, onRelease)
+            val item = YuvPngWorkItem(
+                frameIndex, timestampNs, YuvOwnedSource.Buffered(frame), retainedBytes, reservations, onRelease
+            )
             accounting.bufferedFrame()
             return item
         }
-        internal fun ownedForTest(onRelease: () -> Unit): YuvPngWorkItem {
-            return YuvPngWorkItem(-1, 0L, null, null, null, 0L, null, onRelease)
-        }
+
+        internal fun ownedForTest(onRelease: () -> Unit): YuvPngWorkItem =
+            directOwned(-1, 0L, NoOpOwnedDirectYuvSource, onRelease)
+
         internal fun bufferedForTest(
             frameIndex: Int, timestampNs: Long, retainedBytes: Long,
             reservations: YuvBufferReservations, accounting: YuvCaptureAccounting,
             onRelease: (() -> Unit)? = null
         ): YuvPngWorkItem {
-            val f = BufferedYuvFrame(frameIndex, timestampNs, 1, 1, ByteArray(0), ByteArray(0), ByteArray(0), 1, 1, 1, 1, 1, 1)
-            val item = YuvPngWorkItem(frameIndex, timestampNs, null, null, f, retainedBytes, reservations, onRelease)
+            val f = BufferedYuvFrame(
+                frameIndex, timestampNs, 1, 1,
+                ByteArray(0), ByteArray(0), ByteArray(0), 1, 1, 1, 1, 1, 1
+            )
+            val item = YuvPngWorkItem(
+                frameIndex, timestampNs, YuvOwnedSource.Buffered(f), retainedBytes, reservations, onRelease
+            )
             accounting.bufferedFrame()
             return item
         }
+    }
+
+    private object NoOpOwnedDirectYuvSource : OwnedDirectYuvSource {
+        override val timestampNs: Long = 0L
+        override fun encodeTo(encoder: YuvPngEncoder, candidate: File, rotationDegrees: Int) =
+            error("NoOpOwnedDirectYuvSource cannot encode")
+        override fun release() = Unit
     }
 }
 
@@ -381,12 +745,12 @@ internal class YuvPngWorkProcessor(
     private val committer: YuvCandidateCommitter
 ) {
     fun encode(item: YuvPngWorkItem, candidate: File, rotationDegrees: Int) {
-        val source = item.directSourceForEncoding()
-        if (source != null) { source.encodeTo(encoder, candidate, rotationDegrees); return }
-        val image = item.imageForEncoding()
-        if (image != null) { encoder.encodeDirect(image, candidate, rotationDegrees); return }
-        val buffered = item.bufferedForEncoding() ?: error("YUV work item has no owned source")
-        encoder.encodeBuffered(buffered, candidate, rotationDegrees)
+        // Typed dispatch over the sealed owned source: the direct path enters the
+        // encoder through the OwnedDirectYuvSource, never through nullable probing.
+        when (val source = item.sourceForEncoding()) {
+            is YuvOwnedSource.Direct -> source.source.encodeTo(encoder, candidate, rotationDegrees)
+            is YuvOwnedSource.Buffered -> encoder.encodeBuffered(source.frame, candidate, rotationDegrees)
+        }
     }
 
     fun commit(candidate: File, finalFile: File) = committer.commit(candidate, finalFile)
@@ -400,7 +764,7 @@ internal class DisposableYuvTask(
     private val body: () -> Unit
 ) : DisposableCaptureTask {
     override fun run() = body()
-    override fun dispose() = item.dispose(accounting)
+    override fun dispose() { item.dispose(accounting) }
 }
 
 // ═══ Cleanup coordinator ═══════════════════════════════════════════════
@@ -413,7 +777,11 @@ internal data class YuvCleanupResult(
     val cleanupInitiationCount: Int,
     val ownerCloseRequested: Boolean,
     val workerShutdownRequested: Boolean,
-    val totalDrainedRetainedItems: Int,
+    val totalDrainClaims: Int,
+    val totalDrainDisposalAttempts: Int,
+    val totalDrainDisposalsSucceeded: Int,
+    val totalDrainSettlementsSucceeded: Int,
+    val totalDrainSettlementsFailed: Int,
     val totalQueuedTasksRemoved: Int,
     val totalQueuedDisposableDisposalAttempts: Int,
     val totalQueuedDisposableDisposalsSucceeded: Int,
@@ -441,7 +809,11 @@ internal class YuvCleanupCoordinator(
         val phase: CleanupPhase = CleanupPhase.NOT_STARTED,
         val ownerCloseRequested: Boolean = false,
         val workerShutdownRequested: Boolean = false,
-        val drainedRetainedItems: Int = 0,
+        val drainClaims: Int = 0,
+        val drainDisposalAttempts: Int = 0,
+        val drainDisposalsSucceeded: Int = 0,
+        val drainSettlementsSucceeded: Int = 0,
+        val drainSettlementsFailed: Int = 0,
         val queuedTasksRemoved: Int = 0,
         val queuedDisposableDisposalAttempted: Int = 0,
         val queuedDisposableDisposalsSucceeded: Int = 0,
@@ -463,7 +835,11 @@ internal class YuvCleanupCoordinator(
             cleanupInitiationCount = if (s.phase != CleanupPhase.NOT_STARTED) 1 else 0,
             ownerCloseRequested = s.ownerCloseRequested,
             workerShutdownRequested = s.workerShutdownRequested,
-            totalDrainedRetainedItems = s.drainedRetainedItems,
+            totalDrainClaims = s.drainClaims,
+            totalDrainDisposalAttempts = s.drainDisposalAttempts,
+            totalDrainDisposalsSucceeded = s.drainDisposalsSucceeded,
+            totalDrainSettlementsSucceeded = s.drainSettlementsSucceeded,
+            totalDrainSettlementsFailed = s.drainSettlementsFailed,
             totalQueuedTasksRemoved = s.queuedTasksRemoved,
             totalQueuedDisposableDisposalAttempts = s.queuedDisposableDisposalAttempted,
             totalQueuedDisposableDisposalsSucceeded = s.queuedDisposableDisposalsSucceeded,
@@ -533,21 +909,35 @@ internal class YuvCleanupCoordinator(
             emptyList()
         }
 
-        // Step 3: dispose each claim's item OUTSIDE the lifecycle lock, then finish
-        // each claim independently.  One disposal or finish failure never skips later
-        // claims; both failures are recorded separately with frame identity.
+        // Step 3: settle each claim with the disposal-aware disposeAndFinish, OUTSIDE
+        // the lifecycle lock.  Each claim settles independently: one failure never skips
+        // later claims; disposal failures and lifecycle-release failures are recorded
+        // separately with frame identity, and every counter stays truthful.
         for (claim in claims) {
-            try {
-                claim.item.dispose(accounting)
+            val outcome = try {
+                claim.disposeAndFinish(accounting)
             } catch (t: Throwable) {
-                mutableFailures.add("drainDispose[${claim.frameIndex}]: ${t.message}")
+                mutableFailures.add("drainDisposeAndFinish[${claim.frameIndex}]: ${t.message}")
+                continue
             }
-            try {
-                if (!claim.finish()) {
-                    mutableFailures.add("drainFinish[${claim.frameIndex}]: item not in DRAINING state")
-                }
-            } catch (t: Throwable) {
-                mutableFailures.add("drainFinish[${claim.frameIndex}]: ${t.message}")
+            stateRef.getAndUpdate { current ->
+                current.copy(
+                    drainDisposalAttempts = current.drainDisposalAttempts + 1,
+                    drainDisposalsSucceeded = current.drainDisposalsSucceeded +
+                        if (outcome.disposal.isClean) 1 else 0,
+                    drainSettlementsSucceeded = current.drainSettlementsSucceeded +
+                        if (outcome.status == DrainSettlementStatus.SETTLED) 1 else 0,
+                    drainSettlementsFailed = current.drainSettlementsFailed +
+                        if (outcome.status == DrainSettlementStatus.FAILED) 1 else 0
+                )
+            }
+            if (outcome.status == DrainSettlementStatus.FAILED) {
+                mutableFailures.add(
+                    "drainSettle[${claim.frameIndex}]: lifecycle release failed; item remains DRAINING"
+                )
+            }
+            outcome.disposal.failures().forEach {
+                mutableFailures.add("drainDispose[${claim.frameIndex}]: ${it.message}")
             }
         }
 
@@ -570,7 +960,7 @@ internal class YuvCleanupCoordinator(
         stateRef.getAndUpdate { current ->
             current.copy(
                 workerShutdownRequested = true,
-                drainedRetainedItems = claims.size,
+                drainClaims = claims.size,
                 queuedTasksRemoved = report?.queuedTasksRemoved ?: 0,
                 queuedDisposableDisposalAttempted = report?.queuedDisposableTasksDisposalAttempted ?: 0,
                 queuedDisposableDisposalsSucceeded = report?.queuedDisposableTasksDisposedSuccessfully ?: 0,

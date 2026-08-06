@@ -1,5 +1,6 @@
 package com.projectnuke.keplernightlab
 
+import android.media.FakeImage
 import android.media.Image
 import java.io.File
 import java.nio.file.Files
@@ -11,6 +12,7 @@ import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -67,7 +69,9 @@ class YuvCaptureOwnerTest {
         private val failTimestamp: Boolean = false
     ) : DirectYuvImageAccess {
         val closeCount = AtomicInteger(0)
-        @Volatile private var closed = false
+        val lastImage = AtomicReference<FakeImage?>()
+        private var taken = false
+        private var closed = false
 
         override fun timestampNs(): Long =
             if (failTimestamp) error("timestamp failed") else 4321L
@@ -76,14 +80,17 @@ class YuvCaptureOwnerTest {
         override fun copy(frameIndex: Int): BufferedYuvFrame = error("direct work does not copy")
 
         override fun release() {
+            // Mirrors Camera2DirectYuvImageAccess: release after takeImage is a no-op.
+            if (taken) return
             if (closed) error("double close")
             closed = true
             closeCount.incrementAndGet()
         }
 
         override fun takeImage(): Image? {
-            // No real Image in JVM tests; the encoder handles null gracefully.
-            return null
+            if (taken) error("takeImage called twice")
+            taken = true
+            return FakeImage().also { lastImage.set(it) }
         }
     }
 
@@ -107,7 +114,8 @@ class YuvCaptureOwnerTest {
         workerCapacity: Int = 4,
         val rotationDegrees: Int = 0,
         encodeFailure: Boolean = false,
-        encodeLatch: EncodeLatch? = null
+        encodeLatch: EncodeLatch? = null,
+        rejectDispatch: Boolean = false
     ) {
         val dir: File = Files.createTempDirectory("yuv-owner-test").toFile()
         val handlerThread = android.os.HandlerThread("yuv-test").apply { start() }
@@ -122,7 +130,15 @@ class YuvCaptureOwnerTest {
         val postedStatus = mutableListOf<String>()
 
         val session: YuvCaptureSession = YuvCaptureSession.create(
-            dispatch = { event -> handler.post { event.execute() }; true },
+            dispatch = { event ->
+                if (rejectDispatch) {
+                    event.disposeWithoutMutation()
+                    false
+                } else {
+                    handler.post { event.execute() }
+                    true
+                }
+            },
             outputDir = dir,
             frameCount = frameCount,
             rotationDegrees = rotationDegrees,
@@ -275,23 +291,20 @@ class YuvCaptureOwnerTest {
     // ------------------------------------------------------------------
 
     @Test
-    fun directAccessReleasedExactlyOnceAndWorkerFailureCountsAsFailedFrame() {
-        val harness = Harness(frameCount = 1, encodeFailure = false)
+    fun directAccessReachesSuccessAndReleasesImageExactlyOnce() {
+        val harness = Harness(frameCount = 1)
         try {
             val access = FakeDirectAccess()
-            // FakeDirectAccess.takeImage returns null; the work processor then fails
-            // (no owned source) and the owner records a failed frame.  The owner
-            // does not auto-fail capture on a single worker failure; the terminal
-            // state remains ACTIVE until the caller triggers the deadline.
             harness.session.owner.acceptDirect(access)
-            harness.flushHandler()
-            harness.session.boundedWorker.close()
-            assertTrue(harness.session.boundedWorker.awaitTermination(2_000L))
-            harness.flushHandler()
-            assertEquals(1, access.closeCount.get())
-            assertTrue(harness.session.accounting.snapshot().failedFrames >= 1)
-            // No terminal claim yet: capture did not finish or fail at the framework level.
-            assertEquals(CaptureTerminalStatus.ACTIVE, harness.session.terminalState.status())
+            val status = harness.awaitTerminal()
+            assertEquals(CaptureTerminalStatus.SUCCESS, status)
+            // takeImage consumed the access wrapper; the image is closed by the
+            // work item's dispose exactly once.
+            assertEquals(0, access.closeCount.get())
+            assertEquals(1, access.lastImage.get()!!.closeCount.get())
+            assertEquals(1, harness.session.accounting.snapshot().persistedFrames)
+            assertEquals(1, harness.onCaptureCompleteCount.get())
+            assertEquals(0, harness.onCaptureErrorCount.get())
         } finally {
             harness.shutdown()
         }
@@ -299,7 +312,7 @@ class YuvCaptureOwnerTest {
 
     @Test
     fun directWorkerFailureThenDeadlineReachesTimedOutTerminal() {
-        val harness = Harness(frameCount = 1)
+        val harness = Harness(frameCount = 1, encodeFailure = true)
         try {
             val access = FakeDirectAccess()
             harness.session.owner.acceptDirect(access)
@@ -309,7 +322,9 @@ class YuvCaptureOwnerTest {
             harness.session.owner.onDeadlineReached()
             val status = harness.awaitTerminal()
             assertEquals(CaptureTerminalStatus.TIMED_OUT, status)
-            assertEquals(1, access.closeCount.get())
+            assertEquals(0, access.closeCount.get())
+            // The image is released by the work item's dispose in the task finally.
+            assertEquals(1, access.lastImage.get()!!.closeCount.get())
             assertTrue(harness.onCaptureErrorCount.get() >= 1)
         } finally {
             harness.shutdown()
@@ -325,6 +340,88 @@ class YuvCaptureOwnerTest {
             val status = harness.awaitTerminal()
             assertEquals(CaptureTerminalStatus.FAILED, status)
             assertEquals(1, access.closeCount.get())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun blockedDirectEncoderRetainsSourceUntilReleased() {
+        val encodeLatch = EncodeLatch()
+        val harness = Harness(frameCount = 1, workerCapacity = 1, encodeLatch = encodeLatch)
+        try {
+            val access = FakeDirectAccess()
+            harness.session.owner.acceptDirect(access)
+            encodeLatch.awaitStart()
+            // Mid-encode: the Image must still be owned (not yet released).
+            assertEquals(0, access.lastImage.get()!!.closeCount.get())
+            encodeLatch.release()
+            val status = harness.awaitTerminal()
+            assertEquals(CaptureTerminalStatus.SUCCESS, status)
+            assertEquals(1, access.lastImage.get()!!.closeCount.get())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun directEncodeReleasedExactlyOnceOnSessionCleanup() {
+        val encodeLatch = EncodeLatch()
+        val harness = Harness(frameCount = 1, workerCapacity = 1, encodeLatch = encodeLatch)
+        try {
+            val access = FakeDirectAccess()
+            harness.session.owner.acceptDirect(access)
+            encodeLatch.awaitStart()
+            harness.session.close()
+            // The running worker task is not disposed by shutdown; the source stays
+            // owned until the encoder returns.
+            assertEquals(0, access.lastImage.get()!!.closeCount.get())
+            encodeLatch.release()
+            assertTrue(harness.session.boundedWorker.awaitTermination(5_000L))
+            harness.flushHandler()
+            assertEquals(1, access.lastImage.get()!!.closeCount.get())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun directQueueRejectionReleasesImageExactlyOnce() {
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val harness = Harness(frameCount = 1, workerCapacity = 1)
+        try {
+            // Occupy the single worker slot AND fill the capacity-1 queue so the
+            // direct task is rejected at submit (active + queued both busy).
+            assertTrue(harness.session.boundedWorker.submit(Runnable {
+                started.countDown(); release.await(5, TimeUnit.SECONDS)
+            }))
+            assertTrue(started.await(2, TimeUnit.SECONDS))
+            assertTrue(harness.session.boundedWorker.submit(Runnable {
+                release.await(5, TimeUnit.SECONDS)
+            }))
+            val access = FakeDirectAccess()
+            harness.session.owner.acceptDirect(access)
+            harness.flushHandler()
+            // Rejected task was disposed by the worker: the image is closed exactly once.
+            assertEquals(1, access.lastImage.get()!!.closeCount.get())
+            assertEquals(1, harness.session.accounting.snapshot().droppedFrames)
+        } finally {
+            release.countDown()
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun directOwnerEventRejectionReleasesAccessExactlyOnce() {
+        val harness = Harness(frameCount = 1, rejectDispatch = true)
+        try {
+            val access = FakeDirectAccess()
+            harness.session.owner.acceptDirect(access)
+            // The envelope was disposed without mutation: the access (image not yet
+            // taken) is released exactly once; no work item is created.
+            assertEquals(1, access.closeCount.get())
+            assertNull(access.lastImage.get())
         } finally {
             harness.shutdown()
         }

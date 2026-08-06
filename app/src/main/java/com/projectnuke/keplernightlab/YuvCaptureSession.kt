@@ -36,7 +36,10 @@ internal class YuvCaptureSession internal constructor(
             writeJobJson: (status: String, savedFrames: Int, manifest: List<YuvFrameManifestEntry>) -> Unit = { _, _, _ -> },
             saveMotionOnce: (File) -> Pair<String?, String?> = { _ -> null to null },
             onCaptureComplete: (File) -> Unit = {},
-            onCaptureError: (message: String, cause: Throwable?) -> Unit = { _, _ -> }
+            onCaptureError: (message: String, cause: Throwable?) -> Unit = { _, _ -> },
+            candidateFilesystem: YuvCandidateFilesystem = RealYuvCandidateFilesystem,
+            candidateVerifier: YuvCandidateVerifier = RealYuvCandidateVerifier,
+            finalFileVerifier: YuvFinalFileVerifier = RealYuvFinalFileVerifier
         ): YuvCaptureSession {
             val captureStateOwner = CaptureStateOwner(dispatch)
             val boundedWorker = BoundedCaptureWorker(workerName, workerCapacity)
@@ -68,7 +71,10 @@ internal class YuvCaptureSession internal constructor(
                 saveMotionOnce = saveMotionOnce,
                 onCaptureComplete = onCaptureComplete,
                 onCaptureError = onCaptureError,
-                cleanupCoordinator = cleanupCoordinator
+                cleanupCoordinator = cleanupCoordinator,
+                candidateFilesystem = candidateFilesystem,
+                candidateVerifier = candidateVerifier,
+                finalFileVerifier = finalFileVerifier
             )
             return YuvCaptureSession(
                 captureStateOwner,
