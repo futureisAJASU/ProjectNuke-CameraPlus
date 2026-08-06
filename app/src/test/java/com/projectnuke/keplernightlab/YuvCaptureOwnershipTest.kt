@@ -324,9 +324,9 @@ class YuvCaptureOwnershipTest {
             Thread {
                 start.countDown()
                 assertTrue(start.await(5, TimeUnit.SECONDS))
-                lifecycle.closeAndDrainRetained().forEach {
-                    it.dispose(accounting)
-                    lifecycle.finishDrain(it)
+                lifecycle.claimRetainedForDrain().forEach { claim ->
+                    claim.item.dispose(accounting)
+                    claim.finish()
                 }
                 done.countDown()
             }
@@ -385,7 +385,7 @@ class YuvCaptureOwnershipTest {
         }
         val closer = Thread {
             started.countDown(); assertTrue(started.await(5, TimeUnit.SECONDS))
-            drained.set(lifecycle.closeAndDrainRetained())
+            drained.set(lifecycle.claimRetainedForDrain().map { it.item })
             done.countDown()
         }
         encoder.start(); closer.start()
@@ -400,10 +400,14 @@ class YuvCaptureOwnershipTest {
 
         // If encoding won, settleEncoding removes it
         lifecycle.settleEncoding(item, accounting)
-        // If drained won, dispose the item and finish its drain
-        drained.get()?.forEach {
-            it.dispose(accounting)
-            lifecycle.finishDrain(it)
+        // If the drain claim won, dispose the item and finish the claim
+        if (drained.get()?.isNotEmpty() == true) {
+            val claim = lifecycle.claimRetainedForDrain() // never returns a second claim
+            assertTrue(claim.isEmpty())
+            drained.get()?.forEach {
+                it.dispose(accounting)
+                lifecycle.finishDrain(it)
+            }
         }
 
         assertEquals(0, lifecycle.retainedCount())
@@ -472,9 +476,9 @@ class YuvCaptureOwnershipTest {
         assertEquals(1, lifecycle.encodingCount())
         assertEquals(2, lifecycle.trackedCount())
 
-        lifecycle.closeAndDrainRetained().forEach {
-            it.dispose(accounting)
-            lifecycle.finishDrain(it)
+        lifecycle.claimRetainedForDrain().forEach { claim ->
+            claim.item.dispose(accounting)
+            claim.finish()
         }
         lifecycle.settleEncoding(eItem, accounting)
 

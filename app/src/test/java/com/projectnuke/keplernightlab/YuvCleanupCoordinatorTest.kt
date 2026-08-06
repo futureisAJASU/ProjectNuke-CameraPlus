@@ -4,6 +4,7 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -233,9 +234,8 @@ class YuvCleanupCoordinatorTest {
             onRejected = { _ -> })
         val coordinator = YuvCleanupCoordinator(stateOwner, lifecycle, accounting, reservations, worker)
 
-        // Add a retained item whose disposal blocks, keeping the first
-        // perform() in cleanup's IN_PROGRESS phase while the second caller
-        // invokes perform() and observes the in-progress snapshot.
+        // Add a retained item whose disposal blocks: the initiating caller stays in
+        // cleanup's IN_PROGRESS phase with the item truthfully tracked as DRAINING.
         val disposalStarted = CountDownLatch(1)
         val disposalBlock = CountDownLatch(1)
         assertTrue(reservations.tryReserve(100))
@@ -245,36 +245,71 @@ class YuvCleanupCoordinatorTest {
         }
         assertTrue(lifecycle.tryRegister(blockingItem))
 
-        val barrier = CountDownLatch(1)
+        val t2Called = CountDownLatch(1)
         val done = CountDownLatch(2)
         val results = ConcurrentLinkedQueue<YuvCleanupResult>()
-        val t1 = Thread {
-            assertTrue(barrier.await(5, TimeUnit.SECONDS))
+        val failures = AtomicReference<Throwable?>(null)
+
+        val t1 = childThread("cleanup-caller-1", failures) {
             results.add(coordinator.perform())
             done.countDown()
         }
-        val t2 = Thread {
-            assertTrue(barrier.await(5, TimeUnit.SECONDS))
+        // The second caller is sequenced AFTER the first is provably blocked in
+        // IN_PROGRESS (disposal has started), so its IN_PROGRESS observation is
+        // deterministic instead of racy.
+        val t2 = childThread("cleanup-caller-2", failures) {
+            assertTrue(disposalStarted.await(5, TimeUnit.SECONDS))
             results.add(coordinator.perform())
+            t2Called.countDown()
             done.countDown()
         }
         t1.start(); t2.start()
-        barrier.countDown()
-        // Wait for first caller's perform to enter IN_PROGRESS and start draining
-        assertTrue(disposalStarted.await(2, TimeUnit.SECONDS))
-        // Second caller should observe IN_PROGRESS
+        assertTrue(disposalStarted.await(5, TimeUnit.SECONDS))
+        // The second caller has now observed and returned the IN_PROGRESS snapshot
+        // while the initiator is still blocked inside disposal.
+        assertTrue(t2Called.await(5, TimeUnit.SECONDS))
         disposalBlock.countDown()
         assertTrue(done.await(5, TimeUnit.SECONDS))
         t1.join(2_000); t2.join(2_000)
         assertFalse(t1.isAlive); assertFalse(t2.isAlive)
+        rethrowChildFailures(failures)
 
         assertEquals(2, results.size)
         assertTrue(results.all { it.cleanupInitiationCount == 1 })
 
-        val completed = results.filter { it.phase == CleanupPhase.COMPLETED }
-        val inProgress = results.filter { it.phase == CleanupPhase.IN_PROGRESS }
-        assertTrue("at least one caller observed IN_PROGRESS", inProgress.isNotEmpty())
-        assertTrue("at least one caller observed COMPLETED", completed.isNotEmpty())
+        val completed = results.single { it.phase == CleanupPhase.COMPLETED }
+        val inProgress = results.single { it.phase == CleanupPhase.IN_PROGRESS }
+        // The IN_PROGRESS observer saw the claimed item still tracked as DRAINING
+        // while its disposal was in flight (accounting settles in dispose's finally,
+        // before onRelease unblocks — so frames/bytes are already zero, but the
+        // lifecycle drain debt is still observable).
+        assertEquals(1, inProgress.currentDrainingItems)
+        assertEquals(0, inProgress.currentBufferedFrames)
+        assertEquals(0L, inProgress.currentReservedBytes)
+        assertEquals(0, inProgress.totalDrainedRetainedItems)
+        assertEquals(1, completed.totalDrainedRetainedItems)
+        assertEquals(0, completed.currentDrainingItems)
+    }
+
+    private fun childThread(
+        name: String,
+        failures: AtomicReference<Throwable?>,
+        body: () -> Unit
+    ): Thread {
+        return Thread(
+            {
+                try {
+                    body()
+                } catch (t: Throwable) {
+                    failures.compareAndSet(null, t)
+                }
+            },
+            name
+        )
+    }
+
+    private fun rethrowChildFailures(failures: AtomicReference<Throwable?>) {
+        failures.get()?.let { throw AssertionError("child thread failed", it) }
     }
 
     @Test
@@ -386,11 +421,11 @@ class YuvCleanupCoordinatorTest {
     }
 
     @Test
-    fun closeAndDrainRetainedFailureStillRequestsWorkerShutdown() {
+    fun claimRetainedForDrainFailureStillRequestsWorkerShutdown() {
         val stateOwner = CaptureStateOwner(dispatch = { true })
         val lifecycle = object : YuvBufferedLifecycle() {
-            override fun closeAndDrainRetained(): List<YuvPngWorkItem> =
-                error("injected closeAndDrainRetained failure")
+            override fun claimRetainedForDrain(): List<YuvDrainClaim> =
+                error("injected claimRetainedForDrain failure")
         }
         val accounting = YuvCaptureAccounting()
         val reservations = YuvBufferReservations(1024)
@@ -405,7 +440,7 @@ class YuvCleanupCoordinatorTest {
         assertTrue(result.ownerCloseRequested)
         assertTrue(result.workerShutdownRequested)
         assertEquals(0, result.totalDrainedRetainedItems)
-        assertTrue(result.cleanupFailures.any { it.contains("closeAndDrainRetained") })
+        assertTrue(result.cleanupFailures.any { it.contains("claimRetainedForDrain") })
 
         assertTrue(worker.awaitTermination(5_000))
     }

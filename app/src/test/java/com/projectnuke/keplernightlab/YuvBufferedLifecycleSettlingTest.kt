@@ -163,7 +163,8 @@ class YuvBufferedLifecycleSettlingTest {
         assertTrue(lifecycle.beginEncoding(item))
 
         val startResult = lifecycle.startSettling(item)
-        assertEquals(YuvBufferedLifecycle.SettlementResult.STARTED, startResult)
+        assertEquals(YuvBufferedLifecycle.SettlementResult.STARTED, startResult.result)
+        assertEquals(YuvBufferedLifecycle.State.ENCODING, startResult.previousState)
 
         // State is SETTLING: ownership visible
         assertEquals(1, lifecycle.settlingCount())
@@ -343,7 +344,54 @@ class YuvBufferedLifecycleSettlingTest {
 
         val outcome = lifecycle.settleEncoding(untracked, accounting)
         assertEquals(YuvBufferedLifecycle.EncodingSettlementStatus.UNKNOWN, outcome.status)
-        assertEquals(YuvBufferedLifecycle.State.RELEASED, outcome.previousState)
+        // Never a synthesized RELEASED: the previous state is unknown, reported as null.
+        assertNull(outcome.previousState)
+    }
+
+    @Test
+    fun drainingItemReportsInvalidStateWithDrainingPreviousState() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting)
+        assertTrue(lifecycle.tryRegister(item))
+        // RETAINED -> DRAINING (coordinated drain path)
+        assertTrue(lifecycle.startDraining(item))
+
+        val outcome = lifecycle.settleEncoding(item, accounting)
+        assertEquals(YuvBufferedLifecycle.EncodingSettlementStatus.INVALID_STATE, outcome.status)
+        assertEquals(YuvBufferedLifecycle.State.DRAINING, outcome.previousState)
+        assertFalse(outcome.itemDisposed)
+        assertFalse(outcome.lifecycleReleased)
+
+        item.dispose(accounting)
+        lifecycle.finishDrain(item)
+        assertEquals(0, lifecycle.trackedCount())
+        assertEquals(0L, reservations.currentBytes())
+    }
+
+    @Test
+    fun alreadySettlingItemReportsSettlingPreviousState() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting)
+        assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
+        assertEquals(YuvBufferedLifecycle.SettlementResult.STARTED, lifecycle.startSettling(item).result)
+
+        val outcome = lifecycle.settleEncoding(item, accounting)
+        assertEquals(YuvBufferedLifecycle.EncodingSettlementStatus.ALREADY_SETTLING, outcome.status)
+        assertEquals(YuvBufferedLifecycle.State.SETTLING, outcome.previousState)
+        assertFalse(outcome.itemDisposed)
+        assertFalse(outcome.lifecycleReleased)
+
+        item.dispose(accounting)
+        lifecycle.finishSettling(item)
+        assertEquals(0, lifecycle.trackedCount())
+        assertEquals(0L, reservations.currentBytes())
     }
 
     @Test
@@ -358,7 +406,7 @@ class YuvBufferedLifecycleSettlingTest {
         assertTrue(lifecycle.beginEncoding(item))
 
         val result = lifecycle.startSettling(item)
-        assertEquals(YuvBufferedLifecycle.SettlementResult.STARTED, result)
+        assertEquals(YuvBufferedLifecycle.SettlementResult.STARTED, result.result)
 
         val drained = lifecycle.closeAndDrainRetained()
         assertTrue(drained.isEmpty())
@@ -389,8 +437,13 @@ class YuvBufferedLifecycleSettlingTest {
         }
         assertTrue(lifecycle.tryRegister(item))
 
-        val drained = lifecycle.closeAndDrainRetained()
-        assertEquals(listOf(item), drained)
+        // Coordinated drain claim: RETAINED -> DRAINING, item stays tracked.
+        val claims = lifecycle.claimRetainedForDrain()
+        assertEquals(1, claims.size)
+        val claim = claims[0]
+        assertEquals(item, claim.item)
+        assertEquals(0, claim.frameIndex)
+        assertEquals(YuvBufferedLifecycle.State.DRAINING, claim.state())
 
         // DRAINING ownership visible while disposal blocked
         assertEquals(1, lifecycle.drainingCount())
@@ -402,7 +455,7 @@ class YuvBufferedLifecycleSettlingTest {
 
         val disposalThread = Thread {
             item.dispose(accounting)
-            lifecycle.finishDrain(item)
+            claim.finish()
         }
         disposalThread.start()
         assertTrue(disposalStarted.await(2, TimeUnit.SECONDS))
@@ -420,6 +473,52 @@ class YuvBufferedLifecycleSettlingTest {
         assertEquals(0, lifecycle.trackedCount())
         assertEquals(0L, reservations.currentBytes())
         assertEquals(0, accounting.snapshot().bufferedFrames)
+        // Exactly-once: after a successful finish the claim can never settle again.
+        assertNull(claim.state())
+        assertFalse(claim.finish())
+    }
+
+    @Test
+    fun legacyCloseAndDrainRetainedMatchesProductionContract() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        val disposeCount = AtomicInteger(0)
+        assertTrue(reservations.tryReserve(200L))
+        val item1 = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
+            disposeCount.incrementAndGet()
+        }
+        val item2 = YuvPngWorkItem.bufferedForTest(1, 2L, 100L, reservations, accounting) {
+            disposeCount.incrementAndGet()
+        }
+        assertTrue(lifecycle.tryRegister(item1))
+        assertTrue(lifecycle.tryRegister(item2))
+
+        val drained = lifecycle.closeAndDrainRetained()
+        assertEquals(listOf(item1, item2), drained)
+
+        // Items removed from the registry BEFORE disposal: no DRAINING residue and no
+        // finish call required (ColorFusion pattern: dispose only).
+        assertEquals(0, lifecycle.trackedCount())
+        assertEquals(0, lifecycle.retainedCount())
+        assertEquals(0, lifecycle.drainingCount())
+        // Accounting stays truthful: external disposal still owned by the caller.
+        assertEquals(2, accounting.snapshot().bufferedFrames)
+        assertEquals(200L, reservations.currentBytes())
+
+        drained.forEach { it.dispose(accounting) }
+        drained.forEach { it.dispose(accounting) } // disposal is idempotent at item level
+        assertEquals(2, disposeCount.get())
+        assertEquals(0, accounting.snapshot().bufferedFrames)
+        assertEquals(0L, reservations.currentBytes())
+
+        // Repeated close never returns an item twice; acceptance stays closed.
+        assertTrue(lifecycle.closeAndDrainRetained().isEmpty())
+        assertTrue(reservations.tryReserve(10L))
+        val late = YuvPngWorkItem.bufferedForTest(2, 3L, 10L, reservations, accounting)
+        assertFalse(lifecycle.tryRegister(late))
+        late.dispose(accounting)
+        assertEquals(0, lifecycle.trackedCount())
     }
 
     // ── BufferedEncodeTask consumes every settlement outcome ───────────
@@ -519,7 +618,7 @@ class YuvBufferedLifecycleSettlingTest {
         assertTrue(lifecycle.tryRegister(item))
         assertTrue(lifecycle.beginEncoding(item))
         // External transition to SETTLING before the task settles.
-        assertEquals(YuvBufferedLifecycle.SettlementResult.STARTED, lifecycle.startSettling(item))
+        assertEquals(YuvBufferedLifecycle.SettlementResult.STARTED, lifecycle.startSettling(item).result)
 
         encodeTask(item, lifecycle, accounting, issues).run()
 

@@ -487,9 +487,9 @@ internal class YuvCleanupCoordinator(
      * boundary so one stage's failure never skips a later stage:
      *
      * 1. close CaptureStateOwner
-     * 2. close/claim retained lifecycle items (closeAndDrainRetained)
-     * 3. dispose each drained item independently, then finish each drain item
-     *    independently (one failure never skips later items)
+     * 2. claim retained lifecycle items for coordinated drain (claimRetainedForDrain)
+     * 3. dispose each claim's item outside the lifecycle lock, then finish each claim
+     *    independently (one failure never skips later claims)
      * 4. request BoundedCaptureWorker shutdown
      * 5. merge worker cleanup failures
      * 6. publish COMPLETED state
@@ -523,29 +523,31 @@ internal class YuvCleanupCoordinator(
             mutableFailures.add("ownerClose: ${t.message}")
         }
 
-        // Step 2: claim retained lifecycle items (independent failure boundary).
-        // A failure here must NOT skip worker shutdown or final state publication.
-        val drained = try {
-            lifecycle.closeAndDrainRetained()
+        // Step 2: claim retained lifecycle items for coordinated drain (independent
+        // failure boundary).  A failure here must NOT skip worker shutdown or final
+        // state publication.
+        val claims = try {
+            lifecycle.claimRetainedForDrain()
         } catch (t: Throwable) {
-            mutableFailures.add("closeAndDrainRetained: ${t.message}")
+            mutableFailures.add("claimRetainedForDrain: ${t.message}")
             emptyList()
         }
 
-        // Step 3: dispose each drained item independently, then finish each drain item
-        // independently.  One disposal or finishDrain failure never skips later items.
-        for (item in drained) {
+        // Step 3: dispose each claim's item OUTSIDE the lifecycle lock, then finish
+        // each claim independently.  One disposal or finish failure never skips later
+        // claims; both failures are recorded separately with frame identity.
+        for (claim in claims) {
             try {
-                item.dispose(accounting)
+                claim.item.dispose(accounting)
             } catch (t: Throwable) {
-                mutableFailures.add("drainDispose[${item.frameIndex}]: ${t.message}")
+                mutableFailures.add("drainDispose[${claim.frameIndex}]: ${t.message}")
             }
             try {
-                if (!lifecycle.finishDrain(item)) {
-                    mutableFailures.add("drainFinish[${item.frameIndex}]: item not in DRAINING state")
+                if (!claim.finish()) {
+                    mutableFailures.add("drainFinish[${claim.frameIndex}]: item not in DRAINING state")
                 }
             } catch (t: Throwable) {
-                mutableFailures.add("drainFinish[${item.frameIndex}]: ${t.message}")
+                mutableFailures.add("drainFinish[${claim.frameIndex}]: ${t.message}")
             }
         }
 
@@ -568,7 +570,7 @@ internal class YuvCleanupCoordinator(
         stateRef.getAndUpdate { current ->
             current.copy(
                 workerShutdownRequested = true,
-                drainedRetainedItems = drained.size,
+                drainedRetainedItems = claims.size,
                 queuedTasksRemoved = report?.queuedTasksRemoved ?: 0,
                 queuedDisposableDisposalAttempted = report?.queuedDisposableTasksDisposalAttempted ?: 0,
                 queuedDisposableDisposalsSucceeded = report?.queuedDisposableTasksDisposedSuccessfully ?: 0,

@@ -4,14 +4,25 @@ package com.projectnuke.keplernightlab
  * Buffered-lifecycle state machine for YUV work items.
  *
  * States: RETAINED → ENCODING → SETTLING → (removed)  [encoding path]
- *          RETAINED → DRAINING → (removed)              [close-drain path]
+ *          RETAINED → DRAINING → (removed)              [coordinated drain path]
+ *
+ * Two distinct close/claim APIs:
+ * - [closeAndDrainRetained] (legacy, ColorFusion-compatible): closes acceptance and
+ *   atomically removes every RETAINED item from the registry.  The caller owns
+ *   external `item.dispose(accounting)`; no finish call is required and items are
+ *   never left tracked as DRAINING.
+ * - [claimRetainedForDrain] (coordinator): closes acceptance and atomically claims
+ *   every RETAINED item as DRAINING, returning [YuvDrainClaim] tokens.  The item
+ *   stays tracked (drainingCount / trackedCount stay truthful) until
+ *   `claim.finish()` removes it after external disposal.
  *
  * Contract:
  * - Only ENCODING items may startSettling.
- * - Only RETAINED items may startDraining.
- * - An item is removed from the active registry once it reaches RELEASED.
- * - startSettling on a previously removed (RELEASED) item returns UNKNOWN
- *   (the item is no longer in the active registry).
+ * - startSettling reports the ACTUAL previous lifecycle state atomically
+ *   ([SettlementStart.previousState]); an unknown/removed item reports `null`,
+ *   never a synthesized RELEASED state.
+ * - An item is removed from the active registry once its settlement or drain
+ *   finishes.
  * - While an item is SETTLING or DRAINING its ownership remains visible via
  *   settlingCount / drainingCount / trackedCount so cleanup-coordinator
  *   snapshots are truthful.
@@ -21,6 +32,16 @@ internal open class YuvBufferedLifecycle {
     enum class State { RETAINED, ENCODING, SETTLING, DRAINING, RELEASED }
 
     enum class SettlementResult { STARTED, ALREADY_SETTLING, ALREADY_RELEASED, INVALID_STATE, UNKNOWN }
+
+    /**
+     * Atomic settlement-start decision: the settlement [result] together with the
+     * actual [previousState] observed under the lifecycle lock.  [previousState] is
+     * `null` only for unknown/removed items.
+     */
+    data class SettlementStart(
+        val result: SettlementResult,
+        val previousState: State?
+    )
 
     enum class EncodingSettlementStatus {
         SETTLED,
@@ -33,6 +54,8 @@ internal open class YuvBufferedLifecycle {
     /**
      * Result of one settlement attempt for a buffered work item.
      *
+     * [previousState] is the actual lifecycle state observed before settlement
+     * (`null` for unknown/removed items — never a synthesized RELEASED).
      * [lifecycleReleased] is truthful: it reflects the actual result of the
      * [finishSettling] attempt (never hardcoded).  If resource disposal and lifecycle
      * release BOTH fail, both failures are preserved: [failure] carries the disposal
@@ -40,7 +63,7 @@ internal open class YuvBufferedLifecycle {
      */
     data class EncodingSettlementOutcome(
         val status: EncodingSettlementStatus,
-        val previousState: State,
+        val previousState: State?,
         val itemDisposed: Boolean,
         val lifecycleReleased: Boolean,
         val failure: Throwable? = null,
@@ -77,6 +100,9 @@ internal open class YuvBufferedLifecycle {
 
     fun trackedCount(): Int = synchronized(lock) { items.size }
 
+    /** Current state of a tracked item, or `null` when it is no longer tracked. */
+    internal fun stateOf(item: YuvPngWorkItem): State? = synchronized(lock) { items[item]?.state }
+
     fun tryRegister(item: YuvPngWorkItem): Boolean = synchronized(lock) {
         if (closed) return@synchronized false
         if (item in items) error("YUV work item already tracked by buffered lifecycle")
@@ -91,16 +117,26 @@ internal open class YuvBufferedLifecycle {
         true
     }
 
-    fun startSettling(item: YuvPngWorkItem): SettlementResult = synchronized(lock) {
-        val entry = items[item] ?: return@synchronized SettlementResult.UNKNOWN
+    /**
+     * Starts settlement of an ENCODING item (ENCODING → SETTLING) and reports the
+     * actual previous lifecycle state atomically:
+     * - ENCODING → STARTED, previousState=ENCODING
+     * - SETTLING → ALREADY_SETTLING, previousState=SETTLING
+     * - RETAINED → INVALID_STATE, previousState=RETAINED
+     * - DRAINING → INVALID_STATE, previousState=DRAINING
+     * - unknown/removed → UNKNOWN, previousState=null
+     */
+    fun startSettling(item: YuvPngWorkItem): SettlementStart = synchronized(lock) {
+        val entry = items[item] ?: return@synchronized SettlementStart(SettlementResult.UNKNOWN, null)
+        val prev = entry.state
         when (entry.state) {
             State.ENCODING -> {
                 entry.state = State.SETTLING
-                SettlementResult.STARTED
+                SettlementStart(SettlementResult.STARTED, prev)
             }
-            State.SETTLING -> SettlementResult.ALREADY_SETTLING
-            State.RELEASED -> SettlementResult.ALREADY_RELEASED
-            State.RETAINED, State.DRAINING -> SettlementResult.INVALID_STATE
+            State.SETTLING -> SettlementStart(SettlementResult.ALREADY_SETTLING, prev)
+            State.RELEASED -> SettlementStart(SettlementResult.ALREADY_RELEASED, prev)
+            State.RETAINED, State.DRAINING -> SettlementStart(SettlementResult.INVALID_STATE, prev)
         }
     }
 
@@ -138,37 +174,30 @@ internal open class YuvBufferedLifecycle {
         item: YuvPngWorkItem,
         accounting: YuvCaptureAccounting
     ): EncodingSettlementOutcome {
-        val previous = startSettling(item)
-        val prevState = when (previous) {
-            SettlementResult.STARTED -> State.ENCODING
-            SettlementResult.ALREADY_SETTLING -> State.SETTLING
-            SettlementResult.ALREADY_RELEASED -> State.RELEASED
-            SettlementResult.INVALID_STATE -> State.RETAINED
-            SettlementResult.UNKNOWN -> State.RELEASED
-        }
-        when (previous) {
+        val start = startSettling(item)
+        when (start.result) {
             SettlementResult.STARTED -> Unit
             SettlementResult.ALREADY_SETTLING -> return EncodingSettlementOutcome(
                 status = EncodingSettlementStatus.ALREADY_SETTLING,
-                previousState = prevState,
+                previousState = start.previousState,
                 itemDisposed = false,
                 lifecycleReleased = false
             )
             SettlementResult.ALREADY_RELEASED -> return EncodingSettlementOutcome(
                 status = EncodingSettlementStatus.ALREADY_RELEASED,
-                previousState = prevState,
+                previousState = start.previousState,
                 itemDisposed = false,
                 lifecycleReleased = true
             )
             SettlementResult.INVALID_STATE -> return EncodingSettlementOutcome(
                 status = EncodingSettlementStatus.INVALID_STATE,
-                previousState = prevState,
+                previousState = start.previousState,
                 itemDisposed = false,
                 lifecycleReleased = false
             )
             SettlementResult.UNKNOWN -> return EncodingSettlementOutcome(
                 status = EncodingSettlementStatus.UNKNOWN,
-                previousState = prevState,
+                previousState = start.previousState,
                 itemDisposed = false,
                 lifecycleReleased = false
             )
@@ -200,7 +229,7 @@ internal open class YuvBufferedLifecycle {
 
         return EncodingSettlementOutcome(
             status = EncodingSettlementStatus.SETTLED,
-            previousState = prevState,
+            previousState = start.previousState,
             itemDisposed = disposed,
             lifecycleReleased = released,
             failure = failure,
@@ -209,19 +238,52 @@ internal open class YuvBufferedLifecycle {
     }
 
     /**
-     * Claims RETAINED items as DRAINING (never ENCODING or SETTLING items) and marks
-     * the lifecycle closed.  Open for deterministic failure injection in tests.
+     * LEGACY COMPATIBILITY API (source-compatible with restored ColorFusion callers):
+     *
+     * Closes lifecycle acceptance and atomically claims every RETAINED item, removing
+     * those items from the active registry BEFORE returning.  Each claimed item is
+     * returned exactly once; the caller owns external `item.dispose(accounting)`.
+     * No finish call is required and items are never left tracked as DRAINING.
+     * Repeated close returns no item twice.  ENCODING and SETTLING items remain tracked.
+     *
+     * Open for deterministic failure injection in tests.
      */
     internal open fun closeAndDrainRetained(): List<YuvPngWorkItem> = synchronized(lock) {
         closed = true
         val drained = mutableListOf<YuvPngWorkItem>()
-        for ((item, entry) in items) {
+        val iter = items.entries.iterator()
+        while (iter.hasNext()) {
+            val (item, entry) = iter.next()
             if (entry.state == State.RETAINED) {
-                entry.state = State.DRAINING
+                iter.remove()
                 drained.add(item)
             }
         }
         drained
+    }
+
+    /**
+     * COORDINATED DRAIN API (used only by YuvCleanupCoordinator):
+     *
+     * Closes lifecycle acceptance and atomically claims every RETAINED item as
+     * DRAINING (never ENCODING or SETTLING items).  Each returned [YuvDrainClaim]
+     * keeps its item tracked and exposes the exactly-once [YuvDrainClaim.finish]
+     * settlement capability: finish success removes the item from the registry;
+     * finish failure leaves it DRAINING and the cleanup debt stays observable via
+     * drainingCount / trackedCount.  New registration is rejected after closure.
+     *
+     * Open for deterministic failure injection in tests.
+     */
+    internal open fun claimRetainedForDrain(): List<YuvDrainClaim> = synchronized(lock) {
+        closed = true
+        val claims = mutableListOf<YuvDrainClaim>()
+        for ((item, entry) in items) {
+            if (entry.state == State.RETAINED) {
+                entry.state = State.DRAINING
+                claims.add(YuvDrainClaim(item, this))
+            }
+        }
+        claims
     }
 
     fun snapshotRetainedByFrameIndex(): List<YuvPngWorkItem> = synchronized(lock) {
@@ -231,4 +293,25 @@ internal open class YuvBufferedLifecycle {
             .sortedBy { it.frameIndex }
     }
 
+}
+
+/**
+ * Exactly-once coordinated drain settlement capability.
+ *
+ * Created by [YuvBufferedLifecycle.claimRetainedForDrain]: the claimed [item] is
+ * DRAINING and remains tracked until [finish] succeeds (which removes it from the
+ * active registry).  A failed [finish] (false or thrown) leaves the item DRAINING
+ * and the cleanup debt observable via the lifecycle draining/tracked counts.
+ */
+internal class YuvDrainClaim(
+    val item: YuvPngWorkItem,
+    private val lifecycle: YuvBufferedLifecycle
+) {
+    val frameIndex: Int = item.frameIndex
+
+    /** Current lifecycle state of the claimed item, or `null` once finished/removed. */
+    fun state(): YuvBufferedLifecycle.State? = lifecycle.stateOf(item)
+
+    /** Exactly-once lifecycle settlement: true when the item was removed from the registry. */
+    fun finish(): Boolean = lifecycle.finishDrain(item)
 }

@@ -487,7 +487,6 @@ class YuvCaptureOwnerTest {
         assertEquals(1, lifecycle.encodingCount())
         lifecycle.settleEncoding(item1, accounting)
         item2.dispose(accounting)
-        lifecycle.finishDrain(item2)
         assertEquals(0, accounting.snapshot().bufferedFrames)
         assertEquals(0L, reservations.currentBytes())
         assertEquals(0, lifecycle.trackedCount())
