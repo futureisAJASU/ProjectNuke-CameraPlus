@@ -227,6 +227,32 @@ class YuvAdoptionFilesystemTest {
     }
 
     // ------------------------------------------------------------------
+    // Item 1: post-COMMITTED manifest/final consistency
+    // ------------------------------------------------------------------
+
+    @Test
+    fun postCommittedManifestFinalConsistency() {
+        val harness = Harness()
+        try {
+            harness.acceptDirectAndSettle()
+            val snap = harness.session.accounting.snapshot()
+            // Item 1: persistedFrames == manifest.size invariant
+            assertEquals(snap.persistedFrames, snap.manifest.size)
+            // Item 1: every manifest entry has a readable final file
+            for (entry in snap.manifest) {
+                val finalFile = harness.finalFile(entry.frameIndex)
+                assertTrue("final file missing for frame ${entry.frameIndex}", finalFile.exists())
+                assertTrue("final file not readable for frame ${entry.frameIndex}", finalFile.canRead())
+            }
+            // Item 1: no committed manifest references a deleted final
+            assertEquals(1, snap.persistedFrames)
+            assertEquals(1, snap.manifest.size)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Fail-closed candidate validation
     // ------------------------------------------------------------------
 

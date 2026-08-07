@@ -2,9 +2,11 @@ package com.projectnuke.keplernightlab
 
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -85,13 +87,13 @@ class YuvCandidateOwnershipTest {
         val otherHandle = YuvCandidateHandle(0, File("other.tmp"))
         val claim = handle.tryBeginAdoption()!!
 
-        assertFalse("foreign claim must be rejected", handle.completeAdoption(invalidClaimForTest(otherHandle)))
+        assertFalse("foreign claim must be rejected", handle.completeAdoption(invalidClaimForTest(otherHandle)) == AdoptionResult.COMPLETED)
         assertEquals(CandidateOwnership.ADOPTING, handle.state())
 
-        assertTrue(handle.completeAdoption(claim))
+        assertEquals(AdoptionResult.COMPLETED, handle.completeAdoption(claim))
         assertEquals(CandidateOwnership.ADOPTED, handle.state())
 
-        assertFalse("second completion must fail", handle.completeAdoption(claim))
+        assertEquals(AdoptionResult.ALREADY_TERMINAL, handle.completeAdoption(claim))
         assertEquals(CandidateOwnership.ADOPTED, handle.state())
     }
 
@@ -105,7 +107,7 @@ class YuvCandidateOwnershipTest {
         assertTrue(outcome.alreadySettled)
         assertEquals(CandidateOwnership.ADOPTING, outcome.finalState)
         assertEquals(CandidateOwnership.ADOPTING, handle.state())
-        assertTrue(handle.completeAdoption(claim))
+        assertTrue(handle.completeAdoption(claim) == AdoptionResult.COMPLETED)
         assertEquals(CandidateOwnership.ADOPTED, handle.state())
     }
 
@@ -122,7 +124,7 @@ class YuvCandidateOwnershipTest {
         assertEquals(CandidateOwnership.ADOPTING, handle.state())
         assertEquals(0, filesystem.deleteCalls.get())
         // The real holder can still settle the adoption.
-        assertTrue(handle.completeAdoption(claim))
+        assertTrue(handle.completeAdoption(claim) == AdoptionResult.COMPLETED)
         assertEquals(CandidateOwnership.ADOPTED, handle.state())
     }
 
@@ -372,7 +374,7 @@ class YuvCandidateOwnershipTest {
         val handle = YuvCandidateHandle(0, File("candidate.tmp"))
         val filesystem = RecordingFilesystem(CandidateFileOperationResult.DELETED)
         val claim = handle.tryBeginAdoption()!!
-        assertTrue(handle.completeAdoption(claim))
+        assertEquals(AdoptionResult.COMPLETED, handle.completeAdoption(claim))
 
         val outcome = handle.discardOrQuarantine(filesystem)
 
@@ -391,7 +393,7 @@ class YuvCandidateOwnershipTest {
         val forged = invalidClaimForTest(handle)
         val filesystem = RecordingFilesystem(CandidateFileOperationResult.DELETED)
 
-        assertFalse("forged same-handle claim must not complete adoption", handle.completeAdoption(forged))
+        assertFalse("forged same-handle claim must not complete adoption", handle.completeAdoption(forged) == AdoptionResult.COMPLETED)
         assertEquals(CandidateOwnership.ADOPTING, handle.state())
 
         val rejected = handle.abortAdoption(forged, filesystem)
@@ -400,7 +402,7 @@ class YuvCandidateOwnershipTest {
         assertNull("no terminal record while the genuine claim is in flight", handle.terminal())
 
         // The genuine claim is completely unaffected by the forged attempts.
-        assertTrue(handle.completeAdoption(genuine))
+        assertTrue(handle.completeAdoption(genuine) == AdoptionResult.COMPLETED)
         assertEquals(CandidateOwnership.ADOPTED, handle.state())
         assertNotNull(handle.terminal())
         assertEquals(CandidateOwnership.ADOPTED, handle.terminal()!!.finalState)
@@ -436,5 +438,139 @@ class YuvCandidateOwnershipTest {
         assertNotNull(terminal)
         assertFalse("settled terminal is no longer in-progress", terminal!!.isInProgressOrTerminal)
         assertEquals(CandidateOwnership.DISCARDED, terminal.finalState)
+    }
+
+    // ── Item 2: same-genuine-claim race with barriers ─────────────────────
+
+    @Test
+    fun sameGenuineClaimCompleteVsAbortRace() {
+        val handle = YuvCandidateHandle(0, File("candidate.tmp"))
+        val claim = handle.tryBeginAdoption()!!
+        val filesystem = RecordingFilesystem(CandidateFileOperationResult.DELETED)
+
+        val start = CountDownLatch(2)
+        val done = CountDownLatch(2)
+        val completeResult = AtomicReference<AdoptionResult>()
+        val abortResult = AtomicReference<CandidateDisposalOutcome>()
+        val childException = AtomicReference<Throwable?>()
+
+        val completer = Thread {
+            try {
+                start.countDown(); assertTrue(start.await(5, TimeUnit.SECONDS))
+                completeResult.set(handle.completeAdoption(claim))
+            } catch (t: Throwable) { childException.compareAndSet(null, t) }
+            finally { done.countDown() }
+        }
+        val aborter = Thread {
+            try {
+                start.countDown(); assertTrue(start.await(5, TimeUnit.SECONDS))
+                abortResult.set(handle.abortAdoption(claim, filesystem))
+            } catch (t: Throwable) { childException.compareAndSet(null, t) }
+            finally { done.countDown() }
+        }
+
+        completer.start()
+        aborter.start()
+        assertTrue(done.await(5, TimeUnit.SECONDS))
+        completer.join(5_000)
+        aborter.join(5_000)
+        assertFalse(completer.isAlive)
+        assertFalse(aborter.isAlive)
+        childException.get()?.let { throw it }
+
+        val state = handle.state()
+        assertTrue(state == CandidateOwnership.ADOPTED || state == CandidateOwnership.DISCARDED)
+        if (state == CandidateOwnership.ADOPTED) {
+            assertEquals(AdoptionResult.COMPLETED, completeResult.get())
+            assertTrue(abortResult.get()!!.alreadySettled)
+            assertEquals(0, filesystem.deleteCalls.get())
+        } else {
+            assertTrue(completeResult.get() != AdoptionResult.COMPLETED)
+            assertEquals(CandidateOwnership.DISCARDED, abortResult.get()!!.finalState)
+            assertEquals(1, filesystem.deleteCalls.get())
+        }
+    }
+
+    @Test
+    fun sameGenuineClaimTwoCompletesRace() {
+        val handle = YuvCandidateHandle(0, File("candidate.tmp"))
+        val claim = handle.tryBeginAdoption()!!
+
+        val start = CountDownLatch(2)
+        val done = CountDownLatch(2)
+        val results = CopyOnWriteArrayList<AdoptionResult>()
+        val childException = AtomicReference<Throwable?>()
+
+        val thread1 = Thread {
+            try {
+                start.countDown(); assertTrue(start.await(5, TimeUnit.SECONDS))
+                results.add(handle.completeAdoption(claim))
+            } catch (t: Throwable) { childException.compareAndSet(null, t) }
+            finally { done.countDown() }
+        }
+        val thread2 = Thread {
+            try {
+                start.countDown(); assertTrue(start.await(5, TimeUnit.SECONDS))
+                results.add(handle.completeAdoption(claim))
+            } catch (t: Throwable) { childException.compareAndSet(null, t) }
+            finally { done.countDown() }
+        }
+
+        thread1.start()
+        thread2.start()
+        assertTrue(done.await(5, TimeUnit.SECONDS))
+        thread1.join(5_000)
+        thread2.join(5_000)
+        assertFalse(thread1.isAlive)
+        assertFalse(thread2.isAlive)
+        childException.get()?.let { throw it }
+
+        assertEquals(CandidateOwnership.ADOPTED, handle.state())
+        assertEquals(1, results.count { it == AdoptionResult.COMPLETED })
+        // Second thread may observe LOST_RACE (CAS failed while still ADOPTING) or
+        // ALREADY_TERMINAL (read after first CAS committed) — both are correct
+        // exactly-once outcomes for same-genuine-claim complete-vs-complete races.
+        assertEquals(1, results.count { it != AdoptionResult.COMPLETED })
+    }
+
+    @Test
+    fun sameGenuineClaimTwoAbortsRace() {
+        val handle = YuvCandidateHandle(0, File("candidate.tmp"))
+        val claim = handle.tryBeginAdoption()!!
+        val filesystem = RecordingFilesystem(CandidateFileOperationResult.DELETED)
+
+        val start = CountDownLatch(2)
+        val done = CountDownLatch(2)
+        val results = CopyOnWriteArrayList<CandidateDisposalOutcome>()
+        val childException = AtomicReference<Throwable?>()
+
+        val thread1 = Thread {
+            try {
+                start.countDown(); assertTrue(start.await(5, TimeUnit.SECONDS))
+                results.add(handle.abortAdoption(claim, filesystem))
+            } catch (t: Throwable) { childException.compareAndSet(null, t) }
+            finally { done.countDown() }
+        }
+        val thread2 = Thread {
+            try {
+                start.countDown(); assertTrue(start.await(5, TimeUnit.SECONDS))
+                results.add(handle.abortAdoption(claim, filesystem))
+            } catch (t: Throwable) { childException.compareAndSet(null, t) }
+            finally { done.countDown() }
+        }
+
+        thread1.start()
+        thread2.start()
+        assertTrue(done.await(5, TimeUnit.SECONDS))
+        thread1.join(5_000)
+        thread2.join(5_000)
+        assertFalse(thread1.isAlive)
+        assertFalse(thread2.isAlive)
+        childException.get()?.let { throw it }
+
+        assertEquals(CandidateOwnership.DISCARDED, handle.state())
+        assertEquals(1, results.count { !it.alreadySettled })
+        assertEquals(1, results.count { it.alreadySettled })
+        assertEquals(1, filesystem.deleteCalls.get())
     }
 }

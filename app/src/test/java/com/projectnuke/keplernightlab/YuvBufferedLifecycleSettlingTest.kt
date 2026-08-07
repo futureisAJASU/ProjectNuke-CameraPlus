@@ -966,6 +966,53 @@ class YuvBufferedLifecycleSettlingTest {
         assertEquals(1, lifecycle.settlingCount())
     }
 
+    // ── Item 7: settlement issue + disposal failure exact debt counts ─────
+
+    @Test
+    fun settlementIssuePlusDisposalFailureRecordsExactDebtCount() {
+        val lifecycle = ThrowingFinishSettlingLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        val issues = CopyOnWriteArrayList<YuvBufferedLifecycle.EncodingSettlementOutcome>()
+        val debtDescriptions = CopyOnWriteArrayList<String>()
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
+            error("onRelease threw")
+        }
+        assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
+
+        BufferedEncodeTask(
+            item = item,
+            accounting = accounting,
+            lifecycle = lifecycle,
+            candidateFilesystem = RealYuvCandidateFilesystem,
+            encode = {
+                YuvWorkerCompletion.Success(
+                    0, 1L, YuvCandidateHandle(0, File("candidate.tmp")), "frame_00_color.png", 0L
+                )
+            },
+            postCompletion = { _ -> },
+            onSettlementIssue = { _, outcome -> issues.add(outcome) },
+            onWorkDisposalDebt = { workItem, outcome ->
+                debtDescriptions.add(disposalDescription(outcome, workItem.frameIndex))
+            }
+        ).run()
+
+        // Item 7: disposal debt recorded exactly once (by onWorkDisposalDebt), not
+        // duplicated by onSettlementIssue.  Settlement issue recorded exactly once.
+        assertEquals(1, debtDescriptions.size)
+        assertTrue(debtDescriptions[0].contains("work-item disposal unclean frame=0"))
+        assertEquals(1, issues.size)
+        assertEquals(YuvBufferedLifecycle.EncodingSettlementStatus.SETTLED, issues[0].status)
+        assertEquals("onRelease threw", issues[0].failure?.message)
+        assertEquals("injected finishSettling failure", issues[0].lifecycleReleaseFailure?.message)
+        assertEquals(1, lifecycle.settlingCount())
+        assertEquals(1, lifecycle.trackedCount())
+        assertEquals(0L, reservations.currentBytes())
+        assertEquals(0, accounting.snapshot().bufferedFrames)
+    }
+
     @Test
     fun bufferedEncodeTaskIssueHookThrowDoesNotEscapeIntoWorkerCleanup() {
         val lifecycle = YuvBufferedLifecycle()

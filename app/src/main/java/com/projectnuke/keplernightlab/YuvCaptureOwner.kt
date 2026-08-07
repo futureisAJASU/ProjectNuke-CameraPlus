@@ -233,6 +233,7 @@ internal class YuvCaptureOwner(
             " recoveryFailure=" + it::class.java.simpleName + ": " + it.message
         } ?: ""
         val description = "adoption rollback recovery frame=${entry.frameIndex} file=${entry.filename}" +
+            " eligible=${result.eligible}" +
             " rollbackAttempted=${result.rollbackAttempted}" +
             " rollbackReturnedSuccess=${result.rollbackReturnedSuccess}" +
             " released=${result.released} remainingIndex=${result.indexReservationRemaining}" +
@@ -240,6 +241,39 @@ internal class YuvCaptureOwner(
             failurePart
         candidateCleanupDebts.add(description)
         Log.e("KeplerYuvOwner", description)
+    }
+
+    /**
+     * Item 4: Rollback helper that records the initial rollback attempt, its success
+     * or failure, and (on failure) the recovery result.  Does NOT call
+     * [AdoptionToken.recoverRollbackAfterFailure] when the initial rollback succeeds.
+     *
+     * When the token is already FAILED (e.g. from commit failure), the original failure
+     * is already recorded by the calling path and is NOT re-recorded here as a
+     * "rollback failed" diagnostic.
+     */
+    private fun rollbackAdoptionAndRecord(entry: YuvFrameManifestEntry, token: AdoptionToken) {
+        val preRollbackState = token.state()
+        val rollbackSuccess = token.rollback()
+        if (rollbackSuccess) {
+            // State is ROLLED_BACK; no recovery needed.
+            return
+        }
+        // Rollback did not succeed.  If the token was RESERVED, rollback was actually
+        // attempted but failed: record the rollback failure.  If the token was already
+        // FAILED (e.g. from commit failure), the original failure is already recorded
+        // by the calling path and we skip re-recording it.
+        if (preRollbackState == AdoptionTokenState.RESERVED) {
+            token.failure?.let { failure ->
+                val description = "adoption rollback failed frame=${entry.frameIndex} file=${entry.filename} " +
+                    "cause=${failure::class.java.simpleName}: ${failure.message}"
+                candidateCleanupDebts.add(description)
+                Log.e("KeplerYuvOwner", description)
+            }
+        }
+        // Attempt recovery regardless of pre-rollback state.
+        val recovery = token.recoverRollbackAfterFailure()
+        recordRollbackRecovery(entry, recovery)
     }
 
     /**
@@ -466,10 +500,8 @@ internal class YuvCaptureOwner(
                         "bufferedTaskSettlementIssue frame=${issueItem.frameIndex}: ${outcome.status} $detail"
                     )
                 }
-                val disposal = issueItem.disposalOutcome()
-                if (disposal != null && !disposal.isClean) {
-                    recordDisposalIfUnclean(issueItem, disposal)
-                }
+                // Item 7: DO NOT re-record disposal debt here — that is
+                // onWorkDisposalDebt's exclusive responsibility.
             },
             onWorkDisposalDebt = { workItem, outcome ->
                 recordDisposalIfUnclean(workItem, outcome)
@@ -576,8 +608,7 @@ internal class YuvCaptureOwner(
         //    (never delete it); roll back and settle the candidate through the claim.
         if (destinationExistedBeforeAttempt) {
             Log.w("KeplerYuvOwner", "Unexpected pre-existing final file for frame ${completion.frameIndex}: ${finalFile.path}")
-            token.rollback()
-            recordRollbackRecovery(entry, token.recoverRollbackAfterFailure())
+            rollbackAdoptionAndRecord(entry, token)
             recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
             return
@@ -597,8 +628,7 @@ internal class YuvCaptureOwner(
         if (commitFailure != null) {
             Log.e("KeplerYuvOwner", "Commit failed for frame ${completion.frameIndex}", commitFailure)
             if (destinationCreatedByAttempt) removeOrQuarantineCreatedFinal(finalFile)
-            token.rollback()
-            recordRollbackRecovery(entry, token.recoverRollbackAfterFailure())
+            rollbackAdoptionAndRecord(entry, token)
             recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
             finishError("YUV commit failed for frame ${completion.frameIndex}", cause = commitFailure)
@@ -619,8 +649,7 @@ internal class YuvCaptureOwner(
         }
         if (!finalVerified) {
             Log.w("KeplerYuvOwner", "Final file verification failed after commit for frame ${completion.frameIndex}")
-            token.rollback()
-            recordRollbackRecovery(entry, token.recoverRollbackAfterFailure())
+            rollbackAdoptionAndRecord(entry, token)
             if (destinationCreatedByAttempt) removeOrQuarantineCreatedFinal(finalFile)
             recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
@@ -635,8 +664,7 @@ internal class YuvCaptureOwner(
         if (!token.commit()) {
             Log.e("KeplerYuvOwner", "Adoption commit failed for frame ${completion.frameIndex}", token.failure)
             if (destinationCreatedByAttempt) removeOrQuarantineCreatedFinal(finalFile)
-            token.rollback()
-            recordRollbackRecovery(entry, token.recoverRollbackAfterFailure())
+            rollbackAdoptionAndRecord(entry, token)
             recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
             finishError("YUV adoption commit failed for frame ${completion.frameIndex}", cause = token.failure)
@@ -645,9 +673,10 @@ internal class YuvCaptureOwner(
 
         // 8. Settle the candidate ADOPTED through the exclusive claim.  The claim is
         //    reference-identical to the ADOPTING record's active claim, so completion
-        //    is structurally infallible for the exact claim; an AdoptionInvariantException
-        //    here is impossible internal corruption and is recorded as observable debt.
-        //    The final file is already committed so a corruption must also remove it.
+        //    is structurally infallible for the exact claim.  An invariant failure or
+        //    lost race here is impossible corruption — but the token is already COMMITTED,
+        //    so the manifest entry and final file must NOT be deleted (Item 1).  The
+        //    candidate-state anomaly is recorded as observable debt.
         val claimCompleted = try {
             handle.completeAdoption(claim)
         } catch (t: AdoptionInvariantException) {
@@ -655,17 +684,17 @@ internal class YuvCaptureOwner(
                 "file=${handle.file}: ${t.message}"
             candidateCleanupDebts.add(description)
             Log.e("KeplerYuvOwner", description, t)
-            if (destinationCreatedByAttempt) removeOrQuarantineCreatedFinal(finalFile)
-            accounting.failedFrame()
+            // Item 1: DO NOT delete final — manifest entry exists.  DO NOT call
+            // failedFrame — the frame IS in the manifest.
             return
         }
-        if (!claimCompleted) {
-            val description = "candidate adoption completion rejected frame=${completion.frameIndex} " +
+        if (claimCompleted != AdoptionResult.COMPLETED) {
+            val description = "candidate adoption completion $claimCompleted frame=${completion.frameIndex} " +
                 "file=${handle.file} state=${handle.state()}"
             candidateCleanupDebts.add(description)
             Log.e("KeplerYuvOwner", description)
-            if (destinationCreatedByAttempt) removeOrQuarantineCreatedFinal(finalFile)
-            accounting.failedFrame()
+            // Item 1: DO NOT delete final — manifest entry exists.  DO NOT call
+            // failedFrame — the frame IS in the manifest.
             return
         }
         val persistedFrames = accounting.snapshot().persistedFrames

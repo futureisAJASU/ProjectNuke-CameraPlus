@@ -407,6 +407,107 @@ class YuvAdoptionTokenTest {
         assertEquals(1, corrupted.snapshot().reservedFilenameCount)
     }
 
+    // ── Item 5: recoverRollbackAfterFailure rejects non-FAILED states ─────
+
+    @Test
+    fun recoverRollbackAfterFailureRejectsReservedState() {
+        val a = accounting()
+        val token = a.tryReserveAdoption(entry(0))!!
+        assertEquals(AdoptionTokenState.RESERVED, token.state())
+        val recovery = token.recoverRollbackAfterFailure()
+        assertFalse(recovery.eligible)
+        assertEquals(AdoptionTokenState.RESERVED, recovery.currentState)
+        assertFalse(recovery.rollbackAttempted)
+        assertEquals(AdoptionTokenState.RESERVED, token.state())
+        assertEquals(1, a.snapshot().reservedIndexCount)
+        assertEquals(1, a.snapshot().reservedFilenameCount)
+    }
+
+    @Test
+    fun recoverRollbackAfterFailureRejectsCommittedState() {
+        val a = accounting()
+        val token = a.tryReserveAdoption(entry(0))!!
+        assertTrue(token.commit())
+        assertEquals(AdoptionTokenState.COMMITTED, token.state())
+        val recovery = token.recoverRollbackAfterFailure()
+        assertFalse(recovery.eligible)
+        assertEquals(AdoptionTokenState.COMMITTED, recovery.currentState)
+        assertFalse(recovery.rollbackAttempted)
+        assertEquals(AdoptionTokenState.COMMITTED, token.state())
+        assertEquals(1, a.snapshot().persistedFrames)
+    }
+
+    @Test
+    fun recoverRollbackAfterFailureRejectsRolledBackState() {
+        val a = accounting()
+        val token = a.tryReserveAdoption(entry(0))!!
+        assertTrue(token.rollback())
+        assertEquals(AdoptionTokenState.ROLLED_BACK, token.state())
+        val recovery = token.recoverRollbackAfterFailure()
+        assertFalse(recovery.eligible)
+        assertEquals(AdoptionTokenState.ROLLED_BACK, recovery.currentState)
+        assertFalse(recovery.rollbackAttempted)
+        assertEquals(AdoptionTokenState.ROLLED_BACK, token.state())
+        assertEquals(0, a.snapshot().reservedIndexCount)
+    }
+
+    @Test
+    fun recoverRollbackAfterFailureRejectsFailedRecoveredState() {
+        val a = object : YuvCaptureAccounting() {
+            override fun commitAdoption(token: AdoptionToken): Boolean =
+                throw IllegalStateException("commit boom")
+        }
+        val token = a.tryReserveAdoption(entry(0))!!
+        assertFalse(token.commit())
+        assertEquals(AdoptionTokenState.FAILED, token.state())
+        val recovery1 = token.recoverRollbackAfterFailure()
+        assertTrue(recovery1.eligible)
+        assertTrue(recovery1.released)
+        assertEquals(AdoptionTokenState.FAILED_RECOVERED, token.state())
+        val recovery2 = token.recoverRollbackAfterFailure()
+        assertFalse(recovery2.eligible)
+        assertEquals(AdoptionTokenState.FAILED_RECOVERED, recovery2.currentState)
+    }
+
+    // ── Item 6: unrelated-token isolation ──────────────────────────────────
+
+    @Test
+    fun unrelatedTokenRecoveryDoesNotAffectOtherToken() {
+        val a = object : YuvCaptureAccounting() {
+            override fun commitAdoption(token: AdoptionToken): Boolean {
+                if (token.reservedEntry.frameIndex == 0) throw IllegalStateException("commit boom")
+                return super.commitAdoption(token)
+            }
+        }
+        val tokenA = a.tryReserveAdoption(entry(0))!!
+        val tokenB = a.tryReserveAdoption(entry(1))!!
+        assertEquals(AdoptionTokenState.RESERVED, tokenA.state())
+        assertEquals(AdoptionTokenState.RESERVED, tokenB.state())
+        val snap1 = a.snapshot()
+        assertEquals(2, snap1.reservedIndexCount)
+        assertEquals(2, snap1.reservedFilenameCount)
+
+        assertFalse(tokenA.commit())
+        assertEquals(AdoptionTokenState.FAILED, tokenA.state())
+        assertEquals(AdoptionTokenState.RESERVED, tokenB.state())
+
+        val recovery = tokenA.recoverRollbackAfterFailure()
+        assertTrue(recovery.eligible)
+        assertTrue(recovery.released)
+        assertEquals(AdoptionTokenState.FAILED_RECOVERED, tokenA.state())
+        assertEquals(AdoptionTokenState.RESERVED, tokenB.state())
+        val snap2 = a.snapshot()
+        assertEquals(1, snap2.reservedIndexCount)
+        assertEquals(1, snap2.reservedFilenameCount)
+
+        assertTrue(tokenB.commit())
+        assertEquals(AdoptionTokenState.COMMITTED, tokenB.state())
+        val snap3 = a.snapshot()
+        assertEquals(1, snap3.persistedFrames)
+        assertEquals(0, snap3.reservedIndexCount)
+        assertEquals(0, snap3.reservedFilenameCount)
+    }
+
     @Test
     fun reservedAdoptionBlocksLegacyPersistedFrame() {
         val a = accounting()

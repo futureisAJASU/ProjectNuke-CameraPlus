@@ -153,6 +153,18 @@ internal object RealYuvFinalFileVerifier : YuvFinalFileVerifier {
 }
 
 /**
+ * Result of a [YuvCandidateHandle.completeAdoption] call.  Structured results
+ * prevent the loser of a same-genuine-claim race from being classified as
+ * impossible corruption (AdoptionInvariantException).
+ */
+internal enum class AdoptionResult {
+    COMPLETED,
+    LOST_RACE,
+    STALE_OR_INVALID_CLAIM,
+    ALREADY_TERMINAL
+}
+
+/**
  * Terminal candidate publication: after every settlement the final atomic state
  * together with the [CandidateDisposalOutcome] (or null for ADOPTED) is
  * published so a caller observing DISCARDING cannot mistake an in-flight
@@ -296,21 +308,32 @@ internal class YuvCandidateHandle(
     /**
      * Exactly-once ADOPTING -> ADOPTED for the holder of [claim].  Only the genuine
      * active claim (reference-identical to the one published by tryBeginAdoption) may
-     * complete: a copied/foreign/stale claim is rejected with false.  Because the
-     * active claim object is held exclusively by its owner and no other path can
-     * transition ADOPTING away, an exact match completes structurally infallibly; a
-     * CAS failure despite an exact match is impossible internal corruption and is
-     * surfaced as [AdoptionInvariantException] rather than silently returning false.
+     * complete: a copied/foreign/stale claim is rejected.  A same-genuine-claim race
+     * with [abortAdoption] is a legitimate exactly-once race: exactly one wins, the
+     * loser returns [AdoptionResult.LOST_RACE] without performing any filesystem or
+     * accounting work.
      */
-    fun completeAdoption(claim: CandidateAdoptionClaim): Boolean {
-        if (claim.handle !== this || claim.frameIndex != frameIndex) return false
+    fun completeAdoption(claim: CandidateAdoptionClaim): AdoptionResult {
+        if (claim.handle !== this || claim.frameIndex != frameIndex) return AdoptionResult.STALE_OR_INVALID_CLAIM
         val rec = record.get()
-        if (rec.ownership != CandidateOwnership.ADOPTING || rec.activeClaim !== claim) return false
+        if (rec.ownership == CandidateOwnership.ADOPTED || rec.terminal != null) {
+            return AdoptionResult.ALREADY_TERMINAL
+        }
+        if (rec.ownership != CandidateOwnership.ADOPTING || rec.activeClaim !== claim) {
+            return AdoptionResult.STALE_OR_INVALID_CLAIM
+        }
         val terminal = CandidateTerminalRecord(CandidateOwnership.ADOPTED)
         if (!record.compareAndSet(rec, StateRecord(CandidateOwnership.ADOPTED, terminal = terminal))) {
-            // CAS failed despite the exact active claim matching: ADOPTING was vacated
-            // while its sole holder possessed the claim.  Structurally impossible for a
-            // single holder — surface as a hard, observable invariant violation.
+            // CAS failed: another thread transitioned the state between our read and
+            // CAS.  If the exact active claim still matches and the state changed from
+            // ADOPTING, this is a legitimate race (abortAdoption won), not corruption.
+            val current = record.get()
+            if (current.ownership != CandidateOwnership.ADOPTING ||
+                current.activeClaim !== claim) {
+                return AdoptionResult.LOST_RACE
+            }
+            // State is still ADOPTING with the same claim but CAS still failed:
+            // impossible internal corruption.
             throw AdoptionInvariantException(
                 "completeAdoption CAS failed despite exact active claim: " +
                     "frame=${frameIndex} file=${file} state=${rec.ownership}",
@@ -318,7 +341,7 @@ internal class YuvCandidateHandle(
                 frameIndex = frameIndex
             )
         }
-        return true
+        return AdoptionResult.COMPLETED
     }
 
     /**
@@ -546,6 +569,8 @@ internal class AdoptionToken internal constructor(
         if (prev != AdoptionTokenState.FAILED) {
             val status = reservationStatus()
             return AdoptionRecoveryResult(
+                eligible = false,
+                currentState = prev,
                 rollbackAttempted = false,
                 rollbackReturnedSuccess = false,
                 indexReservationRemaining = status.indexReservedForThisEntry,
@@ -585,6 +610,8 @@ internal class AdoptionToken internal constructor(
             AdoptionTokenState.FAILED_WITH_RESERVATION_DEBT
         state.set(newState)
         return AdoptionRecoveryResult(
+            eligible = true,
+            currentState = AdoptionTokenState.FAILED,
             rollbackAttempted = true,
             rollbackReturnedSuccess = returnedSuccess,
             indexReservationRemaining = status.indexReservedForThisEntry,
@@ -595,6 +622,8 @@ internal class AdoptionToken internal constructor(
     }
 
     data class AdoptionRecoveryResult(
+        val eligible: Boolean,
+        val currentState: AdoptionTokenState?,
         val rollbackAttempted: Boolean,
         val rollbackReturnedSuccess: Boolean,
         val indexReservationRemaining: Boolean,
