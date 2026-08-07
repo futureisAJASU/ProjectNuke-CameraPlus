@@ -28,6 +28,33 @@ class NoFollowFileSystemTest {
         assertTrue(noFollowIdentityMatches(null, null, 12L, 12L, 99L, 99L))
         assertFalse(noFollowIdentityMatches(null, null, 12L, 13L, 99L, 99L))
     }
+
+    @Test
+    fun fileKeyIdentityMatchesExactStringAndRejectsMismatches() {
+        val keyA = "(dev=1,ino=42)"
+        val keyB = "(dev=1,ino=42)"
+        val keyC = "(dev=1,ino=43)"
+        // Same fileKey on both sides -> identity match succeeds.
+        assertTrue(noFollowIdentityMatches(keyA, keyB, 0L, 0L, 0L, 0L))
+        // Different fileKey -> identity mismatch fails closed.
+        assertFalse(noFollowIdentityMatches(keyA, keyC, 0L, 0L, 0L, 0L))
+    }
+
+    @Test
+    fun fileKeyMismatchTrumpsMatchingStatFence() {
+        // fileKey says "different files" even when size+mtime match. The
+        // identity fence must be fail-closed: a same-size same-mtime
+        // replacement with a different fileKey is rejected.
+        assertFalse(noFollowIdentityMatches("(dev=1,ino=1)", "(dev=1,ino=2)", 100L, 100L, 1000L, 1000L))
+    }
+
+    @Test
+    fun sameSizeMtimeDifferentContentFailsWhenFileKeysAreAbsent() {
+        // null/null + matching size + matching mtime -> STILL matches
+        // (the stat fallback accepts this; callers that need stronger
+        // guarantees must layer a content fingerprint on top).
+        assertTrue(noFollowIdentityMatches(null, null, 64L, 64L, 500L, 500L))
+    }
     @Test
     fun childSymlinkIsNotListedOrCounted() {
         val root = createTempDirectory("kepler-nofollow").toFile()
