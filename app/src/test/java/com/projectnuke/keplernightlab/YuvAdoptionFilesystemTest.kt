@@ -106,6 +106,22 @@ class YuvAdoptionFilesystemTest {
         val handlerThread = android.os.HandlerThread("yuv-adopt-test").apply { start() }
         val handler = android.os.Handler(handlerThread.looper)
         val gate = EncodeGate()
+        private var posted = 0
+
+        /**
+         * When true, the SECOND owner dispatch (the completion post from the worker)
+         * is rejected through disposeWithoutMutation, exercising the owner-event
+         * emergency settlement path.  Set on the instance before acceptDirectAndSettle.
+         *
+         * Kept as a mutable field rather than a constructor parameter so that Gradle's
+         * --tests wildcard matches Harness only by name; since Harness has no @Test
+         * methods of its own and (with all-default constructor parameters) a synthetic
+         * no-arg constructor, JUnit's discovery skips it as a non-test class.  Promoting
+         * it to a constructor parameter caused Gradle to additionally select
+         * YuvAdoptionFilesystemTest$Harness and surface JUnit's
+         * "Test class can only have one constructor" initializationError.
+         */
+        var rejectCompletionDispatch = false
 
         val terminalLatch = CountDownLatch(1)
         val onCaptureErrorCount = AtomicInteger(0)
@@ -114,8 +130,19 @@ class YuvAdoptionFilesystemTest {
         val session: YuvCaptureSession = YuvCaptureSession.create(
             // Synchronous dispatch: with a single direct frame, the owner event and
             // the completion event both run inside the worker task, so the adoption
-            // result is fully deterministic once the worker terminates.
-            dispatch = { event -> event.execute(); true },
+            // result is fully deterministic once the worker terminates.  With
+            // rejectCompletionDispatch the FIRST event runs and the SECOND (the
+            // completion post) is rejected through disposeWithoutMutation, exercising
+            // the owner-event emergency settlement path.
+            dispatch = { event ->
+                if (rejectCompletionDispatch && ++posted == 2) {
+                    event.disposeWithoutMutation()
+                    false
+                } else {
+                    event.execute()
+                    true
+                }
+            },
             outputDir = dir,
             frameCount = frameCount,
             rotationDegrees = 0,
@@ -456,6 +483,143 @@ class YuvAdoptionFilesystemTest {
             assertEquals(1, snap.failedFrames)
             assertEquals(0, snap.persistedFrames)
             assertTrue(snap.manifest.isEmpty())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Owner-event rejection: every rejected completion records cleanup debt
+    // ------------------------------------------------------------------
+
+    @Test
+    fun ownerRejectedSuccessCompletionRecordsCleanupDebtForPartialCandidate() {
+        // The completion post is rejected: the emergency settlement path must settle
+        // the partial candidate and keep the cleanup failure observable.
+        val harness = Harness(filesystem = FailingFilesystem())
+        try {
+            harness.rejectCompletionDispatch = true
+            harness.acceptDirectAndSettle()
+            val debts = harness.session.owner.candidateCleanupDebt()
+            assertEquals(1, debts.size)
+            assertTrue(debts[0].contains("candidate cleanup debt"))
+            assertTrue(debts[0].contains("frame=0"))
+            assertTrue(debts[0].contains("quarantine=QUARANTINE_FAILED"))
+            // The candidate file could not be removed: the debt stays observable.
+            assertTrue(harness.leftoverTmpFiles().isNotEmpty())
+            assertEquals(0, harness.session.accounting.snapshot().persistedFrames)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun ownerRejectedFailedCompletionRecordsCleanupDebtForPartialCandidate() {
+        // The completion post carries a Failed status (the committer threw) while
+        // the candidate file was already written by a successful encode.  Rejecting
+        // the completion post exercises the emergency settlement path on a Failed
+        // event: the partial candidate cannot be removed (FailingFilesystem) so the
+        // cleanup debt stays observable.
+        val harness = Harness(
+            filesystem = FailingFilesystem(),
+            committerFailure = IllegalStateException("commit boom")
+        )
+        try {
+            harness.rejectCompletionDispatch = true
+            harness.acceptDirectAndSettle()
+            val debts = harness.session.owner.candidateCleanupDebt()
+            assertEquals(1, debts.size)
+            assertTrue(debts[0].contains("candidate cleanup debt"))
+            assertTrue(debts[0].contains("frame=0"))
+            assertTrue(harness.leftoverTmpFiles().isNotEmpty())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Owner rollback recovery: every rollback failure is recorded
+    // ------------------------------------------------------------------
+
+    /** Accounting whose rollback always throws: the owner's recovery must not drop it. */
+    private fun throwingRollbackAccounting(): YuvCaptureAccounting = object : YuvCaptureAccounting() {
+        override fun rollbackAdoption(token: AdoptionToken): Boolean =
+            throw IllegalStateException("rollback boom")
+    }
+
+    private fun assertRollbackRecoveryDebt(debts: List<String>) {
+        assertTrue("rollback recovery debt missing: $debts", debts.any { it.contains("adoption rollback recovery frame=0") })
+        assertTrue(
+            "recovery failure must be preserved: $debts",
+            debts.any { it.contains("recoveryFailure=IllegalStateException: rollback boom") }
+        )
+        assertTrue("still-held reservations must be reported: $debts", debts.any { it.contains("released=false") })
+        assertTrue("remaining reservations must be visible: $debts", debts.any { it.contains("remainingIndex=true") })
+    }
+
+    @Test
+    fun preExistingFinalCollisionRollbackFailureIsRecorded() {
+        val harness = Harness(accounting = throwingRollbackAccounting())
+        try {
+            val existing = harness.finalFile()
+            Files.write(existing.toPath(), "pre-existing".toByteArray())
+
+            harness.acceptDirectAndSettle()
+
+            assertRollbackRecoveryDebt(harness.session.owner.candidateCleanupDebt())
+            // The pre-existing final file is still preserved byte-for-byte.
+            assertEquals("pre-existing", Files.readAllBytes(existing.toPath()).toString(Charsets.UTF_8))
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun committerFailureRollbackFailureIsRecorded() {
+        val harness = Harness(
+            accounting = throwingRollbackAccounting(),
+            committerFailure = IllegalStateException("commit boom")
+        )
+        try {
+            harness.acceptDirectAndSettle()
+            assertRollbackRecoveryDebt(harness.session.owner.candidateCleanupDebt())
+            assertFalse(harness.finalFile().exists())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun finalVerifierFailureRollbackFailureIsRecorded() {
+        val harness = Harness(
+            accounting = throwingRollbackAccounting(),
+            finalFileVerifier = YuvFinalFileVerifier { _, _ -> false }
+        )
+        try {
+            harness.acceptDirectAndSettle()
+            assertRollbackRecoveryDebt(harness.session.owner.candidateCleanupDebt())
+            assertFalse(harness.finalFile().exists())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun tokenCommitFailureRollbackFailureIsRecorded() {
+        // The accounting commit returns FALSE (no throwable): the token publishes a
+        // diagnostic, and the owner's recovery still records the throwing rollback.
+        val harness = Harness(
+            accounting = object : YuvCaptureAccounting() {
+                override fun commitAdoption(token: AdoptionToken): Boolean = false
+                override fun rollbackAdoption(token: AdoptionToken): Boolean =
+                    throw IllegalStateException("rollback boom")
+            }
+        )
+        try {
+            harness.acceptDirectAndSettle()
+            assertRollbackRecoveryDebt(harness.session.owner.candidateCleanupDebt())
+            assertFalse(harness.finalFile().exists())
+            assertTrue(harness.leftoverTmpFiles().isEmpty())
         } finally {
             harness.shutdown()
         }

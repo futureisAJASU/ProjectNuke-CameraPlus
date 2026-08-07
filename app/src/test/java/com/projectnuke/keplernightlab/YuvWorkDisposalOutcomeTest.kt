@@ -1,6 +1,8 @@
 package com.projectnuke.keplernightlab
 
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -32,6 +34,28 @@ class YuvWorkDisposalOutcomeTest {
         override fun encodeTo(encoder: YuvPngEncoder, candidate: File, rotationDegrees: Int) =
             error("cannot encode")
         override fun release() { released.incrementAndGet() }
+    }
+
+    /**
+     * Deterministic release gating: release() signals entry and blocks until
+     * [releaseGate], making the DISPOSING intermediate observable.
+     */
+    private class GatedDirectSource : OwnedDirectYuvSource {
+        private val entered = CountDownLatch(1)
+        private val releaseLatch = CountDownLatch(1)
+        val releaseCount = AtomicInteger(0)
+        override val timestampNs: Long = 0L
+        override fun encodeTo(encoder: YuvPngEncoder, candidate: File, rotationDegrees: Int) =
+            error("cannot encode")
+        override fun release() {
+            entered.countDown()
+            releaseLatch.await(10, TimeUnit.SECONDS)
+            releaseCount.incrementAndGet()
+        }
+        fun awaitEntered(timeoutSec: Long = 5) {
+            assertTrue("release never entered", entered.await(timeoutSec, TimeUnit.SECONDS))
+        }
+        fun releaseGate() { releaseLatch.countDown() }
     }
 
     @Test
@@ -209,5 +233,35 @@ class YuvWorkDisposalOutcomeTest {
         item.settleBufferedAccounting(accounting)
         assertEquals(0L, reservations.currentBytes())
         assertEquals(0, accounting.snapshot().bufferedFrames)
+    }
+
+    @Test
+    fun secondDisposeDuringInFlightDisposingIsTruthfullyNotClean() {
+        val source = GatedDirectSource()
+        val item = YuvPngWorkItem.directOwned(0, 0L, source) {}
+
+        // The first caller wins the DISPOSING transition and blocks inside release();
+        // the second caller must observe IN_PROGRESS and never touch the resources.
+        val disposeThread = Thread { item.dispose() }
+        disposeThread.start()
+        source.awaitEntered()
+
+        val second = item.dispose()
+
+        assertTrue(second.disposalInProgress)
+        assertTrue(second.alreadyDisposedByAnother)
+        assertFalse(second.isClean)
+        assertTrue(second.failures().isEmpty())
+        assertEquals(0, source.releaseCount.get())
+
+        source.releaseGate()
+        disposeThread.join(5_000)
+        assertFalse("dispose thread still alive", disposeThread.isAlive)
+        // The FIRST caller's settlement completed exactly once and cleanly.
+        assertEquals(1, source.releaseCount.get())
+        val first = item.disposalOutcome()
+        assertNotNull(first)
+        assertTrue(first!!.isClean)
+        assertFalse(first.disposalInProgress)
     }
 }

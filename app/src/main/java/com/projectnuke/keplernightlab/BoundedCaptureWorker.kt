@@ -67,6 +67,10 @@ internal open class BoundedCaptureWorker(
     onRejected: (Runnable) -> Unit = {}
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
+
+    /** Thread-safe internal failure ledger — observable even with default no-op hooks. */
+    private val _ledger = java.util.concurrent.CopyOnWriteArrayList<WorkerFailure>()
+    val disposalsFailureLedger: List<WorkerFailure> get() = _ledger.toList()
     private val queue = ArrayBlockingQueue<Runnable>(capacity.coerceAtLeast(1))
     private val executor = ThreadPoolExecutor(
         1, 1, 0L, TimeUnit.MILLISECONDS,
@@ -128,16 +132,20 @@ internal open class BoundedCaptureWorker(
                             is CaptureTaskDisposalOutcome.Unclean -> {
                                 val description = "taskDisposeUnclean: ${outcome.description}"
                                 taskFailures.add(description)
-                                ignore { onTaskDisposalFailure(task, IllegalStateException(description)) }
+                                val exc = IllegalStateException(description)
+                                ignore { onTaskDisposalFailure(task, exc) }
+                                _ledger.add(WorkerFailure(task, exc, "shutdown", "disposeUnclean", outcome))
                             }
                             is CaptureTaskDisposalOutcome.Failed -> {
                                 taskFailures.add("taskDispose: ${outcome.failure.message}")
                                 ignore { onTaskDisposalFailure(task, outcome.failure) }
+                                _ledger.add(WorkerFailure(task, outcome.failure, "shutdown", "disposeFailed"))
                             }
                         }
                     } catch (t: Throwable) {
                         taskFailures.add("taskDispose: ${t.message}")
                         ignore { onTaskDisposalFailure(task, t) }
+                        _ledger.add(WorkerFailure(task, t, "shutdown", "disposeThrew"))
                     }
                 }
                 is DisposableCaptureTask -> {
@@ -148,6 +156,7 @@ internal open class BoundedCaptureWorker(
                     } catch (t: Throwable) {
                         taskFailures.add("taskDispose: ${t.message}")
                         ignore { onTaskDisposalFailure(task, t) }
+                        _ledger.add(WorkerFailure(task, t, "shutdown", "dispose"))
                     }
                 }
                 else -> nonDisposable++
@@ -160,6 +169,7 @@ internal open class BoundedCaptureWorker(
             } catch (t: Throwable) {
                 rejectionFailures.add("rejectionNotification: ${t.message}")
                 ignore { onRejectionNotificationFailure(task, t) }
+                _ledger.add(WorkerFailure(task, t, "shutdown", "notificationFailure"))
             }
         }
         return CleanupReport(
@@ -182,18 +192,24 @@ internal open class BoundedCaptureWorker(
                         CaptureTaskDisposalOutcome.Clean -> Unit
                         is CaptureTaskDisposalOutcome.Unclean -> {
                             val description = "taskDisposeUnclean: ${outcome.description}"
-                            ignore { onTaskDisposalFailure(task, IllegalStateException(description)) }
+                            val exc = IllegalStateException(description)
+                            ignore { onTaskDisposalFailure(task, exc) }
+                            _ledger.add(WorkerFailure(task, exc, "rejection", "disposeUnclean", outcome))
                         }
-                        is CaptureTaskDisposalOutcome.Failed ->
+                        is CaptureTaskDisposalOutcome.Failed -> {
                             ignore { onTaskDisposalFailure(task, outcome.failure) }
+                            _ledger.add(WorkerFailure(task, outcome.failure, "rejection", "disposeFailed"))
+                        }
                     }
                 } catch (t: Throwable) {
                     ignore { onTaskDisposalFailure(task, t) }
+                    _ledger.add(WorkerFailure(task, t, "rejection", "disposeThrew"))
                 }
             }
             is DisposableCaptureTask -> {
                 try { task.dispose() } catch (t: Throwable) {
                     ignore { onTaskDisposalFailure(task, t) }
+                    _ledger.add(WorkerFailure(task, t, "rejection", "dispose"))
                 }
             }
             else -> Unit
@@ -202,6 +218,7 @@ internal open class BoundedCaptureWorker(
             notificationHook(task)
         } catch (t: Throwable) {
             ignore { onRejectionNotificationFailure(task, t) }
+            _ledger.add(WorkerFailure(task, t, "rejection", "notificationFailure"))
         }
     }
 
@@ -217,4 +234,16 @@ internal open class BoundedCaptureWorker(
     }
 
     override fun close() { shutdownNow() }
+
+    /**
+     * Permanent record of a worker disposal/rejection/notification failure.
+     * Observable even with default no-op hooks.
+     */
+    data class WorkerFailure(
+        val task: Runnable,
+        val throwable: Throwable,
+        val stage: String, // "shutdown" or "rejection"
+        val failureType: String,
+        val disposalOutcome: CaptureTaskDisposalOutcome? = null
+    )
 }

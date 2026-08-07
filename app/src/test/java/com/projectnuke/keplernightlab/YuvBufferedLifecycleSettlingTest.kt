@@ -373,6 +373,87 @@ class YuvBufferedLifecycleSettlingTest {
     }
 
     @Test
+    fun bufferedEncodeTaskNormalRunUncleanOutcomeReachesWorkDisposalDebt() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        val issues = CopyOnWriteArrayList<YuvBufferedLifecycle.EncodingSettlementOutcome>()
+        val debts = CopyOnWriteArrayList<Pair<YuvPngWorkItem, YuvWorkDisposalOutcome>>()
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
+            error("onRelease threw")
+        }
+        assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
+
+        BufferedEncodeTask(
+            item = item,
+            accounting = accounting,
+            lifecycle = lifecycle,
+            candidateFilesystem = RealYuvCandidateFilesystem,
+            encode = {
+                YuvWorkerCompletion.Success(
+                    0, 1L, YuvCandidateHandle(0, File("candidate.tmp")), "frame_00_color.png", 0L
+                )
+            },
+            postCompletion = { _ -> },
+            onSettlementIssue = { _, outcome -> issues.add(outcome) },
+            onWorkDisposalDebt = { workItem, outcome -> debts.add(workItem to outcome) }
+        ).run()
+
+        // The task's NORMAL run settled with an unclean work-item disposal (the
+        // release observer threw): the debt hook receives the item and its truthful
+        // outcome instead of the failure being silently passed.
+        assertEquals(1, debts.size)
+        assertEquals(item, debts[0].first)
+        assertFalse(debts[0].second.isClean)
+        assertEquals("onRelease threw", debts[0].second.releaseObserverFailure?.message)
+        assertEquals(1, issues.size)
+        assertEquals(YuvBufferedLifecycle.EncodingSettlementStatus.SETTLED, issues[0].status)
+        assertEquals("onRelease threw", issues[0].failure?.message)
+    }
+
+    @Test
+    fun repeatedBufferedEncodeTaskDisposalPreservesFirstFailedOutcome() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        val debtCount = AtomicInteger(0)
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
+            error("onRelease threw")
+        }
+        assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
+        val task = BufferedEncodeTask(
+            item = item,
+            accounting = accounting,
+            lifecycle = lifecycle,
+            candidateFilesystem = RealYuvCandidateFilesystem,
+            encode = {
+                YuvWorkerCompletion.Success(
+                    0, 1L, YuvCandidateHandle(0, File("candidate.tmp")), "frame_00_color.png", 0L
+                )
+            },
+            postCompletion = { _ -> },
+            onWorkDisposalDebt = { _, _ -> debtCount.incrementAndGet() }
+        )
+
+        val first = task.disposeWithOutcome()
+        val second = task.disposeWithOutcome()
+
+        assertTrue(first is CaptureTaskDisposalOutcome.Unclean)
+        assertTrue(second is CaptureTaskDisposalOutcome.Unclean)
+        // The repeated disposal preserves the FIRST failed outcome (same description,
+        // never an empty clean result), and the debt hook fired exactly once.
+        assertEquals(
+            (first as CaptureTaskDisposalOutcome.Unclean).description,
+            (second as CaptureTaskDisposalOutcome.Unclean).description
+        )
+        assertEquals(1, debtCount.get())
+    }
+
+    @Test
     fun alreadySettlingItemReportsSettlingPreviousState() {
         val lifecycle = YuvBufferedLifecycle()
         val accounting = YuvCaptureAccounting()

@@ -105,6 +105,18 @@ class YuvCaptureOwnerTest {
         override fun release() { releaseCount.incrementAndGet() }
     }
 
+    /**
+     * Direct access whose release() ALSO throws: the primary failure (timestamp)
+     * and the release failure must both be observable in the owner ledger.
+     */
+    private class ThrowingReleaseDirectAccess : DirectYuvImageAccess {
+        override fun timestampNs(): Long = error("timestamp failed")
+        override fun allocationBytes(): Long = 0L
+        override fun copy(frameIndex: Int): BufferedYuvFrame = error("direct work does not copy")
+        override fun takeImage(): Image? = null
+        override fun release(): Unit = error("release threw")
+    }
+
     // ------------------------------------------------------------------
     // Test harness: deterministic session via the production seam
     // ------------------------------------------------------------------
@@ -344,6 +356,27 @@ class YuvCaptureOwnerTest {
             val status = harness.awaitTerminal()
             assertEquals(CaptureTerminalStatus.FAILED, status)
             assertEquals(1, access.closeCount.get())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun directCreationReleaseFailureReachesOwnerLedger() {
+        // createDirectYuvWork fails on timestamp access AND the emergency release
+        // itself throws: the release failure must reach the observable ledger
+        // instead of being silently discarded.
+        val harness = Harness(frameCount = 1)
+        try {
+            harness.session.owner.acceptDirect(ThrowingReleaseDirectAccess())
+            val status = harness.awaitTerminal()
+            assertEquals(CaptureTerminalStatus.FAILED, status)
+            val debts = harness.session.owner.candidateCleanupDebt()
+            assertEquals(1, debts.size)
+            assertTrue(debts[0].contains("direct creation releaseFailure frame=0"))
+            assertTrue(debts[0].contains("cause=IllegalStateException: timestamp failed"))
+            assertTrue(debts[0].contains("releaseFailure=IllegalStateException: release threw"))
+            assertEquals(1, harness.onCaptureErrorCount.get())
         } finally {
             harness.shutdown()
         }

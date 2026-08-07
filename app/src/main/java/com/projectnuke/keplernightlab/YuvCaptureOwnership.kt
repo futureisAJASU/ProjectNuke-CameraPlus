@@ -153,18 +153,34 @@ internal object RealYuvFinalFileVerifier : YuvFinalFileVerifier {
 }
 
 /**
+ * Terminal candidate publication: after every settlement the final atomic state
+ * together with the [CandidateDisposalOutcome] (or null for ADOPTED) is
+ * published so a caller observing DISCARDING cannot mistake an in-flight
+ * operation for a settled terminal state.  [isInProgressOrTerminal] is true
+ * when another caller is currently performing the settlement and has not yet
+ * published the outcome; in this case finalState is DISCARDING.
+ */
+internal data class CandidateTerminalRecord(
+    val finalState: CandidateOwnership,
+    val outcome: CandidateDisposalOutcome? = null,
+    val isInProgressOrTerminal: Boolean = false
+)
+
+/**
  * Owner-side result of a candidate settlement.  [cleanupFailed] is true exactly when
  * the candidate could neither be deleted nor quarantined: the file remains and the
- * cleanup debt stays observable ([CandidateDisposalOutcome.failureDescription]),
+ * cleanup debt stays observable ([failureDescription]),
  * preserving frame identity, candidate path, failed operations, throwable
  * type/message and the final candidate state.
  */
 internal class CandidateDisposalOutcome(
-    val finalState: CandidateOwnership,
+    val terminal: CandidateTerminalRecord,
     val deleteResult: CandidateFileOperationResult? = null,
     val quarantineResult: CandidateFileOperationResult? = null,
     val alreadySettled: Boolean = false
 ) {
+    val finalState: CandidateOwnership get() = terminal.finalState
+
     val cleanupFailed: Boolean
         get() = !alreadySettled && finalState == CandidateOwnership.QUARANTINED &&
             quarantineResult is CandidateFileOperationResult.QUARANTINE_FAILED
@@ -186,6 +202,9 @@ internal class CandidateDisposalOutcome(
     }
 
     companion object {
+        fun rejectedForInFlight(terminal: CandidateTerminalRecord): CandidateDisposalOutcome =
+            CandidateDisposalOutcome(terminal, alreadySettled = true)
+
         private fun throwableDetail(label: String, failure: Throwable?): String =
             if (failure == null) ""
             else "; $label=${failure::class.java.simpleName}: ${failure.message}"
@@ -193,15 +212,33 @@ internal class CandidateDisposalOutcome(
 }
 
 /**
- * Exclusive adoption claim granted by [YuvCandidateHandle.tryBeginAdoption].
- * Completion ([YuvCandidateHandle.completeAdoption]) and abort
- * ([YuvCandidateHandle.abortAdoption]) are only accepted for the exact claim that
- * won the UNSETTLED -> ADOPTING transition, so adoption and discard share one
- * atomic ownership claim and a DISCARDING candidate can never become ADOPTED.
+ * Opaque, unforgeable adoption claim granted only by
+ * [YuvCandidateHandle.tryBeginAdoption].  The claim carries an internal nonce
+ * that the handle validates atomically: completion and abort are only accepted
+ * for the exact claim that won the UNSETTLED -> ADOPTING transition.
+ * A same-handle forged claim (e.g. constructing a new claim without calling
+ * `tryBeginAdoption`) is rejected because the nonce never matches the state
+ * record's active claimNonce.  The active nonce is cleared only on terminal
+ * completion/abort.
  */
-internal class CandidateAdoptionClaim internal constructor(
-    val handle: YuvCandidateHandle
-)
+internal class CandidateAdoptionClaim private constructor(
+    val handle: YuvCandidateHandle,
+    internal val nonce: Long
+) {
+    companion object {
+        internal fun create(handle: YuvCandidateHandle, nonce: Long): CandidateAdoptionClaim =
+            CandidateAdoptionClaim(handle, nonce)
+
+        /**
+         * TEST-ONLY: simulates an attacker forging a claim for [handle] without
+         * calling tryBeginAdoption.  The nonce 0 can never match an active claim
+         * (tryBeginAdoption always issues nonce >= 1), so every forged claim is
+         * rejected by handle validation.
+         */
+        internal fun forgedForTest(handle: YuvCandidateHandle): CandidateAdoptionClaim =
+            CandidateAdoptionClaim(handle, 0L)
+    }
+}
 
 /**
  * Exactly-once candidate ownership handle backed by one atomic state machine.  A
@@ -216,57 +253,104 @@ internal class YuvCandidateHandle(
     val frameIndex: Int,
     val file: File
 ) {
-    private val state = AtomicReference(CandidateOwnership.UNSETTLED)
+    private data class StateRecord(
+        val ownership: CandidateOwnership = CandidateOwnership.UNSETTLED,
+        val claimNonce: Long = 0L,
+        val terminal: CandidateTerminalRecord? = null
+    )
 
-    fun state(): CandidateOwnership = state.get()
+    private val record = AtomicReference(StateRecord())
+
+    fun state(): CandidateOwnership = record.get().ownership
+
+    /** The terminal record once settled, or null while in-flight or unsettled. */
+    fun terminal(): CandidateTerminalRecord? = record.get().terminal
 
     /**
      * Exactly-once UNSETTLED -> ADOPTING.  The winner receives the exclusive
-     * [CandidateAdoptionClaim]; a concurrent discard is rejected for as long as the
-     * claim is held.  Returns null when the candidate is already claimed or settled.
+     * [CandidateAdoptionClaim] with the active nonce; a concurrent discard is
+     * rejected for as long as the claim is held.  Returns null when the
+     * candidate is already claimed or settled.
      */
-    fun tryBeginAdoption(): CandidateAdoptionClaim? =
-        if (state.compareAndSet(CandidateOwnership.UNSETTLED, CandidateOwnership.ADOPTING)) {
-            CandidateAdoptionClaim(this)
+    fun tryBeginAdoption(): CandidateAdoptionClaim? {
+        val old = record.get()
+        if (old.ownership != CandidateOwnership.UNSETTLED) return null
+        val nextNonce = old.claimNonce + 1
+        val target = StateRecord(CandidateOwnership.ADOPTING, nextNonce)
+        return if (record.compareAndSet(old, target)) {
+            CandidateAdoptionClaim.create(this, nextNonce)
         } else {
             null
         }
-
-    /**
-     * Exactly-once ADOPTING -> ADOPTED for the holder of [claim].  Only the claim
-     * owner may complete; the ADOPTING intermediate makes a completion-race with
-     * any discard impossible.
-     */
-    fun completeAdoption(claim: CandidateAdoptionClaim): Boolean {
-        if (claim.handle !== this) return false
-        return state.compareAndSet(CandidateOwnership.ADOPTING, CandidateOwnership.ADOPTED)
     }
 
     /**
-     * Exactly-once ADOPTING -> DISCARDING -> DISCARDED/QUARANTINED for the holder of
-     * [claim]: the failed adoption settles the candidate through the normal
-     * settlement path (delete, quarantine on failure), never leaving it ADOPTING or
-     * UNSETTLED.  Filesystem throws are contained.
+     * Exactly-once ADOPTING -> ADOPTED for the holder of [claim].  Only the
+     * genuine active claim may complete: the nonce must match the state
+     * record's current claimNonce as well as the handle identity.  The ADOPTING
+     * intermediate makes a completion-race with any discard impossible.
+     */
+    fun completeAdoption(claim: CandidateAdoptionClaim): Boolean {
+        if (claim.handle !== this) return false
+        val rec = record.get()
+        if (rec.ownership != CandidateOwnership.ADOPTING || rec.claimNonce != claim.nonce) return false
+        val terminal = CandidateTerminalRecord(CandidateOwnership.ADOPTED)
+        return record.compareAndSet(rec, StateRecord(CandidateOwnership.ADOPTED, terminal = terminal))
+    }
+
+    /**
+     * Exactly-once ADOPTING -> DISCARDING -> DISCARDED/QUARANTINED for the
+     * holder of [claim]: the failed adoption settles the candidate through
+     * the normal settlement path (delete, quarantine on failure), never
+     * leaving it ADOPTING or UNSETTLED.  Filesystem throws are contained.
      */
     fun abortAdoption(
         claim: CandidateAdoptionClaim,
         filesystem: YuvCandidateFilesystem
     ): CandidateDisposalOutcome {
-        if (claim.handle !== this) return CandidateDisposalOutcome(state.get(), alreadySettled = true)
-        if (!state.compareAndSet(CandidateOwnership.ADOPTING, CandidateOwnership.DISCARDING)) {
-            return CandidateDisposalOutcome(state.get(), alreadySettled = true)
+        if (claim.handle !== this) {
+            val cur = record.get()
+            val term = cur.terminal ?: CandidateTerminalRecord(cur.ownership, isInProgressOrTerminal = true)
+            return CandidateDisposalOutcome.rejectedForInFlight(term)
+        }
+        val rec = record.get()
+        if (rec.ownership != CandidateOwnership.ADOPTING || rec.claimNonce != claim.nonce) {
+            val term = rec.terminal ?: CandidateTerminalRecord(rec.ownership, isInProgressOrTerminal = true)
+            return CandidateDisposalOutcome.rejectedForInFlight(term)
+        }
+        if (!record.compareAndSet(rec, StateRecord(CandidateOwnership.DISCARDING))) {
+            val current = record.get()
+            val term = current.terminal ?: CandidateTerminalRecord(current.ownership, isInProgressOrTerminal = true)
+            return CandidateDisposalOutcome.rejectedForInFlight(term)
         }
         return settleFromDiscarding(filesystem)
     }
 
     /**
-     * Exactly-once UNSETTLED -> DISCARDING -> DISCARDED/QUARANTINED settlement: the
-     * first caller performs the file operations; concurrent/repeated callers observe
-     * the settled (or in-flight) state and never touch the file again.
+     * Exactly-once UNSETTLED -> DISCARDING -> DISCARDED/QUARANTINED
+     * settlement: the first caller performs the file operations;
+     * concurrent/repeated callers observe the settled (or in-flight) state
+     * and never touch the file again.  While DISCARDING, a concurrent call
+     * returns IN_PROGRESS (isInProgressOrTerminal=true), not a terminal
+     * alreadySettled.
      */
     fun discardOrQuarantine(filesystem: YuvCandidateFilesystem): CandidateDisposalOutcome {
-        if (!state.compareAndSet(CandidateOwnership.UNSETTLED, CandidateOwnership.DISCARDING)) {
-            return CandidateDisposalOutcome(state.get(), alreadySettled = true)
+        var current = record.get()
+        if (current.terminal != null) {
+            return CandidateDisposalOutcome(current.terminal!!, alreadySettled = true)
+        }
+        if (current.ownership != CandidateOwnership.UNSETTLED) {
+            return CandidateDisposalOutcome.rejectedForInFlight(
+                CandidateTerminalRecord(current.ownership, isInProgressOrTerminal = true)
+            )
+        }
+        if (!record.compareAndSet(current, StateRecord(CandidateOwnership.DISCARDING))) {
+            val next = record.get()
+            val term = next.terminal
+            if (term != null) return CandidateDisposalOutcome(term, alreadySettled = true)
+            return CandidateDisposalOutcome.rejectedForInFlight(
+                CandidateTerminalRecord(next.ownership, isInProgressOrTerminal = true)
+            )
         }
         return settleFromDiscarding(filesystem)
     }
@@ -286,8 +370,9 @@ internal class YuvCandidateHandle(
                 finalState = CandidateOwnership.QUARANTINED
             }
         }
-        state.set(finalState)
-        return CandidateDisposalOutcome(finalState, deleteResult, quarantineResult)
+        val terminal = CandidateTerminalRecord(finalState)
+        record.set(StateRecord(finalState, terminal = terminal))
+        return CandidateDisposalOutcome(terminal, deleteResult, quarantineResult)
     }
 
     /** Contain a throwing delete implementation; the throwable is preserved. */
@@ -342,8 +427,9 @@ internal class AdoptionToken internal constructor(
     /**
      * Exactly-once RESERVED -> COMMITTING -> COMMITTED.  COMMITTED is only visible
      * after the manifest/persisted mutation completed; an accounting failure leaves
-     * the token in [AdoptionTokenState.FAILED] with [failure] set.  False when the
-     * token was already settled.
+     * the token in [AdoptionTokenState.FAILED] with [failure] set to an
+     * [AdoptionInvariantException] (for false returns) or the thrown exception.
+     * False when the token was already settled.
      */
     fun commit(): Boolean {
         if (!state.compareAndSet(AdoptionTokenState.RESERVED, AdoptionTokenState.COMMITTING)) return false
@@ -354,6 +440,9 @@ internal class AdoptionToken internal constructor(
             false
         }
         if (!ok) {
+            if (failure == null) {
+                failure = commitFailDiagnostic()
+            }
             state.set(AdoptionTokenState.FAILED)
             return false
         }
@@ -364,8 +453,9 @@ internal class AdoptionToken internal constructor(
     /**
      * Exactly-once RESERVED -> ROLLING_BACK -> ROLLED_BACK.  ROLLED_BACK is only
      * visible after both reservations were released; an accounting failure leaves
-     * the token in [AdoptionTokenState.FAILED] with [failure] set.  False when the
-     * token was already settled.
+     * the token in [AdoptionTokenState.FAILED] with [failure] set to an
+     * [AdoptionInvariantException] (for false returns) or the thrown exception.
+     * False when the token was already settled.
      */
     fun rollback(): Boolean {
         if (!state.compareAndSet(AdoptionTokenState.RESERVED, AdoptionTokenState.ROLLING_BACK)) return false
@@ -376,12 +466,95 @@ internal class AdoptionToken internal constructor(
             false
         }
         if (!ok) {
+            if (failure == null) {
+                failure = rollbackFailDiagnostic()
+            }
             state.set(AdoptionTokenState.FAILED)
             return false
         }
         state.set(AdoptionTokenState.ROLLED_BACK)
         return true
     }
+
+    /**
+     * Recovery after a failed adoption: releases whatever reservations remain,
+     * reports whether reservations are still held and whether asymmetric
+     * corruption was detected.  Uses the token's own release path (never the
+     * accounting escape hatch) so observable reservation state stays truthful.
+     */
+    fun recoverRollbackAfterFailure(): AdoptionRecoveryResult {
+        var remainingIndex = false
+        var remainingFilename = false
+        var asymmetric = false
+        var recoveryFailure: Throwable? = null
+        try {
+            accounting.rollbackAdoption(this)
+            val snapAfter = accounting.snapshot()
+            remainingIndex = snapAfter.reservedIndexCount > 0
+            remainingFilename = snapAfter.reservedFilenameCount > 0
+            if (remainingIndex != remainingFilename) asymmetric = true
+        } catch (t: Throwable) {
+            recoveryFailure = t
+            val snap = accounting.snapshot()
+            remainingIndex = snap.reservedIndexCount > 0
+            remainingFilename = snap.reservedFilenameCount > 0
+            if (remainingIndex != remainingFilename) asymmetric = true
+        }
+        return AdoptionRecoveryResult(
+            released = !remainingIndex && !remainingFilename,
+            remainingIndex = remainingIndex,
+            remainingFilename = remainingFilename,
+            asymmetric = asymmetric,
+            recoveryFailure = recoveryFailure
+        )
+    }
+
+    data class AdoptionRecoveryResult(
+        val released: Boolean,
+        val remainingIndex: Boolean,
+        val remainingFilename: Boolean,
+        val asymmetric: Boolean,
+        val recoveryFailure: Throwable? = null
+    )
+
+    private fun commitFailDiagnostic(): AdoptionInvariantException {
+        val entry = reservedEntry
+        val snap = accounting.snapshot()
+        val manifestHasIndex = snap.manifest.any { it.frameIndex == entry.frameIndex }
+        val manifestHasFilename = snap.manifest.any { it.filename == entry.filename }
+        return AdoptionInvariantException(
+            "commitAdoption returned false: frame=${entry.frameIndex} file=${entry.filename}",
+            "commitAdoption",
+            entry.frameIndex, entry.filename,
+            reservedIndexPresent = snap.reservedIndexCount > 0,
+            reservedFilenamePresent = snap.reservedFilenameCount > 0,
+            manifestCollisionIndex = manifestHasIndex,
+            manifestCollisionFilename = manifestHasFilename
+        )
+    }
+
+    private fun rollbackFailDiagnostic(): AdoptionInvariantException {
+        val entry = reservedEntry
+        val snap = accounting.snapshot()
+        return AdoptionInvariantException(
+            "rollbackAdoption returned false: frame=${entry.frameIndex} file=${entry.filename}",
+            "rollbackAdoption",
+            entry.frameIndex, entry.filename,
+            reservedIndexPresent = snap.reservedIndexCount > 0,
+            reservedFilenamePresent = snap.reservedFilenameCount > 0
+        )
+    }
+
+    private class AdoptionInvariantException(
+        message: String,
+        val operation: String,
+        val frameIndex: Int,
+        val filename: String,
+        val reservedIndexPresent: Boolean,
+        val reservedFilenamePresent: Boolean,
+        val manifestCollisionIndex: Boolean? = null,
+        val manifestCollisionFilename: Boolean? = null
+    ) : IllegalStateException(message)
 }
 
 // ── Owned direct YUV source abstraction ────────────────────────────
@@ -431,10 +604,14 @@ internal open class YuvCaptureAccounting {
     open fun failedFrame() = synchronized(lock) { failed++ }
     fun droppedFrame() = synchronized(lock) { dropped++ }
 
-    // Legacy / ColorFusion compat
+    // Legacy / ColorFusion compat — must reject any entry whose frame index or
+    // filename is currently reserved by a pending adoption token, so legacy and
+    // adoption paths can never race on the same identity.
     fun persistedFrame(entry: YuvFrameManifestEntry): Boolean = synchronized(lock) {
         if (!entry.persisted || manifest.containsKey(entry.frameIndex)
-            || manifest.values.any { it.filename == entry.filename }) {
+            || manifest.values.any { it.filename == entry.filename }
+            || reservedIndices.contains(entry.frameIndex)
+            || reservedFilenames.contains(entry.filename)) {
             return@synchronized false
         }
         manifest[entry.frameIndex] = entry
@@ -455,14 +632,24 @@ internal open class YuvCaptureAccounting {
     }
 
     /**
-     * Atomic reservation removal: BOTH reservations must exist; neither set is
-     * mutated until both checks pass; both are removed inside this single
-     * synchronized operation.  On any invariant failure both sets are left unchanged
-     * and false is returned.  Open for deterministic failure injection in tests.
+     * Atomic reservation removal: BOTH reservations must exist, the manifest must
+     * have neither the frame-index nor the filename, and persistedFrames ==
+     * manifest.size BEFORE mutation.  Only after EVERY validation succeeds does
+     * this operation remove both reservations, append the manifest entry and
+     * increment persistedFrames.  On any invariant failure both sets are left
+     * unchanged and false is returned.  Open for deterministic failure injection
+     * in tests.
      */
     open fun commitAdoption(token: AdoptionToken): Boolean = synchronized(lock) {
         val entry = token.reservedEntry
         if (!reservedIndices.contains(entry.frameIndex) || !reservedFilenames.contains(entry.filename)) {
+            return@synchronized false
+        }
+        if (manifest.containsKey(entry.frameIndex) ||
+            manifest.values.any { it.filename == entry.filename }) {
+            return@synchronized false
+        }
+        if (persisted != manifest.size) {
             return@synchronized false
         }
         reservedIndices.remove(entry.frameIndex)
@@ -744,6 +931,8 @@ internal sealed interface YuvOwnedSource {
 internal class YuvWorkDisposalOutcome(
     val disposalAttempted: Boolean,
     val alreadySettled: Boolean = false,
+    val alreadyDisposedByAnother: Boolean = false,
+    val disposalInProgress: Boolean = false,
     val originalOutcome: YuvWorkDisposalOutcome? = null,
     val sourceReleaseRequired: Boolean,
     val sourceReleaseAttempted: Boolean,
@@ -771,21 +960,45 @@ internal class YuvWorkDisposalOutcome(
 
     /**
      * True when every REQUIRED settlement was attempted AND completed by this call
-     * (or, for an already-settled mirror, by the original settlement).
+     * (or, for an already-settled mirror, by the original settlement).  An
+     * IN_PROGRESS outcome (disposalInProgress=true) is never clean.
      */
     val isClean: Boolean
-        get() = originalOutcome?.isClean ?: (
+        get() = if (disposalInProgress) false
+        else originalOutcome?.isClean ?: (
             !failed &&
                 (!sourceReleaseRequired || (sourceReleaseAttempted && sourceReleased)) &&
                 (!reservationReleaseRequired || (reservationReleaseAttempted && reservationReleased)) &&
                 (!bufferedAccountingReleaseRequired ||
                     (bufferedAccountingReleaseAttempted && bufferedAccountingReleased)) &&
                 (!releaseObserverRequired || (releaseObserverAttempted && releaseObserverCompleted))
-            )
+        )
 
     companion object {
         fun notAttempted(): YuvWorkDisposalOutcome = YuvWorkDisposalOutcome(
             disposalAttempted = false,
+            sourceReleaseRequired = false,
+            sourceReleaseAttempted = false,
+            sourceReleased = false,
+            reservationReleaseRequired = false,
+            reservationReleaseAttempted = false,
+            reservationReleased = false,
+            bufferedAccountingReleaseRequired = false,
+            bufferedAccountingReleaseAttempted = false,
+            bufferedAccountingReleased = false,
+            releaseObserverRequired = false,
+            releaseObserverAttempted = false,
+            releaseObserverCompleted = false
+        )
+
+        /**
+         * IN_PROGRESS: another caller is actively disposing this item.  This outcome
+         * is never clean and never reports a terminal settled state.
+         */
+        internal fun inProgress(): YuvWorkDisposalOutcome = YuvWorkDisposalOutcome(
+            disposalAttempted = true,
+            alreadyDisposedByAnother = true,
+            disposalInProgress = true,
             sourceReleaseRequired = false,
             sourceReleaseAttempted = false,
             sourceReleased = false,
@@ -809,6 +1022,7 @@ internal class YuvWorkDisposalOutcome(
             YuvWorkDisposalOutcome(
                 disposalAttempted = false,
                 alreadySettled = true,
+                alreadyDisposedByAnother = true,
                 originalOutcome = first,
                 sourceReleaseRequired = first.sourceReleaseRequired,
                 sourceReleaseAttempted = false,
@@ -838,9 +1052,15 @@ internal class YuvPngWorkItem private constructor(
     private val reservations: YuvBufferReservations?,
     private val onRelease: (() -> Unit)?
 ) {
-    private val released = AtomicBoolean(false)
+    private enum class DisposalState { NOT_STARTED, DISPOSING, SETTLED }
+
+    private data class DisposalRecord(
+        val state: DisposalState = DisposalState.NOT_STARTED,
+        val outcome: YuvWorkDisposalOutcome? = null
+    )
+
+    private val disposal = AtomicReference(DisposalRecord())
     private val bufferedReleased = AtomicBoolean(false)
-    private val firstOutcome = AtomicReference<YuvWorkDisposalOutcome?>(null)
 
     internal val isBuffered: Boolean
         get() = source is YuvOwnedSource.Buffered
@@ -867,20 +1087,38 @@ internal class YuvPngWorkItem private constructor(
     }
 
     /** The FIRST disposal outcome, or null when this item has never been disposed. */
-    internal fun disposalOutcome(): YuvWorkDisposalOutcome? = firstOutcome.get()
+    internal fun disposalOutcome(): YuvWorkDisposalOutcome? = disposal.get().outcome
 
     /**
      * Exactly-once disposal with an explicit [YuvWorkDisposalOutcome]: the owned source
      * (direct release / buffered reservation + accounting) and the release observer are
-     * each settled independently so a failure never skips other cleanup.  The FIRST
-     * outcome is preserved: repeated calls return an already-settled mirror carrying
-     * [YuvWorkDisposalOutcome.alreadySettled] and [YuvWorkDisposalOutcome.originalOutcome].
+     * each settled independently so a failure never skips other cleanup.
+     *
+     * NOT_STARTED -> DISPOSING -> SETTLED(outcome) is a single atomic state
+     * machine: the first caller transitions to DISPOSING and performs every
+     * independent resource settlement before publishing SETTLED.  A second
+     * caller during DISPOSING returns an IN_PROGRESS outcome (isClean=false)
+     * and must not perform any resource settlement.  After SETTLED, repeated
+     * calls return an already-settled mirror of the exact original outcome.
      */
     fun dispose(accounting: YuvCaptureAccounting? = null): YuvWorkDisposalOutcome {
-        if (!released.compareAndSet(false, true)) {
-            val first = firstOutcome.get()
-            return if (first == null) YuvWorkDisposalOutcome.notAttempted()
-            else YuvWorkDisposalOutcome.alreadySettled(first)
+        // AtomicReference.compareAndSet compares object IDENTITY, so the expected
+        // value must be the exact instance read from the reference — a freshly
+        // constructed equal record never matches.  getAndUpdate returns the
+        // PREVIOUS value: only a previous NOT_STARTED record wins the DISPOSING
+        // transition.
+        val previous = disposal.getAndUpdate { cur ->
+            if (cur.state == DisposalState.NOT_STARTED) DisposalRecord(DisposalState.DISPOSING) else cur
+        }
+        if (previous.state != DisposalState.NOT_STARTED) {
+            val first = previous.outcome
+            return if (first != null) {
+                YuvWorkDisposalOutcome.alreadySettled(first)
+            } else {
+                // DISPOSING – another caller is in-flight.  Return IN_PROGRESS, never
+                // marked clean.
+                YuvWorkDisposalOutcome.inProgress()
+            }
         }
 
         val isDirect = source is YuvOwnedSource.Direct
@@ -960,7 +1198,7 @@ internal class YuvPngWorkItem private constructor(
             releaseObserverCompleted = releaseObserverCompleted,
             releaseObserverFailure = releaseObserverFailure
         )
-        firstOutcome.set(outcome)
+        disposal.set(DisposalRecord(DisposalState.SETTLED, outcome))
         return outcome
     }
 
@@ -1075,11 +1313,35 @@ internal class DisposableYuvTask(
 }
 
 /** Stable description of an unclean item disposal for debt reporting. */
-internal fun disposalDescription(outcome: YuvWorkDisposalOutcome, frameIndex: Int): String =
-    "work-item disposal unclean frame=$frameIndex: " +
-        outcome.failures().joinToString("; ") {
-            "${it::class.java.simpleName}: ${it.message}"
-        }
+internal fun disposalDescription(outcome: YuvWorkDisposalOutcome, frameIndex: Int): String {
+    val parts = mutableListOf<String>()
+    parts.add("work-item disposal unclean frame=$frameIndex")
+
+    if (outcome.disposalInProgress) parts.add("disposal=IN_PROGRESS")
+
+    if (outcome.sourceReleaseRequired && !outcome.sourceReleaseAttempted)
+        parts.add("sourceReleaseRequired=notAttempted")
+    if (outcome.reservationReleaseRequired && !outcome.reservationReleaseAttempted)
+        parts.add("reservationReleaseRequired=notAttempted")
+    if (outcome.bufferedAccountingReleaseRequired && !outcome.bufferedAccountingReleaseAttempted)
+        parts.add("bufferedAccountingReleaseRequired=notAttempted")
+    if (outcome.releaseObserverRequired && !outcome.releaseObserverAttempted)
+        parts.add("releaseObserverRequired=notAttempted")
+
+    if (outcome.disposalInProgress) parts.add("anotherCaller=DISPOSING")
+
+    val failures = outcome.failures()
+    if (failures.isNotEmpty()) {
+        parts.add(
+            failures.joinToString("; ") {
+                "${it::class.java.simpleName}: ${it.message}"
+            }
+        )
+    }
+
+    if (parts.size == 1) parts.add("noFailures")
+    return parts.joinToString(": ")
+}
 
 // ═══ Cleanup coordinator ═══════════════════════════════════════════════
 

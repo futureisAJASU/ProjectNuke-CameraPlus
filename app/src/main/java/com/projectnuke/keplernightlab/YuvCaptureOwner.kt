@@ -4,6 +4,7 @@ import android.util.Log
 import java.io.File
 import java.lang.Runnable
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Immutable worker completion result.  The worker never mutates owner state; it only
@@ -60,6 +61,7 @@ internal sealed interface YuvWorkerCompletion {
  * inconsistent with this task's own settlement, and surfacing them is the only way
  * a lost release can be detected.
  */
+/** BufferedEncodeTask */
 internal class BufferedEncodeTask(
     val item: YuvPngWorkItem,
     private val accounting: YuvCaptureAccounting,
@@ -67,9 +69,11 @@ internal class BufferedEncodeTask(
     private val candidateFilesystem: YuvCandidateFilesystem,
     private val encode: () -> YuvWorkerCompletion,
     private val postCompletion: (YuvWorkerCompletion) -> Unit,
-    private val onSettlementIssue: ((YuvPngWorkItem, YuvBufferedLifecycle.EncodingSettlementOutcome) -> Unit)? = null
+    private val onSettlementIssue: ((YuvPngWorkItem, YuvBufferedLifecycle.EncodingSettlementOutcome) -> Unit)? = null,
+    private val onWorkDisposalDebt: ((YuvPngWorkItem, YuvWorkDisposalOutcome) -> Unit)? = null
 ) : OutcomeDisposableCaptureTask {
     private val settled = AtomicBoolean(false)
+    private val firstTaskOutcome = AtomicReference<CaptureTaskDisposalOutcome?>(null)
 
     override fun run() {
         val completion = try {
@@ -89,7 +93,9 @@ internal class BufferedEncodeTask(
     override fun dispose() { disposeWithOutcome() }
 
     override fun disposeWithOutcome(): CaptureTaskDisposalOutcome {
-        if (!settled.compareAndSet(false, true)) return CaptureTaskDisposalOutcome.Clean
+        if (!settled.compareAndSet(false, true)) {
+            return firstTaskOutcome.get()?.let { asMirrored(it) } ?: CaptureTaskDisposalOutcome.Clean
+        }
         return settleItemAndReport()
     }
 
@@ -97,20 +103,34 @@ internal class BufferedEncodeTask(
         val outcome = lifecycle.settleEncoding(item, accounting)
         val settledCleanly = outcome.status == YuvBufferedLifecycle.EncodingSettlementStatus.SETTLED &&
             outcome.failure == null && outcome.lifecycleReleaseFailure == null
-        if (settledCleanly) return CaptureTaskDisposalOutcome.Clean
-        onSettlementIssue?.let { hook ->
-            try {
-                hook(item, outcome)
-            } catch (_: Throwable) {
-                // The issue hook must never throw into worker cleanup.
+        val taskOutcome = if (settledCleanly) {
+            CaptureTaskDisposalOutcome.Clean
+        } else {
+            // Record any work-item disposal debt so it stays observable
+            val disposal = item.disposalOutcome()
+            if (disposal != null && !disposal.isClean) {
+                onWorkDisposalDebt?.invoke(item, disposal)
             }
+            onSettlementIssue?.let { hook ->
+                try {
+                    hook(item, outcome)
+                } catch (_: Throwable) {}
+            }
+            val detail = listOfNotNull(outcome.failure, outcome.lifecycleReleaseFailure)
+                .joinToString("; ") { "${it::class.java.simpleName}: ${it.message}" }
+            CaptureTaskDisposalOutcome.Unclean(disposal, "bufferedTaskDispose frame=${item.frameIndex}: ${outcome.status} $detail")
         }
-        val detail = listOfNotNull(outcome.failure, outcome.lifecycleReleaseFailure)
-            .joinToString("; ") { "${it::class.java.simpleName}: ${it.message}" }
-        return CaptureTaskDisposalOutcome.Unclean(
-            item.disposalOutcome(),
-            "bufferedTaskDispose frame=${item.frameIndex}: ${outcome.status} $detail"
-        )
+        firstTaskOutcome.set(taskOutcome)
+        return taskOutcome
+    }
+
+    private fun asMirrored(taskOutcome: CaptureTaskDisposalOutcome): CaptureTaskDisposalOutcome {
+        if (taskOutcome is CaptureTaskDisposalOutcome.Clean) return taskOutcome
+        if (taskOutcome is CaptureTaskDisposalOutcome.Unclean) {
+            val disposal = item.disposalOutcome()
+            return CaptureTaskDisposalOutcome.Unclean(disposal, taskOutcome.description)
+        }
+        return taskOutcome
     }
 }
 
@@ -175,11 +195,33 @@ internal class YuvCaptureOwner(
     }
 
     /**
-     * Records an unclean work-item disposal as observable cleanup debt.  Never throws:
-     * the description is pre-built from the outcome's preserved failure diagnostics.
+     * Records an adoption-rollback recovery failure as observable debt: a throwing
+     * [YuvCaptureAccounting.rollbackAdoption], still-held reservations, or asymmetric
+     * index/filename corruption must never be silently dropped.
+     */
+    private fun recordRollbackRecovery(
+        entry: YuvFrameManifestEntry,
+        result: AdoptionToken.AdoptionRecoveryResult
+    ) {
+        if (result.recoveryFailure == null && result.released && !result.asymmetric) return
+        val failurePart = result.recoveryFailure?.let {
+            " recoveryFailure=" + it::class.java.simpleName + ": " + it.message
+        } ?: ""
+        val description = "adoption rollback recovery frame=${entry.frameIndex} file=${entry.filename}" +
+            " released=${result.released} remainingIndex=${result.remainingIndex}" +
+            " remainingFilename=${result.remainingFilename} asymmetric=${result.asymmetric}" + failurePart
+        candidateCleanupDebts.add(description)
+        Log.e("KeplerYuvOwner", description)
+    }
+
+    /**
+     * Records every unclean work-item disposal as observable cleanup debt.
+     * A non-clean outcome with an empty throwable list (e.g. missing requirements,
+     * in-progress, or buffered account not provided) is still debt — never silently
+     * passed.  Never throws.
      */
     private fun recordWorkDisposalDebt(item: YuvPngWorkItem, outcome: YuvWorkDisposalOutcome) {
-        if (outcome.isClean || outcome.failures().isEmpty()) return
+        if (outcome.isClean) return
         val description = disposalDescription(outcome, item.frameIndex)
         candidateCleanupDebts.add(description)
         Log.e("KeplerYuvOwner", description)
@@ -263,7 +305,14 @@ internal class YuvCaptureOwner(
                                     captureStateOwner.post(object : CaptureOwnerEvent {
                                         override fun execute() { adoptCompletion(completion) }
                                         override fun disposeWithoutMutation() {
-                                            completion.settleForOwnerRejection(candidateFilesystem)
+                                            val settlement = completion.settleForOwnerRejection(candidateFilesystem)
+                                            if (settlement != null) {
+                                                val handle = when (completion) {
+                                                    is YuvWorkerCompletion.Success -> completion.candidateHandle
+                                                    is YuvWorkerCompletion.Failed -> completion.candidateHandle
+                                                }
+                                                if (handle != null) recordCandidateDebt(settlement, handle.frameIndex, handle.file)
+                                            }
                                         }
                                     })
                                 } finally {
@@ -292,6 +341,14 @@ internal class YuvCaptureOwner(
                     }
                     is DirectYuvWorkCreation.Failed -> {
                         if (creation.cause is Error) throw creation.cause
+                        // Preserve the release failure as observable debt
+                        if (creation.releaseFailure != null) {
+                            val msg = "direct creation releaseFailure frame=$frameIndex " +
+                                "cause=${creation.cause::class.java.simpleName}: ${creation.cause.message} " +
+                                "releaseFailure=${creation.releaseFailure::class.java.simpleName}: ${creation.releaseFailure.message}"
+                            candidateCleanupDebts.add(msg)
+                            Log.e("KeplerYuvOwner", msg)
+                        }
                         finishError("YUV direct creation failed", cause = creation.cause)
                     }
                 }
@@ -350,7 +407,14 @@ internal class YuvCaptureOwner(
                 captureStateOwner.post(object : CaptureOwnerEvent {
                     override fun execute() { adoptCompletion(completion) }
                     override fun disposeWithoutMutation() {
-                        completion.settleForOwnerRejection(candidateFilesystem)
+                        val settlement = completion.settleForOwnerRejection(candidateFilesystem)
+                        if (settlement != null) {
+                            val handle = when (completion) {
+                                is YuvWorkerCompletion.Success -> completion.candidateHandle
+                                is YuvWorkerCompletion.Failed -> completion.candidateHandle
+                            }
+                            if (handle != null) recordCandidateDebt(settlement, handle.frameIndex, handle.file)
+                        }
                     }
                 })
             },
@@ -361,6 +425,14 @@ internal class YuvCaptureOwner(
                 } else {
                     Log.w("KeplerYuvOwner", "YUV settlement issue frame=${issueItem.frameIndex}: ${outcome.status}")
                 }
+                // Unclean settlement always creates debt.
+                val disposal = issueItem.disposalOutcome()
+                if (disposal != null && !disposal.isClean) {
+                    recordDisposalIfUnclean(issueItem, disposal)
+                }
+            },
+            onWorkDisposalDebt = { workItem, outcome ->
+                recordDisposalIfUnclean(workItem, outcome)
             }
         )
         if (!boundedWorker.submit(task)) {
@@ -419,15 +491,24 @@ internal class YuvCaptureOwner(
         val destinationExistedBeforeAttempt = finalFile.exists()
 
         // 1. Fail-closed candidate validation (a THROWING verifier fails closed: the
-        //    throwable is contained and reported, the candidate is settled).
+        //    throwable is contained and reported in the debt ledger).
+        var verifierThrowable: Throwable? = null
         val candidateValid = try {
             candidateVerifier.verify(handle.file, completion.frameIndex)
         } catch (t: Throwable) {
+            verifierThrowable = t
             Log.e("KeplerYuvOwner", "Candidate verifier threw for frame ${completion.frameIndex}", t)
             false
         }
         if (!candidateValid) {
-            Log.e("KeplerYuvOwner", "Candidate validation failed for frame ${completion.frameIndex}: ${handle.file}")
+            val reason = verifierThrowable?.let { ": ${it::class.java.simpleName}: ${it.message}" } ?: ""
+            Log.e("KeplerYuvOwner", "Candidate validation failed for frame ${completion.frameIndex}: ${handle.file}$reason")
+            if (verifierThrowable != null) {
+                candidateCleanupDebts.add(
+                    "candidate verifier failed frame=${completion.frameIndex} file=${handle.file} " +
+                        "${verifierThrowable::class.java.simpleName}: ${verifierThrowable.message}"
+                )
+            }
             recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
             return
@@ -455,7 +536,7 @@ internal class YuvCaptureOwner(
         //    (never delete it); roll back and settle the candidate through the claim.
         if (destinationExistedBeforeAttempt) {
             Log.w("KeplerYuvOwner", "Unexpected pre-existing final file for frame ${completion.frameIndex}: ${finalFile.path}")
-            token.rollback()
+            recordRollbackRecovery(entry, token.recoverRollbackAfterFailure())
             recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
             return
@@ -475,7 +556,7 @@ internal class YuvCaptureOwner(
         if (commitFailure != null) {
             Log.e("KeplerYuvOwner", "Commit failed for frame ${completion.frameIndex}", commitFailure)
             if (destinationCreatedByAttempt) removeOrQuarantineCreatedFinal(finalFile)
-            token.rollback()
+            recordRollbackRecovery(entry, token.recoverRollbackAfterFailure())
             recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
             finishError("YUV commit failed for frame ${completion.frameIndex}", cause = commitFailure)
@@ -493,7 +574,7 @@ internal class YuvCaptureOwner(
         }
         if (!finalVerified) {
             Log.w("KeplerYuvOwner", "Final file verification failed after commit for frame ${completion.frameIndex}")
-            token.rollback()
+            recordRollbackRecovery(entry, token.recoverRollbackAfterFailure())
             if (destinationCreatedByAttempt) removeOrQuarantineCreatedFinal(finalFile)
             recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
@@ -507,7 +588,7 @@ internal class YuvCaptureOwner(
         if (!token.commit()) {
             Log.e("KeplerYuvOwner", "Adoption commit failed for frame ${completion.frameIndex}", token.failure)
             if (destinationCreatedByAttempt) removeOrQuarantineCreatedFinal(finalFile)
-            accounting.releaseReservations(entry)
+            recordRollbackRecovery(entry, token.recoverRollbackAfterFailure())
             recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
             finishError("YUV adoption commit failed for frame ${completion.frameIndex}", cause = token.failure)
@@ -516,12 +597,14 @@ internal class YuvCaptureOwner(
 
         // 8. Settle the candidate ADOPTED through the exclusive claim.  The claim
         //    makes any other settlement impossible, so this can only fail on a
-        //    defensive invariant violation; it is recorded as debt, never swallowed.
+        //    defensive invariant violation; the final file is already committed so
+        //    it must be removed, and failedFrames tracks the anomaly.
         if (!handle.completeAdoption(claim)) {
-            val description = "candidate adoption completion failed frame=${completion.frameIndex} " +
+            val description = "candidate adoption completion invariant-failed frame=${completion.frameIndex} " +
                 "file=${handle.file} state=${handle.state()}"
             candidateCleanupDebts.add(description)
             Log.e("KeplerYuvOwner", description)
+            if (destinationCreatedByAttempt) removeOrQuarantineCreatedFinal(finalFile)
             accounting.failedFrame()
             return
         }

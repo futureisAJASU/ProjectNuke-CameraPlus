@@ -353,4 +353,75 @@ class YuvAdoptionTokenTest {
         assertEquals(0, snap.reservedIndexCount)
         assertEquals(1, snap.reservedFilenameCount)
     }
+
+    @Test
+    fun falseCommitWithoutThrowRecordsInvariantDiagnostic() {
+        // A false accounting commit (no throwable) still publishes a diagnostic:
+        // the token must never be left in an unexplained state.
+        val corrupted = object : YuvCaptureAccounting() {
+            fun removeOnlyFilename(entry: YuvFrameManifestEntry) = synchronized(lock) {
+                reservedFilenames.remove(entry.filename)
+            }
+        }
+        val token = corrupted.tryReserveAdoption(entry(0))!!
+        corrupted.removeOnlyFilename(entry(0))
+
+        assertFalse(token.commit())
+        assertEquals(AdoptionTokenState.FAILED, token.state())
+        val failure = token.failure
+        assertNotNull("false commit must publish a diagnostic failure", failure)
+        assertTrue(failure is IllegalStateException)
+        val message = failure!!.message!!
+        assertTrue("diagnostic must name the operation: $message", message.contains("commitAdoption returned false"))
+        assertTrue("diagnostic must carry the frame identity: $message", message.contains("frame=0"))
+        assertTrue("diagnostic must carry the filename identity: $message", message.contains("file=frame_00_color.png"))
+        // The reservation state is unchanged by the failed commit: still observable.
+        assertEquals(1, corrupted.snapshot().reservedIndexCount)
+        assertEquals(0, corrupted.snapshot().reservedFilenameCount)
+    }
+
+    @Test
+    fun falseRollbackWithoutThrowRecordsInvariantDiagnostic() {
+        val corrupted = object : YuvCaptureAccounting() {
+            fun removeOnlyIndex(entry: YuvFrameManifestEntry) = synchronized(lock) {
+                reservedIndices.remove(entry.frameIndex)
+            }
+        }
+        val token = corrupted.tryReserveAdoption(entry(0))!!
+        corrupted.removeOnlyIndex(entry(0))
+
+        assertFalse(token.rollback())
+        assertEquals(AdoptionTokenState.FAILED, token.state())
+        val failure = token.failure
+        assertNotNull("false rollback must publish a diagnostic failure", failure)
+        assertTrue(failure is IllegalStateException)
+        val message = failure!!.message!!
+        assertTrue("diagnostic must name the operation: $message", message.contains("rollbackAdoption returned false"))
+        assertTrue("diagnostic must carry the frame identity: $message", message.contains("frame=0"))
+        assertTrue("diagnostic must carry the filename identity: $message", message.contains("file=frame_00_color.png"))
+        assertEquals(0, corrupted.snapshot().reservedIndexCount)
+        assertEquals(1, corrupted.snapshot().reservedFilenameCount)
+    }
+
+    @Test
+    fun reservedAdoptionBlocksLegacyPersistedFrame() {
+        val a = accounting()
+        val token = a.tryReserveAdoption(entry(0))!!
+
+        // The legacy path must never race a reserved identity: both the frame index
+        // and the filename are blocked while the adoption token holds them.
+        assertFalse(a.persistedFrame(entry(0)))
+        assertFalse(a.persistedFrame(YuvFrameManifestEntry(1, "frame_00_color.png", 2L, true)))
+        assertTrue("unreserved identity still works", a.persistedFrame(entry(1)))
+        val snap = a.snapshot()
+        assertEquals(1, snap.persistedFrames)
+        assertEquals(1, snap.reservedIndexCount)
+        assertEquals(1, snap.reservedFilenameCount)
+
+        // After the token releases the reservations the identity is free again.
+        assertTrue(token.rollback())
+        assertTrue(a.persistedFrame(entry(0)))
+        assertEquals(2, a.snapshot().persistedFrames)
+        assertEquals(0, a.snapshot().reservedCount)
+    }
 }

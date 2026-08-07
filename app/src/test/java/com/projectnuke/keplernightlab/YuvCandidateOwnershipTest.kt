@@ -85,7 +85,7 @@ class YuvCandidateOwnershipTest {
         val otherHandle = YuvCandidateHandle(0, File("other.tmp"))
         val claim = handle.tryBeginAdoption()!!
 
-        assertFalse("foreign claim must be rejected", handle.completeAdoption(CandidateAdoptionClaim(otherHandle)))
+        assertFalse("foreign claim must be rejected", handle.completeAdoption(CandidateAdoptionClaim.forgedForTest(otherHandle)))
         assertEquals(CandidateOwnership.ADOPTING, handle.state())
 
         assertTrue(handle.completeAdoption(claim))
@@ -116,7 +116,7 @@ class YuvCandidateOwnershipTest {
         val claim = handle.tryBeginAdoption()!!
         val filesystem = RecordingFilesystem(CandidateFileOperationResult.DELETED)
 
-        val foreign = handle.abortAdoption(CandidateAdoptionClaim(otherHandle), filesystem)
+        val foreign = handle.abortAdoption(CandidateAdoptionClaim.forgedForTest(otherHandle), filesystem)
 
         assertTrue(foreign.alreadySettled)
         assertEquals(CandidateOwnership.ADOPTING, handle.state())
@@ -380,5 +380,61 @@ class YuvCandidateOwnershipTest {
         assertEquals(CandidateOwnership.ADOPTED, outcome.finalState)
         assertEquals(0, filesystem.deleteCalls.get())
         assertEquals(0, filesystem.quarantineCalls.get())
+    }
+
+    @Test
+    fun forgedSameHandleClaimCannotCompleteOrAbort() {
+        val handle = YuvCandidateHandle(0, File("candidate.tmp"))
+        val genuine = handle.tryBeginAdoption()!!
+        // A forged claim constructed for the SAME handle (nonce 0) must never match
+        // the active claim (nonce >= 1): completion and abort are both rejected.
+        val forged = CandidateAdoptionClaim.forgedForTest(handle)
+        val filesystem = RecordingFilesystem(CandidateFileOperationResult.DELETED)
+
+        assertFalse("forged same-handle claim must not complete adoption", handle.completeAdoption(forged))
+        assertEquals(CandidateOwnership.ADOPTING, handle.state())
+
+        val rejected = handle.abortAdoption(forged, filesystem)
+        assertTrue(rejected.alreadySettled)
+        assertEquals(0, filesystem.deleteCalls.get())
+        assertNull("no terminal record while the genuine claim is in flight", handle.terminal())
+
+        // The genuine claim is completely unaffected by the forged attempts.
+        assertTrue(handle.completeAdoption(genuine))
+        assertEquals(CandidateOwnership.ADOPTED, handle.state())
+        assertNotNull(handle.terminal())
+        assertEquals(CandidateOwnership.ADOPTED, handle.terminal()!!.finalState)
+    }
+
+    @Test
+    fun repeatedDiscardDuringInFlightDiscardingIsExplicitlyInProgress() {
+        val handle = YuvCandidateHandle(0, File("candidate.tmp"))
+        val filesystem = GatedFilesystem()
+
+        // The discard thread blocks inside delete(): DISCARDING is observable and
+        // no terminal record exists yet.
+        val discardThread = Thread {
+            handle.discardOrQuarantine(filesystem)
+        }
+        discardThread.start()
+        filesystem.awaitEntered()
+        assertEquals(CandidateOwnership.DISCARDING, handle.state())
+        assertNull("no terminal record while in-flight", handle.terminal())
+
+        // A repeated settlement during in-flight DISCARDING is explicitly
+        // IN_PROGRESS, never a terminal already-settled result.
+        val second = handle.discardOrQuarantine(filesystem)
+        assertTrue(second.alreadySettled)
+        assertTrue("in-flight must be explicitly observable", second.terminal.isInProgressOrTerminal)
+        assertEquals(CandidateOwnership.DISCARDING, second.finalState)
+
+        filesystem.release()
+        discardThread.join(5_000)
+        assertFalse("discard thread still alive", discardThread.isAlive)
+        assertEquals(CandidateOwnership.DISCARDED, handle.state())
+        val terminal = handle.terminal()
+        assertNotNull(terminal)
+        assertFalse("settled terminal is no longer in-progress", terminal!!.isInProgressOrTerminal)
+        assertEquals(CandidateOwnership.DISCARDED, terminal.finalState)
     }
 }
