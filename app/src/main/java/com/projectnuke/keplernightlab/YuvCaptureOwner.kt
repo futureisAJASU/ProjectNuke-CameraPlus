@@ -51,8 +51,8 @@ internal sealed interface YuvWorkerCompletion {
  * next buffered item after adopting this task's completion — the task itself never
  * schedules the next frame.
  *
- * Settlement-result consumption: the AtomicBoolean [settled] guard resolves the
- * run()/dispose() race so at most ONE settleEncoding attempt is made per task.  A
+ * Settlement is guarded by a three-state machine [TaskSettlementState]: at most ONE
+ * settleEncoding attempt is made per task via a NOT_STARTED → SETTLING CAS.  A
  * single-task settlement can only legitimately observe SETTLED, so every other outcome
  * is a genuine anomaly (e.g. the lifecycle was externally released or never started)
  * and is surfaced through [onSettlementIssue] exactly once.  In particular
@@ -60,6 +60,10 @@ internal sealed interface YuvWorkerCompletion {
  * outcomes — with the CAS guard they indicate the lifecycle state was already
  * inconsistent with this task's own settlement, and surfacing them is the only way
  * a lost release can be detected.
+ *
+ * Task publication state: [taskState] and [settledOutcome] expose the settlement
+ * state machine and the published outcome so observers (cleanup coordinator, tests)
+ * can check whether the task is NOT_STARTED / SETTLING / SETTLED without racing.
  */
 /** BufferedEncodeTask */
 internal class BufferedEncodeTask(
@@ -72,8 +76,17 @@ internal class BufferedEncodeTask(
     private val onSettlementIssue: ((YuvPngWorkItem, YuvBufferedLifecycle.EncodingSettlementOutcome) -> Unit)? = null,
     private val onWorkDisposalDebt: ((YuvPngWorkItem, YuvWorkDisposalOutcome) -> Unit)? = null
 ) : OutcomeDisposableCaptureTask {
-    private val settled = AtomicBoolean(false)
-    private val firstTaskOutcome = AtomicReference<CaptureTaskDisposalOutcome?>(null)
+
+    internal enum class TaskSettlementState { NOT_STARTED, SETTLING, SETTLED }
+
+    private val settlementState = AtomicReference(TaskSettlementState.NOT_STARTED)
+    private val settledOutcome = AtomicReference<CaptureTaskDisposalOutcome?>(null)
+
+    /** Publicly observable task publication state. */
+    fun taskState(): TaskSettlementState = settlementState.get()
+
+    /** The settled outcome (null until the task reaches SETTLED). */
+    fun settledOutcome(): CaptureTaskDisposalOutcome? = settledOutcome.get()
 
     override fun run() {
         val completion = try {
@@ -84,19 +97,30 @@ internal class BufferedEncodeTask(
         try {
             postCompletion(completion)
         } finally {
-            if (settled.compareAndSet(false, true)) {
-                settleItemAndReport()
-            }
+            attemptSettle()
         }
     }
 
     override fun dispose() { disposeWithOutcome() }
 
-    override fun disposeWithOutcome(): CaptureTaskDisposalOutcome {
-        if (!settled.compareAndSet(false, true)) {
-            return firstTaskOutcome.get()?.let { asMirrored(it) } ?: CaptureTaskDisposalOutcome.Clean
+    override fun disposeWithOutcome(): CaptureTaskDisposalOutcome = attemptSettle()
+
+    /**
+     * Exactly-once settlement via NOT_STARTED → SETTLING CAS.  The winner performs
+     * the lifecycle settlement and publishes SETTLED + the outcome; concurrent or
+     * repeated callers observe SETTLING (in-progress) or SETTLED (published outcome).
+     */
+    private fun attemptSettle(): CaptureTaskDisposalOutcome {
+        if (settlementState.compareAndSet(TaskSettlementState.NOT_STARTED, TaskSettlementState.SETTLING)) {
+            return settleItemAndReport()
         }
-        return settleItemAndReport()
+        return when (val s = settlementState.get()) {
+            TaskSettlementState.SETTLING -> settledOutcome.get()?.let { asMirrored(it) }
+                ?: CaptureTaskDisposalOutcome.Unclean(null, "bufferedTaskDispose frame=${item.frameIndex}: settlement in progress")
+            TaskSettlementState.SETTLED -> settledOutcome.get()?.let { asMirrored(it) }
+                ?: CaptureTaskDisposalOutcome.Clean
+            TaskSettlementState.NOT_STARTED -> CaptureTaskDisposalOutcome.Clean
+        }
     }
 
     private fun settleItemAndReport(): CaptureTaskDisposalOutcome {
@@ -120,7 +144,8 @@ internal class BufferedEncodeTask(
                 .joinToString("; ") { "${it::class.java.simpleName}: ${it.message}" }
             CaptureTaskDisposalOutcome.Unclean(disposal, "bufferedTaskDispose frame=${item.frameIndex}: ${outcome.status} $detail")
         }
-        firstTaskOutcome.set(taskOutcome)
+        settledOutcome.set(taskOutcome)
+        settlementState.set(TaskSettlementState.SETTLED)
         return taskOutcome
     }
 
@@ -208,8 +233,11 @@ internal class YuvCaptureOwner(
             " recoveryFailure=" + it::class.java.simpleName + ": " + it.message
         } ?: ""
         val description = "adoption rollback recovery frame=${entry.frameIndex} file=${entry.filename}" +
-            " released=${result.released} remainingIndex=${result.remainingIndex}" +
-            " remainingFilename=${result.remainingFilename} asymmetric=${result.asymmetric}" + failurePart
+            " rollbackAttempted=${result.rollbackAttempted}" +
+            " rollbackReturnedSuccess=${result.rollbackReturnedSuccess}" +
+            " released=${result.released} remainingIndex=${result.indexReservationRemaining}" +
+            " remainingFilename=${result.filenameReservationRemaining} asymmetric=${result.asymmetric}" +
+            failurePart
         candidateCleanupDebts.add(description)
         Log.e("KeplerYuvOwner", description)
     }
@@ -425,7 +453,19 @@ internal class YuvCaptureOwner(
                 } else {
                     Log.w("KeplerYuvOwner", "YUV settlement issue frame=${issueItem.frameIndex}: ${outcome.status}")
                 }
-                // Unclean settlement always creates debt.
+                // Non-clean settlement is always observable debt — even when the
+                // work-item disposal outcome is clean (e.g. INVALID_STATE, UNKNOWN,
+                // ALREADY_SETTLING with failures).  Step 4: always record debt for
+                // non-clean settlements.
+                val settledCleanly = outcome.status == YuvBufferedLifecycle.EncodingSettlementStatus.SETTLED &&
+                    outcome.failure == null && outcome.lifecycleReleaseFailure == null
+                if (!settledCleanly) {
+                    val detail = listOfNotNull(outcome.failure, outcome.lifecycleReleaseFailure)
+                        .joinToString("; ") { "${it::class.java.simpleName}: ${it.message}" }
+                    candidateCleanupDebts.add(
+                        "bufferedTaskSettlementIssue frame=${issueItem.frameIndex}: ${outcome.status} $detail"
+                    )
+                }
                 val disposal = issueItem.disposalOutcome()
                 if (disposal != null && !disposal.isClean) {
                     recordDisposalIfUnclean(issueItem, disposal)
@@ -536,6 +576,7 @@ internal class YuvCaptureOwner(
         //    (never delete it); roll back and settle the candidate through the claim.
         if (destinationExistedBeforeAttempt) {
             Log.w("KeplerYuvOwner", "Unexpected pre-existing final file for frame ${completion.frameIndex}: ${finalFile.path}")
+            token.rollback()
             recordRollbackRecovery(entry, token.recoverRollbackAfterFailure())
             recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
@@ -556,6 +597,7 @@ internal class YuvCaptureOwner(
         if (commitFailure != null) {
             Log.e("KeplerYuvOwner", "Commit failed for frame ${completion.frameIndex}", commitFailure)
             if (destinationCreatedByAttempt) removeOrQuarantineCreatedFinal(finalFile)
+            token.rollback()
             recordRollbackRecovery(entry, token.recoverRollbackAfterFailure())
             recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
@@ -569,15 +611,20 @@ internal class YuvCaptureOwner(
         val finalVerified = try {
             finalFileVerifier.verify(finalFile, completion.frameIndex)
         } catch (t: Throwable) {
-            Log.e("KeplerYuvOwner", "Final verifier threw for frame ${completion.frameIndex}", t)
+            val description = "final verifier threw frame=${completion.frameIndex} file=${finalFile}: " +
+                "${t::class.java.simpleName}: ${t.message}"
+            candidateCleanupDebts.add(description)
+            Log.e("KeplerYuvOwner", description, t)
             false
         }
         if (!finalVerified) {
             Log.w("KeplerYuvOwner", "Final file verification failed after commit for frame ${completion.frameIndex}")
+            token.rollback()
             recordRollbackRecovery(entry, token.recoverRollbackAfterFailure())
             if (destinationCreatedByAttempt) removeOrQuarantineCreatedFinal(finalFile)
             recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
+            finishError("Final file verification failed for frame ${completion.frameIndex}")
             return
         }
 
@@ -588,6 +635,7 @@ internal class YuvCaptureOwner(
         if (!token.commit()) {
             Log.e("KeplerYuvOwner", "Adoption commit failed for frame ${completion.frameIndex}", token.failure)
             if (destinationCreatedByAttempt) removeOrQuarantineCreatedFinal(finalFile)
+            token.rollback()
             recordRollbackRecovery(entry, token.recoverRollbackAfterFailure())
             recordCandidateDebt(handle.abortAdoption(claim, candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
@@ -595,12 +643,24 @@ internal class YuvCaptureOwner(
             return
         }
 
-        // 8. Settle the candidate ADOPTED through the exclusive claim.  The claim
-        //    makes any other settlement impossible, so this can only fail on a
-        //    defensive invariant violation; the final file is already committed so
-        //    it must be removed, and failedFrames tracks the anomaly.
-        if (!handle.completeAdoption(claim)) {
+        // 8. Settle the candidate ADOPTED through the exclusive claim.  The claim is
+        //    reference-identical to the ADOPTING record's active claim, so completion
+        //    is structurally infallible for the exact claim; an AdoptionInvariantException
+        //    here is impossible internal corruption and is recorded as observable debt.
+        //    The final file is already committed so a corruption must also remove it.
+        val claimCompleted = try {
+            handle.completeAdoption(claim)
+        } catch (t: AdoptionInvariantException) {
             val description = "candidate adoption completion invariant-failed frame=${completion.frameIndex} " +
+                "file=${handle.file}: ${t.message}"
+            candidateCleanupDebts.add(description)
+            Log.e("KeplerYuvOwner", description, t)
+            if (destinationCreatedByAttempt) removeOrQuarantineCreatedFinal(finalFile)
+            accounting.failedFrame()
+            return
+        }
+        if (!claimCompleted) {
+            val description = "candidate adoption completion rejected frame=${completion.frameIndex} " +
                 "file=${handle.file} state=${handle.state()}"
             candidateCleanupDebts.add(description)
             Log.e("KeplerYuvOwner", description)

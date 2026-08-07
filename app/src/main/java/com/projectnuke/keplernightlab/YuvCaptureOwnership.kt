@@ -212,33 +212,41 @@ internal class CandidateDisposalOutcome(
 }
 
 /**
- * Opaque, unforgeable adoption claim granted only by
- * [YuvCandidateHandle.tryBeginAdoption].  The claim carries an internal nonce
- * that the handle validates atomically: completion and abort are only accepted
- * for the exact claim that won the UNSETTLED -> ADOPTING transition.
- * A same-handle forged claim (e.g. constructing a new claim without calling
- * `tryBeginAdoption`) is rejected because the nonce never matches the state
- * record's active claimNonce.  The active nonce is cleared only on terminal
- * completion/abort.
+ * Opaque, unforgeable adoption claim minted exactly once by
+ * [YuvCandidateHandle.tryBeginAdoption].  The claim is validated SOLELY by
+ * reference identity against the exact active claim object published in the
+ * candidate's ADOPTING state record: completion and abort are accepted only for
+ * the very instance that won the UNSETTLED -> ADOPTING transition.
+ *
+ * There is no copyable numeric credential and no factory that can construct
+ * another claim which would satisfy the identity check.  The private constructor
+ * is file-scoped to [YuvCaptureOwnership], so no module caller (including tests)
+ * can mint a competing valid claim.  [invalidClaimForTest] is the only test seam
+ * and it deliberately returns a distinct object instance that can never match the
+ * active claim.
  */
 internal class CandidateAdoptionClaim private constructor(
     val handle: YuvCandidateHandle,
-    internal val nonce: Long
+    val frameIndex: Int
 ) {
     companion object {
-        internal fun create(handle: YuvCandidateHandle, nonce: Long): CandidateAdoptionClaim =
-            CandidateAdoptionClaim(handle, nonce)
+        internal fun create(handle: YuvCandidateHandle, frameIndex: Int): CandidateAdoptionClaim =
+            CandidateAdoptionClaim(handle, frameIndex)
 
-        /**
-         * TEST-ONLY: simulates an attacker forging a claim for [handle] without
-         * calling tryBeginAdoption.  The nonce 0 can never match an active claim
-         * (tryBeginAdoption always issues nonce >= 1), so every forged claim is
-         * rejected by handle validation.
-         */
-        internal fun forgedForTest(handle: YuvCandidateHandle): CandidateAdoptionClaim =
-            CandidateAdoptionClaim(handle, 0L)
+        internal fun invalidForTest(handle: YuvCandidateHandle): CandidateAdoptionClaim =
+            CandidateAdoptionClaim(handle, handle.frameIndex)
     }
 }
+
+/**
+ * TEST-ONLY seam: mint a genuine-shaped but never-validating claim for [handle].
+ * The active claim published by tryBeginAdoption is always a distinct object
+ * instance, so reference-identity validation rejects this unconditionally.  Used
+ * only to exercise rejection of copied/foreign credentials — never as a path to
+ * a valid claim.
+ */
+internal fun invalidClaimForTest(handle: YuvCandidateHandle): CandidateAdoptionClaim =
+    CandidateAdoptionClaim.invalidForTest(handle)
 
 /**
  * Exactly-once candidate ownership handle backed by one atomic state machine.  A
@@ -255,7 +263,7 @@ internal class YuvCandidateHandle(
 ) {
     private data class StateRecord(
         val ownership: CandidateOwnership = CandidateOwnership.UNSETTLED,
-        val claimNonce: Long = 0L,
+        val activeClaim: CandidateAdoptionClaim? = null,
         val terminal: CandidateTerminalRecord? = null
     )
 
@@ -268,53 +276,70 @@ internal class YuvCandidateHandle(
 
     /**
      * Exactly-once UNSETTLED -> ADOPTING.  The winner receives the exclusive
-     * [CandidateAdoptionClaim] with the active nonce; a concurrent discard is
-     * rejected for as long as the claim is held.  Returns null when the
-     * candidate is already claimed or settled.
+     * [CandidateAdoptionClaim] that becomes the active claim stored in the state
+     * record; completion and abort are gated on reference identity with THAT EXACT
+     * object, so a copied/foreign credential can never settle the candidate.
+     * Returns null when the candidate is already claimed or settled.
      */
     fun tryBeginAdoption(): CandidateAdoptionClaim? {
         val old = record.get()
         if (old.ownership != CandidateOwnership.UNSETTLED) return null
-        val nextNonce = old.claimNonce + 1
-        val target = StateRecord(CandidateOwnership.ADOPTING, nextNonce)
+        val claim = CandidateAdoptionClaim.create(this, frameIndex)
+        val target = StateRecord(CandidateOwnership.ADOPTING, activeClaim = claim)
         return if (record.compareAndSet(old, target)) {
-            CandidateAdoptionClaim.create(this, nextNonce)
+            claim
         } else {
             null
         }
     }
 
     /**
-     * Exactly-once ADOPTING -> ADOPTED for the holder of [claim].  Only the
-     * genuine active claim may complete: the nonce must match the state
-     * record's current claimNonce as well as the handle identity.  The ADOPTING
-     * intermediate makes a completion-race with any discard impossible.
+     * Exactly-once ADOPTING -> ADOPTED for the holder of [claim].  Only the genuine
+     * active claim (reference-identical to the one published by tryBeginAdoption) may
+     * complete: a copied/foreign/stale claim is rejected with false.  Because the
+     * active claim object is held exclusively by its owner and no other path can
+     * transition ADOPTING away, an exact match completes structurally infallibly; a
+     * CAS failure despite an exact match is impossible internal corruption and is
+     * surfaced as [AdoptionInvariantException] rather than silently returning false.
      */
     fun completeAdoption(claim: CandidateAdoptionClaim): Boolean {
-        if (claim.handle !== this) return false
+        if (claim.handle !== this || claim.frameIndex != frameIndex) return false
         val rec = record.get()
-        if (rec.ownership != CandidateOwnership.ADOPTING || rec.claimNonce != claim.nonce) return false
+        if (rec.ownership != CandidateOwnership.ADOPTING || rec.activeClaim !== claim) return false
         val terminal = CandidateTerminalRecord(CandidateOwnership.ADOPTED)
-        return record.compareAndSet(rec, StateRecord(CandidateOwnership.ADOPTED, terminal = terminal))
+        if (!record.compareAndSet(rec, StateRecord(CandidateOwnership.ADOPTED, terminal = terminal))) {
+            // CAS failed despite the exact active claim matching: ADOPTING was vacated
+            // while its sole holder possessed the claim.  Structurally impossible for a
+            // single holder — surface as a hard, observable invariant violation.
+            throw AdoptionInvariantException(
+                "completeAdoption CAS failed despite exact active claim: " +
+                    "frame=${frameIndex} file=${file} state=${rec.ownership}",
+                operation = "completeAdoption",
+                frameIndex = frameIndex
+            )
+        }
+        return true
     }
 
     /**
-     * Exactly-once ADOPTING -> DISCARDING -> DISCARDED/QUARANTINED for the
-     * holder of [claim]: the failed adoption settles the candidate through
-     * the normal settlement path (delete, quarantine on failure), never
-     * leaving it ADOPTING or UNSETTLED.  Filesystem throws are contained.
+     * Exactly-once ADOPTING -> DISCARDING -> DISCARDED/QUARANTINED for the holder of
+     * [claim]: only the exact active claim may abort, settling the candidate through
+     * the normal settlement path (delete, quarantine on failure) and never leaving it
+     * ADOPTING or UNSETTLED.  A copied/foreign/stale claim is rejected (in-flight,
+     * no-op) without touching the file.  Filesystem throws are contained.
      */
     fun abortAdoption(
         claim: CandidateAdoptionClaim,
         filesystem: YuvCandidateFilesystem
     ): CandidateDisposalOutcome {
-        if (claim.handle !== this) {
+        if (claim.handle !== this || claim.frameIndex != frameIndex ||
+            record.get().activeClaim !== claim) {
             val cur = record.get()
             val term = cur.terminal ?: CandidateTerminalRecord(cur.ownership, isInProgressOrTerminal = true)
             return CandidateDisposalOutcome.rejectedForInFlight(term)
         }
         val rec = record.get()
-        if (rec.ownership != CandidateOwnership.ADOPTING || rec.claimNonce != claim.nonce) {
+        if (rec.ownership != CandidateOwnership.ADOPTING || rec.activeClaim !== claim) {
             val term = rec.terminal ?: CandidateTerminalRecord(rec.ownership, isInProgressOrTerminal = true)
             return CandidateDisposalOutcome.rejectedForInFlight(term)
         }
@@ -400,7 +425,28 @@ internal class YuvCandidateHandle(
  * stays observable via [AdoptionToken.failure].
  */
 internal enum class AdoptionTokenState {
-    RESERVED, COMMITTING, COMMITTED, ROLLING_BACK, ROLLED_BACK, FAILED
+    RESERVED, COMMITTING, COMMITTED,
+    ROLLING_BACK, ROLLED_BACK,
+    FAILED, RECOVERING, FAILED_RECOVERED, FAILED_WITH_RESERVATION_DEBT
+}
+
+/**
+ * Token-specific reservation probe.  Answers the four questions a recovery or
+ * invariant diagnostic must ask about THIS token's entry, never about the global
+ * reservation population:
+ *  - is THIS frame index reserved?
+ *  - is THIS filename reserved?
+ *  - does THIS frame index collide in the manifest?
+ *  - does THIS filename collide in the manifest?
+ */
+internal data class AdoptionReservationStatus(
+    val indexReservedForThisEntry: Boolean,
+    val filenameReservedForThisEntry: Boolean,
+    val manifestHasIndex: Boolean,
+    val manifestHasFilename: Boolean
+) {
+    val symmetric: Boolean get() = indexReservedForThisEntry == filenameReservedForThisEntry
+    val released: Boolean get() = !indexReservedForThisEntry && !filenameReservedForThisEntry
 }
 
 /**
@@ -411,6 +457,10 @@ internal enum class AdoptionTokenState {
  * / ROLLING_BACK the accounting mutation happens under the token's exclusive claim
  * and the terminal state is published only afterwards.  A concurrent commit/rollback
  * still has exactly one owner (single CAS out of RESERVED).
+ *
+ * After a commit/rollback failure the token is FAILED; [recoverRollbackAfterFailure]
+ * drives a truthful recovery sub-machine (FAILED -> RECOVERING -> FAILED_RECOVERED |
+ * FAILED_WITH_RESERVATION_DEBT) using ONLY this token's reservation status.
  */
 internal class AdoptionToken internal constructor(
     val reservedEntry: YuvFrameManifestEntry,
@@ -423,6 +473,8 @@ internal class AdoptionToken internal constructor(
         private set
 
     fun state(): AdoptionTokenState = state.get()
+
+    fun reservationStatus(): AdoptionReservationStatus = accounting.reservationStatus(reservedEntry)
 
     /**
      * Exactly-once RESERVED -> COMMITTING -> COMMITTED.  COMMITTED is only visible
@@ -477,84 +529,124 @@ internal class AdoptionToken internal constructor(
     }
 
     /**
-     * Recovery after a failed adoption: releases whatever reservations remain,
-     * reports whether reservations are still held and whether asymmetric
-     * corruption was detected.  Uses the token's own release path (never the
-     * accounting escape hatch) so observable reservation state stays truthful.
+     * Recovery after a failed adoption: releases whatever reservations remain for
+     * THIS token, reports whether they are still held, and publishes a truthful
+     * terminal recovery state.  Uses ONLY this token's reservation status.
+     *
+     * A `rollbackAdoption` false return is an invariant anomaly even when the
+     * reservations are already absent — the disappearance is itself recorded as
+     * [recoveryFailure], never silently treated as success.  The forbidden outcome
+     * (returned false, reservations absent, released=true, recoveryFailure=null) is
+     * therefore structurally impossible from this method.
      */
     fun recoverRollbackAfterFailure(): AdoptionRecoveryResult {
-        var remainingIndex = false
-        var remainingFilename = false
-        var asymmetric = false
+        val prev = state.getAndUpdate { s ->
+            if (s == AdoptionTokenState.FAILED) AdoptionTokenState.RECOVERING else s
+        }
+        if (prev != AdoptionTokenState.FAILED) {
+            val status = reservationStatus()
+            return AdoptionRecoveryResult(
+                rollbackAttempted = false,
+                rollbackReturnedSuccess = false,
+                indexReservationRemaining = status.indexReservedForThisEntry,
+                filenameReservationRemaining = status.filenameReservedForThisEntry,
+                asymmetric = !status.symmetric,
+                recoveryFailure = null
+            )
+        }
+        val entry = reservedEntry
+        var returnedSuccess = false
         var recoveryFailure: Throwable? = null
         try {
-            accounting.rollbackAdoption(this)
-            val snapAfter = accounting.snapshot()
-            remainingIndex = snapAfter.reservedIndexCount > 0
-            remainingFilename = snapAfter.reservedFilenameCount > 0
-            if (remainingIndex != remainingFilename) asymmetric = true
+            val ok = accounting.rollbackAdoption(this)
+            if (!ok) {
+                // False return == invariant event.  Record it regardless of whether
+                // the reservations are already absent.
+                recoveryFailure = AdoptionInvariantException(
+                    "rollbackAdoption returned false during recovery: " +
+                        "frame=${entry.frameIndex} file=${entry.filename}",
+                    operation = "rollbackAdoption",
+                    frameIndex = entry.frameIndex,
+                    filename = entry.filename,
+                    rollbackAttempted = true,
+                    rollbackReturnedSuccess = false,
+                    reservationStatus = accounting.reservationStatus(entry)
+                )
+            } else {
+                returnedSuccess = true
+            }
         } catch (t: Throwable) {
             recoveryFailure = t
-            val snap = accounting.snapshot()
-            remainingIndex = snap.reservedIndexCount > 0
-            remainingFilename = snap.reservedFilenameCount > 0
-            if (remainingIndex != remainingFilename) asymmetric = true
         }
+        val status = accounting.reservationStatus(entry)
+        val newState = if (status.released && recoveryFailure == null)
+            AdoptionTokenState.FAILED_RECOVERED
+        else
+            AdoptionTokenState.FAILED_WITH_RESERVATION_DEBT
+        state.set(newState)
         return AdoptionRecoveryResult(
-            released = !remainingIndex && !remainingFilename,
-            remainingIndex = remainingIndex,
-            remainingFilename = remainingFilename,
-            asymmetric = asymmetric,
+            rollbackAttempted = true,
+            rollbackReturnedSuccess = returnedSuccess,
+            indexReservationRemaining = status.indexReservedForThisEntry,
+            filenameReservationRemaining = status.filenameReservedForThisEntry,
+            asymmetric = !status.symmetric,
             recoveryFailure = recoveryFailure
         )
     }
 
     data class AdoptionRecoveryResult(
-        val released: Boolean,
-        val remainingIndex: Boolean,
-        val remainingFilename: Boolean,
+        val rollbackAttempted: Boolean,
+        val rollbackReturnedSuccess: Boolean,
+        val indexReservationRemaining: Boolean,
+        val filenameReservationRemaining: Boolean,
         val asymmetric: Boolean,
         val recoveryFailure: Throwable? = null
-    )
+    ) {
+        val released: Boolean get() = !indexReservationRemaining && !filenameReservationRemaining
+    }
 
     private fun commitFailDiagnostic(): AdoptionInvariantException {
         val entry = reservedEntry
-        val snap = accounting.snapshot()
-        val manifestHasIndex = snap.manifest.any { it.frameIndex == entry.frameIndex }
-        val manifestHasFilename = snap.manifest.any { it.filename == entry.filename }
         return AdoptionInvariantException(
             "commitAdoption returned false: frame=${entry.frameIndex} file=${entry.filename}",
-            "commitAdoption",
-            entry.frameIndex, entry.filename,
-            reservedIndexPresent = snap.reservedIndexCount > 0,
-            reservedFilenamePresent = snap.reservedFilenameCount > 0,
-            manifestCollisionIndex = manifestHasIndex,
-            manifestCollisionFilename = manifestHasFilename
+            operation = "commitAdoption",
+            frameIndex = entry.frameIndex,
+            filename = entry.filename,
+            reservationStatus = accounting.reservationStatus(entry)
         )
     }
 
     private fun rollbackFailDiagnostic(): AdoptionInvariantException {
         val entry = reservedEntry
-        val snap = accounting.snapshot()
         return AdoptionInvariantException(
             "rollbackAdoption returned false: frame=${entry.frameIndex} file=${entry.filename}",
-            "rollbackAdoption",
-            entry.frameIndex, entry.filename,
-            reservedIndexPresent = snap.reservedIndexCount > 0,
-            reservedFilenamePresent = snap.reservedFilenameCount > 0
+            operation = "rollbackAdoption",
+            frameIndex = entry.frameIndex,
+            filename = entry.filename,
+            reservationStatus = accounting.reservationStatus(entry)
         )
     }
+}
 
-    private class AdoptionInvariantException(
-        message: String,
-        val operation: String,
-        val frameIndex: Int,
-        val filename: String,
-        val reservedIndexPresent: Boolean,
-        val reservedFilenamePresent: Boolean,
-        val manifestCollisionIndex: Boolean? = null,
-        val manifestCollisionFilename: Boolean? = null
-    ) : IllegalStateException(message)
+/**
+ * Entry-specific invariant anomaly.  Carries the exact reservation status of the
+ * offender token's entry (never global counts) so diagnostics can answer
+ * "is THIS frame reserved / does THIS filename collide in the manifest?".
+ */
+internal class AdoptionInvariantException(
+    message: String,
+    val operation: String,
+    val frameIndex: Int? = null,
+    val filename: String? = null,
+    val rollbackAttempted: Boolean = false,
+    val rollbackReturnedSuccess: Boolean = false,
+    val reservationStatus: AdoptionReservationStatus? = null,
+    val recoveryFailure: Throwable? = null
+) : IllegalStateException(message) {
+    val reservedIndexPresent: Boolean get() = reservationStatus?.indexReservedForThisEntry ?: false
+    val reservedFilenamePresent: Boolean get() = reservationStatus?.filenameReservedForThisEntry ?: false
+    val manifestCollisionIndex: Boolean get() = reservationStatus?.manifestHasIndex ?: false
+    val manifestCollisionFilename: Boolean get() = reservationStatus?.manifestHasFilename ?: false
 }
 
 // ── Owned direct YUV source abstraction ────────────────────────────
@@ -677,13 +769,18 @@ internal open class YuvCaptureAccounting {
     }
 
     /**
-     * Recovery used only after a token commit failure: releases whatever remains of
-     * the token's reservations (idempotent).  Keeps both sets symmetric when both
-     * reservations exist.
+     * Token-specific reservation probe (Step 5): reports, for THIS entry only,
+     * whether its frame index / filename are still reserved and whether either
+     * collides with the committed manifest.  Recovery diagnostics must never infer
+     * per-token state from the global reservation counts.
      */
-    internal fun releaseReservations(entry: YuvFrameManifestEntry) = synchronized(lock) {
-        reservedIndices.remove(entry.frameIndex)
-        reservedFilenames.remove(entry.filename)
+    fun reservationStatus(entry: YuvFrameManifestEntry): AdoptionReservationStatus = synchronized(lock) {
+        AdoptionReservationStatus(
+            indexReservedForThisEntry = reservedIndices.contains(entry.frameIndex),
+            filenameReservedForThisEntry = reservedFilenames.contains(entry.filename),
+            manifestHasIndex = manifest.containsKey(entry.frameIndex),
+            manifestHasFilename = manifest.values.any { it.filename == entry.filename }
+        )
     }
 
     fun snapshot(): YuvCaptureAccountingSnapshot = synchronized(lock) {
@@ -1371,7 +1468,8 @@ internal data class YuvCleanupResult(
     val currentReservedBytes: Long,
     val cleanupFailures: List<String>,
     val workerTaskDisposalFailures: List<String>,
-    val workerRejectionNotificationFailures: List<String>
+    val workerRejectionNotificationFailures: List<String>,
+    val workerTaskFailures: List<BoundedCaptureWorker.WorkerFailure>
 )
 
 internal class YuvCleanupCoordinator(
@@ -1430,7 +1528,8 @@ internal class YuvCleanupCoordinator(
             // Copy failure collections: the published snapshot is immutable.
             cleanupFailures = s.failures.toList(),
             workerTaskDisposalFailures = s.workerTaskDisposalFailures.toList(),
-            workerRejectionNotificationFailures = s.workerRejectionNotificationFailures.toList()
+            workerRejectionNotificationFailures = s.workerRejectionNotificationFailures.toList(),
+            workerTaskFailures = boundedWorker.disposalsFailureLedger.toList()
         )
     }
 

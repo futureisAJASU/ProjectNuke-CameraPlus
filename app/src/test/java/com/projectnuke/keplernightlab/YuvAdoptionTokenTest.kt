@@ -220,12 +220,16 @@ class YuvAdoptionTokenTest {
         assertEquals(0, snap.persistedFrames)
         assertTrue(snap.manifest.isEmpty())
         // The reservations were never mutated by the failed commit: both still held,
-        // symmetric, and recoverable via releaseReservations.
+        // symmetric, and recoverable via the token's own recovery sub-machine.
         assertEquals(1, snap.reservedIndexCount)
         assertEquals(1, snap.reservedFilenameCount)
         assertFalse(token.rollback())
         assertEquals(AdoptionTokenState.FAILED, token.state())
-        a.releaseReservations(entry(0))
+        val recovery = token.recoverRollbackAfterFailure()
+        assertTrue(recovery.released)
+        assertFalse(recovery.indexReservationRemaining)
+        assertFalse(recovery.filenameReservationRemaining)
+        assertEquals(AdoptionTokenState.FAILED_RECOVERED, token.state())
         assertEquals(0, a.snapshot().reservedIndexCount)
         assertEquals(0, a.snapshot().reservedFilenameCount)
     }

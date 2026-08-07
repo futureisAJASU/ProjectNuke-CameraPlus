@@ -998,6 +998,120 @@ class YuvBufferedLifecycleSettlingTest {
         task.run()
         assertEquals(1, hookCalls.get())
 
+         lifecycle.closeAndDrainRetained().forEach { it.dispose(accounting) }
+    }
+
+    // ── Step 3+4: BufferedEncodeTask state machine + publication state ─────
+
+    @Test
+    fun bufferedEncodeTaskStateTransitionsToSettledWithOutcomePublished() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        val issues = CopyOnWriteArrayList<YuvBufferedLifecycle.EncodingSettlementOutcome>()
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) { }
+        assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
+
+        val task = encodeTask(item, lifecycle, accounting, issues)
+
+        assertEquals(BufferedEncodeTask.TaskSettlementState.NOT_STARTED, task.taskState())
+        assertNull(task.settledOutcome())
+
+        task.run()
+
+        assertEquals(BufferedEncodeTask.TaskSettlementState.SETTLED, task.taskState())
+        assertNotNull(task.settledOutcome())
+        assertTrue(task.settledOutcome() is CaptureTaskDisposalOutcome.Clean)
+        assertEquals(0, lifecycle.trackedCount())
+        assertEquals(0L, reservations.currentBytes())
+    }
+
+    @Test
+    fun bufferedEncodeTaskSettledOutcomeIsMirroredOnRepeatDispose() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
+            error("onRelease threw")
+        }
+        assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
+        val task = BufferedEncodeTask(
+            item = item,
+            accounting = accounting,
+            lifecycle = lifecycle,
+            candidateFilesystem = RealYuvCandidateFilesystem,
+            encode = {
+                YuvWorkerCompletion.Success(
+                    item.frameIndex, item.timestampNs,
+                    YuvCandidateHandle(item.frameIndex, File("candidate.tmp")),
+                    "frame_00_color.png", 0L
+                )
+            },
+            postCompletion = { _ -> },
+            onWorkDisposalDebt = { _, _ -> }
+        )
+
+        val first = task.disposeWithOutcome()
+        val second = task.disposeWithOutcome()
+
+        assertEquals(BufferedEncodeTask.TaskSettlementState.SETTLED, task.taskState())
+        assertTrue(first is CaptureTaskDisposalOutcome.Unclean)
+        assertTrue(second is CaptureTaskDisposalOutcome.Unclean)
+        assertEquals(
+            (first as CaptureTaskDisposalOutcome.Unclean).description,
+            (second as CaptureTaskDisposalOutcome.Unclean).description
+        )
+    }
+
+    @Test
+    fun bufferedEncodeTaskInvalidStatePublishesSettlementIssueAndDebt() {
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        val issues = CopyOnWriteArrayList<YuvBufferedLifecycle.EncodingSettlementOutcome>()
+        val debtDescriptions = CopyOnWriteArrayList<String>()
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) { }
+        // Registered but never began encoding -> RETAINED -> INVALID_STATE.
+        assertTrue(lifecycle.tryRegister(item))
+
+        val task = BufferedEncodeTask(
+            item = item,
+            accounting = accounting,
+            lifecycle = lifecycle,
+            candidateFilesystem = RealYuvCandidateFilesystem,
+            encode = {
+                YuvWorkerCompletion.Success(
+                    item.frameIndex, item.timestampNs,
+                    YuvCandidateHandle(item.frameIndex, File("candidate.tmp")),
+                    "frame_00_color.png", 0L
+                )
+            },
+            postCompletion = { _ -> },
+            onSettlementIssue = { _, outcome ->
+                issues.add(outcome)
+                // Step 4: onSettlementIssue always records debt for non-clean.
+                val settledCleanly = outcome.status == YuvBufferedLifecycle.EncodingSettlementStatus.SETTLED &&
+                    outcome.failure == null && outcome.lifecycleReleaseFailure == null
+                assertFalse("INVALID_STATE must be non-clean", settledCleanly)
+                debtDescriptions.add(
+                    "bufferedTaskSettlementIssue frame=${item.frameIndex}: ${outcome.status}"
+                )
+            }
+        )
+
+        task.run()
+
+        assertEquals(1, issues.size)
+        assertEquals(YuvBufferedLifecycle.EncodingSettlementStatus.INVALID_STATE, issues[0].status)
+        assertEquals(1, debtDescriptions.size)
+        assertTrue(debtDescriptions[0].contains("INVALID_STATE"))
+        assertEquals(BufferedEncodeTask.TaskSettlementState.SETTLED, task.taskState())
+
         lifecycle.closeAndDrainRetained().forEach { it.dispose(accounting) }
     }
 }

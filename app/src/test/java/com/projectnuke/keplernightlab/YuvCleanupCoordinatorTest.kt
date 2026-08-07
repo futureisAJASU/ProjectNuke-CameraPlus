@@ -7,6 +7,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -560,5 +561,45 @@ class YuvCleanupCoordinatorTest {
         assertTrue(result.workerShutdownRequested)
         assertTrue(result.cleanupFailures.any { it.contains("workerShutdown") })
         assertEquals(0, result.totalQueuedTasksRemoved)
+    }
+
+    // ── Step 10: worker-task-failure ledger surfaced in snapshot ──────────
+
+    @Test
+    fun cleanupSnapshotSurfacesWorkerFailureLedger() {
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val stateOwner = CaptureStateOwner(dispatch = { true })
+        val lifecycle = YuvBufferedLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024)
+        val worker = BoundedCaptureWorker("cleanup-ledger", 2,
+            onTaskDisposalFailure = { _, _ -> },
+            onRejectionNotificationFailure = { _, _ -> },
+            onRejected = { _ -> })
+        val coordinator = YuvCleanupCoordinator(stateOwner, lifecycle, accounting, reservations, worker)
+
+        assertTrue(worker.submit(Runnable {
+            started.countDown(); release.await(5, TimeUnit.SECONDS)
+        }))
+        assertTrue(started.await(2, TimeUnit.SECONDS))
+
+        val failingTask = DisposableYuvTask(
+            YuvPngWorkItem.bufferedForTest(0, 1L, 100, reservations, accounting) {
+                error("injected ledger failure")
+            },
+            accounting
+        ) { error("injected ledger failure") }
+        assertTrue(worker.submit(failingTask))
+
+        val result = coordinator.perform()
+        assertTrue(result.workerTaskFailures.isNotEmpty())
+        val failure = result.workerTaskFailures.single { it.task === failingTask }
+        assertEquals("shutdown", failure.stage)
+        assertNotNull(failure.throwable)
+        assertNotNull(failure.disposalOutcome)
+
+        release.countDown()
+        assertTrue(worker.awaitTermination(5_000))
     }
 }

@@ -85,7 +85,7 @@ class YuvCandidateOwnershipTest {
         val otherHandle = YuvCandidateHandle(0, File("other.tmp"))
         val claim = handle.tryBeginAdoption()!!
 
-        assertFalse("foreign claim must be rejected", handle.completeAdoption(CandidateAdoptionClaim.forgedForTest(otherHandle)))
+        assertFalse("foreign claim must be rejected", handle.completeAdoption(invalidClaimForTest(otherHandle)))
         assertEquals(CandidateOwnership.ADOPTING, handle.state())
 
         assertTrue(handle.completeAdoption(claim))
@@ -116,7 +116,7 @@ class YuvCandidateOwnershipTest {
         val claim = handle.tryBeginAdoption()!!
         val filesystem = RecordingFilesystem(CandidateFileOperationResult.DELETED)
 
-        val foreign = handle.abortAdoption(CandidateAdoptionClaim.forgedForTest(otherHandle), filesystem)
+        val foreign = handle.abortAdoption(invalidClaimForTest(otherHandle), filesystem)
 
         assertTrue(foreign.alreadySettled)
         assertEquals(CandidateOwnership.ADOPTING, handle.state())
@@ -386,9 +386,9 @@ class YuvCandidateOwnershipTest {
     fun forgedSameHandleClaimCannotCompleteOrAbort() {
         val handle = YuvCandidateHandle(0, File("candidate.tmp"))
         val genuine = handle.tryBeginAdoption()!!
-        // A forged claim constructed for the SAME handle (nonce 0) must never match
-        // the active claim (nonce >= 1): completion and abort are both rejected.
-        val forged = CandidateAdoptionClaim.forgedForTest(handle)
+        // A forged claim constructed for the SAME handle must never match
+        // the active claim (reference identity): completion and abort are both rejected.
+        val forged = invalidClaimForTest(handle)
         val filesystem = RecordingFilesystem(CandidateFileOperationResult.DELETED)
 
         assertFalse("forged same-handle claim must not complete adoption", handle.completeAdoption(forged))

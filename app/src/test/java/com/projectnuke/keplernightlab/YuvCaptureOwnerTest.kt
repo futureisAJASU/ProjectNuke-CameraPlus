@@ -127,7 +127,8 @@ class YuvCaptureOwnerTest {
         val rotationDegrees: Int = 0,
         encodeFailure: Boolean = false,
         encodeLatch: EncodeLatch? = null,
-        rejectDispatch: Boolean = false
+        rejectDispatch: Boolean = false,
+        finalFileVerifier: YuvFinalFileVerifier = RealYuvFinalFileVerifier
     ) {
         val dir: File = Files.createTempDirectory("yuv-owner-test").toFile()
         val handlerThread = android.os.HandlerThread("yuv-test").apply { start() }
@@ -191,7 +192,8 @@ class YuvCaptureOwnerTest {
             onCaptureError = { msg, _ ->
                 onCaptureErrorCount.incrementAndGet()
                 errorMessage.set(msg)
-            }
+            },
+            finalFileVerifier = finalFileVerifier
         )
 
         /** Wait deterministically for the terminal status to be reached and return it. */
@@ -663,6 +665,30 @@ class YuvCaptureOwnerTest {
         assertTrue(result is DirectYuvWorkCreation.Failed)
         assertEquals(1, accounting.snapshot().failedFrames)
         assertEquals(1, directAccess.closeCount.get())
+    }
+
+    // ── Step 11: final-verifier throw recorded as owner debt ───────────
+
+    @Test
+    fun finalVerifierThrowRecordsOwnerDebtAndFailsTerminal() {
+        val harness = Harness(
+            frameCount = 1,
+            finalFileVerifier = YuvFinalFileVerifier { _, _ ->
+                error("injected final verifier throw")
+            }
+        )
+        try {
+            val access = FakeDirectAccess()
+            harness.session.owner.acceptDirect(access)
+            val status = harness.awaitTerminal()
+            assertEquals(CaptureTerminalStatus.FAILED, status)
+            assertTrue("error callback should fire", harness.onCaptureErrorCount.get() >= 1)
+            val debts = harness.session.owner.candidateCleanupDebt()
+            assertTrue(debts.any { it.contains("final verifier threw") })
+            assertTrue(debts.any { it.contains("injected final verifier throw") })
+        } finally {
+            harness.shutdown()
+        }
     }
 
     companion object {
