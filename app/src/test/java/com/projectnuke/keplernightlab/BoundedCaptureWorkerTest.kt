@@ -392,6 +392,51 @@ class BoundedCaptureWorkerTest {
         assertTrue(worker.awaitTermination(5_000))
     }
 
+    // ── Phase 0.5: rejection failure persists to cleanup snapshot ─────────
+
+    @Test
+    fun ordinaryRejectionFailurePersistsToFinalCleanupSnapshot() {
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val worker = BoundedCaptureWorker("reject-persist", capacity = 1)
+
+        // Occupy the single worker slot.
+        assertTrue(worker.submit(Runnable {
+            started.countDown(); release.await(5, TimeUnit.SECONDS)
+        }))
+        assertTrue(started.await(2, TimeUnit.SECONDS))
+
+        // Fill the capacity-1 queue so the next submit is rejected.
+        assertTrue(worker.submit(Runnable { }))
+
+        // The rejected task's disposal fails: the failure must be recorded in the
+        // worker's historical ledger even though the worker continues operating.
+        val rejectedTask = object : OutcomeDisposableCaptureTask {
+            override fun run() {}
+            override fun dispose() {}
+            override fun disposeWithOutcome() = CaptureTaskDisposalOutcome.Failed(
+                IllegalStateException("rejected task disposal failed")
+            )
+        }
+        assertFalse(worker.submit(rejectedTask))
+
+        // The worker continues: it can still report its queued count.
+        assertTrue(worker.queuedCount() >= 1)
+
+        // Release the running task and shut down: the worker's historical ledger
+        // (the final cleanup snapshot) must contain the earlier rejection failure.
+        release.countDown()
+        worker.shutdownNow()
+
+        val ledger = worker.disposalsFailureLedger
+        assertTrue(
+            "cleanup snapshot must contain the earlier rejection failure: $ledger",
+            ledger.any { it.throwable.message?.contains("rejected task disposal failed") == true }
+        )
+        assertEquals("rejection", ledger.single().stage)
+        assertTrue(worker.awaitTermination(5_000))
+    }
+
     @Test
     fun rejectionOfOutcomeDisposableTaskNotifiesUncleanWithoutCountingSuccess() {
         val started = CountDownLatch(1)

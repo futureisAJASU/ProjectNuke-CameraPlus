@@ -429,7 +429,7 @@ internal class YuvCaptureOwner(
 
     fun onCaptureFailed(cause: Throwable, detail: String) {
         captureStateOwner.post(object : CaptureOwnerEvent {
-            override fun execute() { finishError("Color Burst 罹≪쿂 ?ㅽ뙣: $detail", cause = cause) }
+            override fun execute() { finishError("Color Burst 캡처 실패: $detail", cause = cause) }
             override fun disposeWithoutMutation() {}
         })
     }
@@ -796,7 +796,7 @@ internal class YuvCaptureOwner(
         val snap = accounting.snapshot()
         saveMotionOnce(outputDir)
         writeJobJson("CAPTURE_COMPLETE", snap.persistedFrames, snap.manifest)
-        postStatus("CAPTURE_COMPLETE: 罹≪쿂媛 ?꾨즺?섏뿀?듬땲??")
+        postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
         cleanup()
         postMainOrRun { onCaptureComplete(outputDir) }
     }

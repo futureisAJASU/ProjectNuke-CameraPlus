@@ -651,6 +651,37 @@ class YuvAdoptionFilesystemTest {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Item 1: post-COMMITTED consistency — token COMMITTED => manifest entry
+    // exists => persistedFrames includes entry => the committed manifest entry
+    // survives a subsequent candidate-settlement failure (the candidate handle
+    // is settled independently; the manifest is owned by the accounting).
+    // ------------------------------------------------------------------
+
+    @Test
+    fun tokenCommittedThenCandidateSettlementFailsPreservesManifest() {
+        val accounting = YuvCaptureAccounting()
+        val entry = YuvFrameManifestEntry(0, "frame_00_color.png", 4321L, true)
+        val token = accounting.tryReserveAdoption(entry)!!
+
+        assertTrue(token.commit())
+        assertEquals(AdoptionTokenState.COMMITTED, token.state())
+
+        val snap1 = accounting.snapshot()
+        assertEquals(1, snap1.persistedFrames)
+        assertEquals(1, snap1.manifest.size)
+        assertEquals(0, snap1.failedFrames)
+
+        val handle = YuvCandidateHandle(0, File("candidate.tmp"))
+        val claim = handle.tryBeginAdoption()!!
+        handle.abortAdoption(claim, RealYuvCandidateFilesystem)
+
+        val snap2 = accounting.snapshot()
+        assertEquals(1, snap2.persistedFrames)
+        assertEquals(1, snap2.manifest.size)
+        assertEquals(0, snap2.failedFrames)
+    }
+
     companion object {
         private val PNG_1X1: ByteArray = java.util.Base64.getDecoder().decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="

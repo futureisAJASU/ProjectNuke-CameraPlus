@@ -1161,4 +1161,59 @@ class YuvBufferedLifecycleSettlingTest {
 
         lifecycle.closeAndDrainRetained().forEach { it.dispose(accounting) }
     }
+
+    // ── Phase 0.4: second disposal during SETTLING reports in-progress ─────
+
+    @Test
+    fun bufferedEncodeTaskSecondDisposeDuringSettlingReportsInProgress() {
+        // A lifecycle whose finishSettling returns false makes the settlement
+        // non-clean, so onSettlementIssue fires and we can block inside it to
+        // make the SETTLING state observable to a concurrent disposer.
+        val lifecycle = FalseFinishSettlingLifecycle()
+        val accounting = YuvCaptureAccounting()
+        val reservations = YuvBufferReservations(1024L)
+        val disposeCount = AtomicInteger(0)
+        assertTrue(reservations.tryReserve(100L))
+        val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
+            disposeCount.incrementAndGet()
+        }
+        assertTrue(lifecycle.tryRegister(item))
+        assertTrue(lifecycle.beginEncoding(item))
+
+        val settlementStarted = CountDownLatch(1)
+        val settlementBlock = CountDownLatch(1)
+
+        val task = BufferedEncodeTask(
+            item = item,
+            accounting = accounting,
+            lifecycle = lifecycle,
+            candidateFilesystem = RealYuvCandidateFilesystem,
+            encode = {
+                YuvWorkerCompletion.Success(
+                    item.frameIndex, item.timestampNs,
+                    YuvCandidateHandle(item.frameIndex, File("candidate.tmp")),
+                    "frame_00_color.png", 0L
+                )
+            },
+            postCompletion = { _ -> },
+            onSettlementIssue = { _, _ ->
+                settlementStarted.countDown()
+                settlementBlock.await(5, TimeUnit.SECONDS)
+            }
+        )
+
+        val t1 = Thread { task.run() }
+        t1.start()
+        assertTrue(settlementStarted.await(5, TimeUnit.SECONDS))
+
+        assertEquals(BufferedEncodeTask.TaskSettlementState.SETTLING, task.taskState())
+        val second = task.disposeWithOutcome()
+        assertTrue("second disposal during SETTLING must report in-progress", second is CaptureTaskDisposalOutcome.Unclean)
+        assertFalse("second disposal must not return Clean during SETTLING", second is CaptureTaskDisposalOutcome.Clean)
+
+        settlementBlock.countDown()
+        t1.join(5_000)
+        assertFalse(t1.isAlive)
+        assertEquals(1, disposeCount.get())
+    }
 }

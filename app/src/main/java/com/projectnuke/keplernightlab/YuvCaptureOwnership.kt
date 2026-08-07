@@ -237,14 +237,11 @@ internal class CandidateDisposalOutcome(
  * and it deliberately returns a distinct object instance that can never match the
  * active claim.
  */
-internal class CandidateAdoptionClaim private constructor(
+internal class CandidateAdoptionClaim internal constructor(
     val handle: YuvCandidateHandle,
     val frameIndex: Int
 ) {
     companion object {
-        internal fun create(handle: YuvCandidateHandle, frameIndex: Int): CandidateAdoptionClaim =
-            CandidateAdoptionClaim(handle, frameIndex)
-
         internal fun invalidForTest(handle: YuvCandidateHandle): CandidateAdoptionClaim =
             CandidateAdoptionClaim(handle, handle.frameIndex)
     }
@@ -296,7 +293,7 @@ internal class YuvCandidateHandle(
     fun tryBeginAdoption(): CandidateAdoptionClaim? {
         val old = record.get()
         if (old.ownership != CandidateOwnership.UNSETTLED) return null
-        val claim = CandidateAdoptionClaim.create(this, frameIndex)
+        val claim = CandidateAdoptionClaim(this, frameIndex)
         val target = StateRecord(CandidateOwnership.ADOPTING, activeClaim = claim)
         return if (record.compareAndSet(old, target)) {
             claim
