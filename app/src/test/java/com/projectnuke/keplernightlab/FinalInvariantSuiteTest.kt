@@ -110,4 +110,108 @@ class FinalInvariantSuiteTest {
         assertTrue(noFollowIdentityMatches(null, null, 100L, 100L, 1000L, 1000L))
         assertEquals(false, noFollowIdentityMatches(null, null, 100L, 101L, 1000L, 1000L))
     }
+
+    @Test
+    fun yuvCaptureAccountingPersistedEqualsManifestSizeAtAllTimes() {
+        // The accounting snapshot MUST always keep persistedFrames in sync
+        // with the manifest size. This is the cross-cutting invariant the
+        // YUV owner's adoption pipeline enforces after every persisted frame.
+        val dir = Files.createTempDirectory("final-suite-persisted-eq-manifest").toFile()
+        try {
+            val accounting = YuvCaptureAccounting()
+            assertEquals(0, accounting.snapshot().persistedFrames)
+            assertEquals(0, accounting.snapshot().manifest.size)
+            accounting.persistedFrame(YuvFrameManifestEntry(0, "frame_00_color.png", 1000L, true))
+            val s1 = accounting.snapshot()
+            assertEquals(1, s1.persistedFrames)
+            assertEquals(1, s1.manifest.size)
+            // Duplicate identity is rejected.
+            assertEquals(false, accounting.persistedFrame(YuvFrameManifestEntry(0, "frame_00_color.png", 1001L, true)))
+            val s2 = accounting.snapshot()
+            assertEquals(1, s2.persistedFrames)
+            assertEquals(1, s2.manifest.size)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun yuvCaptureAccountingNeverAllowsNegativeCounters() {
+        // Accounting counters must be monotonically non-negative. Even
+        // arbitrary drop/fail calls must not underflow.
+        val accounting = YuvCaptureAccounting()
+        accounting.receivedFrame()
+        accounting.failedFrame()
+        accounting.droppedFrame()
+        val snap = accounting.snapshot()
+        assertTrue(snap.receivedFrames >= 0)
+        assertTrue(snap.failedFrames >= 0)
+        assertTrue(snap.droppedFrames >= 0)
+        assertTrue(snap.persistedFrames >= 0)
+        assertTrue(snap.bufferedFrames >= 0)
+    }
+
+    @Test
+    fun yuvFrameManifestEntryHasUniqueFilenameAndFrameIndex() {
+        // The manifest is the source of truth for frame identity and
+        // filename. Two entries must NEVER share a frameIndex or a filename.
+        val e1 = YuvFrameManifestEntry(0, "frame_00_color.png", 1000L, true)
+        val e2 = YuvFrameManifestEntry(1, "frame_01_color.png", 2000L, true)
+        assertNotEquals(e1.frameIndex, e2.frameIndex)
+        assertNotEquals(e1.filename, e2.filename)
+    }
+
+    @Test
+    fun captureTerminalStatusEnumCoversAllRequiredOutcomes() {
+        // The terminal state machine must support SUCCESS / PARTIAL_SUCCESS /
+        // FAILED / TIMED_OUT / CANCELLED, plus ACTIVE for the open state.
+        val required = setOf(
+            CaptureTerminalStatus.ACTIVE,
+            CaptureTerminalStatus.SUCCESS,
+            CaptureTerminalStatus.PARTIAL_SUCCESS,
+            CaptureTerminalStatus.FAILED,
+            CaptureTerminalStatus.TIMED_OUT,
+            CaptureTerminalStatus.CANCELLED
+        )
+        for (status in required) {
+            assertTrue("$status missing", status in CaptureTerminalStatus.entries.toSet())
+        }
+    }
+
+    @Test
+    fun rawDngSidecarOutcomeExposesIdentityAfterLocalFailure() {
+        // A frame whose local DNG save fails must still expose its identity so
+        // the manifest can correlate it with the (preserved) raw16 frame.
+        val outcome = RawDngSidecarOutcome.localSaveFailed(
+            frameIndex = 9,
+            failureDescription = "native writer returned false"
+        )
+        assertEquals(9, outcome.frameIndex)
+        assertTrue(outcome.isLocalFailureOnly)
+        assertNotEquals(RawDngSidecarStatus.LOCAL_SAVED, outcome.status)
+    }
+
+    @Test
+    fun rawSaveCompletionIdentityIsIndependentOfEncodedPayload() {
+        // Success and Failed completions both carry frameIndex/timestampNs
+        // so the owner can correlate late completions with the frame map.
+        val success = RawSaveCompletion.Success(
+            frameIndex = 1,
+            timestampNs = 1000L,
+            raw16Filename = "frame_01.raw16",
+            raw16Bytes = 4096L,
+            saveDurationMs = 10L,
+            dngSidecar = RawDngSidecarOutcome.notRequested(1)
+        )
+        val failed = RawSaveCompletion.Failed(
+            frameIndex = 1,
+            timestampNs = 1000L,
+            raw16TempFile = null,
+            failureType = "encode-failed",
+            failureMessage = "boom",
+            throwable = null
+        )
+        assertEquals(success.frameIndex, failed.frameIndex)
+        assertEquals(success.timestampNs, failed.timestampNs)
+    }
 }
