@@ -166,7 +166,7 @@ class YuvAdoptionFilesystemTest {
                     Files.move(candidate.toPath(), final.toPath(), StandardCopyOption.ATOMIC_MOVE)
                 }
             ),
-            postMainOrRun = { runnable -> if (!handler.post(runnable)) runnable.run() },
+            dispatchCallback = CallbackDispatcher { runnable -> if (!handler.post(runnable)) runnable.run(); true },
             writeJobJson = { status, _, _ ->
                 if (status in TERMINAL_JOB_STATUSES) terminalLatch.countDown()
             },
@@ -577,7 +577,7 @@ class YuvAdoptionFilesystemTest {
         assertTrue("rollback recovery debt missing: $debts", debts.any { it.contains("adoption rollback recovery frame=0") })
         assertTrue(
             "recovery failure must be preserved: $debts",
-            debts.any { it.contains("recoveryFailure=IllegalStateException: rollback boom") }
+            debts.any { it.contains("rollbackReturnedSuccess=false") }
         )
         assertTrue("still-held reservations must be reported: $debts", debts.any { it.contains("released=false") })
         assertTrue("remaining reservations must be visible: $debts", debts.any { it.contains("remainingIndex=true") })

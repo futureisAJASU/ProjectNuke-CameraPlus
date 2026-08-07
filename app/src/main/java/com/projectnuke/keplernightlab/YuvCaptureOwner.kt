@@ -169,6 +169,12 @@ internal class BufferedEncodeTask(
  * dropped counters, the persisted manifest, retained-byte registration, completed capture-
  * result count, and success/error callback decision.
  *
+ * Terminal settlement is transactional: a single [settleTerminal] path handles every
+ * terminal outcome.  The settlement phase machine is ACTIVE -> CLAIMED -> SETTLING ->
+ * SETTLED.  [finished] becomes true at CLAIMED (no new capture work may be accepted);
+ * the published [YuvTerminalSnapshot] separately reports whether metadata/callback/cleanup
+ * settlement has completed (SETTLED) or is still in flight.
+ *
  * Terminal states (only the owner may transition out of ACTIVE):
  *  ACTIVE -> SUCCESS | PARTIAL_SUCCESS | FAILED | TIMED_OUT | CANCELLED
  */
@@ -186,7 +192,7 @@ internal class YuvCaptureOwner(
     private val boundedWorker: BoundedCaptureWorker,
     private val finished: AtomicBoolean,
     private val postStatus: (String) -> Unit,
-    private val postMainOrRun: (Runnable) -> Unit,
+    private val dispatchCallback: CallbackDispatcher,
     private val writeJobJson: (status: String, savedFrames: Int, manifest: List<YuvFrameManifestEntry>) -> Unit,
     private val saveMotionOnce: (File) -> Pair<String?, String?>,
     private val onCaptureComplete: (File) -> Unit,
@@ -198,80 +204,68 @@ internal class YuvCaptureOwner(
 ) {
 
     private var completedResults = 0
-    private var terminalReason: String? = null
     private val discardedLateCompletions = mutableListOf<Int>()
-    private val callbackFired = AtomicBoolean(false)
 
-    /**
-     * Cleanup debt recorded for candidates/final files that could neither be deleted
-     * nor quarantined (or whose removal failed).  Thread-safe because the emergency
-     * settlement path (owner-event rejection) runs off the owner dispatcher.
-     */
-    private val candidateCleanupDebts = java.util.concurrent.CopyOnWriteArrayList<String>()
+    private val terminalSettlementPhaseRef = AtomicReference(TerminalSettlementPhase.ACTIVE)
+    private val callbackStateRef = AtomicReference(CallbackState.NOT_REQUESTED)
+    private val terminalReasonRef = AtomicReference<String?>(null)
+    private val diagnostics = java.util.concurrent.CopyOnWriteArrayList<YuvCaptureDiagnostic>()
 
-    internal fun candidateCleanupDebt(): List<String> = candidateCleanupDebts.toList()
+    private val terminalSnapshotRef = AtomicReference(buildSnapshot())
+
+    internal fun candidateCleanupDebt(): List<String> =
+        diagnostics.map { "${it.stage}: ${it.message}" }
+
+    private fun recordDiagnostic(
+        stage: DiagnosticStage,
+        severity: DiagnosticSeverity,
+        frameIndex: Int? = null,
+        path: String? = null,
+        message: String,
+        throwable: Throwable? = null
+    ) {
+        diagnostics.add(YuvCaptureDiagnostic(stage, severity, frameIndex, path, message, throwable))
+        when (severity) {
+            DiagnosticSeverity.ERROR -> Log.e("KeplerYuvOwner", message, throwable)
+            DiagnosticSeverity.WARN -> Log.w("KeplerYuvOwner", message, throwable)
+            DiagnosticSeverity.INFO -> Unit
+        }
+    }
 
     private fun recordCandidateDebt(settlement: CandidateDisposalOutcome, frameIndex: Int, file: File) {
         val description = settlement.failureDescription(frameIndex, file)
         if (description != null) {
-            candidateCleanupDebts.add(description)
-            Log.e("KeplerYuvOwner", description)
+            recordDiagnostic(DiagnosticStage.CANDIDATE_CLEANUP, DiagnosticSeverity.ERROR, frameIndex, file.path, description)
         }
     }
 
-    /**
-     * Records an adoption-rollback recovery failure as observable debt: a throwing
-     * [YuvCaptureAccounting.rollbackAdoption], still-held reservations, or asymmetric
-     * index/filename corruption must never be silently dropped.
-     */
     private fun recordRollbackRecovery(
         entry: YuvFrameManifestEntry,
         result: AdoptionToken.AdoptionRecoveryResult
     ) {
         if (result.recoveryFailure == null && result.released && !result.asymmetric) return
-        val failurePart = result.recoveryFailure?.let {
-            " recoveryFailure=" + it::class.java.simpleName + ": " + it.message
-        } ?: ""
-        val description = "adoption rollback recovery frame=${entry.frameIndex} file=${entry.filename}" +
+        val message = "adoption rollback recovery frame=${entry.frameIndex} file=${entry.filename}" +
             " eligible=${result.eligible}" +
             " rollbackAttempted=${result.rollbackAttempted}" +
             " rollbackReturnedSuccess=${result.rollbackReturnedSuccess}" +
             " released=${result.released} remainingIndex=${result.indexReservationRemaining}" +
-            " remainingFilename=${result.filenameReservationRemaining} asymmetric=${result.asymmetric}" +
-            failurePart
-        candidateCleanupDebts.add(description)
-        Log.e("KeplerYuvOwner", description)
+            " remainingFilename=${result.filenameReservationRemaining} asymmetric=${result.asymmetric}"
+        recordDiagnostic(DiagnosticStage.ADOPTION_ROLLBACK, DiagnosticSeverity.ERROR, entry.frameIndex, entry.filename, message, result.recoveryFailure)
     }
 
-    /**
-     * Item 4: Rollback helper that records the initial rollback attempt, its success
-     * or failure, and (on failure) the recovery result.  Does NOT call
-     * [AdoptionToken.recoverRollbackAfterFailure] when the initial rollback succeeds.
-     *
-     * When the token is already FAILED (e.g. from commit failure), the original failure
-     * is already recorded by the calling path and is NOT re-recorded here as a
-     * "rollback failed" diagnostic.
-     */
     private fun rollbackAdoptionAndRecord(entry: YuvFrameManifestEntry, token: AdoptionToken) {
         val preRollbackState = token.state()
         val rollbackSuccess = token.rollback()
         if (rollbackSuccess) {
-            // State is ROLLED_BACK; no recovery needed.
             return
         }
-        // Rollback did not succeed.  If the token was RESERVED, rollback was actually
-        // attempted but failed: record the rollback failure.  If the token was already
-        // FAILED (e.g. from commit failure), the original failure is already recorded
-        // by the calling path and we skip re-recording it.
         if (preRollbackState == AdoptionTokenState.RESERVED) {
             token.failure?.let { failure ->
-                val description = "adoption rollback failed frame=${entry.frameIndex} file=${entry.filename} " +
-                    "cause=${failure::class.java.simpleName}: ${failure.message}"
-                candidateCleanupDebts.add(description)
-                Log.e("KeplerYuvOwner", description)
+                recordDiagnostic(DiagnosticStage.ADOPTION_ROLLBACK, DiagnosticSeverity.ERROR, entry.frameIndex, entry.filename,
+                    "adoption rollback failed frame=${entry.frameIndex} file=${entry.filename} " +
+                        "cause=${failure::class.java.simpleName}: ${failure.message}", failure)
             }
         }
-        // Attempt recovery regardless of pre-rollback state.
         val recovery = token.recoverRollbackAfterFailure()
         recordRollbackRecovery(entry, recovery)
     }
@@ -284,9 +278,8 @@ internal class YuvCaptureOwner(
      */
     private fun recordWorkDisposalDebt(item: YuvPngWorkItem, outcome: YuvWorkDisposalOutcome) {
         if (outcome.isClean) return
-        val description = disposalDescription(outcome, item.frameIndex)
-        candidateCleanupDebts.add(description)
-        Log.e("KeplerYuvOwner", description)
+        recordDiagnostic(DiagnosticStage.WORK_DISPOSAL, DiagnosticSeverity.ERROR, item.frameIndex,
+            null, disposalDescription(outcome, item.frameIndex))
     }
 
     private fun recordDisposalIfUnclean(item: YuvPngWorkItem, outcome: YuvWorkDisposalOutcome) {
@@ -313,11 +306,11 @@ internal class YuvCaptureOwner(
                             recordDisposalIfUnclean(c.item, c.item.dispose(accounting))
                             return
                         }
-                        postStatus("YUV buffered frame ${accounting.snapshot().bufferedFrames}/$frameCount")
+                        ignoreErrors("buffered status dispatch") { postStatus("YUV buffered frame ${accounting.snapshot().bufferedFrames}/$frameCount") }
                         scheduleBufferedEncoding()
                     }
                     BufferedYuvWorkCreation.Rejected ->
-                        postStatus("YUV memory buffer dropped frame ${frameIndex + 1}/$frameCount: retained=${reservations.currentBytes()} bytes")
+                        ignoreErrors("dropped status dispatch") { postStatus("YUV memory buffer dropped frame ${frameIndex + 1}/$frameCount: retained=${reservations.currentBytes()} bytes") }
                     is BufferedYuvWorkCreation.Failed -> {
                         if (c.cause is Error) throw c.cause
                         finishError("YUV memory buffer copy failed", cause = c.cause)
@@ -398,18 +391,18 @@ internal class YuvCaptureOwner(
                             // Worker already disposed the rejected task (disposeWithOutcome);
                             // the drop is recorded here exactly once.
                             accounting.droppedFrame()
-                            postStatus("YUV direct backpressure: frame ${item.frameIndex + 1} dropped")
+                            ignoreErrors("direct backpressure status dispatch") { postStatus("YUV direct backpressure: frame ${item.frameIndex + 1} dropped") }
                         }
                     }
                     is DirectYuvWorkCreation.Failed -> {
                         if (creation.cause is Error) throw creation.cause
                         // Preserve the release failure as observable debt
                         if (creation.releaseFailure != null) {
-                            val msg = "direct creation releaseFailure frame=$frameIndex " +
-                                "cause=${creation.cause::class.java.simpleName}: ${creation.cause.message} " +
-                                "releaseFailure=${creation.releaseFailure::class.java.simpleName}: ${creation.releaseFailure.message}"
-                            candidateCleanupDebts.add(msg)
-                            Log.e("KeplerYuvOwner", msg)
+                            recordDiagnostic(DiagnosticStage.DIRECT_CREATION_RELEASE, DiagnosticSeverity.ERROR, frameIndex,
+                                null, "direct creation releaseFailure frame=$frameIndex " +
+                                    "cause=${creation.cause::class.java.simpleName}: ${creation.cause.message} " +
+                                    "releaseFailure=${creation.releaseFailure::class.java.simpleName}: ${creation.releaseFailure.message}",
+                                creation.releaseFailure)
                         }
                         finishError("YUV direct creation failed", cause = creation.cause)
                     }
@@ -496,9 +489,9 @@ internal class YuvCaptureOwner(
                 if (!settledCleanly) {
                     val detail = listOfNotNull(outcome.failure, outcome.lifecycleReleaseFailure)
                         .joinToString("; ") { "${it::class.java.simpleName}: ${it.message}" }
-                    candidateCleanupDebts.add(
-                        "bufferedTaskSettlementIssue frame=${issueItem.frameIndex}: ${outcome.status} $detail"
-                    )
+                    recordDiagnostic(DiagnosticStage.LIFECYCLE_SETTLEMENT, DiagnosticSeverity.WARN, issueItem.frameIndex,
+                        null, "bufferedTaskSettlementIssue frame=${issueItem.frameIndex}: ${outcome.status} $detail",
+                        outcome.failure ?: outcome.lifecycleReleaseFailure)
                 }
                 // Item 7: DO NOT re-record disposal debt here — that is
                 // onWorkDisposalDebt's exclusive responsibility.
@@ -511,7 +504,7 @@ internal class YuvCaptureOwner(
             // Worker already called task.dispose() which calls lifecycle.settleEncoding.
             // Do NOT double-settle or double-dispose the item.
             accounting.droppedFrame()
-            postStatus("YUV backpressure: buffered frame ${frame.frameIndex + 1} dropped")
+            ignoreErrors("buffered backpressure status dispatch") { postStatus("YUV backpressure: buffered frame ${frame.frameIndex + 1} dropped") }
         }
     }
 
@@ -576,10 +569,9 @@ internal class YuvCaptureOwner(
             val reason = verifierThrowable?.let { ": ${it::class.java.simpleName}: ${it.message}" } ?: ""
             Log.e("KeplerYuvOwner", "Candidate validation failed for frame ${completion.frameIndex}: ${handle.file}$reason")
             if (verifierThrowable != null) {
-                candidateCleanupDebts.add(
+                recordDiagnostic(DiagnosticStage.CANDIDATE_VERIFY, DiagnosticSeverity.ERROR, completion.frameIndex, handle.file.path,
                     "candidate verifier failed frame=${completion.frameIndex} file=${handle.file} " +
-                        "${verifierThrowable::class.java.simpleName}: ${verifierThrowable.message}"
-                )
+                        "${verifierThrowable::class.java.simpleName}: ${verifierThrowable.message}", verifierThrowable)
             }
             recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
             accounting.failedFrame()
@@ -641,10 +633,9 @@ internal class YuvCaptureOwner(
         val finalVerified = try {
             finalFileVerifier.verify(finalFile, completion.frameIndex)
         } catch (t: Throwable) {
-            val description = "final verifier threw frame=${completion.frameIndex} file=${finalFile}: " +
-                "${t::class.java.simpleName}: ${t.message}"
-            candidateCleanupDebts.add(description)
-            Log.e("KeplerYuvOwner", description, t)
+            recordDiagnostic(DiagnosticStage.FINAL_VERIFY, DiagnosticSeverity.ERROR, completion.frameIndex, finalFile.path,
+                "final verifier threw frame=${completion.frameIndex} file=${finalFile}: " +
+                    "${t::class.java.simpleName}: ${t.message}", t)
             false
         }
         if (!finalVerified) {
@@ -680,26 +671,20 @@ internal class YuvCaptureOwner(
         val claimCompleted = try {
             handle.completeAdoption(claim)
         } catch (t: AdoptionInvariantException) {
-            val description = "candidate adoption completion invariant-failed frame=${completion.frameIndex} " +
-                "file=${handle.file}: ${t.message}"
-            candidateCleanupDebts.add(description)
-            Log.e("KeplerYuvOwner", description, t)
-            // Item 1: DO NOT delete final — manifest entry exists.  DO NOT call
-            // failedFrame — the frame IS in the manifest.
+            recordDiagnostic(DiagnosticStage.ADOPTION_COMMIT, DiagnosticSeverity.ERROR, completion.frameIndex, handle.file.path,
+                "candidate adoption completion invariant-failed frame=${completion.frameIndex} " +
+                    "file=${handle.file}: ${t.message}", t)
             return
         }
         if (claimCompleted != AdoptionResult.COMPLETED) {
-            val description = "candidate adoption completion $claimCompleted frame=${completion.frameIndex} " +
-                "file=${handle.file} state=${handle.state()}"
-            candidateCleanupDebts.add(description)
-            Log.e("KeplerYuvOwner", description)
-            // Item 1: DO NOT delete final — manifest entry exists.  DO NOT call
-            // failedFrame — the frame IS in the manifest.
+            recordDiagnostic(DiagnosticStage.ADOPTION_COMMIT, DiagnosticSeverity.ERROR, completion.frameIndex, handle.file.path,
+                "candidate adoption completion $claimCompleted frame=${completion.frameIndex} " +
+                    "file=${handle.file} state=${handle.state()}")
             return
         }
         val persistedFrames = accounting.snapshot().persistedFrames
-        postStatus("YUV capture: saved $persistedFrames/$frameCount")
-        writeJobJson("CAPTURING", persistedFrames, accounting.snapshot().manifest)
+        ignoreErrors("capturing status dispatch") { postStatus("YUV capture: saved $persistedFrames/$frameCount") }
+        ignoreErrors("capturing metadata write") { writeJobJson("CAPTURING", persistedFrames, accounting.snapshot().manifest) }
     }
 
     /**
@@ -724,13 +709,13 @@ internal class YuvCaptureOwner(
             if (quarantineResult !is CandidateFileOperationResult.QUARANTINE_FAILED) return
             val deleteFailure = deleteResult.failure
             val quarantineFailure = quarantineResult.failure
-            val description = "final-file cleanup debt file=$file" +
-                " delete=${deleteResult.describe()}" +
-                " quarantine=${quarantineResult.describe()}" +
-                (if (deleteFailure == null) "" else " deleteThrowable=" + deleteFailure::class.java.simpleName + ": " + deleteFailure.message) +
-                (if (quarantineFailure == null) "" else " quarantineThrowable=" + quarantineFailure::class.java.simpleName + ": " + quarantineFailure.message)
-            candidateCleanupDebts.add(description)
-            Log.e("KeplerYuvOwner", description)
+            recordDiagnostic(DiagnosticStage.FINAL_CLEANUP, DiagnosticSeverity.ERROR, null, file.path,
+                "final-file cleanup debt file=$file" +
+                    " delete=${deleteResult.describe()}" +
+                    " quarantine=${quarantineResult.describe()}" +
+                    (if (deleteFailure == null) "" else " deleteThrowable=" + deleteFailure::class.java.simpleName + ": " + deleteFailure.message) +
+                    (if (quarantineFailure == null) "" else " quarantineThrowable=" + quarantineFailure::class.java.simpleName + ": " + quarantineFailure.message),
+                quarantineFailure)
         }
     }
 
@@ -741,86 +726,86 @@ internal class YuvCaptureOwner(
     private fun checkTerminal() {
         val snap = accounting.snapshot()
         if (snap.persistedFrames >= frameCount && terminalState.claim(CaptureTerminalStatus.SUCCESS)) {
-            completeSuccess()
+            settleTerminal(YuvTerminalRequest(
+                status = CaptureTerminalStatus.SUCCESS,
+                jobStatus = "CAPTURE_COMPLETE",
+                reason = "All $frameCount frames persisted",
+                completionKind = TerminalCompletionKind.SUCCESS,
+                cause = null,
+                saveMotion = true
+            ))
         }
     }
 
     fun onDeadlineReached() {
         val event = object : CaptureOwnerEvent {
             override fun execute() {
-                // Compute outcome from ONE snapshot, then claim the exact terminal state.
                 val snap = accounting.snapshot()
                 when {
                     snap.persistedFrames >= frameCount -> {
-                        if (terminalState.claim(CaptureTerminalStatus.SUCCESS)) completeSuccess()
+                        if (terminalState.claim(CaptureTerminalStatus.SUCCESS)) {
+                            settleTerminal(YuvTerminalRequest(
+                                status = CaptureTerminalStatus.SUCCESS,
+                                jobStatus = "CAPTURE_COMPLETE",
+                                reason = "All $frameCount frames persisted",
+                                completionKind = TerminalCompletionKind.SUCCESS,
+                                cause = null,
+                                saveMotion = true
+                            ))
+                        }
                     }
                     snap.persistedFrames > 0 -> {
-                        if (terminalState.claim(CaptureTerminalStatus.PARTIAL_SUCCESS)) completePartial(snap)
+                        if (terminalState.claim(CaptureTerminalStatus.PARTIAL_SUCCESS)) {
+                            settleTerminal(YuvTerminalRequest(
+                                status = CaptureTerminalStatus.PARTIAL_SUCCESS,
+                                jobStatus = "CAPTURE_PARTIAL",
+                                reason = "Partial success: ${snap.persistedFrames}/$frameCount persisted",
+                                completionKind = TerminalCompletionKind.SUCCESS,
+                                cause = null,
+                                saveMotion = true
+                            ))
+                        }
                     }
                     else -> {
-                        if (terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) completeTimeout(snap)
+                        if (terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) {
+                            settleTerminal(YuvTerminalRequest(
+                                status = CaptureTerminalStatus.TIMED_OUT,
+                                jobStatus = "CAPTURE_TIMEOUT",
+                                reason = "YUV timeout: saved=${snap.persistedFrames}/$frameCount",
+                                completionKind = TerminalCompletionKind.ERROR,
+                                cause = null,
+                                saveMotion = false
+                            ))
+                        }
                     }
                 }
             }
             override fun disposeWithoutMutation() {}
         }
         if (!captureStateOwner.post(event)) {
-            Log.e("KeplerYuvOwner", "Deadline settlement rejected")
-            finished.set(true)
-            cleanupCoordinator.perform()
+            emergencySettleDeadline()
         }
     }
 
     fun onCancellationRequested() {
         val event = object : CaptureOwnerEvent {
             override fun execute() {
-                if (terminalState.claim(CaptureTerminalStatus.CANCELLED)) completeCancel()
+                if (terminalState.claim(CaptureTerminalStatus.CANCELLED)) {
+                    settleTerminal(YuvTerminalRequest(
+                        status = CaptureTerminalStatus.CANCELLED,
+                        jobStatus = "CAPTURE_CANCELLED",
+                        reason = "Cancelled",
+                        completionKind = TerminalCompletionKind.ERROR,
+                        cause = null,
+                        saveMotion = false
+                    ))
+                }
             }
             override fun disposeWithoutMutation() {}
         }
         if (!captureStateOwner.post(event)) {
-            Log.e("KeplerYuvOwner", "Cancellation rejected")
-            finished.set(true)
-            cleanupCoordinator.perform()
+            emergencySettleCancellation()
         }
-    }
-
-    // ------------------------------------------------------------------
-    // Terminal settlement ??only the owner writes metadata and decides callbacks
-    // ------------------------------------------------------------------
-
-    private fun completeSuccess() {
-        terminalReason = "All $frameCount frames persisted"
-        if (!callbackFired.compareAndSet(false, true)) return
-        finished.set(true)
-        val snap = accounting.snapshot()
-        saveMotionOnce(outputDir)
-        writeJobJson("CAPTURE_COMPLETE", snap.persistedFrames, snap.manifest)
-        postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
-        cleanup()
-        postMainOrRun { onCaptureComplete(outputDir) }
-    }
-
-    private fun completePartial(snap: YuvCaptureAccountingSnapshot) {
-        terminalReason = "Partial success: ${snap.persistedFrames}/$frameCount persisted"
-        if (!callbackFired.compareAndSet(false, true)) return
-        finished.set(true)
-        saveMotionOnce(outputDir)
-        writeJobJson("CAPTURE_PARTIAL", snap.persistedFrames, snap.manifest)
-        postStatus("Captured partial success")
-        cleanup()
-        postMainOrRun { onCaptureComplete(outputDir) }
-    }
-
-    private fun completeTimeout(snap: YuvCaptureAccountingSnapshot) {
-        terminalReason = "YUV timeout: saved=${snap.persistedFrames}/$frameCount"
-        if (!callbackFired.compareAndSet(false, true)) return
-        finished.set(true)
-        Log.e("KeplerYuvOwner", terminalReason ?: "YUV timeout")
-        writeJobJson("CAPTURE_TIMEOUT", snap.persistedFrames, snap.manifest)
-        postStatus(terminalReason!!)
-        cleanup()
-        postMainOrRun { onCaptureError(terminalReason!!, null) }
     }
 
     private fun finishError(
@@ -829,64 +814,211 @@ internal class YuvCaptureOwner(
         terminalAlreadyClaimed: Boolean = false
     ) {
         if (!terminalAlreadyClaimed && !terminalState.claim(CaptureTerminalStatus.FAILED)) return
-        terminalReason = message
-        if (!callbackFired.compareAndSet(false, true)) return
-        finished.set(true)
-        Log.e("KeplerYuvOwner", message, cause)
+        settleTerminal(YuvTerminalRequest(
+            status = CaptureTerminalStatus.FAILED,
+            jobStatus = "CAPTURE_FAILED",
+            reason = message,
+            completionKind = TerminalCompletionKind.ERROR,
+            cause = cause,
+            saveMotion = false
+        ))
+    }
+
+    // ------------------------------------------------------------------
+    // Emergency settlement for rejected owner events (runs off-dispatcher) --
+    // ------------------------------------------------------------------
+
+    private fun emergencySettleDeadline() {
         val snap = accounting.snapshot()
-        writeJobJson("CAPTURE_FAILED", snap.persistedFrames, snap.manifest)
-        postStatus(message)
-        cleanup()
-        postMainOrRun { onCaptureError(message, cause) }
+        val (status, reason) = when {
+            snap.persistedFrames >= frameCount -> CaptureTerminalStatus.SUCCESS to "All $frameCount frames persisted"
+            snap.persistedFrames > 0 -> CaptureTerminalStatus.PARTIAL_SUCCESS to "Partial success: ${snap.persistedFrames}/$frameCount persisted"
+            else -> CaptureTerminalStatus.TIMED_OUT to "YUV timeout: saved=${snap.persistedFrames}/$frameCount"
+        }
+        if (terminalState.claim(status)) {
+            finished.set(true)
+            terminalReasonRef.set(reason)
+            terminalSettlementPhaseRef.set(TerminalSettlementPhase.CLAIMED)
+            recordDiagnostic(DiagnosticStage.OWNER_EVENT_REJECTION, DiagnosticSeverity.WARN, null, null,
+                "deadline event dispatch rejected; emergency settlement path taken")
+            publishSnapshot()
+            try {
+                cleanupCoordinator.perform()
+            } catch (t: Throwable) {
+                recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
+                    "emergency cleanup failed", t)
+            }
+            terminalSettlementPhaseRef.set(TerminalSettlementPhase.SETTLED)
+            publishSnapshot()
+        }
     }
 
-    private fun completeCancel() {
-        terminalReason = "Cancelled"
-        if (!callbackFired.compareAndSet(false, true)) return
+    private fun emergencySettleCancellation() {
+        if (terminalState.claim(CaptureTerminalStatus.CANCELLED)) {
+            finished.set(true)
+            terminalReasonRef.set("Cancelled")
+            terminalSettlementPhaseRef.set(TerminalSettlementPhase.CLAIMED)
+            recordDiagnostic(DiagnosticStage.OWNER_EVENT_REJECTION, DiagnosticSeverity.WARN, null, null,
+                "cancellation event dispatch rejected; emergency settlement path taken")
+            publishSnapshot()
+            try {
+                cleanupCoordinator.perform()
+            } catch (t: Throwable) {
+                recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
+                    "emergency cleanup failed", t)
+            }
+            terminalSettlementPhaseRef.set(TerminalSettlementPhase.SETTLED)
+            publishSnapshot()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // One terminal settlement path
+    // ------------------------------------------------------------------
+
+    private fun settleTerminal(request: YuvTerminalRequest) {
+        if (terminalSettlementPhaseRef.get() != TerminalSettlementPhase.ACTIVE) return
         finished.set(true)
+        terminalReasonRef.set(request.reason)
+        terminalSettlementPhaseRef.set(TerminalSettlementPhase.CLAIMED)
+        publishSnapshot()
+
+        terminalSettlementPhaseRef.set(TerminalSettlementPhase.SETTLING)
+
+        val motionOutcome: Boolean?
+        if (request.saveMotion) {
+            motionOutcome = ignoreErrors("terminal motion save") { saveMotionOnce(outputDir) }
+        } else {
+            motionOutcome = null
+        }
+
         val snap = accounting.snapshot()
-        writeJobJson("CAPTURE_CANCELLED", snap.persistedFrames, snap.manifest)
-        postStatus("CAPTURE_CANCELLED: YUV capture cancelled")
-        cleanup()
-        postMainOrRun { onCaptureError(terminalReason!!, null) }
+        val metadataOutcome = ignoreErrors("terminal metadata write") {
+            writeJobJson(request.jobStatus, snap.persistedFrames, snap.manifest)
+        }
+
+        val statusMessage = when (request.status) {
+            CaptureTerminalStatus.SUCCESS -> "CAPTURE_COMPLETE: 캡처가 완료되었습니다."
+            CaptureTerminalStatus.PARTIAL_SUCCESS -> "Captured partial success"
+            else -> request.reason ?: request.jobStatus
+        }
+        val statusOutcome = ignoreErrors("terminal status dispatch") { postStatus(statusMessage) }
+
+        try {
+            callbackStateRef.set(CallbackState.DISPATCH_PENDING)
+            publishSnapshot()
+            dispatchTerminalCallback(request)
+        } finally {
+            try {
+                cleanupCoordinator.perform()
+            } catch (t: Throwable) {
+                recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
+                    "terminal cleanup failed", t)
+            }
+        }
+
+        if (motionOutcome == false) {
+            recordDiagnostic(DiagnosticStage.TERMINAL_MOTION, DiagnosticSeverity.ERROR, null, outputDir.path,
+                "terminal motion save failed")
+        }
+        if (metadataOutcome == false) {
+            recordDiagnostic(DiagnosticStage.TERMINAL_METADATA, DiagnosticSeverity.ERROR, null, null,
+                "terminal metadata write failed")
+        }
+        if (statusOutcome == false) {
+            recordDiagnostic(DiagnosticStage.TERMINAL_STATUS_DISPATCH, DiagnosticSeverity.ERROR, null, null,
+                "terminal status dispatch failed")
+        }
+
+        terminalSettlementPhaseRef.set(TerminalSettlementPhase.SETTLED)
+        publishSnapshot()
+    }
+
+    private fun dispatchTerminalCallback(request: YuvTerminalRequest) {
+        val callback: () -> Unit = when (request.completionKind) {
+            TerminalCompletionKind.SUCCESS -> { -> onCaptureComplete(outputDir) }
+            TerminalCompletionKind.ERROR -> { -> onCaptureError(request.reason ?: "", request.cause) }
+        }
+        val wrapped = Runnable {
+            try {
+                callback.invoke()
+                callbackStateRef.compareAndSet(CallbackState.DISPATCH_ACCEPTED, CallbackState.EXECUTED)
+            } catch (t: Throwable) {
+                callbackStateRef.set(CallbackState.EXECUTION_FAILED)
+                recordDiagnostic(DiagnosticStage.TERMINAL_CALLBACK_EXECUTION, DiagnosticSeverity.ERROR, null, null,
+                    "terminal callback execution failed", t)
+            } finally {
+                publishSnapshot()
+            }
+        }
+        val dispatched = try {
+            dispatchCallback.dispatch(wrapped)
+        } catch (t: Throwable) {
+            callbackStateRef.set(CallbackState.DISPATCH_REJECTED)
+            recordDiagnostic(DiagnosticStage.TERMINAL_CALLBACK_DISPATCH, DiagnosticSeverity.ERROR, null, null,
+                "terminal callback dispatch threw", t)
+            publishSnapshot()
+            return
+        }
+        if (!dispatched) {
+            callbackStateRef.set(CallbackState.DISPATCH_REJECTED)
+            recordDiagnostic(DiagnosticStage.TERMINAL_CALLBACK_DISPATCH, DiagnosticSeverity.ERROR, null, null,
+                "terminal callback dispatcher returned false")
+            publishSnapshot()
+            return
+        }
+        callbackStateRef.set(CallbackState.DISPATCH_ACCEPTED)
+        publishSnapshot()
+    }
+
+    private inline fun ignoreErrors(stage: String, block: () -> Unit): Boolean = try {
+        block()
+        true
+    } catch (t: Throwable) {
+        Log.e("KeplerYuvOwner", "$stage failed", t)
+        false
     }
 
     // ------------------------------------------------------------------
-    // Cleanup
+    // Immutable terminal snapshot publication
     // ------------------------------------------------------------------
 
-    private fun cleanup() {
-        cleanupCoordinator.perform()
-    }
-
-    // ------------------------------------------------------------------
-    // Snapshot
-    // ------------------------------------------------------------------
-
-    /**
-     * Number of [CameraCaptureSession.CaptureCallback.onCaptureCompleted] events received
-     * so far.  Visible to the production caller for failure-snapshot observability; the
-     * counter itself is mutated only on the owner's serialized dispatcher.
-     */
     fun completedResultsCount(): Int = completedResults
 
     fun terminalState(): CaptureTerminalState = terminalState
 
-    internal fun terminalSnapshot(): TerminalSnapshot {
+    fun terminalSettlementPhase(): TerminalSettlementPhase = terminalSettlementPhaseRef.get()
+
+    fun callbackState(): CallbackState = callbackStateRef.get()
+
+    fun terminalSnapshotRef(): YuvTerminalSnapshot = terminalSnapshotRef.get()
+
+    private fun publishSnapshot() {
+        terminalSnapshotRef.set(buildSnapshot())
+    }
+
+    private fun buildSnapshot(): YuvTerminalSnapshot {
         val snap = accounting.snapshot()
-        return TerminalSnapshot(
+        return YuvTerminalSnapshot(
             receivedFrames = snap.receivedFrames,
             bufferedFrames = snap.bufferedFrames,
             persistedFrames = snap.persistedFrames,
             failedFrames = snap.failedFrames,
             droppedFrames = snap.droppedFrames,
-            manifest = snap.manifest,
+            manifest = snap.manifest.toList(),
             completedResults = completedResults,
             queuedWork = boundedWorker.queuedCount(),
             inFlightWork = boundedWorker.activeCount(),
             terminalStatus = terminalState.status(),
-            terminalReason = terminalReason,
-            discardedLateCompletions = discardedLateCompletions.toList()
+            terminalSettlementPhase = terminalSettlementPhaseRef.get(),
+            terminalReason = terminalReasonRef.get(),
+            discardedLateCompletions = discardedLateCompletions.toList(),
+            cleanupPhase = cleanupCoordinator.snapshot().phase,
+            diagnostics = diagnostics.toList(),
+            metadataWriteOutcome = null,
+            motionSaveOutcome = null,
+            statusDispatchOutcome = null,
+            callbackState = callbackStateRef.get()
         )
     }
 

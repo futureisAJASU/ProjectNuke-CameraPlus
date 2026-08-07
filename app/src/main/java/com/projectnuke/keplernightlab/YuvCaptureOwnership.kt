@@ -1679,3 +1679,73 @@ internal class YuvCleanupCoordinator(
 
     fun snapshot(): YuvCleanupResult = buildSnapshot()
 }
+
+// ═══ Phase 1: terminal settlement types ═══════════════════════════════
+
+internal enum class TerminalCompletionKind { SUCCESS, ERROR }
+
+internal enum class CallbackState {
+    NOT_REQUESTED, DISPATCH_PENDING, DISPATCH_ACCEPTED, DISPATCH_REJECTED, EXECUTED, EXECUTION_FAILED
+}
+
+internal enum class TerminalSettlementPhase { ACTIVE, CLAIMED, SETTLING, SETTLED }
+
+internal fun interface CallbackDispatcher {
+    fun dispatch(runnable: Runnable): Boolean
+}
+
+internal data class YuvTerminalRequest(
+    val status: CaptureTerminalStatus,
+    val jobStatus: String,
+    val reason: String?,
+    val completionKind: TerminalCompletionKind,
+    val cause: Throwable?,
+    val saveMotion: Boolean
+)
+
+internal enum class DiagnosticSeverity { INFO, WARN, ERROR }
+
+internal enum class DiagnosticStage {
+    CANDIDATE_VERIFY, CANDIDATE_CLEANUP,
+    ADOPTION_RESERVE, ADOPTION_ROLLBACK, ADOPTION_COMMIT,
+    FINAL_VERIFY, FINAL_CLEANUP,
+    WORK_DISPOSAL, LIFECYCLE_SETTLEMENT,
+    WORKER_REJECTION, WORKER_SHUTDOWN, DIRECT_CREATION_RELEASE,
+    TERMINAL_MOTION, TERMINAL_METADATA, TERMINAL_STATUS_DISPATCH,
+    TERMINAL_CALLBACK_DISPATCH, TERMINAL_CALLBACK_EXECUTION,
+    CLEANUP, OWNER_EVENT_REJECTION
+}
+
+internal data class YuvCaptureDiagnostic(
+    val stage: DiagnosticStage,
+    val severity: DiagnosticSeverity,
+    val frameIndex: Int? = null,
+    val path: String? = null,
+    val message: String,
+    val throwable: Throwable? = null
+)
+
+internal data class YuvTerminalSnapshot(
+    val receivedFrames: Int,
+    val bufferedFrames: Int,
+    val persistedFrames: Int,
+    val failedFrames: Int,
+    val droppedFrames: Int,
+    val manifest: List<YuvFrameManifestEntry>,
+    val completedResults: Int,
+    val queuedWork: Int,
+    val inFlightWork: Int,
+    val terminalStatus: CaptureTerminalStatus,
+    val terminalSettlementPhase: TerminalSettlementPhase,
+    val terminalReason: String?,
+    val discardedLateCompletions: List<Int>,
+    val cleanupPhase: CleanupPhase,
+    val diagnostics: List<YuvCaptureDiagnostic>,
+    val metadataWriteOutcome: Boolean?,
+    val motionSaveOutcome: Boolean?,
+    val statusDispatchOutcome: Boolean?,
+    val callbackState: CallbackState
+) {
+    val isTerminal: Boolean get() = terminalStatus != CaptureTerminalStatus.ACTIVE
+    val isSettled: Boolean get() = terminalSettlementPhase == TerminalSettlementPhase.SETTLED
+}

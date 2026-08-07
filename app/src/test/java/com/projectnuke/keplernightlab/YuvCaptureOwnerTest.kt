@@ -7,6 +7,7 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
@@ -128,11 +129,16 @@ class YuvCaptureOwnerTest {
         encodeFailure: Boolean = false,
         encodeLatch: EncodeLatch? = null,
         rejectDispatch: Boolean = false,
-        finalFileVerifier: YuvFinalFileVerifier = RealYuvFinalFileVerifier
+        finalFileVerifier: YuvFinalFileVerifier = RealYuvFinalFileVerifier,
+        saveMotionFailure: Boolean = false,
+        metadataFailure: Boolean = false,
+        statusFailure: Boolean = false,
+        callbackDispatchFailure: Boolean = false,
+        callbackBodyFailure: Boolean = false
     ) {
         val dir: File = Files.createTempDirectory("yuv-owner-test").toFile()
         val handlerThread = android.os.HandlerThread("yuv-test").apply { start() }
-        val handler = android.os.Handler(handlerThread.looper)
+        val handler: android.os.Handler = android.os.Handler(handlerThread.looper)
 
         val terminalLatch = CountDownLatch(1)
         val persistedFrames = AtomicInteger(0)
@@ -140,6 +146,7 @@ class YuvCaptureOwnerTest {
         val errorMessage = AtomicReference<String?>(null)
         val onCaptureCompleteCount = AtomicInteger(0)
         val onCaptureErrorCount = AtomicInteger(0)
+        val callbackLatch = CountDownLatch(1)
         val postedStatus = mutableListOf<String>()
 
         val session: YuvCaptureSession = YuvCaptureSession.create(
@@ -175,23 +182,36 @@ class YuvCaptureOwnerTest {
                 }
             ),
             postStatus = { msg ->
+                if (statusFailure) throw IllegalStateException("injected status failure")
                 handler.post { postedStatus += msg }
             },
-            postMainOrRun = { runnable -> if (!handler.post(runnable)) runnable.run() },
+            dispatchCallback = CallbackDispatcher { runnable ->
+                if (callbackDispatchFailure) return@CallbackDispatcher false
+                if (!handler.post(runnable)) runnable.run()
+                true
+            },
             writeJobJson = { status, saved, manifest ->
+                if (metadataFailure) throw IllegalStateException("injected metadata failure")
                 handler.post {
                     persistedFrames.set(saved)
                     if (status in TERMINAL_JOB_STATUSES) terminalLatch.countDown()
                 }
             },
-            saveMotionOnce = { _ -> null to null },
+            saveMotionOnce = { _ ->
+                if (saveMotionFailure) throw IllegalStateException("injected motion failure")
+                null to null
+            },
             onCaptureComplete = { file ->
+                if (callbackBodyFailure) throw IllegalStateException("injected callback body failure")
                 onCaptureCompleteCount.incrementAndGet()
                 capturedFile.set(file)
+                callbackLatch.countDown()
             },
             onCaptureError = { msg, _ ->
+                if (callbackBodyFailure) throw IllegalStateException("injected callback body failure")
                 onCaptureErrorCount.incrementAndGet()
                 errorMessage.set(msg)
+                callbackLatch.countDown()
             },
             finalFileVerifier = finalFileVerifier
         )
@@ -689,6 +709,195 @@ class YuvCaptureOwnerTest {
         } finally {
             harness.shutdown()
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 1.9: terminal settlement transaction
+    // ------------------------------------------------------------------
+
+    @Test
+    fun successTerminalClaimsOnceAndPublishesConsistentSnapshot() {
+        val harness = Harness(frameCount = 1)
+        try {
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            assertTrue("callback did not fire", harness.callbackLatch.await(10, TimeUnit.SECONDS))
+            harness.flushHandler()
+            assertEquals(CaptureTerminalStatus.SUCCESS, harness.session.terminalState.status())
+            assertEquals(TerminalSettlementPhase.SETTLED, harness.session.owner.terminalSettlementPhase())
+            assertEquals(CallbackState.EXECUTED, harness.session.owner.callbackState())
+            assertEquals(1, harness.onCaptureCompleteCount.get())
+            val snap = harness.session.owner.terminalSnapshotRef()
+            assertTrue(snap.isTerminal)
+            assertTrue(snap.isSettled)
+            assertEquals(CaptureTerminalStatus.SUCCESS, snap.terminalStatus)
+            assertEquals(TerminalSettlementPhase.SETTLED, snap.terminalSettlementPhase)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun metadataFailureStillRunsCleanupAndCallback() {
+        val harness = Harness(frameCount = 1, metadataFailure = true)
+        try {
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            waitForSettled(harness)
+            assertEquals(CaptureTerminalStatus.SUCCESS, harness.session.terminalState.status())
+            assertEquals(TerminalSettlementPhase.SETTLED, harness.session.owner.terminalSettlementPhase())
+            assertEquals(1, harness.onCaptureCompleteCount.get())
+            assertEquals(0, harness.onCaptureErrorCount.get())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun motionFailureStillRunsMetadataAndCleanup() {
+        val harness = Harness(frameCount = 1, saveMotionFailure = true)
+        try {
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            waitForSettled(harness)
+            assertEquals(CaptureTerminalStatus.SUCCESS, harness.session.terminalState.status())
+            assertEquals(1, harness.onCaptureCompleteCount.get())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun statusFailureStillRunsCleanup() {
+        val harness = Harness(frameCount = 1, statusFailure = true)
+        try {
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            waitForSettled(harness)
+            assertEquals(CaptureTerminalStatus.SUCCESS, harness.session.terminalState.status())
+            assertEquals(TerminalSettlementPhase.SETTLED, harness.session.owner.terminalSettlementPhase())
+            assertEquals(1, harness.onCaptureCompleteCount.get())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun callbackDispatchRejectionNeverRunsCallbackInline() {
+        val callbackRan = AtomicInteger(0)
+        val dir: File = Files.createTempDirectory("yuv-cb-reject").toFile()
+        val handlerThread = android.os.HandlerThread("yuv-cb-reject").apply { start() }
+        val handler = android.os.Handler(handlerThread.looper)
+        val session = YuvCaptureSession.create(
+            dispatch = { event -> handler.post { event.execute() }; true },
+            outputDir = dir,
+            frameCount = 1,
+            rotationDegrees = 0,
+            workerCapacity = 4,
+            maxRetainedBytes = 16L * 1024 * 1024,
+            workProcessor = YuvPngWorkProcessor(
+                encoder = object : YuvPngEncoder {
+                    override fun encodeDirect(image: Image, candidate: File, rotationDegrees: Int) {
+                        Files.write(candidate.toPath(), PNG_1X1)
+                    }
+                    override fun encodeBuffered(frame: BufferedYuvFrame, candidate: File, rotationDegrees: Int) {
+                        Files.write(candidate.toPath(), PNG_1X1)
+                    }
+                },
+                committer = YuvCandidateCommitter { candidate, final ->
+                    Files.move(candidate.toPath(), final.toPath(), StandardCopyOption.ATOMIC_MOVE)
+                }
+            ),
+            dispatchCallback = CallbackDispatcher { false },
+            onCaptureComplete = { callbackRan.incrementAndGet() },
+            onCaptureError = { _, _ -> callbackRan.incrementAndGet() }
+        )
+        try {
+            session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            // Wait for terminal settlement via phase observation (callback is rejected, so
+            // we cannot wait on the callback itself).
+            var settled = false
+            repeat(200) {
+                val drain = CountDownLatch(1)
+                handler.post(Runnable { drain.countDown() })
+                drain.await(2, TimeUnit.SECONDS)
+                if (session.owner.terminalSettlementPhase() == TerminalSettlementPhase.SETTLED) {
+                    settled = true
+                    return@repeat
+                }
+            }
+            assertTrue("terminal phase is not SETTLED", settled)
+            assertEquals("rejected callback must never execute inline", 0, callbackRan.get())
+            assertEquals(CallbackState.DISPATCH_REJECTED, session.owner.callbackState())
+            assertEquals(CaptureTerminalStatus.SUCCESS, session.terminalState.status())
+        } finally {
+            session.close()
+            handlerThread.quitSafely()
+        }
+    }
+
+    @Test
+    fun callbackBodyFailureRemainsDiagnostic() {
+        val harness = Harness(frameCount = 1, callbackBodyFailure = true)
+        try {
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            waitForSettled(harness)
+            assertEquals(CaptureTerminalStatus.SUCCESS, harness.session.terminalState.status())
+            assertEquals(CallbackState.EXECUTION_FAILED, harness.session.owner.callbackState())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    /**
+     * Wait until the owner's terminal settlement reaches SETTLED.
+     * The buffered path needs the worker to finish encoding before the owner's
+     * adoption event fires settleTerminal, so we wait for the worker to drain
+     * first, then drain the handler until the terminal phase is SETTLED.
+     */
+    /**
+     * Wait until the owner's terminal phase reaches SETTLED.  Posts self-rescheduling
+     * sentinels to the handler: each sentinel observes the phase and, if not yet
+     * SETTLED, posts another sentinel to check again after the next batch of work.
+     * This handles the multi-generation buffered path (buffered event -> worker ->
+     * adoption event -> settleTerminal) without closing the worker prematurely.
+     */
+    private fun waitForSettled(harness: Harness) {
+        // Drain the handler until the terminal phase reaches SETTLED. Each drain
+        // processes one generation of enqueued work. The buffered path needs
+        // multiple generations, so we drain repeatedly.
+        var settled = false
+        repeat(200) {
+            val drain = CountDownLatch(1)
+            harness.handler.post(Runnable { drain.countDown() })
+            drain.await(2, TimeUnit.SECONDS)
+            if (harness.session.owner.terminalSettlementPhase() == TerminalSettlementPhase.SETTLED) {
+                settled = true
+                return@repeat
+            }
+        }
+        assertTrue("terminal phase is not SETTLED", settled)
+        // Give the callback a chance to fire.
+        harness.callbackLatch.await(2, TimeUnit.SECONDS)
+        harness.flushHandler()
+    }
+
+    @Test
+    fun terminalCallbackAtMostOnce() {
+        val harness = Harness(frameCount = 2)
+        try {
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(2000L))
+            assertEquals(CaptureTerminalStatus.SUCCESS, harness.awaitTerminal())
+            harness.session.owner.onDeadlineReached()
+            harness.flushHandler()
+            assertEquals(1, harness.onCaptureCompleteCount.get())
+            assertEquals(0, harness.onCaptureErrorCount.get())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    private fun flushHandler(handler: android.os.Handler) {
+        val latch = CountDownLatch(1)
+        handler.post { latch.countDown() }
+        assertTrue(latch.await(2, TimeUnit.SECONDS))
     }
 
     companion object {

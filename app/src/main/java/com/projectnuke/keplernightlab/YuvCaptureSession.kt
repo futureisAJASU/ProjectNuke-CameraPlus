@@ -19,7 +19,7 @@ internal class YuvCaptureSession internal constructor(
         cleanupCoordinator.perform()
     }
 
-    fun terminalSnapshot(): YuvCaptureOwner.TerminalSnapshot = owner.terminalSnapshot()
+    fun terminalSnapshot(): YuvTerminalSnapshot = owner.terminalSnapshotRef()
 
     companion object {
         fun create(
@@ -32,7 +32,7 @@ internal class YuvCaptureSession internal constructor(
             workerName: String = "YuvCapture-$frameCount",
             workProcessor: YuvPngWorkProcessor,
             postStatus: (String) -> Unit = {},
-            postMainOrRun: (Runnable) -> Unit = { _ -> },
+            dispatchCallback: CallbackDispatcher = CallbackDispatcher { runnable -> runnable.run(); true },
             writeJobJson: (status: String, savedFrames: Int, manifest: List<YuvFrameManifestEntry>) -> Unit = { _, _, _ -> },
             saveMotionOnce: (File) -> Pair<String?, String?> = { _ -> null to null },
             onCaptureComplete: (File) -> Unit = {},
@@ -67,7 +67,7 @@ internal class YuvCaptureSession internal constructor(
                 boundedWorker = boundedWorker,
                 finished = finished,
                 postStatus = postStatus,
-                postMainOrRun = postMainOrRun,
+                dispatchCallback = dispatchCallback,
                 writeJobJson = writeJobJson,
                 saveMotionOnce = saveMotionOnce,
                 onCaptureComplete = onCaptureComplete,
