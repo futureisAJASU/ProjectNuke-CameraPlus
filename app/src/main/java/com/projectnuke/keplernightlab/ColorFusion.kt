@@ -272,7 +272,6 @@ fun captureYuvBurstColorWithMotion(
     var imageReader: ImageReader? = null
 
     val finished = AtomicBoolean(false)
-    val cleanupStarted = AtomicBoolean(false)
     var motionSaved = false
     var motionFiles: Pair<String?, String?> = Pair(null, null)
     var motionInfo = "motion_not_started"
@@ -290,6 +289,22 @@ fun captureYuvBurstColorWithMotion(
         backgroundThread = backgroundThread
     )
 
+    /**
+     * Production resource cleanup: exactly-once, idempotent.  Closes Camera2
+     * resources, detaches callbacks, stops motion logger, shuts down scheduler
+     * and background thread.  Does NOT block Main waiting for the encoder.
+     *
+     * The production coordinator phase/snapshot is the single cleanup authority;
+     * there is no second `cleanupStarted` flag.  This path is used by the
+     * pre-session terminal (before [YuvCaptureSession] exists); once the session
+     * is authoritative the owner performs cleanup in its terminal finally.
+     */
+    fun productionCleanup() {
+        productionResourceCoordinator.perform()
+        // Also close the YUV session (internal cleanup) if one was created.
+        try { yuvSession?.close() } catch (_: Exception) {}
+    }
+
     // Pre-session terminal path: owns exactly-once claim, status/error dispatch through
     // acceptance-reporting Main dispatchers (never inline), and production cleanup.
     // After YuvCaptureSession becomes authoritative this path is no longer used.
@@ -299,24 +314,13 @@ fun captureYuvBurstColorWithMotion(
         cleanup = { productionCleanup() }
     )
 
-    /**
-     * Production resource cleanup: exactly-once, idempotent.  Closes Camera2
-     * resources, detaches callbacks, stops motion logger, shuts down scheduler
-     * and background thread.  Does NOT block Main waiting for the encoder.
-     */
-    fun productionCleanup() {
-        if (!cleanupStarted.compareAndSet(false, true)) return
-        productionResourceCoordinator.perform()
-        // Also close the YUV session (internal cleanup).
-        try { yuvSession?.close() } catch (_: Exception) {}
-    }
-
     // Pre-session terminal path: owns exactly-once claim, status/error dispatch through
     fun logLateCameraCallback(callback: String) {
         val isFinished = yuvSession?.let { !it.terminalState.status().equals(CaptureTerminalStatus.ACTIVE) } ?: finished.get()
         Log.d(
             "KeplerCaptureCancel",
-            "pipeline=YUV callback=$callback late=true finished=$isFinished cleanupStarted=${cleanupStarted.get()}"
+            "pipeline=YUV callback=$callback late=true finished=$isFinished " +
+                "coordinatorPhase=${productionResourceCoordinator.lifecyclePhase()}"
         )
     }
 
@@ -614,7 +618,7 @@ fun captureYuvBurstColorWithMotion(
             workerCapacity = maxOf(2, minOf(frameCount, MAX_YUV_MEMORY_BUFFER_FRAMES)),
             maxRetainedBytes = MAX_YUV_MEMORY_BUFFER_BYTES,
             workProcessor = yuvWorkProcessor,
-            postStatus = { msg -> postStatus(msg) },
+            postStatus = { msg -> statusDispatcher.dispatch(msg) },
                         dispatchCallback = callbackDispatcher,
             writeJobJson = { status, savedFrames, manifest ->
                 metadataWriter?.write(status, savedFrames, manifest)
@@ -623,18 +627,15 @@ fun captureYuvBurstColorWithMotion(
             onCaptureComplete = { dir ->
                 // The owner's dispatchCallback already handles Main-thread dispatch.
                 // We invoke onComplete directly here — do NOT re-post to Main.
+                // Owner terminal cleanup (internal + production coordinators) is
+                // guaranteed in the owner's finally; user callbacks never own cleanup.
                 onComplete(dir)
-                // productionCleanup() is idempotent; the owner already called both
-                // coordinators, but this ensures cleanupStarted is recorded and
-                // yuvSession is formally closed.
-                productionCleanup()
             },
             onCaptureError = { message, cause ->
                 // The owner's dispatchCallback already handles Main-thread dispatch.
                 // We invoke onError directly here — do NOT re-post to Main.
                 logYuvCaptureFailure(stage = "terminal", throwable = cause, detail = message)
                 onError(message)
-                productionCleanup()
             },
             productionResourceCoordinator = productionResourceCoordinator,
             finished = finished

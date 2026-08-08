@@ -116,7 +116,12 @@ class ProductionYuvCaptureBridgeTest {
                 callbackThreadName.set(Thread.currentThread().name)
                 errorCount.incrementAndGet()
                 lastErrorMessage.set(msg)
-            }
+            },
+            productionResourceCoordinator = YuvProductionResourceCoordinator(
+                timeoutScheduler = null,
+                backgroundHandler = null,
+                backgroundThread = null
+            )
         )
 
         fun awaitTerminal(timeoutSec: Long = 10): CaptureTerminalStatus {
@@ -590,7 +595,12 @@ class ProductionYuvCaptureBridgeTest {
                 handler.post(runnable)
                 true
             },
-            onCaptureComplete = { capturedThreads += "COMPLETE:${Thread.currentThread().name}" }
+            onCaptureComplete = { capturedThreads += "COMPLETE:${Thread.currentThread().name}" },
+            productionResourceCoordinator = YuvProductionResourceCoordinator(
+                timeoutScheduler = null,
+                backgroundHandler = null,
+                backgroundThread = null
+            )
         )
         try {
             session.owner.acceptBuffered(Camera2YuvImageAccess(FakeYuvImage(1000L)))

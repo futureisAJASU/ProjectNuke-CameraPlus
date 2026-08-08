@@ -39,6 +39,11 @@ class FinalInvariantSuiteTest {
                         override fun encodeBuffered(frame: BufferedYuvFrame, candidate: java.io.File, rotationDegrees: Int) {}
                     },
                     committer = YuvCandidateCommitter { _, _ -> }
+                ),
+                productionResourceCoordinator = YuvProductionResourceCoordinator(
+                    timeoutScheduler = null,
+                    backgroundHandler = null,
+                    backgroundThread = null
                 )
             )
             try {

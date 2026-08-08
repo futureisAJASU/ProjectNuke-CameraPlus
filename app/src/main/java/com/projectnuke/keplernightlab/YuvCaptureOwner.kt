@@ -6,6 +6,10 @@ import java.lang.Runnable
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
+private inline fun ignoreErrors(label: String, block: () -> Unit) {
+    try { block() } catch (_: Exception) { }
+}
+
 /**
  * Immutable worker completion result.  The worker never mutates owner state; it only
  * encodes a temporary candidate and returns this result for owner-side adoption.
@@ -191,7 +195,7 @@ internal class YuvCaptureOwner(
     private val terminalState: CaptureTerminalState,
     private val boundedWorker: BoundedCaptureWorker,
     private val finished: AtomicBoolean,
-    private val postStatus: (String) -> Unit,
+    private val postStatus: (String) -> Boolean,
     private val dispatchCallback: CallbackDispatcher,
     private val writeJobJson: (status: String, savedFrames: Int, manifest: List<YuvFrameManifestEntry>) -> Unit,
     private val saveMotionOnce: (File) -> Pair<String?, String?>,
@@ -213,11 +217,11 @@ internal class YuvCaptureOwner(
     private val diagnostics = java.util.concurrent.CopyOnWriteArrayList<YuvCaptureDiagnostic>()
 
     // Terminal operation outcomes — never hardcoded null after the operation has run.
-    private val metadataWriteOutcomeRef = AtomicReference(TerminalOperationOutcome.NotRequested)
-    private val motionSaveOutcomeRef = AtomicReference(TerminalOperationOutcome.NotRequested)
-    private val statusDispatchOutcomeRef = AtomicReference(TerminalOperationOutcome.NotRequested)
-    private val callbackDispatchOutcomeRef = AtomicReference(TerminalOperationOutcome.NotRequested)
-    private val callbackExecutionOutcomeRef = AtomicReference(TerminalOperationOutcome.NotRequested)
+    private val metadataWriteOutcomeRef = AtomicReference<TerminalOperationOutcome>(TerminalOperationOutcome.NotRequested)
+    private val motionSaveOutcomeRef = AtomicReference<TerminalOperationOutcome>(TerminalOperationOutcome.NotRequested)
+    private val statusDispatchOutcomeRef = AtomicReference<TerminalOperationOutcome>(TerminalOperationOutcome.NotRequested)
+    private val callbackDispatchOutcomeRef = AtomicReference<TerminalOperationOutcome>(TerminalOperationOutcome.NotRequested)
+    private val callbackExecutionOutcomeRef = AtomicReference<TerminalOperationOutcome>(TerminalOperationOutcome.NotRequested)
 
     private val terminalSnapshotRef = AtomicReference(buildSnapshot())
 
@@ -953,15 +957,21 @@ internal class YuvCaptureOwner(
             CaptureTerminalStatus.PARTIAL_SUCCESS -> "일부 프레임만 캡처되었습니다."
             else -> request.reason ?: request.jobStatus
         }
-        val statusOutcome = runCatching { postStatus(statusMessage) }
-            .fold(
-                onSuccess = { TerminalOperationOutcome.Succeeded },
-                onFailure = { t ->
-                    recordDiagnostic(DiagnosticStage.TERMINAL_STATUS_DISPATCH, DiagnosticSeverity.ERROR, null, null,
-                        "terminal status dispatch failed", t)
-                    TerminalOperationOutcome.Failed(t)
-                }
-            )
+        // Acceptance-reporting terminal status dispatch: a false post result is a
+        // REJECTED terminal dispatch (diagnostic retained), never an inline fallback.
+        val statusOutcome = try {
+            if (postStatus(statusMessage)) {
+                TerminalOperationOutcome.Succeeded
+            } else {
+                recordDiagnostic(DiagnosticStage.TERMINAL_STATUS_DISPATCH, DiagnosticSeverity.ERROR, null, null,
+                    "terminal status dispatch rejected by handler")
+                TerminalOperationOutcome.Failed(IllegalStateException("terminal status dispatch rejected"))
+            }
+        } catch (t: Throwable) {
+            recordDiagnostic(DiagnosticStage.TERMINAL_STATUS_DISPATCH, DiagnosticSeverity.ERROR, null, null,
+                "terminal status dispatch failed", t)
+            TerminalOperationOutcome.Failed(t)
+        }
         statusDispatchOutcomeRef.set(statusOutcome)
 
         try {
@@ -1084,7 +1094,8 @@ internal class YuvCaptureOwner(
             statusDispatchOutcome = statusDispatchOutcomeRef.get(),
             callbackDispatchOutcome = callbackDispatchOutcomeRef.get(),
             callbackExecutionOutcome = callbackExecutionOutcomeRef.get(),
-            callbackState = callbackStateRef.get()
+            callbackState = callbackStateRef.get(),
+            productionCleanup = productionResourceCoordinator.snapshot()
         )
     }
 

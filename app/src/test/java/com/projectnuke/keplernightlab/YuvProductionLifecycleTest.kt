@@ -1,6 +1,8 @@
 package com.projectnuke.keplernightlab
 
+import android.graphics.ImageFormat
 import android.media.Image
+import android.media.ImageReader
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -110,7 +112,7 @@ class YuvProductionLifecycleTest {
                     Files.move(candidate.toPath(), final.toPath(), StandardCopyOption.ATOMIC_MOVE)
                 }
             ),
-            postStatus = { },
+            postStatus = { true },
             dispatchCallback = CallbackDispatcher { runnable ->
                 if (throwCallbackDispatch) throw IllegalStateException("dispatch threw")
                 if (rejectCallbackDispatch) return@CallbackDispatcher false
@@ -224,14 +226,19 @@ class YuvProductionLifecycleTest {
         val ht = android.os.HandlerThread("coord-test").apply { start() }
         val h = android.os.Handler(ht.looper)
         val coord = YuvProductionResourceCoordinator(null, h, ht)
-        assertTrue(coord.perform())
+        val first = coord.perform()
+        assertTrue(first.isTerminal)
+        assertEquals(CoordinatorLifecyclePhase.CLOSED, first.phase)
+        assertEquals(1, first.performCount)
         assertEquals(1, coord.performCount())
         assertEquals(
             setOf("Background.handler", "BackgroundThread.quit"),
             coord.releasedResourceTags().filter { it.startsWith("Background") }.toSet()
         )
         // Second perform is a no-op: exactly-once.
-        assertFalse(coord.perform())
+        val second = coord.perform()
+        assertEquals(CoordinatorLifecyclePhase.CLOSED, second.phase)
+        assertEquals(1, second.performCount)
         assertEquals(1, coord.performCount())
         ht.quitSafely()
     }
@@ -247,8 +254,10 @@ class YuvProductionLifecycleTest {
             assertEquals(0, harness.errorCount.get())
             assertEquals(1, harness.coordinator.performCount())
             assertTrue(harness.coordinator.releasedResourceTags().isNotEmpty())
-            // Idempotent: ColorFusion's own productionCleanup would not double-release.
-            assertFalse(harness.coordinator.perform())
+            // Idempotent: a repeated perform never re-runs release.
+            val repeated = harness.coordinator.perform()
+            assertEquals(CoordinatorLifecyclePhase.CLOSED, repeated.phase)
+            assertEquals(1, repeated.performCount)
             assertEquals(1, harness.coordinator.performCount())
         } finally {
             harness.shutdown()
@@ -279,12 +288,12 @@ class YuvProductionLifecycleTest {
             harness.session.owner.onCaptureFailed(RuntimeException("terminal failure"), "failure")
             assertEquals(CaptureTerminalStatus.FAILED, harness.awaitTerminal())
             val snap = harness.session.owner.terminalSnapshotRef()
-            assertTrue(snap.metadataWriteOutcome is TerminalOperationOutcome.NotRequested,
-                "metadata write not requested on terminal failure")
-            assertTrue(snap.motionSaveOutcome is TerminalOperationOutcome.NotRequested,
-                "motion save not requested on terminal failure")
-            assertTrue(snap.statusDispatchOutcome is TerminalOperationOutcome.Succeeded,
-                "status dispatch must succeed even on failure")
+            assertTrue("terminal metadata write must be requested and succeed on failure",
+                snap.metadataWriteOutcome is TerminalOperationOutcome.Succeeded)
+            assertTrue("motion save not requested on terminal failure",
+                snap.motionSaveOutcome is TerminalOperationOutcome.NotRequested)
+            assertTrue("status dispatch must succeed even on failure",
+                snap.statusDispatchOutcome is TerminalOperationOutcome.Succeeded)
             assertTrue(snap.callbackDispatchOutcome is TerminalOperationOutcome.Succeeded)
             assertTrue(snap.callbackExecutionOutcome is TerminalOperationOutcome.Succeeded)
         } finally {
@@ -300,7 +309,7 @@ class YuvProductionLifecycleTest {
             assertEquals(CaptureTerminalStatus.FAILED, harness.awaitTerminal())
             assertEquals(0, harness.completeCount.get())
             assertEquals(1, harness.coordinator.performCount())
-            assertFalse(harness.coordinator.perform())
+            assertEquals(CoordinatorLifecyclePhase.CLOSED, harness.coordinator.snapshot().phase)
             assertEquals(1, harness.coordinator.performCount())
         } finally {
             harness.shutdown()
@@ -392,6 +401,174 @@ class YuvProductionLifecycleTest {
             assertEquals(1, harness.coordinator.performCount())
         } finally {
             harness.shutdown()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 0.9: deterministic YuvProductionResourceCoordinator unit tests.
+    // Every synchronization is CountDownLatch based; no sleeps/polling.
+    // ------------------------------------------------------------------
+
+    private fun newCoordinator(): Pair<YuvProductionResourceCoordinator, android.os.HandlerThread> {
+        val ht = android.os.HandlerThread("coord-test").apply { start() }
+        return Pair(YuvProductionResourceCoordinator(null, android.os.Handler(ht.looper), ht), ht)
+    }
+
+    private fun newReader(): ImageReader =
+        ImageReader.newInstance(64, 64, ImageFormat.YUV_420_888, 2)
+
+    @Test
+    fun attachImageReaderBeforePerformIsReleasedByPerform() {
+        val (coord, ht) = newCoordinator()
+        try {
+            val reader = newReader()
+            coord.attachImageReader(reader)
+            val snap = coord.perform()
+            assertTrue(snap.isTerminal)
+            assertEquals(CoordinatorLifecyclePhase.CLOSED, snap.phase)
+            assertTrue(
+                snap.records.any { it.resourceType == "ImageReader" && it.action == "close" && it.succeeded }
+            )
+            assertTrue(coord.releasedResourceTags().contains("ImageReader.close"))
+        } finally {
+            ht.quitSafely()
+        }
+    }
+
+    @Test
+    fun performWinsBeforeLateImageReaderAttachmentSettlesImmediately() {
+        val (coord, ht) = newCoordinator()
+        try {
+            assertTrue(coord.perform().isTerminal)
+            val reader = newReader()
+            coord.attachImageReader(reader)
+            val snap = coord.snapshot()
+            assertEquals(1, snap.lateAttachmentCount)
+            assertTrue(snap.records.any { it.resourceType == "ImageReader" && it.lateAttachment && it.succeeded })
+            // The attachment was NOT retained: a repeated perform re-releases nothing.
+            val second = coord.perform()
+            assertEquals(CoordinatorLifecyclePhase.CLOSED, second.phase)
+            assertEquals(1, second.performCount)
+        } finally {
+            ht.quitSafely()
+        }
+    }
+
+    @Test
+    fun lateAttachmentReleaseThrowsAndIsRecordedAsFailure() {
+        val (coord, ht) = newCoordinator()
+        try {
+            coord.releaseInterceptor = { type, action, _ ->
+                if (type == "ImageReader" && action == "close") {
+                    throw IllegalStateException("injected late release failure")
+                }
+            }
+            coord.perform()
+            coord.attachImageReader(newReader())
+            val snap = coord.snapshot()
+            assertEquals(1, snap.lateAttachmentSettlementFailures)
+            assertTrue(
+                snap.records.any {
+                    it.resourceType == "ImageReader" && it.lateAttachment &&
+                        !it.succeeded && it.failure is IllegalStateException
+                }
+            )
+        } finally {
+            ht.quitSafely()
+        }
+    }
+
+    @Test
+    fun concurrentPerformCallsRunExactlyOnce() {
+        val (coord, ht) = newCoordinator()
+        try {
+            val start = CountDownLatch(1)
+            val done = CountDownLatch(2)
+            val results = java.util.Collections.synchronizedList(mutableListOf<Int>())
+            repeat(2) {
+                Thread {
+                    try {
+                        start.await()
+                        results.add(coord.perform().performCount)
+                    } finally {
+                        done.countDown()
+                    }
+                }.start()
+            }
+            start.countDown()
+            assertTrue(done.await(5, TimeUnit.SECONDS))
+            assertEquals(listOf(1, 1), results.sorted())
+            assertEquals(1, coord.performCount())
+            assertTrue(coord.snapshot().isTerminal)
+        } finally {
+            ht.quitSafely()
+        }
+    }
+
+    @Test
+    fun snapshotDuringCleaningShowsPendingPhase() {
+        val (coord, ht) = newCoordinator()
+        try {
+            val enteredRelease = CountDownLatch(1)
+            val continueRelease = CountDownLatch(1)
+            coord.releaseInterceptor = { type, action, real ->
+                if (type == "ImageReader" && action == "close") {
+                    enteredRelease.countDown()
+                    assertTrue(continueRelease.await(5, TimeUnit.SECONDS))
+                    real()
+                } else {
+                    real()
+                }
+            }
+            coord.attachImageReader(newReader())
+            val performed = AtomicReference<ProductionCleanupSnapshot>()
+            val worker = Thread {
+                performed.set(coord.perform())
+            }
+            worker.start()
+            assertTrue(enteredRelease.await(5, TimeUnit.SECONDS))
+            val mid = coord.snapshot()
+            assertEquals(CoordinatorLifecyclePhase.CLEANING, mid.phase)
+            assertFalse(mid.isTerminal)
+            continueRelease.countDown()
+            worker.join(5_000)
+            assertTrue(performed.get().isTerminal)
+        } finally {
+            ht.quitSafely()
+        }
+    }
+
+    @Test
+    fun snapshotAfterClosedContainsCompleteResults() {
+        val (coord, ht) = newCoordinator()
+        try {
+            coord.attachImageReader(newReader())
+            coord.perform()
+            val snap = coord.snapshot()
+            assertEquals(CoordinatorLifecyclePhase.CLOSED, snap.phase)
+            assertTrue(snap.isTerminal)
+            assertEquals(1, snap.performCount)
+            assertTrue(snap.releaseAttempts > 0)
+            assertTrue(snap.records.isNotEmpty())
+        } finally {
+            ht.quitSafely()
+        }
+    }
+
+    @Test
+    fun lateSettlementUpdatesClosedSnapshot() {
+        val (coord, ht) = newCoordinator()
+        try {
+            coord.perform()
+            val before = coord.snapshot()
+            assertEquals(0, before.lateAttachmentCount)
+            assertFalse(before.records.any { it.lateAttachment })
+            coord.attachImageReader(newReader())
+            val after = coord.snapshot()
+            assertEquals(1, after.lateAttachmentCount)
+            assertTrue(after.records.any { it.resourceType == "ImageReader" && it.lateAttachment })
+        } finally {
+            ht.quitSafely()
         }
     }
 

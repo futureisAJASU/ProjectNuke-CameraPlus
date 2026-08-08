@@ -7,7 +7,6 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
@@ -24,26 +23,64 @@ import java.util.concurrent.atomic.AtomicReference
  *  - timeout scheduler (shutdown)
  *  - background [HandlerThread] (quit)
  *
- * Terminal settlement must call [perform] exactly once so that Camera2 resources
- * are always released regardless of whether the user callback, metadata write,
- * or status dispatch succeeded or failed.  The coordinator is idempotent: a
- * second call is a no-op.
+ * Synchronization domain: ONE coordinator lock guards the lifecycle phase and the
+ * ownership references.  Attachment and the OPEN -> CLEANING claim share that lock,
+ * so a resource can never be stored after cleanup has atomically claimed ownership:
  *
- * Internal YUV cleanup ([YuvCleanupCoordinator]) and production cleanup
- * ([perform]) must BOTH be initiated at terminal settlement.
+ * ```
+ * under coordinator lock:
+ *     OPEN:        attachment may be stored
+ *     perform:     OPEN -> CLEANING, snapshot every owned resource, clear ownership refs
+ *     CLEANING/CLOSED: attachment is NOT stored; a late-attachment settlement action is
+ *                      selected (the release itself runs OUTSIDE the lock)
+ *     after release actions complete: CLEANING -> CLOSED
+ * ```
+ *
+ * External resource code (close/stop/abort/quit) NEVER runs while holding the
+ * coordinator lock.  The lock only selects ownership/action; release executes
+ * outside the lock.
+ *
+ * Every owned-resource release attempt produces a structured
+ * [ProductionResourceReleaseRecord].  Late attachments after CLEANING/CLOSED produce
+ * the same structured result.  There is no `catch (_: Exception) {}` for owned
+ * production resources: every failure is recorded in the ledger and remains
+ * observable in [ProductionCleanupSnapshot].
+ *
+ * Repeated [perform] semantics: the FIRST call claims ownership (OPEN -> CLEANING),
+ * releases every owned resource, then publishes CLOSED.  Every later call is a
+ * no-op that returns the CURRENT snapshot (CLOSED, performCount == 1).  A call made
+ * while CLEANING also returns the current snapshot and never re-runs release.
  */
-/** Coordinator lifecycle state machine: OPEN -> CLEANING -> CLOSED. */
 internal enum class CoordinatorLifecyclePhase { OPEN, CLEANING, CLOSED }
 
-/** Immutable cleanup result published by a single [perform]. */
-internal data class ProductionCleanupResult(
-    val phase: String,
-    val performCount: Int,
-    val resourceReleaseAttempts: Int,
-    val resourceReleaseSuccesses: Int,
-    val resourceReleaseFailures: Int,
-    val lateAttachmentsImmediatelySettled: Int
+/** Structured outcome of one resource release attempt (owned or late attachment). */
+internal data class ProductionResourceReleaseRecord(
+    val resourceType: String,
+    val action: String,
+    val lateAttachment: Boolean = false,
+    val attempted: Boolean = true,
+    val succeeded: Boolean = false,
+    val failure: Throwable? = null
 )
+
+/**
+ * Immutable snapshot of the cleanup ledger.  Never stale: it is rebuilt from the
+ * thread-safe ledger on every read, so a late attachment settled after CLOSED is
+ * visible in every subsequent snapshot.
+ */
+internal data class ProductionCleanupSnapshot(
+    val phase: CoordinatorLifecyclePhase,
+    val performCount: Int,
+    val initialResourceCount: Int,
+    val releaseAttempts: Int,
+    val releaseSuccesses: Int,
+    val releaseFailures: Int,
+    val lateAttachmentCount: Int,
+    val lateAttachmentSettlementFailures: Int,
+    val records: List<ProductionResourceReleaseRecord>
+) {
+    val isTerminal: Boolean get() = phase == CoordinatorLifecyclePhase.CLOSED
+}
 
 internal class YuvProductionResourceCoordinator(
     private val timeoutScheduler: ScheduledExecutorService?,
@@ -54,151 +91,238 @@ internal class YuvProductionResourceCoordinator(
     // (ImageReader/MotionLogger during setup, CameraDevice/CameraCaptureSession in
     // onOpened/onConfigured callbacks).  ColorFusion attaches each resource the moment
     // it becomes available so that perform() always releases the LATEST references.
-    @Volatile private var imageReader: ImageReader? = null
-    @Volatile private var cameraDevice: CameraDevice? = null
-    @Volatile private var captureSession: CameraCaptureSession? = null
-    @Volatile private var motionLogger: MotionLogger? = null
+    // These references are ONLY read/written under [coordinatorLock].
+    private var imageReader: ImageReader? = null
+    private var cameraDevice: CameraDevice? = null
+    private var captureSession: CameraCaptureSession? = null
+    private var motionLogger: MotionLogger? = null
 
-    private val lifecycle = AtomicReference(CoordinatorLifecyclePhase.OPEN)
-    private val started = AtomicBoolean(false)
-    private val performRuns = AtomicInteger(0)
-    // Observable release record for diagnostics/tests.  Production ignores it.
-    private val releasedTags = java.util.concurrent.CopyOnWriteArrayList<String>()
-    private val releaseSuccessCount = AtomicInteger(0)
-    private val releaseFailureCount = AtomicInteger(0)
-    private val lateAttachmentsSettled = AtomicInteger(0)
-    private val cleanupResultRef = AtomicReference<ProductionCleanupResult?>(null)
-    private val attachLock = Any()
+    // The ONE synchronization domain: lifecycle phase + ownership + ledger.
+    private val coordinatorLock = Any()
+    private var phase = CoordinatorLifecyclePhase.OPEN
+    private var performCount = 0
+    private var releaseAttempts = 0
+    private var releaseSuccesses = 0
+    private var releaseFailures = 0
+    private var lateAttachmentCount = 0
+    private var lateAttachmentSettlementFailures = 0
+    private val records = mutableListOf<ProductionResourceReleaseRecord>()
+    private val releasedTags = mutableListOf<String>()
 
-    fun lifecyclePhase(): CoordinatorLifecyclePhase = lifecycle.get()
+    fun lifecyclePhase(): CoordinatorLifecyclePhase = synchronized(coordinatorLock) { phase }
 
-    fun performCount(): Int = performRuns.get()
+    fun performCount(): Int = synchronized(coordinatorLock) { performCount }
 
-    fun cleanupResult(): ProductionCleanupResult? = cleanupResultRef.get()
+    /** Current immutable cleanup snapshot; always fresh, never stale. */
+    fun snapshot(): ProductionCleanupSnapshot = buildSnapshot()
 
     /** Resource tags released by the single [perform]; empty until perform runs. */
-    internal fun releasedResourceTags(): List<String> = releasedTags.toList()
+    internal fun releasedResourceTags(): List<String> = synchronized(coordinatorLock) { releasedTags.toList() }
+
+    // ------------------------------------------------------------------
+    // Attachment: under the coordinator lock.  OPEN stores; CLEANING/CLOSED
+    // selects an immediate-settlement action (release runs outside the lock).
+    // ------------------------------------------------------------------
 
     fun attachImageReader(reader: ImageReader?) {
-        synchronized(attachLock) {
-            val phase = lifecycle.get()
-            if (phase == CoordinatorLifecyclePhase.CLEANING || phase == CoordinatorLifecyclePhase.CLOSED) {
-                lateAttachmentsSettled.incrementAndGet()
-                reader?.close()
-                return
+        val late = synchronized(coordinatorLock) {
+            if (phase == CoordinatorLifecyclePhase.OPEN) {
+                imageReader = reader
+                false
+            } else {
+                lateAttachmentCount++
+                true
             }
-            imageReader = reader
         }
+        if (late) settleLateAttachment("ImageReader", "close") { reader?.close() }
     }
 
     fun attachCameraDevice(device: CameraDevice?) {
-        synchronized(attachLock) {
-            val phase = lifecycle.get()
-            if (phase == CoordinatorLifecyclePhase.CLEANING || phase == CoordinatorLifecyclePhase.CLOSED) {
-                lateAttachmentsSettled.incrementAndGet()
-                device?.close()
-                return
+        val late = synchronized(coordinatorLock) {
+            if (phase == CoordinatorLifecyclePhase.OPEN) {
+                cameraDevice = device
+                false
+            } else {
+                lateAttachmentCount++
+                true
             }
-            cameraDevice = device
         }
+        if (late) settleLateAttachment("CameraDevice", "close") { device?.close() }
     }
 
     fun attachCaptureSession(session: CameraCaptureSession?) {
-        synchronized(attachLock) {
-            val phase = lifecycle.get()
-            if (phase == CoordinatorLifecyclePhase.CLEANING || phase == CoordinatorLifecyclePhase.CLOSED) {
-                lateAttachmentsSettled.incrementAndGet()
-                try { session?.close() } catch (_: Exception) {}
-                return
+        val late = synchronized(coordinatorLock) {
+            if (phase == CoordinatorLifecyclePhase.OPEN) {
+                captureSession = session
+                false
+            } else {
+                lateAttachmentCount++
+                true
             }
-            captureSession = session
         }
+        if (late) settleLateAttachment("CaptureSession", "close") { session?.close() }
     }
 
     fun attachMotionLogger(logger: MotionLogger?) {
-        synchronized(attachLock) {
-            val phase = lifecycle.get()
-            if (phase == CoordinatorLifecyclePhase.CLEANING || phase == CoordinatorLifecyclePhase.CLOSED) {
-                lateAttachmentsSettled.incrementAndGet()
-                try { logger?.stop() } catch (_: Exception) {}
-                return
+        val late = synchronized(coordinatorLock) {
+            if (phase == CoordinatorLifecyclePhase.OPEN) {
+                motionLogger = logger
+                false
+            } else {
+                lateAttachmentCount++
+                true
             }
-            motionLogger = logger
         }
+        if (late) settleLateAttachment("MotionLogger", "stop") { logger?.stop() }
     }
+
+    // ------------------------------------------------------------------
+    // perform: claim under the lock, release outside the lock, CLOSED under
+    // the lock.  performCount stays exactly 1.
+    // ------------------------------------------------------------------
 
     /**
-     * Atomic lifecycle transition OPEN -> CLEANING -> CLOSED, then exactly-once
-     * release of every currently-attached production resource.  Returns true only
-     * for the first successful invocation; publishes an immutable [ProductionCleanupResult].
+     * Exactly-once cleanup.  Returns the CURRENT [ProductionCleanupSnapshot].
+     * First call: claims ownership (OPEN -> CLEANING), releases every owned
+     * resource outside the lock, then publishes CLOSED.  Later calls (including
+     * concurrent ones) are no-ops returning the current snapshot.
      */
-    fun perform(): Boolean {
-        if (!lifecycle.compareAndSet(CoordinatorLifecyclePhase.OPEN, CoordinatorLifecyclePhase.CLEANING)) {
-            // If already CLOSED, return false; if CLEANING, also no-op for idempotency.
-            return lifecycle.get() == CoordinatorLifecyclePhase.CLOSED && started.get()
-        }
-        started.set(true)
-        performRuns.incrementAndGet()
-        var attempts = 0
-        var successes = 0
-        var failures = 0
-
-        fun <T> release(tag: String, resource: T?, block: () -> Unit) {
-            attempts++
-            if (resource == null) return
-            releasedTags.add(tag)
-            try {
-                block()
-                successes++
-            } catch (t: Throwable) {
-                failures++
-                Log.w("KeplerYuvCleanup", "release $tag failed", t)
+    fun perform(): ProductionCleanupSnapshot {
+        // Claim under the lock: OPEN -> CLEANING, snapshot owned refs, clear them.
+        // Returns true only when this call won the claim.
+        var claim: ClaimedResources? = null
+        synchronized(coordinatorLock) {
+            if (phase == CoordinatorLifecyclePhase.OPEN) {
+                phase = CoordinatorLifecyclePhase.CLEANING
+                performCount = 1
+                claim = ClaimedResources(
+                    imageReader = imageReader,
+                    cameraDevice = cameraDevice,
+                    captureSession = captureSession,
+                    motionLogger = motionLogger,
+                    initialResourceCount = listOfNotNull(imageReader, cameraDevice, captureSession, motionLogger).size
+                )
+                imageReader = null
+                cameraDevice = null
+                captureSession = null
+                motionLogger = null
             }
         }
+        val owned = claim ?: return buildSnapshot()
 
-        // Detach Camera2 callbacks first.
-        release("ImageReader.listener", imageReader) { imageReader?.setOnImageAvailableListener(null, null) }
-        // Remove pending background callbacks.
-        release("Background.handler", backgroundHandler) { backgroundHandler?.removeCallbacksAndMessages(null) }
-        // Camera session teardown.
-        release("CaptureSession.abort", captureSession) { captureSession?.abortCaptures() }
-        release("CaptureSession.stop", captureSession) { captureSession?.stopRepeating() }
-        release("CaptureSession.close", captureSession) { captureSession?.close() }
-        // ImageReader and CameraDevice.
-        release("ImageReader.close", imageReader) { imageReader?.close() }
-        release("CameraDevice.close", cameraDevice) { cameraDevice?.close() }
-        // Motion logger.
-        release("MotionLogger.stop", motionLogger) { motionLogger?.stop() }
-        // Timeout scheduler.
-        release("TimeoutScheduler.shutdown", timeoutScheduler) { timeoutScheduler?.shutdownNow() }
-        // Background thread ??do NOT block Main waiting for the encoder or thread.
-        release("BackgroundThread.quit", backgroundThread) { backgroundThread?.quitSafely() }
+        // Release every owned resource OUTSIDE the lock.
+        val releaseRecords = mutableListOf<ProductionResourceReleaseRecord>()
+        fun <T> release(resourceType: String, action: String, resource: T?, block: (T) -> Unit) {
+            if (resource == null) return
+            releaseRecords.add(recordRelease(resourceType, action) { block(resource) })
+        }
 
-        lifecycle.set(CoordinatorLifecyclePhase.CLOSED)
-        val result = ProductionCleanupResult(
-            phase = "CLOSED",
-            performCount = performRuns.get(),
-            resourceReleaseAttempts = attempts,
-            resourceReleaseSuccesses = successes,
-            resourceReleaseFailures = failures,
-            lateAttachmentsImmediatelySettled = lateAttachmentsSettled.get()
-        )
-        cleanupResultRef.set(result)
-        return true
+        release("ImageReader", "listener", owned.imageReader) { it.setOnImageAvailableListener(null, null) }
+        release("Background", "handler", backgroundHandler) { it.removeCallbacksAndMessages(null) }
+        release("CaptureSession", "abort", owned.captureSession) { it.abortCaptures() }
+        release("CaptureSession", "stop", owned.captureSession) { it.stopRepeating() }
+        release("CaptureSession", "close", owned.captureSession) { it.close() }
+        release("ImageReader", "close", owned.imageReader) { it.close() }
+        release("CameraDevice", "close", owned.cameraDevice) { it.close() }
+        release("MotionLogger", "stop", owned.motionLogger) { it.stop() }
+        release("TimeoutScheduler", "shutdown", timeoutScheduler) { it.shutdownNow() }
+        release("BackgroundThread", "quit", backgroundThread) { it.quitSafely() }
+
+        // Publish CLOSED under the lock with the completed release ledger.
+        synchronized(coordinatorLock) {
+            phase = CoordinatorLifecyclePhase.CLOSED
+            records.addAll(releaseRecords)
+            releaseAttempts += releaseRecords.size
+            releaseSuccesses += releaseRecords.count { it.succeeded }
+            releaseFailures += releaseRecords.count { !it.succeeded }
+            releaseRecords.forEach { record ->
+                if (record.succeeded) {
+                    releasedTags.add("${record.resourceType}.${record.action}")
+                }
+            }
+        }
+        return buildSnapshot()
     }
 
-    fun isStarted(): Boolean = started.get()
-    internal fun currentImageReader(): ImageReader? = imageReader
-    internal fun currentCameraDevice(): CameraDevice? = cameraDevice
-    internal fun currentCaptureSession(): CameraCaptureSession? = captureSession
-    internal fun currentMotionLogger(): MotionLogger? = motionLogger
+    private class ClaimedResources(
+        val imageReader: ImageReader?,
+        val cameraDevice: CameraDevice?,
+        val captureSession: CameraCaptureSession?,
+        val motionLogger: MotionLogger?,
+        val initialResourceCount: Int
+    )
+
+    /** Runs the release action, records the structured result, then publishes. */
+    private fun settleLateAttachment(resourceType: String, action: String, release: () -> Unit) {
+        val record = recordRelease(resourceType, action, late = true) { release() }
+        synchronized(coordinatorLock) {
+            records.add(record)
+            lateAttachmentSettlementFailures += if (record.succeeded) 0 else 1
+        }
+    }
+
+    /** Executes [block]; the caller decides whether a null resource is recorded. */
+    private fun recordRelease(
+        resourceType: String,
+        action: String,
+        late: Boolean = false,
+        block: () -> Unit
+    ): ProductionResourceReleaseRecord {
+        val failure: Throwable? = try {
+            releaseInterceptor?.invoke(resourceType, action, block) ?: block()
+            null
+        } catch (t: Throwable) {
+            Log.w("KeplerYuvCleanup", "release $resourceType.$action failed", t)
+            t
+        }
+        return ProductionResourceReleaseRecord(
+            resourceType = resourceType,
+            action = action,
+            lateAttachment = late,
+            attempted = true,
+            succeeded = failure == null,
+            failure = failure
+        )
+    }
+
+    private fun buildSnapshot(): ProductionCleanupSnapshot = synchronized(coordinatorLock) {
+        ProductionCleanupSnapshot(
+            phase = phase,
+            performCount = performCount,
+            initialResourceCount = records
+                .asSequence()
+                .filter { !it.lateAttachment }
+                .map { it.resourceType }
+                .distinct()
+                .count(),
+            releaseAttempts = releaseAttempts,
+            releaseSuccesses = releaseSuccesses,
+            releaseFailures = releaseFailures,
+            lateAttachmentCount = lateAttachmentCount,
+            lateAttachmentSettlementFailures = lateAttachmentSettlementFailures,
+            records = records.toList()
+        )
+    }
+
+    internal fun currentImageReader(): ImageReader? = synchronized(coordinatorLock) { imageReader }
+    internal fun currentCameraDevice(): CameraDevice? = synchronized(coordinatorLock) { cameraDevice }
+    internal fun currentCaptureSession(): CameraCaptureSession? = synchronized(coordinatorLock) { captureSession }
+    internal fun currentMotionLogger(): MotionLogger? = synchronized(coordinatorLock) { motionLogger }
+
+    /**
+     * Internal test-only seam: intercepts a single resource release to simulate a
+     * thrown failure or to deterministically pause perform() mid-release (CLEANING).
+     * Production code NEVER sets this; when null the real release runs directly.
+     * The interceptor MAY call [block] (real release) or skip it (simulated throw).
+     */
+    internal var releaseInterceptor: ((String, String, () -> Unit) -> Unit)? = null
 }
 
 /**
  * Production [CallbackDispatcher] that returns the ACTUAL [Handler.post] acceptance
  * result.  If Main dispatch rejects, the callback is NOT executed inline, and
  * [dispatch] returns false.  The caller (YuvCaptureOwner) records a diagnostic and
- * proceeds with cleanup ??the terminal metadata stays valid and production cleanup
+ * proceeds with cleanup — the terminal metadata stays valid and production cleanup
  * still executes.
  */
 internal class YuvProductionCallbackDispatcher(
@@ -252,7 +376,7 @@ internal class YuvPreSessionTerminal(
     private val dispatchError: (String) -> Boolean,
     private val cleanup: () -> Unit
 ) {
-    private val terminalClaimed = AtomicBoolean(false)
+    private val terminalClaimed = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /**
      * Marks the outer pipeline terminal exactly once.  Returns true only when this call
@@ -272,4 +396,3 @@ internal class YuvPreSessionTerminal(
 
     fun isTerminal(): Boolean = terminalClaimed.get()
 }
-

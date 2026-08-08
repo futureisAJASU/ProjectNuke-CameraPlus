@@ -43,7 +43,7 @@ internal class YuvCaptureSession internal constructor(
             maxRetainedBytes: Long,
             workerName: String = "YuvCapture-$frameCount",
             workProcessor: YuvPngWorkProcessor,
-            postStatus: (String) -> Unit = {},
+            postStatus: (String) -> Boolean = { true },
             dispatchCallback: CallbackDispatcher = CallbackDispatcher { runnable -> runnable.run(); true },
             writeJobJson: (status: String, savedFrames: Int, manifest: List<YuvFrameManifestEntry>) -> Unit = { _, _, _ -> },
             saveMotionOnce: (File) -> Pair<String?, String?> = { _ -> null to null },

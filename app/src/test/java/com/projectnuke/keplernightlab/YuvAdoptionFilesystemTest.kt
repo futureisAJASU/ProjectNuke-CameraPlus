@@ -177,7 +177,12 @@ class YuvAdoptionFilesystemTest {
             candidateFilesystem = filesystem,
             candidateVerifier = candidateVerifier,
             finalFileVerifier = finalFileVerifier,
-            accounting = accounting
+            accounting = accounting,
+            productionResourceCoordinator = YuvProductionResourceCoordinator(
+                timeoutScheduler = null,
+                backgroundHandler = null,
+                backgroundThread = null
+            )
         )
 
         fun finalFile(frame: Int = 0): File = File(dir, "frame_%02d_color.png".format(frame))

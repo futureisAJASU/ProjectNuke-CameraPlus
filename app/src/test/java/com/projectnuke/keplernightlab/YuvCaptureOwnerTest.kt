@@ -148,6 +148,11 @@ class YuvCaptureOwnerTest {
         val onCaptureErrorCount = AtomicInteger(0)
         val callbackLatch = CountDownLatch(1)
         val postedStatus = mutableListOf<String>()
+        val testCoordinator = YuvProductionResourceCoordinator(
+            timeoutScheduler = null,
+            backgroundHandler = null,
+            backgroundThread = null
+        )
 
         val session: YuvCaptureSession = YuvCaptureSession.create(
             dispatch = { event ->
@@ -184,6 +189,7 @@ class YuvCaptureOwnerTest {
             postStatus = { msg ->
                 if (statusFailure) throw IllegalStateException("injected status failure")
                 handler.post { postedStatus += msg }
+                true
             },
             dispatchCallback = CallbackDispatcher { runnable ->
                 if (callbackDispatchFailure) return@CallbackDispatcher false
@@ -213,7 +219,8 @@ class YuvCaptureOwnerTest {
                 errorMessage.set(msg)
                 callbackLatch.countDown()
             },
-            finalFileVerifier = finalFileVerifier
+            finalFileVerifier = finalFileVerifier,
+            productionResourceCoordinator = testCoordinator
         )
 
         /** Wait deterministically for the terminal status to be reached and return it. */
@@ -806,7 +813,12 @@ class YuvCaptureOwnerTest {
             ),
             dispatchCallback = CallbackDispatcher { false },
             onCaptureComplete = { callbackRan.incrementAndGet() },
-            onCaptureError = { _, _ -> callbackRan.incrementAndGet() }
+            onCaptureError = { _, _ -> callbackRan.incrementAndGet() },
+            productionResourceCoordinator = YuvProductionResourceCoordinator(
+                timeoutScheduler = null,
+                backgroundHandler = null,
+                backgroundThread = null
+            )
         )
         try {
             session.owner.acceptBuffered(FakeBufferedAccess(1000L))

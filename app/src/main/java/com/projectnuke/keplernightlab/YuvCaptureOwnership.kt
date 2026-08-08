@@ -1757,7 +1757,8 @@ internal data class YuvTerminalSnapshot(
     val statusDispatchOutcome: TerminalOperationOutcome,
     val callbackDispatchOutcome: TerminalOperationOutcome,
     val callbackExecutionOutcome: TerminalOperationOutcome,
-    val callbackState: CallbackState
+    val callbackState: CallbackState,
+    val productionCleanup: ProductionCleanupSnapshot?
 ) {
     val isTerminal: Boolean get() = terminalStatus != CaptureTerminalStatus.ACTIVE
     val isSettled: Boolean get() = terminalSettlementPhase == TerminalSettlementPhase.SETTLED

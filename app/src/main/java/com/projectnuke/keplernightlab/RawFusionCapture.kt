@@ -685,6 +685,19 @@ fun captureRawBurstForFusion(
             }
         }
 
+        fun closeUnmatchedImages() {
+            synchronized(stateLock) {
+                val unmatched = imagesByTimestamp.filter { it.key !in resultsByTimestamp }.keys.toList()
+                for (timestamp in unmatched) {
+                    imagesByTimestamp.remove(timestamp)?.let {
+                        droppedUnmatchedImages++
+                        runCatching { it.close() }
+                    }
+                    imageArrivalMillis.remove(timestamp)
+                }
+            }
+        }
+
         fun trySaveReadyFrames() {
             if (saveWorkerThread.get() != true) {
                 rescanRequested.set(true)
@@ -912,6 +925,7 @@ fun captureRawBurstForFusion(
                     } else {
                         finishError(
                             "CAPTURE_TIMEOUT",
+                            "CAPTURE_TIMEOUT: RAW capture saved $savedFrames/$requestedFrames"
                         )
                     }
                 }
