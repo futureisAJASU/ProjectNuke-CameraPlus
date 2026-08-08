@@ -253,17 +253,27 @@ fun captureYuvBurstColorWithMotion(
     onStatus: (String) -> Unit
 ) {
         val mainHandler = Handler(Looper.getMainLooper())
-    val statusDispatcher = YuvStatusDispatcher(mainHandler) { onStatus(it) }
-    val callbackDispatcher = YuvProductionCallbackDispatcher(mainHandler)
-    fun postStatus(message: String) {
-        statusDispatcher.dispatch(message)
-    }
 
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     val backgroundThread = HandlerThread("KeplerColorBurstThread").apply { start() }
     val backgroundHandler = Handler(backgroundThread.looper)
     val timeoutScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "KeplerColorBurstTimeout").apply { isDaemon = true }
+    }
+
+    // The REAL production seam: Main-thread dispatchers, pre-session terminal,
+    // production resource coordinator, and exactly-once production cleanup are
+    // constructed here (unit-tested as a seam, see ColorFusionProductionSeamTest).
+    val productionSeam = YuvColorFusionProductionSeam(
+        mainHandler = mainHandler,
+        timeoutScheduler = timeoutScheduler,
+        backgroundHandler = backgroundHandler,
+        backgroundThread = backgroundThread,
+        onStatus = onStatus,
+        onError = onError
+    )
+    fun postStatus(message: String) {
+        productionSeam.postStatus(message)
     }
 
     var motionLogger: MotionLogger? = null
@@ -281,46 +291,12 @@ fun captureYuvBurstColorWithMotion(
     var yuvSession: YuvCaptureSession? = null
     var jobFileHolder: JobFileHolder? = null
 
-    // Step 0.1: Production resource coordinator must exist BEFORE any fallible
-    // initialization step so that pre-session terminal cleanup can close resources.
-    val productionResourceCoordinator = YuvProductionResourceCoordinator(
-        timeoutScheduler = timeoutScheduler,
-        backgroundHandler = backgroundHandler,
-        backgroundThread = backgroundThread
-    )
-
-    /**
-     * Production resource cleanup: exactly-once, idempotent.  Closes Camera2
-     * resources, detaches callbacks, stops motion logger, shuts down scheduler
-     * and background thread.  Does NOT block Main waiting for the encoder.
-     *
-     * The production coordinator phase/snapshot is the single cleanup authority;
-     * there is no second `cleanupStarted` flag.  This path is used by the
-     * pre-session terminal (before [YuvCaptureSession] exists); once the session
-     * is authoritative the owner performs cleanup in its terminal finally.
-     */
-    fun productionCleanup() {
-        productionResourceCoordinator.perform()
-        // Also close the YUV session (internal cleanup) if one was created.
-        try { yuvSession?.close() } catch (_: Exception) {}
-    }
-
-    // Pre-session terminal path: owns exactly-once claim, status/error dispatch through
-    // acceptance-reporting Main dispatchers (never inline), and production cleanup.
-    // After YuvCaptureSession becomes authoritative this path is no longer used.
-    val preSessionTerminal = YuvPreSessionTerminal(
-        dispatchStatus = { message -> statusDispatcher.dispatch(message) },
-        dispatchError = { message -> callbackDispatcher.dispatch(Runnable { onError(message) }) },
-        cleanup = { productionCleanup() }
-    )
-
-    // Pre-session terminal path: owns exactly-once claim, status/error dispatch through
     fun logLateCameraCallback(callback: String) {
         val isFinished = yuvSession?.let { !it.terminalState.status().equals(CaptureTerminalStatus.ACTIVE) } ?: finished.get()
         Log.d(
             "KeplerCaptureCancel",
             "pipeline=YUV callback=$callback late=true finished=$isFinished " +
-                "coordinatorPhase=${productionResourceCoordinator.lifecyclePhase()}"
+                "coordinatorPhase=${productionSeam.productionResourceCoordinator.lifecyclePhase()}"
         )
     }
 
@@ -341,7 +317,7 @@ fun captureYuvBurstColorWithMotion(
     ) {
         logYuvCaptureFailure(stage = source, throwable = throwable, detail = message)
         finished.set(true)
-        preSessionTerminal.finish(message)
+        productionSeam.preSessionTerminal.finish(message)
     }
 
     /**
@@ -375,7 +351,7 @@ fun captureYuvBurstColorWithMotion(
         } else {
             // Pre-session cancellation: mark terminal and cleanup.
             finished.set(true)
-            preSessionTerminal.finish("캡처가 취소되었습니다.")
+            productionSeam.preSessionTerminal.finish("캡처가 취소되었습니다.")
         }
     }
 
@@ -618,8 +594,8 @@ fun captureYuvBurstColorWithMotion(
             workerCapacity = maxOf(2, minOf(frameCount, MAX_YUV_MEMORY_BUFFER_FRAMES)),
             maxRetainedBytes = MAX_YUV_MEMORY_BUFFER_BYTES,
             workProcessor = yuvWorkProcessor,
-            postStatus = { msg -> statusDispatcher.dispatch(msg) },
-                        dispatchCallback = callbackDispatcher,
+            postStatus = { msg -> productionSeam.statusDispatcher.dispatch(msg) },
+                        dispatchCallback = productionSeam.callbackDispatcher,
             terminalMetadataWriter = YuvTerminalMetadataWriter { request ->
                 metadataWriter?.write(request.jobStatus, request.savedFrames, request.manifest)
             },
@@ -649,9 +625,10 @@ fun captureYuvBurstColorWithMotion(
                 }
             },
             saveMotionOnce = { dir -> saveMotionOnce(dir) },
-            productionResourceCoordinator = productionResourceCoordinator,
+            productionResourceCoordinator = productionSeam.productionResourceCoordinator,
             finished = finished
         )
+        productionSeam.sessionClose = { yuvSession?.close() }
 
         postStatus("Color Fusion 초기화 4/7: ImageReader 생성 중...")
 
@@ -663,7 +640,7 @@ fun captureYuvBurstColorWithMotion(
         )
 
         imageReader = reader
-        productionResourceCoordinator.attachImageReader(reader)
+        productionSeam.productionResourceCoordinator.attachImageReader(reader)
         if (useMemoryBuffer) {
             postStatus(
                 "YUV memory buffer enabled: frames=$frameCount " +
@@ -705,7 +682,7 @@ fun captureYuvBurstColorWithMotion(
             metadataWriter?.motionInfo = motionInfo
             null
         }
-        productionResourceCoordinator.attachMotionLogger(motionLogger)
+        productionSeam.productionResourceCoordinator.attachMotionLogger(motionLogger)
 
         postStatus(
             "Color Fusion 준비 완료\n" +
@@ -758,7 +735,7 @@ fun captureYuvBurstColorWithMotion(
                         return
                     }
                     cameraDevice = camera
-                    productionResourceCoordinator.attachCameraDevice(camera)
+                    productionSeam.productionResourceCoordinator.attachCameraDevice(camera)
                     if (isTerminalOrFinished()) {
                         logLateCameraCallback("CameraDevice.onOpened.afterAssign")
                         camera.close()
@@ -785,7 +762,7 @@ fun captureYuvBurstColorWithMotion(
                                         return@createRoutedStillCaptureSession
                                     }
                                     captureSession = session
-                                    productionResourceCoordinator.attachCaptureSession(session)
+                                    productionSeam.productionResourceCoordinator.attachCaptureSession(session)
                                     if (isTerminalOrFinished()) {
                                         logLateCameraCallback("CameraCaptureSession.onConfigured.afterAssign")
                                         session.close()
