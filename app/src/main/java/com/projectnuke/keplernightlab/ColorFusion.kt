@@ -192,7 +192,6 @@ internal fun copyYuvFrameToMemory(image: Image, index: Int): BufferedYuvFrame {
     )
 }
 
-@SuppressLint("MissingPermission")
 private class JobFileHolder(var file: File)
 
 private class ProductionMetadataWriter(
@@ -283,6 +282,7 @@ private class ProductionMetadataWriter(
     }
 }
 
+@SuppressLint("MissingPermission")
 fun captureYuvBurstColorWithMotion(
     context: Context,
     cameraId: String,
