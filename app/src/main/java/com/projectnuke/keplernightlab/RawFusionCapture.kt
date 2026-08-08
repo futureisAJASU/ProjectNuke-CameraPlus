@@ -137,7 +137,10 @@ fun captureRawBurstForFusion(
             if (!posted) runCatching { onStatus(message) }
         }
     fun postMainOrRun(action: () -> Unit) {
-        if (!mainHandler.post(action)) runCatching(action)
+        val posted = mainHandler.post(action)
+        if (!posted) {
+            Log.w(RAW_PIPELINE_LOG_TAG, "Main dispatch rejected for RAW callback/action")
+        }
     }
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     val thread = HandlerThread("KeplerRawFusionCaptureThread").apply { start() }
@@ -781,19 +784,40 @@ fun captureRawBurstForFusion(
                     }
                     val dynamicBlackLevel = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
                     val plane = image.planes[0]
+                    val dngSidecarOutcome = if (shouldSaveDngSidecars) {
+                        if (dngSaved) RawDngSidecarOutcome.localSaved(index, dngName)
+                        else RawDngSidecarOutcome.localSaveFailed(index, dngFailure ?: "DNG save failed")
+                    } else {
+                        RawDngSidecarOutcome.notRequested(index)
+                    }
+                    val completion = RawSaveCompletion.Success(
+                        frameIndex = index,
+                        timestampNs = timestamp,
+                        raw16Filename = raw16Name,
+                        raw16Bytes = raw16File.length(),
+                        saveDurationMs = System.currentTimeMillis() - saveStartedAt,
+                        dngSidecar = dngSidecarOutcome
+                    )
                     synchronized(stateLock) {
+                        savedFrames++
+                        val sidecarStatus = when (dngSidecarOutcome.status) {
+                            RawDngSidecarStatus.NOT_REQUESTED -> "NOT_REQUESTED"
+                            RawDngSidecarStatus.LOCAL_SAVED -> "LOCAL_SAVED"
+                            RawDngSidecarStatus.LOCAL_SAVE_FAILED -> "LOCAL_SAVE_FAILED"
+                            else -> "NOT_REQUESTED"
+                        }
+                        val dngFilename = when (dngSidecarOutcome.status) {
+                            RawDngSidecarStatus.LOCAL_SAVED -> dngName
+                            else -> null
+                        }
                         frameObjects.put(
                             JSONObject()
                             .put("index", index)
                             .put("frameIndex", index)
                             .put("raw16File", raw16Name)
-                            .put("dngFile", if (dngSaved) dngName else JSONObject.NULL)
-                            .put("dngSidecarStatus", when {
-                                dngSaved -> "LOCAL_SAVED"
-                                dngFailure != null -> "LOCAL_SAVE_FAILED"
-                                else -> "NOT_REQUESTED"
-                            })
-                            .put("dngSidecarError", dngFailure ?: JSONObject.NULL)
+                            .put("dngFile", dngFilename ?: JSONObject.NULL)
+                            .put("dngSidecarStatus", sidecarStatus)
+                            .put("dngSidecarError", dngSidecarOutcome.failureDescription ?: JSONObject.NULL)
                             .put("timestampNs", timestamp)
                             .put("exposureTimeNs", result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: JSONObject.NULL)
                             .put("sensitivityIso", result.get(CaptureResult.SENSOR_SENSITIVITY) ?: JSONObject.NULL)
@@ -818,7 +842,6 @@ fun captureRawBurstForFusion(
                             .put("cropRegion", finalCropSelection.region?.toString() ?: JSONObject.NULL)
                         )
                     }
-                    savedFrames++
                     val saveMs = System.currentTimeMillis() - saveStartedAt
                     rawFrameSaveTimesMs += saveMs
                     post("RAW saved frame $savedFrames/$requestedFrames (${saveMs}ms)")
@@ -831,17 +854,30 @@ fun captureRawBurstForFusion(
                         return
                     }
                 } catch (e: Exception) {
+                    val failureCompletion = RawSaveCompletion.Failed(
+                        frameIndex = index,
+                        timestampNs = timestamp,
+                        raw16TempFile = File(jobDir, ".${raw16Name}.$index.tmp").takeIf { it.exists() },
+                        failureType = e.javaClass.simpleName,
+                        failureMessage = "RAW fusion capture failed: ${e.stackTraceToString()}",
+                        throwable = e
+                    )
                     runCatching { File(jobDir, ".${raw16Name}.$index.tmp").delete() }
+                    val dngFailureOutcome = if (shouldSaveDngSidecars) {
+                        RawDngSidecarOutcome.localSaveFailed(index, "${e.javaClass.simpleName}: ${e.message}")
+                    } else {
+                        RawDngSidecarOutcome.notRequested(index)
+                    }
                     synchronized(stateLock) {
                         frameObjects.put(
                             JSONObject()
-                                .put("index", index)
-                                .put("frameIndex", index)
-                                .put("raw16File", JSONObject.NULL)
-                                .put("dngFile", JSONObject.NULL)
-                                .put("dngSidecarStatus", if (shouldSaveDngSidecars) "LOCAL_SAVE_FAILED" else "NOT_REQUESTED")
-                                .put("dngSidecarError", if (shouldSaveDngSidecars) "${e.javaClass.simpleName}: ${e.message}" else JSONObject.NULL)
-                                .put("timestampNs", timestamp)
+                            .put("index", index)
+                            .put("frameIndex", index)
+                            .put("raw16File", JSONObject.NULL)
+                            .put("dngFile", JSONObject.NULL)
+                            .put("dngSidecarStatus", if (shouldSaveDngSidecars) "LOCAL_SAVE_FAILED" else "NOT_REQUESTED")
+                            .put("dngSidecarError", if (shouldSaveDngSidecars) dngFailureOutcome.failureDescription else JSONObject.NULL)
+                            .put("timestampNs", timestamp)
                         )
                     }
                     finishError("CAPTURE_FAILED", "RAW fusion capture failed\n${e.stackTraceToString()}")

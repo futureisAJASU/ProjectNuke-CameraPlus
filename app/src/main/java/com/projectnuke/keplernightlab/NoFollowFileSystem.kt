@@ -128,13 +128,31 @@ internal object NoFollowFileSystem {
                 is NoFollowInspection.Present -> current.value
                 else -> error("File changed during read: ${file.absolutePath}")
             }
-            require(
-                after.isRegularFile && !after.isSymbolicLink() &&
-                    noFollowIdentityMatches(
-                        attrs.fileKey(), after.fileKey(), attrs.size(), after.size(),
-                        attrs.lastModifiedTime().toMillis(), after.lastModifiedTime().toMillis()
-                    )
-            ) { "File identity changed during read: ${file.absolutePath}" }
+            val sameStat = noFollowIdentityMatches(
+                attrs.fileKey(), after.fileKey(), attrs.size(), after.size(),
+                attrs.lastModifiedTime().toMillis(), after.lastModifiedTime().toMillis()
+            )
+            // Content fence for null-fileKey providers: same size/mtime + different content must fail.
+            val sameContent = if (attrs.fileKey() == null || after.fileKey() == null) {
+                runCatching {
+                    val verify = java.security.MessageDigest.getInstance("SHA-256")
+                    Files.newInputStream(file.toPath(), LinkOption.NOFOLLOW_LINKS).use { input ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            verify.update(buffer, 0, read)
+                        }
+                    }
+                    val contentDigest = verify.digest().joinToString("") { "%02x".format(it) }
+                    val beforeDigest = java.security.MessageDigest.getInstance("SHA-256").run {
+                        update(bytes)
+                        digest().joinToString("") { "%02x".format(it) }
+                    }
+                    contentDigest == beforeDigest
+                }.getOrDefault(false)
+            } else true
+            require(sameStat && sameContent) { "File identity changed during read: ${file.absolutePath}" }
             bytes
         }
     }
