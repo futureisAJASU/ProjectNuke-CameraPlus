@@ -307,12 +307,11 @@ fun captureYuvBurstColorWithMotion(
     onError: (String) -> Unit = {},
     onStatus: (String) -> Unit
 ) {
-    val mainHandler = Handler(Looper.getMainLooper())
+        val mainHandler = Handler(Looper.getMainLooper())
+    val statusDispatcher = YuvStatusDispatcher(mainHandler) { onStatus(it) }
+    val callbackDispatcher = YuvProductionCallbackDispatcher(mainHandler)
     fun postStatus(message: String) {
-        if (!mainHandler.post { onStatus(message) }) runCatching { onStatus(message) }
-    }
-    fun postMainOrRun(action: () -> Unit) {
-        if (!mainHandler.post(action)) runCatching(action)
+        statusDispatcher.dispatch(message)
     }
 
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -327,7 +326,6 @@ fun captureYuvBurstColorWithMotion(
     var captureSession: CameraCaptureSession? = null
     var imageReader: ImageReader? = null
 
-    var completedResults = 0
     val finished = AtomicBoolean(false)
     val cleanupStarted = AtomicBoolean(false)
     var motionSaved = false
@@ -336,40 +334,63 @@ fun captureYuvBurstColorWithMotion(
     var jobFile: File? = null
     var burstDir: File? = null
     var metadataWriter: ProductionMetadataWriter? = null
+    var productionResourceCoordinator: YuvProductionResourceCoordinator? = null
     var yuvSession: YuvCaptureSession? = null
     var jobFileHolder: JobFileHolder? = null
 
-    fun cleanup() {
+    /**
+     * Production resource cleanup: exactly-once, idempotent.  Closes Camera2
+     * resources, detaches callbacks, stops motion logger, shuts down scheduler
+     * and background thread.  Does NOT block Main waiting for the encoder.
+     */
+    fun productionCleanup() {
         if (!cleanupStarted.compareAndSet(false, true)) return
-        // 1. Settle the YUV session (closes owner, drains lifecycle, shuts down worker).
+        productionResourceCoordinator?.perform()
+        // Also close the YUV session (internal cleanup).
         try { yuvSession?.close() } catch (_: Exception) {}
-        // 2. Detach Camera2 callbacks.
-        try { imageReader?.setOnImageAvailableListener(null, null) } catch (_: Exception) {}
-        try { backgroundHandler.removeCallbacksAndMessages(null) } catch (_: Exception) {}
-        // 3. Camera session / device teardown.
-        try { captureSession?.abortCaptures() } catch (_: Exception) {}
-        try { captureSession?.stopRepeating() } catch (_: Exception) {}
-        try { captureSession?.close() } catch (_: Exception) {}
-        try { imageReader?.close() } catch (_: Exception) {}
-        try { cameraDevice?.close() } catch (_: Exception) {}
-        try { motionLogger?.stop() } catch (_: Exception) {}
-        // 4. Stop the timeout scheduler.
-        timeoutScheduler.shutdownNow()
-        // 5. Request background thread shutdown without blocking Main or encoder.
-        try { backgroundThread.quitSafely() } catch (_: Exception) {}
     }
 
+    // Pre-session terminal path: owns exactly-once claim, status/error dispatch through
+    // acceptance-reporting Main dispatchers (never inline), and production cleanup.
+    // After YuvCaptureSession becomes authoritative this path is no longer used.
+        val preSessionTerminal = YuvPreSessionTerminal(
+        dispatchStatus = { message -> statusDispatcher.dispatch(message) },
+        dispatchError = { message -> callbackDispatcher.dispatch(Runnable { onError(message) }) },
+        cleanup = { productionCleanup() }
+    )
+
     fun logLateCameraCallback(callback: String) {
+        val isFinished = yuvSession?.let { !it.terminalState.status().equals(CaptureTerminalStatus.ACTIVE) } ?: finished.get()
         Log.d(
             "KeplerCaptureCancel",
-            "pipeline=YUV callback=$callback late=true finished=${finished.get()} cleanupStarted=${cleanupStarted.get()}"
+            "pipeline=YUV callback=$callback late=true finished=$isFinished cleanupStarted=${cleanupStarted.get()}"
         )
     }
 
-    captureCancellationHandle.registerCleanupAction {
-        yuvSession?.owner?.onCancellationRequested()
+    /**
+     * Pre-session terminal path: handles failures BEFORE YuvCaptureSession is created.
+     * Marks the outer pipeline terminal exactly once, publishes/logs the error,
+     * dispatches onError through the safe callback dispatcher, closes already-created
+     * production resources, and stops timeout/background infrastructure.
+     *
+     * After YuvCaptureSession becomes authoritative, this path is no longer used.
+     */
+    fun finishPreSessionError(
+        message: String,
+        source: String = "captureYuvBurstColorWithMotion.init",
+        throwable: Throwable? = null,
+        failureType: String? = null,
+        failureMessage: String? = null
+    ) {
+        logYuvCaptureFailure(stage = source, throwable = throwable, detail = message)
+        finished.set(true)
+        preSessionTerminal.finish(message)
     }
 
+    /**
+     * Unified error path: routes to the pre-session path if yuvSession is null,
+     * or to the owner if the session is authoritative.
+     */
     fun finishError(
         message: String,
         source: String = "captureYuvBurstColorWithMotion.legacy",
@@ -377,7 +398,28 @@ fun captureYuvBurstColorWithMotion(
         failureType: String? = null,
         failureMessage: String? = null
     ) {
-        yuvSession?.owner?.onCaptureFailed(throwable ?: RuntimeException(message), message)
+        val session = yuvSession
+        if (session != null) {
+            session.owner.onCaptureFailed(throwable ?: RuntimeException(message), message)
+        } else {
+            finishPreSessionError(message, source, throwable, failureType, failureMessage)
+        }
+    }
+
+    /**
+     * Cancellation handling: covers both pre-session and post-session.
+     * Before yuvSession exists, cancellation triggers pre-session terminal + cleanup.
+     * After yuvSession exists, cancellation routes through the owner.
+     */
+    captureCancellationHandle.registerCleanupAction {
+        val session = yuvSession
+        if (session != null) {
+            session.owner.onCancellationRequested()
+        } else {
+            // Pre-session cancellation: mark terminal and cleanup.
+            finished.set(true)
+            preSessionTerminal.finish("캡처가 취소되었습니다.")
+        }
     }
 
     fun saveMotionOnce(dir: File): Pair<String?, String?> {
@@ -611,6 +653,16 @@ fun captureYuvBurstColorWithMotion(
             }
         )
 
+        // Production resource coordinator created BEFORE the session so it can be wired
+        // into the session's exactly-once terminal settlement.  Camera2 resources are
+        // attached as they become available (ImageReader/MotionLogger in setup,
+        // CameraDevice/CameraCaptureSession in their async callbacks).
+        productionResourceCoordinator = YuvProductionResourceCoordinator(
+            timeoutScheduler = timeoutScheduler,
+            backgroundHandler = backgroundHandler,
+            backgroundThread = backgroundThread
+        )
+
         yuvSession = YuvCaptureSession.create(
             dispatch = { event -> backgroundHandler.post { event.execute() } },
             outputDir = currentBurstDir,
@@ -620,25 +672,23 @@ fun captureYuvBurstColorWithMotion(
             maxRetainedBytes = MAX_YUV_MEMORY_BUFFER_BYTES,
             workProcessor = yuvWorkProcessor,
             postStatus = { msg -> postStatus(msg) },
-            dispatchCallback = CallbackDispatcher { runnable ->
-                if (!mainHandler.post(runnable)) runCatching { runnable.run() }
-                true
-            },
+                        dispatchCallback = callbackDispatcher,
             writeJobJson = { status, savedFrames, manifest ->
                 metadataWriter?.write(status, savedFrames, manifest)
             },
             saveMotionOnce = { dir -> saveMotionOnce(dir) },
             onCaptureComplete = { dir ->
-                finished.set(true)
-                postStatus("CAPTURE_COMPLETE: 캡처가 완료되었습니다.")
-                postMainOrRun { onComplete(dir) }
+                // The owner's dispatchCallback already handles Main-thread dispatch.
+                // We invoke onComplete directly here — do NOT re-post to Main.
+                onComplete(dir)
             },
             onCaptureError = { message, cause ->
-                finished.set(true)
+                // The owner's dispatchCallback already handles Main-thread dispatch.
+                // We invoke onError directly here — do NOT re-post to Main.
                 logYuvCaptureFailure(stage = "terminal", throwable = cause, detail = message)
-                postStatus(message)
-                postMainOrRun { onError(message) }
-            }
+                onError(message)
+            },
+            productionResourceCoordinator = productionResourceCoordinator
         )
 
         postStatus("Color Fusion 초기화 4/7: ImageReader 생성 중...")
@@ -651,6 +701,7 @@ fun captureYuvBurstColorWithMotion(
         )
 
         imageReader = reader
+        productionResourceCoordinator?.attachImageReader(reader)
         if (useMemoryBuffer) {
             postStatus(
                 "YUV memory buffer enabled: frames=$frameCount " +
@@ -692,6 +743,7 @@ fun captureYuvBurstColorWithMotion(
             metadataWriter?.motionInfo = motionInfo
             null
         }
+        productionResourceCoordinator?.attachMotionLogger(motionLogger)
 
         postStatus(
             "Color Fusion 준비 완료\n" +
@@ -707,9 +759,12 @@ fun captureYuvBurstColorWithMotion(
                 "Folder:\n${currentBurstDir.absolutePath}"
         )
 
+        fun isTerminalOrFinished(): Boolean =
+            yuvSession?.let { it.terminalState.status() != CaptureTerminalStatus.ACTIVE } ?: finished.get()
+
         reader.setOnImageAvailableListener(
             { r ->
-                if (finished.get()) {
+                if (isTerminalOrFinished()) {
                     runCatching { r.acquireNextImage()?.close() }
                     return@setOnImageAvailableListener
                 }
@@ -735,13 +790,14 @@ fun captureYuvBurstColorWithMotion(
             cameraId,
             object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
-                    if (finished.get()) {
+                    if (isTerminalOrFinished()) {
                         logLateCameraCallback("CameraDevice.onOpened.beforeAssign")
                         camera.close()
                         return
                     }
                     cameraDevice = camera
-                    if (finished.get()) {
+                    productionResourceCoordinator?.attachCameraDevice(camera)
+                    if (isTerminalOrFinished()) {
                         logLateCameraCallback("CameraDevice.onOpened.afterAssign")
                         camera.close()
                         return
@@ -759,15 +815,16 @@ fun captureYuvBurstColorWithMotion(
                             selectedRoute = zoomRoute,
                             handler = backgroundHandler,
                             pipelineName = "YUV",
-                            isFinished = { finished.get() },
+                            isFinished = { isTerminalOrFinished() },
                             onConfigured = { session, captureRoute ->
-                                    if (finished.get()) {
+                                    if (isTerminalOrFinished()) {
                                         logLateCameraCallback("CameraCaptureSession.onConfigured.beforeAssign")
                                         session.close()
                                         return@createRoutedStillCaptureSession
                                     }
                                     captureSession = session
-                                    if (finished.get()) {
+                                    productionResourceCoordinator?.attachCaptureSession(session)
+                                    if (isTerminalOrFinished()) {
                                         logLateCameraCallback("CameraCaptureSession.onConfigured.afterAssign")
                                         session.close()
                                         return@createRoutedStillCaptureSession
@@ -834,7 +891,7 @@ fun captureYuvBurstColorWithMotion(
                                                     request: CaptureRequest,
                                                     result: TotalCaptureResult
                                                 ) {
-                                                    completedResults++
+                                                    // The owner owns completedResults — no duplicate outer counter.
                                                     metadataWriter?.actualRoute = captureRoute?.name
                                                     metadataWriter?.finalRequestZoomSet = requestZoomRatio
                                                     yuvSession?.owner?.onCaptureCompletedResult()
@@ -892,7 +949,7 @@ fun captureYuvBurstColorWithMotion(
                             },
 
                             onFailed = { reason ->
-                                    if (finished.get()) {
+                                    if (isTerminalOrFinished()) {
                                         logLateCameraCallback("CameraCaptureSession.onConfigureFailed")
                                         return@createRoutedStillCaptureSession
                                     }
@@ -917,7 +974,7 @@ fun captureYuvBurstColorWithMotion(
 
                 override fun onDisconnected(camera: CameraDevice) {
                     camera.close()
-                    if (finished.get()) {
+                    if (isTerminalOrFinished()) {
                         logLateCameraCallback("CameraDevice.onDisconnected")
                         return
                     }
@@ -931,7 +988,7 @@ fun captureYuvBurstColorWithMotion(
 
                 override fun onError(camera: CameraDevice, error: Int) {
                     camera.close()
-                    if (finished.get()) {
+                    if (isTerminalOrFinished()) {
                         logLateCameraCallback("CameraDevice.onError")
                         return
                     }

@@ -198,6 +198,7 @@ internal class YuvCaptureOwner(
     private val onCaptureComplete: (File) -> Unit,
     private val onCaptureError: (message: String, cause: Throwable?) -> Unit,
     private val cleanupCoordinator: YuvCleanupCoordinator,
+    private val productionResourceCoordinator: YuvProductionResourceCoordinator? = null,
     private val candidateFilesystem: YuvCandidateFilesystem = RealYuvCandidateFilesystem,
     private val candidateVerifier: YuvCandidateVerifier = RealYuvCandidateVerifier,
     private val finalFileVerifier: YuvFinalFileVerifier = RealYuvFinalFileVerifier
@@ -422,7 +423,14 @@ internal class YuvCaptureOwner(
 
     fun onCaptureFailed(cause: Throwable, detail: String) {
         captureStateOwner.post(object : CaptureOwnerEvent {
-            override fun execute() { finishError("Color Burst 캡처 실패: $detail", cause = cause) }
+            override fun execute() {
+                // Camera2 capture failure must increment the authoritative failed-capture
+                // accounting exactly once before terminal settlement.
+                if (terminalState.status() == CaptureTerminalStatus.ACTIVE) {
+                    accounting.failedFrame()
+                }
+                finishError("$detail: ${cause.message ?: cause.javaClass.simpleName}", cause = cause)
+            }
             override fun disposeWithoutMutation() {}
         })
     }
@@ -846,7 +854,13 @@ internal class YuvCaptureOwner(
                 cleanupCoordinator.perform()
             } catch (t: Throwable) {
                 recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
-                    "emergency cleanup failed", t)
+                    "emergency internal cleanup failed", t)
+            }
+            try {
+                productionResourceCoordinator?.perform()
+            } catch (t: Throwable) {
+                recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
+                    "emergency production cleanup failed", t)
             }
             terminalSettlementPhaseRef.set(TerminalSettlementPhase.SETTLED)
             publishSnapshot()
@@ -865,7 +879,13 @@ internal class YuvCaptureOwner(
                 cleanupCoordinator.perform()
             } catch (t: Throwable) {
                 recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
-                    "emergency cleanup failed", t)
+                    "emergency internal cleanup failed", t)
+            }
+            try {
+                productionResourceCoordinator?.perform()
+            } catch (t: Throwable) {
+                recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
+                    "emergency production cleanup failed", t)
             }
             terminalSettlementPhaseRef.set(TerminalSettlementPhase.SETTLED)
             publishSnapshot()
@@ -905,15 +925,22 @@ internal class YuvCaptureOwner(
         val statusOutcome = ignoreErrors("terminal status dispatch") { postStatus(statusMessage) }
 
         try {
-            callbackStateRef.set(CallbackState.DISPATCH_PENDING)
-            publishSnapshot()
             dispatchTerminalCallback(request)
         } finally {
+            // Production cleanup: both internal (YuvCleanupCoordinator) AND
+            // production (Camera2/HandlerThread/scheduler) resource settlement
+            // must run exactly once, regardless of callback dispatch outcome.
             try {
                 cleanupCoordinator.perform()
             } catch (t: Throwable) {
                 recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
-                    "terminal cleanup failed", t)
+                    "internal terminal cleanup failed", t)
+            }
+            try {
+                productionResourceCoordinator?.perform()
+            } catch (t: Throwable) {
+                recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
+                    "production terminal cleanup failed", t)
             }
         }
 
@@ -939,10 +966,15 @@ internal class YuvCaptureOwner(
             TerminalCompletionKind.SUCCESS -> { -> onCaptureComplete(outputDir) }
             TerminalCompletionKind.ERROR -> { -> onCaptureError(request.reason ?: "", request.cause) }
         }
+        // The wrapped runnable is the ACTUAL user callback invocation.  CallbackState
+        // tracks this runnable's lifecycle, not an intermediate wrapper.  The dispatch
+        // returns the real Handler.post acceptance result: if Main rejects, the callback
+        // is NOT executed inline — a diagnostic is recorded and cleanup still runs.
         val wrapped = Runnable {
             try {
+                callbackStateRef.compareAndSet(CallbackState.DISPATCH_ACCEPTED, CallbackState.EXECUTING)
                 callback.invoke()
-                callbackStateRef.compareAndSet(CallbackState.DISPATCH_ACCEPTED, CallbackState.EXECUTED)
+                callbackStateRef.set(CallbackState.EXECUTED)
             } catch (t: Throwable) {
                 callbackStateRef.set(CallbackState.EXECUTION_FAILED)
                 recordDiagnostic(DiagnosticStage.TERMINAL_CALLBACK_EXECUTION, DiagnosticSeverity.ERROR, null, null,
@@ -951,6 +983,8 @@ internal class YuvCaptureOwner(
                 publishSnapshot()
             }
         }
+        callbackStateRef.set(CallbackState.DISPATCH_PENDING)
+        publishSnapshot()
         val dispatched = try {
             dispatchCallback.dispatch(wrapped)
         } catch (t: Throwable) {
@@ -960,15 +994,20 @@ internal class YuvCaptureOwner(
             publishSnapshot()
             return
         }
-        if (!dispatched) {
-            callbackStateRef.set(CallbackState.DISPATCH_REJECTED)
-            recordDiagnostic(DiagnosticStage.TERMINAL_CALLBACK_DISPATCH, DiagnosticSeverity.ERROR, null, null,
-                "terminal callback dispatcher returned false")
+        // If synchronous dispatch already executed the callback, the state is now
+        // EXECUTED or EXECUTION_FAILED — do NOT regress to DISPATCH_ACCEPTED.
+        val stateAfterDispatch = callbackStateRef.get()
+        if (stateAfterDispatch == CallbackState.DISPATCH_PENDING) {
+            if (!dispatched) {
+                callbackStateRef.set(CallbackState.DISPATCH_REJECTED)
+                recordDiagnostic(DiagnosticStage.TERMINAL_CALLBACK_DISPATCH, DiagnosticSeverity.ERROR, null, null,
+                    "terminal callback dispatcher returned false")
+                publishSnapshot()
+                return
+            }
+            callbackStateRef.set(CallbackState.DISPATCH_ACCEPTED)
             publishSnapshot()
-            return
         }
-        callbackStateRef.set(CallbackState.DISPATCH_ACCEPTED)
-        publishSnapshot()
     }
 
     private inline fun ignoreErrors(stage: String, block: () -> Unit): Boolean = try {

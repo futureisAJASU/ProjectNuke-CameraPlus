@@ -13,13 +13,25 @@ internal class YuvCaptureSession internal constructor(
     val reservations: YuvBufferReservations,
     val identityOwner: CaptureFrameIdentityOwner,
     val owner: YuvCaptureOwner,
-    val cleanupCoordinator: YuvCleanupCoordinator
+    val cleanupCoordinator: YuvCleanupCoordinator,
+    val productionResourceCoordinator: YuvProductionResourceCoordinator? = null
 ) : AutoCloseable {
     override fun close() {
         cleanupCoordinator.perform()
+        productionResourceCoordinator?.perform()
     }
 
     fun terminalSnapshot(): YuvTerminalSnapshot = owner.terminalSnapshotRef()
+
+    /**
+     * Initiate exactly-once terminal settlement for BOTH internal and production
+     * resource cleanup.  Called by [YuvCaptureOwner.settleTerminal] and the
+     * emergency settlement paths.
+     */
+    fun performTerminalCleanup() {
+        cleanupCoordinator.perform()
+        productionResourceCoordinator?.perform()
+    }
 
     companion object {
         fun create(
@@ -40,7 +52,8 @@ internal class YuvCaptureSession internal constructor(
             candidateFilesystem: YuvCandidateFilesystem = RealYuvCandidateFilesystem,
             candidateVerifier: YuvCandidateVerifier = RealYuvCandidateVerifier,
             finalFileVerifier: YuvFinalFileVerifier = RealYuvFinalFileVerifier,
-            accounting: YuvCaptureAccounting? = null
+            accounting: YuvCaptureAccounting? = null,
+            productionResourceCoordinator: YuvProductionResourceCoordinator? = null
         ): YuvCaptureSession {
             val captureStateOwner = CaptureStateOwner(dispatch)
             val boundedWorker = BoundedCaptureWorker(workerName, workerCapacity)
@@ -73,6 +86,7 @@ internal class YuvCaptureSession internal constructor(
                 onCaptureComplete = onCaptureComplete,
                 onCaptureError = onCaptureError,
                 cleanupCoordinator = cleanupCoordinator,
+                productionResourceCoordinator = productionResourceCoordinator,
                 candidateFilesystem = candidateFilesystem,
                 candidateVerifier = candidateVerifier,
                 finalFileVerifier = finalFileVerifier
@@ -87,7 +101,8 @@ internal class YuvCaptureSession internal constructor(
                 reservations,
                 identityOwner,
                 owner,
-                cleanupCoordinator
+                cleanupCoordinator,
+                productionResourceCoordinator
             )
         }
     }

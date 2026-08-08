@@ -1685,7 +1685,7 @@ internal class YuvCleanupCoordinator(
 internal enum class TerminalCompletionKind { SUCCESS, ERROR }
 
 internal enum class CallbackState {
-    NOT_REQUESTED, DISPATCH_PENDING, DISPATCH_ACCEPTED, DISPATCH_REJECTED, EXECUTED, EXECUTION_FAILED
+    NOT_REQUESTED, DISPATCH_PENDING, DISPATCH_ACCEPTED, DISPATCH_REJECTED, EXECUTING, EXECUTED, EXECUTION_FAILED
 }
 
 internal enum class TerminalSettlementPhase { ACTIVE, CLAIMED, SETTLING, SETTLED }
