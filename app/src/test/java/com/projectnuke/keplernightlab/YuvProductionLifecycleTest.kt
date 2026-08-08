@@ -256,6 +256,43 @@ class YuvProductionLifecycleTest {
     }
 
     @Test
+    fun terminalSuccessPopulatesAllOperationOutcomes() {
+        val harness = Harness(frameCount = 3)
+        try {
+            harness.feedAll()
+            assertEquals(CaptureTerminalStatus.SUCCESS, harness.awaitTerminal())
+            val snap = harness.session.owner.terminalSnapshotRef()
+            assertTrue(snap.metadataWriteOutcome is TerminalOperationOutcome.Succeeded)
+            assertTrue(snap.motionSaveOutcome is TerminalOperationOutcome.Succeeded)
+            assertTrue(snap.statusDispatchOutcome is TerminalOperationOutcome.Succeeded)
+            assertTrue(snap.callbackDispatchOutcome is TerminalOperationOutcome.Succeeded)
+            assertTrue(snap.callbackExecutionOutcome is TerminalOperationOutcome.Succeeded)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun terminalFailurePopulatesExactOperationOutcomes() {
+        val harness = Harness(frameCount = 3)
+        try {
+            harness.session.owner.onCaptureFailed(RuntimeException("terminal failure"), "failure")
+            assertEquals(CaptureTerminalStatus.FAILED, harness.awaitTerminal())
+            val snap = harness.session.owner.terminalSnapshotRef()
+            assertTrue(snap.metadataWriteOutcome is TerminalOperationOutcome.NotRequested,
+                "metadata write not requested on terminal failure")
+            assertTrue(snap.motionSaveOutcome is TerminalOperationOutcome.NotRequested,
+                "motion save not requested on terminal failure")
+            assertTrue(snap.statusDispatchOutcome is TerminalOperationOutcome.Succeeded,
+                "status dispatch must succeed even on failure")
+            assertTrue(snap.callbackDispatchOutcome is TerminalOperationOutcome.Succeeded)
+            assertTrue(snap.callbackExecutionOutcome is TerminalOperationOutcome.Succeeded)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
     fun terminalFailurePerformsExternalCleanupExactlyOnce() {
         val harness = Harness(frameCount = 3)
         try {

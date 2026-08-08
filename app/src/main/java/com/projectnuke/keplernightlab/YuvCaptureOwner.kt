@@ -212,6 +212,13 @@ internal class YuvCaptureOwner(
     private val terminalReasonRef = AtomicReference<String?>(null)
     private val diagnostics = java.util.concurrent.CopyOnWriteArrayList<YuvCaptureDiagnostic>()
 
+    // Terminal operation outcomes — never hardcoded null after the operation has run.
+    private val metadataWriteOutcomeRef = AtomicReference(TerminalOperationOutcome.NotRequested)
+    private val motionSaveOutcomeRef = AtomicReference(TerminalOperationOutcome.NotRequested)
+    private val statusDispatchOutcomeRef = AtomicReference(TerminalOperationOutcome.NotRequested)
+    private val callbackDispatchOutcomeRef = AtomicReference(TerminalOperationOutcome.NotRequested)
+    private val callbackExecutionOutcomeRef = AtomicReference(TerminalOperationOutcome.NotRequested)
+
     private val terminalSnapshotRef = AtomicReference(buildSnapshot())
 
     internal fun candidateCleanupDebt(): List<String> =
@@ -818,10 +825,9 @@ internal class YuvCaptureOwner(
 
     private fun finishError(
         message: String,
-        cause: Throwable? = null,
-        terminalAlreadyClaimed: Boolean = false
+        cause: Throwable? = null
     ) {
-        if (!terminalAlreadyClaimed && !terminalState.claim(CaptureTerminalStatus.FAILED)) return
+        if (!terminalState.claim(CaptureTerminalStatus.FAILED)) return
         settleTerminal(YuvTerminalRequest(
             status = CaptureTerminalStatus.FAILED,
             jobStatus = "CAPTURE_FAILED",
@@ -849,6 +855,11 @@ internal class YuvCaptureOwner(
             terminalSettlementPhaseRef.set(TerminalSettlementPhase.CLAIMED)
             recordDiagnostic(DiagnosticStage.OWNER_EVENT_REJECTION, DiagnosticSeverity.WARN, null, null,
                 "deadline event dispatch rejected; emergency settlement path taken")
+            metadataWriteOutcomeRef.set(TerminalOperationOutcome.NotRequested)
+            motionSaveOutcomeRef.set(TerminalOperationOutcome.NotRequested)
+            statusDispatchOutcomeRef.set(TerminalOperationOutcome.NotRequested)
+            callbackDispatchOutcomeRef.set(TerminalOperationOutcome.NotRequested)
+            callbackExecutionOutcomeRef.set(TerminalOperationOutcome.NotRequested)
             publishSnapshot()
             try {
                 cleanupCoordinator.perform()
@@ -874,6 +885,11 @@ internal class YuvCaptureOwner(
             terminalSettlementPhaseRef.set(TerminalSettlementPhase.CLAIMED)
             recordDiagnostic(DiagnosticStage.OWNER_EVENT_REJECTION, DiagnosticSeverity.WARN, null, null,
                 "cancellation event dispatch rejected; emergency settlement path taken")
+            metadataWriteOutcomeRef.set(TerminalOperationOutcome.NotRequested)
+            motionSaveOutcomeRef.set(TerminalOperationOutcome.NotRequested)
+            statusDispatchOutcomeRef.set(TerminalOperationOutcome.NotRequested)
+            callbackDispatchOutcomeRef.set(TerminalOperationOutcome.NotRequested)
+            callbackExecutionOutcomeRef.set(TerminalOperationOutcome.NotRequested)
             publishSnapshot()
             try {
                 cleanupCoordinator.perform()
@@ -905,24 +921,48 @@ internal class YuvCaptureOwner(
 
         terminalSettlementPhaseRef.set(TerminalSettlementPhase.SETTLING)
 
-        val motionOutcome: Boolean?
-        if (request.saveMotion) {
-            motionOutcome = ignoreErrors("terminal motion save") { saveMotionOnce(outputDir) }
+        val motionOutcome: TerminalOperationOutcome = if (request.saveMotion) {
+            runCatching { saveMotionOnce(outputDir) }
+                .fold(
+                    onSuccess = { TerminalOperationOutcome.Succeeded },
+                    onFailure = { t ->
+                        recordDiagnostic(DiagnosticStage.TERMINAL_MOTION, DiagnosticSeverity.ERROR, null, outputDir.path,
+                            "terminal motion save failed", t)
+                        TerminalOperationOutcome.Failed(t)
+                    }
+                )
         } else {
-            motionOutcome = null
+            TerminalOperationOutcome.NotRequested
         }
+        motionSaveOutcomeRef.set(motionOutcome)
 
         val snap = accounting.snapshot()
-        val metadataOutcome = ignoreErrors("terminal metadata write") {
-            writeJobJson(request.jobStatus, snap.persistedFrames, snap.manifest)
-        }
+        val metadataOutcome = runCatching { writeJobJson(request.jobStatus, snap.persistedFrames, snap.manifest) }
+            .fold(
+                onSuccess = { TerminalOperationOutcome.Succeeded },
+                onFailure = { t ->
+                    recordDiagnostic(DiagnosticStage.TERMINAL_METADATA, DiagnosticSeverity.ERROR, null, null,
+                        "terminal metadata write failed", t)
+                    TerminalOperationOutcome.Failed(t)
+                }
+            )
+        metadataWriteOutcomeRef.set(metadataOutcome)
 
         val statusMessage = when (request.status) {
             CaptureTerminalStatus.SUCCESS -> "CAPTURE_COMPLETE: 캡처가 완료되었습니다."
-            CaptureTerminalStatus.PARTIAL_SUCCESS -> "Captured partial success"
+            CaptureTerminalStatus.PARTIAL_SUCCESS -> "일부 프레임만 캡처되었습니다."
             else -> request.reason ?: request.jobStatus
         }
-        val statusOutcome = ignoreErrors("terminal status dispatch") { postStatus(statusMessage) }
+        val statusOutcome = runCatching { postStatus(statusMessage) }
+            .fold(
+                onSuccess = { TerminalOperationOutcome.Succeeded },
+                onFailure = { t ->
+                    recordDiagnostic(DiagnosticStage.TERMINAL_STATUS_DISPATCH, DiagnosticSeverity.ERROR, null, null,
+                        "terminal status dispatch failed", t)
+                    TerminalOperationOutcome.Failed(t)
+                }
+            )
+        statusDispatchOutcomeRef.set(statusOutcome)
 
         try {
             dispatchTerminalCallback(request)
@@ -944,19 +984,6 @@ internal class YuvCaptureOwner(
             }
         }
 
-        if (motionOutcome == false) {
-            recordDiagnostic(DiagnosticStage.TERMINAL_MOTION, DiagnosticSeverity.ERROR, null, outputDir.path,
-                "terminal motion save failed")
-        }
-        if (metadataOutcome == false) {
-            recordDiagnostic(DiagnosticStage.TERMINAL_METADATA, DiagnosticSeverity.ERROR, null, null,
-                "terminal metadata write failed")
-        }
-        if (statusOutcome == false) {
-            recordDiagnostic(DiagnosticStage.TERMINAL_STATUS_DISPATCH, DiagnosticSeverity.ERROR, null, null,
-                "terminal status dispatch failed")
-        }
-
         terminalSettlementPhaseRef.set(TerminalSettlementPhase.SETTLED)
         publishSnapshot()
     }
@@ -975,8 +1002,10 @@ internal class YuvCaptureOwner(
                 callbackStateRef.compareAndSet(CallbackState.DISPATCH_ACCEPTED, CallbackState.EXECUTING)
                 callback.invoke()
                 callbackStateRef.set(CallbackState.EXECUTED)
+                callbackExecutionOutcomeRef.set(TerminalOperationOutcome.Succeeded)
             } catch (t: Throwable) {
                 callbackStateRef.set(CallbackState.EXECUTION_FAILED)
+                callbackExecutionOutcomeRef.set(TerminalOperationOutcome.Failed(t))
                 recordDiagnostic(DiagnosticStage.TERMINAL_CALLBACK_EXECUTION, DiagnosticSeverity.ERROR, null, null,
                     "terminal callback execution failed", t)
             } finally {
@@ -984,11 +1013,13 @@ internal class YuvCaptureOwner(
             }
         }
         callbackStateRef.set(CallbackState.DISPATCH_PENDING)
+        callbackDispatchOutcomeRef.set(TerminalOperationOutcome.Pending)
         publishSnapshot()
         val dispatched = try {
             dispatchCallback.dispatch(wrapped)
         } catch (t: Throwable) {
             callbackStateRef.set(CallbackState.DISPATCH_REJECTED)
+            callbackDispatchOutcomeRef.set(TerminalOperationOutcome.Failed(t))
             recordDiagnostic(DiagnosticStage.TERMINAL_CALLBACK_DISPATCH, DiagnosticSeverity.ERROR, null, null,
                 "terminal callback dispatch threw", t)
             publishSnapshot()
@@ -1000,22 +1031,16 @@ internal class YuvCaptureOwner(
         if (stateAfterDispatch == CallbackState.DISPATCH_PENDING) {
             if (!dispatched) {
                 callbackStateRef.set(CallbackState.DISPATCH_REJECTED)
+                callbackDispatchOutcomeRef.set(TerminalOperationOutcome.Failed(IllegalStateException("dispatch returned false")))
                 recordDiagnostic(DiagnosticStage.TERMINAL_CALLBACK_DISPATCH, DiagnosticSeverity.ERROR, null, null,
                     "terminal callback dispatcher returned false")
                 publishSnapshot()
                 return
             }
             callbackStateRef.set(CallbackState.DISPATCH_ACCEPTED)
+            callbackDispatchOutcomeRef.set(TerminalOperationOutcome.Succeeded)
             publishSnapshot()
         }
-    }
-
-    private inline fun ignoreErrors(stage: String, block: () -> Unit): Boolean = try {
-        block()
-        true
-    } catch (t: Throwable) {
-        Log.e("KeplerYuvOwner", "$stage failed", t)
-        false
     }
 
     // ------------------------------------------------------------------
@@ -1054,9 +1079,11 @@ internal class YuvCaptureOwner(
             discardedLateCompletions = discardedLateCompletions.toList(),
             cleanupPhase = cleanupCoordinator.snapshot().phase,
             diagnostics = diagnostics.toList(),
-            metadataWriteOutcome = null,
-            motionSaveOutcome = null,
-            statusDispatchOutcome = null,
+            metadataWriteOutcome = metadataWriteOutcomeRef.get(),
+            motionSaveOutcome = motionSaveOutcomeRef.get(),
+            statusDispatchOutcome = statusDispatchOutcomeRef.get(),
+            callbackDispatchOutcome = callbackDispatchOutcomeRef.get(),
+            callbackExecutionOutcome = callbackExecutionOutcomeRef.get(),
             callbackState = callbackStateRef.get()
         )
     }

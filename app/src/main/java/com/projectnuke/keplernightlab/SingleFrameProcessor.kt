@@ -7,7 +7,6 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.Files
 import java.nio.file.LinkOption
-import java.security.MessageDigest
 import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.CancellationException
 
@@ -464,15 +463,5 @@ private fun writeBitmapPngCandidate(bitmap: Bitmap, outputFile: File): File {
     }
 }
 
-private fun sha256NoFollow(path: java.nio.file.Path): String {
-    val digest = MessageDigest.getInstance("SHA-256")
-    Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS).use { input ->
-        val buffer = ByteArray(16 * 1024)
-        while (true) {
-            val read = input.read(buffer)
-            if (read < 0) break
-            digest.update(buffer, 0, read)
-        }
-    }
-    return digest.digest().joinToString("") { "%02x".format(it) }
-}
+private fun sha256NoFollow(path: java.nio.file.Path): String = NoFollowFileSystem.digestVerified(path.toFile()).sha256
+

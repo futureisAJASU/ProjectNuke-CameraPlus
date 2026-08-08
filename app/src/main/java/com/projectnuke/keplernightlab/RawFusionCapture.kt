@@ -566,103 +566,103 @@ fun captureRawBurstForFusion(
         motionLogger = runCatching { MotionLogger(context).also { it.start() } }.getOrNull()
         postCaptureProgress()
 
-        fun finishError(status: String, message: String, terminalAlreadyClaimed: Boolean = false) {
-            if (!terminalAlreadyClaimed && !terminalState.claim(CaptureTerminalStatus.FAILED)) return
-            finished.set(true)
-            if (rawSelection.requiresMaximumResolutionPixelMode && maxResolutionPixelModeFailure == null) {
-                maxResolutionPixelModeFailure = "Maximum-resolution RAW capture failed: $message"
+        fun finishError(status: String, message: String) {
+            val settleEvent = object : CaptureOwnerEvent {
+                override fun execute() {
+                    if (!terminalState.claim(CaptureTerminalStatus.FAILED)) return
+                    if (rawSelection.requiresMaximumResolutionPixelMode && maxResolutionPixelModeFailure == null) {
+                        maxResolutionPixelModeFailure = "Maximum-resolution RAW capture failed: $message"
+                    }
+                    writeJobStatus(jobFile, baseJob, status, message)
+                    post(message)
+                    postMainOrRun { onError(message) }
+                    cleanup()
+                }
+                override fun disposeWithoutMutation() {
+                    finished.set(true)
+                    runCatching { cleanup() }
+                }
             }
-            writeJobStatus(jobFile, baseJob, status, message)
-            post(message)
-            postMainOrRun { onError(message) }
-            cleanup()
+            if (!captureStateOwner.post(settleEvent)) {
+                finished.set(true)
+                runCatching { cleanup() }
+            }
         }
+
 
         fun finishSuccess(
             partial: Boolean = false,
-            reason: String? = null,
-            terminalAlreadyClaimed: Boolean = false
+            reason: String? = null
         ) {
-            if (!terminalAlreadyClaimed && !terminalState.claim(
-                    if (partial) CaptureTerminalStatus.PARTIAL_SUCCESS else CaptureTerminalStatus.SUCCESS
-                )) return
-            finished.set(true)
-            val motionFiles = runCatching { motionLogger?.saveToDirectory(jobDir) }.getOrNull()
-            val status = if (partial) "CAPTURE_COMPLETE_PARTIAL" else "CAPTURE_COMPLETE"
-            val completeness = if (partial) "PARTIAL" else "FULL"
-            val partialReason = reason ?: "saved $savedFrames/$requestedFrames frames; failedCaptures=$failedCaptures; droppedUnmatchedImages=$droppedUnmatchedImages"
-            val completeJob = JSONObject(baseJob.toString())
-                .put("status", status)
-                .put("savedFrames", savedFrames)
-                .put("requestedFrames", requestedFrames)
-                .put("attemptedFrames", attemptedFrames)
-                .put("receivedImages", receivedImages)
-                .put("completedResults", completedResults)
-                .put("failedCaptures", failedCaptures)
-                .put("droppedUnmatchedImages", droppedUnmatchedImages)
-                .put("rawSpeedMode", rawSpeedMode.name)
-                .put("rawCaptureStartedAt", rawCaptureStartedAt)
-                .put("rawCaptureMs", System.currentTimeMillis() - rawCaptureStartedAt)
-                .put("rawSaveTotalMs", rawFrameSaveTimesMs.sum())
-                .put("captureStageCompleteAt", System.currentTimeMillis())
-                .put("processingStartedAt", JSONObject.NULL)
-                .put("userCanMoveDevice", true)
-                .put("currentPipelineStage", "PROCESSING")
-                .put("jobDirAbsolutePath", jobDir.absolutePath)
-                .put("adbDebugHint", adbDebugHint)
-                .put("rawFirstImageDelayMs", rawFirstImageDelayMs ?: JSONObject.NULL)
-                .put(
-                    "rawAverageFrameSaveMs",
-                    rawFrameSaveTimesMs.takeIf { it.isNotEmpty() }?.average() ?: JSONObject.NULL
-                )
-                .put("rawTotalCaptureMs", System.currentTimeMillis() - rawCaptureStartedAt)
-                .put("rawDebugPreviewSkipped", rawSpeedMode == RawSpeedMode.BALANCED)
-                .put(
-                    "rawDebugPreviewSkipReason",
-                    if (rawSpeedMode == RawSpeedMode.BALANCED) {
-                        "RAW speed mode Balanced skips optional debug preview PNGs during processing."
+            val settleEvent = object : CaptureOwnerEvent {
+                override fun execute() {
+                    if (!terminalState.claim(
+                            if (partial) CaptureTerminalStatus.PARTIAL_SUCCESS else CaptureTerminalStatus.SUCCESS
+                        )) return
+                    finished.set(true)
+                    val motionFiles = runCatching { motionLogger?.saveToDirectory(jobDir) }.getOrNull()
+                    val status = if (partial) "CAPTURE_COMPLETE_PARTIAL" else "CAPTURE_COMPLETE"
+                    val completeness = if (partial) "PARTIAL" else "FULL"
+                    val partialReason = reason ?: "saved $savedFrames/$requestedFrames frames; failedCaptures=$failedCaptures; droppedUnmatchedImages=$droppedUnmatchedImages"
+                    val completeJob = JSONObject(baseJob.toString())
+                        .put("status", status)
+                        .put("savedFrames", savedFrames)
+                        .put("requestedFrames", requestedFrames)
+                        .put("attemptedFrames", attemptedFrames)
+                        .put("receivedImages", receivedImages)
+                        .put("completedResults", completedResults)
+                        .put("failedCaptures", failedCaptures)
+                        .put("droppedUnmatchedImages", droppedUnmatchedImages)
+                        .put("rawSpeedMode", rawSpeedMode.name)
+                        .put("rawCaptureStartedAt", rawCaptureStartedAt)
+                        .put("rawCaptureMs", System.currentTimeMillis() - rawCaptureStartedAt)
+                        .put("rawSaveTotalMs", rawFrameSaveTimesMs.sum())
+                        .put("captureStageCompleteAt", System.currentTimeMillis())
+                        .put("processingStartedAt", JSONObject.NULL)
+                        .put("userCanMoveDevice", true)
+                        .put("currentPipelineStage", "PROCESSING")
+                        .put("jobDirAbsolutePath", jobDir.absolutePath)
+                        .put("adbDebugHint", adbDebugHint)
+                        .put("rawFirstImageDelayMs", rawFirstImageDelayMs ?: JSONObject.NULL)
+                        .put(
+                            "rawAverageFrameSaveMs",
+                            rawFrameSaveTimesMs.takeIf { it.isNotEmpty() }?.average() ?: JSONObject.NULL
+                        )
+                        .put("rawTotalCaptureMs", System.currentTimeMillis() - rawCaptureStartedAt)
+                        .put("rawDebugPreviewSkipped", rawSpeedMode == RawSpeedMode.BALANCED)
+                        .put(
+                            "rawDebugPreviewSkipReason",
+                            if (rawSpeedMode == RawSpeedMode.BALANCED) {
+                                "RAW speed mode Balanced skips optional debug preview PNGs during processing."
+                            } else {
+                                JSONObject.NULL
+                            }
+                        )
+                        .put("captureCompleteness", completeness)
+                        .put("partialCapture", partial)
+                        .put("frames", frameObjectsSnapshot())
+                        .put("gyroFile", motionFiles?.first ?: JSONObject.NULL)
+                        .put("rotationVectorFile", motionFiles?.second ?: JSONObject.NULL)
+                        .put("capturedAt", System.currentTimeMillis())
+                    if (partial) completeJob.put("partialReason", partialReason)
+                    KeplerJobMetadata.write(jobDir, completeJob)
+                    Log.i(RAW_PIPELINE_LOG_TAG, "CAPTURE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} savedFrames=$savedFrames/$requestedFrames partial=$partial droppedUnmatchedImages=$droppedUnmatchedImages")
+                    if (partial) {
+                        post("CAPTURE_COMPLETE_PARTIAL: 캡처가 완료되었습니다. saved $savedFrames/$requestedFrames frames")
                     } else {
-                        JSONObject.NULL
+                        post("CAPTURE_COMPLETE: 캡처가 완료되었습니다. saved $savedFrames/$requestedFrames frames")
                     }
-                )
-                .put("captureCompleteness", completeness)
-                .put("partialCapture", partial)
-                .put("frames", frameObjectsSnapshot())
-                .put("gyroFile", motionFiles?.first ?: JSONObject.NULL)
-                .put("rotationVectorFile", motionFiles?.second ?: JSONObject.NULL)
-                .put("capturedAt", System.currentTimeMillis())
-            if (partial) completeJob.put("partialReason", partialReason)
-            KeplerJobMetadata.write(jobDir, completeJob)
-            Log.i(RAW_PIPELINE_LOG_TAG, "CAPTURE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} savedFrames=$savedFrames/$requestedFrames partial=$partial droppedUnmatchedImages=$droppedUnmatchedImages")
-            if (partial) {
-                post("CAPTURE_COMPLETE_PARTIAL: 캡처가 완료되었습니다. saved $savedFrames/$requestedFrames frames")
-            } else {
-                post("CAPTURE_COMPLETE: 캡처가 완료되었습니다. saved $savedFrames/$requestedFrames frames")
-            }
-            cleanup()
-            postMainOrRun { onComplete(jobDir) }
-        }
-
-        fun closeUnmatchedImages(force: Boolean = false) {
-            synchronized(stateLock) {
-            val pendingLimit = if (highResolutionRaw) 3 else min(7, requestedFrames + 1)
-            val now = System.currentTimeMillis()
-            val stale = imagesByTimestamp.keys
-                .filter { timestamp ->
-                    force || (
-                        imagesByTimestamp.size > pendingLimit &&
-                            !resultsByTimestamp.containsKey(timestamp) &&
-                            now - (imageArrivalMillis[timestamp] ?: now) >= 2_000L
-                    )
+                    cleanup()
+                    postMainOrRun { onComplete(jobDir) }
                 }
-                .sorted()
-            stale.forEach { timestamp ->
-                imagesByTimestamp.remove(timestamp)?.let {
-                    droppedUnmatchedImages++
-                    runCatching { it.close() }
+                override fun disposeWithoutMutation() {
+                    finished.set(true)
+                    runCatching { cleanup() }
                 }
-                imageArrivalMillis.remove(timestamp)
             }
+            if (!captureStateOwner.post(settleEvent)) {
+                finished.set(true)
+                runCatching { cleanup() }
             }
         }
 
@@ -867,21 +867,15 @@ fun captureRawBurstForFusion(
                 override fun execute() {
                     if (savedFrames >= requestedFrames) {
                         finishSuccess(
-                            partial = false,
-                            reason = "all RAW frames persisted before timeout settlement",
-                            terminalAlreadyClaimed = true
+                            partial = false
                         )
                     } else if (savedFrames >= MIN_RAW_FUSION_FRAMES) {
                         finishSuccess(
-                            partial = true,
-                            reason = "saved $savedFrames/$requestedFrames frames; timeout; failedCaptures=$failedCaptures; droppedUnmatchedImages=$droppedUnmatchedImages",
-                            terminalAlreadyClaimed = true
+                            partial = true
                         )
                     } else {
                         finishError(
                             "CAPTURE_TIMEOUT",
-                            "CAPTURE_TIMEOUT: RAW capture saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames, failed $failedCaptures, droppedUnmatchedImages=$droppedUnmatchedImages",
-                            terminalAlreadyClaimed = true
                         )
                     }
                 }

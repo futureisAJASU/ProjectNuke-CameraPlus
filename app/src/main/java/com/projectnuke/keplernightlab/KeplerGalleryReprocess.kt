@@ -16,12 +16,11 @@ import kotlinx.coroutines.isActive
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.io.FileInputStream
+import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.LinkOption
-import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -3179,18 +3178,8 @@ private fun isImmutableSourceFrame(file: File, jobKind: ReprocessJobKind): Boole
 internal fun isReprocessWorkerWritable(file: File, kind: ReprocessJobKind): Boolean = !isImmutableSourceFrame(file, kind)
 
 /** Compute SHA-256 digest of a file by streaming — never loads whole large files into memory. */
-private fun computeSha256(file: File): String {
-    val digest = MessageDigest.getInstance("SHA-256")
-    FileInputStream(file).use { input ->
-        val buffer = ByteArray(64 * 1024)
-        while (true) {
-            val read = input.read(buffer)
-            if (read <= 0) break
-            digest.update(buffer, 0, read)
-        }
-    }
-    return digest.digest().joinToString("") { "%02x".format(it) }
-}
+private fun computeSha256(file: File): String =
+    NoFollowFileSystem.digestVerified(file).sha256
 
 internal fun backupReprocessTransaction(
     jobDir: File,

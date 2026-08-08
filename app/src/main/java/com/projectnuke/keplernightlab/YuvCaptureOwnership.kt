@@ -1703,6 +1703,17 @@ internal data class YuvTerminalRequest(
     val saveMotion: Boolean
 )
 
+/** Structured outcome of a terminal operation. Never hardcode null after the operation has run. */
+internal sealed interface TerminalOperationOutcome {
+    data object NotRequested : TerminalOperationOutcome
+    data object Pending : TerminalOperationOutcome
+    data object Succeeded : TerminalOperationOutcome
+    data class Failed(val cause: Throwable) : TerminalOperationOutcome
+
+    val isTerminal: Boolean
+        get() = this is Succeeded || this is Failed
+}
+
 internal enum class DiagnosticSeverity { INFO, WARN, ERROR }
 
 internal enum class DiagnosticStage {
@@ -1741,9 +1752,11 @@ internal data class YuvTerminalSnapshot(
     val discardedLateCompletions: List<Int>,
     val cleanupPhase: CleanupPhase,
     val diagnostics: List<YuvCaptureDiagnostic>,
-    val metadataWriteOutcome: Boolean?,
-    val motionSaveOutcome: Boolean?,
-    val statusDispatchOutcome: Boolean?,
+    val metadataWriteOutcome: TerminalOperationOutcome,
+    val motionSaveOutcome: TerminalOperationOutcome,
+    val statusDispatchOutcome: TerminalOperationOutcome,
+    val callbackDispatchOutcome: TerminalOperationOutcome,
+    val callbackExecutionOutcome: TerminalOperationOutcome,
     val callbackState: CallbackState
 ) {
     val isTerminal: Boolean get() = terminalStatus != CaptureTerminalStatus.ACTIVE

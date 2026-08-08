@@ -53,11 +53,12 @@ internal class YuvCaptureSession internal constructor(
             candidateVerifier: YuvCandidateVerifier = RealYuvCandidateVerifier,
             finalFileVerifier: YuvFinalFileVerifier = RealYuvFinalFileVerifier,
             accounting: YuvCaptureAccounting? = null,
-            productionResourceCoordinator: YuvProductionResourceCoordinator? = null
+            productionResourceCoordinator: YuvProductionResourceCoordinator? = null,
+            finished: AtomicBoolean? = null
         ): YuvCaptureSession {
             val captureStateOwner = CaptureStateOwner(dispatch)
             val boundedWorker = BoundedCaptureWorker(workerName, workerCapacity)
-            val finished = AtomicBoolean(false)
+            val finishedState = finished ?: AtomicBoolean(false)
             val reservations = YuvBufferReservations(maxRetainedBytes)
             val accounting = accounting ?: YuvCaptureAccounting()
             val lifecycle = YuvBufferedLifecycle()
@@ -78,7 +79,7 @@ internal class YuvCaptureSession internal constructor(
                 identityOwner = identityOwner,
                 terminalState = terminalState,
                 boundedWorker = boundedWorker,
-                finished = finished,
+                finished = finishedState,
                 postStatus = postStatus,
                 dispatchCallback = dispatchCallback,
                 writeJobJson = writeJobJson,
@@ -94,7 +95,7 @@ internal class YuvCaptureSession internal constructor(
             return YuvCaptureSession(
                 captureStateOwner,
                 boundedWorker,
-                finished,
+                finishedState,
                 terminalState,
                 accounting,
                 lifecycle,

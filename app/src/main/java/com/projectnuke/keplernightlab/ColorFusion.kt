@@ -681,14 +681,20 @@ fun captureYuvBurstColorWithMotion(
                 // The owner's dispatchCallback already handles Main-thread dispatch.
                 // We invoke onComplete directly here — do NOT re-post to Main.
                 onComplete(dir)
+                // productionCleanup() is idempotent; the owner already called both
+                // coordinators, but this ensures cleanupStarted is recorded and
+                // yuvSession is formally closed.
+                productionCleanup()
             },
             onCaptureError = { message, cause ->
                 // The owner's dispatchCallback already handles Main-thread dispatch.
                 // We invoke onError directly here — do NOT re-post to Main.
                 logYuvCaptureFailure(stage = "terminal", throwable = cause, detail = message)
                 onError(message)
+                productionCleanup()
             },
-            productionResourceCoordinator = productionResourceCoordinator
+            productionResourceCoordinator = productionResourceCoordinator,
+            finished = finished
         )
 
         postStatus("Color Fusion 초기화 4/7: ImageReader 생성 중...")
