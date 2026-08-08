@@ -198,7 +198,7 @@ internal class YuvCaptureOwner(
     private val onCaptureComplete: (File) -> Unit,
     private val onCaptureError: (message: String, cause: Throwable?) -> Unit,
     private val cleanupCoordinator: YuvCleanupCoordinator,
-    private val productionResourceCoordinator: YuvProductionResourceCoordinator? = null,
+    private val productionResourceCoordinator: YuvProductionResourceCoordinator,
     private val candidateFilesystem: YuvCandidateFilesystem = RealYuvCandidateFilesystem,
     private val candidateVerifier: YuvCandidateVerifier = RealYuvCandidateVerifier,
     private val finalFileVerifier: YuvFinalFileVerifier = RealYuvFinalFileVerifier
@@ -868,7 +868,7 @@ internal class YuvCaptureOwner(
                     "emergency internal cleanup failed", t)
             }
             try {
-                productionResourceCoordinator?.perform()
+                productionResourceCoordinator.perform()
             } catch (t: Throwable) {
                 recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
                     "emergency production cleanup failed", t)
@@ -898,7 +898,7 @@ internal class YuvCaptureOwner(
                     "emergency internal cleanup failed", t)
             }
             try {
-                productionResourceCoordinator?.perform()
+                productionResourceCoordinator.perform()
             } catch (t: Throwable) {
                 recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
                     "emergency production cleanup failed", t)
@@ -977,7 +977,7 @@ internal class YuvCaptureOwner(
                     "internal terminal cleanup failed", t)
             }
             try {
-                productionResourceCoordinator?.perform()
+                productionResourceCoordinator.perform()
             } catch (t: Throwable) {
                 recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
                     "production terminal cleanup failed", t)

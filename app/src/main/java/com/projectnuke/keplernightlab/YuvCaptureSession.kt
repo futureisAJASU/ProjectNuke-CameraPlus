@@ -14,11 +14,11 @@ internal class YuvCaptureSession internal constructor(
     val identityOwner: CaptureFrameIdentityOwner,
     val owner: YuvCaptureOwner,
     val cleanupCoordinator: YuvCleanupCoordinator,
-    val productionResourceCoordinator: YuvProductionResourceCoordinator? = null
+    val productionResourceCoordinator: YuvProductionResourceCoordinator
 ) : AutoCloseable {
     override fun close() {
         cleanupCoordinator.perform()
-        productionResourceCoordinator?.perform()
+        productionResourceCoordinator.perform()
     }
 
     fun terminalSnapshot(): YuvTerminalSnapshot = owner.terminalSnapshotRef()
@@ -30,7 +30,7 @@ internal class YuvCaptureSession internal constructor(
      */
     fun performTerminalCleanup() {
         cleanupCoordinator.perform()
-        productionResourceCoordinator?.perform()
+        productionResourceCoordinator.perform()
     }
 
     companion object {
@@ -53,7 +53,7 @@ internal class YuvCaptureSession internal constructor(
             candidateVerifier: YuvCandidateVerifier = RealYuvCandidateVerifier,
             finalFileVerifier: YuvFinalFileVerifier = RealYuvFinalFileVerifier,
             accounting: YuvCaptureAccounting? = null,
-            productionResourceCoordinator: YuvProductionResourceCoordinator? = null,
+            productionResourceCoordinator: YuvProductionResourceCoordinator,
             finished: AtomicBoolean? = null
         ): YuvCaptureSession {
             val captureStateOwner = CaptureStateOwner(dispatch)

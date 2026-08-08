@@ -9,6 +9,7 @@ import android.util.Log
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Exactly-once idempotent owner of production Camera2/infrastructure resources.
@@ -31,6 +32,19 @@ import java.util.concurrent.atomic.AtomicInteger
  * Internal YUV cleanup ([YuvCleanupCoordinator]) and production cleanup
  * ([perform]) must BOTH be initiated at terminal settlement.
  */
+/** Coordinator lifecycle state machine: OPEN -> CLEANING -> CLOSED. */
+internal enum class CoordinatorLifecyclePhase { OPEN, CLEANING, CLOSED }
+
+/** Immutable cleanup result published by a single [perform]. */
+internal data class ProductionCleanupResult(
+    val phase: String,
+    val performCount: Int,
+    val resourceReleaseAttempts: Int,
+    val resourceReleaseSuccesses: Int,
+    val resourceReleaseFailures: Int,
+    val lateAttachmentsImmediatelySettled: Int
+)
+
 internal class YuvProductionResourceCoordinator(
     private val timeoutScheduler: ScheduledExecutorService?,
     private val backgroundHandler: Handler?,
@@ -45,71 +59,132 @@ internal class YuvProductionResourceCoordinator(
     @Volatile private var captureSession: CameraCaptureSession? = null
     @Volatile private var motionLogger: MotionLogger? = null
 
+    private val lifecycle = AtomicReference(CoordinatorLifecyclePhase.OPEN)
     private val started = AtomicBoolean(false)
     private val performRuns = AtomicInteger(0)
     // Observable release record for diagnostics/tests.  Production ignores it.
     private val releasedTags = java.util.concurrent.CopyOnWriteArrayList<String>()
+    private val releaseSuccessCount = AtomicInteger(0)
+    private val releaseFailureCount = AtomicInteger(0)
+    private val lateAttachmentsSettled = AtomicInteger(0)
+    private val cleanupResultRef = AtomicReference<ProductionCleanupResult?>(null)
+    private val attachLock = Any()
 
-    fun attachImageReader(reader: ImageReader?) {
-        imageReader = reader
-    }
+    fun lifecyclePhase(): CoordinatorLifecyclePhase = lifecycle.get()
 
-    fun attachCameraDevice(device: CameraDevice?) {
-        cameraDevice = device
-    }
-
-    fun attachCaptureSession(session: CameraCaptureSession?) {
-        captureSession = session
-    }
-
-    fun attachMotionLogger(logger: MotionLogger?) {
-        motionLogger = logger
-    }
-
-    /** Number of successful (first-time) [perform] invocations. */
     fun performCount(): Int = performRuns.get()
+
+    fun cleanupResult(): ProductionCleanupResult? = cleanupResultRef.get()
 
     /** Resource tags released by the single [perform]; empty until perform runs. */
     internal fun releasedResourceTags(): List<String> = releasedTags.toList()
 
-    /**
-     * Exactly-once idempotent release of every currently-attached production resource.
-     * A second call is a no-op, so ColorFusion and the owner's terminal settlement may
-     * both invoke this without double-releasing.  Never blocks Main waiting for the
-     * encoder or the background HandlerThread (quitSafely is non-blocking).
-     */
-    fun perform(): Boolean {
-        if (!started.compareAndSet(false, true)) return false
-        performRuns.incrementAndGet()
-        // Detach Camera2 callbacks first.
-        releaseResource("ImageReader.listener", imageReader) { imageReader?.setOnImageAvailableListener(null, null) }
-        // Remove pending background callbacks.
-        releaseResource("Background.handler", backgroundHandler) { backgroundHandler?.removeCallbacksAndMessages(null) }
-        // Camera session teardown.
-        releaseResource("CaptureSession.abort", captureSession) { captureSession?.abortCaptures() }
-        releaseResource("CaptureSession.stop", captureSession) { captureSession?.stopRepeating() }
-        releaseResource("CaptureSession.close", captureSession) { captureSession?.close() }
-        // ImageReader and CameraDevice.
-        releaseResource("ImageReader.close", imageReader) { imageReader?.close() }
-        releaseResource("CameraDevice.close", cameraDevice) { cameraDevice?.close() }
-        // Motion logger.
-        releaseResource("MotionLogger.stop", motionLogger) { motionLogger?.stop() }
-        // Timeout scheduler.
-        releaseResource("TimeoutScheduler.shutdown", timeoutScheduler) { timeoutScheduler?.shutdownNow() }
-        // Background thread — do NOT block Main waiting for the encoder or thread.
-        releaseResource("BackgroundThread.quit", backgroundThread) { backgroundThread?.quitSafely() }
-        return true
+    fun attachImageReader(reader: ImageReader?) {
+        synchronized(attachLock) {
+            val phase = lifecycle.get()
+            if (phase == CoordinatorLifecyclePhase.CLEANING || phase == CoordinatorLifecyclePhase.CLOSED) {
+                lateAttachmentsSettled.incrementAndGet()
+                reader?.close()
+                return
+            }
+            imageReader = reader
+        }
     }
 
-    /** Best-effort release of one owned resource; records the tag and swallows teardown exceptions. */
-    private fun <T> releaseResource(tag: String, resource: T?, block: () -> Unit) {
-        if (resource == null) return
-        releasedTags.add(tag)
-        try {
-            block()
-        } catch (t: Throwable) {
-            Log.w("KeplerYuvCleanup", "release $tag failed", t)
+    fun attachCameraDevice(device: CameraDevice?) {
+        synchronized(attachLock) {
+            val phase = lifecycle.get()
+            if (phase == CoordinatorLifecyclePhase.CLEANING || phase == CoordinatorLifecyclePhase.CLOSED) {
+                lateAttachmentsSettled.incrementAndGet()
+                device?.close()
+                return
+            }
+            cameraDevice = device
         }
+    }
+
+    fun attachCaptureSession(session: CameraCaptureSession?) {
+        synchronized(attachLock) {
+            val phase = lifecycle.get()
+            if (phase == CoordinatorLifecyclePhase.CLEANING || phase == CoordinatorLifecyclePhase.CLOSED) {
+                lateAttachmentsSettled.incrementAndGet()
+                try { session?.close() } catch (_: Exception) {}
+                return
+            }
+            captureSession = session
+        }
+    }
+
+    fun attachMotionLogger(logger: MotionLogger?) {
+        synchronized(attachLock) {
+            val phase = lifecycle.get()
+            if (phase == CoordinatorLifecyclePhase.CLEANING || phase == CoordinatorLifecyclePhase.CLOSED) {
+                lateAttachmentsSettled.incrementAndGet()
+                try { logger?.stop() } catch (_: Exception) {}
+                return
+            }
+            motionLogger = logger
+        }
+    }
+
+    /**
+     * Atomic lifecycle transition OPEN -> CLEANING -> CLOSED, then exactly-once
+     * release of every currently-attached production resource.  Returns true only
+     * for the first successful invocation; publishes an immutable [ProductionCleanupResult].
+     */
+    fun perform(): Boolean {
+        if (!lifecycle.compareAndSet(CoordinatorLifecyclePhase.OPEN, CoordinatorLifecyclePhase.CLEANING)) {
+            // If already CLOSED, return false; if CLEANING, also no-op for idempotency.
+            return lifecycle.get() == CoordinatorLifecyclePhase.CLOSED && started.get()
+        }
+        started.set(true)
+        performRuns.incrementAndGet()
+        var attempts = 0
+        var successes = 0
+        var failures = 0
+
+        fun <T> release(tag: String, resource: T?, block: () -> Unit) {
+            attempts++
+            if (resource == null) return
+            releasedTags.add(tag)
+            try {
+                block()
+                successes++
+            } catch (t: Throwable) {
+                failures++
+                Log.w("KeplerYuvCleanup", "release $tag failed", t)
+            }
+        }
+
+        // Detach Camera2 callbacks first.
+        release("ImageReader.listener", imageReader) { imageReader?.setOnImageAvailableListener(null, null) }
+        // Remove pending background callbacks.
+        release("Background.handler", backgroundHandler) { backgroundHandler?.removeCallbacksAndMessages(null) }
+        // Camera session teardown.
+        release("CaptureSession.abort", captureSession) { captureSession?.abortCaptures() }
+        release("CaptureSession.stop", captureSession) { captureSession?.stopRepeating() }
+        release("CaptureSession.close", captureSession) { captureSession?.close() }
+        // ImageReader and CameraDevice.
+        release("ImageReader.close", imageReader) { imageReader?.close() }
+        release("CameraDevice.close", cameraDevice) { cameraDevice?.close() }
+        // Motion logger.
+        release("MotionLogger.stop", motionLogger) { motionLogger?.stop() }
+        // Timeout scheduler.
+        release("TimeoutScheduler.shutdown", timeoutScheduler) { timeoutScheduler?.shutdownNow() }
+        // Background thread ??do NOT block Main waiting for the encoder or thread.
+        release("BackgroundThread.quit", backgroundThread) { backgroundThread?.quitSafely() }
+
+        lifecycle.set(CoordinatorLifecyclePhase.CLOSED)
+        val result = ProductionCleanupResult(
+            phase = "CLOSED",
+            performCount = performRuns.get(),
+            resourceReleaseAttempts = attempts,
+            resourceReleaseSuccesses = successes,
+            resourceReleaseFailures = failures,
+            lateAttachmentsImmediatelySettled = lateAttachmentsSettled.get()
+        )
+        cleanupResultRef.set(result)
+        return true
     }
 
     fun isStarted(): Boolean = started.get()
@@ -123,7 +198,7 @@ internal class YuvProductionResourceCoordinator(
  * Production [CallbackDispatcher] that returns the ACTUAL [Handler.post] acceptance
  * result.  If Main dispatch rejects, the callback is NOT executed inline, and
  * [dispatch] returns false.  The caller (YuvCaptureOwner) records a diagnostic and
- * proceeds with cleanup — the terminal metadata stays valid and production cleanup
+ * proceeds with cleanup ??the terminal metadata stays valid and production cleanup
  * still executes.
  */
 internal class YuvProductionCallbackDispatcher(
@@ -197,3 +272,4 @@ internal class YuvPreSessionTerminal(
 
     fun isTerminal(): Boolean = terminalClaimed.get()
 }
+

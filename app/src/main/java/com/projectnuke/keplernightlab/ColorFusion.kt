@@ -279,9 +279,25 @@ fun captureYuvBurstColorWithMotion(
     var jobFile: File? = null
     var burstDir: File? = null
     var metadataWriter: ProductionMetadataWriter? = null
-    var productionResourceCoordinator: YuvProductionResourceCoordinator? = null
     var yuvSession: YuvCaptureSession? = null
     var jobFileHolder: JobFileHolder? = null
+
+    // Step 0.1: Production resource coordinator must exist BEFORE any fallible
+    // initialization step so that pre-session terminal cleanup can close resources.
+    val productionResourceCoordinator = YuvProductionResourceCoordinator(
+        timeoutScheduler = timeoutScheduler,
+        backgroundHandler = backgroundHandler,
+        backgroundThread = backgroundThread
+    )
+
+    // Pre-session terminal path: owns exactly-once claim, status/error dispatch through
+    // acceptance-reporting Main dispatchers (never inline), and production cleanup.
+    // After YuvCaptureSession becomes authoritative this path is no longer used.
+    val preSessionTerminal = YuvPreSessionTerminal(
+        dispatchStatus = { message -> statusDispatcher.dispatch(message) },
+        dispatchError = { message -> callbackDispatcher.dispatch(Runnable { onError(message) }) },
+        cleanup = { productionCleanup() }
+    )
 
     /**
      * Production resource cleanup: exactly-once, idempotent.  Closes Camera2
@@ -290,20 +306,12 @@ fun captureYuvBurstColorWithMotion(
      */
     fun productionCleanup() {
         if (!cleanupStarted.compareAndSet(false, true)) return
-        productionResourceCoordinator?.perform()
+        productionResourceCoordinator.perform()
         // Also close the YUV session (internal cleanup).
         try { yuvSession?.close() } catch (_: Exception) {}
     }
 
     // Pre-session terminal path: owns exactly-once claim, status/error dispatch through
-    // acceptance-reporting Main dispatchers (never inline), and production cleanup.
-    // After YuvCaptureSession becomes authoritative this path is no longer used.
-        val preSessionTerminal = YuvPreSessionTerminal(
-        dispatchStatus = { message -> statusDispatcher.dispatch(message) },
-        dispatchError = { message -> callbackDispatcher.dispatch(Runnable { onError(message) }) },
-        cleanup = { productionCleanup() }
-    )
-
     fun logLateCameraCallback(callback: String) {
         val isFinished = yuvSession?.let { !it.terminalState.status().equals(CaptureTerminalStatus.ACTIVE) } ?: finished.get()
         Log.d(
@@ -598,16 +606,6 @@ fun captureYuvBurstColorWithMotion(
             }
         )
 
-        // Production resource coordinator created BEFORE the session so it can be wired
-        // into the session's exactly-once terminal settlement.  Camera2 resources are
-        // attached as they become available (ImageReader/MotionLogger in setup,
-        // CameraDevice/CameraCaptureSession in their async callbacks).
-        productionResourceCoordinator = YuvProductionResourceCoordinator(
-            timeoutScheduler = timeoutScheduler,
-            backgroundHandler = backgroundHandler,
-            backgroundThread = backgroundThread
-        )
-
         yuvSession = YuvCaptureSession.create(
             dispatch = { event -> backgroundHandler.post { event.execute() } },
             outputDir = currentBurstDir,
@@ -652,7 +650,7 @@ fun captureYuvBurstColorWithMotion(
         )
 
         imageReader = reader
-        productionResourceCoordinator?.attachImageReader(reader)
+        productionResourceCoordinator.attachImageReader(reader)
         if (useMemoryBuffer) {
             postStatus(
                 "YUV memory buffer enabled: frames=$frameCount " +
@@ -694,7 +692,7 @@ fun captureYuvBurstColorWithMotion(
             metadataWriter?.motionInfo = motionInfo
             null
         }
-        productionResourceCoordinator?.attachMotionLogger(motionLogger)
+        productionResourceCoordinator.attachMotionLogger(motionLogger)
 
         postStatus(
             "Color Fusion 준비 완료\n" +
@@ -747,7 +745,7 @@ fun captureYuvBurstColorWithMotion(
                         return
                     }
                     cameraDevice = camera
-                    productionResourceCoordinator?.attachCameraDevice(camera)
+                    productionResourceCoordinator.attachCameraDevice(camera)
                     if (isTerminalOrFinished()) {
                         logLateCameraCallback("CameraDevice.onOpened.afterAssign")
                         camera.close()
@@ -774,7 +772,7 @@ fun captureYuvBurstColorWithMotion(
                                         return@createRoutedStillCaptureSession
                                     }
                                     captureSession = session
-                                    productionResourceCoordinator?.attachCaptureSession(session)
+                                    productionResourceCoordinator.attachCaptureSession(session)
                                     if (isTerminalOrFinished()) {
                                         logLateCameraCallback("CameraCaptureSession.onConfigured.afterAssign")
                                         session.close()
