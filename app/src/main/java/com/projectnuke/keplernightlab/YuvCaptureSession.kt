@@ -2,6 +2,7 @@ package com.projectnuke.keplernightlab
 
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 internal class YuvCaptureSession internal constructor(
     val captureStateOwner: CaptureStateOwner,
@@ -14,9 +15,18 @@ internal class YuvCaptureSession internal constructor(
     val identityOwner: CaptureFrameIdentityOwner,
     val owner: YuvCaptureOwner,
     val cleanupCoordinator: YuvCleanupCoordinator,
-    val productionResourceCoordinator: YuvProductionResourceCoordinator
-) : AutoCloseable {
+    val productionResourceCoordinator: YuvProductionResourceCoordinator,
+    val terminalRequestHandoff: YuvTerminalRequestHandoff,
+    internal val terminalMetadataWriter: YuvTerminalMetadataWriter,
+    internal val verifiedFileReader: YuvVerifiedFileReader,
+    internal val terminalFinalVerifier: YuvTerminalFinalVerifier,
+    internal val onSessionTerminal: (YuvTerminalRequest) -> Unit
+) : AutoCloseable, YuvSessionTerminalOperations {
     override fun close() {
+        // Deterministically unblock any ColorFusion terminal gate FIRST, then
+        // perform the coordinated resource cleanup.  A waiter that was unblocked
+        // by closure must never synthesize a terminal result.
+        terminalRequestHandoff.close()
         cleanupCoordinator.perform()
         productionResourceCoordinator.perform()
     }
@@ -25,13 +35,33 @@ internal class YuvCaptureSession internal constructor(
 
     /**
      * Initiate exactly-once terminal settlement for BOTH internal and production
-     * resource cleanup.  Called by [YuvCaptureOwner.settleTerminal] and the
-     * emergency settlement paths.
+     * resource cleanup.  Called by [YuvCaptureOwner.settleTerminalByRequest] and
+     * the emergency settlement paths.
      */
     fun performTerminalCleanup() {
         cleanupCoordinator.perform()
         productionResourceCoordinator.perform()
     }
+
+    // ------------------------------------------------------------------
+    // YuvSessionTerminalOperations: the owner requests session terminal
+    // operations; the session owns the callbacks/adapters.
+    // ------------------------------------------------------------------
+
+    override fun publishTerminal(request: YuvTerminalRequest): Boolean =
+        terminalRequestHandoff.publish(request)
+
+    override fun requestTerminalMetadataWrite(request: YuvTerminalMetadataRequest) =
+        terminalMetadataWriter.write(request)
+
+    override fun verifyTerminalFinalFile(file: File, frameIndex: Int): Boolean =
+        terminalFinalVerifier.verify(file, frameIndex)
+
+    override fun readVerifiedTerminalFile(file: File): ByteArray =
+        verifiedFileReader.read(file)
+
+    override fun observeTerminal(request: YuvTerminalRequest) =
+        onSessionTerminal(request)
 
     companion object {
         fun create(
@@ -52,6 +82,20 @@ internal class YuvCaptureSession internal constructor(
             candidateFilesystem: YuvCandidateFilesystem = RealYuvCandidateFilesystem,
             candidateVerifier: YuvCandidateVerifier = RealYuvCandidateVerifier,
             finalFileVerifier: YuvFinalFileVerifier = RealYuvFinalFileVerifier,
+            terminalMetadataWriter: YuvTerminalMetadataWriter =
+                YuvTerminalMetadataWriter { request ->
+                    writeJobJson(request.jobStatus, request.savedFrames, request.manifest)
+                },
+            verifiedFileReader: YuvVerifiedFileReader =
+                YuvVerifiedFileReader { file -> NoFollowFileSystem.readBytesVerified(file) },
+            terminalFinalVerifier: YuvTerminalFinalVerifier =
+                YuvTerminalFinalVerifier { file, frameIndex -> finalFileVerifier.verify(file, frameIndex) },
+            onSessionTerminal: (YuvTerminalRequest) -> Unit = { request ->
+                when (request.completionKind) {
+                    TerminalCompletionKind.SUCCESS -> onCaptureComplete(outputDir)
+                    TerminalCompletionKind.ERROR -> onCaptureError(request.reason ?: "", request.cause)
+                }
+            },
             accounting: YuvCaptureAccounting? = null,
             productionResourceCoordinator: YuvProductionResourceCoordinator,
             finished: AtomicBoolean? = null
@@ -67,6 +111,8 @@ internal class YuvCaptureSession internal constructor(
             val cleanupCoordinator = YuvCleanupCoordinator(
                 captureStateOwner, lifecycle, accounting, reservations, boundedWorker
             )
+            val terminalRequestHandoff = YuvTerminalRequestHandoff()
+            val sessionRef = AtomicReference<YuvCaptureSession?>()
             val owner = YuvCaptureOwner(
                 captureStateOwner = captureStateOwner,
                 outputDir = outputDir,
@@ -82,15 +128,30 @@ internal class YuvCaptureSession internal constructor(
                 finished = finishedState,
                 postStatus = postStatus,
                 dispatchCallback = dispatchCallback,
-                writeJobJson = writeJobJson,
+                sessionTerminal = object : YuvSessionTerminalOperations {
+                    override fun publishTerminal(request: YuvTerminalRequest): Boolean =
+                        sessionRef.get()?.publishTerminal(request) ?: false
+
+                    override fun requestTerminalMetadataWrite(request: YuvTerminalMetadataRequest) {
+                        sessionRef.get()?.requestTerminalMetadataWrite(request)
+                    }
+
+                    override fun verifyTerminalFinalFile(file: File, frameIndex: Int): Boolean =
+                        sessionRef.get()?.verifyTerminalFinalFile(file, frameIndex) ?: false
+
+                    override fun readVerifiedTerminalFile(file: File): ByteArray =
+                        sessionRef.get()?.readVerifiedTerminalFile(file)
+                            ?: error("session not initialized")
+
+                    override fun observeTerminal(request: YuvTerminalRequest) {
+                        sessionRef.get()?.observeTerminal(request)
+                    }
+                },
                 saveMotionOnce = saveMotionOnce,
-                onCaptureComplete = onCaptureComplete,
-                onCaptureError = onCaptureError,
                 cleanupCoordinator = cleanupCoordinator,
                 productionResourceCoordinator = productionResourceCoordinator,
                 candidateFilesystem = candidateFilesystem,
-                candidateVerifier = candidateVerifier,
-                finalFileVerifier = finalFileVerifier
+                candidateVerifier = candidateVerifier
             )
             return YuvCaptureSession(
                 captureStateOwner,
@@ -103,8 +164,13 @@ internal class YuvCaptureSession internal constructor(
                 identityOwner,
                 owner,
                 cleanupCoordinator,
-                productionResourceCoordinator
-            )
+                productionResourceCoordinator,
+                terminalRequestHandoff,
+                terminalMetadataWriter,
+                verifiedFileReader,
+                terminalFinalVerifier,
+                onSessionTerminal
+            ).also { sessionRef.set(it) }
         }
     }
 }

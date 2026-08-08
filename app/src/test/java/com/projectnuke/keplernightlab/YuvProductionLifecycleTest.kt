@@ -13,6 +13,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -63,7 +65,8 @@ class YuvProductionLifecycleTest {
         encodeFailure: Boolean = false,
         rejectCallbackDispatch: Boolean = false,
         throwCallbackDispatch: Boolean = false,
-        callbackBodyFailure: Boolean = false
+        callbackBodyFailure: Boolean = false,
+        rejectOwnerEvent: Boolean = false
     ) {
         val dir: File = Files.createTempDirectory("yuv-prod-lifecycle").toFile()
         val handlerThread = android.os.HandlerThread("yuv-prod-lifecycle").apply { start() }
@@ -89,8 +92,15 @@ class YuvProductionLifecycleTest {
 
         val session: YuvCaptureSession = YuvCaptureSession.create(
             dispatch = { event ->
-                handler.post { event.execute() }
-                true
+                // rejectOwnerEvent exercises the owner-event emergency settlement
+                // paths (deadline/cancellation) on the caller thread.
+                if (rejectOwnerEvent) {
+                    event.disposeWithoutMutation()
+                    false
+                } else {
+                    handler.post { event.execute() }
+                    true
+                }
             },
             outputDir = dir,
             frameCount = frameCount,
@@ -569,6 +579,156 @@ class YuvProductionLifecycleTest {
             assertTrue(after.records.any { it.resourceType == "ImageReader" && it.lateAttachment })
         } finally {
             ht.quitSafely()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 1: terminal publication semantics
+    // ------------------------------------------------------------------
+
+    @Test
+    fun terminalRequestIsSolelyPublishedExactlyOnce() {
+        val harness = Harness(frameCount = 3)
+        try {
+            harness.feedAll()
+            assertEquals(CaptureTerminalStatus.SUCCESS, harness.awaitTerminal())
+            val handoff = harness.session.terminalRequestHandoff
+            val published = handoff.request()
+            assertNotNull("terminal request must be published", published)
+            val publishedRequest = published!!
+            assertEquals(CaptureTerminalStatus.SUCCESS, publishedRequest.status)
+            // Duplicate/late publications are rejected and never replace the winner.
+            assertFalse(handoff.publish(publishedRequest))
+            assertFalse(handoff.publish(publishedRequest.copy(status = CaptureTerminalStatus.CANCELLED)))
+            assertEquals(CaptureTerminalStatus.SUCCESS, handoff.request()?.status)
+            // The published request is the terminal authority: no counters/elapsed
+            // time inference anywhere in the snapshot path.
+            assertEquals(publishedRequest, handoff.request())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun gateReturnsPublishedRequestImmediately() {
+        val handoff = YuvTerminalRequestHandoff()
+        val request = YuvTerminalRequest(
+            status = CaptureTerminalStatus.SUCCESS,
+            jobStatus = "CAPTURE_COMPLETE",
+            reason = "All 3 frames persisted",
+            completionKind = TerminalCompletionKind.SUCCESS,
+            cause = null,
+            saveMotion = true
+        )
+        assertTrue(handoff.publish(request))
+        assertEquals(request, handoff.awaitPublishedOrClosed())
+        assertFalse(handoff.isClosed())
+    }
+
+    @Test
+    fun gateUnblocksOnCloseWithoutSynthesizingRequest() {
+        val handoff = YuvTerminalRequestHandoff()
+        assertTrue(handoff.close())
+        assertNull("closure must never synthesize a request", handoff.awaitPublishedOrClosed())
+        assertTrue(handoff.isClosed())
+        // Publish after close is rejected.
+        val request = YuvTerminalRequest(
+            status = CaptureTerminalStatus.TIMED_OUT,
+            jobStatus = "CAPTURE_TIMEOUT",
+            reason = "timeout",
+            completionKind = TerminalCompletionKind.ERROR,
+            cause = null,
+            saveMotion = false
+        )
+        assertFalse(handoff.publish(request))
+        assertNull(handoff.request())
+    }
+
+    @Test
+    fun sessionCloseUnblocksGateDeterministically() {
+        val harness = Harness(frameCount = 3)
+        try {
+            // Close before any terminal publication: the gate must unblock with null.
+            harness.session.close()
+            val waited = harness.session.terminalRequestHandoff.awaitPublishedOrClosed()
+            assertNull(waited)
+            assertTrue(harness.session.terminalRequestHandoff.isClosed())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun concurrentPublicationsExactlyOneWins() {
+        val handoff = YuvTerminalRequestHandoff()
+        val start = CountDownLatch(1)
+        val done = CountDownLatch(2)
+        val winners = java.util.Collections.synchronizedList(mutableListOf<Boolean>())
+        val request = YuvTerminalRequest(
+            status = CaptureTerminalStatus.SUCCESS,
+            jobStatus = "CAPTURE_COMPLETE",
+            reason = "all persisted",
+            completionKind = TerminalCompletionKind.SUCCESS,
+            cause = null,
+            saveMotion = true
+        )
+        repeat(2) {
+            Thread {
+                try {
+                    start.await()
+                    winners.add(handoff.publish(request))
+                } finally {
+                    done.countDown()
+                }
+            }.start()
+        }
+        start.countDown()
+        assertTrue(done.await(5, TimeUnit.SECONDS))
+        assertEquals(1, winners.count { it })
+        assertNotNull(handoff.request())
+    }
+
+    @Test
+    fun emergencyCancellationSettlementPublishesRequestThroughSameTransaction() {
+        val harness = Harness(frameCount = 3, rejectOwnerEvent = true)
+        try {
+            harness.session.owner.onCancellationRequested()
+            val published = harness.session.terminalRequestHandoff.awaitPublishedOrClosed(5)
+            assertNotNull("emergency settlement must publish the request", published)
+            val publishedRequest = published!!
+            assertEquals(CaptureTerminalStatus.CANCELLED, publishedRequest.status)
+            assertEquals(TerminalCompletionKind.ERROR, publishedRequest.completionKind)
+            assertEquals(CaptureTerminalStatus.CANCELLED, harness.session.terminalState.status())
+            assertEquals(TerminalSettlementPhase.SETTLED, harness.session.owner.terminalSettlementPhase())
+            assertEquals(1, harness.coordinator.performCount())
+            // Emergency transaction: motion/metadata/status are NotRequested, but the
+            // terminal observer is still dispatched through dispatchCallback (the Main
+            // dispatcher is independent of the rejected owner event dispatcher).
+            val snap = harness.session.owner.terminalSnapshotRef()
+            assertTrue(snap.metadataWriteOutcome is TerminalOperationOutcome.NotRequested)
+            assertTrue(snap.motionSaveOutcome is TerminalOperationOutcome.NotRequested)
+            assertTrue(snap.statusDispatchOutcome is TerminalOperationOutcome.NotRequested)
+            assertTrue(snap.callbackDispatchOutcome is TerminalOperationOutcome.Succeeded)
+            assertTrue(snap.callbackExecutionOutcome is TerminalOperationOutcome.Succeeded)
+            assertEquals(1, harness.errorCount.get())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun emergencyDeadlineSettlementPublishesTimedOutRequest() {
+        val harness = Harness(frameCount = 3, rejectOwnerEvent = true)
+        try {
+            harness.session.owner.onDeadlineReached()
+            val published = harness.session.terminalRequestHandoff.awaitPublishedOrClosed(5)
+            assertNotNull("emergency deadline settlement must publish the request", published)
+            assertEquals(CaptureTerminalStatus.TIMED_OUT, published!!.status)
+            assertEquals(CaptureTerminalStatus.TIMED_OUT, harness.session.terminalState.status())
+            assertEquals(TerminalSettlementPhase.SETTLED, harness.session.owner.terminalSettlementPhase())
+            assertEquals(1, harness.coordinator.performCount())
+        } finally {
+            harness.shutdown()
         }
     }
 

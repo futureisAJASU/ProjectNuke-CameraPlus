@@ -620,23 +620,35 @@ fun captureYuvBurstColorWithMotion(
             workProcessor = yuvWorkProcessor,
             postStatus = { msg -> statusDispatcher.dispatch(msg) },
                         dispatchCallback = callbackDispatcher,
-            writeJobJson = { status, savedFrames, manifest ->
-                metadataWriter?.write(status, savedFrames, manifest)
+            terminalMetadataWriter = YuvTerminalMetadataWriter { request ->
+                metadataWriter?.write(request.jobStatus, request.savedFrames, request.manifest)
+            },
+            verifiedFileReader = YuvVerifiedFileReader { file ->
+                NoFollowFileSystem.readBytesVerified(file)
+            },
+            terminalFinalVerifier = YuvTerminalFinalVerifier { file, frameIndex ->
+                RealYuvFinalFileVerifier.verify(file, frameIndex)
+            },
+            onSessionTerminal = { request ->
+                // Session terminal observer: consumes the SOLE published request and
+                // dispatches exactly one user callback.  Runs on Main (the owner's
+                // dispatchCallback already posted it); never infers the terminal
+                // result from counters or elapsed time.
+                when (request.completionKind) {
+                    TerminalCompletionKind.SUCCESS -> {
+                        onComplete(currentBurstDir)
+                    }
+                    TerminalCompletionKind.ERROR -> {
+                        logYuvCaptureFailure(
+                            stage = "terminal",
+                            throwable = request.cause,
+                            detail = request.reason ?: "YUV capture failed"
+                        )
+                        onError(request.reason ?: "YUV capture failed")
+                    }
+                }
             },
             saveMotionOnce = { dir -> saveMotionOnce(dir) },
-            onCaptureComplete = { dir ->
-                // The owner's dispatchCallback already handles Main-thread dispatch.
-                // We invoke onComplete directly here — do NOT re-post to Main.
-                // Owner terminal cleanup (internal + production coordinators) is
-                // guaranteed in the owner's finally; user callbacks never own cleanup.
-                onComplete(dir)
-            },
-            onCaptureError = { message, cause ->
-                // The owner's dispatchCallback already handles Main-thread dispatch.
-                // We invoke onError directly here — do NOT re-post to Main.
-                logYuvCaptureFailure(stage = "terminal", throwable = cause, detail = message)
-                onError(message)
-            },
             productionResourceCoordinator = productionResourceCoordinator,
             finished = finished
         )
@@ -871,6 +883,22 @@ fun captureYuvBurstColorWithMotion(
                                         timeoutScheduler.schedule({
                                             yuvSession?.owner?.onDeadlineReached()
                                         }, captureTimeoutMs, TimeUnit.MILLISECONDS)
+                                        // Terminal publication gate: parks (on a DEDICATED
+                                        // daemon thread — never the owner dispatcher) until
+                                        // the sole YuvTerminalRequest is published, the
+                                        // session closes, or the defensive bound expires.
+                                        val sessionToGate = yuvSession
+                                        Thread(
+                                            {
+                                                sessionToGate?.let {
+                                                    completeCaptureYuv(
+                                                        it,
+                                                        captureTimeoutMs + YUV_TERMINAL_SETTLE_MARGIN_MS
+                                                    )
+                                                }
+                                            },
+                                            "KeplerYuvTerminalWait"
+                                        ).apply { isDaemon = true }.start()
                                     } catch (e: Exception) {
                                         val templateFailure =
                                             e.message?.contains(
@@ -962,6 +990,47 @@ fun captureYuvBurstColorWithMotion(
         )
     }
 }
+
+/**
+ * Terminal publication gate (production-only).  Parks on the session's SOLE
+ * terminal-request publication:
+ *
+ *  - published request -> the session terminal observer already dispatched the
+ *    single user callback; nothing more to do.
+ *  - session closed before publication -> cancellation/closure; no user callback
+ *    is synthesized.
+ *  - defensive bound expired with no publication and no close -> invariant
+ *    failure: record/log only.  This watchdog NEVER chooses the user-visible
+ *    terminal result.
+ *
+ * Must run on a thread that is NOT the owner's serialized dispatcher (parking
+ * the dispatcher would deadlock terminal settlement).
+ */
+private fun completeCaptureYuv(session: YuvCaptureSession, settleBoundMillis: Long) {
+    val published = session.terminalRequestHandoff.awaitPublishedOrClosed(settleBoundMillis)
+    when {
+        published != null -> {
+            // Sole publication observed; the session terminal observer handled dispatch.
+        }
+        session.terminalRequestHandoff.isClosed() -> {
+            Log.w(
+                "KeplerYuvTerminal",
+                "YUV terminal gate: session closed before terminal publication; " +
+                    "no user callback dispatched"
+            )
+        }
+        else -> {
+            Log.w(
+                "KeplerYuvTerminal",
+                "invariant failure: YUV terminal settlement did not publish a request " +
+                    "within ${settleBoundMillis}ms; recording only, no synthesized terminal result"
+            )
+        }
+    }
+}
+
+/** Defensive bound for the terminal gate: capture timeout plus a generous settlement margin. */
+private const val YUV_TERMINAL_SETTLE_MARGIN_MS = 15_000L
 
 private fun computeYuvCaptureTimeoutMs(
     frameCount: Int,

@@ -173,11 +173,18 @@ internal class BufferedEncodeTask(
  * dropped counters, the persisted manifest, retained-byte registration, completed capture-
  * result count, and success/error callback decision.
  *
- * Terminal settlement is transactional: a single [settleTerminal] path handles every
- * terminal outcome.  The settlement phase machine is ACTIVE -> CLAIMED -> SETTLING ->
- * SETTLED.  [finished] becomes true at CLAIMED (no new capture work may be accepted);
- * the published [YuvTerminalSnapshot] separately reports whether metadata/callback/cleanup
- * settlement has completed (SETTLED) or is still in flight.
+ *  Terminal settlement is transactional: a single [settleTerminalByRequest] path handles
+ *  every terminal outcome.  The settlement phase machine is ACTIVE -> CLAIMED -> SETTLING ->
+ *  SETTLED.  [finished] becomes true at CLAIMED (no new capture work may be accepted);
+ *  the published [YuvTerminalSnapshot] separately reports whether metadata/callback/cleanup
+ *  settlement has completed (SETTLED) or is still in flight.
+ *
+ *  Terminal publication: the session-owned [YuvTerminalRequestHandoff] is the SOLE
+ *  publication.  Exactly one [YuvTerminalRequest] is published via
+ *  [YuvSessionTerminalOperations.publishTerminal]; ColorFusion observes it (gate +
+ *  session terminal observer) and never infers the terminal result from counters or
+ *  elapsed time.  The owner never invokes the production metadata writer or verifier
+ *  directly — it requests session terminal operations.
  *
  * Terminal states (only the owner may transition out of ACTIVE):
  *  ACTIVE -> SUCCESS | PARTIAL_SUCCESS | FAILED | TIMED_OUT | CANCELLED
@@ -197,15 +204,12 @@ internal class YuvCaptureOwner(
     private val finished: AtomicBoolean,
     private val postStatus: (String) -> Boolean,
     private val dispatchCallback: CallbackDispatcher,
-    private val writeJobJson: (status: String, savedFrames: Int, manifest: List<YuvFrameManifestEntry>) -> Unit,
+    private val sessionTerminal: YuvSessionTerminalOperations,
     private val saveMotionOnce: (File) -> Pair<String?, String?>,
-    private val onCaptureComplete: (File) -> Unit,
-    private val onCaptureError: (message: String, cause: Throwable?) -> Unit,
     private val cleanupCoordinator: YuvCleanupCoordinator,
     private val productionResourceCoordinator: YuvProductionResourceCoordinator,
     private val candidateFilesystem: YuvCandidateFilesystem = RealYuvCandidateFilesystem,
-    private val candidateVerifier: YuvCandidateVerifier = RealYuvCandidateVerifier,
-    private val finalFileVerifier: YuvFinalFileVerifier = RealYuvFinalFileVerifier
+    private val candidateVerifier: YuvCandidateVerifier = RealYuvCandidateVerifier
 ) {
 
     private var completedResults = 0
@@ -648,9 +652,10 @@ internal class YuvCaptureOwner(
 
         // 6. Fail-closed verification of the newly created final file (a THROWING
         //    final verifier is the same as verification failure).  Only the newly
-        //    created file may be removed/quarantined.
+        //    created file may be removed/quarantined.  Verification is a session
+        //    terminal operation; the owner requests it through the session gateway.
         val finalVerified = try {
-            finalFileVerifier.verify(finalFile, completion.frameIndex)
+            sessionTerminal.verifyTerminalFinalFile(finalFile, completion.frameIndex)
         } catch (t: Throwable) {
             recordDiagnostic(DiagnosticStage.FINAL_VERIFY, DiagnosticSeverity.ERROR, completion.frameIndex, finalFile.path,
                 "final verifier threw frame=${completion.frameIndex} file=${finalFile}: " +
@@ -703,7 +708,11 @@ internal class YuvCaptureOwner(
         }
         val persistedFrames = accounting.snapshot().persistedFrames
         ignoreErrors("capturing status dispatch") { postStatus("YUV capture: saved $persistedFrames/$frameCount") }
-        ignoreErrors("capturing metadata write") { writeJobJson("CAPTURING", persistedFrames, accounting.snapshot().manifest) }
+        ignoreErrors("capturing metadata write") {
+            sessionTerminal.requestTerminalMetadataWrite(
+                YuvTerminalMetadataRequest("CAPTURING", persistedFrames, accounting.snapshot().manifest)
+            )
+        }
     }
 
     /**
@@ -745,7 +754,7 @@ internal class YuvCaptureOwner(
     private fun checkTerminal() {
         val snap = accounting.snapshot()
         if (snap.persistedFrames >= frameCount && terminalState.claim(CaptureTerminalStatus.SUCCESS)) {
-            settleTerminal(YuvTerminalRequest(
+            settleTerminalByRequest(YuvTerminalRequest(
                 status = CaptureTerminalStatus.SUCCESS,
                 jobStatus = "CAPTURE_COMPLETE",
                 reason = "All $frameCount frames persisted",
@@ -763,7 +772,7 @@ internal class YuvCaptureOwner(
                 when {
                     snap.persistedFrames >= frameCount -> {
                         if (terminalState.claim(CaptureTerminalStatus.SUCCESS)) {
-                            settleTerminal(YuvTerminalRequest(
+                            settleTerminalByRequest(YuvTerminalRequest(
                                 status = CaptureTerminalStatus.SUCCESS,
                                 jobStatus = "CAPTURE_COMPLETE",
                                 reason = "All $frameCount frames persisted",
@@ -775,7 +784,7 @@ internal class YuvCaptureOwner(
                     }
                     snap.persistedFrames > 0 -> {
                         if (terminalState.claim(CaptureTerminalStatus.PARTIAL_SUCCESS)) {
-                            settleTerminal(YuvTerminalRequest(
+                            settleTerminalByRequest(YuvTerminalRequest(
                                 status = CaptureTerminalStatus.PARTIAL_SUCCESS,
                                 jobStatus = "CAPTURE_PARTIAL",
                                 reason = "Partial success: ${snap.persistedFrames}/$frameCount persisted",
@@ -787,7 +796,7 @@ internal class YuvCaptureOwner(
                     }
                     else -> {
                         if (terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) {
-                            settleTerminal(YuvTerminalRequest(
+                            settleTerminalByRequest(YuvTerminalRequest(
                                 status = CaptureTerminalStatus.TIMED_OUT,
                                 jobStatus = "CAPTURE_TIMEOUT",
                                 reason = "YUV timeout: saved=${snap.persistedFrames}/$frameCount",
@@ -810,7 +819,7 @@ internal class YuvCaptureOwner(
         val event = object : CaptureOwnerEvent {
             override fun execute() {
                 if (terminalState.claim(CaptureTerminalStatus.CANCELLED)) {
-                    settleTerminal(YuvTerminalRequest(
+                    settleTerminalByRequest(YuvTerminalRequest(
                         status = CaptureTerminalStatus.CANCELLED,
                         jobStatus = "CAPTURE_CANCELLED",
                         reason = "Cancelled",
@@ -832,7 +841,7 @@ internal class YuvCaptureOwner(
         cause: Throwable? = null
     ) {
         if (!terminalState.claim(CaptureTerminalStatus.FAILED)) return
-        settleTerminal(YuvTerminalRequest(
+        settleTerminalByRequest(YuvTerminalRequest(
             status = CaptureTerminalStatus.FAILED,
             jobStatus = "CAPTURE_FAILED",
             reason = message,
@@ -844,71 +853,73 @@ internal class YuvCaptureOwner(
 
     // ------------------------------------------------------------------
     // Emergency settlement for rejected owner events (runs off-dispatcher) --
+    // every emergency path still goes through the SAME terminal transaction
+    // (settleTerminalByRequest) so the terminal request is published and the
+    // ColorFusion terminal gate always unparks.
     // ------------------------------------------------------------------
 
     private fun emergencySettleDeadline() {
         val snap = accounting.snapshot()
-        val (status, reason) = when {
-            snap.persistedFrames >= frameCount -> CaptureTerminalStatus.SUCCESS to "All $frameCount frames persisted"
-            snap.persistedFrames > 0 -> CaptureTerminalStatus.PARTIAL_SUCCESS to "Partial success: ${snap.persistedFrames}/$frameCount persisted"
-            else -> CaptureTerminalStatus.TIMED_OUT to "YUV timeout: saved=${snap.persistedFrames}/$frameCount"
+        val status: CaptureTerminalStatus
+        val completionKind: TerminalCompletionKind
+        val reason: String
+        val saveMotion: Boolean
+        when {
+            snap.persistedFrames >= frameCount -> {
+                status = CaptureTerminalStatus.SUCCESS
+                completionKind = TerminalCompletionKind.SUCCESS
+                reason = "All $frameCount frames persisted"
+                saveMotion = true
+            }
+            snap.persistedFrames > 0 -> {
+                status = CaptureTerminalStatus.PARTIAL_SUCCESS
+                completionKind = TerminalCompletionKind.SUCCESS
+                reason = "Partial success: ${snap.persistedFrames}/$frameCount persisted"
+                saveMotion = true
+            }
+            else -> {
+                status = CaptureTerminalStatus.TIMED_OUT
+                completionKind = TerminalCompletionKind.ERROR
+                reason = "YUV timeout: saved=${snap.persistedFrames}/$frameCount"
+                saveMotion = false
+            }
         }
         if (terminalState.claim(status)) {
-            finished.set(true)
-            terminalReasonRef.set(reason)
-            terminalSettlementPhaseRef.set(TerminalSettlementPhase.CLAIMED)
             recordDiagnostic(DiagnosticStage.OWNER_EVENT_REJECTION, DiagnosticSeverity.WARN, null, null,
                 "deadline event dispatch rejected; emergency settlement path taken")
-            metadataWriteOutcomeRef.set(TerminalOperationOutcome.NotRequested)
-            motionSaveOutcomeRef.set(TerminalOperationOutcome.NotRequested)
-            statusDispatchOutcomeRef.set(TerminalOperationOutcome.NotRequested)
-            callbackDispatchOutcomeRef.set(TerminalOperationOutcome.NotRequested)
-            callbackExecutionOutcomeRef.set(TerminalOperationOutcome.NotRequested)
-            publishSnapshot()
-            try {
-                cleanupCoordinator.perform()
-            } catch (t: Throwable) {
-                recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
-                    "emergency internal cleanup failed", t)
-            }
-            try {
-                productionResourceCoordinator.perform()
-            } catch (t: Throwable) {
-                recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
-                    "emergency production cleanup failed", t)
-            }
-            terminalSettlementPhaseRef.set(TerminalSettlementPhase.SETTLED)
-            publishSnapshot()
+            settleTerminalByRequest(
+                YuvTerminalRequest(
+                    status = status,
+                    jobStatus = when (status) {
+                        CaptureTerminalStatus.SUCCESS -> "CAPTURE_COMPLETE"
+                        CaptureTerminalStatus.PARTIAL_SUCCESS -> "CAPTURE_PARTIAL"
+                        else -> "CAPTURE_TIMEOUT"
+                    },
+                    reason = reason,
+                    completionKind = completionKind,
+                    cause = null,
+                    saveMotion = saveMotion
+                ),
+                emergency = true
+            )
         }
     }
 
     private fun emergencySettleCancellation() {
         if (terminalState.claim(CaptureTerminalStatus.CANCELLED)) {
-            finished.set(true)
-            terminalReasonRef.set("Cancelled")
-            terminalSettlementPhaseRef.set(TerminalSettlementPhase.CLAIMED)
             recordDiagnostic(DiagnosticStage.OWNER_EVENT_REJECTION, DiagnosticSeverity.WARN, null, null,
                 "cancellation event dispatch rejected; emergency settlement path taken")
-            metadataWriteOutcomeRef.set(TerminalOperationOutcome.NotRequested)
-            motionSaveOutcomeRef.set(TerminalOperationOutcome.NotRequested)
-            statusDispatchOutcomeRef.set(TerminalOperationOutcome.NotRequested)
-            callbackDispatchOutcomeRef.set(TerminalOperationOutcome.NotRequested)
-            callbackExecutionOutcomeRef.set(TerminalOperationOutcome.NotRequested)
-            publishSnapshot()
-            try {
-                cleanupCoordinator.perform()
-            } catch (t: Throwable) {
-                recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
-                    "emergency internal cleanup failed", t)
-            }
-            try {
-                productionResourceCoordinator.perform()
-            } catch (t: Throwable) {
-                recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
-                    "emergency production cleanup failed", t)
-            }
-            terminalSettlementPhaseRef.set(TerminalSettlementPhase.SETTLED)
-            publishSnapshot()
+            settleTerminalByRequest(
+                YuvTerminalRequest(
+                    status = CaptureTerminalStatus.CANCELLED,
+                    jobStatus = "CAPTURE_CANCELLED",
+                    reason = "Cancelled",
+                    completionKind = TerminalCompletionKind.ERROR,
+                    cause = null,
+                    saveMotion = false
+                ),
+                emergency = true
+            )
         }
     }
 
@@ -916,7 +927,15 @@ internal class YuvCaptureOwner(
     // One terminal settlement path
     // ------------------------------------------------------------------
 
-    private fun settleTerminal(request: YuvTerminalRequest) {
+    /**
+     * The single terminal transaction.  Exactly one [YuvTerminalRequest] is
+     * published through the session-owned handoff (sole publication) before the
+     * terminal observer is dispatched.  [emergency] selects the owner-event
+     * rejection path: the four terminal operations (motion/metadata/status/
+     * callback-dispatch outcomes) are NotRequested, but publication and cleanup
+     * still follow the same transaction so the ColorFusion gate always unparks.
+     */
+    private fun settleTerminalByRequest(request: YuvTerminalRequest, emergency: Boolean = false) {
         if (terminalSettlementPhaseRef.get() != TerminalSettlementPhase.ACTIVE) return
         finished.set(true)
         terminalReasonRef.set(request.reason)
@@ -925,54 +944,73 @@ internal class YuvCaptureOwner(
 
         terminalSettlementPhaseRef.set(TerminalSettlementPhase.SETTLING)
 
-        val motionOutcome: TerminalOperationOutcome = if (request.saveMotion) {
-            runCatching { saveMotionOnce(outputDir) }
+        if (emergency) {
+            metadataWriteOutcomeRef.set(TerminalOperationOutcome.NotRequested)
+            motionSaveOutcomeRef.set(TerminalOperationOutcome.NotRequested)
+            statusDispatchOutcomeRef.set(TerminalOperationOutcome.NotRequested)
+        } else {
+            val motionOutcome: TerminalOperationOutcome = if (request.saveMotion) {
+                runCatching { saveMotionOnce(outputDir) }
+                    .fold(
+                        onSuccess = { TerminalOperationOutcome.Succeeded },
+                        onFailure = { t ->
+                            recordDiagnostic(DiagnosticStage.TERMINAL_MOTION, DiagnosticSeverity.ERROR, null, outputDir.path,
+                                "terminal motion save failed", t)
+                            TerminalOperationOutcome.Failed(t)
+                        }
+                    )
+            } else {
+                TerminalOperationOutcome.NotRequested
+            }
+            motionSaveOutcomeRef.set(motionOutcome)
+
+            val snap = accounting.snapshot()
+            val metadataOutcome = runCatching {
+                sessionTerminal.requestTerminalMetadataWrite(
+                    YuvTerminalMetadataRequest(request.jobStatus, snap.persistedFrames, snap.manifest)
+                )
+            }
                 .fold(
                     onSuccess = { TerminalOperationOutcome.Succeeded },
                     onFailure = { t ->
-                        recordDiagnostic(DiagnosticStage.TERMINAL_MOTION, DiagnosticSeverity.ERROR, null, outputDir.path,
-                            "terminal motion save failed", t)
+                        recordDiagnostic(DiagnosticStage.TERMINAL_METADATA, DiagnosticSeverity.ERROR, null, null,
+                            "terminal metadata write failed", t)
                         TerminalOperationOutcome.Failed(t)
                     }
                 )
-        } else {
-            TerminalOperationOutcome.NotRequested
-        }
-        motionSaveOutcomeRef.set(motionOutcome)
+            metadataWriteOutcomeRef.set(metadataOutcome)
 
-        val snap = accounting.snapshot()
-        val metadataOutcome = runCatching { writeJobJson(request.jobStatus, snap.persistedFrames, snap.manifest) }
-            .fold(
-                onSuccess = { TerminalOperationOutcome.Succeeded },
-                onFailure = { t ->
-                    recordDiagnostic(DiagnosticStage.TERMINAL_METADATA, DiagnosticSeverity.ERROR, null, null,
-                        "terminal metadata write failed", t)
-                    TerminalOperationOutcome.Failed(t)
-                }
-            )
-        metadataWriteOutcomeRef.set(metadataOutcome)
-
-        val statusMessage = when (request.status) {
-            CaptureTerminalStatus.SUCCESS -> "CAPTURE_COMPLETE: 캡처가 완료되었습니다."
-            CaptureTerminalStatus.PARTIAL_SUCCESS -> "일부 프레임만 캡처되었습니다."
-            else -> request.reason ?: request.jobStatus
-        }
-        // Acceptance-reporting terminal status dispatch: a false post result is a
-        // REJECTED terminal dispatch (diagnostic retained), never an inline fallback.
-        val statusOutcome = try {
-            if (postStatus(statusMessage)) {
-                TerminalOperationOutcome.Succeeded
-            } else {
-                recordDiagnostic(DiagnosticStage.TERMINAL_STATUS_DISPATCH, DiagnosticSeverity.ERROR, null, null,
-                    "terminal status dispatch rejected by handler")
-                TerminalOperationOutcome.Failed(IllegalStateException("terminal status dispatch rejected"))
+            val statusMessage = when (request.status) {
+                CaptureTerminalStatus.SUCCESS -> "CAPTURE_COMPLETE: 캡처가 완료되었습니다."
+                CaptureTerminalStatus.PARTIAL_SUCCESS -> "일부 프레임만 캡처되었습니다."
+                else -> request.reason ?: request.jobStatus
             }
-        } catch (t: Throwable) {
-            recordDiagnostic(DiagnosticStage.TERMINAL_STATUS_DISPATCH, DiagnosticSeverity.ERROR, null, null,
-                "terminal status dispatch failed", t)
-            TerminalOperationOutcome.Failed(t)
+            // Acceptance-reporting terminal status dispatch: a false post result is a
+            // REJECTED terminal dispatch (diagnostic retained), never an inline fallback.
+            val statusOutcome = try {
+                if (postStatus(statusMessage)) {
+                    TerminalOperationOutcome.Succeeded
+                } else {
+                    recordDiagnostic(DiagnosticStage.TERMINAL_STATUS_DISPATCH, DiagnosticSeverity.ERROR, null, null,
+                        "terminal status dispatch rejected by handler")
+                    TerminalOperationOutcome.Failed(IllegalStateException("terminal status dispatch rejected"))
+                }
+            } catch (t: Throwable) {
+                recordDiagnostic(DiagnosticStage.TERMINAL_STATUS_DISPATCH, DiagnosticSeverity.ERROR, null, null,
+                    "terminal status dispatch failed", t)
+                TerminalOperationOutcome.Failed(t)
+            }
+            statusDispatchOutcomeRef.set(statusOutcome)
         }
-        statusDispatchOutcomeRef.set(statusOutcome)
+
+        // Sole terminal publication: exactly one YuvTerminalRequest wins the handoff.
+        // ColorFusion's terminal gate unparks on this publication; a rejected
+        // duplicate (closed handoff or already published) is a late diagnostic only.
+        val published = sessionTerminal.publishTerminal(request)
+        if (!published) {
+            recordDiagnostic(DiagnosticStage.TERMINAL_PUBLICATION, DiagnosticSeverity.WARN, null, null,
+                "terminal request publication rejected (handoff closed or already published)")
+        }
 
         try {
             dispatchTerminalCallback(request)
@@ -999,10 +1037,11 @@ internal class YuvCaptureOwner(
     }
 
     private fun dispatchTerminalCallback(request: YuvTerminalRequest) {
-        val callback: () -> Unit = when (request.completionKind) {
-            TerminalCompletionKind.SUCCESS -> { -> onCaptureComplete(outputDir) }
-            TerminalCompletionKind.ERROR -> { -> onCaptureError(request.reason ?: "", request.cause) }
-        }
+        // The dispatched observer is the SESSION terminal observer: ColorFusion
+        // consumes the published request and dispatches exactly one onComplete/
+        // onError from it.  The owner never invokes the production callbacks
+        // directly.
+        val callback: () -> Unit = { sessionTerminal.observeTerminal(request) }
         // The wrapped runnable is the ACTUAL user callback invocation.  CallbackState
         // tracks this runnable's lifecycle, not an intermediate wrapper.  The dispatch
         // returns the real Handler.post acceptance result: if Main rejects, the callback
