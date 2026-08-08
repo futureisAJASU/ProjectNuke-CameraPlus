@@ -55,15 +55,6 @@ private enum class YuvRgbMatrix {
 
 private val DEFAULT_YUV_RGB_MATRIX = YuvRgbMatrix.BT601_FULL
 
-private data class YuvCaptureFailureSnapshot(
-    val jobFile: File?,
-    val savedFrames: Int,
-    val receivedImages: Int,
-    val completedResults: Int,
-    val failedCaptures: Int,
-    val frames: List<YuvFrameManifestEntry>
-)
-
 private fun logYuvCaptureFailure(
     stage: String,
     throwable: Throwable? = null,
@@ -81,52 +72,6 @@ private fun logYuvCaptureFailure(
         Log.e(YUV_CAPTURE_LOG_TAG, message, throwable)
     } else {
         Log.e(YUV_CAPTURE_LOG_TAG, message)
-    }
-}
-
-private fun persistYuvCaptureFailure(
-    snapshot: YuvCaptureFailureSnapshot,
-    source: String,
-    throwable: Throwable? = null,
-    failureType: String? = null,
-    failureMessage: String? = null
-) {
-    val jobFile = snapshot.jobFile ?: return
-    runCatching {
-        val job = if (jobFile.exists()) {
-            JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
-        } else {
-            JSONObject()
-        }
-        val framesArray = JSONArray()
-        snapshot.frames.forEach { frame ->
-            val frameObject = JSONObject()
-                .put("index", frame.frameIndex)
-                .put("frameIndex", frame.frameIndex)
-                .put("file", frame.filename)
-                .put("timestampNs", frame.timestampNs)
-                .put("persisted", frame.persisted)
-            if (frame.failure != null) frameObject.put("failure", frame.failure)
-            framesArray.put(frameObject)
-        }
-        job.put("status", "CAPTURE_FAILED")
-            .put("currentPipelineStage", "CAPTURE_FAILED")
-            .put("processStatus", "CAPTURE_FAILED")
-            .put("captureFailed", true)
-            .put("captureFailureSource", source)
-            .put("captureFailureType", failureType ?: throwable?.javaClass?.name ?: "Unknown")
-            .put("captureFailureMessage", failureMessage ?: throwable?.message ?: "")
-            .put("captureFailureStackTrace", throwable?.stackTraceToString() ?: "")
-            .put("savedFrames", snapshot.savedFrames)
-            .put("receivedImages", snapshot.receivedImages)
-            .put("completedResults", snapshot.completedResults)
-            .put("failedCaptures", snapshot.failedCaptures)
-            .put("yuvRgbMatrix", DEFAULT_YUV_RGB_MATRIX.name)
-            .put("frames", framesArray)
-            .put("updatedAt", System.currentTimeMillis())
-        KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
-    }.onFailure { persistError ->
-        Log.w(YUV_CAPTURE_LOG_TAG, "Failed to persist YUV capture failure metadata", persistError)
     }
 }
 
