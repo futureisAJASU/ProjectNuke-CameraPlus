@@ -21,6 +21,14 @@ import org.robolectric.RobolectricTestRunner
 @RunWith(RobolectricTestRunner::class)
 class RawCaptureLedgerTest {
 
+    private fun <I, R> RawCaptureLedger<I, R>.takeAllReadyFrames(): List<RawReadyFrame<I, R>> =
+        buildList {
+            while (true) {
+                val frame = takeNextReadyFrame() ?: break
+                add(frame)
+            }
+        }
+
     private fun ledger(
         requestedFrames: Int = 4,
         onClose: (String) -> Unit = {}
@@ -37,7 +45,7 @@ class RawCaptureLedgerTest {
         owner.recordResult(1L, "res-1")
         owner.recordResult(3L, "res-3")
 
-        val ready = owner.takeReadyFrames()
+        val ready = owner.takeAllReadyFrames()
 
         assertEquals(listOf(1L, 2L, 3L), ready.map { it.timestampNs })
         assertEquals(listOf(0, 1, 2), ready.map { it.frameIndex })
@@ -55,13 +63,13 @@ class RawCaptureLedgerTest {
         owner.recordImage(1L, "img-1", 10L)
         owner.recordResult(2L, "res-2")
 
-        val first = owner.takeReadyFrames()
+        val first = owner.takeAllReadyFrames()
 
         assertTrue(first.isEmpty())
         owner.recordResult(1L, "res-1")
         owner.recordImage(2L, "img-2", 20L)
 
-        val second = owner.takeReadyFrames()
+        val second = owner.takeAllReadyFrames()
 
         assertEquals(listOf(1L, 2L), second.map { it.timestampNs })
         assertTrue(closed.isEmpty())
@@ -83,22 +91,6 @@ class RawCaptureLedgerTest {
         owner.evictEmergencyUnmatchedImages(readerCapacity = 5)
         assertEquals(listOf("img-1"), closed)
         assertEquals(1, owner.snapshot().droppedUnmatchedImages)
-    }
-
-    @Test
-    fun closeUnmatchedClosesOnlyUnmatchedImages() {
-        val closed = mutableListOf<String>()
-        val owner = ledger(onClose = { closed += it })
-        owner.recordImage(1L, "img-1", 10L)
-        owner.recordImage(2L, "img-2", 20L)
-        owner.recordResult(1L, "res-1")
-
-        owner.releaseUnmatchedImagesAtTerminal()
-
-        assertEquals(listOf("img-2"), closed)
-        assertEquals(1, owner.snapshot().droppedUnmatchedImages)
-        val ready = owner.takeReadyFrames()
-        assertEquals(listOf(1L), ready.map { it.timestampNs })
     }
 
     @Test
@@ -157,15 +149,15 @@ class RawCaptureLedgerTest {
         owner.recordImage(1L, "img-1", 10L)
         owner.recordResult(1L, "res-1")
 
-        val first = owner.takeReadyFrames()
-        assertEquals(1, first.size)
-        val frame = first.single()
+        val first = owner.takeNextReadyFrame()
+        assertTrue(first != null)
+        val frame = first!!
         owner.restoreRejectedSubmission(frame)
 
-        val second = owner.takeReadyFrames()
-        assertEquals(1, second.size)
-        assertEquals(1L, second.single().timestampNs)
-        assertEquals(frame.frameIndex, second.single().frameIndex)
+        val second = owner.takeNextReadyFrame()
+        assertTrue(second != null)
+        assertEquals(1L, second!!.timestampNs)
+        assertEquals(frame.frameIndex, second.frameIndex)
         assertTrue(closed.isEmpty())
     }
 
@@ -180,7 +172,7 @@ class RawCaptureLedgerTest {
         owner.recordResult(2L, "res-2")
         owner.recordResult(3L, "res-3")
 
-        val ready = owner.takeReadyFrames()
+        val ready = owner.takeAllReadyFrames()
 
         assertEquals(listOf(0, 1), ready.map { it.frameIndex })
         assertEquals(listOf("img-1", "img-2"), ready.map { it.image })
@@ -227,7 +219,7 @@ class RawCaptureLedgerTest {
         owner.releaseAllImages()
 
         assertEquals(listOf("img-1", "img-2"), closed)
-        assertTrue(owner.takeReadyFrames().isEmpty())
+        assertTrue(owner.takeAllReadyFrames().isEmpty())
         assertEquals(0, owner.frameObjectsSnapshot().length())
     }
 
@@ -252,7 +244,7 @@ class RawCaptureLedgerTest {
 
         assertEquals(listOf("img-7-old"), closed)
         owner.recordResult(7L, "res-7")
-        val ready = owner.takeReadyFrames()
+        val ready = owner.takeAllReadyFrames()
         assertEquals(listOf("img-7-new"), ready.map { it.image })
     }
 

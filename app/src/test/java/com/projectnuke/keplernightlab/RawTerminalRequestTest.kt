@@ -49,6 +49,8 @@ class RawTerminalRequestTest {
             metadata = RawTerminalOperationOutcome.Succeeded,
             status = RawTerminalOperationOutcome.Succeeded,
             callback = RawTerminalOperationOutcome.Succeeded,
+            callbackDispatch = RawTerminalOperationOutcome.Succeeded,
+            callbackExecution = RawTerminalOperationOutcome.Succeeded,
             cleanup = null
         )
         assertEquals(RawTerminalSettlementPhase.SETTLED, snapshot.phase)
@@ -56,6 +58,19 @@ class RawTerminalRequestTest {
         assertEquals(RawTerminalOperationOutcome.Succeeded, snapshot.metadata)
         assertEquals(RawTerminalOperationOutcome.Succeeded, snapshot.status)
         assertEquals(RawTerminalOperationOutcome.Succeeded, snapshot.callback)
+        assertEquals(RawTerminalOperationOutcome.Succeeded, snapshot.callbackDispatch)
+        assertEquals(RawTerminalOperationOutcome.Succeeded, snapshot.callbackExecution)
         assertEquals(3, snapshot.progress.savedFrames)
+    }
+
+    @Test
+    fun cleanupDebtStatusesDoNotClaimSuccessfulDiscardWithoutEvidence() {
+        assertEquals(RawOutputCleanupStatus.NOT_ATTEMPTED, RawOutputCleanupOutcome.NotNeeded.status)
+        assertEquals(RawOutputCleanupStatus.DELETED, RawOutputCleanupOutcome.Clean.status)
+        assertEquals(RawOutputCleanupStatus.ADOPTED, RawOutputCleanupOutcome.adopted().status)
+        assertEquals(
+            RawOutputCleanupStatus.DELETE_THREW,
+            RawOutputCleanupOutcome.failed(IllegalStateException("delete failed")).status
+        )
     }
 }

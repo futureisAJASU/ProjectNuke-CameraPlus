@@ -133,23 +133,6 @@ internal class RawCaptureLedger<IMAGE, RESULT>(
         evicted?.let { releaseImage(it, RawImageReleaseReason.CAPACITY_EVICTION) }
     }
 
-    /** Terminal-only release. Normal matching deliberately retains Image-before-result. */
-    fun releaseUnmatchedImagesAtTerminal() {
-        val unmatched = synchronized(lock) {
-            val unmatched = imagesByTimestamp.filter { it.key !in resultsByTimestamp }.keys.toList()
-            unmatched.mapNotNull { timestamp ->
-                imagesByTimestamp.remove(timestamp)?.also {
-                    droppedUnmatchedImages++
-                }
-            }.also {
-                for (timestamp in unmatched) {
-                    imageArrivalMillis.remove(timestamp)
-                }
-            }
-        }
-        unmatched.forEach { releaseImage(it, RawImageReleaseReason.TERMINAL_CLEANUP) }
-    }
-
     /**
      * Transactionally transfers one ready pair at a time. A rejected submission must
      * call [restoreRejectedSubmission] with this same object, preserving identity.
@@ -190,25 +173,6 @@ internal class RawCaptureLedger<IMAGE, RESULT>(
             check(submissionPendingByTimestamp.put(frame.timestampNs, frame) == null) {
                 "duplicate RAW submission-pending timestamp ${frame.timestampNs}"
             }
-        }
-    }
-
-    /** Legacy batch adapter. Production dispatch uses [takeNextReadyFrame]. */
-    fun takeReadyFrames(): List<RawReadyFrame<IMAGE, RESULT>> {
-        val frames = mutableListOf<RawReadyFrame<IMAGE, RESULT>>()
-        while (true) {
-            val frame = takeNextReadyFrame() ?: break
-            frames += frame
-        }
-        return frames
-    }
-
-    /** Legacy retry adapter loses identity by design; production must use [restoreRejectedSubmission]. */
-    fun restorePair(timestampNs: Long, image: IMAGE, result: RESULT) {
-        synchronized(lock) {
-            imagesByTimestamp[timestampNs] = image
-            imageArrivalMillis[timestampNs] = System.currentTimeMillis()
-            resultsByTimestamp[timestampNs] = result
         }
     }
 
