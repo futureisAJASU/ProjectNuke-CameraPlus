@@ -120,7 +120,7 @@ private data class RawSaveFrameRequest(
     val result: TotalCaptureResult,
     val raw16Filename: String,
     val dngFilename: String,
-    val frameEntryPrefix: JSONObject
+    val frame: RawFrameManifestData
 )
 
 @SuppressLint("MissingPermission")
@@ -743,12 +743,18 @@ fun captureRawBurstForFusion(
                 try {
                     writeCompactRaw16(image, raw16Temp)
                     KeplerJobMetadata.atomicReplace(raw16Temp, raw16File)
+                    val expectedRaw16Bytes = image.width.toLong() * image.height.toLong() * 2L
+                    verifyRaw16Payload(raw16File, expectedRaw16Bytes)
                 } finally {
                     if (raw16Temp.exists()) raw16Temp.delete()
                 }
                 if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
                     runCatching { raw16File.delete() }
-                    return RawSaveCompletion.Abandoned(index, timestamp)
+                    return RawSaveCompletion.Abandoned(
+                        index,
+                        timestamp,
+                        RawOutputOwnership(null, raw16File.takeIf { it.exists() }, RawOutputState.DISCARDED, null)
+                    )
                 }
                 var dngSaved = false
                 var dngFailure: String? = null
@@ -781,7 +787,11 @@ fun captureRawBurstForFusion(
                 if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
                     runCatching { raw16File.delete() }
                     runCatching { dngFile.delete() }
-                    return RawSaveCompletion.Abandoned(index, timestamp)
+                    return RawSaveCompletion.Abandoned(
+                        index,
+                        timestamp,
+                        RawOutputOwnership(null, raw16File.takeIf { it.exists() }, RawOutputState.DISCARDED, null)
+                    )
                 }
                 val dynamicBlackLevel = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
                 val plane = image.planes[0]
@@ -791,26 +801,21 @@ fun captureRawBurstForFusion(
                 } else {
                     RawDngSidecarOutcome.notRequested(index)
                 }
-                val frameEntry = JSONObject(request.frameEntryPrefix.toString())
-                    .put("dngSidecarStatus", when (dngSidecarOutcome.status) {
-                        RawDngSidecarStatus.NOT_REQUESTED -> "NOT_REQUESTED"
-                        RawDngSidecarStatus.LOCAL_SAVED -> "LOCAL_SAVED"
-                        RawDngSidecarStatus.LOCAL_SAVE_FAILED -> "LOCAL_SAVE_FAILED"
-                        else -> "NOT_REQUESTED"
-                    })
-                    .put("dngFile", if (dngSaved) dngName else JSONObject.NULL)
-                    .put("dngSidecarError", dngSidecarOutcome.failureDescription ?: JSONObject.NULL)
-                    .put("exposureTimeNs", result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: JSONObject.NULL)
-                    .put("sensitivityIso", result.get(CaptureResult.SENSOR_SENSITIVITY) ?: JSONObject.NULL)
-                    .put("frameDurationNs", result.get(CaptureResult.SENSOR_FRAME_DURATION) ?: JSONObject.NULL)
-                    .put("rawWidth", image.width)
-                    .put("rawHeight", image.height)
-                    .put("rowStride", plane.rowStride)
-                    .put("pixelStride", plane.pixelStride)
-                    .put("dynamicBlackLevel", dynamicBlackLevel?.let { JSONArray(it.toList()) } ?: JSONObject.NULL)
-                    .put("dynamicWhiteLevel", result.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL) ?: JSONObject.NULL)
-                    .put("colorCorrectionGains", result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.toString() ?: JSONObject.NULL)
-                    .put("colorCorrectionTransform", result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.toString() ?: JSONObject.NULL)
+                val frame = request.frame.copy(
+                    dngFilename = if (dngSaved) dngName else null,
+                    dngSidecar = dngSidecarOutcome,
+                    exposureTimeNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME),
+                    sensitivityIso = result.get(CaptureResult.SENSOR_SENSITIVITY),
+                    frameDurationNs = result.get(CaptureResult.SENSOR_FRAME_DURATION),
+                    rawWidth = image.width,
+                    rawHeight = image.height,
+                    rowStride = plane.rowStride,
+                    pixelStride = plane.pixelStride,
+                    dynamicBlackLevel = dynamicBlackLevel?.toList(),
+                    dynamicWhiteLevel = result.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL),
+                    colorCorrectionGains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.toString(),
+                    colorCorrectionTransform = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.toString()
+                )
                 return RawSaveCompletion.Success(
                     frameIndex = index,
                     timestampNs = timestamp,
@@ -818,23 +823,38 @@ fun captureRawBurstForFusion(
                     raw16Bytes = raw16File.length(),
                     saveDurationMs = System.currentTimeMillis() - saveStartedAt,
                     dngSidecar = dngSidecarOutcome,
-                    frameEntry = frameEntry
+                    output = RawOutputOwnership(
+                        tempFile = null,
+                        finalFile = raw16File,
+                        state = RawOutputState.VERIFIED_FINAL,
+                        verifiedBytes = raw16File.length()
+                    ),
+                    frame = frame
                 )
             } catch (e: Exception) {
                 val failureCompletion = RawSaveCompletion.Failed(
                     frameIndex = index,
                     timestampNs = timestamp,
-                    raw16TempFile = File(jobDir, ".${raw16Name}.$index.tmp").takeIf { it.exists() },
                     failureType = e.javaClass.simpleName,
                     failureMessage = "RAW fusion capture failed: ${e.stackTraceToString()}",
                     throwable = e,
-                    frameEntry = JSONObject(request.frameEntryPrefix.toString())
-                        .put("raw16File", JSONObject.NULL)
-                        .put("dngFile", JSONObject.NULL)
-                        .put("dngSidecarStatus", if (shouldSaveDngSidecars) "LOCAL_SAVE_FAILED" else "NOT_REQUESTED")
-                        .put("dngSidecarError", if (shouldSaveDngSidecars) "${e.javaClass.simpleName}: ${e.message}" else JSONObject.NULL)
+                    output = RawOutputOwnership(
+                        tempFile = null,
+                        finalFile = raw16File.takeIf { it.exists() },
+                        state = if (raw16File.exists()) RawOutputState.TEMP else RawOutputState.NONE,
+                        verifiedBytes = null
+                    ),
+                    frame = request.frame.copy(
+                        raw16Filename = null,
+                        dngFilename = null,
+                        dngSidecar = if (shouldSaveDngSidecars) {
+                            RawDngSidecarOutcome.localSaveFailed(index, "${e.javaClass.simpleName}: ${e.message}")
+                        } else {
+                            RawDngSidecarOutcome.notRequested(index)
+                        },
+                        failureDescription = "${e.javaClass.simpleName}: ${e.message}"
+                    )
                 )
-                runCatching { File(jobDir, ".${raw16Name}.$index.tmp").delete() }
                 return failureCompletion
             } finally {
                 runCatching { image.close() }
@@ -848,8 +868,8 @@ fun captureRawBurstForFusion(
                         add(File(jobDir, completion.raw16Filename))
                         completion.dngSidecar.sidecarFilename?.let { add(File(jobDir, it)) }
                     }
-                    is RawSaveCompletion.Failed -> listOfNotNull(completion.raw16TempFile)
-                    is RawSaveCompletion.Abandoned -> emptyList()
+                    is RawSaveCompletion.Failed -> listOfNotNull(completion.output.tempFile, completion.output.finalFile)
+                    is RawSaveCompletion.Abandoned -> listOfNotNull(completion.output.tempFile, completion.output.finalFile)
                 }
                 var failure: Throwable? = null
                 for (file in files.distinct()) {
@@ -941,24 +961,27 @@ fun captureRawBurstForFusion(
                 val frame = ledger.value.takeNextReadyFrame() ?: return
                 val raw16Name = "frame_${frame.frameIndex.toString().padStart(2, '0')}.raw16"
                 val dngName = "frame_${frame.frameIndex.toString().padStart(2, '0')}.dng"
-                val entryPrefix = JSONObject()
-                    .put("index", frame.frameIndex)
-                    .put("frameIndex", frame.frameIndex)
-                    .put("raw16File", raw16Name)
-                    .put("dngFile", if (shouldSaveDngSidecars) dngName else JSONObject.NULL)
-                    .put("dngSidecarStatus", if (shouldSaveDngSidecars) "LOCAL_SAVED" else "NOT_REQUESTED")
-                    .put("dngSidecarError", JSONObject.NULL)
-                    .put("timestampNs", frame.timestampNs)
-                    .put("cameraId", cameraId)
-                    .put("zoomRatio", finalRequestZoom.toDouble())
-                    .put("selectedRoute", zoomRoute.name)
-                    .put("actualRoute", finalCaptureRoute?.name ?: JSONObject.NULL)
-                    .put("requestedPhysicalCameraId", physicalCameraId ?: JSONObject.NULL)
-                    .put("activePhysicalId", activePhysicalId ?: JSONObject.NULL)
-                    .put("finalRequestZoom", finalRequestZoom.toDouble())
-                    .put("cropApplied", finalCropApplied)
-                    .put("cropActiveArraySource", finalCropSelection.activeArraySource)
-                    .put("cropRegion", finalCropSelection.region?.toString() ?: JSONObject.NULL)
+                val frameManifest = RawFrameManifestData(
+                    frameIndex = frame.frameIndex,
+                    timestampNs = frame.timestampNs,
+                    raw16Filename = raw16Name,
+                    dngFilename = if (shouldSaveDngSidecars) dngName else null,
+                    dngSidecar = if (shouldSaveDngSidecars) {
+                        RawDngSidecarOutcome.localSavePending(frame.frameIndex, dngName)
+                    } else {
+                        RawDngSidecarOutcome.notRequested(frame.frameIndex)
+                    },
+                    cameraId = cameraId,
+                    zoomRatio = finalRequestZoom.toDouble(),
+                    selectedRoute = zoomRoute.name,
+                    actualRoute = finalCaptureRoute?.name,
+                    requestedPhysicalCameraId = physicalCameraId,
+                    activePhysicalId = activePhysicalId,
+                    finalRequestZoom = finalRequestZoom.toDouble(),
+                    cropApplied = finalCropApplied,
+                    cropActiveArraySource = finalCropSelection.activeArraySource,
+                    cropRegion = finalCropSelection.region?.toString()
+                )
                 val request = RawSaveFrameRequest(
                     frameIndex = frame.frameIndex,
                     timestampNs = frame.timestampNs,
@@ -966,7 +989,7 @@ fun captureRawBurstForFusion(
                     result = frame.result,
                     raw16Filename = raw16Name,
                     dngFilename = dngName,
-                    frameEntryPrefix = entryPrefix
+                    frame = frameManifest
                 )
                 if (!submitSaveRequest(request)) return
             }
@@ -2189,41 +2212,37 @@ private fun writeCompactRaw16(image: Image, file: File) {
     val pixelStride = plane.pixelStride
     val limit = buffer.limit()
     val rowBytes = ByteArray(width * 2)
-    val temp = File(file.parentFile, ".${file.name}.${System.nanoTime()}.tmp")
-    var committed = false
-    try {
-        val fileOutput = FileOutputStream(temp)
-        fileOutput.use { rawOutput ->
-            BufferedOutputStream(rawOutput).use { output ->
-                for (y in 0 until height) {
-                    val row = y * rowStride
-                    var out = 0
-                    for (x in 0 until width) {
-                        val index = row + x * pixelStride
-                        if (index + 1 < limit) {
-                            rowBytes[out++] = buffer.get(index)
-                            rowBytes[out++] = buffer.get(index + 1)
-                        } else {
-                            rowBytes[out++] = 0
-                            rowBytes[out++] = 0
-                        }
+    FileOutputStream(file).use { rawOutput ->
+        BufferedOutputStream(rawOutput).use { output ->
+            for (y in 0 until height) {
+                val row = y * rowStride
+                var out = 0
+                for (x in 0 until width) {
+                    val index = row + x * pixelStride
+                    if (index + 1 < limit) {
+                        rowBytes[out++] = buffer.get(index)
+                        rowBytes[out++] = buffer.get(index + 1)
+                    } else {
+                        rowBytes[out++] = 0
+                        rowBytes[out++] = 0
                     }
-                    output.write(rowBytes)
                 }
+                output.write(rowBytes)
             }
-            rawOutput.fd.sync()
         }
-        KeplerJobMetadata.atomicReplace(temp, file)
-        committed = true
-    val expectedSize = width * height * 2L
-        val attrs = NoFollowFileSystem.inspect(file.toPath())
-        val size = (attrs as? NoFollowInspection.Present)?.value?.size() ?: -1L
-        if (size < expectedSize) {
-            error("RAW16 output invalid: ${file.absolutePath}, size=$size, expected=$expectedSize")
-        }
-    } finally {
-        if (!committed) runCatching { temp.delete() }
+        rawOutput.fd.sync()
     }
+    val expectedSize = width.toLong() * height.toLong() * 2L
+    verifyRaw16Payload(file, expectedSize)
+}
+
+/** Exact compact RAW16 payload contract: width * height packed 16-bit samples. */
+internal fun verifyRaw16Payload(file: File, expectedSize: Long): NoFollowFileSystem.StreamDigest {
+    val digest = NoFollowFileSystem.digestVerified(file)
+    check(digest.size == expectedSize) {
+        "RAW16 output invalid: ${file.absolutePath}, size=${digest.size}, expected=$expectedSize"
+    }
+    return digest
 }
 
 private class Raw16BytesToShorts(private val pixelCount: Int) : OutputStream() {

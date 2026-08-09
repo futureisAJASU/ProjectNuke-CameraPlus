@@ -22,6 +22,8 @@ package com.projectnuke.keplernightlab
 enum class RawDngSidecarStatus {
     /** The DNG sidecar was not requested for this frame. */
     NOT_REQUESTED,
+    /** The worker owns a requested DNG sidecar but has not completed its write. */
+    LOCAL_SAVE_PENDING,
     /** The DNG sidecar was successfully saved locally. */
     LOCAL_SAVED,
     /** The DNG sidecar local save failed. */
@@ -64,6 +66,9 @@ data class RawDngSidecarOutcome(
     companion object {
         fun notRequested(frameIndex: Int): RawDngSidecarOutcome =
             RawDngSidecarOutcome(frameIndex, RawDngSidecarStatus.NOT_REQUESTED, null, null, null)
+
+        fun localSavePending(frameIndex: Int, filename: String): RawDngSidecarOutcome =
+            RawDngSidecarOutcome(frameIndex, RawDngSidecarStatus.LOCAL_SAVE_PENDING, filename, null, null)
 
         fun localSaved(frameIndex: Int, filename: String): RawDngSidecarOutcome =
             RawDngSidecarOutcome(frameIndex, RawDngSidecarStatus.LOCAL_SAVED, filename, null, null)

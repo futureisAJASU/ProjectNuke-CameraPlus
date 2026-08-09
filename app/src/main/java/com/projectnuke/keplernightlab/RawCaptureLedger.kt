@@ -1,6 +1,7 @@
 package com.projectnuke.keplernightlab
 
 import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Immutable snapshot of RAW capture progress, published by the owner after every
@@ -234,14 +235,46 @@ internal class RawCaptureLedger<IMAGE, RESULT>(
         savedFrames++
         synchronized(lock) {
             rawFrameSaveTimesMs += completion.saveDurationMs
-            completion.frameEntry?.let { frameObjects.put(it) }
+            frameObjects.put(completion.frame.toJson())
         }
     }
 
     /** Adopts a failed frame's manifest entry (no saved-frame accounting). */
     fun adoptFailure(completion: RawSaveCompletion.Failed) {
-        synchronized(lock) { completion.frameEntry?.let { frameObjects.put(it) } }
+        synchronized(lock) { frameObjects.put(completion.frame.toJson()) }
     }
+
+    /** JSON serialization is owner-only; workers carry [RawFrameManifestData]. */
+    private fun RawFrameManifestData.toJson(): JSONObject = JSONObject()
+        .put("index", frameIndex)
+        .put("frameIndex", frameIndex)
+        .put("raw16File", raw16Filename ?: JSONObject.NULL)
+        .put("dngFile", dngFilename ?: JSONObject.NULL)
+        .put("dngSidecarStatus", dngSidecar.status.name)
+        .put("dngSidecarError", dngSidecar.failureDescription ?: JSONObject.NULL)
+        .put("timestampNs", timestampNs)
+        .put("cameraId", cameraId)
+        .put("zoomRatio", zoomRatio)
+        .put("selectedRoute", selectedRoute)
+        .put("actualRoute", actualRoute ?: JSONObject.NULL)
+        .put("requestedPhysicalCameraId", requestedPhysicalCameraId ?: JSONObject.NULL)
+        .put("activePhysicalId", activePhysicalId ?: JSONObject.NULL)
+        .put("finalRequestZoom", finalRequestZoom)
+        .put("cropApplied", cropApplied)
+        .put("cropActiveArraySource", cropActiveArraySource)
+        .put("cropRegion", cropRegion ?: JSONObject.NULL)
+        .put("exposureTimeNs", exposureTimeNs ?: JSONObject.NULL)
+        .put("sensitivityIso", sensitivityIso ?: JSONObject.NULL)
+        .put("frameDurationNs", frameDurationNs ?: JSONObject.NULL)
+        .put("rawWidth", rawWidth ?: JSONObject.NULL)
+        .put("rawHeight", rawHeight ?: JSONObject.NULL)
+        .put("rowStride", rowStride ?: JSONObject.NULL)
+        .put("pixelStride", pixelStride ?: JSONObject.NULL)
+        .put("dynamicBlackLevel", dynamicBlackLevel?.let { JSONArray(it) } ?: JSONObject.NULL)
+        .put("dynamicWhiteLevel", dynamicWhiteLevel ?: JSONObject.NULL)
+        .put("colorCorrectionGains", colorCorrectionGains ?: JSONObject.NULL)
+        .put("colorCorrectionTransform", colorCorrectionTransform ?: JSONObject.NULL)
+        .put("failureReason", failureDescription ?: JSONObject.NULL)
 
     fun rawSaveTotalMs(): Long = synchronized(lock) { rawFrameSaveTimesMs.sum() }
 

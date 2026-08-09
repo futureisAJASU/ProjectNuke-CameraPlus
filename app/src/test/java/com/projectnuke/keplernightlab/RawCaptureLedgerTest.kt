@@ -104,7 +104,6 @@ class RawCaptureLedgerTest {
     @Test
     fun adoptSuccessAccumulatesCountersManifestAndSaveTimes() {
         val owner = ledger()
-        val entry = JSONObject().put("index", 0).put("raw16File", "frame_00.raw16")
         owner.adoptSuccess(
             RawSaveCompletion.Success(
                 frameIndex = 0,
@@ -112,8 +111,7 @@ class RawCaptureLedgerTest {
                 raw16Filename = "frame_00.raw16",
                 raw16Bytes = 1024L,
                 saveDurationMs = 42L,
-                dngSidecar = RawDngSidecarOutcome.notRequested(0),
-                frameEntry = entry
+                dngSidecar = RawDngSidecarOutcome.notRequested(0)
             )
         )
         owner.adoptSuccess(
@@ -131,23 +129,20 @@ class RawCaptureLedgerTest {
         assertEquals(100L, owner.rawSaveTotalMs())
         assertEquals(50.0, owner.rawAverageSaveMs()!!, 0.0)
         val manifest = owner.frameObjectsSnapshot()
-        assertEquals(1, manifest.length())
+        assertEquals(2, manifest.length())
         assertEquals("frame_00.raw16", manifest.getJSONObject(0).getString("raw16File"))
     }
 
     @Test
     fun adoptFailureRecordsManifestEntryWithoutSavedFrameAccounting() {
         val owner = ledger()
-        val entry = JSONObject().put("index", 2).put("raw16File", JSONObject.NULL)
         owner.adoptFailure(
             RawSaveCompletion.Failed(
                 frameIndex = 2,
                 timestampNs = 9L,
-                raw16TempFile = null,
                 failureType = "encode threw",
                 failureMessage = "boom",
-                throwable = null,
-                frameEntry = entry
+                throwable = null
             )
         )
 

@@ -1,12 +1,11 @@
 package com.projectnuke.keplernightlab
 
-import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
+import kotlin.io.path.createTempDirectory
 
 /**
  * Tests for the immutable RAW save completion model.
@@ -61,14 +60,19 @@ class RawSaveCompletionTest {
         val completion = RawSaveCompletion.Failed(
             frameIndex = 3,
             timestampNs = 9999L,
-            raw16TempFile = File("/tmp/frame_03.raw16.tmp"),
             failureType = "encode-failed",
             failureMessage = failure.message ?: "encode failed",
-            throwable = failure
+            throwable = failure,
+            output = RawOutputOwnership(
+                tempFile = java.io.File("/tmp/frame_03.raw16.tmp"),
+                finalFile = null,
+                state = RawOutputState.TEMP,
+                verifiedBytes = null
+            )
         )
         assertEquals(3, completion.frameIndex)
         assertEquals(9999L, completion.timestampNs)
-        assertNotNull(completion.raw16TempFile)
+        assertEquals("frame_03.raw16.tmp", completion.output.tempFile?.name)
         assertEquals("encode-failed", completion.failureType)
         assertEquals("raw16 encoder returned false", completion.failureMessage)
         assertEquals(failure, completion.throwable)
@@ -82,12 +86,11 @@ class RawSaveCompletionTest {
         val completion = RawSaveCompletion.Failed(
             frameIndex = 5,
             timestampNs = 5555L,
-            raw16TempFile = null,
             failureType = "OutOfMemoryError",
             failureMessage = "Insufficient heap before file creation",
             throwable = null
         )
-        assertNull(completion.raw16TempFile)
+        assertEquals(null, completion.output.tempFile)
         assertEquals(null, completion.throwable)
     }
 
@@ -118,7 +121,7 @@ class RawSaveCompletionTest {
         // without an `else` branch.
         val values: List<RawSaveCompletion> = listOf(
             RawSaveCompletion.Success(0, 0L, "f.raw16", 0L, 0L, RawDngSidecarOutcome.notRequested(0)),
-            RawSaveCompletion.Failed(0, 0L, null, "x", "x", null),
+            RawSaveCompletion.Failed(0, 0L, "x", "x", null),
             RawSaveCompletion.Abandoned(0, 0L)
         )
         for (c in values) {
@@ -156,5 +159,20 @@ class RawSaveCompletionTest {
         task.run()
 
         assertEquals(1, disposed)
+    }
+
+    @Test
+    fun raw16PayloadRequiresExactPackedSize() {
+        val root = createTempDirectory("raw16-size").toFile()
+        try {
+            val exact = root.resolve("exact.raw16").apply { writeBytes(ByteArray(8)) }
+            assertEquals(8L, verifyRaw16Payload(exact, 8L).size)
+            val short = root.resolve("short.raw16").apply { writeBytes(ByteArray(7)) }
+            assertThrows(IllegalStateException::class.java) { verifyRaw16Payload(short, 8L) }
+            val oversized = root.resolve("oversized.raw16").apply { writeBytes(ByteArray(9)) }
+            assertThrows(IllegalStateException::class.java) { verifyRaw16Payload(oversized, 8L) }
+        } finally {
+            root.deleteRecursively()
+        }
     }
 }

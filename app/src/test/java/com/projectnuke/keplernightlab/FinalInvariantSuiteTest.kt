@@ -212,7 +212,6 @@ class FinalInvariantSuiteTest {
         val failed = RawSaveCompletion.Failed(
             frameIndex = 1,
             timestampNs = 1000L,
-            raw16TempFile = null,
             failureType = "encode-failed",
             failureMessage = "boom",
             throwable = null
