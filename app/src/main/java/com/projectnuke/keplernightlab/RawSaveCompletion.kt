@@ -12,18 +12,37 @@ internal enum class RawOutputState {
     NONE
 }
 
+internal enum class RawOutputCleanupStatus {
+    NOT_ATTEMPTED,
+    ABSENT,
+    DELETED,
+    DELETE_RETURNED_FALSE,
+    DELETE_THREW,
+    QUARANTINED,
+    QUARANTINE_FAILED,
+    ADOPTED
+}
+
 internal data class RawOutputCleanupOutcome(
     val attempted: Boolean,
     val succeeded: Boolean,
-    val failureDescription: String? = null
+    val failureDescription: String? = null,
+    val status: RawOutputCleanupStatus = when {
+        !attempted -> RawOutputCleanupStatus.NOT_ATTEMPTED
+        succeeded -> RawOutputCleanupStatus.DELETED
+        else -> RawOutputCleanupStatus.DELETE_THREW
+    }
 ) {
     companion object {
-        val NotNeeded = RawOutputCleanupOutcome(attempted = false, succeeded = true)
-        val Clean = RawOutputCleanupOutcome(attempted = true, succeeded = true)
+        val NotNeeded = RawOutputCleanupOutcome(false, true, status = RawOutputCleanupStatus.NOT_ATTEMPTED)
+        val Clean = RawOutputCleanupOutcome(true, true, status = RawOutputCleanupStatus.DELETED)
+        fun absent() = RawOutputCleanupOutcome(true, true, status = RawOutputCleanupStatus.ABSENT)
+        fun adopted() = RawOutputCleanupOutcome(true, true, status = RawOutputCleanupStatus.ADOPTED)
         fun failed(error: Throwable) = RawOutputCleanupOutcome(
             attempted = true,
             succeeded = false,
-            failureDescription = "${error.javaClass.simpleName}: ${error.message}"
+            failureDescription = "${error.javaClass.simpleName}: ${error.message}",
+            status = RawOutputCleanupStatus.DELETE_THREW
         )
     }
 }
@@ -181,6 +200,24 @@ internal sealed interface RawSaveCompletion {
         val output: RawOutputOwnership = RawOutputOwnership(null, null, RawOutputState.NONE, null),
         override val imageReleaseFailure: Throwable? = null
     ) : RawSaveCompletion
+}
+
+/** Settles the transferred Image before exposing the immutable completion. */
+internal fun settleRawSaveImage(
+    completion: RawSaveCompletion,
+    closeImage: () -> Unit
+): RawSaveCompletion {
+    val releaseFailure = try {
+        closeImage()
+        null
+    } catch (failure: Throwable) {
+        failure
+    }
+    return when (completion) {
+        is RawSaveCompletion.Success -> completion.copy(imageReleaseFailure = releaseFailure)
+        is RawSaveCompletion.Failed -> completion.copy(imageReleaseFailure = releaseFailure)
+        is RawSaveCompletion.Abandoned -> completion.copy(imageReleaseFailure = releaseFailure)
+    }
 }
 
 /**

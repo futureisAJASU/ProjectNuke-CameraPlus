@@ -153,6 +153,35 @@ class RawSaveCompletionTest {
     }
 
     @Test
+    fun imageReleaseFailureIsCapturedAfterSaveOutcomeForEveryCompletionKind() {
+        val failure = IllegalStateException("image close failed")
+        var closeCount = 0
+        fun close(): Unit {
+            closeCount++
+            throw failure
+        }
+        val success = settleRawSaveImage(
+            RawSaveCompletion.Success(0, 0L, "f.raw16", 8L, 1L, RawDngSidecarOutcome.notRequested(0)),
+            ::close
+        )
+        assertEquals(failure, success.imageReleaseFailure)
+        assertEquals(1, closeCount)
+
+        closeCount = 0
+        val failed = settleRawSaveImage(
+            RawSaveCompletion.Failed(1, 1L, "failed", "failed", failure),
+            ::close
+        )
+        assertEquals(failure, failed.imageReleaseFailure)
+        assertEquals(1, closeCount)
+
+        closeCount = 0
+        val abandoned = settleRawSaveImage(RawSaveCompletion.Abandoned(2, 2L), ::close)
+        assertEquals(failure, abandoned.imageReleaseFailure)
+        assertEquals(1, closeCount)
+    }
+
+    @Test
     fun completionPostRejectionReturnsOutputOwnershipToDisposer() {
         var disposed = 0
         val task = RawSaveTask(

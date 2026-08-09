@@ -73,8 +73,12 @@ data class RawDngSidecarOutcome(
         fun localSaved(frameIndex: Int, filename: String): RawDngSidecarOutcome =
             RawDngSidecarOutcome(frameIndex, RawDngSidecarStatus.LOCAL_SAVED, filename, null, null)
 
-        fun localSaveFailed(frameIndex: Int, failureDescription: String): RawDngSidecarOutcome =
-            RawDngSidecarOutcome(frameIndex, RawDngSidecarStatus.LOCAL_SAVE_FAILED, null, null, failureDescription)
+        fun localSaveFailed(
+            frameIndex: Int,
+            failureDescription: String,
+            filename: String? = null
+        ): RawDngSidecarOutcome =
+            RawDngSidecarOutcome(frameIndex, RawDngSidecarStatus.LOCAL_SAVE_FAILED, filename, null, failureDescription)
 
         fun publicExportPending(frameIndex: Int, localFilename: String): RawDngSidecarOutcome =
             RawDngSidecarOutcome(frameIndex, RawDngSidecarStatus.PUBLIC_EXPORT_PENDING, localFilename, null, null)
