@@ -41,6 +41,8 @@ internal data class RawTerminalSnapshot(
     val metadata: RawTerminalOperationOutcome,
     val status: RawTerminalOperationOutcome,
     val callback: RawTerminalOperationOutcome,
+    val callbackDispatch: RawTerminalOperationOutcome = RawTerminalOperationOutcome.NotRequested,
+    val callbackExecution: RawTerminalOperationOutcome = RawTerminalOperationOutcome.NotRequested,
     val cleanup: RawProductionCleanupSnapshot?,
     val imageReleaseFailures: List<RawImageReleaseFailure> = emptyList(),
     val outputCleanupFailures: List<RawOutputCleanupFailure> = emptyList()

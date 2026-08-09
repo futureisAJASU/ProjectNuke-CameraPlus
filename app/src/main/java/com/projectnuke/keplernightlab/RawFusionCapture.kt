@@ -155,16 +155,27 @@ fun captureRawBurstForFusion(
                 Log.e(RAW_PIPELINE_LOG_TAG, "RAW status callback failed", callbackFailure)
             }
         }
+    val rawCallbackDispatchOutcome = AtomicReference<RawTerminalOperationOutcome>(RawTerminalOperationOutcome.NotRequested)
+    val rawCallbackExecutionOutcome = AtomicReference<RawTerminalOperationOutcome>(RawTerminalOperationOutcome.NotRequested)
+    val republishRawTerminalSnapshot = AtomicReference<(() -> Unit)?>(null)
     fun postMainOrRun(action: () -> Unit): Boolean {
         val posted = mainHandler.post {
             try {
                 action()
+                rawCallbackExecutionOutcome.set(RawTerminalOperationOutcome.Succeeded)
             } catch (callbackFailure: Throwable) {
                 Log.e(RAW_PIPELINE_LOG_TAG, "RAW terminal callback failed", callbackFailure)
+                rawCallbackExecutionOutcome.set(RawTerminalOperationOutcome.Failed(callbackFailure))
             }
+            republishRawTerminalSnapshot.get()?.invoke()
         }
         if (!posted) {
             Log.w(RAW_PIPELINE_LOG_TAG, "Main dispatch rejected for RAW callback/action")
+            rawCallbackDispatchOutcome.set(
+                RawTerminalOperationOutcome.Failed(IllegalStateException("RAW callback dispatch rejected"))
+            )
+        } else {
+            rawCallbackDispatchOutcome.set(RawTerminalOperationOutcome.Succeeded)
         }
         return posted
     }
@@ -220,6 +231,8 @@ fun captureRawBurstForFusion(
             metadata = RawTerminalOperationOutcome.NotRequested,
             status = RawTerminalOperationOutcome.NotRequested,
             callback = RawTerminalOperationOutcome.NotRequested,
+            callbackDispatch = rawCallbackDispatchOutcome.get(),
+            callbackExecution = rawCallbackExecutionOutcome.get(),
             cleanup = null,
             imageReleaseFailures = emptyList()
             , outputCleanupFailures = emptyList()
@@ -233,6 +246,8 @@ fun captureRawBurstForFusion(
         metadata: RawTerminalOperationOutcome = rawTerminalSnapshotStore.get().metadata,
         status: RawTerminalOperationOutcome = rawTerminalSnapshotStore.get().status,
         callback: RawTerminalOperationOutcome = rawTerminalSnapshotStore.get().callback,
+        callbackDispatch: RawTerminalOperationOutcome = rawTerminalSnapshotStore.get().callbackDispatch,
+        callbackExecution: RawTerminalOperationOutcome = rawTerminalSnapshotStore.get().callbackExecution,
         cleanup: RawProductionCleanupSnapshot? = rawTerminalSnapshotStore.get().cleanup,
         imageReleaseFailures: List<RawImageReleaseFailure> = rawTerminalSnapshotStore.get().imageReleaseFailures
         , outputCleanupFailures: List<RawOutputCleanupFailure> = rawTerminalSnapshotStore.get().outputCleanupFailures
@@ -248,10 +263,29 @@ fun captureRawBurstForFusion(
                 metadata = metadata,
                 status = status,
                 callback = callback,
+                callbackDispatch = callbackDispatch,
+                callbackExecution = callbackExecution,
                 cleanup = cleanup,
                 imageReleaseFailures = imageReleaseFailures
                 , outputCleanupFailures = outputCleanupFailures
             )
+        )
+    }
+    republishRawTerminalSnapshot.set {
+        val current = rawTerminalSnapshotStore.get()
+        publishRawTerminalSnapshot(
+            phase = current.phase,
+            reason = current.reason,
+            settlementFailure = current.settlementFailure,
+            motion = current.motion,
+            metadata = current.metadata,
+            status = current.status,
+            callback = current.callback,
+            callbackDispatch = rawCallbackDispatchOutcome.get(),
+            callbackExecution = rawCallbackExecutionOutcome.get(),
+            cleanup = current.cleanup,
+            imageReleaseFailures = current.imageReleaseFailures,
+            outputCleanupFailures = current.outputCleanupFailures
         )
     }
     fun recordImageReleaseFailure(frameIndex: Int?, timestampNs: Long?, reason: String, failure: Throwable) {
@@ -805,6 +839,8 @@ fun captureRawBurstForFusion(
                             metadata = metadataOutcome,
                             status = statusOutcome,
                             callback = callbackOutcome,
+                            callbackDispatch = rawCallbackDispatchOutcome.get(),
+                            callbackExecution = rawCallbackExecutionOutcome.get(),
                             cleanup = rawTerminalSnapshotStore.get().cleanup
                         )
                         publishRawTerminalSnapshot(RawTerminalSettlementPhase.SETTLED, request.reason)
