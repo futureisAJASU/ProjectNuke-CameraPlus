@@ -159,11 +159,12 @@ internal object NoFollowFileSystem {
                     fileKey = after.fileKey(),
                     descriptorIdentity = openedDescriptor,
                     sha256 = digestHex,
-                    strength = if (after.fileKey() != null && openedDescriptor != null) {
-                        StableIdentityStrength.OBJECT_IDENTITY
-                    } else {
-                        StableIdentityStrength.CONTENT_IDENTITY
-                    }
+                    // A descriptor probe is evidence about the opened handle,
+                    // but this provider-neutral API cannot prove that its
+                    // identity namespace is comparable to BasicFileAttributes.fileKey.
+                    // Keep the token content-strength unless an injected/provider
+                    // implementation supplies a proven object correspondence.
+                    strength = StableIdentityStrength.CONTENT_IDENTITY
                 )
             )
         }

@@ -119,6 +119,17 @@ class NoFollowFileSystemTest {
             root.deleteRecursively()
         }
     }
+
+    @Test
+    fun providerNeutralStreamNeverMintsObjectIdentityFromUncorrelatedProbe() {
+        val root = createTempDirectory("kepler-nofollow-content-strength").toFile()
+        try {
+            val token = NoFollowFileSystem.stableIdentity(root.resolve("payload").apply { writeText("bytes") })
+            assertEquals(NoFollowFileSystem.StableIdentityStrength.CONTENT_IDENTITY, token.strength)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
     @Test
     fun childSymlinkIsNotListedOrCounted() {
         val root = createTempDirectory("kepler-nofollow").toFile()
