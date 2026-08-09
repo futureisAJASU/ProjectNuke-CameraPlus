@@ -111,7 +111,8 @@ class FinalInvariantSuiteTest {
         assertTrue(noFollowIdentityMatches("(dev=1,ino=1)", "(dev=1,ino=1)", 0L, 0L, 0L, 0L))
         // fileKey mismatch: different keys -> fail closed even if stat matches.
         assertNotEquals(true, noFollowIdentityMatches("(dev=1,ino=1)", "(dev=1,ino=2)", 64L, 64L, 1000L, 1000L))
-        // Null fileKeys: fall back to size+mtime (both must match to be accepted).
+        // The legacy stat helper can report matching fields, but it is not used
+        // as a stable-identity proof when file keys are unavailable.
         assertTrue(noFollowIdentityMatches(null, null, 100L, 100L, 1000L, 1000L))
         assertEquals(false, noFollowIdentityMatches(null, null, 100L, 101L, 1000L, 1000L))
     }

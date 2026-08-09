@@ -142,28 +142,13 @@ internal object RealYuvFinalFileVerifier : YuvFinalFileVerifier {
     private val PNG_SIGNATURE = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
 
     override fun verify(finalFile: File, frameIndex: Int): Boolean {
-        val before = when (val inspection = NoFollowFileSystem.inspect(finalFile.toPath())) {
-            NoFollowInspection.Absent -> return false
-            is NoFollowInspection.InspectionFailed -> return false
-            is NoFollowInspection.Present -> inspection.value
+        val digest = try {
+            NoFollowFileSystem.digestVerified(finalFile)
+        } catch (_: Throwable) {
+            return false
         }
-        if (!before.isRegularFile || before.isSymbolicLink()) return false
-        val header = ByteArray(8)
-        var read = 0
-        val signatureMatch = try {
-            Files.newInputStream(finalFile.toPath(), LinkOption.NOFOLLOW_LINKS).use { input ->
-                while (read < header.size) {
-                    val count = input.read(header, read, header.size - read)
-                    if (count <= 0) break
-                    read += count
-                }
-                read == header.size && header.contentEquals(PNG_SIGNATURE)
-            }
-        } catch (t: Throwable) {
-            false
-        }
-        if (!signatureMatch) return false
-        return NoFollowFileSystem.revalidate(finalFile.toPath(), before)
+        return digest.prefix.size >= PNG_SIGNATURE.size &&
+            digest.prefix.copyOf(PNG_SIGNATURE.size).contentEquals(PNG_SIGNATURE)
     }
 }
 

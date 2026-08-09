@@ -10,6 +10,8 @@ import java.nio.file.Path
 import java.nio.file.attribute.BasicFileAttributes
 import java.io.OutputStream
 import java.io.FileInputStream
+import java.io.InputStream
+import java.io.ByteArrayOutputStream
 import java.security.MessageDigest
 
 internal fun noFollowIdentityMatches(
@@ -22,15 +24,22 @@ internal fun noFollowIdentityMatches(
 ): Boolean = if (expectedFileKey != null && actualFileKey != null) {
     expectedFileKey == actualFileKey
 } else {
+    // This is only a stat-equality helper retained for callers that merely
+    // report a change.  It is NOT a stable-identity proof when file keys are
+    // absent; correctness-sensitive callers use StableFileIdentity below.
     expectedSize == actualSize && expectedModifiedMillis == actualModifiedMillis
 }
 
-/** Descriptor identity probe for Android providers that omit BasicFileAttributes.fileKey(). */
-private fun descriptorIdentity(path: Path): String? = runCatching {
-    FileInputStream(path.toFile()).use { stream ->
+/**
+ * Best-effort descriptor identity probe.  It is deliberately given the exact
+ * stream that supplies authoritative content; opening a second FileInputStream
+ * here would introduce a replacement window.
+ */
+private fun descriptorIdentity(input: InputStream): String? = runCatching {
+    (input as? FileInputStream)?.let { stream ->
         val os = Class.forName("android.system.Os")
         val stat = os.getMethod("fstat", java.io.FileDescriptor::class.java)
-            .invoke(null, stream.fd)
+        .invoke(null, stream.fd)
         val dev = stat.javaClass.getField("st_dev").getLong(stat)
         val ino = stat.javaClass.getField("st_ino").getLong(stat)
         "$dev:$ino"
@@ -45,13 +54,31 @@ internal sealed interface NoFollowInspection<out T> {
 
 internal object NoFollowFileSystem {
     data class StreamDigest(val size: Long, val sha256: String, val prefix: ByteArray)
+    /**
+     * Evidence produced by one authoritative no-follow stream read.  A null
+     * fileKey/descriptor means this represents stable *content* (sha256), not
+     * a proof that a provider kept the same underlying file object.
+     */
+    data class StableFileIdentity(
+        val isRegularFile: Boolean,
+        val size: Long,
+        val modifiedMillis: Long,
+        val fileKey: Any?,
+        val descriptorIdentity: String?,
+        val sha256: String
+    )
+
+    private data class VerifiedRead(
+        val digest: StreamDigest,
+        val identity: StableFileIdentity
+    )
     private object DiscardOutput : OutputStream() {
         override fun write(b: Int) = Unit
         override fun write(buffer: ByteArray, offset: Int, length: Int) = Unit
     }
 
-    /** Streams a stable regular file without following links; never loads a RAW/DNG into memory. */
-    fun copyVerified(file: File, output: OutputStream): StreamDigest {
+    /** Shared streaming engine for every verified read/copy operation. */
+    private fun streamVerified(file: File, output: OutputStream): VerifiedRead {
         val path = file.toPath()
         val before = when (val inspection = inspect(path)) {
             NoFollowInspection.Absent -> throw java.io.FileNotFoundException(file.absolutePath)
@@ -59,12 +86,12 @@ internal object NoFollowFileSystem {
             is NoFollowInspection.Present -> inspection.value
         }
         require(before.isRegularFile && !before.isSymbolicLink()) { "Unsafe file: ${file.absolutePath}" }
-        val beforeDescriptor = if (before.fileKey() == null) descriptorIdentity(path) else null
         val digest = MessageDigest.getInstance("SHA-256")
         val prefix = ByteArray(16)
         var prefixCount = 0
         var size = 0L
         Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS).use { input ->
+            val openedDescriptor = descriptorIdentity(input)
             val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
             while (true) {
                 val read = input.read(buffer)
@@ -78,83 +105,65 @@ internal object NoFollowFileSystem {
                 output.write(buffer, 0, read)
                 size += read
             }
+            val digestHex = digest.digest().joinToString("") { "%02x".format(it) }
+            val after = when (val inspection = inspect(path)) {
+                is NoFollowInspection.Present -> inspection.value
+                else -> null
+            }
+            require(after != null && after.isRegularFile && !after.isSymbolicLink()) {
+                "File identity changed during read: ${file.absolutePath}"
+            }
+            val sameKey = before.fileKey() != null && after.fileKey() != null &&
+                before.fileKey() == after.fileKey()
+            val sameStat = before.size() == after.size() &&
+                before.lastModifiedTime().toMillis() == after.lastModifiedTime().toMillis()
+            // Without a provider file key we can prove only stable content.  A
+            // second no-follow stream hashes the current pathname; equal bytes
+            // make the content fence explicit rather than pretending stat data
+            // is object identity.
+            val sameContent = if (sameKey) true else {
+                digestAtPath(path) == digestHex
+            }
+            require((sameKey || sameContent) && sameStat) {
+                "File identity changed during read: ${file.absolutePath}"
+            }
+            val streamDigest = StreamDigest(size, digestHex, prefix.copyOf(prefixCount))
+            return VerifiedRead(
+                digest = streamDigest,
+                identity = StableFileIdentity(
+                    isRegularFile = true,
+                    size = size,
+                    modifiedMillis = after.lastModifiedTime().toMillis(),
+                    fileKey = after.fileKey(),
+                    descriptorIdentity = openedDescriptor,
+                    sha256 = digestHex
+                )
+            )
         }
-        val digestHex = digest.digest().joinToString("") { "%02x".format(it) }
-        val after = when (val inspection = inspect(path)) {
-            is NoFollowInspection.Present -> inspection.value
-            else -> null
-        }
-        require(after != null && after.isRegularFile && !after.isSymbolicLink()) {
-            "File identity changed during read: ${file.absolutePath}"
-        }
-        val sameStat = noFollowIdentityMatches(
-            before.fileKey(), after.fileKey(), before.size(), after.size(),
-            before.lastModifiedTime().toMillis(), after.lastModifiedTime().toMillis()
-        )
-        // Android providers may omit fileKey(). A descriptor-bound read has already held the
-        // opened inode while streaming; add a bounded post-read fingerprint fence for providers
-        // without keys so same-size/mtime replacement with different content cannot be adopted.
-        val sameContent = if (before.fileKey() == null || after.fileKey() == null) {
-            runCatching {
-                val verify = MessageDigest.getInstance("SHA-256")
-                Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS).use { input ->
-                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read <= 0) break
-                        verify.update(buffer, 0, read)
-                    }
-                }
-                verify.digest().joinToString("") { "%02x".format(it) } == digestHex
-            }.getOrDefault(false)
-        } else true
-        val descriptorStable = if (before.fileKey() == null || after.fileKey() == null) {
-            val afterDescriptor = descriptorIdentity(path)
-            if (beforeDescriptor != null && afterDescriptor != null) beforeDescriptor == afterDescriptor else true
-        } else true
-        require(sameStat && sameContent && descriptorStable) { "File identity changed during read: ${file.absolutePath}" }
-        return StreamDigest(size, digestHex, prefix.copyOf(prefixCount))
+        error("Input stream closed before verified read completed")
     }
 
-    fun digestVerified(file: File): StreamDigest = copyVerified(file, DiscardOutput)
-    fun readBytesVerified(file: File): ByteArray = when (val inspection = inspect(file.toPath())) {
-        NoFollowInspection.Absent -> throw java.io.FileNotFoundException(file.absolutePath)
-        is NoFollowInspection.InspectionFailed -> throw inspection.exception
-        is NoFollowInspection.Present -> {
-            val attrs = inspection.value
-            require(attrs.isRegularFile && !attrs.isSymbolicLink()) { "Unsafe file: ${file.absolutePath}" }
-            val bytes = Files.newInputStream(file.toPath(), LinkOption.NOFOLLOW_LINKS).use { it.readBytes() }
-            val after = when (val current = inspect(file.toPath())) {
-                is NoFollowInspection.Present -> current.value
-                else -> error("File changed during read: ${file.absolutePath}")
+    private fun digestAtPath(path: Path): String? = runCatching {
+        val digest = MessageDigest.getInstance("SHA-256")
+        Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS).use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                digest.update(buffer, 0, read)
             }
-            val sameStat = noFollowIdentityMatches(
-                attrs.fileKey(), after.fileKey(), attrs.size(), after.size(),
-                attrs.lastModifiedTime().toMillis(), after.lastModifiedTime().toMillis()
-            )
-            // Content fence for null-fileKey providers: same size/mtime + different content must fail.
-            val sameContent = if (attrs.fileKey() == null || after.fileKey() == null) {
-                runCatching {
-                    val verify = java.security.MessageDigest.getInstance("SHA-256")
-                    Files.newInputStream(file.toPath(), LinkOption.NOFOLLOW_LINKS).use { input ->
-                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read <= 0) break
-                            verify.update(buffer, 0, read)
-                        }
-                    }
-                    val contentDigest = verify.digest().joinToString("") { "%02x".format(it) }
-                    val beforeDigest = java.security.MessageDigest.getInstance("SHA-256").run {
-                        update(bytes)
-                        digest().joinToString("") { "%02x".format(it) }
-                    }
-                    contentDigest == beforeDigest
-                }.getOrDefault(false)
-            } else true
-            require(sameStat && sameContent) { "File identity changed during read: ${file.absolutePath}" }
-            bytes
         }
+        digest.digest().joinToString("") { "%02x".format(it) }
+    }.getOrNull()
+
+    /** Streams a stable regular file without following links; never loads a RAW/DNG into memory. */
+    fun copyVerified(file: File, output: OutputStream): StreamDigest = streamVerified(file, output).digest
+
+    fun digestVerified(file: File): StreamDigest = copyVerified(file, DiscardOutput)
+    fun stableIdentity(file: File): StableFileIdentity = streamVerified(file, DiscardOutput).identity
+    fun readBytesVerified(file: File): ByteArray = ByteArrayOutputStream().use { output ->
+        streamVerified(file, output)
+        output.toByteArray()
     }
 
     fun readTextVerified(file: File): String = readBytesVerified(file).toString(Charsets.UTF_8)
@@ -192,6 +201,11 @@ internal object NoFollowFileSystem {
         NoFollowInspection.InspectionFailed(error)
     }
 
+    /**
+     * Legacy stat-only revalidation.  It is fail-closed on providers without a
+     * file key because size/mtime cannot prove identity.  New correctness
+     * callers must retain [StableFileIdentity] from [stableIdentity].
+     */
     fun revalidate(path: Path, expected: BasicFileAttributes): Boolean = when (val current = inspect(path)) {
         NoFollowInspection.Absent -> false
         is NoFollowInspection.InspectionFailed -> false
@@ -201,11 +215,28 @@ internal object NoFollowFileSystem {
                 actual.isDirectory == expected.isDirectory &&
                 actual.isRegularFile == expected.isRegularFile &&
                 actual.isOther == expected.isOther &&
-                noFollowIdentityMatches(
-                    expected.fileKey(), actual.fileKey(), expected.size(), actual.size(),
-                    expected.lastModifiedTime().toMillis(), actual.lastModifiedTime().toMillis()
-                )
+                expected.fileKey() != null && actual.fileKey() != null &&
+                expected.fileKey() == actual.fileKey()
         }
+    }
+
+    /**
+     * Revalidates a token emitted by the authoritative stream read.  Providers
+     * with file keys get object identity; providers without them get a fresh
+     * no-follow digest comparison, i.e. stable content rather than a false
+     * object-identity claim.
+     */
+    fun revalidate(path: Path, expected: StableFileIdentity): Boolean {
+        val current = try {
+            stableIdentity(path.toFile())
+        } catch (_: Exception) {
+            return false
+        }
+        if (!current.isRegularFile || current.size != expected.size) return false
+        if (expected.fileKey != null && current.fileKey != null) {
+            return expected.fileKey == current.fileKey
+        }
+        return current.sha256 == expected.sha256
     }
 
     // Directory-stream providers on some Android/Windows filesystems do not expose file keys.

@@ -51,11 +51,25 @@ class NoFollowFileSystemTest {
     }
 
     @Test
-    fun sameSizeMtimeDifferentContentFailsWhenFileKeysAreAbsent() {
-        // null/null + matching size + matching mtime -> STILL matches
-        // (the stat fallback accepts this; callers that need stronger
-        // guarantees must layer a content fingerprint on top).
+    fun statHelperDoesNotClaimStableIdentityWhenFileKeysAreAbsent() {
+        // This legacy helper is only stat equality. Correctness-sensitive
+        // callers use StableFileIdentity, which carries a content digest.
         assertTrue(noFollowIdentityMatches(null, null, 64L, 64L, 500L, 500L))
+    }
+
+    @Test
+    fun stableIdentityRejectsSameSizeSameMtimeReplacementWithoutFileKey() {
+        val root = createTempDirectory("kepler-nofollow-token").toFile()
+        try {
+            val file = root.resolve("payload.raw16").apply { writeText("AAAA") }
+            val baseline = NoFollowFileSystem.stableIdentity(file)
+            file.writeText("BBBB")
+            val nullKeyToken = baseline.copy(fileKey = null, descriptorIdentity = null)
+
+            assertFalse(NoFollowFileSystem.revalidate(file.toPath(), nullKeyToken))
+        } finally {
+            root.deleteRecursively()
+        }
     }
     @Test
     fun childSymlinkIsNotListedOrCounted() {

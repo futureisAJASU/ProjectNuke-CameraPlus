@@ -3148,13 +3148,12 @@ private fun decodeNativeRgbaPreview(
 ): Bitmap? {
     if (width <= 0 || height <= 0) return null
     val expectedBytes = width.toLong() * height.toLong() * 4L
-    val fileAttributes = when (val inspection = NoFollowFileSystem.inspect(file.toPath())) {
-        is NoFollowInspection.Present -> inspection.value
-        else -> return null
+    val identity = try {
+        NoFollowFileSystem.stableIdentity(file)
+    } catch (_: Exception) {
+        return null
     }
-    if (!fileAttributes.isRegularFile || fileAttributes.isSymbolicLink() ||
-        fileAttributes.size() != expectedBytes ||
-        !NoFollowFileSystem.revalidate(file.toPath(), fileAttributes)) return null
+    if (!identity.isRegularFile || identity.size != expectedBytes) return null
     val scale = max(1, max(width, height) / maxDimension)
     val outWidth = max(1, width / scale)
     val outHeight = max(1, height / scale)
@@ -3181,7 +3180,7 @@ private fun decodeNativeRgbaPreview(
         bitmap.recycle()
         throw t
     }
-    if (!NoFollowFileSystem.revalidate(file.toPath(), fileAttributes)) {
+    if (!NoFollowFileSystem.revalidate(file.toPath(), identity)) {
         bitmap.recycle()
         return null
     }
@@ -3189,15 +3188,15 @@ private fun decodeNativeRgbaPreview(
 }
 
 private fun decodeLatestResultPreview(file: File, maxDimension: Int = 1280): Bitmap? {
-    val fileAttributes = when (val inspection = NoFollowFileSystem.inspect(file.toPath())) {
-        is NoFollowInspection.Present -> inspection.value
-        else -> return null
+    val identity = try {
+        NoFollowFileSystem.stableIdentity(file)
+    } catch (_: Exception) {
+        return null
     }
-    if (!fileAttributes.isRegularFile || fileAttributes.isSymbolicLink() ||
-        !NoFollowFileSystem.revalidate(file.toPath(), fileAttributes)) return null
+    if (!identity.isRegularFile) return null
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     BitmapFactory.decodeFile(file.absolutePath, bounds)
-    if (!NoFollowFileSystem.revalidate(file.toPath(), fileAttributes)) return null
+    if (!NoFollowFileSystem.revalidate(file.toPath(), identity)) return null
     if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
 
     var sampleSize = 1
@@ -3211,7 +3210,7 @@ private fun decodeLatestResultPreview(file: File, maxDimension: Int = 1280): Bit
         file.absolutePath,
         BitmapFactory.Options().apply { inSampleSize = sampleSize }
     )
-    if (bitmap != null && !NoFollowFileSystem.revalidate(file.toPath(), fileAttributes)) {
+    if (bitmap != null && !NoFollowFileSystem.revalidate(file.toPath(), identity)) {
         bitmap.recycle()
         return null
     }
