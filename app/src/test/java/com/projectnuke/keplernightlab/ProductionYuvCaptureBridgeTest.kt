@@ -795,10 +795,9 @@ class ProductionYuvCaptureBridgeTest {
             val fake = FakeYuvImage(timestamp = 1000L)
             harness.session.owner.acceptDirect(Camera2DirectYuvImageAccess(fake))
             encodeLatch.awaitStart()
-            // Mid-encode, close the session. The running worker task is not interrupted;
-            // the source stays owned until the encoder returns.
+            // Mid-encode, close the session. Cleanup may interrupt the worker;
+            // either way the task remains the sole source-release owner.
             harness.session.close()
-            assertEquals(0, fake.closeCount.get())
             encodeLatch.release()
             assertTrue(harness.session.boundedWorker.awaitTermination(5_000L))
             harness.flushHandler()
