@@ -208,13 +208,19 @@ class YuvCaptureOwnerTest {
                 null to null
             },
             onCaptureComplete = { file ->
-                if (callbackBodyFailure) throw IllegalStateException("injected callback body failure")
+                if (callbackBodyFailure) {
+                    callbackLatch.countDown()
+                    throw IllegalStateException("injected callback body failure")
+                }
                 onCaptureCompleteCount.incrementAndGet()
                 capturedFile.set(file)
                 callbackLatch.countDown()
             },
             onCaptureError = { msg, _ ->
-                if (callbackBodyFailure) throw IllegalStateException("injected callback body failure")
+                if (callbackBodyFailure) {
+                    callbackLatch.countDown()
+                    throw IllegalStateException("injected callback body failure")
+                }
                 onCaptureErrorCount.incrementAndGet()
                 errorMessage.set(msg)
                 callbackLatch.countDown()
@@ -327,6 +333,7 @@ class YuvCaptureOwnerTest {
             val access = ThrowingBufferedAccess()
             harness.session.owner.acceptBuffered(access)
             val status = harness.awaitTerminal()
+            harness.awaitCallback()
             assertEquals(CaptureTerminalStatus.FAILED, status)
             harness.awaitCallback()
             assertEquals(1, access.releaseCount.get())
@@ -800,6 +807,7 @@ class YuvCaptureOwnerTest {
     @Test
     fun callbackDispatchRejectionNeverRunsCallbackInline() {
         val callbackRan = AtomicInteger(0)
+        val terminalLatch = CountDownLatch(1)
         val dir: File = Files.createTempDirectory("yuv-cb-reject").toFile()
         val handlerThread = android.os.HandlerThread("yuv-cb-reject").apply { start() }
         val handler = android.os.Handler(handlerThread.looper)
@@ -824,6 +832,11 @@ class YuvCaptureOwnerTest {
                 }
             ),
             dispatchCallback = CallbackDispatcher { false },
+            writeJobJson = { status, _, _ ->
+                if (status in setOf("CAPTURE_COMPLETE", "CAPTURE_PARTIAL", "CAPTURE_FAILED", "CAPTURE_TIMEOUT", "CAPTURE_CANCELLED")) {
+                    terminalLatch.countDown()
+                }
+            },
             onCaptureComplete = { callbackRan.incrementAndGet() },
             onCaptureError = { _, _ -> callbackRan.incrementAndGet() },
             productionResourceCoordinator = YuvProductionResourceCoordinator(
@@ -834,19 +847,11 @@ class YuvCaptureOwnerTest {
         )
         try {
             session.owner.acceptBuffered(FakeBufferedAccess(1000L))
-            // Wait for terminal settlement via phase observation (callback is rejected, so
-            // we cannot wait on the callback itself).
-            var settled = false
-            repeat(200) {
-                val drain = CountDownLatch(1)
-                handler.post(Runnable { drain.countDown() })
-                drain.await(2, TimeUnit.SECONDS)
-                if (session.owner.terminalSettlementPhase() == TerminalSettlementPhase.SETTLED) {
-                    settled = true
-                    return@repeat
-                }
-            }
-            assertTrue("terminal phase is not SETTLED", settled)
+            // Metadata publication is the deterministic terminal barrier even
+            // when the user callback dispatcher rejects the callback.
+            assertTrue(terminalLatch.await(10, TimeUnit.SECONDS))
+            flushHandler(handler)
+            assertEquals(TerminalSettlementPhase.SETTLED, session.owner.terminalSettlementPhase())
             assertEquals("rejected callback must never execute inline", 0, callbackRan.get())
             assertEquals(CallbackState.DISPATCH_REJECTED, session.owner.callbackState())
             assertEquals(CaptureTerminalStatus.SUCCESS, session.terminalState.status())
@@ -883,22 +888,8 @@ class YuvCaptureOwnerTest {
      * adoption event -> settleTerminal) without closing the worker prematurely.
      */
     private fun waitForSettled(harness: Harness) {
-        // Drain the handler until the terminal phase reaches SETTLED. Each drain
-        // processes one generation of enqueued work. The buffered path needs
-        // multiple generations, so we drain repeatedly.
-        var settled = false
-        repeat(200) {
-            val drain = CountDownLatch(1)
-            harness.handler.post(Runnable { drain.countDown() })
-            drain.await(2, TimeUnit.SECONDS)
-            if (harness.session.owner.terminalSettlementPhase() == TerminalSettlementPhase.SETTLED) {
-                settled = true
-                return@repeat
-            }
-        }
-        assertTrue("terminal phase is not SETTLED", settled)
-        // Give the callback a chance to fire.
-        harness.callbackLatch.await(2, TimeUnit.SECONDS)
+        assertTrue("terminal callback did not publish", harness.callbackLatch.await(10, TimeUnit.SECONDS))
+        assertEquals(TerminalSettlementPhase.SETTLED, harness.session.owner.terminalSettlementPhase())
         harness.flushHandler()
     }
 

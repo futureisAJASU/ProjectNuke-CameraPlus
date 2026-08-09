@@ -13,7 +13,7 @@ import org.junit.Test
 /** Production queue/settlement seam tests used by both Camera2 capture owners. */
 class ColorFusionRawFusionCaptureTimeoutTest {
     @Test
-    fun productionYuvOwnerDiscardsBlockedPngCompletionAfterTimeout() {
+    fun boundedWorkerDiscardsBlockedPngCompletionAfterTimeout() {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val terminal = CaptureTerminalState()
@@ -22,13 +22,14 @@ class ColorFusionRawFusionCaptureTimeoutTest {
         try {
             assertTrue(worker.submit(Runnable {
                 entered.countDown()
-                release.await(2, TimeUnit.SECONDS)
+                assertTrue(release.await(2, TimeUnit.SECONDS))
                 if (terminal.status() == CaptureTerminalStatus.ACTIVE) adopted.set(true)
             }))
             assertTrue(entered.await(2, TimeUnit.SECONDS))
             assertTrue(terminal.claim(CaptureTerminalStatus.TIMED_OUT))
             release.countDown()
-            worker.awaitTermination(2_000L)
+            worker.close()
+            assertTrue(worker.awaitTermination(2_000L))
             assertFalse(adopted.get())
         } finally {
             worker.close()
@@ -36,7 +37,7 @@ class ColorFusionRawFusionCaptureTimeoutTest {
     }
 
     @Test
-    fun productionRawOwnerDiscardsBlockedDngCompletionAfterCancellation() {
+    fun boundedWorkerDiscardsBlockedDngCompletionAfterCancellation() {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val terminal = CaptureTerminalState()
@@ -45,13 +46,14 @@ class ColorFusionRawFusionCaptureTimeoutTest {
         try {
             assertTrue(worker.submit(Runnable {
                 entered.countDown()
-                release.await(2, TimeUnit.SECONDS)
+                assertTrue(release.await(2, TimeUnit.SECONDS))
                 if (terminal.status() == CaptureTerminalStatus.ACTIVE) adopted.set(true)
             }))
             assertTrue(entered.await(2, TimeUnit.SECONDS))
             assertTrue(terminal.claim(CaptureTerminalStatus.CANCELLED))
             release.countDown()
-            worker.awaitTermination(2_000L)
+            worker.close()
+            assertTrue(worker.awaitTermination(2_000L))
             assertFalse(adopted.get())
         } finally {
             worker.close()
@@ -88,7 +90,7 @@ class ColorFusionRawFusionCaptureTimeoutTest {
         try {
             assertTrue(worker.submit(Runnable {
                 entered.countDown()
-                release.await(2, TimeUnit.SECONDS)
+                assertTrue(release.await(2, TimeUnit.SECONDS))
             }))
             assertTrue(entered.await(2, TimeUnit.SECONDS))
             assertTrue(terminal.compareAndSet(false, true))
@@ -108,7 +110,7 @@ class ColorFusionRawFusionCaptureTimeoutTest {
         try {
             assertTrue(worker.submit(Runnable {
                 entered.countDown()
-                release.await(2, TimeUnit.SECONDS)
+                assertTrue(release.await(2, TimeUnit.SECONDS))
             }))
             assertTrue(entered.await(2, TimeUnit.SECONDS))
             worker.submit(Runnable { adopted.set(true) })

@@ -23,7 +23,7 @@ import org.junit.Test
 class FinalInvariantSuiteTest {
 
     @Test
-    fun yuvSessionReachesSuccessAndPublishesConsistentSnapshot() {
+    fun yuvSessionStartsActiveWithConsistentEmptySnapshot() {
         val dir = Files.createTempDirectory("final-suite-success").toFile()
         try {
             val session = YuvCaptureSession.create(
@@ -47,7 +47,8 @@ class FinalInvariantSuiteTest {
                 )
             )
             try {
-                // Initial invariant: session starts ACTIVE with no manifests.
+                // Initialization invariant; terminal success is covered by the
+                // production bridge suites.
                 val initial = session.accounting.snapshot()
                 assertEquals(0, initial.receivedFrames)
                 assertEquals(0, initial.persistedFrames)
