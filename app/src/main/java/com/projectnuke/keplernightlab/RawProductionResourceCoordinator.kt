@@ -46,13 +46,13 @@ internal class RawProductionResourceCoordinator(
     private val records = mutableListOf<RawProductionReleaseRecord>()
 
     fun attachImageReader(value: ImageReader?): RawAttachmentDisposition =
-        attach(value, "ImageReader", imageReader, { imageReader = it }, { it.setOnImageAvailableListener(null, null); it.close() })
+        attach(value, "ImageReader", { imageReader }, { imageReader = it }, { it.setOnImageAvailableListener(null, null); it.close() })
     fun attachCameraDevice(value: CameraDevice?): RawAttachmentDisposition =
-        attach(value, "CameraDevice", cameraDevice, { cameraDevice = it }, { it.close() })
+        attach(value, "CameraDevice", { cameraDevice }, { cameraDevice = it }, { it.close() })
     fun attachCaptureSession(value: CameraCaptureSession?): RawAttachmentDisposition =
-        attach(value, "CaptureSession", captureSession, { captureSession = it }, { releaseSession(it) })
+        attach(value, "CaptureSession", { captureSession }, { captureSession = it }, { releaseSession(it) })
     fun attachMotionLogger(value: MotionLogger?): RawAttachmentDisposition =
-        attach(value, "MotionLogger", motionLogger, { motionLogger = it }, { it.stop() })
+        attach(value, "MotionLogger", { motionLogger }, { motionLogger = it }, { it.stop() })
 
     private fun releaseSession(session: CameraCaptureSession) {
         var first: Throwable? = null
@@ -65,34 +65,46 @@ internal class RawProductionResourceCoordinator(
         first?.let { throw it }
     }
 
-    private fun <T : Any> attach(
+    /**
+     * Single attachment decision for one coordinator slot.  [current] is invoked ONLY
+     * while [lock] is held, so the authoritative owned-resource read and the
+     * store/duplicate decision are atomic with respect to [perform]'s ownership claim
+     * and to every other attachment: exactly one caller can ever be ACCEPTED for an
+     * empty slot and an accepted resource is never overwritten.
+     *
+     * A rejected value is settled exactly once OUTSIDE the lock.  The disposition
+     * (SETTLED_DUPLICATE vs SETTLED_LATE) is selected under the lock as well, so a
+     * concurrent [perform] can never retroactively reclassify a duplicate into a late
+     * attachment while the settlement runs.
+     */
+    internal fun <T : Any> attach(
         value: T?,
         tag: String,
-        current: T?,
+        current: () -> T?,
         store: (T) -> Unit,
         settle: (T) -> Unit
     ): RawAttachmentDisposition {
         if (value == null) return RawAttachmentDisposition.NO_RESOURCE
-        synchronized(lock) {
+        val rejected: RawAttachmentDisposition? = synchronized(lock) {
             if (phase == RawCoordinatorPhase.OPEN) {
-                if (current === value) {
+                val owned = current()
+                if (owned === value) {
                     duplicateAttachments++
                     return RawAttachmentDisposition.ALREADY_OWNED
                 }
-                if (current == null) {
+                if (owned == null) {
                     store(value)
                     return RawAttachmentDisposition.ACCEPTED
                 }
                 duplicateAttachments++
+                RawAttachmentDisposition.SETTLED_DUPLICATE
             } else {
                 lateAttachments++
+                RawAttachmentDisposition.SETTLED_LATE
             }
         }
         settleOutsideLock(tag, value, settle)
-        return synchronized(lock) {
-            if (phase == RawCoordinatorPhase.OPEN) RawAttachmentDisposition.SETTLED_DUPLICATE
-            else RawAttachmentDisposition.SETTLED_LATE
-        }
+        return rejected!!
     }
 
     fun perform(): RawProductionCleanupSnapshot {
@@ -139,10 +151,18 @@ internal class RawProductionResourceCoordinator(
 
     private fun settle(tag: String, release: () -> Unit) {
         try {
-            release()
+            releaseInterceptor?.invoke(tag, release) ?: release()
             synchronized(lock) { records += RawProductionReleaseRecord(tag, true, true) }
         } catch (t: Throwable) {
             synchronized(lock) { records += RawProductionReleaseRecord(tag, true, false, t) }
         }
     }
+
+    /**
+     * Internal test-only seam: intercepts a single release to inject a failure or to
+     * deterministically pause perform/attachment settlement.  The interceptor MAY
+     * invoke [release] (real release) or skip it (simulated throw).  Production code
+     * never sets this.
+     */
+    internal var releaseInterceptor: ((tag: String, release: () -> Unit) -> Unit)? = null
 }
