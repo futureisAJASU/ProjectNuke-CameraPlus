@@ -957,6 +957,30 @@ internal class YuvCaptureOwner(
      * still follow the same transaction so the ColorFusion gate always unparks.
      */
     private fun settleTerminalByRequest(request: YuvTerminalRequest, emergency: Boolean = false) {
+        try {
+            settleTerminalByRequestInternal(request, emergency)
+        } catch (failure: Throwable) {
+            recordDiagnostic(
+                DiagnosticStage.TERMINAL_PUBLICATION,
+                DiagnosticSeverity.ERROR,
+                null,
+                null,
+                "unexpected YUV terminal transaction failure",
+                failure
+            )
+            try { cleanupCoordinator.perform() } catch (cleanupFailure: Throwable) {
+                recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
+                    "internal cleanup after terminal transaction failure failed", cleanupFailure)
+            }
+            try { productionResourceCoordinator.perform() } catch (cleanupFailure: Throwable) {
+                recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
+                    "production cleanup after terminal transaction failure failed", cleanupFailure)
+            }
+            sessionTerminal.publishSettlementFailure(failure)
+        }
+    }
+
+    private fun settleTerminalByRequestInternal(request: YuvTerminalRequest, emergency: Boolean = false) {
         if (terminalSettlementPhaseRef.get() != TerminalSettlementPhase.ACTIVE) return
         finished.set(true)
         terminalReasonRef.set(request.reason)
@@ -1024,22 +1048,6 @@ internal class YuvCaptureOwner(
             statusDispatchOutcomeRef.set(statusOutcome)
         }
 
-        // Sole terminal publication: exactly one YuvTerminalRequest wins the handoff.
-        // ColorFusion's terminal gate unparks on this publication; a rejected
-        // duplicate (closed handoff or already published) is a late diagnostic only.
-        val published = try {
-            sessionTerminal.publishTerminal(request)
-        } catch (t: Throwable) {
-            recordDiagnostic(DiagnosticStage.TERMINAL_PUBLICATION, DiagnosticSeverity.ERROR, null, null,
-                "terminal request publication threw; publishing settlement failure", t)
-            sessionTerminal.publishSettlementFailure(t)
-            false
-        }
-        if (!published) {
-            recordDiagnostic(DiagnosticStage.TERMINAL_PUBLICATION, DiagnosticSeverity.WARN, null, null,
-                "terminal request publication rejected (handoff closed or already published)")
-        }
-
         try {
             // The terminal observer consumes the typed handoff result.  In particular,
             // an unpublished local request never reaches a normal user callback.
@@ -1064,6 +1072,22 @@ internal class YuvCaptureOwner(
 
         terminalSettlementPhaseRef.set(TerminalSettlementPhase.SETTLED)
         publishOwnerSnapshot(emergency, request)
+
+        // Publication is the release barrier: every required settlement attempt
+        // and the final immutable snapshot are visible before the sole consumer
+        // can choose the user callback.
+        val published = try {
+            sessionTerminal.publishTerminal(request)
+        } catch (t: Throwable) {
+            recordDiagnostic(DiagnosticStage.TERMINAL_PUBLICATION, DiagnosticSeverity.ERROR, null, null,
+                "terminal request publication threw; publishing settlement failure", t)
+            sessionTerminal.publishSettlementFailure(t)
+            false
+        }
+        if (!published) {
+            recordDiagnostic(DiagnosticStage.TERMINAL_PUBLICATION, DiagnosticSeverity.WARN, null, null,
+                "terminal request publication rejected (handoff closed or already published)")
+        }
     }
 
     /** Called by the terminal-handoff consumer, never by local terminal settlement. */
@@ -1088,6 +1112,27 @@ internal class YuvCaptureOwner(
                     "YUV terminal handoff watchdog expired; no capture result synthesized")
             }
         }
+    }
+
+    internal fun recordTerminalWatchdogTimeout() {
+        recordDiagnostic(
+            DiagnosticStage.TERMINAL_PUBLICATION,
+            DiagnosticSeverity.ERROR,
+            null,
+            null,
+            "YUV terminal handoff watchdog expired; unbounded consumer remains active"
+        )
+    }
+
+    internal fun recordTerminalSettlementFailure(failure: Throwable) {
+        recordDiagnostic(
+            DiagnosticStage.TERMINAL_PUBLICATION,
+            DiagnosticSeverity.ERROR,
+            null,
+            null,
+            "YUV terminal transaction failed before publication",
+            failure
+        )
     }
 
     private fun dispatchTerminalCallback(callback: () -> Unit) {

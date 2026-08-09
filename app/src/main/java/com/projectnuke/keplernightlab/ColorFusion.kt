@@ -629,7 +629,9 @@ fun captureYuvBurstColorWithMotion(
             finished = finished,
             // ColorFusion starts the real terminal consumer only after the finite
             // captureBurst operation is accepted below.
-            startTerminalObserverOnCreate = false
+            // Terminal consumption starts with session authority, before any
+            // fallible ImageReader/camera/session/request setup.
+            startTerminalObserverOnCreate = true
         )
         postStatus("Color Fusion 초기화 4/7: ImageReader 생성 중...")
 
@@ -926,7 +928,6 @@ fun captureYuvBurstColorWithMotion(
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
-                    productionSeam.productionResourceCoordinator.perform()
                     if (isTerminalOrFinished()) {
                         logLateCameraCallback("CameraDevice.onDisconnected")
                         return
@@ -940,7 +941,6 @@ fun captureYuvBurstColorWithMotion(
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
-                    productionSeam.productionResourceCoordinator.perform()
                     if (isTerminalOrFinished()) {
                         logLateCameraCallback("CameraDevice.onError")
                         return

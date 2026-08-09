@@ -78,6 +78,22 @@ class FinalInvariantSuiteTest {
     }
 
     @Test
+    fun terminalWatchdogDoesNotConsumeLaterPublication() {
+        val handoff = YuvTerminalRequestHandoff()
+        assertEquals(YuvTerminalHandoffResult.WatchdogTimeout, handoff.awaitResult(1L))
+        val request = YuvTerminalRequest(
+            status = CaptureTerminalStatus.SUCCESS,
+            jobStatus = "CAPTURE_COMPLETE",
+            reason = null,
+            completionKind = TerminalCompletionKind.SUCCESS,
+            cause = null,
+            saveMotion = false
+        )
+        assertTrue(handoff.publish(request))
+        assertEquals(YuvTerminalHandoffResult.Published(request), handoff.awaitResult())
+    }
+
+    @Test
     fun captureFrameIdentityOwnerIsBoundedAndUnique() {
         val owner = CaptureFrameIdentityOwner(3)
         assertEquals(0, owner.nextIdentity())

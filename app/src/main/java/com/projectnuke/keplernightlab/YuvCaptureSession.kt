@@ -21,9 +21,11 @@ internal class YuvCaptureSession internal constructor(
     internal val verifiedFileReader: YuvVerifiedFileReader,
     internal val terminalFinalVerifier: YuvTerminalFinalVerifier,
     internal val onSessionTerminal: (YuvTerminalRequest) -> Unit,
+    internal val onSessionSettlementFailure: (Throwable) -> Unit,
     private val startTerminalObserverOnCreate: Boolean
 ) : AutoCloseable, YuvSessionTerminalOperations {
     private val terminalObserverStarted = AtomicBoolean(false)
+    private val terminalWatchdogStarted = AtomicBoolean(false)
 
     init {
         if (startTerminalObserverOnCreate) startTerminalObservation()
@@ -49,27 +51,28 @@ internal class YuvCaptureSession internal constructor(
         productionResourceCoordinator.perform()
     }
 
-    /**
-     * Starts the sole terminal consumer exactly once. Production starts this after
-     * finite captureBurst submission; test sessions can opt in at construction.
-     */
+    /** Starts the unbounded sole terminal consumer. The optional bound arms only a diagnostic watchdog. */
     fun startTerminalObservation(settleBoundMillis: Long? = null): Boolean {
-        if (!terminalObserverStarted.compareAndSet(false, true)) return false
-        Thread(
-            {
-                val result = if (settleBoundMillis == null) {
-                    terminalRequestHandoff.awaitResult()
-                } else {
-                    terminalRequestHandoff.awaitResult(settleBoundMillis)
-                }
-                owner.consumeTerminalHandoff(result)
-            },
-            "KeplerYuvTerminalWait"
-        ).apply {
-            isDaemon = true
-            start()
+        val started = terminalObserverStarted.compareAndSet(false, true)
+        if (started) {
+            Thread({
+                owner.consumeTerminalHandoff(terminalRequestHandoff.awaitResult())
+            }, "KeplerYuvTerminalWait").apply {
+                isDaemon = true
+                start()
+            }
         }
-        return true
+        if (settleBoundMillis != null && terminalWatchdogStarted.compareAndSet(false, true)) {
+            Thread({
+                if (terminalRequestHandoff.awaitResult(settleBoundMillis) is YuvTerminalHandoffResult.WatchdogTimeout) {
+                    owner.recordTerminalWatchdogTimeout()
+                }
+            }, "KeplerYuvTerminalWatchdog").apply {
+                isDaemon = true
+                start()
+            }
+        }
+        return started
     }
 
     // ------------------------------------------------------------------
@@ -96,14 +99,12 @@ internal class YuvCaptureSession internal constructor(
         onSessionTerminal(request)
 
     override fun observeSettlementFailure(failure: Throwable) =
-        onSessionTerminal(YuvTerminalRequest(
-            status = CaptureTerminalStatus.FAILED,
-            jobStatus = "CAPTURE_INTERNAL_ERROR",
-            reason = "YUV terminal settlement failed",
-            completionKind = TerminalCompletionKind.ERROR,
-            cause = failure,
-            saveMotion = false
-        ))
+        onSessionSettlementFailure(failure)
+
+    private fun onSessionSettlementFailure(failure: Throwable) {
+        owner.recordTerminalSettlementFailure(failure)
+        onSessionSettlementFailure.invoke(failure)
+    }
 
     companion object {
         fun create(
@@ -137,6 +138,9 @@ internal class YuvCaptureSession internal constructor(
                     TerminalCompletionKind.SUCCESS -> onCaptureComplete(outputDir)
                     TerminalCompletionKind.ERROR -> onCaptureError(request.reason ?: "", request.cause)
                 }
+            },
+            onSessionSettlementFailure: (Throwable) -> Unit = { failure ->
+                onCaptureError("CAPTURE_INTERNAL_ERROR: YUV terminal settlement failed", failure)
             },
             accounting: YuvCaptureAccounting? = null,
             productionResourceCoordinator: YuvProductionResourceCoordinator,
@@ -220,6 +224,7 @@ internal class YuvCaptureSession internal constructor(
                 verifiedFileReader,
                 terminalFinalVerifier,
                 onSessionTerminal,
+                onSessionSettlementFailure,
                 startTerminalObserverOnCreate
             ).also { sessionRef.set(it) }
         }
