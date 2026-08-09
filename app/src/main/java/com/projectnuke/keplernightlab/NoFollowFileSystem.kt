@@ -31,6 +31,27 @@ internal fun noFollowIdentityMatches(
 }
 
 /**
+ * Final evidence fence for a stream read.  Path-before/path-after equality is
+ * not sufficient: a provider can swap B in for the read and restore A before
+ * the final stat.  The digest of the exact opened stream must therefore match
+ * a fresh no-follow read of the final pathname as well.
+ */
+internal fun noFollowReadFenceAccepts(
+    beforeFileKey: Any?,
+    afterFileKey: Any?,
+    beforeSize: Long,
+    afterSize: Long,
+    beforeModifiedMillis: Long,
+    afterModifiedMillis: Long,
+    openedSha256: String,
+    finalPathSha256: String?
+): Boolean {
+    if (beforeSize != afterSize || beforeModifiedMillis != afterModifiedMillis) return false
+    if (beforeFileKey != null && afterFileKey != null && beforeFileKey != afterFileKey) return false
+    return finalPathSha256 != null && openedSha256 == finalPathSha256
+}
+
+/**
  * Best-effort descriptor identity probe.  It is deliberately given the exact
  * stream that supplies authoritative content; opening a second FileInputStream
  * here would introduce a replacement window.
@@ -53,6 +74,7 @@ internal sealed interface NoFollowInspection<out T> {
 }
 
 internal object NoFollowFileSystem {
+    enum class StableIdentityStrength { OBJECT_IDENTITY, CONTENT_IDENTITY }
     data class StreamDigest(val size: Long, val sha256: String, val prefix: ByteArray)
     /**
      * Evidence produced by one authoritative no-follow stream read.  A null
@@ -65,7 +87,8 @@ internal object NoFollowFileSystem {
         val modifiedMillis: Long,
         val fileKey: Any?,
         val descriptorIdentity: String?,
-        val sha256: String
+        val sha256: String,
+        val strength: StableIdentityStrength = StableIdentityStrength.CONTENT_IDENTITY
     )
 
     private data class VerifiedRead(
@@ -113,18 +136,17 @@ internal object NoFollowFileSystem {
             require(after != null && after.isRegularFile && !after.isSymbolicLink()) {
                 "File identity changed during read: ${file.absolutePath}"
             }
-            val sameKey = before.fileKey() != null && after.fileKey() != null &&
-                before.fileKey() == after.fileKey()
-            val sameStat = before.size() == after.size() &&
-                before.lastModifiedTime().toMillis() == after.lastModifiedTime().toMillis()
-            // Without a provider file key we can prove only stable content.  A
-            // second no-follow stream hashes the current pathname; equal bytes
-            // make the content fence explicit rather than pretending stat data
-            // is object identity.
-            val sameContent = if (sameKey) true else {
-                digestAtPath(path) == digestHex
-            }
-            require((sameKey || sameContent) && sameStat) {
+            val finalPathDigest = digestAtPath(path)
+            require(noFollowReadFenceAccepts(
+                beforeFileKey = before.fileKey(),
+                afterFileKey = after.fileKey(),
+                beforeSize = before.size(),
+                afterSize = after.size(),
+                beforeModifiedMillis = before.lastModifiedTime().toMillis(),
+                afterModifiedMillis = after.lastModifiedTime().toMillis(),
+                openedSha256 = digestHex,
+                finalPathSha256 = finalPathDigest
+            )) {
                 "File identity changed during read: ${file.absolutePath}"
             }
             val streamDigest = StreamDigest(size, digestHex, prefix.copyOf(prefixCount))
@@ -136,7 +158,12 @@ internal object NoFollowFileSystem {
                     modifiedMillis = after.lastModifiedTime().toMillis(),
                     fileKey = after.fileKey(),
                     descriptorIdentity = openedDescriptor,
-                    sha256 = digestHex
+                    sha256 = digestHex,
+                    strength = if (after.fileKey() != null && openedDescriptor != null) {
+                        StableIdentityStrength.OBJECT_IDENTITY
+                    } else {
+                        StableIdentityStrength.CONTENT_IDENTITY
+                    }
                 )
             )
         }
@@ -233,8 +260,11 @@ internal object NoFollowFileSystem {
             return false
         }
         if (!current.isRegularFile || current.size != expected.size) return false
-        if (expected.fileKey != null && current.fileKey != null) {
-            return expected.fileKey == current.fileKey
+        if (expected.strength == StableIdentityStrength.OBJECT_IDENTITY) {
+            return current.strength == StableIdentityStrength.OBJECT_IDENTITY &&
+                expected.fileKey != null && current.fileKey == expected.fileKey &&
+                expected.descriptorIdentity != null &&
+                current.descriptorIdentity == expected.descriptorIdentity
         }
         return current.sha256 == expected.sha256
     }

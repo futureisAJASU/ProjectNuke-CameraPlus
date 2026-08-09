@@ -71,6 +71,54 @@ class NoFollowFileSystemTest {
             root.deleteRecursively()
         }
     }
+
+    @Test
+    fun swapBackPathFenceRejectsDifferentBytesEvenWhenKeysMatch() {
+        assertFalse(
+            noFollowReadFenceAccepts(
+                beforeFileKey = "A",
+                afterFileKey = "A",
+                beforeSize = 4L,
+                afterSize = 4L,
+                beforeModifiedMillis = 10L,
+                afterModifiedMillis = 10L,
+                openedSha256 = "content-from-B",
+                finalPathSha256 = "content-from-A"
+            )
+        )
+    }
+
+    @Test
+    fun stableReadFenceAcceptsMatchingContentWhenObjectKeyUnavailable() {
+        assertTrue(
+            noFollowReadFenceAccepts(
+                beforeFileKey = null,
+                afterFileKey = null,
+                beforeSize = 4L,
+                afterSize = 4L,
+                beforeModifiedMillis = 10L,
+                afterModifiedMillis = 10L,
+                openedSha256 = "same-content",
+                finalPathSha256 = "same-content"
+            )
+        )
+    }
+
+    @Test
+    fun stableIdentityStrengthDoesNotDowngradeObjectToken() {
+        val root = createTempDirectory("kepler-nofollow-strength").toFile()
+        try {
+            val file = root.resolve("payload").apply { writeText("same") }
+            val expected = NoFollowFileSystem.stableIdentity(file).copy(
+                fileKey = "A",
+                descriptorIdentity = "descriptor-A",
+                strength = NoFollowFileSystem.StableIdentityStrength.OBJECT_IDENTITY
+            )
+            assertFalse(NoFollowFileSystem.revalidate(file.toPath(), expected))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
     @Test
     fun childSymlinkIsNotListedOrCounted() {
         val root = createTempDirectory("kepler-nofollow").toFile()
