@@ -203,6 +203,9 @@ class ProductionYuvCaptureBridgeTest {
 
             val status = harness.awaitTerminal()
             assertEquals(CaptureTerminalStatus.SUCCESS, status)
+            harness.awaitCallback()
+            harness.session.boundedWorker.close()
+            assertTrue(harness.session.boundedWorker.awaitTermination(5_000L))
             // The Image was transferred into the worker, encoded, and released exactly once.
             assertEquals(1, fake.closeCount.get())
             assertEquals(1, harness.completeCount.get())
@@ -442,6 +445,7 @@ class ProductionYuvCaptureBridgeTest {
             harness.session.owner.onCancellationRequested()
             val status = harness.awaitTerminal()
             assertEquals(CaptureTerminalStatus.CANCELLED, status)
+            harness.awaitCallback()
             assertEquals(1, harness.errorCount.get())
             assertEquals(0, harness.completeCount.get())
         } finally {
