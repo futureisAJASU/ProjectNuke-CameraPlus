@@ -148,7 +148,10 @@ class RawSaveCompletionTest {
                     dngSidecar = RawDngSidecarOutcome.notRequested(4)
                 )
             },
-            postCompletion = { false },
+            unexpectedFailure = { throwable ->
+                RawSaveCompletion.Failed(4, 44L, throwable.javaClass.simpleName, throwable.message.orEmpty(), throwable)
+            },
+            postCompletion = { RawCompletionPostOutcome.REJECTED_UNSETTLED },
             disposeCompletion = {
                 disposed++
                 CaptureTaskDisposalOutcome.Clean

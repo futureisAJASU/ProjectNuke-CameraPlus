@@ -29,6 +29,8 @@ internal data class RawOutputOwnership(
     val cleanup: RawOutputCleanupOutcome = RawOutputCleanupOutcome.NotNeeded
 )
 
+internal enum class RawCompletionPostOutcome { ACCEPTED, REJECTED_AND_DISPOSED, REJECTED_UNSETTLED }
+
 /** Immutable metadata collected while the worker still owns the Image/result. */
 internal data class RawFrameManifestData(
     val frameIndex: Int,
@@ -174,7 +176,8 @@ internal sealed interface RawSaveCompletion {
  */
 internal class RawSaveTask(
     private val produceCompletion: () -> RawSaveCompletion,
-    private val postCompletion: (RawSaveCompletion) -> Boolean,
+    private val unexpectedFailure: (Throwable) -> RawSaveCompletion,
+    private val postCompletion: (RawSaveCompletion) -> RawCompletionPostOutcome,
     private val disposeCompletion: (RawSaveCompletion) -> CaptureTaskDisposalOutcome,
     private val disposeQueuedInput: () -> CaptureTaskDisposalOutcome
 ) : OutcomeDisposableCaptureTask {
@@ -182,8 +185,15 @@ internal class RawSaveTask(
 
     override fun run() {
         if (!started.compareAndSet(false, true)) return
-        val completion = produceCompletion()
-        if (!postCompletion(completion)) {
+        val completion = try {
+            produceCompletion()
+        } catch (t: Throwable) {
+            // The task boundary is the last ownership point for fatal worker
+            // failures.  Convert them into an immutable completion so the
+            // serialized owner can reject/adopt and settle outputs normally.
+            unexpectedFailure(t)
+        }
+        if (postCompletion(completion) == RawCompletionPostOutcome.REJECTED_UNSETTLED) {
             disposeCompletion(completion)
         }
     }

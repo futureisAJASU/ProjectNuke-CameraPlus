@@ -751,24 +751,24 @@ fun captureRawBurstForFusion(
             val dngName = request.dngFilename
             val raw16File = File(jobDir, raw16Name)
             val dngFile = File(jobDir, dngName)
+            var raw16Temp: File? = null
             try {
                 post("RAW saving frame ${index + 1}/$requestedFrames...")
                 val saveStartedAt = System.currentTimeMillis()
-                val raw16Temp = File(jobDir, ".${raw16Name}.${System.nanoTime()}.tmp")
+                raw16Temp = File(jobDir, ".${raw16Name}.${System.nanoTime()}.tmp")
                 try {
                     writeCompactRaw16(image, raw16Temp)
                     KeplerJobMetadata.atomicReplace(raw16Temp, raw16File)
                     val expectedRaw16Bytes = image.width.toLong() * image.height.toLong() * 2L
                     verifyRaw16Payload(raw16File, expectedRaw16Bytes)
                 } finally {
-                    if (raw16Temp.exists()) raw16Temp.delete()
+                    if (raw16Temp?.exists() == true) raw16Temp?.delete()
                 }
                 if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
-                    runCatching { raw16File.delete() }
                     return RawSaveCompletion.Abandoned(
                         index,
                         timestamp,
-                        RawOutputOwnership(null, raw16File.takeIf { it.exists() }, RawOutputState.DISCARDED, null)
+                        RawOutputOwnership(raw16Temp?.takeIf { it.exists() }, raw16File.takeIf { it.exists() }, RawOutputState.DISCARDED, null)
                     )
                 }
                 var dngSaved = false
@@ -800,12 +800,10 @@ fun captureRawBurstForFusion(
                     }
                 }
                 if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
-                    runCatching { raw16File.delete() }
-                    runCatching { dngFile.delete() }
                     return RawSaveCompletion.Abandoned(
                         index,
                         timestamp,
-                        RawOutputOwnership(null, raw16File.takeIf { it.exists() }, RawOutputState.DISCARDED, null)
+                        RawOutputOwnership(raw16Temp?.takeIf { it.exists() }, raw16File.takeIf { it.exists() }, RawOutputState.DISCARDED, null)
                     )
                 }
                 val dynamicBlackLevel = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
@@ -839,7 +837,7 @@ fun captureRawBurstForFusion(
                     saveDurationMs = System.currentTimeMillis() - saveStartedAt,
                     dngSidecar = dngSidecarOutcome,
                     output = RawOutputOwnership(
-                        tempFile = null,
+                        tempFile = raw16Temp?.takeIf { it.exists() },
                         finalFile = raw16File,
                         state = RawOutputState.VERIFIED_FINAL,
                         verifiedBytes = raw16File.length()
@@ -902,6 +900,34 @@ fun captureRawBurstForFusion(
             }
             val task = RawSaveTask(
                 produceCompletion = { saveRawFrameToCompletion(request) },
+                unexpectedFailure = { throwable ->
+                    RawSaveCompletion.Failed(
+                        frameIndex = request.frameIndex,
+                        timestampNs = request.timestampNs,
+                        failureType = throwable.javaClass.simpleName,
+                        failureMessage = "RAW fusion worker failed: ${throwable.stackTraceToString()}",
+                        throwable = throwable,
+                        output = RawOutputOwnership(
+                            tempFile = null,
+                            finalFile = null,
+                            state = RawOutputState.NONE,
+                            verifiedBytes = null
+                        ),
+                        frame = request.frame.copy(
+                            raw16Filename = null,
+                            dngFilename = null,
+                            dngSidecar = if (shouldSaveDngSidecars) {
+                                RawDngSidecarOutcome.localSaveFailed(
+                                    request.frameIndex,
+                                    "${throwable.javaClass.simpleName}: ${throwable.message}"
+                                )
+                            } else {
+                                RawDngSidecarOutcome.notRequested(request.frameIndex)
+                            },
+                            failureDescription = "${throwable.javaClass.simpleName}: ${throwable.message}"
+                        )
+                    )
+                },
                 postCompletion = { completion ->
                     val event = object : CaptureOwnerEvent {
                         override fun execute() {
@@ -936,7 +962,13 @@ fun captureRawBurstForFusion(
                             disposeUnadoptedCompletion(completion)
                         }
                     }
-                    captureStateOwner.post(event)
+                    if (captureStateOwner.post(event)) {
+                        RawCompletionPostOutcome.ACCEPTED
+                    } else {
+                        // CaptureStateOwner owns disposal on rejection; do not
+                        // let RawSaveTask dispose the same completion again.
+                        RawCompletionPostOutcome.REJECTED_AND_DISPOSED
+                    }
                 },
                 disposeCompletion = ::disposeUnadoptedCompletion,
                 disposeQueuedInput = {
