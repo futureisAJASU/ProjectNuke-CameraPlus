@@ -399,6 +399,7 @@ class YuvCaptureOwnerTest {
             val access = FakeDirectAccess(failTimestamp = true)
             harness.session.owner.acceptDirect(access)
             val status = harness.awaitTerminal()
+            harness.awaitCallback()
             assertEquals(CaptureTerminalStatus.FAILED, status)
             assertEquals(1, access.closeCount.get())
         } finally {
