@@ -60,6 +60,7 @@ class ProductionYuvCaptureBridgeTest {
         val terminalLatch = CountDownLatch(1)
         val completeCount = AtomicInteger(0)
         val errorCount = AtomicInteger(0)
+        val callbackLatch = CountDownLatch(1)
         val callbackThread = AtomicReference<Thread?>(null)
         val capturedDir = AtomicReference<File?>(null)
         val lastErrorMessage = AtomicReference<String?>(null)
@@ -111,11 +112,13 @@ class ProductionYuvCaptureBridgeTest {
                 callbackThreadName.set(Thread.currentThread().name)
                 completeCount.incrementAndGet()
                 capturedDir.set(file)
+                callbackLatch.countDown()
             },
             onCaptureError = { msg, _ ->
                 callbackThreadName.set(Thread.currentThread().name)
                 errorCount.incrementAndGet()
                 lastErrorMessage.set(msg)
+                callbackLatch.countDown()
             },
             productionResourceCoordinator = YuvProductionResourceCoordinator(
                 timeoutScheduler = null,
@@ -134,6 +137,11 @@ class ProductionYuvCaptureBridgeTest {
             val drain = CountDownLatch(1)
             handler.post { drain.countDown() }
             assertTrue(drain.await(2, TimeUnit.SECONDS))
+        }
+
+        fun awaitCallback() {
+            assertTrue("terminal callback not reached", callbackLatch.await(10, TimeUnit.SECONDS))
+            flushHandler()
         }
 
         fun shutdown() {
@@ -357,6 +365,7 @@ class ProductionYuvCaptureBridgeTest {
 
             val status = harness.awaitTerminal()
             assertEquals(CaptureTerminalStatus.TIMED_OUT, status)
+            harness.awaitCallback()
             val snap = harness.session.accounting.snapshot()
             assertEquals(0, snap.persistedFrames)
             assertTrue(snap.manifest.isEmpty())

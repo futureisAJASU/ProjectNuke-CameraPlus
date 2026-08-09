@@ -268,6 +268,7 @@ class YuvProductionLifecycleTest {
         try {
             harness.feedAll()
             assertEquals(CaptureTerminalStatus.SUCCESS, harness.awaitTerminal())
+            harness.awaitCallback()
             assertEquals(1, harness.completeCount.get())
             assertEquals(0, harness.errorCount.get())
             assertEquals(1, harness.coordinator.performCount())

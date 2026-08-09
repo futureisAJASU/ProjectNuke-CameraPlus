@@ -230,6 +230,11 @@ class YuvCaptureOwnerTest {
             return session.terminalState.status()
         }
 
+        fun awaitCallback() {
+            assertTrue("terminal callback not reached", callbackLatch.await(10, TimeUnit.SECONDS))
+            flushHandler()
+        }
+
         /** Run posted tasks on the test handler thread to make latches advance. */
         fun flushHandler() {
             val latch = CountDownLatch(1)
@@ -323,6 +328,7 @@ class YuvCaptureOwnerTest {
             harness.session.owner.acceptBuffered(access)
             val status = harness.awaitTerminal()
             assertEquals(CaptureTerminalStatus.FAILED, status)
+            harness.awaitCallback()
             assertEquals(1, access.releaseCount.get())
             assertEquals(1, harness.onCaptureErrorCount.get())
             assertEquals(0, harness.onCaptureCompleteCount.get())
@@ -344,6 +350,7 @@ class YuvCaptureOwnerTest {
             harness.session.owner.acceptDirect(access)
             val status = harness.awaitTerminal()
             assertEquals(CaptureTerminalStatus.SUCCESS, status)
+            harness.awaitCallback()
             // takeImage consumed the access wrapper; the image is closed by the
             // work item's dispose exactly once.
             assertEquals(0, access.closeCount.get())
@@ -368,6 +375,7 @@ class YuvCaptureOwnerTest {
             harness.session.owner.onDeadlineReached()
             val status = harness.awaitTerminal()
             assertEquals(CaptureTerminalStatus.TIMED_OUT, status)
+            harness.awaitCallback()
             assertEquals(0, access.closeCount.get())
             // The image is released by the work item's dispose in the task finally.
             assertEquals(1, access.lastImage.get()!!.closeCount.get())
@@ -401,6 +409,7 @@ class YuvCaptureOwnerTest {
             harness.session.owner.acceptDirect(ThrowingReleaseDirectAccess())
             val status = harness.awaitTerminal()
             assertEquals(CaptureTerminalStatus.FAILED, status)
+            harness.awaitCallback()
             val debts = harness.session.owner.candidateCleanupDebt()
             assertEquals(1, debts.size)
             assertTrue(debts[0].contains("direct creation releaseFailure frame=0"))
@@ -553,6 +562,7 @@ class YuvCaptureOwnerTest {
             encodeLatch.release()
             val status = harness.awaitTerminal()
             assertEquals(CaptureTerminalStatus.TIMED_OUT, status)
+            harness.awaitCallback()
             assertEquals(0, harness.session.accounting.snapshot().persistedFrames)
             assertTrue(harness.onCaptureErrorCount.get() >= 1)
         } finally {
@@ -899,6 +909,7 @@ class YuvCaptureOwnerTest {
             harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
             harness.session.owner.acceptBuffered(FakeBufferedAccess(2000L))
             assertEquals(CaptureTerminalStatus.SUCCESS, harness.awaitTerminal())
+            harness.awaitCallback()
             harness.session.owner.onDeadlineReached()
             harness.flushHandler()
             assertEquals(1, harness.onCaptureCompleteCount.get())
