@@ -728,6 +728,7 @@ class YuvCaptureOwnerTest {
             val access = FakeDirectAccess()
             harness.session.owner.acceptDirect(access)
             val status = harness.awaitTerminal()
+            harness.flushHandler()
             assertEquals(CaptureTerminalStatus.FAILED, status)
             assertTrue("error callback should fire", harness.onCaptureErrorCount.get() >= 1)
             val debts = harness.session.owner.candidateCleanupDebt()
