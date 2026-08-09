@@ -644,6 +644,7 @@ fun captureYuvBurstColorWithMotion(
 
         when (productionSeam.productionResourceCoordinator.attachImageReader(reader)) {
             ProductionAttachmentDisposition.ACCEPTED -> imageReader = reader
+            ProductionAttachmentDisposition.ALREADY_OWNED -> imageReader = reader
             ProductionAttachmentDisposition.SETTLED_LATE -> {
                 logLateCameraCallback("ImageReader.attach")
                 return
@@ -742,6 +743,7 @@ fun captureYuvBurstColorWithMotion(
                 override fun onOpened(camera: CameraDevice) {
                     when (productionSeam.productionResourceCoordinator.attachCameraDevice(camera)) {
                         ProductionAttachmentDisposition.ACCEPTED -> cameraDevice = camera
+                        ProductionAttachmentDisposition.ALREADY_OWNED -> cameraDevice = camera
                         ProductionAttachmentDisposition.SETTLED_LATE -> {
                             logLateCameraCallback("CameraDevice.onOpened.lateAttach")
                             return
@@ -770,6 +772,7 @@ fun captureYuvBurstColorWithMotion(
                             onConfigured = { session, captureRoute ->
                                     when (productionSeam.productionResourceCoordinator.attachCaptureSession(session)) {
                                         ProductionAttachmentDisposition.ACCEPTED -> captureSession = session
+                                        ProductionAttachmentDisposition.ALREADY_OWNED -> captureSession = session
                                         ProductionAttachmentDisposition.SETTLED_LATE -> {
                                             logLateCameraCallback("CameraCaptureSession.onConfigured.lateAttach")
                                             return@createRoutedStillCaptureSession
