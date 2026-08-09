@@ -195,7 +195,7 @@ fun captureRawBurstForFusion(
     val ledger = lazy {
         RawCaptureLedger<Image, TotalCaptureResult>(
             requestedFrames = requestedFrames,
-            closeImage = { runCatching { it.close() } }
+            closeImage = { it.close() }
         )
     }
     val progressSnapshot = AtomicReference(
@@ -259,7 +259,6 @@ fun captureRawBurstForFusion(
         if (!cleanupStarted.compareAndSet(false, true)) return
         publishRawTerminalSnapshot(RawTerminalSettlementPhase.SETTLING)
         captureStateOwner.close()
-        runCatching { reader?.setOnImageAvailableListener(null, null) }
         ledger.value.releaseAllImages()
         val production = productionResourceCoordinator.perform()
         publishRawTerminalSnapshot(
@@ -834,7 +833,10 @@ fun captureRawBurstForFusion(
         }
 
         cancellationDispatcher.set { finishCancelled() }
-        if (cancellationRequested.get()) finishCancelled()
+        if (cancellationRequested.get()) {
+            finishCancelled()
+            return
+        }
 
         var dispatchReady: () -> Unit = {}
 
@@ -1187,10 +1189,12 @@ fun captureRawBurstForFusion(
             }
         }
 
-        fun postResultReceived(timestampNs: Long, result: TotalCaptureResult) {
+        fun postResultReceived(timestampNs: Long, result: TotalCaptureResult, activePhysicalIdValue: String?) {
             val event = object : CaptureOwnerEvent {
                 override fun execute() {
                     if (finished.get() || captureStateOwner.isClosed()) return
+                    activePhysicalId = activePhysicalIdValue
+                    baseJob.put("activePhysicalId", activePhysicalIdValue ?: JSONObject.NULL)
                     ledger.value.recordResult(timestampNs, result)
                     publishProgress()
                     postCaptureProgress()
@@ -1371,7 +1375,7 @@ fun captureRawBurstForFusion(
                                             result: TotalCaptureResult
                                         ) {
                                             val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
-                                            activePhysicalId = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
+                                            val activePhysicalIdValue = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
                                             baseJob.put("activePhysicalId", activePhysicalId ?: JSONObject.NULL)
                                             Log.i(
                                                 "KeplerPhysicalRoute",
@@ -1382,7 +1386,7 @@ fun captureRawBurstForFusion(
                                                     "finalRequestZoom=$requestZoomRatio"
                                             )
                                             if (timestamp != null && !finished.get()) {
-                                                postResultReceived(timestamp, result)
+                                                postResultReceived(timestamp, result, activePhysicalIdValue)
                                             }
                                         }
 
