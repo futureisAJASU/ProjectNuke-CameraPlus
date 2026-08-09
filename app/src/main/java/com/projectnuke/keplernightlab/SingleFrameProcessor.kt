@@ -51,8 +51,14 @@ internal fun processSingleFrameJobSync(
         stage = "PROCESSING",
         status = "SINGLE_FRAME_PROCESSING"
     )
-    KeplerJobMetadata.update(jobDir) { current ->
-        current.put("processingAttemptId", processingAttemptId)
+    if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+        updateProcessingStage(jobDir, "PROCESSING", "SINGLE_FRAME_PROCESSING") { current ->
+            current.put("processingAttemptId", processingAttemptId)
+        }
+    } else {
+        KeplerJobMetadata.update(jobDir) { current ->
+            current.put("processingAttemptId", processingAttemptId)
+        }
     }
 
     var sourceForCleanup: Bitmap? = null
