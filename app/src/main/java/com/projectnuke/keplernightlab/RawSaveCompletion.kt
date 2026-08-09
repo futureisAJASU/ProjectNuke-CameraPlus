@@ -92,7 +92,7 @@ internal data class RawFrameManifestData(
     val failureDescription: String? = null
 )
 
-private fun defaultRawFrameManifest(
+internal fun defaultRawFrameManifest(
     frameIndex: Int,
     timestampNs: Long,
     raw16Filename: String?,
@@ -218,6 +218,32 @@ internal fun settleRawSaveImage(
         is RawSaveCompletion.Failed -> completion.copy(imageReleaseFailure = releaseFailure)
         is RawSaveCompletion.Abandoned -> completion.copy(imageReleaseFailure = releaseFailure)
     }
+}
+
+internal data class RawSuccessOutputSettlementPlan(
+    val adopted: List<File>,
+    val leftovers: List<File>
+)
+
+/** Shared production ownership split used before the owner settles a success. */
+internal fun planRawSuccessOutputSettlement(
+    jobDir: File,
+    completion: RawSaveCompletion.Success
+): RawSuccessOutputSettlementPlan {
+    val adopted = buildList {
+        add(File(jobDir, completion.raw16Filename))
+        if (completion.dngSidecar.status == RawDngSidecarStatus.LOCAL_SAVED &&
+            completion.frame.dngFilename != null
+        ) {
+            add(File(jobDir, completion.frame.dngFilename))
+        }
+    }
+    val leftovers = listOfNotNull(
+        completion.output.tempFile,
+        completion.output.dngTempFile,
+        completion.output.dngFinalFile
+    ).filterNot { file -> adopted.any { it.absolutePath == file.absolutePath } }
+    return RawSuccessOutputSettlementPlan(adopted, leftovers)
 }
 
 /**

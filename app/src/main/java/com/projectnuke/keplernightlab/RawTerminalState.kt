@@ -11,9 +11,15 @@ internal data class RawImageReleaseFailure(
     val reason: String,
     val failure: Throwable
 )
-internal data class RawOutputCleanupFailure(
-    val paths: List<String>,
-    val failure: Throwable
+internal enum class RawOutputResourceKind { RAW_TEMP, RAW_FINAL, DNG_TEMP, DNG_FINAL }
+internal enum class RawOutputOwnershipRole { ADOPTED, UNADOPTED, TEMPORARY }
+
+internal data class RawOutputCleanupRecord(
+    val path: String,
+    val resourceKind: RawOutputResourceKind,
+    val ownershipRole: RawOutputOwnershipRole,
+    val status: RawOutputCleanupStatus,
+    val failure: Throwable? = null
 )
 
 internal data class RawTerminalRequest(
@@ -45,7 +51,7 @@ internal data class RawTerminalSnapshot(
     val callbackExecution: RawTerminalOperationOutcome = RawTerminalOperationOutcome.NotRequested,
     val cleanup: RawProductionCleanupSnapshot?,
     val imageReleaseFailures: List<RawImageReleaseFailure> = emptyList(),
-    val outputCleanupFailures: List<RawOutputCleanupFailure> = emptyList()
+    val outputCleanupFailures: List<RawOutputCleanupRecord> = emptyList()
 )
 
 internal class RawTerminalSnapshotStore(initial: RawTerminalSnapshot) {
