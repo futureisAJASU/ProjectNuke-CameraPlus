@@ -5,6 +5,17 @@ import java.util.concurrent.atomic.AtomicReference
 internal enum class RawTerminalCompletionKind { SUCCESS, ERROR }
 internal enum class RawTerminalSettlementPhase { ACTIVE, CLAIMED, SETTLING, SETTLED, SETTLEMENT_FAILED }
 
+internal data class RawImageReleaseFailure(
+    val frameIndex: Int?,
+    val timestampNs: Long?,
+    val reason: String,
+    val failure: Throwable
+)
+internal data class RawOutputCleanupFailure(
+    val paths: List<String>,
+    val failure: Throwable
+)
+
 internal data class RawTerminalRequest(
     val status: CaptureTerminalStatus,
     val jobStatus: String,
@@ -30,7 +41,9 @@ internal data class RawTerminalSnapshot(
     val metadata: RawTerminalOperationOutcome,
     val status: RawTerminalOperationOutcome,
     val callback: RawTerminalOperationOutcome,
-    val cleanup: RawProductionCleanupSnapshot?
+    val cleanup: RawProductionCleanupSnapshot?,
+    val imageReleaseFailures: List<RawImageReleaseFailure> = emptyList(),
+    val outputCleanupFailures: List<RawOutputCleanupFailure> = emptyList()
 )
 
 internal class RawTerminalSnapshotStore(initial: RawTerminalSnapshot) {

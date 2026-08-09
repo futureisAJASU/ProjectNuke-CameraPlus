@@ -2,7 +2,15 @@ package com.projectnuke.keplernightlab
 
 import java.io.File
 
-internal enum class RawOutputState { TEMP, VERIFIED_FINAL, DISCARDED, CLEANUP_FAILED, NONE }
+internal enum class RawOutputState {
+    TEMP,
+    VERIFIED_FINAL,
+    UNADOPTED_FINAL,
+    DISPOSAL_REQUIRED,
+    DISCARDED,
+    CLEANUP_FAILED,
+    NONE
+}
 
 internal data class RawOutputCleanupOutcome(
     val attempted: Boolean,
@@ -113,6 +121,7 @@ internal sealed interface RawSaveCompletion {
     val frameIndex: Int
     /** Timestamp (ns) the completion refers to. */
     val timestampNs: Long
+    val imageReleaseFailure: Throwable?
 
     /**
      * Frame raw16 saved successfully; optional DNG sidecar may also be saved.
@@ -135,6 +144,7 @@ internal sealed interface RawSaveCompletion {
             state = RawOutputState.NONE,
             verifiedBytes = raw16Bytes
         ),
+        override val imageReleaseFailure: Throwable? = null,
         val frame: RawFrameManifestData = defaultRawFrameManifest(
             frameIndex, timestampNs, raw16Filename, dngSidecar
         )
@@ -154,6 +164,7 @@ internal sealed interface RawSaveCompletion {
         val failureMessage: String,
         val throwable: Throwable?,
         val output: RawOutputOwnership = RawOutputOwnership(null, null, RawOutputState.NONE, null),
+        override val imageReleaseFailure: Throwable? = null,
         val frame: RawFrameManifestData = defaultRawFrameManifest(
             frameIndex, timestampNs, null, RawDngSidecarOutcome.notRequested(frameIndex)
         ).copy(failureDescription = failureMessage)
@@ -167,7 +178,8 @@ internal sealed interface RawSaveCompletion {
     data class Abandoned(
         override val frameIndex: Int,
         override val timestampNs: Long,
-        val output: RawOutputOwnership = RawOutputOwnership(null, null, RawOutputState.NONE, null)
+        val output: RawOutputOwnership = RawOutputOwnership(null, null, RawOutputState.NONE, null),
+        override val imageReleaseFailure: Throwable? = null
     ) : RawSaveCompletion
 }
 

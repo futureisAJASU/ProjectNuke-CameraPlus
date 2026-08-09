@@ -95,6 +95,24 @@ class RawSaveCompletionTest {
     }
 
     @Test
+    fun unadoptedOutputStateDoesNotClaimDiscardedWhileFileRemains() {
+        val finalFile = java.io.File("/tmp/frame_08.raw16")
+        val completion = RawSaveCompletion.Abandoned(
+            frameIndex = 8,
+            timestampNs = 88L,
+            output = RawOutputOwnership(
+                tempFile = null,
+                finalFile = finalFile,
+                state = RawOutputState.UNADOPTED_FINAL,
+                verifiedBytes = 16L,
+                cleanup = RawOutputCleanupOutcome.failed(IllegalStateException("pending"))
+            )
+        )
+        assertEquals(RawOutputState.UNADOPTED_FINAL, completion.output.state)
+        assertFalse(completion.output.cleanup.succeeded)
+    }
+
+    @Test
     fun lateCompletionCanBeConstructedDeterministically() {
         // Late completion path: the worker finishes a frame after terminal
         // was already claimed. The owner publishes the orphan in
