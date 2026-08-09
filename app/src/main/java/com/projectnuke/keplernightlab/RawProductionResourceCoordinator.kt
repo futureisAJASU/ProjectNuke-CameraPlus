@@ -104,7 +104,9 @@ internal class RawProductionResourceCoordinator(
             }
             resources = listOfNotNull(
                 imageReader?.let { "ImageReader" to { it.setOnImageAvailableListener(null, null); it.close() } },
-                captureSession?.let { "CaptureSession" to { releaseSession(it) } },
+                captureSession?.let { "CaptureSession.abort" to { it.abortCaptures() } },
+                captureSession?.let { "CaptureSession.stop" to { it.stopRepeating() } },
+                captureSession?.let { "CaptureSession.close" to { it.close() } },
                 cameraDevice?.let { "CameraDevice" to { it.close() } },
                 motionLogger?.let { "MotionLogger" to { it.stop() } }
             )
