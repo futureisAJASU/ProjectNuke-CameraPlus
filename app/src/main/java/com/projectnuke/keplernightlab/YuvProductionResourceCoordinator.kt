@@ -54,7 +54,7 @@ import java.util.concurrent.atomic.AtomicReference
 internal enum class CoordinatorLifecyclePhase { OPEN, CLEANING, CLOSED }
 
 /** Result of handing an asynchronously-created production resource to its sole owner. */
-internal enum class ProductionAttachmentDisposition { ACCEPTED, SETTLED_LATE, NO_RESOURCE }
+internal enum class ProductionAttachmentDisposition { ACCEPTED, ALREADY_OWNED, SETTLED_LATE, NO_RESOURCE }
 
 /** Structured outcome of one resource release attempt (owned or late attachment). */
 internal data class ProductionResourceReleaseRecord(
@@ -140,64 +140,72 @@ internal class YuvProductionResourceCoordinator(
 
     fun attachImageReader(reader: ImageReader?): ProductionAttachmentDisposition {
         if (reader == null) return ProductionAttachmentDisposition.NO_RESOURCE
-        val late = synchronized(coordinatorLock) {
-            if (phase == CoordinatorLifecyclePhase.OPEN && imageReader == null) {
+        val disposition = synchronized(coordinatorLock) {
+            if (phase == CoordinatorLifecyclePhase.OPEN && imageReader === reader) {
+                ProductionAttachmentDisposition.ALREADY_OWNED
+            } else if (phase == CoordinatorLifecyclePhase.OPEN && imageReader == null) {
                 imageReader = reader
-                false
+                ProductionAttachmentDisposition.ACCEPTED
             } else {
                 lateAttachmentCount++
-                true
+                ProductionAttachmentDisposition.SETTLED_LATE
             }
         }
-        if (!late) return ProductionAttachmentDisposition.ACCEPTED
+        if (disposition != ProductionAttachmentDisposition.SETTLED_LATE) return disposition
         settleLateAttachment("ImageReader", "close") { reader.close() }
         return ProductionAttachmentDisposition.SETTLED_LATE
     }
 
     fun attachCameraDevice(device: CameraDevice?): ProductionAttachmentDisposition {
         if (device == null) return ProductionAttachmentDisposition.NO_RESOURCE
-        val late = synchronized(coordinatorLock) {
-            if (phase == CoordinatorLifecyclePhase.OPEN && cameraDevice == null) {
+        val disposition = synchronized(coordinatorLock) {
+            if (phase == CoordinatorLifecyclePhase.OPEN && cameraDevice === device) {
+                ProductionAttachmentDisposition.ALREADY_OWNED
+            } else if (phase == CoordinatorLifecyclePhase.OPEN && cameraDevice == null) {
                 cameraDevice = device
-                false
+                ProductionAttachmentDisposition.ACCEPTED
             } else {
                 lateAttachmentCount++
-                true
+                ProductionAttachmentDisposition.SETTLED_LATE
             }
         }
-        if (!late) return ProductionAttachmentDisposition.ACCEPTED
+        if (disposition != ProductionAttachmentDisposition.SETTLED_LATE) return disposition
         settleLateAttachment("CameraDevice", "close") { device.close() }
         return ProductionAttachmentDisposition.SETTLED_LATE
     }
 
     fun attachCaptureSession(session: CameraCaptureSession?): ProductionAttachmentDisposition {
         if (session == null) return ProductionAttachmentDisposition.NO_RESOURCE
-        val late = synchronized(coordinatorLock) {
-            if (phase == CoordinatorLifecyclePhase.OPEN && captureSession == null) {
+        val disposition = synchronized(coordinatorLock) {
+            if (phase == CoordinatorLifecyclePhase.OPEN && captureSession === session) {
+                ProductionAttachmentDisposition.ALREADY_OWNED
+            } else if (phase == CoordinatorLifecyclePhase.OPEN && captureSession == null) {
                 captureSession = session
-                false
+                ProductionAttachmentDisposition.ACCEPTED
             } else {
                 lateAttachmentCount++
-                true
+                ProductionAttachmentDisposition.SETTLED_LATE
             }
         }
-        if (!late) return ProductionAttachmentDisposition.ACCEPTED
+        if (disposition != ProductionAttachmentDisposition.SETTLED_LATE) return disposition
         settleLateAttachment("CaptureSession", "close") { session.close() }
         return ProductionAttachmentDisposition.SETTLED_LATE
     }
 
     fun attachMotionLogger(logger: MotionLogger?): ProductionAttachmentDisposition {
         if (logger == null) return ProductionAttachmentDisposition.NO_RESOURCE
-        val late = synchronized(coordinatorLock) {
-            if (phase == CoordinatorLifecyclePhase.OPEN && motionLogger == null) {
+        val disposition = synchronized(coordinatorLock) {
+            if (phase == CoordinatorLifecyclePhase.OPEN && motionLogger === logger) {
+                ProductionAttachmentDisposition.ALREADY_OWNED
+            } else if (phase == CoordinatorLifecyclePhase.OPEN && motionLogger == null) {
                 motionLogger = logger
-                false
+                ProductionAttachmentDisposition.ACCEPTED
             } else {
                 lateAttachmentCount++
-                true
+                ProductionAttachmentDisposition.SETTLED_LATE
             }
         }
-        if (!late) return ProductionAttachmentDisposition.ACCEPTED
+        if (disposition != ProductionAttachmentDisposition.SETTLED_LATE) return disposition
         settleLateAttachment("MotionLogger", "stop") { logger.stop() }
         return ProductionAttachmentDisposition.SETTLED_LATE
     }
