@@ -237,7 +237,7 @@ fun cleanupKeplerGalleryJob(
     val job = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
         target, JOB_JSON_FILE_NAME, requireFile = true
     )) {
-        is NoFollowInspection.Present -> runCatching { JSONObject(resolved.value.readText()) }
+        is NoFollowInspection.Present -> runCatching { JSONObject(NoFollowFileSystem.readTextVerified(resolved.value)) }
             .getOrElse { throw IllegalStateException("Cannot read job.json", it) }
         NoFollowInspection.Absent -> JSONObject()
         is NoFollowInspection.InspectionFailed -> throw resolved.exception
@@ -353,7 +353,7 @@ fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
     val job = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
         directory, JOB_JSON_FILE_NAME, requireFile = true
     )) {
-        is NoFollowInspection.Present -> JSONObject(resolved.value.readText())
+        is NoFollowInspection.Present -> JSONObject(NoFollowFileSystem.readTextVerified(resolved.value))
         NoFollowInspection.Absent -> null
         is NoFollowInspection.InspectionFailed -> throw resolved.exception
     }

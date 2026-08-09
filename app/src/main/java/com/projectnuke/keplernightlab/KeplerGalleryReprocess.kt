@@ -2283,7 +2283,7 @@ private fun fallbackIdentity(transaction: ReprocessTransaction): Triple<String, 
  *  Does NOT catch exceptions — IO/security failures propagate to the caller so the evidence
  *  layer can distinguish InspectionFailed from Untrustworthy. */
 private fun readMarkerIdentity(marker: File): Triple<String, String, Long>? {
-    val lines = marker.readLines()
+    val lines = NoFollowFileSystem.readLinesVerified(marker)
     if (lines.size != 3) return null
     if (lines.any { it.isBlank() }) return null
     val parsed = linkedMapOf<String, String>()
@@ -2331,7 +2331,7 @@ internal fun quarantineMarkerContent(transaction: ReprocessTransaction): String 
  *  propagate to the caller so the evidence layer can distinguish InspectionFailed from
  *  Untrustworthy. */
 internal fun readQuarantineMarkerIdentity(marker: File): Triple<String, String, Long>? {
-    val lines = marker.readLines()
+    val lines = NoFollowFileSystem.readLinesVerified(marker)
     if (lines.size == 1 && lines[0].trim() == "quarantined") return null
     return readMarkerIdentity(marker)
 }

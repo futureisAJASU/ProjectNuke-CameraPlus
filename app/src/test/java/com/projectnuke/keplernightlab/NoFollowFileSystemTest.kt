@@ -3,7 +3,9 @@ package com.projectnuke.keplernightlab
 import java.nio.file.Files
 import java.io.ByteArrayOutputStream
 import kotlin.io.path.createTempDirectory
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -105,6 +107,52 @@ class NoFollowFileSystemTest {
         } finally {
             parent.deleteRecursively()
             outside.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun readTextVerifiedReadsUtf8AndRejectsMissingTarget() {
+        val root = createTempDirectory("kepler-nofollow-text").toFile()
+        try {
+            val file = root.resolve("job.json").apply { writeText("{\"a\":1}\n안녕") }
+            assertEquals("{\"a\":1}\n안녕", NoFollowFileSystem.readTextVerified(file))
+            assertThrows(java.io.FileNotFoundException::class.java) {
+                NoFollowFileSystem.readTextVerified(root.resolve("missing.json"))
+            }
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun readLinesVerifiedMatchesFileReadLinesSemantics() {
+        val root = createTempDirectory("kepler-nofollow-lines").toFile()
+        try {
+            val trailing = root.resolve("marker").apply {
+                writeText("transactionId=tx1\nbackupRoot=.reprocess_backup_tx1\ncreatedAt=42\n")
+            }
+            val parsed = NoFollowFileSystem.readLinesVerified(trailing)
+            assertEquals(3, parsed.size)
+            assertEquals("transactionId=tx1", parsed[0])
+            assertEquals("createdAt=42", parsed[2])
+            val crlf = root.resolve("crlf").apply { writeText("a\r\nb\r\n") }
+            assertEquals(listOf("a", "b"), NoFollowFileSystem.readLinesVerified(crlf))
+            val legacy = root.resolve("legacy").apply { writeText("quarantined\n") }
+            assertEquals(listOf("quarantined"), NoFollowFileSystem.readLinesVerified(legacy))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun readTextVerifiedRejectsDirectoryTarget() {
+        val root = createTempDirectory("kepler-nofollow-text-dir").toFile()
+        try {
+            assertThrows(IllegalArgumentException::class.java) {
+                NoFollowFileSystem.readTextVerified(root)
+            }
+        } finally {
+            root.deleteRecursively()
         }
     }
 

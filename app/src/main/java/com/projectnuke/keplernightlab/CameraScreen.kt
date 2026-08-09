@@ -1325,7 +1325,7 @@ mainHandler.removeCallbacks(watchdog)
                             captureCancellationHandle = captureCancellation,
                             onStatus = callback,
                             onComplete = { jobDir ->
-                                val job = JSONObject(File(jobDir, "job.json").readText())
+                                val job = JSONObject(NoFollowFileSystem.readTextVerified(File(jobDir, "job.json")))
                                 callback(
                                     "PIPELINE_COMPLETE: Test 50M RAW Capture success. cameraId=${mainSelection.cameraId}, size=${job.optInt("rawWidth")}x${job.optInt("rawHeight")} ${"%.1f".format(job.optInt("rawWidth") * job.optInt("rawHeight") / 1_000_000.0)}MP, source=${job.optString("rawSizeSource")}, maxPixelMode=${job.optBoolean("requiresMaximumResolutionPixelMode")}, job=${jobDir.name}"
                                 )
@@ -2888,7 +2888,7 @@ fun loadLatestKeplerResult(context: Context): LatestKeplerResult {
             )
 
         val jobFile = File(latestJobDir, "job.json")
-        val job = JSONObject(jobFile.readText())
+        val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
 
         val firstFrameName = job.optJSONArray("frames")
             ?.optJSONObject(0)
@@ -2952,7 +2952,7 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
 
         val latest = latestJobs.firstNotNullOfOrNull { jobDir ->
             if (isReprocessQuarantined(jobDir)) return@firstNotNullOfOrNull null
-            val job = runCatching { JSONObject(File(jobDir, "job.json").readText()) }.getOrNull()
+            val job = runCatching { JSONObject(NoFollowFileSystem.readTextVerified(File(jobDir, "job.json"))) }.getOrNull()
                 ?: return@firstNotNullOfOrNull null
             if (KeplerJobMetadata.isOperationActive(jobDir) || isKeplerJobActive(job)) {
                 return@firstNotNullOfOrNull null

@@ -1480,7 +1480,7 @@ fun averageLatestYuvBurstGray(
             }
 
             val jobFile = NoFollowFileSystem.requireDirectChildFile(latestJobDir, JOB_JSON_FILE_NAME)
-            val job = JSONObject(jobFile.readText())
+            val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
 
             val width = job.getInt("width")
             val height = job.getInt("height")
@@ -1509,7 +1509,7 @@ fun averageLatestYuvBurstGray(
                 val frameFile = NoFollowFileSystem.optionalDirectChildFile(latestJobDir, fileName)
                     ?: continue
 
-                val bytes = frameFile.readBytes()
+                val bytes = NoFollowFileSystem.readBytesVerified(frameFile)
 
                 if (bytes.size < pixelCount) {
                     continue
@@ -1616,7 +1616,7 @@ fun summarizeLatestYuvMotionJob(
             }
 
             val jobFile = NoFollowFileSystem.requireDirectChildFile(latestJobDir, JOB_JSON_FILE_NAME)
-            val job = JSONObject(jobFile.readText())
+            val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
 
             val status = job.optString("status", "unknown")
             val cameraId = job.optString("cameraId", "unknown")
@@ -1868,7 +1868,7 @@ fun writeBurstJobJson(
         json.put("createdAt", now)
     } else {
         val oldCreatedAt = runCatching {
-            JSONObject(existingJobFile.readText()).optLong("createdAt", now)
+            JSONObject(NoFollowFileSystem.readTextVerified(existingJobFile)).optLong("createdAt", now)
         }.getOrDefault(now)
 
         json.put("createdAt", oldCreatedAt)
@@ -1936,7 +1936,7 @@ fun writeYuvJobJson(
         json.put("createdAt", now)
     } else {
         val oldCreatedAt = runCatching {
-            JSONObject(existingJobFile.readText()).optLong("createdAt", now)
+            JSONObject(NoFollowFileSystem.readTextVerified(existingJobFile)).optLong("createdAt", now)
         }.getOrDefault(now)
 
         json.put("createdAt", oldCreatedAt)

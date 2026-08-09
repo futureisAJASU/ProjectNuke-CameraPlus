@@ -25,10 +25,9 @@ import android.util.Log
 import android.util.Size
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedInputStream
+import java.io.OutputStream
 import java.io.BufferedOutputStream
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -1335,7 +1334,7 @@ private object RawFusionExportCoordinator {
         )
         val nativePostprocessMetadata = if (nativePostprocessUsed) {
             cancellation.throwIfCancelled()
-            runCatching { JSONObject(nativeMetadataFile.readText()) }.getOrNull()
+            runCatching { JSONObject(NoFollowFileSystem.readTextVerified(nativeMetadataFile)) }.getOrNull()
         } else {
             null
         }
@@ -1590,7 +1589,7 @@ private object RawFusionExportCoordinator {
             )
         }
         cancellation.throwIfCancelled()
-        val debug = runCatching { JSONObject(renderDebugFile.readText()) }.getOrNull()
+        val debug = runCatching { JSONObject(NoFollowFileSystem.readTextVerified(renderDebugFile)) }.getOrNull()
         val nativeWarnings = debug?.optJSONArray("renderWarnings") ?: JSONArray()
         Log.i(
             RAW_PIPELINE_LOG_TAG,
@@ -1744,7 +1743,7 @@ fun processRawFusionJob(
 
     return try {
         cancellation.throwIfCancelled()
-        val job = JSONObject(jobFile.readText())
+        val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
         cancellation.throwIfCancelled()
 
         // 1-2. Remove stale previous-run values for every owned progress, diagnostic, processor-
@@ -2124,33 +2123,39 @@ private fun writeCompactRaw16(image: Image, file: File) {
     }
 }
 
-internal fun readRaw16(file: File, pixelCount: Int): ShortArray {
+private class Raw16BytesToShorts(private val pixelCount: Int) : OutputStream() {
     val values = ShortArray(pixelCount)
-    val bytes = ByteArray(1024 * 1024)
-    var byteCarry: Int? = null
-    var out = 0
-    BufferedInputStream(FileInputStream(file)).use { input ->
-        while (out < pixelCount) {
-            val read = input.read(bytes)
-            if (read <= 0) break
-            var index = 0
-            if (byteCarry != null && index < read) {
-                values[out++] = ((bytes[index].toInt() and 0xFF) shl 8 or byteCarry!!).toShort()
-                byteCarry = null
-                index++
-            }
-            while (index + 1 < read && out < pixelCount) {
-                val lo = bytes[index].toInt() and 0xFF
-                val hi = bytes[index + 1].toInt() and 0xFF
-                values[out++] = ((hi shl 8) or lo).toShort()
-                index += 2
-            }
-            if (index < read && out < pixelCount) {
-                byteCarry = bytes[index].toInt() and 0xFF
-            }
+    private var byteCarry: Int? = null
+    private var out = 0
+
+    override fun write(b: Int) {
+        write(byteArrayOf(b.toByte()), 0, 1)
+    }
+
+    override fun write(buffer: ByteArray, offset: Int, length: Int) {
+        var index = 0
+        val read = length
+        if (byteCarry != null && index < read && out < pixelCount) {
+            values[out++] = ((buffer[offset + index].toInt() and 0xFF) shl 8 or byteCarry!!).toShort()
+            byteCarry = null
+            index++
+        }
+        while (index + 1 < read && out < pixelCount) {
+            val lo = buffer[offset + index].toInt() and 0xFF
+            val hi = buffer[offset + index + 1].toInt() and 0xFF
+            values[out++] = ((hi shl 8) or lo).toShort()
+            index += 2
+        }
+        if (index < read && out < pixelCount) {
+            byteCarry = buffer[offset + index].toInt() and 0xFF
         }
     }
-    return values
+}
+
+internal fun readRaw16(file: File, pixelCount: Int): ShortArray {
+    val parser = Raw16BytesToShorts(pixelCount)
+    NoFollowFileSystem.copyVerified(file, parser)
+    return parser.values
 }
 
 internal fun writeRaw16(values: ShortArray, file: File) {
@@ -2351,6 +2356,51 @@ private fun saveRawFusionPng(bitmap: Bitmap, file: File) {
     }
 }
 
+private class NativeRgbaBitmapSink(
+    private val bitmap: Bitmap,
+    private val width: Int,
+    private val height: Int
+) : OutputStream() {
+    private val byteBuffer = ByteBuffer.allocate(width * 16 * 4).order(ByteOrder.LITTLE_ENDIAN)
+    private val pixels = IntArray(width * 16)
+    private var y = 0
+
+    override fun write(b: Int) {
+        write(byteArrayOf(b.toByte()), 0, 1)
+    }
+
+    override fun write(buffer: ByteArray, offset: Int, length: Int) {
+        var off = offset
+        var len = length
+        while (len > 0) {
+            if (y >= height) error("Unexpected trailing bytes in native RGBA output")
+            val rows = min(16, height - y)
+            val bytesNeeded = width * rows * 4
+            byteBuffer.clear()
+            var filled = 0
+            while (filled < bytesNeeded && len > 0) {
+                val take = min(len, bytesNeeded - filled)
+                byteBuffer.put(buffer, off, take)
+                off += take
+                len -= take
+                filled += take
+            }
+            if (filled < bytesNeeded) error("Unexpected EOF in native RGBA output")
+            var p = 0
+            var b = 0
+            while (p < width * rows) {
+                val r = byteBuffer.array()[b++].toInt() and 0xFF
+                val g = byteBuffer.array()[b++].toInt() and 0xFF
+                val blue = byteBuffer.array()[b++].toInt() and 0xFF
+                val a = byteBuffer.array()[b++].toInt() and 0xFF
+                pixels[p++] = Color.argb(a, r, g, blue)
+            }
+            bitmap.setPixels(pixels, 0, width, 0, y, width, rows)
+            y += rows
+        }
+    }
+}
+
 internal fun loadRawRgbaBitmap(file: File, width: Int, height: Int): Bitmap {
     val expectedBytes = width.toLong() * height.toLong() * 4L
     require(file.length() == expectedBytes) {
@@ -2358,34 +2408,7 @@ internal fun loadRawRgbaBitmap(file: File, width: Int, height: Int): Bitmap {
     }
     val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
     try {
-        val rowsPerChunk = 16
-        val byteBuffer = ByteBuffer.allocate(width * rowsPerChunk * 4).order(ByteOrder.LITTLE_ENDIAN)
-        val pixels = IntArray(width * rowsPerChunk)
-        FileInputStream(file).use { input ->
-            var y = 0
-            while (y < height) {
-                val rows = min(rowsPerChunk, height - y)
-                val bytesNeeded = width * rows * 4
-                byteBuffer.clear()
-                var offset = 0
-                while (offset < bytesNeeded) {
-                    val read = input.read(byteBuffer.array(), offset, bytesNeeded - offset)
-                    if (read < 0) error("Unexpected EOF in native RGBA output")
-                    offset += read
-                }
-                var p = 0
-                var b = 0
-                while (p < width * rows) {
-                    val r = byteBuffer.array()[b++].toInt() and 0xFF
-                    val g = byteBuffer.array()[b++].toInt() and 0xFF
-                    val blue = byteBuffer.array()[b++].toInt() and 0xFF
-                    val a = byteBuffer.array()[b++].toInt() and 0xFF
-                    pixels[p++] = Color.argb(a, r, g, blue)
-                }
-                bitmap.setPixels(pixels, 0, width, 0, y, width, rows)
-                y += rows
-            }
-        }
+        NoFollowFileSystem.copyVerified(file, NativeRgbaBitmapSink(bitmap, width, height))
         return bitmap
     } catch (t: Throwable) {
         bitmap.takeUnless { it.isRecycled }?.recycle()

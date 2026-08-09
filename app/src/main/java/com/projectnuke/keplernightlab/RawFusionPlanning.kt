@@ -148,7 +148,7 @@ internal fun chooseRawReferenceFrame(
 
 private fun readRawGyroSamples(file: File): List<RawGyro> {
     if (!file.exists()) return emptyList()
-    return file.readLines().drop(1).mapNotNull { line ->
+    return NoFollowFileSystem.readLinesVerified(file).drop(1).mapNotNull { line ->
         val parts = line.split(',')
         val timestamp = parts.getOrNull(0)?.toLongOrNull() ?: return@mapNotNull null
         val x = parts.getOrNull(1)?.toDoubleOrNull() ?: 0.0

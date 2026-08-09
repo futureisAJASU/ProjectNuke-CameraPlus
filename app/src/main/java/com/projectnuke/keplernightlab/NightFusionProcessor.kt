@@ -448,7 +448,7 @@ private fun boxBlur3x3(source: Bitmap): Bitmap {
 private fun readGyroSamples(file: File): List<GyroSampleForFusion> {
     if (!file.exists()) return emptyList()
 
-    return file.readLines()
+    return NoFollowFileSystem.readLinesVerified(file)
         .drop(1)
         .mapNotNull { line ->
             val parts = line.split(',')

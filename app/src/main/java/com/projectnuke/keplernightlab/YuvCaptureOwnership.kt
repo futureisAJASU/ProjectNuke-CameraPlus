@@ -2,6 +2,8 @@ package com.projectnuke.keplernightlab
 
 import android.media.Image
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -140,15 +142,28 @@ internal object RealYuvFinalFileVerifier : YuvFinalFileVerifier {
     private val PNG_SIGNATURE = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
 
     override fun verify(finalFile: File, frameIndex: Int): Boolean {
-        if (!finalFile.exists() || !finalFile.isFile || !finalFile.canRead()) return false
-        return try {
-            finalFile.inputStream().use { input ->
-                val header = ByteArray(8)
-                input.read(header) == 8 && header.contentEquals(PNG_SIGNATURE)
+        val before = when (val inspection = NoFollowFileSystem.inspect(finalFile.toPath())) {
+            NoFollowInspection.Absent -> return false
+            is NoFollowInspection.InspectionFailed -> return false
+            is NoFollowInspection.Present -> inspection.value
+        }
+        if (!before.isRegularFile || before.isSymbolicLink()) return false
+        val header = ByteArray(8)
+        var read = 0
+        val signatureMatch = try {
+            Files.newInputStream(finalFile.toPath(), LinkOption.NOFOLLOW_LINKS).use { input ->
+                while (read < header.size) {
+                    val count = input.read(header, read, header.size - read)
+                    if (count <= 0) break
+                    read += count
+                }
+                read == header.size && header.contentEquals(PNG_SIGNATURE)
             }
         } catch (t: Throwable) {
             false
         }
+        if (!signatureMatch) return false
+        return NoFollowFileSystem.revalidate(finalFile.toPath(), before)
     }
 }
 

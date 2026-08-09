@@ -1075,4 +1075,34 @@ class YuvCaptureOwnershipTest {
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
         )
     }
+
+    @Test
+    fun realYuvFinalFileVerifierAcceptsPngSignatureAndRejectsOtherContent() {
+        val root = Files.createTempDirectory("kepler-yuv-verifier").toFile()
+        try {
+            val png = root.resolve("frame.png").apply {
+                writeBytes(PNG_1X1)
+            }
+            assertTrue(RealYuvFinalFileVerifier.verify(png, 0))
+            val garbage = root.resolve("frame.txt").apply {
+                writeBytes(byteArrayOf(1, 2, 3, 4, 5, 6, 7, 8))
+            }
+            assertFalse(RealYuvFinalFileVerifier.verify(garbage, 0))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun realYuvFinalFileVerifierRejectsMissingEmptyAndDirectoryTargets() {
+        val root = Files.createTempDirectory("kepler-yuv-verifier").toFile()
+        try {
+            assertFalse(RealYuvFinalFileVerifier.verify(root.resolve("missing.png"), 0))
+            val empty = root.resolve("empty.png").apply { writeBytes(ByteArray(0)) }
+            assertFalse(RealYuvFinalFileVerifier.verify(empty, 0))
+            assertFalse(RealYuvFinalFileVerifier.verify(root, 0))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
 }

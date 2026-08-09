@@ -1580,7 +1580,7 @@ fun writeColorJobJson(
     val actualPhysicalCameraId =
         if (actualRoute == PhysicalCaptureRoute.PHYSICAL.name) physicalCameraId else null
     val previousJob = if (jobFile.exists()) {
-        runCatching { JSONObject(jobFile.readText()) }.getOrNull()
+        runCatching { JSONObject(NoFollowFileSystem.readTextVerified(jobFile)) }.getOrNull()
     } else {
         null
     }

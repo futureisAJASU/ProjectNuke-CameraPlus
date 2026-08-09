@@ -246,7 +246,7 @@ internal fun reprocessYuvJob(
             if (selectedFrameIndices != null) {
                 applyExplicitYuvFrameSelection(jobDir, selectedFrameIndices)
             }
-            val initialJob = JSONObject(jobFile.readText())
+            val initialJob = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
             val singleFrame = isSingleFrameJob(initialJob)
             val requiredFrames = if (singleFrame) 1 else 2
             val frames = initialJob.optJSONArray("frames")

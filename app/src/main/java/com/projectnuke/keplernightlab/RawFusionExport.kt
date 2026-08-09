@@ -633,7 +633,7 @@ fun captureProcessExportRawNightFusion(
                         return@post
                     }
                     val processedJobFile = File(jobDir, JOB_JSON_FILE_NAME)
-                    val processedJob = JSONObject(processedJobFile.readText())
+                    val processedJob = JSONObject(NoFollowFileSystem.readTextVerified(processedJobFile))
                     val requestedFrames = processedJob.optInt("requestedFrames", frameCount)
                     val usedFrameCount = processedJob.optInt(
                         "usedFrameCount",

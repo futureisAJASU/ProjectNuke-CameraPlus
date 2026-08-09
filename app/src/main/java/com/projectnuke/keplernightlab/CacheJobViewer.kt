@@ -921,7 +921,7 @@ fun readJsonFilePretty(file: File): String {
             !inspection.value.isRegularFile || inspection.value.isSymbolicLink()
         ) return "Unsafe file: ${file.name}"
     }
-    val raw = runCatching { file.readText() }
+    val raw = runCatching { NoFollowFileSystem.readTextVerified(file) }
         .getOrElse { return "Read failed: ${it.javaClass.simpleName}: ${it.message}" }
     return runCatching { JSONObject(raw).toString(2) }
         .getOrElse {
@@ -980,7 +980,7 @@ private fun parseJsonFile(file: File): Pair<JSONObject?, String?> {
             !inspection.value.isRegularFile || inspection.value.isSymbolicLink()
         ) return null to "${file.name}: not a regular non-symlink file"
     }
-    return runCatching { JSONObject(file.readText()) }
+    return runCatching { JSONObject(NoFollowFileSystem.readTextVerified(file)) }
         .fold(
             onSuccess = { it to null },
             onFailure = { null to "${file.name}: ${it.javaClass.simpleName}: ${it.message}" }

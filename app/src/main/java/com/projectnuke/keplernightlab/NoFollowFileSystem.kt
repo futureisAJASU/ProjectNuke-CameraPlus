@@ -159,6 +159,18 @@ internal object NoFollowFileSystem {
 
     fun readTextVerified(file: File): String = readBytesVerified(file).toString(Charsets.UTF_8)
 
+    /**
+     * Reads lines with [File.readLines] semantics (LF/CRLF terminators stripped
+     * and the single trailing empty line removed) while verifying stable file
+     * identity, so it is a drop-in verified replacement for [File.readLines].
+     */
+    fun readLinesVerified(file: File): List<String> {
+        val lines = readTextVerified(file)
+            .split('\n')
+            .map { if (it.endsWith('\r')) it.dropLast(1) else it }
+        return if (lines.isNotEmpty() && lines.last().isEmpty()) lines.dropLast(1) else lines
+    }
+
     fun decodeBitmapVerified(file: File, options: BitmapFactory.Options? = null): Bitmap? {
         val bytes = readBytesVerified(file)
         return if (options == null) BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
