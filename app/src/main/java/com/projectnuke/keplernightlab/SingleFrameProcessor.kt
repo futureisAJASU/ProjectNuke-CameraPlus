@@ -113,7 +113,6 @@ internal fun processSingleFrameJobSync(
         }
         KeplerJobMetadata.atomicReplace(requireNotNull(candidateFile), outputFile)
         outputWritten = true
-        cancellation.throwIfCancelled()
         check(
             !Files.isSymbolicLink(outputPath) &&
                 Files.isRegularFile(outputPath, LinkOption.NOFOLLOW_LINKS) &&
@@ -122,6 +121,7 @@ internal fun processSingleFrameJobSync(
             "Single-frame output verification failed"
         }
         committedFinalVerified = true
+        cancellation.throwIfCancelled()
         val finishedAt = System.currentTimeMillis()
 
         val completedOutput = requireNotNull(outputFile)

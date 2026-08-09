@@ -163,6 +163,8 @@ class BitmapTileSink(
 private class StreamingPngTileSink(
     private val outputFile: File
 ) : SuperResolutionTileSink {
+    private enum class State { IDLE, WRITING, COMMITTED, ABORTED }
+    private var state = State.IDLE
     private var temporary: File? = null
     private var rawOutput: FileOutputStream? = null
     private var stream: BufferedOutputStream? = null
@@ -174,6 +176,7 @@ private class StreamingPngTileSink(
     private var row: ByteArray? = null
 
     override fun begin(width: Int, height: Int) {
+        check(state == State.IDLE || state == State.ABORTED) { "PNG sink begin in state=$state" }
         require(width > 0 && height > 0)
         this.width = width
         this.height = height
@@ -181,6 +184,7 @@ private class StreamingPngTileSink(
         parent.mkdirs()
         val temp = File(parent, ".${outputFile.name}.${System.nanoTime()}.tmp")
         temporary = temp
+        state = State.WRITING
         val fileOutput = FileOutputStream(temp)
         rawOutput = fileOutput
         val out = BufferedOutputStream(fileOutput, 64 * 1024)
@@ -199,6 +203,7 @@ private class StreamingPngTileSink(
     }
 
     override fun writeTile(x: Int, y: Int, width: Int, height: Int, pixels: IntArray) {
+        check(state == State.WRITING) { "PNG sink write in state=$state" }
         check(x == 0 && width == this.width && y == nextY)
         require(height > 0 && pixels.size >= Math.multiplyExact(width, height))
         val out = requireNotNull(stream)
@@ -225,6 +230,7 @@ private class StreamingPngTileSink(
     }
 
     override fun finish(): File {
+        check(state == State.WRITING) { "PNG sink finish in state=$state" }
         check(nextY == height)
         val out = requireNotNull(stream)
         val encoder = requireNotNull(deflater)
@@ -238,15 +244,20 @@ private class StreamingPngTileSink(
         rawOutput?.fd?.sync()
         out.close()
         temporary?.let { KeplerJobMetadata.atomicReplace(it, outputFile) }
+        check(NoFollowFileSystem.isRealFile(outputFile.toPath()) && outputFile.length() > 0L) {
+            "PNG sink final verification failed"
+        }
         encoder.end()
         stream = null
         rawOutput = null
         deflater = null
         temporary = null
+        state = State.COMMITTED
         return outputFile
     }
 
     override fun abort() {
+        if (state == State.COMMITTED) return
         runCatching { stream?.close() }
         deflater?.end()
         temporary?.delete()
@@ -255,6 +266,7 @@ private class StreamingPngTileSink(
         rawOutput = null
         deflater = null
         temporary = null
+        state = State.ABORTED
     }
 
     private fun writeInt(target: ByteArray, offset: Int, value: Int) {
@@ -1686,18 +1698,23 @@ private fun createSuperResolutionJobDirectory(context: Context): File {
 }
 
 private fun saveJpeg(bitmap: Bitmap, outputFile: File, quality: Int = JPEG_QUALITY) {
-    val temporary = File(outputFile.parentFile, ".${outputFile.name}.${System.nanoTime()}.tmp")
-    try {
-        FileOutputStream(temporary).use { output ->
-        check(bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
-            "JPEG encode failed."
+    commitProcessingArtifact(
+        finalFile = outputFile,
+        writeTemp = { temporary ->
+            FileOutputStream(temporary).use { output ->
+                check(bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
+                    "JPEG encode failed."
+                }
+                output.fd.sync()
+            }
+        },
+        verifyFinal = { committed ->
+            val bytes = NoFollowFileSystem.readBytesVerified(committed)
+            check(bytes.size >= 4 && bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte()) {
+                "JPEG final verification failed"
+            }
         }
-            output.fd.sync()
-        }
-        KeplerJobMetadata.atomicReplace(temporary, outputFile)
-    } finally {
-        if (temporary.exists()) temporary.delete()
-    }
+    )
 }
 
 private fun estimateFusionWorkingBytes(
