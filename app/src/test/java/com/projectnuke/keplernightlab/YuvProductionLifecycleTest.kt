@@ -289,6 +289,7 @@ class YuvProductionLifecycleTest {
         try {
             harness.feedAll()
             assertEquals(CaptureTerminalStatus.SUCCESS, harness.awaitTerminal())
+            harness.awaitCallback()
             val snap = harness.session.owner.terminalSnapshotRef()
             assertTrue(snap.metadataWriteOutcome is TerminalOperationOutcome.Succeeded)
             assertTrue(snap.motionSaveOutcome is TerminalOperationOutcome.Succeeded)
