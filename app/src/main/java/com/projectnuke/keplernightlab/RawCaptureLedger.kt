@@ -150,10 +150,6 @@ internal class RawCaptureLedger<IMAGE, RESULT>(
         unmatched.forEach { releaseImage(it, RawImageReleaseReason.TERMINAL_CLEANUP) }
     }
 
-    /** Compatibility only for terminal callers; never use from normal event dispatch. */
-    @Deprecated("Terminal-only; use releaseUnmatchedImagesAtTerminal")
-    fun closeUnmatchedImages() = releaseUnmatchedImagesAtTerminal()
-
     /**
      * Transactionally transfers one ready pair at a time. A rejected submission must
      * call [restoreRejectedSubmission] with this same object, preserving identity.

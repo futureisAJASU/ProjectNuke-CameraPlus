@@ -93,7 +93,7 @@ class RawCaptureLedgerTest {
         owner.recordImage(2L, "img-2", 20L)
         owner.recordResult(1L, "res-1")
 
-        owner.closeUnmatchedImages()
+        owner.releaseUnmatchedImagesAtTerminal()
 
         assertEquals(listOf("img-2"), closed)
         assertEquals(1, owner.snapshot().droppedUnmatchedImages)

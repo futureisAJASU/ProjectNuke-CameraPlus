@@ -566,6 +566,7 @@ class ProductionYuvCaptureBridgeTest {
         val handlerThread = android.os.HandlerThread("prod-cb-thread").apply { start() }
         val handler = android.os.Handler(handlerThread.looper)
         val capturedThreads = mutableListOf<String>()
+        val callbackLatch = CountDownLatch(1)
         val dir = Files.createTempDirectory("prod-cb-thread").toFile()
         val session = YuvCaptureSession.create(
             dispatch = { event ->
@@ -595,7 +596,10 @@ class ProductionYuvCaptureBridgeTest {
                 handler.post(runnable)
                 true
             },
-            onCaptureComplete = { capturedThreads += "COMPLETE:${Thread.currentThread().name}" },
+            onCaptureComplete = {
+                capturedThreads += "COMPLETE:${Thread.currentThread().name}"
+                callbackLatch.countDown()
+            },
             productionResourceCoordinator = YuvProductionResourceCoordinator(
                 timeoutScheduler = null,
                 backgroundHandler = null,
@@ -604,18 +608,8 @@ class ProductionYuvCaptureBridgeTest {
         )
         try {
             session.owner.acceptBuffered(Camera2YuvImageAccess(FakeYuvImage(1000L)))
-            // Wait for terminal settle.
-            var settled = false
-            repeat(200) {
-                val drain = CountDownLatch(1)
-                handler.post { drain.countDown() }
-                drain.await(2, TimeUnit.SECONDS)
-                if (session.owner.terminalSettlementPhase() == TerminalSettlementPhase.SETTLED) {
-                    settled = true
-                    return@repeat
-                }
-            }
-            assertTrue("terminal phase not SETTLED", settled)
+            assertTrue("completion callback not reached", callbackLatch.await(5, TimeUnit.SECONDS))
+            assertEquals(TerminalSettlementPhase.SETTLED, session.owner.terminalSettlementPhase())
             // The dispatch thread (captured before post) must NOT be the worker thread.
             // We allow the COMPLETE callback to fire on the dispatched handler thread.
             assertTrue("callback thread not captured", capturedThreads.any { it.startsWith("COMPLETE:") })
