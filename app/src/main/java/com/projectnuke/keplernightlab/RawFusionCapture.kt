@@ -148,14 +148,25 @@ fun captureRawBurstForFusion(
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
     fun post(message: String): Boolean =
-        mainHandler.post { onStatus(message) }.also { posted ->
-            if (!posted) runCatching { onStatus(message) }
+        mainHandler.post {
+            try {
+                onStatus(message)
+            } catch (callbackFailure: Throwable) {
+                Log.e(RAW_PIPELINE_LOG_TAG, "RAW status callback failed", callbackFailure)
+            }
         }
-    fun postMainOrRun(action: () -> Unit) {
-        val posted = mainHandler.post(action)
+    fun postMainOrRun(action: () -> Unit): Boolean {
+        val posted = mainHandler.post {
+            try {
+                action()
+            } catch (callbackFailure: Throwable) {
+                Log.e(RAW_PIPELINE_LOG_TAG, "RAW terminal callback failed", callbackFailure)
+            }
+        }
         if (!posted) {
             Log.w(RAW_PIPELINE_LOG_TAG, "Main dispatch rejected for RAW callback/action")
         }
+        return posted
     }
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     val thread = HandlerThread("KeplerRawFusionCaptureThread").apply { start() }
@@ -223,11 +234,14 @@ fun captureRawBurstForFusion(
         )
     }
 
+    // Cancellation is intentionally only recorded here.  Once the owner has been
+    // initialized below it is delivered as an immutable owner event, so it cannot
+    // pre-claim terminal state and strand metadata/callback/cleanup settlement.
+    val cancellationRequested = AtomicBoolean(false)
+    val cancellationDispatcher = AtomicReference<(() -> Unit)?>(null)
     captureCancellationHandle.registerCleanupAction {
-        if (terminalState.claim(CaptureTerminalStatus.CANCELLED)) {
-            finished.set(true)
-            cleanup()
-        }
+        cancellationRequested.set(true)
+        cancellationDispatcher.get()?.invoke()
     }
 
     fun writeJobStatus(jobFile: File?, baseJob: JSONObject?, status: String, error: String? = null) {
@@ -578,10 +592,14 @@ fun captureRawBurstForFusion(
         motionLogger = runCatching { MotionLogger(context).also { it.start() } }.getOrNull()
         postCaptureProgress()
 
-        fun finishError(status: String, message: String) {
+        fun finishError(
+            status: String,
+            message: String,
+            terminalStatus: CaptureTerminalStatus = CaptureTerminalStatus.FAILED
+        ) {
             val settleEvent = object : CaptureOwnerEvent {
                 override fun execute() {
-                    if (!terminalState.claim(CaptureTerminalStatus.FAILED)) return
+                    if (!terminalState.claim(terminalStatus)) return
                     if (rawSelection.requiresMaximumResolutionPixelMode && maxResolutionPixelModeFailure == null) {
                         maxResolutionPixelModeFailure = "Maximum-resolution RAW capture failed: $message"
                     }
@@ -677,6 +695,35 @@ fun captureRawBurstForFusion(
                 runCatching { cleanup() }
             }
         }
+
+        fun finishCancelled() {
+            val settleEvent = object : CaptureOwnerEvent {
+                override fun execute() {
+                    if (!terminalState.claim(CaptureTerminalStatus.CANCELLED)) return
+                    finished.set(true)
+                    val message = "CAPTURE_CANCELLED: RAW capture was cancelled"
+                    writeJobStatus(jobFile, baseJob, "CAPTURE_CANCELLED", message)
+                    post(message)
+                    postMainOrRun { onError(message) }
+                    cleanup()
+                }
+
+                override fun disposeWithoutMutation() {
+                    // The owner was already closed before the cancellation request
+                    // could run.  Do not manufacture a second callback; cleanup is
+                    // still required to settle resources retained before dispatch.
+                    finished.set(true)
+                    cleanup()
+                }
+            }
+            if (!captureStateOwner.post(settleEvent)) {
+                finished.set(true)
+                cleanup()
+            }
+        }
+
+        cancellationDispatcher.set { finishCancelled() }
+        if (cancellationRequested.get()) finishCancelled()
 
         var dispatchReady: () -> Unit = {}
 
@@ -795,56 +842,77 @@ fun captureRawBurstForFusion(
         }
 
         fun submitSaveRequest(request: RawSaveFrameRequest): Boolean {
-            val task = object : OutcomeDisposableCaptureTask {
-                private val started = AtomicBoolean(false)
-
-                override fun run() {
-                    if (!started.compareAndSet(false, true)) return
-                    val completion = saveRawFrameToCompletion(request)
+            fun disposeUnadoptedCompletion(completion: RawSaveCompletion): CaptureTaskDisposalOutcome {
+                val files = when (completion) {
+                    is RawSaveCompletion.Success -> buildList {
+                        add(File(jobDir, completion.raw16Filename))
+                        completion.dngSidecar.sidecarFilename?.let { add(File(jobDir, it)) }
+                    }
+                    is RawSaveCompletion.Failed -> listOfNotNull(completion.raw16TempFile)
+                    is RawSaveCompletion.Abandoned -> emptyList()
+                }
+                var failure: Throwable? = null
+                for (file in files.distinct()) {
+                    try {
+                        if (file.exists() && !file.delete()) {
+                            throw java.io.IOException("Could not delete unadopted RAW output ${file.absolutePath}")
+                        }
+                    } catch (t: Throwable) {
+                        Log.e(RAW_PIPELINE_LOG_TAG, "RAW completion cleanup failed", t)
+                        if (failure == null) failure = t
+                    }
+                }
+                return failure?.let { CaptureTaskDisposalOutcome.Failed(it) }
+                    ?: CaptureTaskDisposalOutcome.Clean
+            }
+            val task = RawSaveTask(
+                produceCompletion = { saveRawFrameToCompletion(request) },
+                postCompletion = { completion ->
                     val event = object : CaptureOwnerEvent {
-                    override fun execute() {
-                        if (captureStateOwner.isClosed()) return
-                        when (completion) {
-                            is RawSaveCompletion.Success -> {
-                                ledger.value.adoptSuccess(completion)
-                                publishProgress()
-                                post("RAW saved frame ${ledger.value.savedFrames}/${ledger.value.requestedFrames} (${completion.saveDurationMs}ms)")
-                                if (ledger.value.savedFrames == 1 || ledger.value.savedFrames == ledger.value.requestedFrames) {
-                                    writeJobStatus(jobFile, baseJob, "CAPTURING")
-                                }
-                                postCaptureProgress()
-                                if (ledger.value.savedFrames >= ledger.value.requestedFrames) {
-                                    finishSuccess()
-                                } else {
-                                    dispatchReady()
-                                }
+                        override fun execute() {
+                            if (captureStateOwner.isClosed()) {
+                                disposeUnadoptedCompletion(completion)
+                                return
                             }
-                            is RawSaveCompletion.Failed -> {
-                                ledger.value.adoptFailure(completion)
-                                finishError("CAPTURE_FAILED", completion.failureMessage)
+                            when (completion) {
+                                is RawSaveCompletion.Success -> {
+                                    ledger.value.adoptSuccess(completion)
+                                    publishProgress()
+                                    post("RAW saved frame ${ledger.value.savedFrames}/${ledger.value.requestedFrames} (${completion.saveDurationMs}ms)")
+                                    if (ledger.value.savedFrames == 1 || ledger.value.savedFrames == ledger.value.requestedFrames) {
+                                        writeJobStatus(jobFile, baseJob, "CAPTURING")
+                                    }
+                                    postCaptureProgress()
+                                    if (ledger.value.savedFrames >= ledger.value.requestedFrames) {
+                                        finishSuccess()
+                                    } else {
+                                        dispatchReady()
+                                    }
+                                }
+                                is RawSaveCompletion.Failed -> {
+                                    ledger.value.adoptFailure(completion)
+                                    finishError("CAPTURE_FAILED", completion.failureMessage)
+                                }
+                                is RawSaveCompletion.Abandoned -> Unit
                             }
-                            is RawSaveCompletion.Abandoned -> Unit
+                        }
+
+                        override fun disposeWithoutMutation() {
+                            disposeUnadoptedCompletion(completion)
                         }
                     }
-                    override fun disposeWithoutMutation() {}
-                    }
                     captureStateOwner.post(event)
-                }
-
-                override fun dispose() {
-                    disposeWithOutcome()
-                }
-
-                override fun disposeWithOutcome(): CaptureTaskDisposalOutcome {
-                    if (!started.compareAndSet(false, true)) return CaptureTaskDisposalOutcome.Clean
-                    return try {
+                },
+                disposeCompletion = ::disposeUnadoptedCompletion,
+                disposeQueuedInput = {
+                    try {
                         request.image.close()
                         CaptureTaskDisposalOutcome.Clean
                     } catch (t: Throwable) {
                         CaptureTaskDisposalOutcome.Failed(t)
                     }
                 }
-            }
+            )
             // Before executor acceptance the owner retains request.image. A rejection
             // therefore returns it to the same pending identity below; a queued task
             // is disposable because ownership moved to the worker after acceptance.
@@ -979,9 +1047,9 @@ fun captureRawBurstForFusion(
         }
 
         timeoutScheduler.schedule({
-            if (!terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) return@schedule
             val settle = object : CaptureOwnerEvent {
                 override fun execute() {
+                    if (finished.get() || terminalState.status() != CaptureTerminalStatus.ACTIVE) return
                     val snapshot = progressSnapshot.get()
                     if (snapshot.savedFrames >= snapshot.requestedFrames) {
                         finishSuccess(
@@ -994,7 +1062,8 @@ fun captureRawBurstForFusion(
                     } else {
                         finishError(
                             "CAPTURE_TIMEOUT",
-                            "CAPTURE_TIMEOUT: RAW capture saved ${snapshot.savedFrames}/${snapshot.requestedFrames}"
+                            "CAPTURE_TIMEOUT: RAW capture saved ${snapshot.savedFrames}/${snapshot.requestedFrames}",
+                            terminalStatus = CaptureTerminalStatus.TIMED_OUT
                         )
                     }
                 }
@@ -1002,7 +1071,9 @@ fun captureRawBurstForFusion(
             }
             if (!captureStateOwner.post(settle)) {
                 Log.e(RAW_PIPELINE_LOG_TAG, "RAW owner handler rejected timeout settlement")
-                finished.set(true)
+                // A rejected event must not pre-claim an arbitrary terminal
+                // outcome off-owner.  The production cleanup path remains the
+                // only resource settlement fallback; no callback is synthesized.
                 cleanup()
             }
         }, max(30_000L, requestedFrames * 8_000L), TimeUnit.MILLISECONDS)

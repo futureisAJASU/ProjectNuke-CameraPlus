@@ -130,4 +130,31 @@ class RawSaveCompletionTest {
             assertTrue(kind in listOf("success", "failed", "abandoned"))
         }
     }
+
+    @Test
+    fun completionPostRejectionReturnsOutputOwnershipToDisposer() {
+        var disposed = 0
+        val task = RawSaveTask(
+            produceCompletion = {
+                RawSaveCompletion.Success(
+                    frameIndex = 4,
+                    timestampNs = 44L,
+                    raw16Filename = "frame_04.raw16",
+                    raw16Bytes = 8L,
+                    saveDurationMs = 1L,
+                    dngSidecar = RawDngSidecarOutcome.notRequested(4)
+                )
+            },
+            postCompletion = { false },
+            disposeCompletion = {
+                disposed++
+                CaptureTaskDisposalOutcome.Clean
+            },
+            disposeQueuedInput = { error("accepted task must not dispose queued input") }
+        )
+
+        task.run()
+
+        assertEquals(1, disposed)
+    }
 }

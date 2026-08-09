@@ -74,3 +74,35 @@ sealed interface RawSaveCompletion {
         override val timestampNs: Long
     ) : RawSaveCompletion
 }
+
+/**
+ * Production worker task for a single RAW save.  The task owns its Image after
+ * executor acceptance.  A completion remains worker-owned until the serialized
+ * owner accepts the completion event; rejected/late events are returned to the
+ * supplied disposer instead of silently retaining a final output.
+ */
+internal class RawSaveTask(
+    private val produceCompletion: () -> RawSaveCompletion,
+    private val postCompletion: (RawSaveCompletion) -> Boolean,
+    private val disposeCompletion: (RawSaveCompletion) -> CaptureTaskDisposalOutcome,
+    private val disposeQueuedInput: () -> CaptureTaskDisposalOutcome
+) : OutcomeDisposableCaptureTask {
+    private val started = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    override fun run() {
+        if (!started.compareAndSet(false, true)) return
+        val completion = produceCompletion()
+        if (!postCompletion(completion)) {
+            disposeCompletion(completion)
+        }
+    }
+
+    override fun dispose() {
+        disposeWithOutcome()
+    }
+
+    override fun disposeWithOutcome(): CaptureTaskDisposalOutcome {
+        if (!started.compareAndSet(false, true)) return CaptureTaskDisposalOutcome.Clean
+        return disposeQueuedInput()
+    }
+}
