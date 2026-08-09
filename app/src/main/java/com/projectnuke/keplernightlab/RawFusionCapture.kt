@@ -603,10 +603,15 @@ fun captureRawBurstForFusion(
                     if (rawSelection.requiresMaximumResolutionPixelMode && maxResolutionPixelModeFailure == null) {
                         maxResolutionPixelModeFailure = "Maximum-resolution RAW capture failed: $message"
                     }
-                    writeJobStatus(jobFile, baseJob, status, message)
-                    post(message)
-                    postMainOrRun { onError(message) }
-                    cleanup()
+                    try {
+                        writeJobStatus(jobFile, baseJob, status, message)
+                        post(message)
+                    } catch (failure: Throwable) {
+                        Log.e(RAW_PIPELINE_LOG_TAG, "RAW failure metadata/status failed", failure)
+                    } finally {
+                        cleanup()
+                        postMainOrRun { onError(message) }
+                    }
                 }
                 override fun disposeWithoutMutation() {
                     finished.set(true)
@@ -630,7 +635,9 @@ fun captureRawBurstForFusion(
                             if (partial) CaptureTerminalStatus.PARTIAL_SUCCESS else CaptureTerminalStatus.SUCCESS
                         )) return
                     finished.set(true)
-                    val motionFiles = runCatching { motionLogger?.saveToDirectory(jobDir) }.getOrNull()
+                    val motionFiles = runCatching { motionLogger?.saveToDirectory(jobDir) }
+                        .onFailure { Log.e(RAW_PIPELINE_LOG_TAG, "RAW motion save failed", it) }
+                        .getOrNull()
                     val status = if (partial) "CAPTURE_COMPLETE_PARTIAL" else "CAPTURE_COMPLETE"
                     val completeness = if (partial) "PARTIAL" else "FULL"
                     val partialReason = reason ?: "saved ${ledger.value.savedFrames}/${ledger.value.requestedFrames} frames; failedCaptures=${ledger.value.failedCaptures}; droppedUnmatchedImages=${ledger.value.droppedUnmatchedImages}"
@@ -675,15 +682,20 @@ fun captureRawBurstForFusion(
                         .put("rotationVectorFile", motionFiles?.second ?: JSONObject.NULL)
                         .put("capturedAt", System.currentTimeMillis())
                     if (partial) completeJob.put("partialReason", partialReason)
-                    KeplerJobMetadata.write(jobDir, completeJob)
-                    Log.i(RAW_PIPELINE_LOG_TAG, "CAPTURE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} savedFrames=${ledger.value.savedFrames}/${ledger.value.requestedFrames} partial=$partial droppedUnmatchedImages=${ledger.value.droppedUnmatchedImages}")
-                    if (partial) {
-                        post("CAPTURE_COMPLETE_PARTIAL: 캡처가 완료되었습니다. saved ${ledger.value.savedFrames}/${ledger.value.requestedFrames} frames")
-                    } else {
-                        post("CAPTURE_COMPLETE: 캡처가 완료되었습니다. saved ${ledger.value.savedFrames}/${ledger.value.requestedFrames} frames")
+                    try {
+                        KeplerJobMetadata.write(jobDir, completeJob)
+                        Log.i(RAW_PIPELINE_LOG_TAG, "CAPTURE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} savedFrames=${ledger.value.savedFrames}/${ledger.value.requestedFrames} partial=$partial droppedUnmatchedImages=${ledger.value.droppedUnmatchedImages}")
+                        if (partial) {
+                            post("CAPTURE_COMPLETE_PARTIAL: 캡처가 완료되었습니다. saved ${ledger.value.savedFrames}/${ledger.value.requestedFrames} frames")
+                        } else {
+                            post("CAPTURE_COMPLETE: 캡처가 완료되었습니다. saved ${ledger.value.savedFrames}/${ledger.value.requestedFrames} frames")
+                        }
+                    } catch (failure: Throwable) {
+                        Log.e(RAW_PIPELINE_LOG_TAG, "RAW success metadata/status failed", failure)
+                    } finally {
+                        cleanup()
+                        postMainOrRun { onComplete(jobDir) }
                     }
-                    cleanup()
-                    postMainOrRun { onComplete(jobDir) }
                 }
                 override fun disposeWithoutMutation() {
                     finished.set(true)
