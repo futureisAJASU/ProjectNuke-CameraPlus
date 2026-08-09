@@ -1,6 +1,7 @@
 package com.projectnuke.keplernightlab
 
 import java.io.File
+import org.json.JSONObject
 
 /**
  * Immutable completion emitted by the RAW save worker.
@@ -33,6 +34,8 @@ sealed interface RawSaveCompletion {
      *
      * @param raw16Filename final raw16 filename committed by the worker
      * @param dngSidecar outcome of the per-frame DNG sidecar (NOT_REQUESTED if disabled)
+     * @param frameEntry manifest entry assembled by the worker while the image/result
+     * were still open; the owner adopts it or discards it, never mutating it
      */
     data class Success(
         override val frameIndex: Int,
@@ -40,7 +43,8 @@ sealed interface RawSaveCompletion {
         val raw16Filename: String,
         val raw16Bytes: Long,
         val saveDurationMs: Long,
-        val dngSidecar: RawDngSidecarOutcome
+        val dngSidecar: RawDngSidecarOutcome,
+        val frameEntry: JSONObject? = null
     ) : RawSaveCompletion
 
     /**
@@ -48,6 +52,7 @@ sealed interface RawSaveCompletion {
      *
      * @param failureType short failure category (e.g. "OutOfMemoryError", "encode threw")
      * @param failureMessage human-readable failure description
+     * @param frameEntry manifest entry for the failed frame (raw16File null)
      */
     data class Failed(
         override val frameIndex: Int,
@@ -55,6 +60,17 @@ sealed interface RawSaveCompletion {
         val raw16TempFile: File?,
         val failureType: String,
         val failureMessage: String,
-        val throwable: Throwable?
+        val throwable: Throwable?,
+        val frameEntry: JSONObject? = null
+    ) : RawSaveCompletion
+
+    /**
+     * Frame save was abandoned mid-write because the owner already claimed a
+     * terminal status; the worker deleted its own partial files. Nothing is
+     * adopted; the completion exists so the owner can close the accounting loop.
+     */
+    data class Abandoned(
+        override val frameIndex: Int,
+        override val timestampNs: Long
     ) : RawSaveCompletion
 }

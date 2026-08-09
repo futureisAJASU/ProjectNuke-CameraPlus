@@ -41,6 +41,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -108,6 +109,21 @@ private data class RawRenderMetadata(
     val warnings: Set<String>
 )
 
+/**
+ * Immutable save-work item handed from the RAW owner to the save worker. The
+ * worker owns the transferred image/result resources, performs file I/O only,
+ * and returns an immutable [RawSaveCompletion]; it never touches owner state.
+ */
+private data class RawSaveFrameRequest(
+    val frameIndex: Int,
+    val timestampNs: Long,
+    val image: Image,
+    val result: TotalCaptureResult,
+    val raw16Filename: String,
+    val dngFilename: String,
+    val frameEntryPrefix: JSONObject
+)
+
 @SuppressLint("MissingPermission")
 fun captureRawBurstForFusion(
     context: Context,
@@ -149,9 +165,6 @@ fun captureRawBurstForFusion(
         dispatch = { event -> handler.post { event.execute() } }
     )
     val saveWorker = BoundedCaptureWorker("KeplerRawFusionSave", capacity = 2)
-    val saveWorkerThread = ThreadLocal<Boolean>()
-    val workerScheduled = AtomicBoolean(false)
-    val rescanRequested = AtomicBoolean(false)
     val timeoutScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "KeplerRawFusionTimeout").apply { isDaemon = true }
     }
@@ -159,45 +172,40 @@ fun captureRawBurstForFusion(
     var session: CameraCaptureSession? = null
     var reader: ImageReader? = null
     var motionLogger: MotionLogger? = null
-    val frameObjects = JSONArray()
     var requestedFrames = frameCount
-    var attemptedFrames = 0
-    var savedFrames = 0
-    val frameIdentityOwner = CaptureFrameIdentityOwner(frameCount)
-    var receivedImages = 0
-    var completedResults = 0
+    // The serialized owner owns ALL mutable RAW capture state: unmatched maps,
+    // counters, frame identity, manifest, and sidecar accounting. The save
+    // worker only performs file I/O and returns immutable RawSaveCompletion
+    // objects; Camera2/ImageReader callbacks only post owner events.
+    val ledger = lazy {
+        RawCaptureLedger<Image, TotalCaptureResult>(
+            requestedFrames = requestedFrames,
+            closeImage = { runCatching { it.close() } }
+        )
+    }
+    val progressSnapshot = AtomicReference(
+        RawCaptureProgressSnapshot(0, 0, 0, 0, 0, 0, 0)
+    )
+    fun publishProgress() {
+        progressSnapshot.set(ledger.value.snapshot())
+    }
     val finished = AtomicBoolean(false)
     val terminalState = CaptureTerminalState()
     val cleanupStarted = AtomicBoolean(false)
-    val stateLock = Any()
-    val imagesByTimestamp = mutableMapOf<Long, Image>()
-    val imageArrivalMillis = mutableMapOf<Long, Long>()
-    val resultsByTimestamp = mutableMapOf<Long, TotalCaptureResult>()
-    val savedTimestamps = mutableSetOf<Long>()
-    var failedCaptures = 0
-    var droppedUnmatchedImages = 0
     var maxResolutionPixelModeFailure: String? = null
     var sensorPixelModeUsed = false
-    var timeoutRunnable: Runnable? = null
     val rawCaptureStartedAt = System.currentTimeMillis()
-    var rawFirstImageDelayMs: Long? = null
-    val rawFrameSaveTimesMs = mutableListOf<Long>()
-    fun frameObjectsSnapshot(): JSONArray = synchronized(stateLock) { JSONArray(frameObjects.toString()) }
+    fun frameObjectsSnapshot(): JSONArray = ledger.value.frameObjectsSnapshot()
     fun postCaptureProgress() {
-        post("RAW 캡처 중입니다. 기기를 움직이지 마세요. saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames, failed $failedCaptures")
+        val snapshot = progressSnapshot.get()
+        post("RAW 캡처 중입니다. 기기를 움직이지 마세요. saved ${snapshot.savedFrames}/${snapshot.requestedFrames}, images ${snapshot.receivedImages}/${snapshot.requestedFrames}, results ${snapshot.completedResults}/${snapshot.requestedFrames}, failed ${snapshot.failedCaptures}")
     }
 
     fun cleanup() {
         if (!cleanupStarted.compareAndSet(false, true)) return
         captureStateOwner.close()
-        timeoutRunnable = null
         runCatching { reader?.setOnImageAvailableListener(null, null) }
-        synchronized(stateLock) {
-            imagesByTimestamp.values.forEach { runCatching { it.close() } }
-            imagesByTimestamp.clear()
-            imageArrivalMillis.clear()
-            resultsByTimestamp.clear()
-        }
+        ledger.value.releaseAllImages()
         try { session?.abortCaptures() } catch (_: Exception) {}
         try { session?.stopRepeating() } catch (_: Exception) {}
         try { session?.close() } catch (_: Exception) {}
@@ -225,24 +233,25 @@ fun captureRawBurstForFusion(
 
     fun writeJobStatus(jobFile: File?, baseJob: JSONObject?, status: String, error: String? = null) {
         if (jobFile == null || baseJob == null) return
+        val snapshot = progressSnapshot.get()
         runCatching {
             val job = JSONObject(baseJob.toString())
                 .put("status", status)
-                .put("requestedFrames", requestedFrames)
-                .put("attemptedFrames", attemptedFrames)
-                .put("savedFrames", savedFrames)
-                .put("receivedImages", receivedImages)
-                .put("completedResults", completedResults)
-                .put("failedCaptures", failedCaptures)
-                .put("droppedUnmatchedImages", droppedUnmatchedImages)
+                .put("requestedFrames", snapshot.requestedFrames)
+                .put("attemptedFrames", snapshot.attemptedFrames)
+                .put("savedFrames", snapshot.savedFrames)
+                .put("receivedImages", snapshot.receivedImages)
+                .put("completedResults", snapshot.completedResults)
+                .put("failedCaptures", snapshot.failedCaptures)
+                .put("droppedUnmatchedImages", snapshot.droppedUnmatchedImages)
                 .put("sensorPixelModeUsed", sensorPixelModeUsed)
                 .put(
                     "currentPipelineStage",
                     if (status.contains("FAILED") || status.contains("ABORTED")) "FAILED" else "CAPTURE"
                 )
                 .put("userCanMoveDevice", false)
-                .put("captureCompleteness", if (savedFrames >= requestedFrames) "FULL" else if (savedFrames >= MIN_RAW_FUSION_FRAMES) "PARTIAL" else "FAILED")
-                .put("partialCapture", savedFrames in MIN_RAW_FUSION_FRAMES until requestedFrames)
+                .put("captureCompleteness", if (snapshot.savedFrames >= snapshot.requestedFrames) "FULL" else if (snapshot.savedFrames >= MIN_RAW_FUSION_FRAMES) "PARTIAL" else "FAILED")
+                .put("partialCapture", snapshot.savedFrames in MIN_RAW_FUSION_FRAMES until snapshot.requestedFrames)
                 .put("frames", frameObjectsSnapshot())
                 .put("updatedAt", System.currentTimeMillis())
             if (error != null) job.put("error", error)
@@ -270,6 +279,7 @@ fun captureRawBurstForFusion(
             null
         }
         if (frameClampReason != null) post(frameClampReason)
+        publishProgress()
         val shouldSaveDngSidecars = saveDngSidecars
         val dngSidecarSkipReason = if (shouldSaveDngSidecars) null
         else "Per-frame DNG sidecars not requested; compact raw16 retained."
@@ -470,7 +480,7 @@ fun captureRawBurstForFusion(
             .put("dngSidecarSkipReason", dngSidecarSkipReason ?: JSONObject.NULL)
             .put("rawSpeedMode", rawSpeedMode.name)
             .put("rawCaptureStartedAt", rawCaptureStartedAt)
-            .put("droppedUnmatchedImages", droppedUnmatchedImages)
+            .put("droppedUnmatchedImages", ledger.value.droppedUnmatchedImages)
             .put("rawDebugPreviewSkipped", rawSpeedMode == RawSpeedMode.BALANCED)
             .put(
                 "rawDebugPreviewSkipReason",
@@ -480,7 +490,7 @@ fun captureRawBurstForFusion(
                     JSONObject.NULL
                 }
             )
-            .put("attemptedFrames", attemptedFrames)
+            .put("attemptedFrames", ledger.value.attemptedFrames)
             .put("captureCompleteness", "FAILED")
             .put("partialCapture", false)
             .put("frames", frameObjectsSnapshot())
@@ -606,30 +616,30 @@ fun captureRawBurstForFusion(
                     val motionFiles = runCatching { motionLogger?.saveToDirectory(jobDir) }.getOrNull()
                     val status = if (partial) "CAPTURE_COMPLETE_PARTIAL" else "CAPTURE_COMPLETE"
                     val completeness = if (partial) "PARTIAL" else "FULL"
-                    val partialReason = reason ?: "saved $savedFrames/$requestedFrames frames; failedCaptures=$failedCaptures; droppedUnmatchedImages=$droppedUnmatchedImages"
+                    val partialReason = reason ?: "saved ${ledger.value.savedFrames}/${ledger.value.requestedFrames} frames; failedCaptures=${ledger.value.failedCaptures}; droppedUnmatchedImages=${ledger.value.droppedUnmatchedImages}"
                     val completeJob = JSONObject(baseJob.toString())
                         .put("status", status)
-                        .put("savedFrames", savedFrames)
-                        .put("requestedFrames", requestedFrames)
-                        .put("attemptedFrames", attemptedFrames)
-                        .put("receivedImages", receivedImages)
-                        .put("completedResults", completedResults)
-                        .put("failedCaptures", failedCaptures)
-                        .put("droppedUnmatchedImages", droppedUnmatchedImages)
+                        .put("savedFrames", ledger.value.savedFrames)
+                        .put("requestedFrames", ledger.value.requestedFrames)
+                        .put("attemptedFrames", ledger.value.attemptedFrames)
+                        .put("receivedImages", ledger.value.receivedImages)
+                        .put("completedResults", ledger.value.completedResults)
+                        .put("failedCaptures", ledger.value.failedCaptures)
+                        .put("droppedUnmatchedImages", ledger.value.droppedUnmatchedImages)
                         .put("rawSpeedMode", rawSpeedMode.name)
                         .put("rawCaptureStartedAt", rawCaptureStartedAt)
                         .put("rawCaptureMs", System.currentTimeMillis() - rawCaptureStartedAt)
-                        .put("rawSaveTotalMs", rawFrameSaveTimesMs.sum())
+                        .put("rawSaveTotalMs", ledger.value.rawSaveTotalMs())
                         .put("captureStageCompleteAt", System.currentTimeMillis())
                         .put("processingStartedAt", JSONObject.NULL)
                         .put("userCanMoveDevice", true)
                         .put("currentPipelineStage", "PROCESSING")
                         .put("jobDirAbsolutePath", jobDir.absolutePath)
                         .put("adbDebugHint", adbDebugHint)
-                        .put("rawFirstImageDelayMs", rawFirstImageDelayMs ?: JSONObject.NULL)
+                        .put("rawFirstImageDelayMs", ledger.value.rawFirstImageDelayMs ?: JSONObject.NULL)
                         .put(
                             "rawAverageFrameSaveMs",
-                            rawFrameSaveTimesMs.takeIf { it.isNotEmpty() }?.average() ?: JSONObject.NULL
+                            ledger.value.rawAverageSaveMs() ?: JSONObject.NULL
                         )
                         .put("rawTotalCaptureMs", System.currentTimeMillis() - rawCaptureStartedAt)
                         .put("rawDebugPreviewSkipped", rawSpeedMode == RawSpeedMode.BALANCED)
@@ -649,11 +659,11 @@ fun captureRawBurstForFusion(
                         .put("capturedAt", System.currentTimeMillis())
                     if (partial) completeJob.put("partialReason", partialReason)
                     KeplerJobMetadata.write(jobDir, completeJob)
-                    Log.i(RAW_PIPELINE_LOG_TAG, "CAPTURE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} savedFrames=$savedFrames/$requestedFrames partial=$partial droppedUnmatchedImages=$droppedUnmatchedImages")
+                    Log.i(RAW_PIPELINE_LOG_TAG, "CAPTURE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} savedFrames=${ledger.value.savedFrames}/${ledger.value.requestedFrames} partial=$partial droppedUnmatchedImages=${ledger.value.droppedUnmatchedImages}")
                     if (partial) {
-                        post("CAPTURE_COMPLETE_PARTIAL: 캡처가 완료되었습니다. saved $savedFrames/$requestedFrames frames")
+                        post("CAPTURE_COMPLETE_PARTIAL: 캡처가 완료되었습니다. saved ${ledger.value.savedFrames}/${ledger.value.requestedFrames} frames")
                     } else {
-                        post("CAPTURE_COMPLETE: 캡처가 완료되었습니다. saved $savedFrames/$requestedFrames frames")
+                        post("CAPTURE_COMPLETE: 캡처가 완료되었습니다. saved ${ledger.value.savedFrames}/${ledger.value.requestedFrames} frames")
                     }
                     cleanup()
                     postMainOrRun { onComplete(jobDir) }
@@ -669,263 +679,291 @@ fun captureRawBurstForFusion(
             }
         }
 
-        fun evictEmergencyUnmatchedImages(readerCapacity: Int) {
-            synchronized(stateLock) {
-            if (imagesByTimestamp.size < readerCapacity) return
-            imagesByTimestamp.keys
-                .filter { it !in resultsByTimestamp }
-                .minByOrNull { imageArrivalMillis[it] ?: Long.MIN_VALUE }
-                ?.let { timestamp ->
-                    imagesByTimestamp.remove(timestamp)?.let {
-                        droppedUnmatchedImages++
-                        runCatching { it.close() }
-                    }
-                    imageArrivalMillis.remove(timestamp)
-                }
-            }
-        }
+        var dispatchReady: () -> Unit = {}
 
-        fun closeUnmatchedImages() {
-            synchronized(stateLock) {
-                val unmatched = imagesByTimestamp.filter { it.key !in resultsByTimestamp }.keys.toList()
-                for (timestamp in unmatched) {
-                    imagesByTimestamp.remove(timestamp)?.let {
-                        droppedUnmatchedImages++
-                        runCatching { it.close() }
-                    }
-                    imageArrivalMillis.remove(timestamp)
-                }
-            }
-        }
-
-        fun trySaveReadyFrames() {
-            if (saveWorkerThread.get() != true) {
-                rescanRequested.set(true)
-                if (!workerScheduled.compareAndSet(false, true)) return
-                val accepted = saveWorker.submit(Runnable {
-                    saveWorkerThread.set(true)
-                    try {
-                        do {
-                            rescanRequested.set(false)
-                            trySaveReadyFrames()
-                        } while (rescanRequested.get())
-                    } finally {
-                        saveWorkerThread.remove()
-                        workerScheduled.set(false)
-                        if (rescanRequested.get()) trySaveReadyFrames()
-                    }
-                })
-                if (!accepted) {
-                    workerScheduled.set(false)
-                    post("RAW save queue saturated; retaining the unmatched pair for terminal cleanup")
-                }
-                return
-            }
-            if (finished.get()) return
-            closeUnmatchedImages()
-            val ready = synchronized(stateLock) {
-                imagesByTimestamp.keys
-                    .filter { it !in savedTimestamps && resultsByTimestamp.containsKey(it) }
-                    .sorted()
-            }
-            for (timestamp in ready) {
-                if (savedFrames >= requestedFrames || finished.get()) return
-                val pair = synchronized(stateLock) {
-                    val image = imagesByTimestamp.remove(timestamp) ?: return@synchronized null
-                    imageArrivalMillis.remove(timestamp)
-                    val result = resultsByTimestamp.remove(timestamp)
-                    if (result == null) {
-                        imagesByTimestamp[timestamp] = image
-                        imageArrivalMillis[timestamp] = System.currentTimeMillis()
-                        null
-                    } else Pair(image, result)
-                }
-                val image = pair?.first ?: continue
-                val result = pair!!.second
-                savedTimestamps.add(timestamp)
-                val index = frameIdentityOwner.nextIdentity() ?: return
-                val raw16Name = "frame_${index.toString().padStart(2, '0')}.raw16"
-                val dngName = "frame_${index.toString().padStart(2, '0')}.dng"
+        fun saveRawFrameToCompletion(request: RawSaveFrameRequest): RawSaveCompletion {
+            val index = request.frameIndex
+            val timestamp = request.timestampNs
+            val image = request.image
+            val result = request.result
+            val raw16Name = request.raw16Filename
+            val dngName = request.dngFilename
+            val raw16File = File(jobDir, raw16Name)
+            val dngFile = File(jobDir, dngName)
+            try {
+                post("RAW saving frame ${index + 1}/$requestedFrames...")
+                val saveStartedAt = System.currentTimeMillis()
+                val raw16Temp = File(jobDir, ".${raw16Name}.${System.nanoTime()}.tmp")
                 try {
-                    post("RAW saving frame ${index + 1}/$requestedFrames...")
-                    val saveStartedAt = System.currentTimeMillis()
-                    val raw16File = File(jobDir, raw16Name)
-                    val raw16Temp = File(jobDir, ".${raw16Name}.${System.nanoTime()}.tmp")
-                    try {
-                        writeCompactRaw16(image, raw16Temp)
-                        KeplerJobMetadata.atomicReplace(raw16Temp, raw16File)
-                    } finally {
-                        if (raw16Temp.exists()) raw16Temp.delete()
-                    }
-                    if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
-                        runCatching { raw16File.delete() }
-                        return
-                    }
-                    var dngSaved = false
-                    var dngFailure: String? = null
-                    if (shouldSaveDngSidecars) {
-                        val dngFile = File(jobDir, dngName)
-                        val dngTemp = File(jobDir, ".${dngName}.${System.nanoTime()}.tmp")
-                        try {
-                            FileOutputStream(dngTemp).use { output ->
-                                DngCreator(characteristics, result).use { creator ->
-                                    creator.writeImage(output, image)
-                                }
-                                output.fd.sync()
-                            }
-                            val tempDigest = NoFollowFileSystem.digestVerified(dngTemp)
-                            check(tempDigest.size > 0L) { "DNG output was empty" }
-                            check(isDngTiffHeader(tempDigest.prefix)) { "DNG output header was invalid" }
-                            KeplerJobMetadata.atomicReplace(dngTemp, dngFile)
-                            // Some providers do not allow opening a directory channel. That is a
-                            // best-effort durability fence after the atomic replacement.
-                            runCatching {
-                                java.nio.channels.FileChannel.open(jobDir.toPath()).use { it.force(true) }
-                            }
-                            dngSaved = true
-                        } catch (e: Exception) {
-                            dngFailure = "${e.javaClass.simpleName}: ${e.message}"
-                            post("RAW DNG sidecar failed; continuing with raw16 fusion.")
-                        } finally {
-                            runCatching { if (dngTemp.exists()) dngTemp.delete() }
-                        }
-                    }
-                    if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
-                        runCatching { raw16File.delete() }
-                        runCatching { File(jobDir, dngName).delete() }
-                        return
-                    }
-                    val dynamicBlackLevel = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
-                    val plane = image.planes[0]
-                    val dngSidecarOutcome = if (shouldSaveDngSidecars) {
-                        if (dngSaved) RawDngSidecarOutcome.localSaved(index, dngName)
-                        else RawDngSidecarOutcome.localSaveFailed(index, dngFailure ?: "DNG save failed")
-                    } else {
-                        RawDngSidecarOutcome.notRequested(index)
-                    }
-                    val completion = RawSaveCompletion.Success(
-                        frameIndex = index,
-                        timestampNs = timestamp,
-                        raw16Filename = raw16Name,
-                        raw16Bytes = raw16File.length(),
-                        saveDurationMs = System.currentTimeMillis() - saveStartedAt,
-                        dngSidecar = dngSidecarOutcome
-                    )
-                    synchronized(stateLock) {
-                        savedFrames++
-                        val sidecarStatus = when (dngSidecarOutcome.status) {
-                            RawDngSidecarStatus.NOT_REQUESTED -> "NOT_REQUESTED"
-                            RawDngSidecarStatus.LOCAL_SAVED -> "LOCAL_SAVED"
-                            RawDngSidecarStatus.LOCAL_SAVE_FAILED -> "LOCAL_SAVE_FAILED"
-                            else -> "NOT_REQUESTED"
-                        }
-                        val dngFilename = when (dngSidecarOutcome.status) {
-                            RawDngSidecarStatus.LOCAL_SAVED -> dngName
-                            else -> null
-                        }
-                        frameObjects.put(
-                            JSONObject()
-                            .put("index", index)
-                            .put("frameIndex", index)
-                            .put("raw16File", raw16Name)
-                            .put("dngFile", dngFilename ?: JSONObject.NULL)
-                            .put("dngSidecarStatus", sidecarStatus)
-                            .put("dngSidecarError", dngSidecarOutcome.failureDescription ?: JSONObject.NULL)
-                            .put("timestampNs", timestamp)
-                            .put("exposureTimeNs", result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: JSONObject.NULL)
-                            .put("sensitivityIso", result.get(CaptureResult.SENSOR_SENSITIVITY) ?: JSONObject.NULL)
-                            .put("frameDurationNs", result.get(CaptureResult.SENSOR_FRAME_DURATION) ?: JSONObject.NULL)
-                            .put("rawWidth", image.width)
-                            .put("rawHeight", image.height)
-                            .put("rowStride", plane.rowStride)
-                            .put("pixelStride", plane.pixelStride)
-                            .put("dynamicBlackLevel", dynamicBlackLevel?.let { JSONArray(it.toList()) } ?: JSONObject.NULL)
-                            .put("dynamicWhiteLevel", result.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL) ?: JSONObject.NULL)
-                            .put("colorCorrectionGains", result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.toString() ?: JSONObject.NULL)
-                            .put("colorCorrectionTransform", result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.toString() ?: JSONObject.NULL)
-                            .put("cameraId", cameraId)
-                            .put("zoomRatio", finalRequestZoom.toDouble())
-                            .put("selectedRoute", zoomRoute.name)
-                            .put("actualRoute", finalCaptureRoute?.name ?: JSONObject.NULL)
-                            .put("requestedPhysicalCameraId", physicalCameraId ?: JSONObject.NULL)
-                            .put("activePhysicalId", activePhysicalId ?: JSONObject.NULL)
-                            .put("finalRequestZoom", finalRequestZoom.toDouble())
-                            .put("cropApplied", finalCropApplied)
-                            .put("cropActiveArraySource", finalCropSelection.activeArraySource)
-                            .put("cropRegion", finalCropSelection.region?.toString() ?: JSONObject.NULL)
-                        )
-                    }
-                    val saveMs = System.currentTimeMillis() - saveStartedAt
-                    rawFrameSaveTimesMs += saveMs
-                    post("RAW saved frame $savedFrames/$requestedFrames (${saveMs}ms)")
-                    if (savedFrames == 1 || savedFrames == requestedFrames) {
-                        writeJobStatus(jobFile, baseJob, "CAPTURING")
-                    }
-                    postCaptureProgress()
-                    if (savedFrames >= requestedFrames) {
-                        finishSuccess()
-                        return
-                    }
-                } catch (e: Exception) {
-                    val failureCompletion = RawSaveCompletion.Failed(
-                        frameIndex = index,
-                        timestampNs = timestamp,
-                        raw16TempFile = File(jobDir, ".${raw16Name}.$index.tmp").takeIf { it.exists() },
-                        failureType = e.javaClass.simpleName,
-                        failureMessage = "RAW fusion capture failed: ${e.stackTraceToString()}",
-                        throwable = e
-                    )
-                    runCatching { File(jobDir, ".${raw16Name}.$index.tmp").delete() }
-                    val dngFailureOutcome = if (shouldSaveDngSidecars) {
-                        RawDngSidecarOutcome.localSaveFailed(index, "${e.javaClass.simpleName}: ${e.message}")
-                    } else {
-                        RawDngSidecarOutcome.notRequested(index)
-                    }
-                    synchronized(stateLock) {
-                        frameObjects.put(
-                            JSONObject()
-                            .put("index", index)
-                            .put("frameIndex", index)
-                            .put("raw16File", JSONObject.NULL)
-                            .put("dngFile", JSONObject.NULL)
-                            .put("dngSidecarStatus", if (shouldSaveDngSidecars) "LOCAL_SAVE_FAILED" else "NOT_REQUESTED")
-                            .put("dngSidecarError", if (shouldSaveDngSidecars) dngFailureOutcome.failureDescription else JSONObject.NULL)
-                            .put("timestampNs", timestamp)
-                        )
-                    }
-                    finishError("CAPTURE_FAILED", "RAW fusion capture failed\n${e.stackTraceToString()}")
-                    return
+                    writeCompactRaw16(image, raw16Temp)
+                    KeplerJobMetadata.atomicReplace(raw16Temp, raw16File)
                 } finally {
+                    if (raw16Temp.exists()) raw16Temp.delete()
+                }
+                if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+                    runCatching { raw16File.delete() }
+                    return RawSaveCompletion.Abandoned(index, timestamp)
+                }
+                var dngSaved = false
+                var dngFailure: String? = null
+                if (shouldSaveDngSidecars) {
+                    val dngTemp = File(jobDir, ".${dngName}.${System.nanoTime()}.tmp")
+                    try {
+                        FileOutputStream(dngTemp).use { output ->
+                            DngCreator(characteristics, result).use { creator ->
+                                creator.writeImage(output, image)
+                            }
+                            output.fd.sync()
+                        }
+                        val tempDigest = NoFollowFileSystem.digestVerified(dngTemp)
+                        check(tempDigest.size > 0L) { "DNG output was empty" }
+                        check(isDngTiffHeader(tempDigest.prefix)) { "DNG output header was invalid" }
+                        KeplerJobMetadata.atomicReplace(dngTemp, dngFile)
+                        // Some providers do not allow opening a directory channel. That is a
+                        // best-effort durability fence after the atomic replacement.
+                        runCatching {
+                            java.nio.channels.FileChannel.open(jobDir.toPath()).use { it.force(true) }
+                        }
+                        dngSaved = true
+                    } catch (e: Exception) {
+                        dngFailure = "${e.javaClass.simpleName}: ${e.message}"
+                        post("RAW DNG sidecar failed; continuing with raw16 fusion.")
+                    } finally {
+                        runCatching { if (dngTemp.exists()) dngTemp.delete() }
+                    }
+                }
+                if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
+                    runCatching { raw16File.delete() }
+                    runCatching { dngFile.delete() }
+                    return RawSaveCompletion.Abandoned(index, timestamp)
+                }
+                val dynamicBlackLevel = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
+                val plane = image.planes[0]
+                val dngSidecarOutcome = if (shouldSaveDngSidecars) {
+                    if (dngSaved) RawDngSidecarOutcome.localSaved(index, dngName)
+                    else RawDngSidecarOutcome.localSaveFailed(index, dngFailure ?: "DNG save failed")
+                } else {
+                    RawDngSidecarOutcome.notRequested(index)
+                }
+                val frameEntry = JSONObject(request.frameEntryPrefix.toString())
+                    .put("dngSidecarStatus", when (dngSidecarOutcome.status) {
+                        RawDngSidecarStatus.NOT_REQUESTED -> "NOT_REQUESTED"
+                        RawDngSidecarStatus.LOCAL_SAVED -> "LOCAL_SAVED"
+                        RawDngSidecarStatus.LOCAL_SAVE_FAILED -> "LOCAL_SAVE_FAILED"
+                        else -> "NOT_REQUESTED"
+                    })
+                    .put("dngFile", if (dngSaved) dngName else JSONObject.NULL)
+                    .put("dngSidecarError", dngSidecarOutcome.failureDescription ?: JSONObject.NULL)
+                    .put("exposureTimeNs", result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: JSONObject.NULL)
+                    .put("sensitivityIso", result.get(CaptureResult.SENSOR_SENSITIVITY) ?: JSONObject.NULL)
+                    .put("frameDurationNs", result.get(CaptureResult.SENSOR_FRAME_DURATION) ?: JSONObject.NULL)
+                    .put("rawWidth", image.width)
+                    .put("rawHeight", image.height)
+                    .put("rowStride", plane.rowStride)
+                    .put("pixelStride", plane.pixelStride)
+                    .put("dynamicBlackLevel", dynamicBlackLevel?.let { JSONArray(it.toList()) } ?: JSONObject.NULL)
+                    .put("dynamicWhiteLevel", result.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL) ?: JSONObject.NULL)
+                    .put("colorCorrectionGains", result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.toString() ?: JSONObject.NULL)
+                    .put("colorCorrectionTransform", result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.toString() ?: JSONObject.NULL)
+                return RawSaveCompletion.Success(
+                    frameIndex = index,
+                    timestampNs = timestamp,
+                    raw16Filename = raw16Name,
+                    raw16Bytes = raw16File.length(),
+                    saveDurationMs = System.currentTimeMillis() - saveStartedAt,
+                    dngSidecar = dngSidecarOutcome,
+                    frameEntry = frameEntry
+                )
+            } catch (e: Exception) {
+                val failureCompletion = RawSaveCompletion.Failed(
+                    frameIndex = index,
+                    timestampNs = timestamp,
+                    raw16TempFile = File(jobDir, ".${raw16Name}.$index.tmp").takeIf { it.exists() },
+                    failureType = e.javaClass.simpleName,
+                    failureMessage = "RAW fusion capture failed: ${e.stackTraceToString()}",
+                    throwable = e,
+                    frameEntry = JSONObject(request.frameEntryPrefix.toString())
+                        .put("raw16File", JSONObject.NULL)
+                        .put("dngFile", JSONObject.NULL)
+                        .put("dngSidecarStatus", if (shouldSaveDngSidecars) "LOCAL_SAVE_FAILED" else "NOT_REQUESTED")
+                        .put("dngSidecarError", if (shouldSaveDngSidecars) "${e.javaClass.simpleName}: ${e.message}" else JSONObject.NULL)
+                )
+                runCatching { File(jobDir, ".${raw16Name}.$index.tmp").delete() }
+                return failureCompletion
+            } finally {
+                runCatching { image.close() }
+            }
+        }
+
+        fun submitSaveRequest(request: RawSaveFrameRequest): Boolean {
+            val accepted = saveWorker.submit(Runnable {
+                val completion = saveRawFrameToCompletion(request)
+                val event = object : CaptureOwnerEvent {
+                    override fun execute() {
+                        if (captureStateOwner.isClosed()) return
+                        when (completion) {
+                            is RawSaveCompletion.Success -> {
+                                ledger.value.adoptSuccess(completion)
+                                publishProgress()
+                                post("RAW saved frame ${ledger.value.savedFrames}/${ledger.value.requestedFrames} (${completion.saveDurationMs}ms)")
+                                if (ledger.value.savedFrames == 1 || ledger.value.savedFrames == ledger.value.requestedFrames) {
+                                    writeJobStatus(jobFile, baseJob, "CAPTURING")
+                                }
+                                postCaptureProgress()
+                                if (ledger.value.savedFrames >= ledger.value.requestedFrames) {
+                                    finishSuccess()
+                                } else {
+                                    dispatchReady()
+                                }
+                            }
+                            is RawSaveCompletion.Failed -> {
+                                ledger.value.adoptFailure(completion)
+                                finishError("CAPTURE_FAILED", completion.failureMessage)
+                            }
+                            is RawSaveCompletion.Abandoned -> Unit
+                        }
+                    }
+                    override fun disposeWithoutMutation() {}
+                }
+                captureStateOwner.post(event)
+            })
+            if (!accepted) {
+                ledger.value.restorePair(request.timestampNs, request.image, request.result)
+                post("RAW save queue saturated; retaining the unmatched pair for terminal cleanup")
+            }
+            return accepted
+        }
+
+        fun dispatchReadyFrames() {
+            if (captureStateOwner.isClosed() || finished.get()) return
+            ledger.value.closeUnmatchedImages()
+            for (frame in ledger.value.takeReadyFrames()) {
+                if (ledger.value.savedFrames >= ledger.value.requestedFrames || finished.get() || captureStateOwner.isClosed()) return
+                val raw16Name = "frame_${frame.frameIndex.toString().padStart(2, '0')}.raw16"
+                val dngName = "frame_${frame.frameIndex.toString().padStart(2, '0')}.dng"
+                val entryPrefix = JSONObject()
+                    .put("index", frame.frameIndex)
+                    .put("frameIndex", frame.frameIndex)
+                    .put("raw16File", raw16Name)
+                    .put("dngFile", if (shouldSaveDngSidecars) dngName else JSONObject.NULL)
+                    .put("dngSidecarStatus", if (shouldSaveDngSidecars) "LOCAL_SAVED" else "NOT_REQUESTED")
+                    .put("dngSidecarError", JSONObject.NULL)
+                    .put("timestampNs", frame.timestampNs)
+                    .put("cameraId", cameraId)
+                    .put("zoomRatio", finalRequestZoom.toDouble())
+                    .put("selectedRoute", zoomRoute.name)
+                    .put("actualRoute", finalCaptureRoute?.name ?: JSONObject.NULL)
+                    .put("requestedPhysicalCameraId", physicalCameraId ?: JSONObject.NULL)
+                    .put("activePhysicalId", activePhysicalId ?: JSONObject.NULL)
+                    .put("finalRequestZoom", finalRequestZoom.toDouble())
+                    .put("cropApplied", finalCropApplied)
+                    .put("cropActiveArraySource", finalCropSelection.activeArraySource)
+                    .put("cropRegion", finalCropSelection.region?.toString() ?: JSONObject.NULL)
+                val request = RawSaveFrameRequest(
+                    frameIndex = frame.frameIndex,
+                    timestampNs = frame.timestampNs,
+                    image = frame.image,
+                    result = frame.result,
+                    raw16Filename = raw16Name,
+                    dngFilename = dngName,
+                    frameEntryPrefix = entryPrefix
+                )
+                if (!submitSaveRequest(request)) return
+            }
+        }
+        dispatchReady = { dispatchReadyFrames() }
+        fun postReceiveImage(timestampNs: Long, image: Image, readerCapacity: Int) {
+            val event = object : CaptureOwnerEvent {
+                override fun execute() {
+                    if (finished.get() || captureStateOwner.isClosed()) {
+                        runCatching { image.close() }
+                        return
+                    }
+                    ledger.value.evictEmergencyUnmatchedImages(readerCapacity)
+                    ledger.value.recordImage(timestampNs, image, System.currentTimeMillis())
+                    if (ledger.value.rawFirstImageDelayMs == null) {
+                        ledger.value.rawFirstImageDelayMs = System.currentTimeMillis() - rawCaptureStartedAt
+                        post("RAW first image delay: ${ledger.value.rawFirstImageDelayMs}ms")
+                    }
+                    ledger.value.evictEmergencyUnmatchedImages(readerCapacity)
+                    ledger.value.closeUnmatchedImages()
+                    publishProgress()
+                    postCaptureProgress()
+                    dispatchReadyFrames()
+                }
+                override fun disposeWithoutMutation() {
                     runCatching { image.close() }
                 }
             }
+            if (!captureStateOwner.post(event)) {
+                runCatching { image.close() }
+            }
         }
 
-        timeoutRunnable = Runnable {
-            if (savedFrames < requestedFrames) {
-                if (savedFrames >= MIN_RAW_FUSION_FRAMES) {
-                    finishSuccess(partial = true, reason = "saved $savedFrames/$requestedFrames frames; timeout; failedCaptures=$failedCaptures; droppedUnmatchedImages=$droppedUnmatchedImages")
-                } else {
-                    val message = "CAPTURE_TIMEOUT: RAW capture saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames, failed $failedCaptures, droppedUnmatchedImages=$droppedUnmatchedImages"
-                    finishError("CAPTURE_TIMEOUT", message)
+        fun postResultReceived(timestampNs: Long, result: TotalCaptureResult) {
+            val event = object : CaptureOwnerEvent {
+                override fun execute() {
+                    if (finished.get() || captureStateOwner.isClosed()) return
+                    ledger.value.recordResult(timestampNs, result)
+                    publishProgress()
+                    postCaptureProgress()
+                    dispatchReadyFrames()
                 }
+                override fun disposeWithoutMutation() {}
             }
-        }.also { timeoutScheduler.schedule({
+            captureStateOwner.post(event)
+        }
+
+        fun postCaptureFailed(reason: Int) {
+            val event = object : CaptureOwnerEvent {
+                override fun execute() {
+                    if (captureStateOwner.isClosed()) return
+                    ledger.value.recordCaptureFailure()
+                    publishProgress()
+                    val snapshot = progressSnapshot.get()
+                    post("RAW capture failure: reason=$reason, saved ${snapshot.savedFrames}/${snapshot.requestedFrames}")
+                    if (ledger.value.savedFrames + ledger.value.failedCaptures >= ledger.value.attemptedFrames) {
+                        if (ledger.value.savedFrames >= MIN_RAW_FUSION_FRAMES) {
+                            finishSuccess(partial = true, reason = "saved ${ledger.value.savedFrames}/${ledger.value.requestedFrames} frames; failedCaptures=${ledger.value.failedCaptures}; droppedUnmatchedImages=${ledger.value.droppedUnmatchedImages}")
+                        } else {
+                            finishError("CAPTURE_FAILED", "PIPELINE_FAILED: RAW capture failed; saved ${ledger.value.savedFrames}/${ledger.value.requestedFrames}, failed ${ledger.value.failedCaptures}, droppedUnmatchedImages=${ledger.value.droppedUnmatchedImages}")
+                        }
+                    }
+                }
+                override fun disposeWithoutMutation() {}
+            }
+            captureStateOwner.post(event)
+        }
+
+        fun postSetAttemptedFrames(value: Int) {
+            val event = object : CaptureOwnerEvent {
+                override fun execute() {
+                    if (captureStateOwner.isClosed()) return
+                    ledger.value.setAttemptedFrames(value)
+                    publishProgress()
+                }
+                override fun disposeWithoutMutation() {}
+            }
+            captureStateOwner.post(event)
+        }
+
+        timeoutScheduler.schedule({
             if (!terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) return@schedule
             val settle = object : CaptureOwnerEvent {
                 override fun execute() {
-                    if (savedFrames >= requestedFrames) {
+                    val snapshot = progressSnapshot.get()
+                    if (snapshot.savedFrames >= snapshot.requestedFrames) {
                         finishSuccess(
                             partial = false
                         )
-                    } else if (savedFrames >= MIN_RAW_FUSION_FRAMES) {
+                    } else if (snapshot.savedFrames >= MIN_RAW_FUSION_FRAMES) {
                         finishSuccess(
                             partial = true
                         )
                     } else {
                         finishError(
                             "CAPTURE_TIMEOUT",
-                            "CAPTURE_TIMEOUT: RAW capture saved $savedFrames/$requestedFrames"
+                            "CAPTURE_TIMEOUT: RAW capture saved ${snapshot.savedFrames}/${snapshot.requestedFrames}"
                         )
                     }
                 }
@@ -936,11 +974,10 @@ fun captureRawBurstForFusion(
                 finished.set(true)
                 cleanup()
             }
-        }, max(30_000L, requestedFrames * 8_000L), TimeUnit.MILLISECONDS) }
+        }, max(30_000L, requestedFrames * 8_000L), TimeUnit.MILLISECONDS)
 
         imageReader.setOnImageAvailableListener({ r ->
             if (finished.get()) return@setOnImageAvailableListener
-            evictEmergencyUnmatchedImages(imageReader.maxImages)
             val image = try {
                 r.acquireNextImage()
             } catch (e: Exception) {
@@ -955,20 +992,7 @@ fun captureRawBurstForFusion(
                 runCatching { image.close() }
                 return@setOnImageAvailableListener
             }
-            receivedImages++
-            if (rawFirstImageDelayMs == null) {
-                rawFirstImageDelayMs = System.currentTimeMillis() - rawCaptureStartedAt
-                post("RAW first image delay: ${rawFirstImageDelayMs}ms")
-            }
-            synchronized(stateLock) {
-                imagesByTimestamp.remove(image.timestamp)?.let { runCatching { it.close() } }
-                imagesByTimestamp[image.timestamp] = image
-                imageArrivalMillis[image.timestamp] = System.currentTimeMillis()
-            }
-            evictEmergencyUnmatchedImages(imageReader.maxImages)
-            closeUnmatchedImages()
-            postCaptureProgress()
-            trySaveReadyFrames()
+            postReceiveImage(image.timestamp, image, imageReader.maxImages)
         }, handler)
 
         cameraManager.openCamera(
@@ -1040,7 +1064,7 @@ fun captureRawBurstForFusion(
                                         )
                                     }.build()
                                 }
-                                attemptedFrames = requests.size
+                                postSetAttemptedFrames(requests.size)
                                 writeJobStatus(jobFile, baseJob, "CAPTURING")
                                 configured.captureBurst(
                                     requests,
@@ -1062,12 +1086,7 @@ fun captureRawBurstForFusion(
                                                     "finalRequestZoom=$requestZoomRatio"
                                             )
                                             if (timestamp != null && !finished.get()) {
-                                                synchronized(stateLock) {
-                                                    resultsByTimestamp[timestamp] = result
-                                                }
-                                                completedResults++
-                                                postCaptureProgress()
-                                                trySaveReadyFrames()
+                                                postResultReceived(timestamp, result)
                                             }
                                         }
 
@@ -1076,25 +1095,17 @@ fun captureRawBurstForFusion(
                                             request: CaptureRequest,
                                             failure: android.hardware.camera2.CaptureFailure
                                         ) {
-                                            failedCaptures++
-                                            post("RAW capture failure: reason=${failure.reason}, saved $savedFrames/$requestedFrames")
-                                            if (savedFrames + failedCaptures >= attemptedFrames) {
-                                                if (savedFrames >= MIN_RAW_FUSION_FRAMES) {
-                                                    finishSuccess(partial = true, reason = "saved $savedFrames/$requestedFrames frames; failedCaptures=$failedCaptures; droppedUnmatchedImages=$droppedUnmatchedImages")
-                                                } else {
-                                                    finishError("CAPTURE_FAILED", "PIPELINE_FAILED: RAW capture failed; saved $savedFrames/$requestedFrames, failed $failedCaptures, droppedUnmatchedImages=$droppedUnmatchedImages")
-                                                }
-                                            }
+                                            postCaptureFailed(failure.reason)
                                         }
 
                                         override fun onCaptureSequenceAborted(
                                             session: CameraCaptureSession,
                                             sequenceId: Int
                                         ) {
-                                            if (savedFrames >= MIN_RAW_FUSION_FRAMES && savedFrames < requestedFrames) {
-                                                finishSuccess(partial = true, reason = "saved $savedFrames/$requestedFrames frames; sequence aborted; failedCaptures=$failedCaptures; droppedUnmatchedImages=$droppedUnmatchedImages")
+                                            if (ledger.value.savedFrames >= MIN_RAW_FUSION_FRAMES && ledger.value.savedFrames < ledger.value.requestedFrames) {
+                                                finishSuccess(partial = true, reason = "saved ${ledger.value.savedFrames}/${ledger.value.requestedFrames} frames; sequence aborted; failedCaptures=${ledger.value.failedCaptures}; droppedUnmatchedImages=${ledger.value.droppedUnmatchedImages}")
                                             } else {
-                                                finishError("CAPTURE_ABORTED", "PIPELINE_FAILED: RAW capture sequence aborted; saved $savedFrames/$requestedFrames; droppedUnmatchedImages=$droppedUnmatchedImages")
+                                                finishError("CAPTURE_ABORTED", "PIPELINE_FAILED: RAW capture sequence aborted; saved ${ledger.value.savedFrames}/${ledger.value.requestedFrames}; droppedUnmatchedImages=${ledger.value.droppedUnmatchedImages}")
                                             }
                                         }
 
@@ -1103,7 +1114,7 @@ fun captureRawBurstForFusion(
                                             sequenceId: Int,
                                             frameNumber: Long
                                         ) {
-                                            post("RAW capture sequence done: saved $savedFrames/$requestedFrames, images $receivedImages/$requestedFrames, results $completedResults/$requestedFrames")
+                                            post("RAW capture sequence done: saved ${ledger.value.savedFrames}/${ledger.value.requestedFrames}, images ${ledger.value.receivedImages}/${ledger.value.requestedFrames}, results ${ledger.value.completedResults}/${ledger.value.requestedFrames}")
                                         }
                                     },
                                     handler

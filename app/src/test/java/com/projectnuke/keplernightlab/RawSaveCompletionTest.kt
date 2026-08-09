@@ -113,19 +113,21 @@ class RawSaveCompletionTest {
 
     @Test
     fun sealedInterfaceExhaustiveness() {
-        // The sealed interface is intentionally closed: only Success / Failed
-        // exist, so a `when` over [RawSaveCompletion] is exhaustive without
-        // an `else` branch.
+        // The sealed interface is intentionally closed: Success / Failed /
+        // Abandoned exist, so a `when` over [RawSaveCompletion] is exhaustive
+        // without an `else` branch.
         val values: List<RawSaveCompletion> = listOf(
             RawSaveCompletion.Success(0, 0L, "f.raw16", 0L, 0L, RawDngSidecarOutcome.notRequested(0)),
-            RawSaveCompletion.Failed(0, 0L, null, "x", "x", null)
+            RawSaveCompletion.Failed(0, 0L, null, "x", "x", null),
+            RawSaveCompletion.Abandoned(0, 0L)
         )
         for (c in values) {
             val kind = when (c) {
                 is RawSaveCompletion.Success -> "success"
                 is RawSaveCompletion.Failed -> "failed"
+                is RawSaveCompletion.Abandoned -> "abandoned"
             }
-            assertTrue(kind in listOf("success", "failed"))
+            assertTrue(kind in listOf("success", "failed", "abandoned"))
         }
     }
 }
