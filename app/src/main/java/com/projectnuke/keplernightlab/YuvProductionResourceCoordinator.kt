@@ -141,7 +141,7 @@ internal class YuvProductionResourceCoordinator(
     fun attachImageReader(reader: ImageReader?): ProductionAttachmentDisposition {
         if (reader == null) return ProductionAttachmentDisposition.NO_RESOURCE
         val late = synchronized(coordinatorLock) {
-            if (phase == CoordinatorLifecyclePhase.OPEN) {
+            if (phase == CoordinatorLifecyclePhase.OPEN && imageReader == null) {
                 imageReader = reader
                 false
             } else {
@@ -157,7 +157,7 @@ internal class YuvProductionResourceCoordinator(
     fun attachCameraDevice(device: CameraDevice?): ProductionAttachmentDisposition {
         if (device == null) return ProductionAttachmentDisposition.NO_RESOURCE
         val late = synchronized(coordinatorLock) {
-            if (phase == CoordinatorLifecyclePhase.OPEN) {
+            if (phase == CoordinatorLifecyclePhase.OPEN && cameraDevice == null) {
                 cameraDevice = device
                 false
             } else {
@@ -173,7 +173,7 @@ internal class YuvProductionResourceCoordinator(
     fun attachCaptureSession(session: CameraCaptureSession?): ProductionAttachmentDisposition {
         if (session == null) return ProductionAttachmentDisposition.NO_RESOURCE
         val late = synchronized(coordinatorLock) {
-            if (phase == CoordinatorLifecyclePhase.OPEN) {
+            if (phase == CoordinatorLifecyclePhase.OPEN && captureSession == null) {
                 captureSession = session
                 false
             } else {
@@ -189,7 +189,7 @@ internal class YuvProductionResourceCoordinator(
     fun attachMotionLogger(logger: MotionLogger?): ProductionAttachmentDisposition {
         if (logger == null) return ProductionAttachmentDisposition.NO_RESOURCE
         val late = synchronized(coordinatorLock) {
-            if (phase == CoordinatorLifecyclePhase.OPEN) {
+            if (phase == CoordinatorLifecyclePhase.OPEN && motionLogger == null) {
                 motionLogger = logger
                 false
             } else {

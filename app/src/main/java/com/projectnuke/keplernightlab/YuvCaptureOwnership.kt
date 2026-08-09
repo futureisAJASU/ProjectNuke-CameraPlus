@@ -1017,9 +1017,10 @@ internal fun createBufferedYuvWork(
     access: YuvImageAccess,
     reservations: YuvBufferReservations,
     accounting: YuvCaptureAccounting,
-    onRelease: (() -> Unit)? = null
+    onRelease: (() -> Unit)? = null,
+    releaseSource: (() -> YuvImageReleaseOutcome)? = null
 ): BufferedYuvWorkCreation {
-    val guard = YuvImageReleaseGuard(access)
+    val guard = releaseSource ?: YuvImageReleaseGuard(access)::releaseSafely
     var timestampNs = 0L
     var bytes = 0L
     var reserved = false
@@ -1042,7 +1043,7 @@ internal fun createBufferedYuvWork(
         accounting.failedFrame()
         return BufferedYuvWorkCreation.Failed(t)
     } finally {
-        guard.releaseSafely()
+        guard()
         if (reserved && !itemOwner) {
             reservations.release(bytes)
         }

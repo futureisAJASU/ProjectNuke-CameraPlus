@@ -328,7 +328,13 @@ internal class YuvCaptureOwner(
                 accounting.receivedFrame()
                 val frameIndex = identityOwner.nextIdentity()
                 if (frameIndex == null) { accounting.droppedFrame(); guard.releaseSafely(); return }
-                when (val c = createBufferedYuvWork(frameIndex, access, reservations, accounting)) {
+                when (val c = createBufferedYuvWork(
+                    frameIndex,
+                    access,
+                    reservations,
+                    accounting,
+                    releaseSource = guard::releaseSafely
+                )) {
                     is BufferedYuvWorkCreation.Accepted -> {
                         if (!lifecycle.tryRegister(c.item)) {
                             recordDisposalIfUnclean(c.item, c.item.dispose(accounting))
@@ -1210,7 +1216,11 @@ internal class YuvCaptureOwner(
 
     fun callbackState(): CallbackState = callbackStateRef.get()
 
-    fun terminalSnapshotRef(): YuvTerminalSnapshot = terminalSnapshotRef.get()
+    fun terminalSnapshotRef(): YuvTerminalSnapshot = buildSnapshot(
+        ownerPublishedStateRef.get().copy(
+            productionCleanup = productionResourceCoordinator.snapshot()
+        )
+    )
 
     /** Safe from callback/terminal-observer threads: reads immutable/atomic values only. */
     private fun publishSnapshot() {
