@@ -603,6 +603,7 @@ fun captureRawBurstForFusion(
             val settleEvent = object : CaptureOwnerEvent {
                 override fun execute() {
                     if (!terminalState.claim(terminalStatus)) return
+                    finished.set(true)
                     if (rawSelection.requiresMaximumResolutionPixelMode && maxResolutionPixelModeFailure == null) {
                         maxResolutionPixelModeFailure = "Maximum-resolution RAW capture failed: $message"
                     }
@@ -717,10 +718,15 @@ fun captureRawBurstForFusion(
                     if (!terminalState.claim(CaptureTerminalStatus.CANCELLED)) return
                     finished.set(true)
                     val message = "CAPTURE_CANCELLED: RAW capture was cancelled"
-                    writeJobStatus(jobFile, baseJob, "CAPTURE_CANCELLED", message)
-                    post(message)
-                    postMainOrRun { onError(message) }
-                    cleanup()
+                    try {
+                        writeJobStatus(jobFile, baseJob, "CAPTURE_CANCELLED", message)
+                        post(message)
+                    } catch (failure: Throwable) {
+                        Log.e(RAW_PIPELINE_LOG_TAG, "RAW cancellation metadata/status failed", failure)
+                    } finally {
+                        cleanup()
+                        postMainOrRun { onError(message) }
+                    }
                 }
 
                 override fun disposeWithoutMutation() {
@@ -1280,11 +1286,26 @@ fun captureRawBurstForFusion(
                                             session: CameraCaptureSession,
                                             sequenceId: Int
                                         ) {
-                                            if (ledger.value.savedFrames >= MIN_RAW_FUSION_FRAMES && ledger.value.savedFrames < ledger.value.requestedFrames) {
-                                                finishSuccess(partial = true, reason = "saved ${ledger.value.savedFrames}/${ledger.value.requestedFrames} frames; sequence aborted; failedCaptures=${ledger.value.failedCaptures}; droppedUnmatchedImages=${ledger.value.droppedUnmatchedImages}")
-                                            } else {
-                                                finishError("CAPTURE_ABORTED", "PIPELINE_FAILED: RAW capture sequence aborted; saved ${ledger.value.savedFrames}/${ledger.value.requestedFrames}; droppedUnmatchedImages=${ledger.value.droppedUnmatchedImages}")
+                                            val event = object : CaptureOwnerEvent {
+                                                override fun execute() {
+                                                    val saved = ledger.value.savedFrames
+                                                    val requested = ledger.value.requestedFrames
+                                                    if (saved >= MIN_RAW_FUSION_FRAMES && saved < requested) {
+                                                        finishSuccess(
+                                                            partial = true,
+                                                            reason = "saved $saved/$requested frames; sequence aborted; failedCaptures=${ledger.value.failedCaptures}; droppedUnmatchedImages=${ledger.value.droppedUnmatchedImages}"
+                                                        )
+                                                    } else {
+                                                        finishError(
+                                                            "CAPTURE_ABORTED",
+                                                            "PIPELINE_FAILED: RAW capture sequence aborted; saved $saved/$requested; droppedUnmatchedImages=${ledger.value.droppedUnmatchedImages}"
+                                                        )
+                                                    }
+                                                }
+
+                                                override fun disposeWithoutMutation() = Unit
                                             }
+                                            captureStateOwner.post(event)
                                         }
 
                                         override fun onCaptureSequenceCompleted(
@@ -1292,7 +1313,15 @@ fun captureRawBurstForFusion(
                                             sequenceId: Int,
                                             frameNumber: Long
                                         ) {
-                                            post("RAW capture sequence done: saved ${ledger.value.savedFrames}/${ledger.value.requestedFrames}, images ${ledger.value.receivedImages}/${ledger.value.requestedFrames}, results ${ledger.value.completedResults}/${ledger.value.requestedFrames}")
+                                            val event = object : CaptureOwnerEvent {
+                                                override fun execute() {
+                                                    val snapshot = progressSnapshot.get()
+                                                    post("RAW capture sequence done: saved ${snapshot.savedFrames}/${snapshot.requestedFrames}, images ${snapshot.receivedImages}/${snapshot.requestedFrames}, results ${snapshot.completedResults}/${snapshot.requestedFrames}")
+                                                }
+
+                                                override fun disposeWithoutMutation() = Unit
+                                            }
+                                            captureStateOwner.post(event)
                                         }
                                     },
                                     handler
