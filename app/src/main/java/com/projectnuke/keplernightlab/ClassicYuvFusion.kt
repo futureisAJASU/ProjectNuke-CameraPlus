@@ -465,7 +465,7 @@ internal fun processClassicYuvFusionJob(
                 )
         }
         cancellation.throwIfCancelled()
-        File(jobDir, "yuv_debug.json").writeText(job.toString(2))
+        writeVerifiedTextArtifact(File(jobDir, "yuv_debug.json"), job.toString(2))
         persistClassicYuvSuccess(
             jobDir = jobDir,
             job = job,
@@ -1378,8 +1378,8 @@ private fun writeFusionDebugMetadata(
         .put("processingTimeMs", processingTimeMs)
         .put("outputWidth", outputWidth)
         .put("outputHeight", outputHeight)
-    File(jobDir, "fusion_debug.json").writeText(debug.toString(2))
-    File(jobDir, "yuv_debug.json").writeText(debug.toString(2))
+    writeVerifiedTextArtifact(File(jobDir, "fusion_debug.json"), debug.toString(2))
+    writeVerifiedTextArtifact(File(jobDir, "yuv_debug.json"), debug.toString(2))
     job.put("fusionDebugFile", "fusion_debug.json")
         .put("yuvDebugFile", "yuv_debug.json")
         .put("fusionAlignmentSummary", alignments)
@@ -1947,26 +1947,23 @@ private fun formatClassicFailureMessage(throwable: Throwable?, reason: String): 
 }
 
 private fun saveClassicBitmap(bitmap: Bitmap, file: File) {
-    require(file.parentFile?.let { NoFollowFileSystem.isRealDirectory(it.toPath()) } == true) {
-        "Bitmap output parent must be a real directory"
-    }
-    require(!java.nio.file.Files.isSymbolicLink(file.toPath())) {
-        "Bitmap output must not be a symbolic link: ${file.name}"
-    }
-    val candidate = File(file.parentFile, ".${file.name}.${System.nanoTime()}.tmp")
-    require(!java.nio.file.Files.exists(candidate.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
-        "Bitmap output candidate already exists"
-    }
-    try {
-        FileOutputStream(candidate).use { output ->
-            check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
-                "Could not save ${file.name}"
+    commitProcessingArtifact(
+        finalFile = file,
+        writeTemp = { candidate ->
+            FileOutputStream(candidate).use { output ->
+                check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
+                    "Could not save ${file.name}"
+                }
+                output.fd.sync()
+            }
+        },
+        verifyFinal = { committed ->
+            val signature = committed.inputStream().use { it.readNBytes(8) }
+            check(signature.contentEquals(byteArrayOf(137.toByte(), 80, 78, 71, 13, 10, 26, 10))) {
+                "Could not verify ${file.name}"
             }
         }
-        KeplerJobMetadata.atomicReplace(candidate, file)
-    } finally {
-        runCatching { if (candidate.exists()) candidate.delete() }
-    }
+    )
 }
 
 private fun luma(color: Int): Int = (

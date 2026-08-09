@@ -271,7 +271,7 @@ internal fun runClassicRawFusionMerge(
             .put("mergeRejectMapAvailable", false)
             .put("mergeRejectMapFile", JSONObject.NULL)
         cancellation.throwIfCancelled()
-        alignmentFile.writeText(debug.toString(2))
+        writeVerifiedTextArtifact(alignmentFile, debug.toString(2))
         cancellation.throwIfCancelled()
         // Debug preview generation is optional; cancellation is checked around it.
         writeRawFusionDebugPreviews(jobDir, reference, mergedRawFile, sensor, blackLevelEstimate, job, cancellation)
@@ -566,13 +566,17 @@ private fun mergeClassicRawTiles(
     val weights = FloatArray(tileArraySize.toInt())
     val outRow = ByteArray(sensor.width * 2)
     val rowBytes = ByteArray(sensor.width * 2)
+    val mergedCandidate = File(
+        mergedRawFile.parentFile,
+        ".${mergedRawFile.name}.${System.nanoTime()}.tmp"
+    )
 
     try {
         frames.forEach { frame ->
             cancellation.throwIfCancelled()
             frameInputs[frame] = RandomAccessFile(frame.input.file, "r")
         }
-        BufferedOutputStream(FileOutputStream(mergedRawFile)).use { output ->
+        BufferedOutputStream(FileOutputStream(mergedCandidate)).use { output ->
             var tileTop = 0
             while (tileTop < sensor.height) {
                 cancellation.throwIfCancelled()
@@ -663,8 +667,16 @@ private fun mergeClassicRawTiles(
                 tileTop += tileRows
             }
         }
+        check(mergedCandidate.length() == sensor.width.toLong() * sensor.height.toLong() * 2L) {
+            "Classic RAW merged payload has invalid size: ${mergedCandidate.length()}"
+        }
+        KeplerJobMetadata.atomicReplace(mergedCandidate, mergedRawFile)
+        check(mergedRawFile.length() == sensor.width.toLong() * sensor.height.toLong() * 2L) {
+            "Classic RAW final payload has invalid size: ${mergedRawFile.length()}"
+        }
     } finally {
         frameInputs.values.forEach { runCatching { it.close() } }
+        if (mergedCandidate.exists()) mergedCandidate.delete()
     }
     return RawMergeStats(rejected, compared, downweighted, memoryPlan)
 }
@@ -836,11 +848,23 @@ private fun rawProxyToBitmap(proxy: RawProxy): Bitmap {
 }
 
 private fun saveClassicRawPng(bitmap: Bitmap, file: File) {
-    FileOutputStream(file).use { output ->
-        check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
-            "Could not save ${file.name}"
+    commitProcessingArtifact(
+        finalFile = file,
+        writeTemp = { temp ->
+            FileOutputStream(temp).use { output ->
+                check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
+                    "Could not save ${file.name}"
+                }
+                output.fd.sync()
+            }
+        },
+        verifyFinal = { committed ->
+            val signature = committed.inputStream().use { it.readNBytes(8) }
+            check(signature.contentEquals(byteArrayOf(137.toByte(), 80, 78, 71, 13, 10, 26, 10))) {
+                "Could not verify ${file.name}"
+            }
         }
-    }
+    )
 }
 
 private fun exposureProduct(meta: JSONObject): Float {
