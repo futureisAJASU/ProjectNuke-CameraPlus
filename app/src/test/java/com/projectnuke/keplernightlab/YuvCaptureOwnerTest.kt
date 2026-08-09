@@ -287,6 +287,7 @@ class YuvCaptureOwnerTest {
             assertEquals(3, harness.session.accounting.snapshot().persistedFrames)
             assertEquals(0, harness.session.reservations.currentBytes())
             assertEquals(0, harness.session.lifecycle.retainedCount())
+            assertTrue("terminal callback did not fire", harness.callbackLatch.await(10, TimeUnit.SECONDS))
             assertEquals(1, harness.onCaptureCompleteCount.get())
             assertEquals(0, harness.onCaptureErrorCount.get())
         } finally {
@@ -570,6 +571,7 @@ class YuvCaptureOwnerTest {
             encodeLatch.release()
             val status = harness.awaitTerminal()
             assertEquals(CaptureTerminalStatus.CANCELLED, status)
+            assertTrue("terminal callback did not fire", harness.callbackLatch.await(10, TimeUnit.SECONDS))
             assertEquals(0, harness.onCaptureCompleteCount.get())
             assertEquals(1, harness.onCaptureErrorCount.get())
         } finally {

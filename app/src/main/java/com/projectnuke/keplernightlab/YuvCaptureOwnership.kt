@@ -1724,9 +1724,10 @@ internal sealed interface TerminalOperationOutcome {
     data object Pending : TerminalOperationOutcome
     data object Succeeded : TerminalOperationOutcome
     data class Failed(val cause: Throwable) : TerminalOperationOutcome
+    data class SkippedUnsafe(val reason: String) : TerminalOperationOutcome
 
     val isTerminal: Boolean
-        get() = this is Succeeded || this is Failed
+        get() = this is Succeeded || this is Failed || this is SkippedUnsafe
 }
 
 internal enum class DiagnosticSeverity { INFO, WARN, ERROR }

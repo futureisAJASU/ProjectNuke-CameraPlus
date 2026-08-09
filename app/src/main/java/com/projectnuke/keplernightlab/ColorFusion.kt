@@ -626,7 +626,10 @@ fun captureYuvBurstColorWithMotion(
             },
             saveMotionOnce = { dir -> saveMotionOnce(dir) },
             productionResourceCoordinator = productionSeam.productionResourceCoordinator,
-            finished = finished
+            finished = finished,
+            // ColorFusion starts the real terminal consumer only after the finite
+            // captureBurst operation is accepted below.
+            startTerminalObserverOnCreate = false
         )
         productionSeam.sessionClose = { yuvSession?.close() }
 
@@ -864,18 +867,13 @@ fun captureYuvBurstColorWithMotion(
                                         // daemon thread — never the owner dispatcher) until
                                         // the sole YuvTerminalRequest is published, the
                                         // session closes, or the defensive bound expires.
-                                        val sessionToGate = yuvSession
-                                        Thread(
-                                            {
-                                                sessionToGate?.let {
-                                                    completeCaptureYuv(
-                                                        it,
-                                                        captureTimeoutMs + YUV_TERMINAL_SETTLE_MARGIN_MS
-                                                    )
-                                                }
-                                            },
-                                            "KeplerYuvTerminalWait"
-                                        ).apply { isDaemon = true }.start()
+                                        // The terminal handoff observer is the only consumer
+                                        // that chooses the final user callback. It receives a
+                                        // typed Published / Closed / SettlementFailed / watchdog
+                                        // result and never infers a terminal result from time.
+                                        yuvSession?.startTerminalObservation(
+                                            captureTimeoutMs + YUV_TERMINAL_SETTLE_MARGIN_MS
+                                        )
                                     } catch (e: Exception) {
                                         val templateFailure =
                                             e.message?.contains(
@@ -983,29 +981,6 @@ fun captureYuvBurstColorWithMotion(
  * Must run on a thread that is NOT the owner's serialized dispatcher (parking
  * the dispatcher would deadlock terminal settlement).
  */
-private fun completeCaptureYuv(session: YuvCaptureSession, settleBoundMillis: Long) {
-    val published = session.terminalRequestHandoff.awaitPublishedOrClosed(settleBoundMillis)
-    when {
-        published != null -> {
-            // Sole publication observed; the session terminal observer handled dispatch.
-        }
-        session.terminalRequestHandoff.isClosed() -> {
-            Log.w(
-                "KeplerYuvTerminal",
-                "YUV terminal gate: session closed before terminal publication; " +
-                    "no user callback dispatched"
-            )
-        }
-        else -> {
-            Log.w(
-                "KeplerYuvTerminal",
-                "invariant failure: YUV terminal settlement did not publish a request " +
-                    "within ${settleBoundMillis}ms; recording only, no synthesized terminal result"
-            )
-        }
-    }
-}
-
 /** Defensive bound for the terminal gate: capture timeout plus a generous settlement margin. */
 private const val YUV_TERMINAL_SETTLE_MARGIN_MS = 15_000L
 

@@ -84,6 +84,7 @@ class YuvProductionLifecycleTest {
         )
 
         val terminalLatch = CountDownLatch(1)
+        val callbackLatch = CountDownLatch(1)
 
         val completeCount = AtomicInteger(0)
         val errorCount = AtomicInteger(0)
@@ -139,11 +140,13 @@ class YuvProductionLifecycleTest {
                 if (callbackBodyFailure) throw IllegalStateException("callback body threw")
                 completeCount.incrementAndGet()
                 capturedDir.set(file)
+                callbackLatch.countDown()
             },
             onCaptureError = { msg, _ ->
                 if (callbackBodyFailure) throw IllegalStateException("callback body threw")
                 errorCount.incrementAndGet()
                 lastError.set(msg)
+                callbackLatch.countDown()
             },
             productionResourceCoordinator = coordinator
         )
@@ -164,6 +167,11 @@ class YuvProductionLifecycleTest {
             val latch = CountDownLatch(1)
             assertTrue("handler flush did not complete", handler.post { latch.countDown() })
             assertTrue(latch.await(2, TimeUnit.SECONDS))
+        }
+
+        fun awaitCallback() {
+            assertTrue("terminal callback not reached", callbackLatch.await(10, TimeUnit.SECONDS))
+            flushHandler()
         }
 
         fun shutdown() {
@@ -297,6 +305,7 @@ class YuvProductionLifecycleTest {
         try {
             harness.session.owner.onCaptureFailed(RuntimeException("terminal failure"), "failure")
             assertEquals(CaptureTerminalStatus.FAILED, harness.awaitTerminal())
+            harness.awaitCallback()
             val snap = harness.session.owner.terminalSnapshotRef()
             assertTrue("terminal metadata write must be requested and succeed on failure",
                 snap.metadataWriteOutcome is TerminalOperationOutcome.Succeeded)
@@ -701,13 +710,13 @@ class YuvProductionLifecycleTest {
             assertEquals(CaptureTerminalStatus.CANCELLED, harness.session.terminalState.status())
             assertEquals(TerminalSettlementPhase.SETTLED, harness.session.owner.terminalSettlementPhase())
             assertEquals(1, harness.coordinator.performCount())
-            // Emergency transaction: motion/metadata/status are NotRequested, but the
-            // terminal observer is still dispatched through dispatchCallback (the Main
-            // dispatcher is independent of the rejected owner event dispatcher).
+            // Emergency settlement still attempts every session-safe operation; only
+            // motion itself is not requested for cancellation.
+            harness.awaitCallback()
             val snap = harness.session.owner.terminalSnapshotRef()
-            assertTrue(snap.metadataWriteOutcome is TerminalOperationOutcome.NotRequested)
+            assertTrue(snap.metadataWriteOutcome is TerminalOperationOutcome.Succeeded)
             assertTrue(snap.motionSaveOutcome is TerminalOperationOutcome.NotRequested)
-            assertTrue(snap.statusDispatchOutcome is TerminalOperationOutcome.NotRequested)
+            assertTrue(snap.statusDispatchOutcome is TerminalOperationOutcome.Succeeded)
             assertTrue(snap.callbackDispatchOutcome is TerminalOperationOutcome.Succeeded)
             assertTrue(snap.callbackExecutionOutcome is TerminalOperationOutcome.Succeeded)
             assertEquals(1, harness.errorCount.get())

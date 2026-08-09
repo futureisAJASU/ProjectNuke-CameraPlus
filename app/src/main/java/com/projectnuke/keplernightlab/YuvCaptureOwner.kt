@@ -227,7 +227,14 @@ internal class YuvCaptureOwner(
     private val callbackDispatchOutcomeRef = AtomicReference<TerminalOperationOutcome>(TerminalOperationOutcome.NotRequested)
     private val callbackExecutionOutcomeRef = AtomicReference<TerminalOperationOutcome>(TerminalOperationOutcome.NotRequested)
 
-    private val terminalSnapshotRef = AtomicReference(buildSnapshot())
+    /**
+     * Only the serialized owner builds this publication from its mutable counters and
+     * collections.  Callback/terminal-observer threads only combine this immutable
+     * value with their atomic operation outcomes; they never read owner collections.
+     */
+    private val ownerPublishedStateRef = AtomicReference(buildOwnerPublishedState())
+    private val terminalSnapshotRef = AtomicReference(buildSnapshot(ownerPublishedStateRef.get()))
+    private val terminalObservationClaimed = AtomicBoolean(false)
 
     internal fun candidateCleanupDebt(): List<String> =
         diagnostics.map { "${it.stage}: ${it.message}" }
@@ -940,15 +947,15 @@ internal class YuvCaptureOwner(
         finished.set(true)
         terminalReasonRef.set(request.reason)
         terminalSettlementPhaseRef.set(TerminalSettlementPhase.CLAIMED)
-        publishSnapshot()
+        publishOwnerSnapshot(emergency, request)
 
         terminalSettlementPhaseRef.set(TerminalSettlementPhase.SETTLING)
 
-        if (emergency) {
-            metadataWriteOutcomeRef.set(TerminalOperationOutcome.NotRequested)
-            motionSaveOutcomeRef.set(TerminalOperationOutcome.NotRequested)
-            statusDispatchOutcomeRef.set(TerminalOperationOutcome.NotRequested)
-        } else {
+        run {
+            // These operations are deliberately expressed through session-owned,
+            // thread-safe seams.  Owner-event rejection may force this transaction
+            // off the capture handler, but it must still attempt the public terminal
+            // contract rather than falsely reporting NotRequested.
             val motionOutcome: TerminalOperationOutcome = if (request.saveMotion) {
                 runCatching { saveMotionOnce(outputDir) }
                     .fold(
@@ -1006,14 +1013,23 @@ internal class YuvCaptureOwner(
         // Sole terminal publication: exactly one YuvTerminalRequest wins the handoff.
         // ColorFusion's terminal gate unparks on this publication; a rejected
         // duplicate (closed handoff or already published) is a late diagnostic only.
-        val published = sessionTerminal.publishTerminal(request)
+        val published = try {
+            sessionTerminal.publishTerminal(request)
+        } catch (t: Throwable) {
+            recordDiagnostic(DiagnosticStage.TERMINAL_PUBLICATION, DiagnosticSeverity.ERROR, null, null,
+                "terminal request publication threw; publishing settlement failure", t)
+            sessionTerminal.publishSettlementFailure(t)
+            false
+        }
         if (!published) {
             recordDiagnostic(DiagnosticStage.TERMINAL_PUBLICATION, DiagnosticSeverity.WARN, null, null,
                 "terminal request publication rejected (handoff closed or already published)")
         }
 
         try {
-            dispatchTerminalCallback(request)
+            // The terminal observer consumes the typed handoff result.  In particular,
+            // an unpublished local request never reaches a normal user callback.
+            // ColorFusion starts that observer after finite captureBurst submission.
         } finally {
             // Production cleanup: both internal (YuvCleanupCoordinator) AND
             // production (Camera2/HandlerThread/scheduler) resource settlement
@@ -1033,22 +1049,53 @@ internal class YuvCaptureOwner(
         }
 
         terminalSettlementPhaseRef.set(TerminalSettlementPhase.SETTLED)
-        publishSnapshot()
+        publishOwnerSnapshot(emergency, request)
     }
 
-    private fun dispatchTerminalCallback(request: YuvTerminalRequest) {
+    /** Called by the terminal-handoff consumer, never by local terminal settlement. */
+    fun consumeTerminalHandoff(result: YuvTerminalHandoffResult) {
+        if (!terminalObservationClaimed.compareAndSet(false, true)) return
+        when (result) {
+            is YuvTerminalHandoffResult.Published -> dispatchTerminalCallback {
+                sessionTerminal.observeTerminal(result.request)
+            }
+            is YuvTerminalHandoffResult.SettlementFailed -> {
+                recordDiagnostic(DiagnosticStage.TERMINAL_PUBLICATION, DiagnosticSeverity.ERROR, null, null,
+                    "YUV terminal handoff reported settlement failure", result.failure)
+                dispatchTerminalCallback { sessionTerminal.observeSettlementFailure(result.failure) }
+            }
+            YuvTerminalHandoffResult.Closed -> {
+                // Explicit lifecycle closure is not a locally invented capture result.
+                recordDiagnostic(DiagnosticStage.TERMINAL_PUBLICATION, DiagnosticSeverity.WARN, null, null,
+                    "YUV terminal handoff closed before publication; no normal callback dispatched")
+            }
+            YuvTerminalHandoffResult.WatchdogTimeout -> {
+                recordDiagnostic(DiagnosticStage.TERMINAL_PUBLICATION, DiagnosticSeverity.ERROR, null, null,
+                    "YUV terminal handoff watchdog expired; no capture result synthesized")
+            }
+        }
+    }
+
+    private fun dispatchTerminalCallback(callback: () -> Unit) {
         // The dispatched observer is the SESSION terminal observer: ColorFusion
         // consumes the published request and dispatches exactly one onComplete/
         // onError from it.  The owner never invokes the production callbacks
         // directly.
-        val callback: () -> Unit = { sessionTerminal.observeTerminal(request) }
         // The wrapped runnable is the ACTUAL user callback invocation.  CallbackState
         // tracks this runnable's lifecycle, not an intermediate wrapper.  The dispatch
         // returns the real Handler.post acceptance result: if Main rejects, the callback
         // is NOT executed inline — a diagnostic is recorded and cleanup still runs.
         val wrapped = Runnable {
             try {
+                // A dispatcher is allowed to run synchronously before dispatch()
+                // returns.  Claim either PENDING (sync) or ACCEPTED (async) without
+                // ever regressing an already-executed callback back to accepted.
+                callbackStateRef.compareAndSet(CallbackState.DISPATCH_PENDING, CallbackState.EXECUTING)
                 callbackStateRef.compareAndSet(CallbackState.DISPATCH_ACCEPTED, CallbackState.EXECUTING)
+                callbackDispatchOutcomeRef.compareAndSet(
+                    TerminalOperationOutcome.Pending,
+                    TerminalOperationOutcome.Succeeded
+                )
                 callback.invoke()
                 callbackStateRef.set(CallbackState.EXECUTED)
                 callbackExecutionOutcomeRef.set(TerminalOperationOutcome.Succeeded)
@@ -1096,7 +1143,7 @@ internal class YuvCaptureOwner(
     // Immutable terminal snapshot publication
     // ------------------------------------------------------------------
 
-    fun completedResultsCount(): Int = completedResults
+    fun completedResultsCount(): Int = ownerPublishedStateRef.get().completedResults
 
     fun terminalState(): CaptureTerminalState = terminalState
 
@@ -1106,19 +1153,16 @@ internal class YuvCaptureOwner(
 
     fun terminalSnapshotRef(): YuvTerminalSnapshot = terminalSnapshotRef.get()
 
+    /** Safe from callback/terminal-observer threads: reads immutable/atomic values only. */
     private fun publishSnapshot() {
-        terminalSnapshotRef.set(buildSnapshot())
+        terminalSnapshotRef.set(buildSnapshot(ownerPublishedStateRef.get()))
     }
 
-    private fun buildSnapshot(): YuvTerminalSnapshot {
+    /** Must be called only by the serialized owner, except the explicit emergency copy path. */
+    private fun buildOwnerPublishedState(): OwnerPublishedState {
         val snap = accounting.snapshot()
-        return YuvTerminalSnapshot(
-            receivedFrames = snap.receivedFrames,
-            bufferedFrames = snap.bufferedFrames,
-            persistedFrames = snap.persistedFrames,
-            failedFrames = snap.failedFrames,
-            droppedFrames = snap.droppedFrames,
-            manifest = snap.manifest.toList(),
+        return OwnerPublishedState(
+            accounting = snap,
             completedResults = completedResults,
             queuedWork = boundedWorker.queuedCount(),
             inFlightWork = boundedWorker.activeCount(),
@@ -1127,6 +1171,44 @@ internal class YuvCaptureOwner(
             terminalReason = terminalReasonRef.get(),
             discardedLateCompletions = discardedLateCompletions.toList(),
             cleanupPhase = cleanupCoordinator.snapshot().phase,
+            productionCleanup = productionResourceCoordinator.snapshot()
+        )
+    }
+
+    private fun publishOwnerSnapshot(emergency: Boolean, request: YuvTerminalRequest) {
+        if (emergency) {
+            // Emergency settlement is allowed to use only the last immutable owner
+            // publication.  It must not inspect owner-confined collections off-owner.
+            ownerPublishedStateRef.set(ownerPublishedStateRef.get().copy(
+                terminalStatus = request.status,
+                terminalSettlementPhase = terminalSettlementPhaseRef.get(),
+                terminalReason = request.reason,
+                cleanupPhase = cleanupCoordinator.snapshot().phase,
+                productionCleanup = productionResourceCoordinator.snapshot()
+            ))
+        } else {
+            ownerPublishedStateRef.set(buildOwnerPublishedState())
+        }
+        publishSnapshot()
+    }
+
+    private fun buildSnapshot(owner: OwnerPublishedState): YuvTerminalSnapshot {
+        val snap = owner.accounting
+        return YuvTerminalSnapshot(
+            receivedFrames = snap.receivedFrames,
+            bufferedFrames = snap.bufferedFrames,
+            persistedFrames = snap.persistedFrames,
+            failedFrames = snap.failedFrames,
+            droppedFrames = snap.droppedFrames,
+            manifest = snap.manifest.toList(),
+            completedResults = owner.completedResults,
+            queuedWork = owner.queuedWork,
+            inFlightWork = owner.inFlightWork,
+            terminalStatus = owner.terminalStatus,
+            terminalSettlementPhase = owner.terminalSettlementPhase,
+            terminalReason = owner.terminalReason,
+            discardedLateCompletions = owner.discardedLateCompletions,
+            cleanupPhase = owner.cleanupPhase,
             diagnostics = diagnostics.toList(),
             metadataWriteOutcome = metadataWriteOutcomeRef.get(),
             motionSaveOutcome = motionSaveOutcomeRef.get(),
@@ -1134,9 +1216,22 @@ internal class YuvCaptureOwner(
             callbackDispatchOutcome = callbackDispatchOutcomeRef.get(),
             callbackExecutionOutcome = callbackExecutionOutcomeRef.get(),
             callbackState = callbackStateRef.get(),
-            productionCleanup = productionResourceCoordinator.snapshot()
+            productionCleanup = owner.productionCleanup
         )
     }
+
+    private data class OwnerPublishedState(
+        val accounting: YuvCaptureAccountingSnapshot,
+        val completedResults: Int,
+        val queuedWork: Int,
+        val inFlightWork: Int,
+        val terminalStatus: CaptureTerminalStatus,
+        val terminalSettlementPhase: TerminalSettlementPhase,
+        val terminalReason: String?,
+        val discardedLateCompletions: List<Int>,
+        val cleanupPhase: CleanupPhase,
+        val productionCleanup: ProductionCleanupSnapshot?
+    )
 
     internal data class TerminalSnapshot(
         val receivedFrames: Int,

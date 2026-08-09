@@ -20,8 +20,14 @@ internal class YuvCaptureSession internal constructor(
     internal val terminalMetadataWriter: YuvTerminalMetadataWriter,
     internal val verifiedFileReader: YuvVerifiedFileReader,
     internal val terminalFinalVerifier: YuvTerminalFinalVerifier,
-    internal val onSessionTerminal: (YuvTerminalRequest) -> Unit
+    internal val onSessionTerminal: (YuvTerminalRequest) -> Unit,
+    private val startTerminalObserverOnCreate: Boolean
 ) : AutoCloseable, YuvSessionTerminalOperations {
+    private val terminalObserverStarted = AtomicBoolean(false)
+
+    init {
+        if (startTerminalObserverOnCreate) startTerminalObservation()
+    }
     override fun close() {
         // Deterministically unblock any ColorFusion terminal gate FIRST, then
         // perform the coordinated resource cleanup.  A waiter that was unblocked
@@ -43,6 +49,29 @@ internal class YuvCaptureSession internal constructor(
         productionResourceCoordinator.perform()
     }
 
+    /**
+     * Starts the sole terminal consumer exactly once. Production starts this after
+     * finite captureBurst submission; test sessions can opt in at construction.
+     */
+    fun startTerminalObservation(settleBoundMillis: Long? = null): Boolean {
+        if (!terminalObserverStarted.compareAndSet(false, true)) return false
+        Thread(
+            {
+                val result = if (settleBoundMillis == null) {
+                    terminalRequestHandoff.awaitResult()
+                } else {
+                    terminalRequestHandoff.awaitResult(settleBoundMillis)
+                }
+                owner.consumeTerminalHandoff(result)
+            },
+            "KeplerYuvTerminalWait"
+        ).apply {
+            isDaemon = true
+            start()
+        }
+        return true
+    }
+
     // ------------------------------------------------------------------
     // YuvSessionTerminalOperations: the owner requests session terminal
     // operations; the session owns the callbacks/adapters.
@@ -50,6 +79,9 @@ internal class YuvCaptureSession internal constructor(
 
     override fun publishTerminal(request: YuvTerminalRequest): Boolean =
         terminalRequestHandoff.publish(request)
+
+    override fun publishSettlementFailure(failure: Throwable): Boolean =
+        terminalRequestHandoff.failSettlement(failure)
 
     override fun requestTerminalMetadataWrite(request: YuvTerminalMetadataRequest) =
         terminalMetadataWriter.write(request)
@@ -62,6 +94,16 @@ internal class YuvCaptureSession internal constructor(
 
     override fun observeTerminal(request: YuvTerminalRequest) =
         onSessionTerminal(request)
+
+    override fun observeSettlementFailure(failure: Throwable) =
+        onSessionTerminal(YuvTerminalRequest(
+            status = CaptureTerminalStatus.FAILED,
+            jobStatus = "CAPTURE_INTERNAL_ERROR",
+            reason = "YUV terminal settlement failed",
+            completionKind = TerminalCompletionKind.ERROR,
+            cause = failure,
+            saveMotion = false
+        ))
 
     companion object {
         fun create(
@@ -98,7 +140,8 @@ internal class YuvCaptureSession internal constructor(
             },
             accounting: YuvCaptureAccounting? = null,
             productionResourceCoordinator: YuvProductionResourceCoordinator,
-            finished: AtomicBoolean? = null
+            finished: AtomicBoolean? = null,
+            startTerminalObserverOnCreate: Boolean = true
         ): YuvCaptureSession {
             val captureStateOwner = CaptureStateOwner(dispatch)
             val boundedWorker = BoundedCaptureWorker(workerName, workerCapacity)
@@ -132,6 +175,9 @@ internal class YuvCaptureSession internal constructor(
                     override fun publishTerminal(request: YuvTerminalRequest): Boolean =
                         sessionRef.get()?.publishTerminal(request) ?: false
 
+                    override fun publishSettlementFailure(failure: Throwable): Boolean =
+                        sessionRef.get()?.publishSettlementFailure(failure) ?: false
+
                     override fun requestTerminalMetadataWrite(request: YuvTerminalMetadataRequest) {
                         sessionRef.get()?.requestTerminalMetadataWrite(request)
                     }
@@ -145,6 +191,10 @@ internal class YuvCaptureSession internal constructor(
 
                     override fun observeTerminal(request: YuvTerminalRequest) {
                         sessionRef.get()?.observeTerminal(request)
+                    }
+
+                    override fun observeSettlementFailure(failure: Throwable) {
+                        sessionRef.get()?.observeSettlementFailure(failure)
                     }
                 },
                 saveMotionOnce = saveMotionOnce,
@@ -169,7 +219,8 @@ internal class YuvCaptureSession internal constructor(
                 terminalMetadataWriter,
                 verifiedFileReader,
                 terminalFinalVerifier,
-                onSessionTerminal
+                onSessionTerminal,
+                startTerminalObserverOnCreate
             ).also { sessionRef.set(it) }
         }
     }
