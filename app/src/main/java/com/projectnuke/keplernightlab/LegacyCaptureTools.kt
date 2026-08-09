@@ -222,6 +222,14 @@ class MotionLogger(context: Context) {
 fun KeplerNightLabApp() {
     val context = LocalContext.current
 
+    // This diagnostic surface is not part of the release camera flow. Keep
+    // the historical capability tools available for developer builds only;
+    // production CameraScreen actions use the serialized capture owners.
+    if (!BuildConfig.DEBUG) {
+        Text("Camera diagnostics are available in debug builds only.")
+        return
+    }
+
     var hasCameraPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(
