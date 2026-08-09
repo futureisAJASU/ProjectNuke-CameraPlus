@@ -182,6 +182,53 @@ class RawSaveCompletionTest {
     }
 
     @Test
+    fun adoptedOutputPlanNeverSchedulesSuccessfulDngForDeletion() {
+        val root = createTempDirectory("raw-adoption-plan").toFile()
+        try {
+            val raw = root.resolve("frame_00.raw16").apply { writeBytes(ByteArray(8)) }
+            val dng = root.resolve("frame_00.dng").apply { writeBytes(byteArrayOf(1, 2)) }
+            val completion = RawSaveCompletion.Success(
+                frameIndex = 0,
+                timestampNs = 1L,
+                raw16Filename = raw.name,
+                raw16Bytes = raw.length(),
+                saveDurationMs = 1L,
+                dngSidecar = RawDngSidecarOutcome.localSaved(0, dng.name),
+                output = RawOutputOwnership(null, raw, RawOutputState.VERIFIED_FINAL, raw.length(), dngFinalFile = dng),
+                frame = defaultRawFrameManifest(0, 1L, raw.name, RawDngSidecarOutcome.localSaved(0, dng.name))
+                    .copy(dngFilename = dng.name)
+            )
+            val plan = planRawSuccessOutputSettlement(root, completion)
+            assertEquals(setOf(raw.absolutePath, dng.absolutePath), plan.adopted.map { it.absolutePath }.toSet())
+            assertTrue(plan.leftovers.isEmpty())
+            assertTrue(raw.exists())
+            assertTrue(dng.exists())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun failedDngFinalRemainsLeftoverWhileRaw16IsAdopted() {
+        val root = createTempDirectory("raw-failed-dng-plan").toFile()
+        try {
+            val raw = root.resolve("frame_01.raw16").apply { writeBytes(ByteArray(8)) }
+            val dng = root.resolve("frame_01.dng").apply { writeBytes(byteArrayOf(1, 2)) }
+            val sidecar = RawDngSidecarOutcome.localSaveFailed(1, "verification failed", dng.name)
+            val completion = RawSaveCompletion.Success(
+                1, 2L, raw.name, raw.length(), 1L, sidecar,
+                RawOutputOwnership(null, raw, RawOutputState.VERIFIED_FINAL, raw.length(), dngFinalFile = dng),
+                frame = defaultRawFrameManifest(1, 2L, raw.name, sidecar)
+            )
+            val plan = planRawSuccessOutputSettlement(root, completion)
+            assertEquals(listOf(raw.absolutePath), plan.adopted.map { it.absolutePath })
+            assertEquals(listOf(dng.absolutePath), plan.leftovers.map { it.absolutePath })
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun completionPostRejectionReturnsOutputOwnershipToDisposer() {
         var disposed = 0
         val task = RawSaveTask(
