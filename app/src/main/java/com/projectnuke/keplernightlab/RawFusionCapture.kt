@@ -758,6 +758,16 @@ fun captureRawBurstForFusion(
             val raw16File = File(jobDir, raw16Name)
             val dngFile = File(jobDir, dngName)
             var raw16Temp: File? = null
+            var dngTemp: File? = null
+            fun deleteOwned(file: File?): RawOutputCleanupOutcome {
+                if (file == null || !file.exists()) return RawOutputCleanupOutcome.NotNeeded
+                return try {
+                    if (file.delete()) RawOutputCleanupOutcome.Clean
+                    else RawOutputCleanupOutcome.failed(IllegalStateException("delete returned false: ${file.absolutePath}"))
+                } catch (t: Throwable) {
+                    RawOutputCleanupOutcome.failed(t)
+                }
+            }
             try {
                 post("RAW saving frame ${index + 1}/$requestedFrames...")
                 val saveStartedAt = System.currentTimeMillis()
@@ -768,30 +778,33 @@ fun captureRawBurstForFusion(
                     val expectedRaw16Bytes = image.width.toLong() * image.height.toLong() * 2L
                     verifyRaw16Payload(raw16File, expectedRaw16Bytes)
                 } finally {
-                    if (raw16Temp?.exists() == true) raw16Temp?.delete()
+                    val cleanup = deleteOwned(raw16Temp)
+                    if (!cleanup.succeeded) post("RAW temp cleanup failed: ${cleanup.failureDescription}")
                 }
                 if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
                     return RawSaveCompletion.Abandoned(
                         index,
                         timestamp,
-                        RawOutputOwnership(raw16Temp?.takeIf { it.exists() }, raw16File.takeIf { it.exists() }, RawOutputState.DISCARDED, null)
+                        RawOutputOwnership(raw16Temp?.takeIf { it.exists() }, raw16File.takeIf { it.exists() }, RawOutputState.CLEANUP_FAILED.takeIf { raw16Temp?.exists() == true } ?: RawOutputState.DISCARDED, null, dngTempFile = null, dngFinalFile = null)
                     )
                 }
                 var dngSaved = false
                 var dngFailure: String? = null
                 if (shouldSaveDngSidecars) {
-                    val dngTemp = File(jobDir, ".${dngName}.${System.nanoTime()}.tmp")
+                    dngTemp = File(jobDir, ".${dngName}.${System.nanoTime()}.tmp")
                     try {
-                        FileOutputStream(dngTemp).use { output ->
+                        FileOutputStream(dngTemp!!).use { output ->
                             DngCreator(characteristics, result).use { creator ->
                                 creator.writeImage(output, image)
                             }
                             output.fd.sync()
                         }
-                        val tempDigest = NoFollowFileSystem.digestVerified(dngTemp)
+                        val tempDigest = NoFollowFileSystem.digestVerified(dngTemp!!)
                         check(tempDigest.size > 0L) { "DNG output was empty" }
                         check(isDngTiffHeader(tempDigest.prefix)) { "DNG output header was invalid" }
-                        KeplerJobMetadata.atomicReplace(dngTemp, dngFile)
+                        KeplerJobMetadata.atomicReplace(dngTemp!!, dngFile)
+                        val finalDigest = NoFollowFileSystem.digestVerified(dngFile)
+                        check(finalDigest.size > 0L && isDngTiffHeader(finalDigest.prefix)) { "DNG final verification failed" }
                         // Some providers do not allow opening a directory channel. That is a
                         // best-effort durability fence after the atomic replacement.
                         runCatching {
@@ -802,14 +815,15 @@ fun captureRawBurstForFusion(
                         dngFailure = "${e.javaClass.simpleName}: ${e.message}"
                         post("RAW DNG sidecar failed; continuing with raw16 fusion.")
                     } finally {
-                        runCatching { if (dngTemp.exists()) dngTemp.delete() }
+                        val cleanup = deleteOwned(dngTemp)
+                        if (!cleanup.succeeded) dngFailure = dngFailure ?: cleanup.failureDescription
                     }
                 }
                 if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
                     return RawSaveCompletion.Abandoned(
                         index,
                         timestamp,
-                        RawOutputOwnership(raw16Temp?.takeIf { it.exists() }, raw16File.takeIf { it.exists() }, RawOutputState.DISCARDED, null)
+                        RawOutputOwnership(raw16Temp?.takeIf { it.exists() }, raw16File.takeIf { it.exists() }, RawOutputState.CLEANUP_FAILED.takeIf { raw16Temp?.exists() == true } ?: RawOutputState.DISCARDED, null, dngTempFile = dngTemp?.takeIf { it.exists() }, dngFinalFile = dngFile.takeIf { it.exists() })
                     )
                 }
                 val dynamicBlackLevel = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
@@ -846,7 +860,9 @@ fun captureRawBurstForFusion(
                         tempFile = raw16Temp?.takeIf { it.exists() },
                         finalFile = raw16File,
                         state = RawOutputState.VERIFIED_FINAL,
-                        verifiedBytes = raw16File.length()
+                        verifiedBytes = raw16File.length(),
+                        dngTempFile = dngTemp?.takeIf { it.exists() },
+                        dngFinalFile = dngFile.takeIf { dngSaved && it.exists() }
                     ),
                     frame = frame
                 )
@@ -858,10 +874,12 @@ fun captureRawBurstForFusion(
                     failureMessage = "RAW fusion capture failed: ${e.stackTraceToString()}",
                     throwable = e,
                     output = RawOutputOwnership(
-                        tempFile = null,
+                        tempFile = raw16Temp?.takeIf { it.exists() },
                         finalFile = raw16File.takeIf { it.exists() },
-                        state = if (raw16File.exists()) RawOutputState.TEMP else RawOutputState.NONE,
-                        verifiedBytes = null
+                        state = if (raw16Temp?.exists() == true || raw16File.exists()) RawOutputState.CLEANUP_FAILED else RawOutputState.NONE,
+                        verifiedBytes = null,
+                        dngTempFile = dngTemp?.takeIf { it.exists() },
+                        dngFinalFile = dngFile.takeIf { it.exists() }
                     ),
                     frame = request.frame.copy(
                         raw16Filename = null,
@@ -886,9 +904,10 @@ fun captureRawBurstForFusion(
                     is RawSaveCompletion.Success -> buildList {
                         add(File(jobDir, completion.raw16Filename))
                         completion.dngSidecar.sidecarFilename?.let { add(File(jobDir, it)) }
+                        addAll(listOfNotNull(completion.output.tempFile, completion.output.dngTempFile))
                     }
-                    is RawSaveCompletion.Failed -> listOfNotNull(completion.output.tempFile, completion.output.finalFile)
-                    is RawSaveCompletion.Abandoned -> listOfNotNull(completion.output.tempFile, completion.output.finalFile)
+                    is RawSaveCompletion.Failed -> listOfNotNull(completion.output.tempFile, completion.output.finalFile, completion.output.dngTempFile, completion.output.dngFinalFile)
+                    is RawSaveCompletion.Abandoned -> listOfNotNull(completion.output.tempFile, completion.output.finalFile, completion.output.dngTempFile, completion.output.dngFinalFile)
                 }
                 var failure: Throwable? = null
                 for (file in files.distinct()) {
@@ -957,10 +976,13 @@ fun captureRawBurstForFusion(
                                     }
                                 }
                                 is RawSaveCompletion.Failed -> {
+                                    disposeUnadoptedCompletion(completion)
                                     ledger.value.adoptFailure(completion)
                                     finishError("CAPTURE_FAILED", completion.failureMessage)
                                 }
-                                is RawSaveCompletion.Abandoned -> Unit
+                                is RawSaveCompletion.Abandoned -> {
+                                    disposeUnadoptedCompletion(completion)
+                                }
                             }
                         }
 

@@ -26,7 +26,10 @@ internal data class RawOutputOwnership(
     val finalFile: File?,
     val state: RawOutputState,
     val verifiedBytes: Long?,
-    val cleanup: RawOutputCleanupOutcome = RawOutputCleanupOutcome.NotNeeded
+    val cleanup: RawOutputCleanupOutcome = RawOutputCleanupOutcome.NotNeeded,
+    val dngTempFile: File? = null,
+    val dngFinalFile: File? = null,
+    val dngCleanup: RawOutputCleanupOutcome = RawOutputCleanupOutcome.NotNeeded
 )
 
 internal enum class RawCompletionPostOutcome { ACCEPTED, REJECTED_AND_DISPOSED, REJECTED_UNSETTLED }
