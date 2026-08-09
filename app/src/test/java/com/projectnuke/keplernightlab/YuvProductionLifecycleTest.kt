@@ -413,6 +413,7 @@ class YuvProductionLifecycleTest {
         try {
             harness.session.owner.onCaptureFailed(RuntimeException("capture failed"), "onCaptureFailed")
             assertEquals(CaptureTerminalStatus.FAILED, harness.awaitTerminal())
+            harness.awaitCallback()
             // Authoritative failed-capture accounting incremented exactly once and is
             // present in terminal metadata.
             assertEquals(1, harness.session.accounting.snapshot().failedFrames)
