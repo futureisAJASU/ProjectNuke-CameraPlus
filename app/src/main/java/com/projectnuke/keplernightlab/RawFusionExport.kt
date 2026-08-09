@@ -542,8 +542,16 @@ fun captureProcessExportRawNightFusion(
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ) {
-    val main = Handler(Looper.getMainLooper())
-    fun post(message: String) = main.post { onStatus(message) }
+    val callbackDispatcher = ProcessingCallbackDispatcher(
+        Handler(Looper.getMainLooper()),
+        "KeplerRawPipeline"
+    )
+    fun post(message: String) {
+        val result = callbackDispatcher.dispatch { onStatus(message) }
+        if (result != ProcessingCallbackDispatchResult.ACCEPTED) {
+            Log.w("KeplerRawPipeline", "status dispatch $result")
+        }
+    }
     cancellation.throwIfCancelled()
     post("RAW 캡처 중입니다. 기기를 움직이지 마세요. saved 0/$frameCount, images 0/$frameCount, results 0/$frameCount")
     captureRawBurstForFusion(
@@ -1252,8 +1260,16 @@ internal fun reprocessRawJob(
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ): ReprocessWorkerRun {
-    val main = Handler(Looper.getMainLooper())
-    fun post(message: String) = main.post { onStatus(message) }
+    val callbackDispatcher = ProcessingCallbackDispatcher(
+        Handler(Looper.getMainLooper()),
+        "KeplerRawReprocess"
+    )
+    fun post(message: String) {
+        val result = callbackDispatcher.dispatch { onStatus(message) }
+        if (result != ProcessingCallbackDispatchResult.ACCEPTED) {
+            Log.w("KeplerRawReprocess", "status dispatch $result")
+        }
+    }
     val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
     val thread = HandlerThread("KeplerRawReprocessThread").apply { start() }
     Handler(thread.looper).post {

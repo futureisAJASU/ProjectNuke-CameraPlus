@@ -54,10 +54,18 @@ fun analyzeKeplerFrameQuality(
     onStatus: (String) -> Unit,
     onComplete: () -> Unit
 ) {
-    val main = Handler(Looper.getMainLooper())
-    fun post(message: String) = main.post { onStatus(message) }
+    val callbackDispatcher = ProcessingCallbackDispatcher(
+        Handler(Looper.getMainLooper()),
+        "KeplerFrameQuality"
+    )
+    fun post(message: String) {
+        val result = callbackDispatcher.dispatch { onStatus(message) }
+        if (result != ProcessingCallbackDispatchResult.ACCEPTED) {
+            android.util.Log.w("KeplerFrameQuality", "status dispatch $result")
+        }
+    }
     val thread = HandlerThread("KeplerFrameQualityThread").apply { start() }
-    Handler(thread.looper).post {
+    val workerPosted = runCatching { Handler(thread.looper).post {
         try {
             val job = loadJobJson(jobDir)
             val frames = job.optJSONArray("frames") ?: JSONArray()
@@ -120,8 +128,22 @@ fun analyzeKeplerFrameQuality(
         } catch (e: Exception) {
             post("Frame quality analysis failed: ${e.javaClass.simpleName}: ${e.message}")
         } finally {
-            main.post(onComplete)
+            val result = callbackDispatcher.dispatch(onComplete)
+            if (result != ProcessingCallbackDispatchResult.ACCEPTED) {
+                android.util.Log.w("KeplerFrameQuality", "completion dispatch $result")
+            }
             thread.quitSafely()
+        }
+    } }.getOrElse { failure ->
+        android.util.Log.e("KeplerFrameQuality", "worker dispatch failed", failure)
+        false
+    }
+    if (!workerPosted) {
+        thread.quitSafely()
+        post("Frame quality analysis failed: worker could not start.")
+        val result = callbackDispatcher.dispatch(onComplete)
+        if (result != ProcessingCallbackDispatchResult.ACCEPTED) {
+            android.util.Log.w("KeplerFrameQuality", "completion dispatch $result")
         }
     }
 }
@@ -152,13 +174,13 @@ private fun loadRawLumaSample(
     frame: JSONObject,
     fileName: String
 ): QualityLumaSample {
-    val file = File(jobDir, fileName)
-    require(file.isFile) { "RAW16 file missing: $fileName" }
+    val file = NoFollowFileSystem.requireDirectChildFile(jobDir, fileName)
     val width = frame.optInt("rawWidth", job.optInt("rawWidth", 0))
     val height = frame.optInt("rawHeight", job.optInt("rawHeight", 0))
     require(width > 0 && height > 0) { "RAW dimensions missing" }
-    require(file.length() >= width.toLong() * height.toLong() * 2L) {
-        "RAW16 file truncated: $fileName"
+    val expectedBytes = width.toLong() * height.toLong() * 2L
+    require(NoFollowFileSystem.digestVerified(file).size == expectedBytes) {
+        "RAW16 file has invalid size: $fileName"
     }
     val step = max(1, ceil(max(width, height) / QUALITY_MAX_SAMPLE_DIMENSION.toDouble()).toInt())
     val sampledWidth = max(1, width / step)

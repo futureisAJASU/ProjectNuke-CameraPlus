@@ -81,7 +81,8 @@ fun processLatestNightFusionV02(
     val workerThread = HandlerThread("KeplerNightFusionV02Thread").apply { start() }
     val workerHandler = Handler(workerThread.looper)
 
-    workerHandler.post {
+    val workerPosted = runCatching {
+        workerHandler.post {
         var jobDir: File? = null
         try {
             cancellation.throwIfCancelled()
@@ -116,6 +117,14 @@ fun processLatestNightFusionV02(
         } finally {
             workerThread.quitSafely()
         }
+        }
+    }.getOrElse { failure ->
+        Log.e("KeplerYuvPipeline", "worker dispatch failed", failure)
+        false
+    }
+    if (!workerPosted) {
+        workerThread.quitSafely()
+        postStatus("PIPELINE_FAILED: YUV Night Fusion worker could not start; cache kept.")
     }
 }
 

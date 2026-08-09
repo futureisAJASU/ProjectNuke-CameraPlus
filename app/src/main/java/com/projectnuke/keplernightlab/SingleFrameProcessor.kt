@@ -142,8 +142,14 @@ internal fun processSingleFrameJobSync(
             finishedAt = finishedAt,
             metadataPolicy = metadataPolicy
         )
-        backupFile?.delete()
-        backupFile = null
+        backupFile?.let { backup ->
+            if (Files.exists(backup.toPath(), LinkOption.NOFOLLOW_LINKS) &&
+                !Files.deleteIfExists(backup.toPath())
+            ) {
+                error("Could not settle previous single-frame output backup")
+            }
+            backupFile = null
+        }
         onStatus("일반 사진 후처리가 완료되었습니다.")
         return completedOutput
     } catch (ce: CancellationException) {
@@ -295,11 +301,9 @@ private fun cleanupCancelledSingleFrameOutput(
     }
 }
 
-private fun isValidSingleFrameOutput(file: File): Boolean =
-    Files.exists(file.toPath(), LinkOption.NOFOLLOW_LINKS) &&
-        !Files.isSymbolicLink(file.toPath()) &&
-        Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS) &&
-        Files.size(file.toPath()) > 0L
+private fun isValidSingleFrameOutput(file: File): Boolean = runCatching {
+    NoFollowFileSystem.digestVerified(file).size > 0L
+}.getOrDefault(false)
 
 private fun persistSingleFrameCancellation(
     jobDir: File,

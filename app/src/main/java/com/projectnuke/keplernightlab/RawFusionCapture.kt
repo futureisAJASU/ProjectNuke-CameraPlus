@@ -2338,9 +2338,13 @@ fun processRawFusionJob(
             onStatus = onStatus
         )
         cancellation.throwIfCancelled()
+        val mergedRawDigest = if (classicMerge.success) {
+            runCatching { NoFollowFileSystem.digestVerified(mergedRawFile) }.getOrNull()
+        } else {
+            null
+        }
         val classicMergedOk = classicMerge.success &&
-            mergedRawFile.exists() &&
-            mergedRawFile.length() >= pixelCount * 2L &&
+            mergedRawDigest?.size == pixelCount * 2L &&
             alignmentFile.exists()
         if (!classicMergedOk) {
             val failureMessage = classicMerge.errorMessage ?: "Classic RAW fusion failed"

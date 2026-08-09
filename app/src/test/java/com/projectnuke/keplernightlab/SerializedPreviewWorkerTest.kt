@@ -3,6 +3,7 @@ package com.projectnuke.keplernightlab
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.Collections
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -51,20 +52,22 @@ class SerializedPreviewWorkerTest {
     @Test fun renderFailureDoesNotPoisonLaterLatestRequest() {
         val adopted = CountDownLatch(1)
         val firstStarted = CountDownLatch(1)
-        val errors = mutableListOf<Throwable>()
-        val recycledSources = mutableListOf<Int>()
+        val errorReported = CountDownLatch(1)
+        val errors = Collections.synchronizedList(mutableListOf<Throwable>())
+        val recycledSources = Collections.synchronizedList(mutableListOf<Int>())
         val worker = SerializedPreviewWorker<Int, Int>(
             render = { value -> if (value == 1) { firstStarted.countDown(); error("expected") } else value },
             recycleSource = recycledSources::add,
             recycleResult = {},
             adopt = { adopted.countDown() },
-            onError = errors::add
+            onError = { error -> errors.add(error); errorReported.countDown() }
         )
         try {
             worker.submit(1)
             assertTrue(firstStarted.await(2, TimeUnit.SECONDS))
             worker.submit(2)
             assertTrue(adopted.await(2, TimeUnit.SECONDS))
+            assertTrue(errorReported.await(2, TimeUnit.SECONDS))
             assertEquals(1, errors.size)
             assertTrue(recycledSources.containsAll(listOf(1, 2)))
         } finally {

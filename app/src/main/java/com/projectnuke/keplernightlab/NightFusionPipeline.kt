@@ -87,7 +87,8 @@ fun captureProcessExportNightFusion(
                 }
             }
             val workerThread = HandlerThread("KeplerCaptureProcessExportThread").apply { start() }
-            Handler(workerThread.looper).post {
+            val workerHandler = Handler(workerThread.looper)
+            val workerPosted = runCatching { workerHandler.post {
                 try {
                     cancellation.throwIfCancelled()
                     post(if (captureMode == CaptureMode.SINGLE_FRAME) {
@@ -212,6 +213,13 @@ fun captureProcessExportNightFusion(
                 } finally {
                     workerThread.quitSafely()
                 }
+            } }.getOrElse { failure ->
+                android.util.Log.e("KeplerYuvPipeline", "capture/process worker dispatch failed", failure)
+                false
+            }
+            if (!workerPosted) {
+                workerThread.quitSafely()
+                post("PIPELINE_FAILED: Capture processing worker could not start; cache kept.")
             }
         },
         onError = { error ->

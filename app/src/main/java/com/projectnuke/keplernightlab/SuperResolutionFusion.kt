@@ -1709,10 +1709,7 @@ private fun saveJpeg(bitmap: Bitmap, outputFile: File, quality: Int = JPEG_QUALI
             }
         },
         verifyFinal = { committed ->
-            val bytes = NoFollowFileSystem.readBytesVerified(committed)
-            check(bytes.size >= 4 && bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte()) {
-                "JPEG final verification failed"
-            }
+            verifyJpegArtifact(committed)
         }
     )
 }

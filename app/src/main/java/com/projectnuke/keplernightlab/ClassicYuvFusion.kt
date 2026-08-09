@@ -147,10 +147,8 @@ internal fun processClassicYuvFusionJob(
             job.put("currentPipelineStage", stage)
                 .put("processStatus", status)
                 .put("processingStartedAt", processingStartedAt)
-            KeplerJobMetadata.update(jobDir) { current ->
-                current.put("currentPipelineStage", stage)
-                    .put("processStatus", status)
-                    .put("processingStartedAt", processingStartedAt)
+            updateProcessingStage(jobDir, stage, status) { current ->
+                current.put("processingStartedAt", processingStartedAt)
                     .put("yuvProcessingPolicy", metadataPolicy.name)
             }
             Log.i("KeplerYuvPipeline", "$stage: $status")
@@ -1395,9 +1393,9 @@ private fun generateFusionDebugArtifacts(
 ) {
     try {
         val referenceOutput = File(jobDir, "reference_frame.png")
-        referenceFile.copyTo(referenceOutput, overwrite = true)
+        copyVerifiedArtifact(referenceFile, referenceOutput)
         val yuvReferenceOutput = File(jobDir, "yuv_reference_preview.png")
-        referenceFile.copyTo(yuvReferenceOutput, overwrite = true)
+        copyVerifiedArtifact(referenceFile, yuvReferenceOutput)
         val fusedOutput = File(jobDir, "fused_classic_yuv_v1.png")
         saveClassicBitmap(fusedBitmap, fusedOutput)
         val yuvFusedOutput = File(jobDir, "yuv_fused_preview.png")
