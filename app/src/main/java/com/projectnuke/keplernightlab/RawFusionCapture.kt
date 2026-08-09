@@ -249,7 +249,11 @@ fun captureRawBurstForFusion(
         callback: RawTerminalOperationOutcome = rawTerminalSnapshotStore.get().callback,
         callbackDispatch: RawTerminalOperationOutcome = rawTerminalSnapshotStore.get().callbackDispatch,
         callbackExecution: RawTerminalOperationOutcome = rawTerminalSnapshotStore.get().callbackExecution,
-        cleanup: RawProductionCleanupSnapshot? = rawTerminalSnapshotStore.get().cleanup,
+        cleanup: RawProductionCleanupSnapshot? = if (cleanupStarted.get()) {
+            productionResourceCoordinator.snapshot()
+        } else {
+            rawTerminalSnapshotStore.get().cleanup
+        },
         imageReleaseFailures: List<RawImageReleaseFailure> = rawTerminalSnapshotStore.get().imageReleaseFailures
         , outputCleanupFailures: List<RawOutputCleanupFailure> = rawTerminalSnapshotStore.get().outputCleanupFailures
     ) {

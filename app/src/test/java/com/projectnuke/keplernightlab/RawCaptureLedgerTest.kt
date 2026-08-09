@@ -232,6 +232,18 @@ class RawCaptureLedgerTest {
     }
 
     @Test
+    fun releaseFailureIsRetainedAsStructuredLedgerOutcome() {
+        val failure = IllegalStateException("close failed")
+        val owner = ledger(onClose = { throw failure })
+        owner.recordImage(1L, "img-1", 10L)
+        owner.releaseAllImages()
+        val outcomes = owner.imageReleaseOutcomes()
+        assertEquals(1, outcomes.size)
+        assertFalse(outcomes.single().succeeded)
+        assertEquals(failure, outcomes.single().failure)
+    }
+
+    @Test
     fun duplicateTimestampReplacesAndClosesPriorImage() {
         val closed = mutableListOf<String>()
         val owner = ledger(onClose = { closed += it })
