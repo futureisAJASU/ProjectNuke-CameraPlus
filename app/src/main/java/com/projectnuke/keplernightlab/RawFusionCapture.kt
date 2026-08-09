@@ -178,6 +178,11 @@ fun captureRawBurstForFusion(
     val timeoutScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "KeplerRawFusionTimeout").apply { isDaemon = true }
     }
+    val productionResourceCoordinator = RawProductionResourceCoordinator(
+        timeoutScheduler = timeoutScheduler,
+        saveWorker = saveWorker,
+        backgroundThread = thread
+    )
     var cameraDevice: CameraDevice? = null
     var session: CameraCaptureSession? = null
     var reader: ImageReader? = null
@@ -216,15 +221,7 @@ fun captureRawBurstForFusion(
         captureStateOwner.close()
         runCatching { reader?.setOnImageAvailableListener(null, null) }
         ledger.value.releaseAllImages()
-        try { session?.abortCaptures() } catch (_: Exception) {}
-        try { session?.stopRepeating() } catch (_: Exception) {}
-        try { session?.close() } catch (_: Exception) {}
-        try { reader?.close() } catch (_: Exception) {}
-        try { cameraDevice?.close() } catch (_: Exception) {}
-        try { motionLogger?.stop() } catch (_: Exception) {}
-        timeoutScheduler.shutdownNow()
-        saveWorker.shutdownNow()
-        try { thread.quitSafely() } catch (_: Exception) {}
+        productionResourceCoordinator.perform()
     }
 
     fun logLateCameraCallback(callback: String) {
@@ -588,8 +585,14 @@ fun captureRawBurstForFusion(
             throw e
         }
         reader = imageReader
+        if (productionResourceCoordinator.attachImageReader(imageReader) == RawAttachmentDisposition.SETTLED_LATE) {
+            return
+        }
 
         motionLogger = runCatching { MotionLogger(context).also { it.start() } }.getOrNull()
+        if (productionResourceCoordinator.attachMotionLogger(motionLogger) == RawAttachmentDisposition.SETTLED_LATE) {
+            return
+        }
         postCaptureProgress()
 
         fun finishError(
@@ -1142,6 +1145,9 @@ fun captureRawBurstForFusion(
                         return
                     }
                     cameraDevice = camera
+                    if (productionResourceCoordinator.attachCameraDevice(camera) == RawAttachmentDisposition.SETTLED_LATE) {
+                        return
+                    }
                     if (finished.get()) {
                         logLateCameraCallback("CameraDevice.onOpened.afterAssign")
                         camera.close()
@@ -1166,6 +1172,9 @@ fun captureRawBurstForFusion(
                             }
                             try {
                                 session = configured
+                                if (productionResourceCoordinator.attachCaptureSession(configured) == RawAttachmentDisposition.SETTLED_LATE) {
+                                    return@createRoutedStillCaptureSession
+                                }
                                 if (finished.get()) {
                                     logLateCameraCallback("CameraCaptureSession.onConfigured.afterAssign")
                                     configured.close()
@@ -1277,7 +1286,6 @@ fun captureRawBurstForFusion(
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
-                    camera.close()
                     if (finished.get()) {
                         logLateCameraCallback("CameraDevice.onDisconnected")
                         return
@@ -1286,7 +1294,6 @@ fun captureRawBurstForFusion(
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
-                    camera.close()
                     if (finished.get()) {
                         logLateCameraCallback("CameraDevice.onError")
                         return
