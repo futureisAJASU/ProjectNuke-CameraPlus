@@ -1019,23 +1019,23 @@ private fun ensureSufficientSpaceForYuvBurstPngs(
 }
 
 private fun writeBitmapToTempPng(bitmap: Bitmap, finalFile: File) {
-    val tempFile = File(finalFile.parentFile, ".${finalFile.name}.${System.nanoTime()}.tmp")
-    try {
-        FileOutputStream(tempFile).use { output ->
-            if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
-                throw IllegalStateException("Bitmap PNG compression returned false")
+    commitProcessingArtifact(
+        finalFile = finalFile,
+        writeTemp = { temp ->
+            FileOutputStream(temp).use { output ->
+                check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
+                    "Bitmap PNG compression returned false"
+                }
+                output.fd.sync()
             }
-            output.fd.sync()
-        }
-        KeplerJobMetadata.atomicReplace(tempFile, finalFile)
-    } catch (t: Throwable) {
-        runCatching {
-            if (tempFile.exists()) {
-                tempFile.delete()
+        },
+        verifyFinal = { committed ->
+            val signature = committed.inputStream().use { it.readNBytes(8) }
+            check(signature.contentEquals(byteArrayOf(137.toByte(), 80, 78, 71, 13, 10, 26, 10))) {
+                "Bitmap PNG verification failed"
             }
         }
-        throw t
-    }
+    )
 }
 
 fun averageLatestYuvBurstColor(
@@ -1043,8 +1043,12 @@ fun averageLatestYuvBurstColor(
     onStatus: (String) -> Unit
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
+    val callbackDispatcher = ProcessingCallbackDispatcher(mainHandler, "KeplerColorFusion")
     fun postStatus(message: String) {
-        if (!mainHandler.post { onStatus(message) }) runCatching { onStatus(message) }
+        val result = callbackDispatcher.dispatch { onStatus(message) }
+        if (result != ProcessingCallbackDispatchResult.ACCEPTED) {
+            Log.w("KeplerColorFusion", "status dispatch $result")
+        }
     }
 
     val workerThread = HandlerThread("KeplerAverageColorThread").apply { start() }

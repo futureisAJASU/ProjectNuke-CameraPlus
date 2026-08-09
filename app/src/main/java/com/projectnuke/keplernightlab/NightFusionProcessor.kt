@@ -70,8 +70,12 @@ fun processLatestNightFusionV02(
     onStatus: (String) -> Unit
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
+    val callbackDispatcher = ProcessingCallbackDispatcher(mainHandler, "KeplerYuvPipeline")
     fun postStatus(message: String) {
-        mainHandler.post { onStatus(message) }
+        val result = callbackDispatcher.dispatch { onStatus(message) }
+        if (result != ProcessingCallbackDispatchResult.ACCEPTED) {
+            Log.w("KeplerYuvPipeline", "status dispatch $result")
+        }
     }
 
     val workerThread = HandlerThread("KeplerNightFusionV02Thread").apply { start() }

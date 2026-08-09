@@ -39,8 +39,12 @@ fun captureProcessExportNightFusion(
     onStatus: (String) -> Unit
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
+    val callbackDispatcher = ProcessingCallbackDispatcher(mainHandler, "KeplerYuvPipeline")
     fun post(message: String) {
-        mainHandler.post { onStatus(message) }
+        val result = callbackDispatcher.dispatch { onStatus(message) }
+        if (result != ProcessingCallbackDispatchResult.ACCEPTED) {
+            android.util.Log.w("KeplerYuvPipeline", "status dispatch $result")
+        }
     }
 
     cancellation.throwIfCancelled()
@@ -229,7 +233,14 @@ internal fun reprocessYuvJob(
     onStatus: (String) -> Unit
 ): ReprocessWorkerRun {
     val mainHandler = Handler(Looper.getMainLooper())
-    fun post(message: String) = mainHandler.post { onStatus(message) }
+    val callbackDispatcher = ProcessingCallbackDispatcher(mainHandler, "KeplerYuvReprocess")
+    fun post(message: String): Boolean {
+        val result = callbackDispatcher.dispatch { onStatus(message) }
+        if (result != ProcessingCallbackDispatchResult.ACCEPTED) {
+            android.util.Log.w("KeplerYuvReprocess", "status dispatch $result")
+        }
+        return result == ProcessingCallbackDispatchResult.ACCEPTED
+    }
     val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
     val workerThread = HandlerThread("KeplerYuvReprocessThread").apply { start() }
     Handler(workerThread.looper).post {

@@ -10,6 +10,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -484,7 +485,14 @@ fun captureProcessExportSuperResolutionFusion(
     onStatus: (String) -> Unit
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
-    fun post(message: String) = mainHandler.post { onStatus(message) }
+    val callbackDispatcher = ProcessingCallbackDispatcher(mainHandler, "KeplerSuperResolution")
+    fun post(message: String): Boolean {
+        val result = callbackDispatcher.dispatch { onStatus(message) }
+        if (result != ProcessingCallbackDispatchResult.ACCEPTED) {
+            Log.w("KeplerSuperResolution", "status dispatch $result")
+        }
+        return result == ProcessingCallbackDispatchResult.ACCEPTED
+    }
     val captureFrames = frameCount.coerceIn(MIN_FUSION_FRAMES, 6)
 
     cancellation.throwIfCancelled()
