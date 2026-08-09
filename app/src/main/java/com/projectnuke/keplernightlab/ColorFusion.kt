@@ -631,8 +631,6 @@ fun captureYuvBurstColorWithMotion(
             // captureBurst operation is accepted below.
             startTerminalObserverOnCreate = false
         )
-        productionSeam.sessionClose = { yuvSession?.close() }
-
         postStatus("Color Fusion 초기화 4/7: ImageReader 생성 중...")
 
         val reader = ImageReader.newInstance(
@@ -642,8 +640,14 @@ fun captureYuvBurstColorWithMotion(
             min(4, maxOf(2, frameCount))
         )
 
-        imageReader = reader
-        productionSeam.productionResourceCoordinator.attachImageReader(reader)
+        when (productionSeam.productionResourceCoordinator.attachImageReader(reader)) {
+            ProductionAttachmentDisposition.ACCEPTED -> imageReader = reader
+            ProductionAttachmentDisposition.SETTLED_LATE -> {
+                logLateCameraCallback("ImageReader.attach")
+                return
+            }
+            ProductionAttachmentDisposition.NO_RESOURCE -> error("new ImageReader was unexpectedly null")
+        }
         if (useMemoryBuffer) {
             postStatus(
                 "YUV memory buffer enabled: frames=$frameCount " +
@@ -685,7 +689,12 @@ fun captureYuvBurstColorWithMotion(
             metadataWriter?.motionInfo = motionInfo
             null
         }
-        productionSeam.productionResourceCoordinator.attachMotionLogger(motionLogger)
+        if (productionSeam.productionResourceCoordinator.attachMotionLogger(motionLogger) ==
+            ProductionAttachmentDisposition.SETTLED_LATE
+        ) {
+            logLateCameraCallback("MotionLogger.attach")
+            return
+        }
 
         postStatus(
             "Color Fusion 준비 완료\n" +
@@ -704,25 +713,22 @@ fun captureYuvBurstColorWithMotion(
         fun isTerminalOrFinished(): Boolean =
             yuvSession?.let { it.terminalState.status() != CaptureTerminalStatus.ACTIVE } ?: finished.get()
 
-        reader.setOnImageAvailableListener(
-            { r ->
-                if (isTerminalOrFinished()) {
-                    runCatching { r.acquireNextImage()?.close() }
-                    return@setOnImageAvailableListener
-                }
-                val image = try {
-                    r.acquireNextImage()
-                } catch (t: Throwable) {
-                    if (t is Error) throw t
-                    yuvSession?.owner?.onCaptureFailed(t, "YUV acquire failed")
-                    return@setOnImageAvailableListener
-                } ?: return@setOnImageAvailableListener
-                if (useMemoryBuffer) {
-                    yuvSession?.owner?.acceptBuffered(Camera2YuvImageAccess(image))
-                } else {
-                    yuvSession?.owner?.acceptDirect(Camera2DirectYuvImageAccess(image))
-                }
+        val imageBridge = YuvProductionImageBridge(
+            ownerProvider = { yuvSession?.owner },
+            isTerminal = ::isTerminalOrFinished,
+            onAcquireFailure = { failure ->
+                yuvSession?.owner?.onCaptureFailed(failure, "YUV acquire failed")
             },
+            onReleaseFailure = { failure ->
+                logYuvCaptureFailure(
+                    stage = "image.release",
+                    throwable = failure,
+                    detail = "late YUV Image.close failed"
+                )
+            }
+        )
+        reader.setOnImageAvailableListener(
+            { availableReader -> imageBridge.onImageAvailable(availableReader, useMemoryBuffer) },
             backgroundHandler
         )
 
@@ -732,16 +738,17 @@ fun captureYuvBurstColorWithMotion(
             cameraId,
             object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
-                    if (isTerminalOrFinished()) {
-                        logLateCameraCallback("CameraDevice.onOpened.beforeAssign")
-                        camera.close()
-                        return
+                    when (productionSeam.productionResourceCoordinator.attachCameraDevice(camera)) {
+                        ProductionAttachmentDisposition.ACCEPTED -> cameraDevice = camera
+                        ProductionAttachmentDisposition.SETTLED_LATE -> {
+                            logLateCameraCallback("CameraDevice.onOpened.lateAttach")
+                            return
+                        }
+                        ProductionAttachmentDisposition.NO_RESOURCE -> return
                     }
-                    cameraDevice = camera
-                    productionSeam.productionResourceCoordinator.attachCameraDevice(camera)
                     if (isTerminalOrFinished()) {
                         logLateCameraCallback("CameraDevice.onOpened.afterAssign")
-                        camera.close()
+                        productionSeam.productionResourceCoordinator.perform()
                         return
                     }
                     postStatus("카메라 열림. Color Burst 세션 생성 중...")
@@ -759,16 +766,17 @@ fun captureYuvBurstColorWithMotion(
                             pipelineName = "YUV",
                             isFinished = { isTerminalOrFinished() },
                             onConfigured = { session, captureRoute ->
-                                    if (isTerminalOrFinished()) {
-                                        logLateCameraCallback("CameraCaptureSession.onConfigured.beforeAssign")
-                                        session.close()
-                                        return@createRoutedStillCaptureSession
+                                    when (productionSeam.productionResourceCoordinator.attachCaptureSession(session)) {
+                                        ProductionAttachmentDisposition.ACCEPTED -> captureSession = session
+                                        ProductionAttachmentDisposition.SETTLED_LATE -> {
+                                            logLateCameraCallback("CameraCaptureSession.onConfigured.lateAttach")
+                                            return@createRoutedStillCaptureSession
+                                        }
+                                        ProductionAttachmentDisposition.NO_RESOURCE -> return@createRoutedStillCaptureSession
                                     }
-                                    captureSession = session
-                                    productionSeam.productionResourceCoordinator.attachCaptureSession(session)
                                     if (isTerminalOrFinished()) {
                                         logLateCameraCallback("CameraCaptureSession.onConfigured.afterAssign")
-                                        session.close()
+                                        productionSeam.productionResourceCoordinator.perform()
                                         return@createRoutedStillCaptureSession
                                     }
                                     postStatus("Color Fusion 초기화 7/7: 세션 준비 완료. $frameCount 장 촬영 중...")
@@ -825,40 +833,32 @@ fun captureYuvBurstColorWithMotion(
                                                 yuvCaptureRequestTemplate
                                         )
 
-                                        session.captureBurst(
-                                            requests,
-                                            object : CameraCaptureSession.CaptureCallback() {
-                                                override fun onCaptureCompleted(
-                                                    session: CameraCaptureSession,
-                                                    request: CaptureRequest,
-                                                    result: TotalCaptureResult
-                                                ) {
-                                                    // The owner owns completedResults — no duplicate outer counter.
-                                                    metadataWriter?.actualRoute = captureRoute?.name
-                                                    metadataWriter?.finalRequestZoomSet = requestZoomRatio
-                                                    yuvSession?.owner?.onCaptureCompletedResult()
-                                                    Log.i(
-                                                        "KeplerPhysicalRoute",
-                                                        "capture completed selectedRoute=$zoomRoute actualRoute=$captureRoute " +
-                                                            "requestedUiZoomRatio=$requestedUiZoomRatio " +
-                                                            "requestedPhysicalCameraId=$physicalCameraId " +
-                                                            "activePhysicalId=${result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)} " +
-                                                            "finalRequestZoom=$requestZoomRatio"
-                                                    )
-                                                }
-
-                                                override fun onCaptureFailed(
-                                                    session: CameraCaptureSession,
-                                                    request: CaptureRequest,
-                                                    failure: CaptureFailure
-                                                ) {
-                                                     yuvSession?.owner?.onCaptureFailed(
-                                                         RuntimeException("CaptureFailure reason=${failure.reason} sequenceId=${failure.sequenceId} frameNumber=${failure.frameNumber} wasImageCaptured=${failure.wasImageCaptured()}"),
-                                                         "Color Burst 캡처 실패"
-                                                     )
-                                                }
+                                        val callbackBridge = YuvProductionCameraCallbackBridge(
+                                            ownerProvider = { yuvSession?.owner },
+                                            isTerminal = ::isTerminalOrFinished,
+                                            onCompleted = { result ->
+                                                metadataWriter?.actualRoute = captureRoute?.name
+                                                metadataWriter?.finalRequestZoomSet = requestZoomRatio
+                                                Log.i(
+                                                    "KeplerPhysicalRoute",
+                                                    "capture completed selectedRoute=$zoomRoute actualRoute=$captureRoute " +
+                                                        "requestedUiZoomRatio=$requestedUiZoomRatio " +
+                                                        "requestedPhysicalCameraId=$physicalCameraId " +
+                                                        "activePhysicalId=${result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)} " +
+                                                        "finalRequestZoom=$requestZoomRatio"
+                                                )
                                             },
-                                            backgroundHandler
+                                            failureDetail = { failure ->
+                                                "CaptureFailure reason=${failure.reason} sequenceId=${failure.sequenceId} " +
+                                                    "frameNumber=${failure.frameNumber} wasImageCaptured=${failure.wasImageCaptured()}"
+                                            }
+                                        )
+                                        YuvFiniteBurstSubmission().submit(
+                                            session = session,
+                                            requests = requests,
+                                            callback = callbackBridge.callback(),
+                                            handler = backgroundHandler,
+                                            frameCount = frameCount
                                         )
                                         timeoutScheduler.schedule({
                                             yuvSession?.owner?.onDeadlineReached()
@@ -926,7 +926,7 @@ fun captureYuvBurstColorWithMotion(
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
-                    camera.close()
+                    productionSeam.productionResourceCoordinator.perform()
                     if (isTerminalOrFinished()) {
                         logLateCameraCallback("CameraDevice.onDisconnected")
                         return
@@ -940,7 +940,7 @@ fun captureYuvBurstColorWithMotion(
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
-                    camera.close()
+                    productionSeam.productionResourceCoordinator.perform()
                     if (isTerminalOrFinished()) {
                         logLateCameraCallback("CameraDevice.onError")
                         return

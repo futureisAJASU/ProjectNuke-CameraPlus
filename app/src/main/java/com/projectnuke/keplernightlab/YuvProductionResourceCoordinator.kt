@@ -53,6 +53,9 @@ import java.util.concurrent.atomic.AtomicReference
  */
 internal enum class CoordinatorLifecyclePhase { OPEN, CLEANING, CLOSED }
 
+/** Result of handing an asynchronously-created production resource to its sole owner. */
+internal enum class ProductionAttachmentDisposition { ACCEPTED, SETTLED_LATE, NO_RESOURCE }
+
 /** Structured outcome of one resource release attempt (owned or late attachment). */
 internal data class ProductionResourceReleaseRecord(
     val resourceType: String,
@@ -77,7 +80,16 @@ internal data class ProductionCleanupSnapshot(
     val releaseFailures: Int,
     val lateAttachmentCount: Int,
     val lateAttachmentSettlementFailures: Int,
-    val records: List<ProductionResourceReleaseRecord>
+    val records: List<ProductionResourceReleaseRecord>,
+    val initialReleaseAttempts: Int = 0,
+    val initialReleaseSuccesses: Int = 0,
+    val initialReleaseFailures: Int = 0,
+    val lateReleaseAttempts: Int = 0,
+    val lateReleaseSuccesses: Int = 0,
+    val lateReleaseFailures: Int = 0,
+    val totalReleaseAttempts: Int = releaseAttempts,
+    val totalReleaseSuccesses: Int = releaseSuccesses,
+    val totalReleaseFailures: Int = releaseFailures
 ) {
     val isTerminal: Boolean get() = phase == CoordinatorLifecyclePhase.CLOSED
 }
@@ -106,6 +118,8 @@ internal class YuvProductionResourceCoordinator(
     private var releaseFailures = 0
     private var lateAttachmentCount = 0
     private var lateAttachmentSettlementFailures = 0
+    /** Externally attached Camera2/motion resources claimed by OPEN -> CLEANING. */
+    private var claimedInitialResourceCount = 0
     private val records = mutableListOf<ProductionResourceReleaseRecord>()
     private val releasedTags = mutableListOf<String>()
 
@@ -124,7 +138,8 @@ internal class YuvProductionResourceCoordinator(
     // selects an immediate-settlement action (release runs outside the lock).
     // ------------------------------------------------------------------
 
-    fun attachImageReader(reader: ImageReader?) {
+    fun attachImageReader(reader: ImageReader?): ProductionAttachmentDisposition {
+        if (reader == null) return ProductionAttachmentDisposition.NO_RESOURCE
         val late = synchronized(coordinatorLock) {
             if (phase == CoordinatorLifecyclePhase.OPEN) {
                 imageReader = reader
@@ -134,10 +149,13 @@ internal class YuvProductionResourceCoordinator(
                 true
             }
         }
-        if (late) settleLateAttachment("ImageReader", "close") { reader?.close() }
+        if (!late) return ProductionAttachmentDisposition.ACCEPTED
+        settleLateAttachment("ImageReader", "close") { reader.close() }
+        return ProductionAttachmentDisposition.SETTLED_LATE
     }
 
-    fun attachCameraDevice(device: CameraDevice?) {
+    fun attachCameraDevice(device: CameraDevice?): ProductionAttachmentDisposition {
+        if (device == null) return ProductionAttachmentDisposition.NO_RESOURCE
         val late = synchronized(coordinatorLock) {
             if (phase == CoordinatorLifecyclePhase.OPEN) {
                 cameraDevice = device
@@ -147,10 +165,13 @@ internal class YuvProductionResourceCoordinator(
                 true
             }
         }
-        if (late) settleLateAttachment("CameraDevice", "close") { device?.close() }
+        if (!late) return ProductionAttachmentDisposition.ACCEPTED
+        settleLateAttachment("CameraDevice", "close") { device.close() }
+        return ProductionAttachmentDisposition.SETTLED_LATE
     }
 
-    fun attachCaptureSession(session: CameraCaptureSession?) {
+    fun attachCaptureSession(session: CameraCaptureSession?): ProductionAttachmentDisposition {
+        if (session == null) return ProductionAttachmentDisposition.NO_RESOURCE
         val late = synchronized(coordinatorLock) {
             if (phase == CoordinatorLifecyclePhase.OPEN) {
                 captureSession = session
@@ -160,10 +181,13 @@ internal class YuvProductionResourceCoordinator(
                 true
             }
         }
-        if (late) settleLateAttachment("CaptureSession", "close") { session?.close() }
+        if (!late) return ProductionAttachmentDisposition.ACCEPTED
+        settleLateAttachment("CaptureSession", "close") { session.close() }
+        return ProductionAttachmentDisposition.SETTLED_LATE
     }
 
-    fun attachMotionLogger(logger: MotionLogger?) {
+    fun attachMotionLogger(logger: MotionLogger?): ProductionAttachmentDisposition {
+        if (logger == null) return ProductionAttachmentDisposition.NO_RESOURCE
         val late = synchronized(coordinatorLock) {
             if (phase == CoordinatorLifecyclePhase.OPEN) {
                 motionLogger = logger
@@ -173,7 +197,9 @@ internal class YuvProductionResourceCoordinator(
                 true
             }
         }
-        if (late) settleLateAttachment("MotionLogger", "stop") { logger?.stop() }
+        if (!late) return ProductionAttachmentDisposition.ACCEPTED
+        settleLateAttachment("MotionLogger", "stop") { logger.stop() }
+        return ProductionAttachmentDisposition.SETTLED_LATE
     }
 
     // ------------------------------------------------------------------
@@ -202,6 +228,7 @@ internal class YuvProductionResourceCoordinator(
                     motionLogger = motionLogger,
                     initialResourceCount = listOfNotNull(imageReader, cameraDevice, captureSession, motionLogger).size
                 )
+                claimedInitialResourceCount = claim!!.initialResourceCount
                 imageReader = null
                 cameraDevice = null
                 captureSession = null
@@ -257,6 +284,9 @@ internal class YuvProductionResourceCoordinator(
         val record = recordRelease(resourceType, action, late = true) { release() }
         synchronized(coordinatorLock) {
             records.add(record)
+            releaseAttempts++
+            releaseSuccesses += if (record.succeeded) 1 else 0
+            releaseFailures += if (record.succeeded) 0 else 1
             lateAttachmentSettlementFailures += if (record.succeeded) 0 else 1
         }
     }
@@ -289,18 +319,22 @@ internal class YuvProductionResourceCoordinator(
         ProductionCleanupSnapshot(
             phase = phase,
             performCount = performCount,
-            initialResourceCount = records
-                .asSequence()
-                .filter { !it.lateAttachment }
-                .map { it.resourceType }
-                .distinct()
-                .count(),
+            initialResourceCount = claimedInitialResourceCount,
             releaseAttempts = releaseAttempts,
             releaseSuccesses = releaseSuccesses,
             releaseFailures = releaseFailures,
             lateAttachmentCount = lateAttachmentCount,
             lateAttachmentSettlementFailures = lateAttachmentSettlementFailures,
-            records = records.toList()
+            records = records.toList(),
+            initialReleaseAttempts = records.count { !it.lateAttachment && it.attempted },
+            initialReleaseSuccesses = records.count { !it.lateAttachment && it.succeeded },
+            initialReleaseFailures = records.count { !it.lateAttachment && it.attempted && !it.succeeded },
+            lateReleaseAttempts = records.count { it.lateAttachment && it.attempted },
+            lateReleaseSuccesses = records.count { it.lateAttachment && it.succeeded },
+            lateReleaseFailures = records.count { it.lateAttachment && it.attempted && !it.succeeded },
+            totalReleaseAttempts = releaseAttempts,
+            totalReleaseSuccesses = releaseSuccesses,
+            totalReleaseFailures = releaseFailures
         )
     }
 

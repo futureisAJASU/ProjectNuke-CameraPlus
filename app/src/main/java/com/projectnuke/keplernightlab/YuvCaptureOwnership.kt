@@ -1001,10 +1001,29 @@ internal sealed interface BufferedYuvWorkCreation {
     data class Failed(val cause: Throwable) : BufferedYuvWorkCreation
 }
 
-internal class YuvImageReleaseGuard(private val access: YuvImageAccess) {
+internal data class YuvImageReleaseOutcome(
+    val attempted: Boolean,
+    val succeeded: Boolean,
+    val failure: Throwable? = null
+)
+
+internal class YuvImageReleaseGuard(
+    private val access: YuvImageAccess,
+    private val onReleaseOutcome: (YuvImageReleaseOutcome) -> Unit = {}
+) {
     private val consumed = AtomicBoolean(false)
-    fun releaseSafely() {
-        if (consumed.compareAndSet(false, true)) runCatching { access.release() }
+    fun releaseSafely(): YuvImageReleaseOutcome {
+        if (!consumed.compareAndSet(false, true)) {
+            return YuvImageReleaseOutcome(attempted = false, succeeded = true)
+        }
+        val outcome = try {
+            access.release()
+            YuvImageReleaseOutcome(attempted = true, succeeded = true)
+        } catch (t: Throwable) {
+            YuvImageReleaseOutcome(attempted = true, succeeded = false, failure = t)
+        }
+        onReleaseOutcome(outcome)
+        return outcome
     }
 }
 

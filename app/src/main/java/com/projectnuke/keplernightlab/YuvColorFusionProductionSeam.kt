@@ -35,13 +35,6 @@ internal class YuvColorFusionProductionSeam(
     /** Acceptance-reporting Main-thread callback dispatcher (never inline). */
     val callbackDispatcher = YuvProductionCallbackDispatcher(mainHandler)
 
-    /**
-     * Late-bound by ColorFusion after [YuvCaptureSession] creation; production
-     * cleanup closes the session (internal cleanup) through this hook.  Pre-session
-     * cleanup leaves it null and skips the session close.
-     */
-    var sessionClose: (() -> Unit)? = null
-
     fun postStatus(message: String) {
         statusDispatcher.dispatch(message)
     }
@@ -60,10 +53,11 @@ internal class YuvColorFusionProductionSeam(
     /**
      * Production resource cleanup: exactly-once, idempotent.  Closes Camera2
      * resources, detaches callbacks, stops motion logger, shuts down scheduler and
-     * background thread, and closes the session if one was created.
+     * background thread. Once a YuvCaptureSession exists, its serialized terminal
+     * owner separately owns internal worker cleanup; retaining a session-close hook
+     * here would create circular, ambiguous cleanup authority.
      */
     fun productionCleanup() {
         productionResourceCoordinator.perform()
-        try { sessionClose?.invoke() } catch (_: Exception) {}
     }
 }

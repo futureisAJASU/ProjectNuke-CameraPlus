@@ -315,7 +315,12 @@ internal class YuvCaptureOwner(
 
     fun acceptBuffered(access: YuvImageAccess) {
         val event = object : CaptureOwnerEvent {
-            val guard = YuvImageReleaseGuard(access)
+            val guard = YuvImageReleaseGuard(access) { outcome ->
+                outcome.failure?.let { failure ->
+                    recordDiagnostic(DiagnosticStage.WORK_DISPOSAL, DiagnosticSeverity.ERROR, null, null,
+                        "buffered YUV source release failed", failure)
+                }
+            }
             override fun execute() {
                 if (terminalState.status() != CaptureTerminalStatus.ACTIVE) { guard.releaseSafely(); return }
                 // receivedFrames counts the acquired access as soon as owner processing
@@ -340,7 +345,9 @@ internal class YuvCaptureOwner(
                     }
                 }
             }
-            override fun disposeWithoutMutation() = guard.releaseSafely()
+            override fun disposeWithoutMutation() {
+                guard.releaseSafely()
+            }
         }
         // post() either accepted (event settled by owner) or rejected (event
         // already disposed via disposeWithoutMutation).  NEVER release access
@@ -350,7 +357,12 @@ internal class YuvCaptureOwner(
 
     fun acceptDirect(access: DirectYuvImageAccess) {
         val event = object : CaptureOwnerEvent {
-            val guard = YuvImageReleaseGuard(access)
+            val guard = YuvImageReleaseGuard(access) { outcome ->
+                outcome.failure?.let { failure ->
+                    recordDiagnostic(DiagnosticStage.WORK_DISPOSAL, DiagnosticSeverity.ERROR, null, null,
+                        "direct YUV source release failed", failure)
+                }
+            }
             override fun execute() {
                 if (terminalState.status() != CaptureTerminalStatus.ACTIVE) { guard.releaseSafely(); return }
                 // receivedFrames counts the acquired access as soon as owner processing
@@ -431,7 +443,9 @@ internal class YuvCaptureOwner(
                     }
                 }
             }
-            override fun disposeWithoutMutation() = guard.releaseSafely()
+            override fun disposeWithoutMutation() {
+                guard.releaseSafely()
+            }
         }
         captureStateOwner.post(event)
     }

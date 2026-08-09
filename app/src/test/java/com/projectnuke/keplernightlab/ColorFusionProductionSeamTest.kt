@@ -33,8 +33,6 @@ class ColorFusionProductionSeamTest {
         val backgroundThread = HandlerThread("seam-bg").apply { start() }
         val backgroundHandler = Handler(backgroundThread.looper)
         val timeoutScheduler = Executors.newSingleThreadScheduledExecutor()
-        val sessionCloseCount = AtomicInteger(0)
-
         val seam = YuvColorFusionProductionSeam(
             mainHandler = Handler(Looper.getMainLooper()),
             timeoutScheduler = timeoutScheduler,
@@ -42,7 +40,7 @@ class ColorFusionProductionSeamTest {
             backgroundThread = backgroundThread,
             onStatus = { statusMessages.add(it) },
             onError = { errorMessages.add(it) }
-        ).also { it.sessionClose = { sessionCloseCount.incrementAndGet() } }
+        )
 
         fun idleMain() {
             shadowOf(Looper.getMainLooper()).idle()
@@ -107,12 +105,10 @@ class ColorFusionProductionSeamTest {
             harness.seam.preSessionTerminal.finish("pre-session boom")
             harness.idleMain()
             assertEquals(1, harness.seam.productionResourceCoordinator.performCount())
-            assertEquals(1, harness.sessionCloseCount.get())
             assertTrue(harness.seam.productionResourceCoordinator.snapshot().isTerminal)
             // Repeated finish never re-runs cleanup.
             harness.seam.preSessionTerminal.finish("again")
             assertEquals(1, harness.seam.productionResourceCoordinator.performCount())
-            assertEquals(1, harness.sessionCloseCount.get())
         } finally {
             harness.seam.productionCleanup()
         }
@@ -128,9 +124,8 @@ class ColorFusionProductionSeamTest {
             val snap = harness.seam.productionResourceCoordinator.snapshot()
             assertTrue(snap.isTerminal)
             assertEquals(1, snap.performCount)
-            // session.close() itself is idempotent (handoff CAS + coordinators), so a
-            // repeated productionCleanup invokes it again without double-releasing.
-            assertTrue(harness.sessionCloseCount.get() >= 1)
+            // Session/internal work cleanup has a separate serialized owner; the
+            // production seam does not retain a circular session-close callback.
             val tags = harness.seam.productionResourceCoordinator.releasedResourceTags()
             assertTrue(tags.contains("Background.handler"))
             assertTrue(tags.contains("BackgroundThread.quit"))
