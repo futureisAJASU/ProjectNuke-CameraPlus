@@ -35,4 +35,27 @@ class RawTerminalRequestTest {
         assertEquals(false, failure.saveMotion)
         assertEquals(false, cancelled.saveMotion)
     }
+
+    @Test
+    fun settledSnapshotCarriesCompletedOperationOutcomesAndCleanup() {
+        val progress = RawCaptureProgressSnapshot(3, 3, 3, 3, 0, 0, 3)
+        val snapshot = RawTerminalSnapshot(
+            progress = progress,
+            terminalStatus = CaptureTerminalStatus.SUCCESS,
+            reason = null,
+            phase = RawTerminalSettlementPhase.SETTLED,
+            settlementFailure = null,
+            motion = RawTerminalOperationOutcome.Succeeded,
+            metadata = RawTerminalOperationOutcome.Succeeded,
+            status = RawTerminalOperationOutcome.Succeeded,
+            callback = RawTerminalOperationOutcome.Succeeded,
+            cleanup = null
+        )
+        assertEquals(RawTerminalSettlementPhase.SETTLED, snapshot.phase)
+        assertEquals(RawTerminalOperationOutcome.Succeeded, snapshot.motion)
+        assertEquals(RawTerminalOperationOutcome.Succeeded, snapshot.metadata)
+        assertEquals(RawTerminalOperationOutcome.Succeeded, snapshot.status)
+        assertEquals(RawTerminalOperationOutcome.Succeeded, snapshot.callback)
+        assertEquals(3, snapshot.progress.savedFrames)
+    }
 }
