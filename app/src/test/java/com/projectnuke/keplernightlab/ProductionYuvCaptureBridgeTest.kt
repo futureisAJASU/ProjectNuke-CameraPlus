@@ -58,6 +58,7 @@ class ProductionYuvCaptureBridgeTest {
         val handler: android.os.Handler = android.os.Handler(handlerThread.looper)
 
         val terminalLatch = CountDownLatch(1)
+        val terminalObservationLatch = CountDownLatch(1)
         val completeCount = AtomicInteger(0)
         val errorCount = AtomicInteger(0)
         val callbackLatch = CountDownLatch(1)
@@ -93,8 +94,12 @@ class ProductionYuvCaptureBridgeTest {
                 }
             ),
             dispatchCallback = CallbackDispatcher { runnable ->
-                if (rejectCallbackDispatch) return@CallbackDispatcher false
+                if (rejectCallbackDispatch) {
+                    terminalObservationLatch.countDown()
+                    return@CallbackDispatcher false
+                }
                 val captured = Thread.currentThread().name
+                terminalObservationLatch.countDown()
                 if (!handler.post {
                     callbackThread.set(Thread.currentThread())
                     runnable.run()
@@ -129,6 +134,7 @@ class ProductionYuvCaptureBridgeTest {
 
         fun awaitTerminal(timeoutSec: Long = 10): CaptureTerminalStatus {
             assertTrue("terminal not reached", terminalLatch.await(timeoutSec, TimeUnit.SECONDS))
+            assertTrue("terminal callback dispatch not reached", terminalObservationLatch.await(timeoutSec, TimeUnit.SECONDS))
             flushHandler()
             return session.terminalState.status()
         }
@@ -245,6 +251,9 @@ class ProductionYuvCaptureBridgeTest {
 
             val status = harness.awaitTerminal()
             assertEquals(CaptureTerminalStatus.SUCCESS, status)
+            harness.session.boundedWorker.close()
+            assertTrue(harness.session.boundedWorker.awaitTermination(5_000L))
+            harness.flushHandler()
             // Each Image was released exactly once after copy into BufferedYuvFrame.
             assertEquals(1, fake1.closeCount.get())
             assertEquals(1, fake2.closeCount.get())
