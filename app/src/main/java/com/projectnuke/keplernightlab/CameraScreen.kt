@@ -1365,16 +1365,34 @@ mainHandler.removeCallbacks(watchdog)
                         return@test50Processed
                     }
                     runCameraJob(
-                        "Test 50M YUV/JPEG Capture: cameraId=${mainSelection.cameraId}",
+                        "Test 50M YUV Capture: cameraId=${mainSelection.cameraId}",
                         requestedFrames = 1
-                    ) { cancellation, _, callback ->
+                    ) { cancellation, captureCancellation, callback ->
                         cancellation.throwIfCancelled()
-                        capture50MpProcessedTest(
+                        captureYuvBurstColorWithMotion(
                             context = context,
                             cameraId = mainSelection.cameraId,
-                            onStatus = callback,
-                            onComplete = {},
-                            onError = {}
+                            frameCount = 1,
+                            resolutionMode = CaptureResolutionMode.MP50,
+                            zoomRatio = 1.0f,
+                            requestedUiZoomRatio = 1.0f,
+                            focusAeState = focusAeState,
+                            captureMode = CaptureMode.SINGLE_FRAME,
+                            captureCancellationHandle = captureCancellation,
+                            onComplete = { jobDir ->
+                                val job = JSONObject(
+                                    NoFollowFileSystem.readTextVerified(File(jobDir, JOB_JSON_FILE_NAME))
+                                )
+                                callback(
+                                    "PIPELINE_COMPLETE: Test 50M YUV Capture success. " +
+                                        "cameraId=${mainSelection.cameraId}, size=${job.optInt("outputWidth")}x${job.optInt("outputHeight")}, " +
+                                        "job=${jobDir.name}"
+                                )
+                            },
+                            onError = { error ->
+                                callback("PIPELINE_FAILED: Test 50M YUV Capture failed. $error")
+                            },
+                            onStatus = callback
                         )
                     }
                 },
