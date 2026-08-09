@@ -94,6 +94,22 @@ internal open class BoundedCaptureWorker(
         }
     }
 
+    /**
+     * Submission boundary for owner-retained work.  Unlike [submit], rejection does
+     * not dispose the task: the caller still owns it and can atomically return the
+     * same resource/identity to its serialized state for a retry.  Once execute()
+     * accepts, normal worker/shutdown disposal ownership applies.
+     */
+    fun submitRetainedOnRejection(task: Runnable): Boolean {
+        if (closed.get()) return false
+        return try {
+            executor.execute(task)
+            true
+        } catch (_: RejectedExecutionException) {
+            false
+        }
+    }
+
     data class CleanupReport(
         val queuedTasksRemoved: Int,
         val queuedDisposableTasksDisposalAttempted: Int,

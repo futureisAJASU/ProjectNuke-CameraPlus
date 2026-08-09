@@ -795,9 +795,13 @@ fun captureRawBurstForFusion(
         }
 
         fun submitSaveRequest(request: RawSaveFrameRequest): Boolean {
-            val accepted = saveWorker.submit(Runnable {
-                val completion = saveRawFrameToCompletion(request)
-                val event = object : CaptureOwnerEvent {
+            val task = object : OutcomeDisposableCaptureTask {
+                private val started = AtomicBoolean(false)
+
+                override fun run() {
+                    if (!started.compareAndSet(false, true)) return
+                    val completion = saveRawFrameToCompletion(request)
+                    val event = object : CaptureOwnerEvent {
                     override fun execute() {
                         if (captureStateOwner.isClosed()) return
                         when (completion) {
@@ -823,21 +827,50 @@ fun captureRawBurstForFusion(
                         }
                     }
                     override fun disposeWithoutMutation() {}
+                    }
+                    captureStateOwner.post(event)
                 }
-                captureStateOwner.post(event)
-            })
+
+                override fun dispose() {
+                    disposeWithOutcome()
+                }
+
+                override fun disposeWithOutcome(): CaptureTaskDisposalOutcome {
+                    if (!started.compareAndSet(false, true)) return CaptureTaskDisposalOutcome.Clean
+                    return try {
+                        request.image.close()
+                        CaptureTaskDisposalOutcome.Clean
+                    } catch (t: Throwable) {
+                        CaptureTaskDisposalOutcome.Failed(t)
+                    }
+                }
+            }
+            // Before executor acceptance the owner retains request.image. A rejection
+            // therefore returns it to the same pending identity below; a queued task
+            // is disposable because ownership moved to the worker after acceptance.
+            val accepted = saveWorker.submitRetainedOnRejection(task)
             if (!accepted) {
-                ledger.value.restorePair(request.timestampNs, request.image, request.result)
-                post("RAW save queue saturated; retaining the unmatched pair for terminal cleanup")
+                // Rejection happens before worker ownership transfers. Restore the
+                // same pending frame so retries never burn or duplicate an identity.
+                ledger.value.restoreRejectedSubmission(
+                    RawReadyFrame(
+                        frameIndex = request.frameIndex,
+                        timestampNs = request.timestampNs,
+                        image = request.image,
+                        result = request.result
+                    )
+                )
+                post("RAW save queue saturated; retaining the pending frame for retry")
             }
             return accepted
         }
 
         fun dispatchReadyFrames() {
             if (captureStateOwner.isClosed() || finished.get()) return
-            ledger.value.closeUnmatchedImages()
-            for (frame in ledger.value.takeReadyFrames()) {
-                if (ledger.value.savedFrames >= ledger.value.requestedFrames || finished.get() || captureStateOwner.isClosed()) return
+            while (ledger.value.savedFrames < ledger.value.requestedFrames &&
+                !finished.get() && !captureStateOwner.isClosed()
+            ) {
+                val frame = ledger.value.takeNextReadyFrame() ?: return
                 val raw16Name = "frame_${frame.frameIndex.toString().padStart(2, '0')}.raw16"
                 val dngName = "frame_${frame.frameIndex.toString().padStart(2, '0')}.dng"
                 val entryPrefix = JSONObject()
@@ -885,7 +918,6 @@ fun captureRawBurstForFusion(
                         post("RAW first image delay: ${ledger.value.rawFirstImageDelayMs}ms")
                     }
                     ledger.value.evictEmergencyUnmatchedImages(readerCapacity)
-                    ledger.value.closeUnmatchedImages()
                     publishProgress()
                     postCaptureProgress()
                     dispatchReadyFrames()

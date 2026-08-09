@@ -156,7 +156,7 @@ class RawCaptureLedgerTest {
     }
 
     @Test
-    fun restoredPairCanBeTakenAgainWithFreshIdentity() {
+    fun rejectedSubmissionKeepsItsFrameIdentityOnRetry() {
         val closed = mutableListOf<String>()
         val owner = ledger(onClose = { closed += it })
         owner.recordImage(1L, "img-1", 10L)
@@ -165,12 +165,12 @@ class RawCaptureLedgerTest {
         val first = owner.takeReadyFrames()
         assertEquals(1, first.size)
         val frame = first.single()
-        owner.restorePair(frame.timestampNs, frame.image, frame.result)
+        owner.restoreRejectedSubmission(frame)
 
         val second = owner.takeReadyFrames()
         assertEquals(1, second.size)
         assertEquals(1L, second.single().timestampNs)
-        assertEquals(1, second.single().frameIndex)
+        assertEquals(frame.frameIndex, second.single().frameIndex)
         assertTrue(closed.isEmpty())
     }
 

@@ -28,6 +28,17 @@ internal data class RawReadyFrame<IMAGE, RESULT>(
     val result: RESULT
 )
 
+internal enum class RawImageReleaseReason {
+    DUPLICATE_TIMESTAMP, CAPACITY_EVICTION, IDENTITY_EXHAUSTED, TERMINAL_CLEANUP
+}
+
+internal data class RawImageReleaseOutcome(
+    val reason: RawImageReleaseReason,
+    val attempted: Boolean,
+    val succeeded: Boolean,
+    val failure: Throwable? = null
+)
+
 /**
  * The RAW capture owner's authoritative mutable state: unmatched timestamp maps,
  * progress counters, frame identity, manifest, and sidecar accounting.
@@ -48,9 +59,12 @@ internal class RawCaptureLedger<IMAGE, RESULT>(
     private val imagesByTimestamp = mutableMapOf<Long, IMAGE>()
     private val imageArrivalMillis = mutableMapOf<Long, Long>()
     private val resultsByTimestamp = mutableMapOf<Long, RESULT>()
+    /** A rejected save submission keeps this exact identity for a later retry. */
+    private val submissionPendingByTimestamp = mutableMapOf<Long, RawReadyFrame<IMAGE, RESULT>>()
     private val identity = CaptureFrameIdentityOwner(requestedFrames)
     private val rawFrameSaveTimesMs = mutableListOf<Long>()
     private val frameObjects = JSONArray()
+    private val imageReleaseOutcomes = mutableListOf<RawImageReleaseOutcome>()
 
     var attemptedFrames = 0
         private set
@@ -77,11 +91,14 @@ internal class RawCaptureLedger<IMAGE, RESULT>(
     )
 
     fun recordImage(timestampNs: Long, image: IMAGE, arrivalMillis: Long) {
-        synchronized(lock) {
-            imagesByTimestamp.remove(timestampNs)?.let { closeImage(it) }
+        val replaced = synchronized(lock) {
+            val previous = imagesByTimestamp.remove(timestampNs)
+            imageArrivalMillis.remove(timestampNs)
             imagesByTimestamp[timestampNs] = image
             imageArrivalMillis[timestampNs] = arrivalMillis
+            previous
         }
+        replaced?.let { releaseImage(it, RawImageReleaseReason.DUPLICATE_TIMESTAMP) }
         receivedImages++
     }
 
@@ -100,73 +117,116 @@ internal class RawCaptureLedger<IMAGE, RESULT>(
 
     /** Drops the oldest unmatched image when the held-image count reaches capacity. */
     fun evictEmergencyUnmatchedImages(readerCapacity: Int) {
-        synchronized(lock) {
+        val evicted = synchronized(lock) {
             if (imagesByTimestamp.size < readerCapacity) return
             imagesByTimestamp.keys
                 .filter { it !in resultsByTimestamp }
                 .minByOrNull { imageArrivalMillis[it] ?: Long.MIN_VALUE }
                 ?.let { timestamp ->
-                    imagesByTimestamp.remove(timestamp)?.let { closeImage(it) }
+                    val image = imagesByTimestamp.remove(timestamp)
                     imageArrivalMillis.remove(timestamp)
                     droppedUnmatchedImages++
+                    image
                 }
         }
+        evicted?.let { releaseImage(it, RawImageReleaseReason.CAPACITY_EVICTION) }
     }
 
-    /** Closes every held image whose capture result has not arrived. */
-    fun closeUnmatchedImages() {
-        synchronized(lock) {
+    /** Terminal-only release. Normal matching deliberately retains Image-before-result. */
+    fun releaseUnmatchedImagesAtTerminal() {
+        val unmatched = synchronized(lock) {
             val unmatched = imagesByTimestamp.filter { it.key !in resultsByTimestamp }.keys.toList()
-            for (timestamp in unmatched) {
-                imagesByTimestamp.remove(timestamp)?.let { closeImage(it) }
-                imageArrivalMillis.remove(timestamp)
-                droppedUnmatchedImages++
+            unmatched.mapNotNull { timestamp ->
+                imagesByTimestamp.remove(timestamp)?.also {
+                    droppedUnmatchedImages++
+                }
+            }.also {
+                for (timestamp in unmatched) {
+                    imageArrivalMillis.remove(timestamp)
+                }
             }
         }
+        unmatched.forEach { releaseImage(it, RawImageReleaseReason.TERMINAL_CLEANUP) }
     }
+
+    /** Compatibility only for terminal callers; never use from normal event dispatch. */
+    @Deprecated("Terminal-only; use releaseUnmatchedImagesAtTerminal")
+    fun closeUnmatchedImages() = releaseUnmatchedImagesAtTerminal()
 
     /**
-     * Removes and pairs ready (image, result) frames in ascending timestamp order,
-     * allocating each a frame identity. Pairs whose result has not yet arrived
-     * stay in the unmatched maps.
+     * Transactionally transfers one ready pair at a time. A rejected submission must
+     * call [restoreRejectedSubmission] with this same object, preserving identity.
      */
-    fun takeReadyFrames(): List<RawReadyFrame<IMAGE, RESULT>> {
-        val taken: List<RawReadyFrame<IMAGE, RESULT>> = synchronized(lock) {
-            val pairs = mutableListOf<RawReadyFrame<IMAGE, RESULT>>()
-            for (timestamp in imagesByTimestamp.keys
+    fun takeNextReadyFrame(): RawReadyFrame<IMAGE, RESULT>? {
+        var exhausted: IMAGE? = null
+        val ready: RawReadyFrame<IMAGE, RESULT>? = synchronized(lock) {
+            submissionPendingByTimestamp.keys.minOrNull()?.let { timestamp ->
+                return@synchronized submissionPendingByTimestamp.remove(timestamp)
+            }
+            val timestamp = imagesByTimestamp.keys
+                .asSequence()
                 .filter { resultsByTimestamp.containsKey(it) }
-                .sorted()) {
-                val image = imagesByTimestamp.remove(timestamp) ?: continue
-                imageArrivalMillis.remove(timestamp)
-                val result = resultsByTimestamp.remove(timestamp)
-                if (result == null) {
-                    imagesByTimestamp[timestamp] = image
-                    imageArrivalMillis[timestamp] = System.currentTimeMillis()
+                .minOrNull()
+                ?: return@synchronized null
+            val image = imagesByTimestamp.remove(timestamp) ?: return@synchronized null
+            imageArrivalMillis.remove(timestamp)
+            val result = resultsByTimestamp.remove(timestamp)
+            if (result == null) {
+                imagesByTimestamp[timestamp] = image
+                null
+            } else {
+                val index = identity.nextIdentity()
+                if (index == null) {
+                    exhausted = image
+                    null
                 } else {
-                    pairs.add(RawReadyFrame(frameIndex = 0, timestampNs = timestamp, image = image, result = result))
+                    RawReadyFrame(index, timestamp, image, result)
                 }
             }
-            pairs
         }
-        val frames = mutableListOf<RawReadyFrame<IMAGE, RESULT>>()
-        for (pair in taken) {
-            val index = identity.nextIdentity()
-            if (index == null) {
-                closeImage(pair.image)
-                continue
+        exhausted?.let { releaseImage(it, RawImageReleaseReason.IDENTITY_EXHAUSTED) }
+        return ready
+    }
+
+    fun restoreRejectedSubmission(frame: RawReadyFrame<IMAGE, RESULT>) {
+        synchronized(lock) {
+            check(submissionPendingByTimestamp.put(frame.timestampNs, frame) == null) {
+                "duplicate RAW submission-pending timestamp ${frame.timestampNs}"
             }
-            frames.add(pair.copy(frameIndex = index))
+        }
+    }
+
+    /** Legacy batch adapter. Production dispatch uses [takeNextReadyFrame]. */
+    fun takeReadyFrames(): List<RawReadyFrame<IMAGE, RESULT>> {
+        val frames = mutableListOf<RawReadyFrame<IMAGE, RESULT>>()
+        while (true) {
+            val frame = takeNextReadyFrame() ?: break
+            frames += frame
         }
         return frames
     }
 
-    /** Restores a pair whose save submission was rejected (queue saturated). */
+    /** Legacy retry adapter loses identity by design; production must use [restoreRejectedSubmission]. */
     fun restorePair(timestampNs: Long, image: IMAGE, result: RESULT) {
         synchronized(lock) {
             imagesByTimestamp[timestampNs] = image
             imageArrivalMillis[timestampNs] = System.currentTimeMillis()
             resultsByTimestamp[timestampNs] = result
         }
+    }
+
+    private fun releaseImage(image: IMAGE, reason: RawImageReleaseReason) {
+        val outcome = try {
+            closeImage(image)
+            RawImageReleaseOutcome(reason, attempted = true, succeeded = true)
+        } catch (t: Throwable) {
+            RawImageReleaseOutcome(reason, attempted = true, succeeded = false, failure = t)
+        }
+        synchronized(lock) { imageReleaseOutcomes += outcome }
+    }
+
+    fun imageReleaseOutcomes(): List<RawImageReleaseOutcome> = synchronized(lock) {
+        imageReleaseOutcomes.toList()
     }
 
     /** Adopts a successfully saved frame: counter + manifest + save-time accounting. */
@@ -193,11 +253,17 @@ internal class RawCaptureLedger<IMAGE, RESULT>(
 
     /** Closes every held image and clears the maps. Called only from terminal cleanup. */
     fun releaseAllImages() {
-        synchronized(lock) {
-            imagesByTimestamp.values.forEach { closeImage(it) }
+        val held = synchronized(lock) {
+            val values = buildList {
+                addAll(imagesByTimestamp.values)
+                addAll(submissionPendingByTimestamp.values.map { it.image })
+            }
             imagesByTimestamp.clear()
             imageArrivalMillis.clear()
             resultsByTimestamp.clear()
+            submissionPendingByTimestamp.clear()
+            values
         }
+        held.forEach { releaseImage(it, RawImageReleaseReason.TERMINAL_CLEANUP) }
     }
 }
