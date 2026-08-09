@@ -922,6 +922,34 @@ mainHandler.removeCallbacks(watchdog)
         mainHandler.postDelayed(jobStart, 250L)
     }
 
+    fun runHardenedRawDebugCapture(
+        frameCount: Int,
+        cancellation: KeplerPipelineCancellationToken,
+        captureCancellation: KeplerCaptureCancellationHandle,
+        callback: (String) -> Unit
+    ) {
+        cancellation.throwIfCancelled()
+        val selection = cameraState.selection
+        captureRawBurstForFusion(
+            context = context,
+            cameraId = selection.cameraId,
+            frameCount = frameCount,
+            resolutionMode = CaptureResolutionMode.MP12,
+            zoomRatio = selection.effectiveZoomRatio,
+            requestedUiZoomRatio = zoomUiState.zoomRatio,
+            physicalCameraId = selection.physicalCameraId,
+            zoomRoute = selectedThreeXSource,
+            focusAeState = focusAeState,
+            rawSpeedMode = rawSpeedMode,
+            processingParams = processingSettings.resolvedParams(),
+            saveDngSidecars = true,
+            captureCancellationHandle = captureCancellation,
+            onStatus = callback,
+            onComplete = { jobDir -> callback("PIPELINE_COMPLETE: RAW debug capture complete: ${jobDir.name}") },
+            onError = { message -> callback("PIPELINE_FAILED: RAW debug capture failed. $message") }
+        )
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -1168,22 +1196,13 @@ mainHandler.removeCallbacks(watchdog)
                 onRaw = {
                     runCameraJob("RAW DNG 촬영 준비 중...", requestedFrames = 1) { cancellation, _, callback ->
                         cancellation.throwIfCancelled()
-                        captureSingleRawDng(
-                            context = context,
-                            cameraId = LEGACY_DEBUG_CAMERA_ID,
-                            onStatus = callback
-                        )
+                        runHardenedRawDebugCapture(1, cancellation, activeCaptureCancellation.get() ?: KeplerCaptureCancellationHandle(), callback)
                     }
                 },
                 onRawBurst = {
                     runCameraJob("RAW Burst 촬영 준비 중...", requestedFrames = 4) { cancellation, _, callback ->
                         cancellation.throwIfCancelled()
-                        captureRawBurstDng(
-                            context = context,
-                            cameraId = LEGACY_DEBUG_CAMERA_ID,
-                            frameCount = 4,
-                            onStatus = callback
-                        )
+                        runHardenedRawDebugCapture(4, cancellation, activeCaptureCancellation.get() ?: KeplerCaptureCancellationHandle(), callback)
                     }
                 },
                 onClear = {
@@ -1271,23 +1290,14 @@ mainHandler.removeCallbacks(watchdog)
                     currentScreen = MainScreen.CAMERA
                     runCameraJob("RAW DNG capture preparing...") { cancellation, _, callback ->
                         cancellation.throwIfCancelled()
-                        captureSingleRawDng(
-                            context = context,
-                            cameraId = LEGACY_DEBUG_CAMERA_ID,
-                            onStatus = callback
-                        )
+                        runHardenedRawDebugCapture(1, cancellation, activeCaptureCancellation.get() ?: KeplerCaptureCancellationHandle(), callback)
                     }
                 },
                 onRawBurst = {
                     currentScreen = MainScreen.CAMERA
                     runCameraJob("RAW Burst capture preparing...") { cancellation, _, callback ->
                         cancellation.throwIfCancelled()
-                        captureRawBurstDng(
-                            context = context,
-                            cameraId = LEGACY_DEBUG_CAMERA_ID,
-                            frameCount = 4,
-                            onStatus = callback
-                        )
+                        runHardenedRawDebugCapture(4, cancellation, activeCaptureCancellation.get() ?: KeplerCaptureCancellationHandle(), callback)
                     }
                 },
                 onTest50MRaw = test50@{
