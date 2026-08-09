@@ -64,13 +64,33 @@ class RawTerminalRequestTest {
     }
 
     @Test
-    fun cleanupDebtStatusesDoNotClaimSuccessfulDiscardWithoutEvidence() {
-        assertEquals(RawOutputCleanupStatus.NOT_ATTEMPTED, RawOutputCleanupOutcome.NotNeeded.status)
-        assertEquals(RawOutputCleanupStatus.DELETED, RawOutputCleanupOutcome.Clean.status)
-        assertEquals(RawOutputCleanupStatus.ADOPTED, RawOutputCleanupOutcome.adopted().status)
+    fun cleanupLedgerRetainsDistinctSettlementStatuses() {
         assertEquals(
-            RawOutputCleanupStatus.DELETE_THREW,
-            RawOutputCleanupOutcome.failed(IllegalStateException("delete failed")).status
+            setOf(
+                RawOutputCleanupStatus.NOT_ATTEMPTED,
+                RawOutputCleanupStatus.ABSENT,
+                RawOutputCleanupStatus.DELETED,
+                RawOutputCleanupStatus.DELETE_RETURNED_FALSE,
+                RawOutputCleanupStatus.DELETE_THREW,
+                RawOutputCleanupStatus.QUARANTINED,
+                RawOutputCleanupStatus.QUARANTINE_FAILED,
+                RawOutputCleanupStatus.ADOPTED
+            ),
+            RawOutputCleanupStatus.entries.toSet()
         )
+    }
+
+    @Test
+    fun cleanupLedgerUsesTemporaryAndUnadoptedRolesPrecisely() {
+        val records = listOf(
+            RawOutputCleanupRecord("frame.raw16.tmp", RawOutputResourceKind.RAW_TEMP, RawOutputOwnershipRole.TEMPORARY, RawOutputCleanupStatus.DELETED),
+            RawOutputCleanupRecord("frame.dng.tmp", RawOutputResourceKind.DNG_TEMP, RawOutputOwnershipRole.TEMPORARY, RawOutputCleanupStatus.ABSENT),
+            RawOutputCleanupRecord("frame.raw16", RawOutputResourceKind.RAW_FINAL, RawOutputOwnershipRole.UNADOPTED, RawOutputCleanupStatus.DELETE_THREW),
+            RawOutputCleanupRecord("frame.dng", RawOutputResourceKind.DNG_FINAL, RawOutputOwnershipRole.ADOPTED, RawOutputCleanupStatus.ADOPTED)
+        )
+        assertEquals(RawOutputOwnershipRole.TEMPORARY, records[0].ownershipRole)
+        assertEquals(RawOutputOwnershipRole.TEMPORARY, records[1].ownershipRole)
+        assertEquals(RawOutputOwnershipRole.UNADOPTED, records[2].ownershipRole)
+        assertEquals(RawOutputOwnershipRole.ADOPTED, records[3].ownershipRole)
     }
 }

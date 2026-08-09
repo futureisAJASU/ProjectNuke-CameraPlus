@@ -23,40 +23,14 @@ internal enum class RawOutputCleanupStatus {
     ADOPTED
 }
 
-internal data class RawOutputCleanupOutcome(
-    val attempted: Boolean,
-    val succeeded: Boolean,
-    val failureDescription: String? = null,
-    val status: RawOutputCleanupStatus = when {
-        !attempted -> RawOutputCleanupStatus.NOT_ATTEMPTED
-        succeeded -> RawOutputCleanupStatus.DELETED
-        else -> RawOutputCleanupStatus.DELETE_THREW
-    }
-) {
-    companion object {
-        val NotNeeded = RawOutputCleanupOutcome(false, true, status = RawOutputCleanupStatus.NOT_ATTEMPTED)
-        val Clean = RawOutputCleanupOutcome(true, true, status = RawOutputCleanupStatus.DELETED)
-        fun absent() = RawOutputCleanupOutcome(true, true, status = RawOutputCleanupStatus.ABSENT)
-        fun adopted() = RawOutputCleanupOutcome(true, true, status = RawOutputCleanupStatus.ADOPTED)
-        fun failed(error: Throwable) = RawOutputCleanupOutcome(
-            attempted = true,
-            succeeded = false,
-            failureDescription = "${error.javaClass.simpleName}: ${error.message}",
-            status = RawOutputCleanupStatus.DELETE_THREW
-        )
-    }
-}
-
 /** Exact worker-owned output paths; no completion may invent a temp filename. */
 internal data class RawOutputOwnership(
     val tempFile: File?,
     val finalFile: File?,
     val state: RawOutputState,
     val verifiedBytes: Long?,
-    val cleanup: RawOutputCleanupOutcome = RawOutputCleanupOutcome.NotNeeded,
     val dngTempFile: File? = null,
-    val dngFinalFile: File? = null,
-    val dngCleanup: RawOutputCleanupOutcome = RawOutputCleanupOutcome.NotNeeded
+    val dngFinalFile: File? = null
 )
 
 internal enum class RawCompletionPostOutcome { ACCEPTED, REJECTED_AND_DISPOSED, REJECTED_UNSETTLED }
@@ -224,6 +198,49 @@ internal data class RawSuccessOutputSettlementPlan(
     val adopted: List<File>,
     val leftovers: List<File>
 )
+
+internal data class RawOutputSettlementResult(
+    val records: List<RawOutputCleanupRecord>,
+    val failure: Throwable?
+)
+
+internal fun settleRawOutputFiles(
+    files: List<File>,
+    deleteFile: (File) -> Boolean = { it.delete() }
+): RawOutputSettlementResult {
+    val records = mutableListOf<RawOutputCleanupRecord>()
+    var firstFailure: Throwable? = null
+    for (file in files.distinctBy { it.absolutePath }) {
+        val kind = when {
+            file.name.endsWith(".tmp") && file.name.contains(".dng.") -> RawOutputResourceKind.DNG_TEMP
+            file.name.endsWith(".tmp") -> RawOutputResourceKind.RAW_TEMP
+            file.extension.equals("dng", ignoreCase = true) -> RawOutputResourceKind.DNG_FINAL
+            else -> RawOutputResourceKind.RAW_FINAL
+        }
+        val role = if (kind == RawOutputResourceKind.RAW_TEMP || kind == RawOutputResourceKind.DNG_TEMP) {
+            RawOutputOwnershipRole.TEMPORARY
+        } else {
+            RawOutputOwnershipRole.UNADOPTED
+        }
+        if (!file.exists()) {
+            records += RawOutputCleanupRecord(file.absolutePath, kind, role, RawOutputCleanupStatus.ABSENT)
+            continue
+        }
+        try {
+            if (!deleteFile(file)) {
+                val failure = java.io.IOException("Could not delete RAW output ${file.absolutePath}")
+                records += RawOutputCleanupRecord(file.absolutePath, kind, role, RawOutputCleanupStatus.DELETE_RETURNED_FALSE, failure)
+                if (firstFailure == null) firstFailure = failure
+            } else {
+                records += RawOutputCleanupRecord(file.absolutePath, kind, role, RawOutputCleanupStatus.DELETED)
+            }
+        } catch (failure: Throwable) {
+            records += RawOutputCleanupRecord(file.absolutePath, kind, role, RawOutputCleanupStatus.DELETE_THREW, failure)
+            if (firstFailure == null) firstFailure = failure
+        }
+    }
+    return RawOutputSettlementResult(records, firstFailure)
+}
 
 /** Shared production ownership split used before the owner settles a success. */
 internal fun planRawSuccessOutputSettlement(

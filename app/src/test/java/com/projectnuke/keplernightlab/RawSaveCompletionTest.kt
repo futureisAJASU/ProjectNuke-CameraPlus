@@ -105,11 +105,10 @@ class RawSaveCompletionTest {
                 finalFile = finalFile,
                 state = RawOutputState.UNADOPTED_FINAL,
                 verifiedBytes = 16L,
-                cleanup = RawOutputCleanupOutcome.failed(IllegalStateException("pending"))
             )
         )
         assertEquals(RawOutputState.UNADOPTED_FINAL, completion.output.state)
-        assertFalse(completion.output.cleanup.succeeded)
+        assertTrue(completion.output.finalFile != null)
     }
 
     @Test
@@ -223,6 +222,53 @@ class RawSaveCompletionTest {
             val plan = planRawSuccessOutputSettlement(root, completion)
             assertEquals(listOf(raw.absolutePath), plan.adopted.map { it.absolutePath })
             assertEquals(listOf(dng.absolutePath), plan.leftovers.map { it.absolutePath })
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun filesystemSettlementDeletesOnlyUnadoptedLeftoversAndRecordsEachPath() {
+        val root = createTempDirectory("raw-settlement").toFile()
+        try {
+            val temp = root.resolve("frame_02.raw16.tmp").apply { writeBytes(byteArrayOf(1)) }
+            val failedDng = root.resolve("frame_02.dng").apply { writeBytes(byteArrayOf(2)) }
+            val sibling = root.resolve("frame_03.raw16").apply { writeBytes(byteArrayOf(3)) }
+            val result = settleRawOutputFiles(
+                listOf(temp, failedDng, sibling),
+                deleteFile = { file -> if (file == failedDng) false else file.delete() }
+            )
+            assertFalse(temp.exists())
+            assertTrue(failedDng.exists())
+            assertFalse(sibling.exists())
+            assertEquals(RawOutputCleanupStatus.DELETED, result.records.first { it.path == temp.absolutePath }.status)
+            assertEquals(RawOutputOwnershipRole.TEMPORARY, result.records.first { it.path == temp.absolutePath }.ownershipRole)
+            assertEquals(RawOutputCleanupStatus.DELETE_RETURNED_FALSE, result.records.first { it.path == failedDng.absolutePath }.status)
+            assertEquals(RawOutputOwnershipRole.UNADOPTED, result.records.first { it.path == failedDng.absolutePath }.ownershipRole)
+            assertEquals(RawOutputCleanupStatus.DELETED, result.records.first { it.path == sibling.absolutePath }.status)
+            assertEquals(sibling.absolutePath, result.records.single { it.path == sibling.absolutePath }.path)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun adoptedRawAndDngAreNotPassedToFilesystemSettlement() {
+        val root = createTempDirectory("raw-adopted-files").toFile()
+        try {
+            val raw = root.resolve("frame_04.raw16").apply { writeBytes(byteArrayOf(1)) }
+            val dng = root.resolve("frame_04.dng").apply { writeBytes(byteArrayOf(2)) }
+            val completion = RawSaveCompletion.Success(
+                4, 4L, raw.name, raw.length(), 1L,
+                RawDngSidecarOutcome.localSaved(4, dng.name),
+                RawOutputOwnership(null, raw, RawOutputState.VERIFIED_FINAL, raw.length(), dngFinalFile = dng),
+                frame = defaultRawFrameManifest(4, 4L, raw.name, RawDngSidecarOutcome.localSaved(4, dng.name)).copy(dngFilename = dng.name)
+            )
+            val plan = planRawSuccessOutputSettlement(root, completion)
+            val result = settleRawOutputFiles(plan.leftovers)
+            assertTrue(result.records.isEmpty())
+            assertTrue(raw.exists())
+            assertTrue(dng.exists())
         } finally {
             root.deleteRecursively()
         }

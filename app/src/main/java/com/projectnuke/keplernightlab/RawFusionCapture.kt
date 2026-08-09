@@ -219,7 +219,7 @@ fun captureRawBurstForFusion(
     val terminalState = CaptureTerminalState()
     val cleanupStarted = AtomicBoolean(false)
     val rawImageReleaseFailures = AtomicReference<List<RawImageReleaseFailure>>(emptyList())
-    val rawOutputCleanupFailures = AtomicReference<List<RawOutputCleanupRecord>>(emptyList())
+    val rawOutputCleanupRecords = AtomicReference<List<RawOutputCleanupRecord>>(emptyList())
     var publishedLedgerImageReleaseCount = 0
     val rawTerminalSnapshotStore = RawTerminalSnapshotStore(
         RawTerminalSnapshot(
@@ -236,7 +236,7 @@ fun captureRawBurstForFusion(
             callbackExecution = rawCallbackExecutionOutcome.get(),
             cleanup = null,
             imageReleaseFailures = emptyList()
-            , outputCleanupFailures = emptyList()
+            , outputCleanupRecords = emptyList()
         )
     )
     fun publishRawTerminalSnapshot(
@@ -255,7 +255,7 @@ fun captureRawBurstForFusion(
             rawTerminalSnapshotStore.get().cleanup
         },
         imageReleaseFailures: List<RawImageReleaseFailure> = rawTerminalSnapshotStore.get().imageReleaseFailures
-        , outputCleanupFailures: List<RawOutputCleanupRecord> = rawTerminalSnapshotStore.get().outputCleanupFailures
+        , outputCleanupRecords: List<RawOutputCleanupRecord> = rawTerminalSnapshotStore.get().outputCleanupRecords
     ) {
         rawTerminalSnapshotStore.publish(
             RawTerminalSnapshot(
@@ -272,7 +272,7 @@ fun captureRawBurstForFusion(
                 callbackExecution = callbackExecution,
                 cleanup = cleanup,
                 imageReleaseFailures = imageReleaseFailures
-                , outputCleanupFailures = outputCleanupFailures
+                , outputCleanupRecords = outputCleanupRecords
             )
         )
     }
@@ -290,7 +290,7 @@ fun captureRawBurstForFusion(
             callbackExecution = rawCallbackExecutionOutcome.get(),
             cleanup = current.cleanup,
             imageReleaseFailures = current.imageReleaseFailures,
-            outputCleanupFailures = current.outputCleanupFailures
+            outputCleanupRecords = current.outputCleanupRecords
         )
     }
     fun outputResourceKind(file: File): RawOutputResourceKind = when {
@@ -428,7 +428,7 @@ fun captureRawBurstForFusion(
                 callbackExecution = rawCallbackExecutionOutcome.get(),
                 cleanup = rawTerminalSnapshotStore.get().cleanup,
                 imageReleaseFailures = rawImageReleaseFailures.get(),
-                outputCleanupFailures = rawOutputCleanupFailures.get()
+                outputCleanupRecords = rawOutputCleanupRecords.get()
             )
             val callbackAccepted = postMainOrRun { onError(message) }
             publishRawTerminalSnapshot(
@@ -443,7 +443,7 @@ fun captureRawBurstForFusion(
                 callbackExecution = rawCallbackExecutionOutcome.get(),
                 cleanup = rawTerminalSnapshotStore.get().cleanup,
                 imageReleaseFailures = rawImageReleaseFailures.get(),
-                outputCleanupFailures = rawOutputCleanupFailures.get()
+                outputCleanupRecords = rawOutputCleanupRecords.get()
             )
         }
     }
@@ -873,7 +873,7 @@ fun captureRawBurstForFusion(
                             callbackExecution = rawCallbackExecutionOutcome.get(),
                             cleanup = rawTerminalSnapshotStore.get().cleanup,
                             imageReleaseFailures = rawImageReleaseFailures.get(),
-                            outputCleanupFailures = rawOutputCleanupFailures.get()
+                            outputCleanupRecords = rawOutputCleanupRecords.get()
                         )
                         val callbackAccepted = if (request.completionKind == RawTerminalCompletionKind.SUCCESS) {
                             postMainOrRun { onComplete(jobDir) }
@@ -965,13 +965,13 @@ fun captureRawBurstForFusion(
             fun settleImageAndAttach(completion: RawSaveCompletion): RawSaveCompletion {
                 return settleRawSaveImage(completion) { image.close() }
             }
-            fun deleteOwned(file: File?): RawOutputCleanupOutcome {
-                if (file == null || !file.exists()) return RawOutputCleanupOutcome.NotNeeded
+            fun deleteOwned(file: File?): RawOutputCleanupStatus {
+                if (file == null || !file.exists()) return RawOutputCleanupStatus.ABSENT
                 return try {
-                    if (file.delete()) RawOutputCleanupOutcome.Clean
-                    else RawOutputCleanupOutcome.failed(IllegalStateException("delete returned false: ${file.absolutePath}"))
+                    if (file.delete()) RawOutputCleanupStatus.DELETED
+                    else RawOutputCleanupStatus.DELETE_RETURNED_FALSE
                 } catch (t: Throwable) {
-                    RawOutputCleanupOutcome.failed(t)
+                    RawOutputCleanupStatus.DELETE_THREW
                 }
             }
             try {
@@ -985,7 +985,9 @@ fun captureRawBurstForFusion(
                     verifyRaw16Payload(raw16File, expectedRaw16Bytes)
                 } finally {
                     val cleanup = deleteOwned(raw16Temp)
-                    if (!cleanup.succeeded) post("RAW temp cleanup failed: ${cleanup.failureDescription}")
+                    if (cleanup != RawOutputCleanupStatus.DELETED && cleanup != RawOutputCleanupStatus.ABSENT) {
+                        post("RAW temp cleanup failed: ${cleanup.name}")
+                    }
                 }
                 if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
                     return settleImageAndAttach(RawSaveCompletion.Abandoned(
@@ -1022,7 +1024,9 @@ fun captureRawBurstForFusion(
                         post("RAW DNG sidecar failed; continuing with raw16 fusion.")
                     } finally {
                         val cleanup = deleteOwned(dngTemp)
-                        if (!cleanup.succeeded) dngFailure = dngFailure ?: cleanup.failureDescription
+                        if (cleanup != RawOutputCleanupStatus.DELETED && cleanup != RawOutputCleanupStatus.ABSENT) {
+                            dngFailure = dngFailure ?: "DNG cleanup ${cleanup.name}"
+                        }
                     }
                 }
                 if (terminalState.status() != CaptureTerminalStatus.ACTIVE) {
@@ -1103,58 +1107,16 @@ fun captureRawBurstForFusion(
 
         fun submitSaveRequest(request: RawSaveFrameRequest): Boolean {
             fun disposeOutputFiles(files: List<File>): CaptureTaskDisposalOutcome {
-                var failure: Throwable? = null
-                val records = mutableListOf<RawOutputCleanupRecord>()
-                for (file in files.distinct()) {
-                    if (!file.exists()) {
-                        records += RawOutputCleanupRecord(
-                            file.absolutePath,
-                            outputResourceKind(file),
-                            RawOutputOwnershipRole.UNADOPTED,
-                            RawOutputCleanupStatus.ABSENT
-                        )
-                        continue
-                    }
-                    try {
-                        if (file.exists() && !file.delete()) {
-                            val error = java.io.IOException("Could not delete unadopted RAW output ${file.absolutePath}")
-                            records += RawOutputCleanupRecord(
-                                file.absolutePath,
-                                outputResourceKind(file),
-                                RawOutputOwnershipRole.UNADOPTED,
-                                RawOutputCleanupStatus.DELETE_RETURNED_FALSE,
-                                error
-                            )
-                            throw error
-                        }
-                        records += RawOutputCleanupRecord(
-                            file.absolutePath,
-                            outputResourceKind(file),
-                            RawOutputOwnershipRole.UNADOPTED,
-                            RawOutputCleanupStatus.DELETED
-                        )
-                    } catch (t: Throwable) {
-                        Log.e(RAW_PIPELINE_LOG_TAG, "RAW completion cleanup failed", t)
-                        if (records.none { it.path == file.absolutePath && it.failure != null }) {
-                            records += RawOutputCleanupRecord(
-                                file.absolutePath,
-                                outputResourceKind(file),
-                                RawOutputOwnershipRole.UNADOPTED,
-                                RawOutputCleanupStatus.DELETE_THREW,
-                                t
-                            )
-                        }
-                        if (failure == null) failure = t
-                    }
-                }
-                rawOutputCleanupFailures.updateAndGet { it + records }
+                val result = settleRawOutputFiles(files)
+                result.failure?.let { Log.e(RAW_PIPELINE_LOG_TAG, "RAW completion cleanup failed", it) }
+                rawOutputCleanupRecords.updateAndGet { it + result.records }
                 val current = rawTerminalSnapshotStore.get()
                 publishRawTerminalSnapshot(
                     current.phase,
                     settlementFailure = current.settlementFailure,
-                    outputCleanupFailures = rawOutputCleanupFailures.get()
+                    outputCleanupRecords = rawOutputCleanupRecords.get()
                 )
-                val outcome = failure?.let { CaptureTaskDisposalOutcome.Failed(it) }
+                val outcome = result.failure?.let { CaptureTaskDisposalOutcome.Failed(it) }
                     ?: CaptureTaskDisposalOutcome.Clean
                 return outcome
             }
@@ -1186,7 +1148,7 @@ fun captureRawBurstForFusion(
             }
             fun recordAdoptedOutputs(completion: RawSaveCompletion.Success) {
                 val adopted = planRawSuccessOutputSettlement(jobDir, completion).adopted
-                rawOutputCleanupFailures.updateAndGet { current ->
+                rawOutputCleanupRecords.updateAndGet { current ->
                     current + adopted.map { file ->
                         RawOutputCleanupRecord(
                             path = file.absolutePath,
@@ -1200,7 +1162,7 @@ fun captureRawBurstForFusion(
                 publishRawTerminalSnapshot(
                     current.phase,
                     settlementFailure = current.settlementFailure,
-                    outputCleanupFailures = rawOutputCleanupFailures.get()
+                    outputCleanupRecords = rawOutputCleanupRecords.get()
                 )
             }
             val task = RawSaveTask(
