@@ -8,12 +8,7 @@ import java.util.concurrent.atomic.AtomicReference
  * States: RETAINED → ENCODING → SETTLING → (removed)  [encoding path]
  *          RETAINED → DRAINING → (removed)              [coordinated drain path]
  *
- * Two distinct close/claim APIs:
- * - [closeAndDrainRetained] (legacy, ColorFusion-compatible): closes acceptance and
- *   atomically removes every RETAINED item from the registry.  The caller owns
- *   external `item.dispose(accounting)`; no finish call is required and items are
- *   never left tracked as DRAINING.
- * - [claimRetainedForDrain] (coordinator): closes acceptance and atomically claims
+ * The coordinated drain API closes acceptance and atomically claims
  *   every RETAINED item as DRAINING, returning [YuvDrainClaim] tokens.  The item
  *   stays tracked (drainingCount / trackedCount stay truthful) until
  *   `claim.disposeAndFinish(accounting)` disposes the item and removes it from the
@@ -238,31 +233,6 @@ internal open class YuvBufferedLifecycle {
             failure = failure,
             lifecycleReleaseFailure = releaseFailure
         )
-    }
-
-    /**
-     * LEGACY COMPATIBILITY API (source-compatible with restored ColorFusion callers):
-     *
-     * Closes lifecycle acceptance and atomically claims every RETAINED item, removing
-     * those items from the active registry BEFORE returning.  Each claimed item is
-     * returned exactly once; the caller owns external `item.dispose(accounting)`.
-     * No finish call is required and items are never left tracked as DRAINING.
-     * Repeated close returns no item twice.  ENCODING and SETTLING items remain tracked.
-     *
-     * Open for deterministic failure injection in tests.
-     */
-    internal open fun closeAndDrainRetained(): List<YuvPngWorkItem> = synchronized(lock) {
-        closed = true
-        val drained = mutableListOf<YuvPngWorkItem>()
-        val iter = items.entries.iterator()
-        while (iter.hasNext()) {
-            val (item, entry) = iter.next()
-            if (entry.state == State.RETAINED) {
-                iter.remove()
-                drained.add(item)
-            }
-        }
-        drained
     }
 
     /**

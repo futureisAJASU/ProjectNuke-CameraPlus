@@ -166,7 +166,7 @@ class YuvCaptureOwnershipTest {
         // Worker's initial terminal check passed.
         assertFalse(lifecycle.isClosed())
         // Terminal cleanup closes acceptance and drains (nothing retained yet).
-        val drained = lifecycle.closeAndDrainRetained()
+        val drained = lifecycle.drainRetainedForTest()
         assertTrue(drained.isEmpty())
         // Worker attempts to retain the buffered item AFTER cleanup completed.
         assertFalse(lifecycle.tryRegister(item))
@@ -188,7 +188,7 @@ class YuvCaptureOwnershipTest {
         val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting) {
             disposeCount.incrementAndGet()
         }
-        lifecycle.closeAndDrainRetained()
+        lifecycle.drainRetainedForTest()
 
         assertFalse(lifecycle.tryRegister(item))
         item.dispose(accounting)
@@ -204,7 +204,7 @@ class YuvCaptureOwnershipTest {
         val reservations = YuvBufferReservations(1024L)
         assertTrue(reservations.tryReserve(100L))
         val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting)
-        lifecycle.closeAndDrainRetained()
+        lifecycle.drainRetainedForTest()
 
         assertFalse(lifecycle.tryRegister(item))
         assertEquals(100L, reservations.currentBytes())
@@ -226,7 +226,7 @@ class YuvCaptureOwnershipTest {
         assertTrue(lifecycle.tryRegister(item))
         assertEquals(1, accounting.snapshot().bufferedFrames)
 
-        val drained = lifecycle.closeAndDrainRetained()
+        val drained = lifecycle.drainRetainedForTest()
         assertEquals(listOf(item), drained)
         drained.forEach { it.dispose(accounting) }
         drained.forEach { it.dispose(accounting) }
@@ -249,7 +249,7 @@ class YuvCaptureOwnershipTest {
         assertTrue(lifecycle.tryRegister(item))
         assertTrue(lifecycle.beginEncoding(item))
 
-        val drained = lifecycle.closeAndDrainRetained()
+        val drained = lifecycle.drainRetainedForTest()
         assertTrue(drained.isEmpty())
         assertEquals(0, disposeCount.get())
         assertEquals(1, lifecycle.encodingCount())
@@ -268,7 +268,7 @@ class YuvCaptureOwnershipTest {
         assertTrue(lifecycle.tryRegister(item))
         assertTrue(lifecycle.beginEncoding(item))
 
-        lifecycle.closeAndDrainRetained()
+        lifecycle.drainRetainedForTest()
         assertEquals(100L, reservations.currentBytes())
         assertEquals(1, accounting.snapshot().bufferedFrames)
 
@@ -349,7 +349,7 @@ class YuvCaptureOwnershipTest {
         val lifecycle = YuvBufferedLifecycle()
         val accounting = YuvCaptureAccounting()
         val reservations = YuvBufferReservations(1024L)
-        lifecycle.closeAndDrainRetained()
+        lifecycle.drainRetainedForTest()
 
         repeat(25) { index ->
             assertTrue(reservations.tryReserve(10L))
@@ -426,9 +426,9 @@ class YuvCaptureOwnershipTest {
         val item = YuvPngWorkItem.bufferedForTest(0, 1L, 100L, reservations, accounting)
         assertTrue(lifecycle.tryRegister(item))
 
-        val first = lifecycle.closeAndDrainRetained()
+        val first = lifecycle.drainRetainedForTest()
         assertEquals(listOf(item), first)
-        val second = lifecycle.closeAndDrainRetained()
+        val second = lifecycle.drainRetainedForTest()
         assertTrue(second.isEmpty())
 
         first.forEach { it.dispose(accounting) }
@@ -449,7 +449,7 @@ class YuvCaptureOwnershipTest {
         assertEquals(1, lifecycle.encodingCount())
         assertEquals(1, lifecycle.trackedCount())
 
-        val drained = lifecycle.closeAndDrainRetained()
+        val drained = lifecycle.drainRetainedForTest()
         assertTrue(drained.isEmpty())
         assertEquals(0, lifecycle.retainedCount())
         assertEquals(1, lifecycle.encodingCount())
@@ -580,7 +580,8 @@ class YuvCaptureOwnershipTest {
         assertEquals(0, fakeImage.closeCount.get())
         val item = (result as DirectYuvWorkCreation.Accepted).item
         assertEquals(4321L, item.timestampNs)
-        val wrapped = item.imageForEncoding() as? FakeImage
+        val wrapped = ((item.sourceForEncoding() as? YuvOwnedSource.Direct)
+            ?.source as? AndroidOwnedDirectYuvSource)?.image as? FakeImage
         assertNotNull(wrapped)
         assertEquals(0, wrapped!!.closeCount.get())
         item.dispose(accounting)

@@ -1215,14 +1215,7 @@ internal class YuvPngWorkItem private constructor(
      * or null for buffered items and test-owned direct sources.  Never the mutable
      * ownership field it used to be — the sealed source is the single owner.
      */
-    fun imageForEncoding(): Image? = (source as? YuvOwnedSource.Direct)
-        ?.source
-        ?.let { it as? AndroidOwnedDirectYuvSource }
-        ?.image
-
-    fun bufferedForEncoding(): BufferedYuvFrame? = (source as? YuvOwnedSource.Buffered)?.frame
-
-    fun settleBufferedAccounting(accounting: YuvCaptureAccounting) {
+    internal fun completeBufferedSettlement(accounting: YuvCaptureAccounting) {
         if (retainedBytes > 0L && bufferedReleased.compareAndSet(false, true)) {
             reservations?.release(retainedBytes)
             accounting.releasedBufferedFrame()

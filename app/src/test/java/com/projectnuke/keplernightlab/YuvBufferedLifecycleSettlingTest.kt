@@ -45,7 +45,7 @@ class YuvBufferedLifecycleSettlingTest {
         assertEquals(1, accounting.snapshot().bufferedFrames)
         assertEquals(100L, reservations.currentBytes())
 
-        lifecycle.closeAndDrainRetained().forEach { it.dispose(accounting) }
+        lifecycle.drainRetainedForTest().forEach { it.dispose(accounting) }
     }
 
     @Test
@@ -302,7 +302,7 @@ class YuvBufferedLifecycleSettlingTest {
     }
 
     @Test
-    fun settleBufferedAccountingFailureDoesNotSkipItemDisposal() {
+    fun bufferedSettlementFailureDoesNotSkipItemDisposal() {
         val lifecycle = YuvBufferedLifecycle()
         val accounting = YuvCaptureAccounting()
         val reservations = YuvBufferReservations(1024L)
@@ -490,7 +490,7 @@ class YuvBufferedLifecycleSettlingTest {
         val result = lifecycle.startSettling(item)
         assertEquals(YuvBufferedLifecycle.SettlementResult.STARTED, result.result)
 
-        val drained = lifecycle.closeAndDrainRetained()
+        val drained = lifecycle.drainRetainedForTest()
         assertTrue(drained.isEmpty())
         assertEquals(1, lifecycle.settlingCount())
         assertEquals(1, lifecycle.trackedCount())
@@ -752,13 +752,13 @@ class YuvBufferedLifecycleSettlingTest {
         assertEquals(DrainSettlementStatus.ALREADY_FAILED, claim.disposeAndFinish(null).status)
         assertEquals(0, disposeCount.get())
         // The claim can be recovered by settling the item through the normal path.
-        item.settleBufferedAccounting(accounting)
+        item.completeBufferedSettlement(accounting)
         assertEquals(0L, reservations.currentBytes())
         assertEquals(0, accounting.snapshot().bufferedFrames)
     }
 
     @Test
-    fun legacyCloseAndDrainRetainedMatchesProductionContract() {
+    fun coordinatedDrainRetainedMatchesProductionContract() {
         val lifecycle = YuvBufferedLifecycle()
         val accounting = YuvCaptureAccounting()
         val reservations = YuvBufferReservations(1024L)
@@ -773,7 +773,7 @@ class YuvBufferedLifecycleSettlingTest {
         assertTrue(lifecycle.tryRegister(item1))
         assertTrue(lifecycle.tryRegister(item2))
 
-        val drained = lifecycle.closeAndDrainRetained()
+        val drained = lifecycle.drainRetainedForTest()
         assertEquals(listOf(item1, item2), drained)
 
         // Items removed from the registry BEFORE disposal: no DRAINING residue and no
@@ -792,7 +792,7 @@ class YuvBufferedLifecycleSettlingTest {
         assertEquals(0L, reservations.currentBytes())
 
         // Repeated close never returns an item twice; acceptance stays closed.
-        assertTrue(lifecycle.closeAndDrainRetained().isEmpty())
+        assertTrue(lifecycle.drainRetainedForTest().isEmpty())
         assertTrue(reservations.tryReserve(10L))
         val late = YuvPngWorkItem.bufferedForTest(2, 3L, 10L, reservations, accounting)
         assertFalse(lifecycle.tryRegister(late))
@@ -868,7 +868,7 @@ class YuvBufferedLifecycleSettlingTest {
         assertEquals(1, lifecycle.retainedCount())
         assertEquals(100L, reservations.currentBytes())
 
-        lifecycle.closeAndDrainRetained().forEach { it.dispose(accounting) }
+        lifecycle.drainRetainedForTest().forEach { it.dispose(accounting) }
     }
 
     @Test
@@ -1045,7 +1045,7 @@ class YuvBufferedLifecycleSettlingTest {
         task.run()
         assertEquals(1, hookCalls.get())
 
-         lifecycle.closeAndDrainRetained().forEach { it.dispose(accounting) }
+         lifecycle.drainRetainedForTest().forEach { it.dispose(accounting) }
     }
 
     // ── Step 3+4: BufferedEncodeTask state machine + publication state ─────
@@ -1159,7 +1159,7 @@ class YuvBufferedLifecycleSettlingTest {
         assertTrue(debtDescriptions[0].contains("INVALID_STATE"))
         assertEquals(BufferedEncodeTask.TaskSettlementState.SETTLED, task.taskState())
 
-        lifecycle.closeAndDrainRetained().forEach { it.dispose(accounting) }
+        lifecycle.drainRetainedForTest().forEach { it.dispose(accounting) }
     }
 
     // ── Phase 0.4: second disposal during SETTLING reports in-progress ─────

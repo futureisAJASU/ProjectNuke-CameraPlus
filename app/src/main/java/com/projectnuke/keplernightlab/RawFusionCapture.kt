@@ -641,12 +641,75 @@ fun captureRawBurstForFusion(
         }
         postCaptureProgress()
 
+        fun submitTerminal(request: RawTerminalRequest) {
+            fun settleFailure(failure: Throwable) {
+                terminalState.claim(CaptureTerminalStatus.FAILED)
+                finished.set(true)
+                publishRawTerminalSnapshot(
+                    RawTerminalSettlementPhase.SETTLEMENT_FAILED,
+                    request.reason,
+                    failure
+                )
+                cleanup()
+            }
+            val event = object : CaptureOwnerEvent {
+                override fun execute() {
+                    if (!terminalState.claim(request.status)) return
+                    finished.set(true)
+                    publishRawTerminalSnapshot(RawTerminalSettlementPhase.CLAIMED, request.reason)
+                    val message = request.reason ?: request.jobStatus
+                    try {
+                        if (request.saveMotion) {
+                            runCatching { motionLogger?.saveToDirectory(jobDir) }
+                        }
+                        if (request.completionKind == RawTerminalCompletionKind.SUCCESS) {
+                            val terminalJob = JSONObject(baseJob.toString())
+                                .put("status", request.jobStatus)
+                                .put("savedFrames", ledger.value.savedFrames)
+                                .put("requestedFrames", ledger.value.requestedFrames)
+                                .put("attemptedFrames", ledger.value.attemptedFrames)
+                                .put("receivedImages", ledger.value.receivedImages)
+                                .put("completedResults", ledger.value.completedResults)
+                                .put("failedCaptures", ledger.value.failedCaptures)
+                                .put("droppedUnmatchedImages", ledger.value.droppedUnmatchedImages)
+                                .put("frames", frameObjectsSnapshot())
+                            KeplerJobMetadata.write(jobDir, terminalJob)
+                        } else {
+                            writeJobStatus(jobFile, baseJob, request.jobStatus, message)
+                        }
+                        post(message)
+                    } catch (failure: Throwable) {
+                        publishRawTerminalSnapshot(
+                            RawTerminalSettlementPhase.SETTLING,
+                            request.reason,
+                            failure
+                        )
+                    } finally {
+                        cleanup()
+                        if (request.completionKind == RawTerminalCompletionKind.SUCCESS) {
+                            postMainOrRun { onComplete(jobDir) }
+                        } else {
+                            postMainOrRun { onError(message) }
+                        }
+                        publishRawTerminalSnapshot(RawTerminalSettlementPhase.SETTLED, request.reason)
+                    }
+                }
+
+                override fun disposeWithoutMutation() {
+                    settleFailure(IllegalStateException("RAW terminal event disposed before execution"))
+                }
+            }
+            if (!captureStateOwner.post(event)) {
+                settleFailure(IllegalStateException("RAW terminal owner rejected ${request.status}"))
+            }
+        }
+
         fun finishError(
             status: String,
             message: String,
             terminalStatus: CaptureTerminalStatus = CaptureTerminalStatus.FAILED
-        ) {
-            val terminalRequest = RawTerminalRequest(
+        ) = submitTerminal(
+            RawTerminalRequest(
                 status = terminalStatus,
                 jobStatus = status,
                 reason = message,
@@ -654,46 +717,32 @@ fun captureRawBurstForFusion(
                 cause = null,
                 saveMotion = false
             )
-            val settleEvent = object : CaptureOwnerEvent {
-                override fun execute() {
-                    if (!terminalState.claim(terminalRequest.status)) return
-                    publishRawTerminalSnapshot(RawTerminalSettlementPhase.CLAIMED, terminalRequest.reason)
-                    finished.set(true)
-                    if (rawSelection.requiresMaximumResolutionPixelMode && maxResolutionPixelModeFailure == null) {
-                        maxResolutionPixelModeFailure = "Maximum-resolution RAW capture failed: $message"
-                    }
-                    try {
-                        val metadataOutcome = writeJobStatus(jobFile, baseJob, terminalRequest.jobStatus, terminalRequest.reason)
-                        publishRawTerminalSnapshot(
-                            RawTerminalSettlementPhase.SETTLING,
-                            metadata = metadataOutcome,
-                            status = RawTerminalOperationOutcome.Succeeded
-                        )
-                        post(message)
-                    } catch (failure: Throwable) {
-                        Log.e(RAW_PIPELINE_LOG_TAG, "RAW failure metadata/status failed", failure)
-                    } finally {
-                        cleanup()
-                        postMainOrRun { onError(message) }
-                        publishRawTerminalSnapshot(RawTerminalSettlementPhase.SETTLED, terminalRequest.reason)
-                    }
-                }
-                override fun disposeWithoutMutation() {
-                    finished.set(true)
-                    runCatching { cleanup() }
-                }
-            }
-            if (!captureStateOwner.post(settleEvent)) {
-                val failure = IllegalStateException("RAW terminal owner rejected ${terminalRequest.status}")
-                terminalState.claim(CaptureTerminalStatus.FAILED)
-                finished.set(true)
-                publishRawTerminalSnapshot(RawTerminalSettlementPhase.SETTLEMENT_FAILED, terminalRequest.reason, failure)
-                cleanup()
-            }
-        }
+        )
 
+        fun finishSuccess(partial: Boolean = false, reason: String? = null) = submitTerminal(
+            RawTerminalRequest(
+                status = if (partial) CaptureTerminalStatus.PARTIAL_SUCCESS else CaptureTerminalStatus.SUCCESS,
+                jobStatus = if (partial) "CAPTURE_COMPLETE_PARTIAL" else "CAPTURE_COMPLETE",
+                reason = reason,
+                completionKind = RawTerminalCompletionKind.SUCCESS,
+                cause = null,
+                saveMotion = true
+            )
+        )
 
-        fun finishSuccess(
+        fun finishCancelled() = submitTerminal(
+            RawTerminalRequest(
+                status = CaptureTerminalStatus.CANCELLED,
+                jobStatus = "CAPTURE_CANCELLED",
+                reason = "CAPTURE_CANCELLED: RAW capture was cancelled",
+                completionKind = RawTerminalCompletionKind.ERROR,
+                cause = null,
+                saveMotion = false
+            )
+        )
+
+        /* Legacy terminal implementations retained only in history; the wrappers above are authoritative.
+        fun finishSuccessLegacy(
             partial: Boolean = false,
             reason: String? = null
         ) {
@@ -788,7 +837,7 @@ fun captureRawBurstForFusion(
             }
         }
 
-        fun finishCancelled() {
+        fun finishCancelledLegacy() {
             val terminalRequest = RawTerminalRequest(
                 status = CaptureTerminalStatus.CANCELLED,
                 jobStatus = "CAPTURE_CANCELLED",
@@ -832,6 +881,7 @@ fun captureRawBurstForFusion(
             }
         }
 
+        */
         cancellationDispatcher.set { finishCancelled() }
         if (cancellationRequested.get()) {
             finishCancelled()

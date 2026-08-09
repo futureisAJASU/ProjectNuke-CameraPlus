@@ -680,7 +680,7 @@ class YuvCaptureOwnerTest {
     }
 
     @Test
-    fun closeAndDrainRetainedExcludesEncodingItems() {
+    fun coordinatedDrainExcludesEncodingItems() {
         val reservations = YuvBufferReservations(1024L)
         val accounting = YuvCaptureAccounting()
         val lifecycle = YuvBufferedLifecycle()
@@ -690,7 +690,7 @@ class YuvCaptureOwnerTest {
         assertTrue(lifecycle.tryRegister(item1))
         assertTrue(lifecycle.tryRegister(item2))
         assertTrue(lifecycle.beginEncoding(item1))
-        val drained = lifecycle.closeAndDrainRetained()
+        val drained = lifecycle.drainRetainedForTest()
         assertEquals(listOf(item2), drained)
         assertEquals(1, lifecycle.encodingCount())
         lifecycle.settleEncoding(item1, accounting)

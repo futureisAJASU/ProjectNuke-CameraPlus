@@ -138,7 +138,7 @@ class YuvWorkDisposalOutcomeTest {
         val observer = AtomicInteger(0)
         YuvPngWorkItem.bufferedForTest(1, 1L, 100L, reservations, accounting)
         // Release the first item's accounting count externally (the owner's
-        // settleBufferedAccounting path), then do the same for the second item so
+        // buffered settlement path), then do the same for the second item so
         // dispose()'s accounting release hits the double-release check().
         accounting.releasedBufferedFrame()
         val item = YuvPngWorkItem.bufferedForTest(2, 2L, 100L, reservations2, accounting) {
@@ -230,7 +230,7 @@ class YuvWorkDisposalOutcomeTest {
         assertEquals(1, accounting.snapshot().bufferedFrames)
         assertEquals(1, observer.get())
         // The caller can settle the debt through the normal path.
-        item.settleBufferedAccounting(accounting)
+        item.completeBufferedSettlement(accounting)
         assertEquals(0L, reservations.currentBytes())
         assertEquals(0, accounting.snapshot().bufferedFrames)
     }
