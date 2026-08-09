@@ -9,12 +9,14 @@ import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.CancellationException
+import java.util.UUID
 
 internal const val SINGLE_FRAME_OUTPUT_FILE_NAME = "single_frame_processed.png"
 private const val SINGLE_FRAME_PIPELINE_VERSION = "single_yuv_isp_v1"
 
 internal enum class SingleFrameCleanupResult {
     PREVIOUS_OUTPUT_RESTORED,
+    COMMITTED_FINAL_RETAINED,
     NEW_OUTPUT_REMOVED,
     NO_PREVIOUS_OUTPUT,
     UNCOMMITTED_OUTPUT_REMAINS,
@@ -39,6 +41,7 @@ internal fun processSingleFrameJobSync(
     }
     val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
     val processingStartedAt = System.currentTimeMillis()
+    val processingAttemptId = UUID.randomUUID().toString()
 
     persistSingleFrameProgress(
         jobDir = jobDir,
@@ -48,6 +51,9 @@ internal fun processSingleFrameJobSync(
         stage = "PROCESSING",
         status = "SINGLE_FRAME_PROCESSING"
     )
+    KeplerJobMetadata.update(jobDir) { current ->
+        current.put("processingAttemptId", processingAttemptId)
+    }
 
     var sourceForCleanup: Bitmap? = null
     var processedForCleanup: Bitmap? = null
@@ -57,6 +63,7 @@ internal fun processSingleFrameJobSync(
     var previousOutputHash: String? = null
     var candidateFile: File? = null
     var backupFile: File? = null
+    var committedFinalVerified = false
     try {
         val frames = job.optJSONArray("frames")
             ?: error("Single-frame job has no frames array")
@@ -114,6 +121,7 @@ internal fun processSingleFrameJobSync(
         ) {
             "Single-frame output verification failed"
         }
+        committedFinalVerified = true
         val finishedAt = System.currentTimeMillis()
 
         val completedOutput = requireNotNull(outputFile)
@@ -134,14 +142,18 @@ internal fun processSingleFrameJobSync(
         return completedOutput
     } catch (ce: CancellationException) {
         if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            val settlement = cleanupCancelledSingleFrameOutput(
-                outputFile = outputFile,
-                outputWritten = outputWritten,
-                outputExistedBefore = outputExistedBefore,
-                candidateFile = candidateFile,
-                backupFile = backupFile,
-                previousOutputHash = previousOutputHash
-            )
+            val settlement = if (committedFinalVerified) {
+                SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
+            } else {
+                cleanupCancelledSingleFrameOutput(
+                    outputFile = outputFile,
+                    outputWritten = outputWritten,
+                    outputExistedBefore = outputExistedBefore,
+                    candidateFile = candidateFile,
+                    backupFile = backupFile,
+                    previousOutputHash = previousOutputHash
+                )
+            }
             persistSingleFrameCancellation(
                 jobDir = jobDir,
                 params = params,
@@ -304,10 +316,12 @@ private fun persistSingleFrameCancellation(
                 .put("singleFrameCleanupResult", settlement.name)
                 .put("singleFrameCancelledOutputRetained", settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED)
                 .put("userCanMoveDevice", true)
-            if (settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED) {
+            if (settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED ||
+                settlement == SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
+            ) {
                 current.put("galleryDisplayUnavailable", false)
                     .put("finalOutputAvailable", true)
-                    .put("singleFrameCancelledPriorOutputValid", true)
+                    .put("singleFrameCancelledPriorOutputValid", settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED)
             } else {
                 current.put("galleryDisplayUnavailable", true)
                     .put("finalOutputAvailable", false)

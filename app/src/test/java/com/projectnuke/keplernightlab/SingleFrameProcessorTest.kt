@@ -135,7 +135,7 @@ class SingleFrameProcessorTest {
         }
     }
     @Test
-    fun cancellationAfterAtomicOutputRemovesOrphanAndMarksJobUnavailable() {
+    fun cancellationAfterVerifiedOutputRetainsCommittedResult() {
         val jobDir = Files.createTempDirectory("kepler-single-cancel-").toFile()
         try {
             val sourceFile = File(jobDir, "frame_000.png")
@@ -186,11 +186,11 @@ class SingleFrameProcessorTest {
             }
 
             assertTrue(cancelled)
-            assertFalse(outputFile.exists())
+            assertTrue(outputFile.exists())
             val job = KeplerJobMetadata.read(jobDir)
             assertEquals("PIPELINE_CANCELLED", job.getString("processStatus"))
-            assertTrue(job.getBoolean("galleryDisplayUnavailable"))
-            assertFalse(job.getBoolean("finalOutputAvailable"))
+            assertFalse(job.getBoolean("galleryDisplayUnavailable"))
+            assertTrue(job.getBoolean("finalOutputAvailable"))
         } finally {
             jobDir.deleteRecursively()
         }
