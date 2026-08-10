@@ -403,19 +403,19 @@ fun runSuperResolutionFusion(
     request.outputDir.mkdirs()
 
     if (inputFiles.isEmpty()) {
-        processingAttempt.releaseOwnedLease()
         return failedSuperResolutionResult(
             request = request,
             inputFrameCount = 0,
-            message = "No readable source frames."
+            message = "No readable source frames.",
+            processingAttempt = processingAttempt
         )
     }
     if (request.sourceMode == SuperResolutionSourceMode.FULLRES_50MP_RAW) {
-        processingAttempt.releaseOwnedLease()
         return failedSuperResolutionResult(
             request = request,
             inputFrameCount = inputFiles.size,
-            message = "FULLRES_50MP_RAW decoder is not implemented yet."
+            message = "FULLRES_50MP_RAW decoder is not implemented yet.",
+            processingAttempt = processingAttempt
         )
     }
 
@@ -430,7 +430,8 @@ fun runSuperResolutionFusion(
             return failedSuperResolutionResult(
                 request = request,
                 inputFrameCount = inputFiles.size,
-                message = "Could not decode source frames."
+                message = "Could not decode source frames.",
+                processingAttempt = processingAttempt
             )
         }
 
@@ -548,14 +549,16 @@ fun runSuperResolutionFusion(
             request = request,
             inputFrameCount = inputFiles.size,
             message = "Out of memory; fusion stopped without attempting recovery.",
-            shifts = shifts
+            shifts = shifts,
+            processingAttempt = processingAttempt
         )
     } catch (error: Exception) {
         failedSuperResolutionResult(
             request = request,
             inputFrameCount = inputFiles.size,
             message = "${error.javaClass.simpleName}: ${error.message}",
-            shifts = shifts
+            shifts = shifts,
+            processingAttempt = processingAttempt
         )
     } finally {
         processingAttempt.releaseOwnedLease()
@@ -1612,7 +1615,8 @@ private fun runSingleFrameFallback(
             request = request,
             inputFrameCount = request.inputFrameFiles.size,
             message = "$reason Streaming single-frame fallback is not implemented.",
-            shifts = shifts
+            shifts = shifts,
+            processingAttempt = processingAttempt
         )
     }
     request.status("${superResolutionStatusLabel(request)}: writing output...")
@@ -1627,7 +1631,8 @@ private fun runSingleFrameFallback(
             request,
             request.inputFrameFiles.size,
             "Fallback reference decode failed.",
-            shifts
+            shifts,
+            processingAttempt
         )
     var output: Bitmap? = null
     return try {
@@ -1644,8 +1649,12 @@ private fun runSingleFrameFallback(
             superResolutionOutputFileName(targetMegapixels)
         )
         request.cancellation.throwIfCancelled()
-        saveJpeg(output!!, outputFile)
-        request.cancellation.throwIfCancelled()
+        val artifact = saveJpeg(output!!, outputFile, cancellation = request.cancellation)
+        recordProcessingArtifactSettlements(
+            request.outputDir,
+            processingAttempt,
+            artifact.settlements
+        )
         val actualOutputMegapixels = megapixels(output!!.width, output!!.height)
         val result = SuperResolutionFusionResult(
             outputFile = outputFile,
@@ -1664,8 +1673,9 @@ private fun runSingleFrameFallback(
             message = reason
         )
         markProcessingArtifactClaim(request.outputDir, processingAttempt, "superResolutionOutputFile", requireNotNull(result.outputFile))
+        val postCommitCancellation = request.cancellation.isCancelled
         writeSuperResolutionJob(request, result, "COMPLETE", reason, processingAttempt)
-        if (request.cancellation.isCancelled) {
+        if (postCommitCancellation) {
             markProcessingPostCommitCancellation(request.outputDir, processingAttempt)
         }
         result
@@ -1679,7 +1689,8 @@ private fun failedSuperResolutionResult(
     request: SuperResolutionFusionRequest,
     inputFrameCount: Int,
     message: String,
-    shifts: List<FrameShift> = emptyList()
+    shifts: List<FrameShift> = emptyList(),
+    processingAttempt: ProcessingAttempt? = null
 ): SuperResolutionFusionResult {
     val sourceMegapixels = detectSourceMegapixels(request.inputFrameFiles.firstOrNull())
     val targetMegapixels = if (sourceMegapixels > 0.0) {
@@ -1705,7 +1716,7 @@ private fun failedSuperResolutionResult(
         rawInputUsed = request.sourceMode == SuperResolutionSourceMode.FULLRES_50MP_RAW,
         message = message
     )
-    runCatching { writeSuperResolutionJob(request, result, "FAILED", message) }
+    runCatching { writeSuperResolutionJob(request, result, "FAILED", message, processingAttempt) }
     return result
 }
 
@@ -1820,9 +1831,15 @@ private fun createSuperResolutionJobDirectory(context: Context): File {
     }
 }
 
-private fun saveJpeg(bitmap: Bitmap, outputFile: File, quality: Int = JPEG_QUALITY) {
-    commitProcessingArtifact(
+private fun saveJpeg(
+    bitmap: Bitmap,
+    outputFile: File,
+    quality: Int = JPEG_QUALITY,
+    cancellation: KeplerPipelineCancellation? = null
+): ProcessingArtifactResult {
+    return commitProcessingArtifact(
         finalFile = outputFile,
+        cancellation = cancellation,
         writeTemp = { temporary ->
             FileOutputStream(temporary).use { output ->
                 check(bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {

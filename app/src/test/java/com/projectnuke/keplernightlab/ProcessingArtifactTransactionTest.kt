@@ -214,4 +214,52 @@ class ProcessingArtifactTransactionTest {
             dir.deleteRecursively()
         }
     }
+
+    @Test
+    fun settlementObserverRunsExactlyOnceOnSuccess() {
+        val dir = Files.createTempDirectory("processing-artifact-observer-success").toFile()
+        try {
+            val reports = mutableListOf<ProcessingArtifactSettlementReport>()
+            val result = commitProcessingArtifact(
+                finalFile = File(dir, "result.bin"),
+                writeTemp = { it.writeBytes("ok".toByteArray()) },
+                verifyFinal = { check(it.readText() == "ok") },
+                onSettlement = { reports += it }
+            )
+            assertEquals(ProcessingArtifactState.ADOPTED, result.state)
+            assertEquals(1, reports.size)
+            assertEquals(ProcessingArtifactState.ADOPTED, reports.single().state)
+            assertTrue(reports.single().settlements.any {
+                it.status == ProcessingArtifactSettlementStatus.ADOPTED
+            })
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun settlementObserverRunsBeforeCancellationRethrow() {
+        val dir = Files.createTempDirectory("processing-artifact-observer-cancel").toFile()
+        try {
+            val reports = mutableListOf<ProcessingArtifactSettlementReport>()
+            val cancellation = TestCancellation(cancelled = true)
+            var cancelled = false
+            try {
+                commitProcessingArtifact(
+                    finalFile = File(dir, "result.bin"),
+                    writeTemp = { it.writeBytes("never".toByteArray()) },
+                    verifyFinal = {},
+                    cancellation = cancellation,
+                    onSettlement = { reports += it }
+                )
+            } catch (_: CancellationException) {
+                cancelled = true
+            }
+            assertTrue(cancelled)
+            assertEquals(1, reports.size)
+            assertTrue(reports.single().settlements.isNotEmpty())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
 }

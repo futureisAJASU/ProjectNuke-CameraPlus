@@ -55,16 +55,13 @@ internal fun processSingleFrameJobSync(
         params = params,
         metadataPolicy = metadataPolicy,
         stage = "PROCESSING",
-        status = "SINGLE_FRAME_PROCESSING"
+        status = "SINGLE_FRAME_PROCESSING",
+        attempt = processingAttempt
     )
     if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
         updateProcessingStage(jobDir, "PROCESSING", "SINGLE_FRAME_PROCESSING", mutate = { current ->
             current.put("processingAttemptId", processingAttemptId)
         }, attempt = processingAttempt)
-    } else {
-        KeplerJobMetadata.update(jobDir) { current ->
-            current.put("processingAttemptId", processingAttemptId)
-        }
     }
 
     var sourceForCleanup: Bitmap? = null
@@ -146,7 +143,8 @@ internal fun processSingleFrameJobSync(
             params = params,
             processingStartedAt = processingStartedAt,
             finishedAt = finishedAt,
-            metadataPolicy = metadataPolicy
+            metadataPolicy = metadataPolicy,
+            attempt = processingAttempt
         )
         backupFile?.let { backup ->
             if (Files.exists(backup.toPath(), LinkOption.NOFOLLOW_LINKS) &&
@@ -177,7 +175,8 @@ internal fun processSingleFrameJobSync(
                 params = params,
                 processingStartedAt = processingStartedAt,
                 settlement = settlement,
-                cancellation = ce
+                cancellation = ce,
+                attempt = processingAttempt
             )
         }
         throw ce
@@ -193,7 +192,8 @@ internal fun processSingleFrameJobSync(
             processingStartedAt,
             metadataPolicy,
             oom,
-            settlement
+            settlement,
+            processingAttempt
         )
         throw oom
     } catch (e: Exception) {
@@ -208,7 +208,8 @@ internal fun processSingleFrameJobSync(
             processingStartedAt,
             metadataPolicy,
             e,
-            settlement
+            settlement,
+            processingAttempt
         )
         throw e
     } finally {
@@ -317,10 +318,11 @@ private fun persistSingleFrameCancellation(
     params: ClassicYuvFusionParams,
     processingStartedAt: Long,
     settlement: SingleFrameCleanupResult,
-    cancellation: CancellationException
+    cancellation: CancellationException,
+    attempt: ProcessingAttempt
 ) {
     runCatching {
-        KeplerJobMetadata.update(jobDir) { current ->
+        updateForProcessingAttempt(jobDir, attempt) { current ->
             current.put("processingStartedAt", processingStartedAt)
                 .put("processingTimeMs", System.currentTimeMillis() - processingStartedAt)
                 .put("singleFrameProcessingPolicy", ReprocessMetadataPolicy.NORMAL.name)
@@ -358,9 +360,10 @@ private fun persistSingleFrameProgress(
     params: ClassicYuvFusionParams,
     metadataPolicy: ReprocessMetadataPolicy,
     stage: String,
-    status: String
+    status: String,
+    attempt: ProcessingAttempt
 ) {
-    KeplerJobMetadata.update(jobDir) { current ->
+    updateForProcessingAttempt(jobDir, attempt) { current ->
         current.put("processingStartedAt", processingStartedAt)
             .put("singleFrameProcessingPolicy", metadataPolicy.name)
             .put("fusionEngine", SINGLE_FRAME_PIPELINE_VERSION)
@@ -387,9 +390,10 @@ private fun persistSingleFrameSuccess(
     params: ClassicYuvFusionParams,
     processingStartedAt: Long,
     finishedAt: Long,
-    metadataPolicy: ReprocessMetadataPolicy
+    metadataPolicy: ReprocessMetadataPolicy,
+    attempt: ProcessingAttempt
 ) {
-    KeplerJobMetadata.update(jobDir) { current ->
+    updateForProcessingAttempt(jobDir, attempt) { current ->
         current.put("processingStartedAt", processingStartedAt)
             .put("processingTimeMs", finishedAt - processingStartedAt)
             .put("singleFrameProcessingPolicy", metadataPolicy.name)
@@ -440,10 +444,11 @@ private fun persistSingleFrameFailure(
     processingStartedAt: Long,
     metadataPolicy: ReprocessMetadataPolicy,
     failure: Throwable,
-    settlement: SingleFrameCleanupResult = SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
+    settlement: SingleFrameCleanupResult = SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT,
+    attempt: ProcessingAttempt
 ) {
     runCatching {
-        KeplerJobMetadata.update(jobDir) { current ->
+        updateForProcessingAttempt(jobDir, attempt) { current ->
             current.put("processingStartedAt", processingStartedAt)
                 .put("processingTimeMs", System.currentTimeMillis() - processingStartedAt)
                 .put("singleFrameProcessingPolicy", metadataPolicy.name)

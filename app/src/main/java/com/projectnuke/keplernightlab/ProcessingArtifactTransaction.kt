@@ -34,6 +34,7 @@ internal enum class ProcessingArtifactSettlementStatus {
     ABSENT,
     DELETED,
     RESTORED,
+    RESTORED_UNVERIFIED,
     ADOPTED,
     DELETE_FAILED,
     RESTORE_FAILED
@@ -61,6 +62,14 @@ internal data class ProcessingArtifactResult(
     val hadPriorFinal: Boolean = false,
     /** Whether rollback restored and verified the prior final. */
     val priorFinalRestored: Boolean = false
+)
+
+internal data class ProcessingArtifactSettlementReport(
+    val state: ProcessingArtifactState,
+    val settlements: List<ProcessingArtifactSettlementRecord>,
+    val cleanupFailure: Throwable?,
+    val hadPriorFinal: Boolean,
+    val priorFinalRestored: Boolean
 )
 
 /**
@@ -128,7 +137,8 @@ internal fun commitProcessingArtifact(
     finalFile: File,
     writeTemp: (File) -> Unit,
     verifyFinal: (File) -> Unit,
-    cancellation: KeplerPipelineCancellation? = null
+    cancellation: KeplerPipelineCancellation? = null,
+    onSettlement: ((ProcessingArtifactSettlementReport) -> Unit)? = null
 ): ProcessingArtifactResult {
     val parent = finalFile.parentFile ?: error("Artifact parent is missing")
     require(NoFollowFileSystem.isRealDirectory(parent.toPath())) { "Artifact parent must be a real directory" }
@@ -141,6 +151,15 @@ internal fun commitProcessingArtifact(
     var priorBackedUp = false
     var newFinalCommitted = false
     var priorRestored = false
+
+    fun notifySettlement(report: ProcessingArtifactSettlementReport) {
+        try {
+            onSettlement?.invoke(report)
+        } catch (observerFailure: Throwable) {
+            // Settlement observers are diagnostic only and must never replace
+            // the primary transaction result/failure.
+        }
+    }
 
     fun checkCancelled() {
         cancellation?.throwIfCancelled()
@@ -191,7 +210,7 @@ internal fun commitProcessingArtifact(
             ProcessingArtifactResourceRole.TEMPORARY,
             ProcessingArtifactSettlementStatus.ABSENT
         )
-        return ProcessingArtifactResult(
+        val result = ProcessingArtifactResult(
             finalFile = finalFile,
             state = state,
             cleanupFailure = settlements.firstOrNull { it.failure != null }?.failure,
@@ -199,6 +218,16 @@ internal fun commitProcessingArtifact(
             hadPriorFinal = priorBackedUp,
             priorFinalRestored = false
         )
+        notifySettlement(
+            ProcessingArtifactSettlementReport(
+                state = result.state,
+                settlements = result.settlements,
+                cleanupFailure = result.cleanupFailure,
+                hadPriorFinal = result.hadPriorFinal,
+                priorFinalRestored = result.priorFinalRestored
+            )
+        )
+        return result
     } catch (failure: Throwable) {
         val cleanupRecords = mutableListOf<ProcessingArtifactSettlementRecord>()
         if (newFinalCommitted) {
@@ -229,9 +258,9 @@ internal fun commitProcessingArtifact(
                 )
             } catch (restoreFailure: Throwable) {
                 cleanupRecords += ProcessingArtifactSettlementRecord(
-                    priorBackup,
-                    ProcessingArtifactResourceRole.PRIOR_BACKUP,
-                    ProcessingArtifactSettlementStatus.RESTORE_FAILED,
+                    finalFile,
+                    ProcessingArtifactResourceRole.RESTORED_PRIOR,
+                    ProcessingArtifactSettlementStatus.RESTORED_UNVERIFIED,
                     restoreFailure
                 )
             }
@@ -245,6 +274,15 @@ internal fun commitProcessingArtifact(
         } else {
             state = ProcessingArtifactState.ROLLED_BACK
         }
+        notifySettlement(
+            ProcessingArtifactSettlementReport(
+                state = state,
+                settlements = allSettlements,
+                cleanupFailure = cleanupFailure,
+                hadPriorFinal = priorBackedUp,
+                priorFinalRestored = priorRestored
+            )
+        )
         if (failure is Error || failure is java.util.concurrent.CancellationException) throw failure
         throw ProcessingArtifactException(
             finalFile = finalFile,
@@ -256,6 +294,22 @@ internal fun commitProcessingArtifact(
         )
     }
 }
+
+// Binary/source compatibility for callers compiled before the diagnostic
+// settlement observer was added. The observer-aware overload remains the
+// authoritative implementation.
+internal fun commitProcessingArtifact(
+    finalFile: File,
+    writeTemp: (File) -> Unit,
+    verifyFinal: (File) -> Unit,
+    cancellation: KeplerPipelineCancellation?
+): ProcessingArtifactResult = commitProcessingArtifact(
+    finalFile = finalFile,
+    writeTemp = writeTemp,
+    verifyFinal = verifyFinal,
+    cancellation = cancellation,
+    onSettlement = null
+)
 
 internal fun writeVerifiedJsonArtifact(finalFile: File, text: String): ProcessingArtifactResult =
     commitProcessingArtifact(
