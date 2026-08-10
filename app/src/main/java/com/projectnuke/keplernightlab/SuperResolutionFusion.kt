@@ -275,12 +275,11 @@ internal class StreamingPngTileSink(
             state = State.COMMITTED
             outputFile
         } catch (failure: Throwable) {
-            cleanupRecords += settleTemporary()
+            cleanupRecords += listOfNotNull(settleTemporary())
+            settleStreams()
             runCatching { encoder.end() }
                 .onSuccess { resourceSettlementRecords += ProcessingResourceSettlementRecord("DEFLATER", "ENDED") }
                 .onFailure { resourceSettlementRecords += ProcessingResourceSettlementRecord("DEFLATER", "END_FAILED", it) }
-            stream = null
-            rawOutput = null
             deflater = null
             temporary = null
             state = State.FAILED
@@ -292,25 +291,14 @@ internal class StreamingPngTileSink(
         if (state == State.COMMITTED || state == State.ABORTED) return
         check(state == State.WRITING || state == State.FAILED) { "PNG sink abort in state=$state" }
         state = State.ABORTING
-        val streamFailure = runCatching { stream?.close() }.exceptionOrNull()
-        resourceSettlementRecords += if (streamFailure == null) {
-            ProcessingResourceSettlementRecord("STREAM", "CLOSED")
-        } else {
-            ProcessingResourceSettlementRecord("STREAM", "CLOSE_FAILED", streamFailure)
-        }
-        val rawFailure = runCatching { rawOutput?.close() }.exceptionOrNull()
-        resourceSettlementRecords += if (rawFailure == null) {
-            ProcessingResourceSettlementRecord("RAW_FD", "CLOSED")
-        } else {
-            ProcessingResourceSettlementRecord("RAW_FD", "CLOSE_FAILED", rawFailure)
-        }
+        settleStreams()
         val deflaterFailure = runCatching { deflater?.end() }.exceptionOrNull()
         resourceSettlementRecords += if (deflaterFailure == null) {
             ProcessingResourceSettlementRecord("DEFLATER", "ENDED")
         } else {
             ProcessingResourceSettlementRecord("DEFLATER", "END_FAILED", deflaterFailure)
         }
-        cleanupRecords += settleTemporary()
+        cleanupRecords += listOfNotNull(settleTemporary())
         stream = null
         rawOutput = null
         deflater = null
@@ -321,13 +309,33 @@ internal class StreamingPngTileSink(
     internal fun settlementRecords(): List<ProcessingArtifactSettlementRecord> = cleanupRecords.toList()
     internal fun resourceSettlementRecords(): List<ProcessingResourceSettlementRecord> = resourceSettlementRecords.toList()
 
-    private fun settleTemporary(): ProcessingArtifactSettlementRecord {
+    private fun settleTemporary(): ProcessingArtifactSettlementRecord? {
         return temporary?.let { settleProcessingArtifactPath(it) }
-            ?: ProcessingArtifactSettlementRecord(
-                outputFile,
-                ProcessingArtifactResourceRole.TEMPORARY,
-                ProcessingArtifactSettlementStatus.NOT_ATTEMPTED
-            )
+    }
+
+    private fun settleStreams() {
+        val currentStream = stream
+        val streamFailure = runCatching { currentStream?.close() }.exceptionOrNull()
+        resourceSettlementRecords += if (streamFailure == null) {
+            ProcessingResourceSettlementRecord("STREAM", "CLOSED")
+        } else {
+            ProcessingResourceSettlementRecord("STREAM", "CLOSE_FAILED", streamFailure)
+        }
+        if (streamFailure != null) {
+            val currentRaw = rawOutput
+            if (currentRaw != null) {
+                val rawFailure = runCatching { currentRaw.close() }.exceptionOrNull()
+                resourceSettlementRecords += if (rawFailure == null) {
+                    ProcessingResourceSettlementRecord("RAW_FD_FALLBACK", "CLOSED")
+                } else {
+                    ProcessingResourceSettlementRecord("RAW_FD_FALLBACK", "CLOSE_FAILED", rawFailure)
+                }
+            }
+        } else if (currentStream != null) {
+            resourceSettlementRecords += ProcessingResourceSettlementRecord("RAW_FD", "CLOSED")
+        }
+        stream = null
+        rawOutput = null
     }
 
     private fun writeInt(target: ByteArray, offset: Int, value: Int) {
