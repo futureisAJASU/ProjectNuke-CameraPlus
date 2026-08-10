@@ -554,7 +554,7 @@ fun copyToClipboard(context: Context, label: String, text: String) {
 
 @SuppressLint("MissingPermission")
 @Suppress("DEPRECATION")
-fun captureSingleRawDng(
+private fun captureSingleRawDng(
     context: Context,
     cameraId: String = "0",
     onStatus: (String) -> Unit
@@ -770,7 +770,7 @@ fun captureSingleRawDng(
 
 @SuppressLint("MissingPermission")
 @Suppress("DEPRECATION")
-fun captureRawBurstDng(
+private fun captureRawBurstDng(
     context: Context,
     cameraId: String = "0",
     frameCount: Int = 4,
@@ -1078,7 +1078,7 @@ fun captureRawBurstDng(
 
 @SuppressLint("MissingPermission")
 @Suppress("DEPRECATION")
-fun captureYuvBurstGrayWithMotion(
+private fun captureYuvBurstGrayWithMotion(
     context: Context,
     cameraId: String = "0",
     frameCount: Int = 4,

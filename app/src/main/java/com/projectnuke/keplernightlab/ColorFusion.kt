@@ -1035,7 +1035,7 @@ private fun writeBitmapToTempPng(bitmap: Bitmap, finalFile: File) {
     )
 }
 
-fun averageLatestYuvBurstColor(
+private fun averageLatestYuvBurstColor(
     context: Context,
     onStatus: (String) -> Unit
 ) {
