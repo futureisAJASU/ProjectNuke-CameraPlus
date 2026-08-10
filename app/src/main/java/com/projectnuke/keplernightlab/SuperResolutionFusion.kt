@@ -1672,6 +1672,14 @@ private fun writeSuperResolutionJob(
     status: String,
     reason: String?
 ) {
+    val priorAttempt = runCatching {
+        NoFollowFileSystem.resolveDirectChildResult(request.outputDir, SUPER_RES_JOB_FILE, requireFile = true)
+            .let { result ->
+                if (result is NoFollowInspection.Present) {
+                    JSONObject(NoFollowFileSystem.readTextVerified(result.value))
+                } else null
+            }
+    }.getOrNull()
     val shiftArray = JSONArray()
     result.estimatedShifts.forEach { shift ->
         shiftArray.put(
@@ -1726,6 +1734,11 @@ private fun writeSuperResolutionJob(
         .put("reason", reason ?: JSONObject.NULL)
         .put("failureMessage", if (status == "FAILED") result.message else JSONObject.NULL)
         .put("message", result.message)
+    priorAttempt?.optString("processingAttemptId")?.takeIf { it.isNotBlank() }?.let {
+        job.put("processingAttemptId", it)
+            .put("processingStartedAt", priorAttempt.optLong("processingStartedAt"))
+            .put("processingMode", priorAttempt.optString("processingMode", "SUPER_RESOLUTION"))
+    }
     KeplerJobMetadata.write(request.outputDir, job)
 }
 

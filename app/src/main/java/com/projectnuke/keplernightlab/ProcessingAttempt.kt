@@ -25,6 +25,12 @@ internal fun beginProcessingAttempt(
     additionalOwnedKeys: Set<String> = emptySet()
 ): ProcessingAttempt {
     val attempt = ProcessingAttempt(UUID.randomUUID().toString(), System.currentTimeMillis(), mode)
+    if (NoFollowFileSystem.resolveDirectChildResult(jobDir, JOB_JSON_FILE_NAME, requireFile = true) is NoFollowInspection.Absent) {
+        KeplerJobMetadata.write(
+            jobDir,
+            org.json.JSONObject().put("jobType", mode).put("pipeline", mode)
+        )
+    }
     KeplerJobMetadata.update(jobDir) { job ->
         (COMMON_PROCESSING_ATTEMPT_KEYS + additionalOwnedKeys).forEach(job::remove)
         job.put("processingAttemptId", attempt.id)

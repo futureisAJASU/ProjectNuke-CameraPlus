@@ -40,4 +40,17 @@ class ProcessingAttemptTest {
             dir.deleteRecursively()
         }
     }
+
+    @Test
+    fun newAttemptCreatesMetadataForNewProcessingDirectory() {
+        val dir = Files.createTempDirectory("processing-attempt-new").toFile()
+        try {
+            val attempt = beginProcessingAttempt(dir, "SUPER_RESOLUTION")
+            val job = KeplerJobMetadata.read(dir)
+            assertEquals(attempt.id, job.getString("processingAttemptId"))
+            assertEquals("SUPER_RESOLUTION", job.getString("processingMode"))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
 }
