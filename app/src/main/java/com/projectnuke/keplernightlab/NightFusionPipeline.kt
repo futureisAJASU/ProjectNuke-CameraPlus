@@ -239,6 +239,7 @@ internal fun reprocessYuvJob(
     fusionParams: ClassicYuvFusionParams? = null,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     operationLease: JobOperationLease? = null,
+    workerPostOperation: ((Runnable) -> Boolean)? = null,
     onStatus: (String) -> Unit
 ): ReprocessWorkerRun {
     val mainHandler = Handler(Looper.getMainLooper())
@@ -252,7 +253,9 @@ internal fun reprocessYuvJob(
     }
     val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
     val workerThread = HandlerThread("KeplerYuvReprocessThread").apply { start() }
-    Handler(workerThread.looper).post {
+    val workerHandler = Handler(workerThread.looper)
+    val workerPosted = runCatching {
+        (workerPostOperation ?: workerHandler::post).invoke(Runnable {
         val jobFile = NoFollowFileSystem.requireDirectChildFile(jobDir, JOB_JSON_FILE_NAME)
         var totalFrames = 0
         var enabledFrames = 0
@@ -287,7 +290,7 @@ internal fun reprocessYuvJob(
                 val message = "Not enough enabled YUV frames to reprocess: required=$requiredFrames actual=$enabledFrames"
                 post(message)
                 terminalResult = Result.failure(IllegalStateException(message))
-                return@post
+                return@Runnable
             }
 
             post(if (singleFrame) {
@@ -375,6 +378,19 @@ internal fun reprocessYuvJob(
                 )
             )
         }
+        })
+    }.getOrElse { false }
+    if (!workerPosted) {
+        workerThread.quitSafely()
+        terminal.complete(
+            ReprocessWorkerOutcome(
+                result = Result.failure(IllegalStateException("YUV reprocess worker could not start")),
+                publicExportCommitted = false,
+                exportVerified = false,
+                disposition = ReprocessTerminalDisposition.UNCOMMITTED_FAILURE,
+                terminalError = IllegalStateException("YUV reprocess worker could not start")
+            )
+        )
     }
     return ReprocessWorkerRun(
         terminal = terminal,
