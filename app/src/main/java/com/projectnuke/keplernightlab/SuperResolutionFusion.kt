@@ -447,7 +447,8 @@ fun runSuperResolutionFusion(
                 shifts = shifts,
                 sourceMegapixels = sourceMegapixels,
                 targetMegapixels = resolvedTargetMegapixels,
-                reason = "Fewer than two frames passed alignment."
+                reason = "Fewer than two frames passed alignment.",
+                processingAttempt = processingAttempt
             )
         }
 
@@ -465,7 +466,8 @@ fun runSuperResolutionFusion(
                 shifts = shifts,
                 sourceMegapixels = sourceMegapixels,
                 targetMegapixels = resolvedTargetMegapixels,
-                reason = "Memory guard selected single-frame fallback."
+                reason = "Memory guard selected single-frame fallback.",
+                processingAttempt = processingAttempt
             )
         }
 
@@ -509,8 +511,8 @@ fun runSuperResolutionFusion(
             rawInputUsed = request.sourceMode == SuperResolutionSourceMode.FULLRES_50MP_RAW,
             message = "Multi-frame tiled super-resolution completed."
         )
-        writeSuperResolutionJob(request, result, "COMPLETE", null)
         markProcessingArtifactClaim(request.outputDir, processingAttempt, "superResolutionOutputFile", requireNotNull(result.outputFile))
+        writeSuperResolutionJob(request, result, "COMPLETE", null, processingAttempt)
         result
     } catch (ce: CancellationException) {
         throw ce
@@ -1575,7 +1577,8 @@ private fun runSingleFrameFallback(
     shifts: List<FrameShift>,
     sourceMegapixels: Double,
     targetMegapixels: Double,
-    reason: String
+    reason: String,
+    processingAttempt: ProcessingAttempt
 ): SuperResolutionFusionResult {
     if (targetMegapixels > request.targetPolicy.maxSafeTargetMegapixels) {
         return failedSuperResolutionResult(
@@ -1633,7 +1636,8 @@ private fun runSingleFrameFallback(
             rawInputUsed = request.sourceMode == SuperResolutionSourceMode.FULLRES_50MP_RAW,
             message = reason
         )
-        writeSuperResolutionJob(request, result, "COMPLETE", reason)
+        markProcessingArtifactClaim(request.outputDir, processingAttempt, "superResolutionOutputFile", requireNotNull(result.outputFile))
+        writeSuperResolutionJob(request, result, "COMPLETE", reason, processingAttempt)
         result
     } finally {
         output?.takeUnless { it.isRecycled }?.recycle()
@@ -1679,7 +1683,8 @@ private fun writeSuperResolutionJob(
     request: SuperResolutionFusionRequest,
     result: SuperResolutionFusionResult,
     status: String,
-    reason: String?
+    reason: String?,
+    processingAttempt: ProcessingAttempt? = null
 ) {
     val priorAttempt = runCatching {
         NoFollowFileSystem.resolveDirectChildResult(request.outputDir, SUPER_RES_JOB_FILE, requireFile = true)
@@ -1748,7 +1753,17 @@ private fun writeSuperResolutionJob(
             .put("processingStartedAt", priorAttempt.optLong("processingStartedAt"))
             .put("processingMode", priorAttempt.optString("processingMode", "SUPER_RESOLUTION"))
     }
-    KeplerJobMetadata.write(request.outputDir, job)
+    if (processingAttempt == null) {
+        KeplerJobMetadata.write(request.outputDir, job)
+    } else {
+        updateForProcessingAttempt(request.outputDir, processingAttempt) { current ->
+            val keys = job.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                current.put(key, job.get(key))
+            }
+        }
+    }
 }
 
 private fun readColorBurstFrameFiles(jobDir: File): List<File> {
