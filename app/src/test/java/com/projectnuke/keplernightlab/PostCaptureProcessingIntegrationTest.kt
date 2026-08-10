@@ -45,7 +45,9 @@ class PostCaptureProcessingIntegrationTest {
             assertNotNull(result.outputFile)
             assertTrue(requireNotNull(result.outputFile).isFile)
             assertEquals("COMPLETE", KeplerJobMetadata.read(outputDir).getString("status"))
-            assertTrue(KeplerJobMetadata.read(outputDir).getString("processingAttemptId").isNotBlank())
+            val persisted = KeplerJobMetadata.read(outputDir)
+            assertTrue(persisted.getString("processingAttemptId").isNotBlank())
+            assertTrue(persisted.optInt("processingArtifactSettlementCount") >= 1)
         } finally {
             source.recycle()
             root.deleteRecursively()

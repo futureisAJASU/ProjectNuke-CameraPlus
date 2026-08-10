@@ -509,6 +509,15 @@ fun runSuperResolutionFusion(
             denoiseAlgorithm = request.denoiseAlgorithm,
             cancellation = request.cancellation
         )
+        if (tileSink is StreamingPngTileSink) {
+            recordProcessingArtifactSettlements(
+                request.outputDir,
+                processingAttempt,
+                tileSink.settlementRecords().filter {
+                    it.status != ProcessingArtifactSettlementStatus.ADOPTED
+                }
+            )
+        }
         val actualOutputMegapixels = megapixels(dimensions.first, dimensions.second)
         val result = SuperResolutionFusionResult(
             outputFile = writtenFile,
