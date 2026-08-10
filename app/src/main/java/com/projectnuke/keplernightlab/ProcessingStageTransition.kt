@@ -11,6 +11,12 @@ internal fun updateProcessingStage(
 ) {
     KeplerJobMetadata.update(jobDir) { current ->
         val previous = current.optString("currentPipelineStage", "CAPTURE_COMPLETE")
+        val inProgressStages = setOf(
+            "YUV_ALIGNING", "YUV_MERGING", "YUV_DENOISE_SHARPEN", "YUV_EXPORTING",
+            "RAW_ALIGNING", "RAW_MERGING", "RAW_EXPORTING",
+            "SUPER_RESOLUTION_PROCESSING", "SUPER_RESOLUTION_EXPORTING",
+            "SINGLE_FRAME_PROCESSING"
+        )
         val allowed = when (stage) {
             "PROCESSING" -> previous in setOf(
                 "CAPTURE_COMPLETE", "PROCESSING", "PIPELINE_FAILED", "FAILED", "CANCELLED", "PIPELINE_CANCELLED"
@@ -23,6 +29,9 @@ internal fun updateProcessingStage(
             "PIPELINE_FAILED", "PIPELINE_CANCELLED", "FAILED", "CANCELLED" ->
                 previous != "PIPELINE_COMPLETE" && previous != "VERIFIED_EXPORT_COMPLETE" &&
                     previous != "COMPLETE"
+            in inProgressStages -> previous !in setOf(
+                "PIPELINE_COMPLETE", "VERIFIED_EXPORT_COMPLETE", "COMPLETE"
+            )
             else -> false
         }
         check(allowed) { "Invalid processing stage transition $previous -> $stage" }

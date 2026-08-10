@@ -40,4 +40,21 @@ class ProcessingStageTransitionTest {
             dir.deleteRecursively()
         }
     }
+
+    @Test
+    fun unknownTransitionFailsClosed() {
+        val dir = Files.createTempDirectory("processing-stage-unknown").toFile()
+        try {
+            KeplerJobMetadata.write(dir, JSONObject().put("currentPipelineStage", "PROCESSING"))
+            var rejected = false
+            try {
+                updateProcessingStage(dir, "MADE_UP_STAGE", "STATUS")
+            } catch (_: IllegalStateException) {
+                rejected = true
+            }
+            assertTrue(rejected)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
 }
