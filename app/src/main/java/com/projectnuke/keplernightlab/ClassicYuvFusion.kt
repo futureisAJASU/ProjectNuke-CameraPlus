@@ -336,6 +336,11 @@ internal fun processClassicYuvFusionJob(
         val finalFile = File(jobDir, "sharpened_night_fusion.png")
         cancellation.throwIfCancelled()
         saveClassicBitmap(finalBitmap, finalFile, cancellation)
+        markProcessingArtifactClaim(jobDir, processingAttempt, "finalFile", finalFile)
+        val postCommitCancellation = cancellation.isCancelled
+        if (postCommitCancellation) {
+            markProcessingPostCommitCancellation(jobDir, processingAttempt)
+        }
         val exportDoneAt = System.currentTimeMillis()
         val processingTimeMs = System.currentTimeMillis() - processingStartedAt
         excludedFrameCount = countExcludedFrames(job)
@@ -442,7 +447,7 @@ internal fun processClassicYuvFusionJob(
         job.remove("yuvExternalFrameWeightsTarget")
     }
         val debugMetadataFailure = runCatching {
-            cancellation.throwIfCancelled()
+            if (!postCommitCancellation) cancellation.throwIfCancelled()
             writeFusionDebugMetadata(
                 jobDir = jobDir,
                 job = job,
@@ -458,15 +463,19 @@ internal fun processClassicYuvFusionJob(
                 lowConfidenceAlignmentCount = lowConfidenceAlignmentCount
             )
         }.exceptionOrNull()
-        cancellation.throwIfCancelled()
-        generateFusionDebugArtifacts(
-            jobDir = jobDir,
-            job = job,
-            referenceFile = activeReference.file,
-            mergedBitmap = merged,
-            fusedBitmap = finalBitmap,
-            params = params
-        )
+        if (!postCommitCancellation) {
+            generateFusionDebugArtifacts(
+                jobDir = jobDir,
+                job = job,
+                referenceFile = activeReference.file,
+                mergedBitmap = merged,
+                fusedBitmap = finalBitmap,
+                params = params
+            )
+        } else {
+            job.put("debugArtifactStatus", "SKIPPED_CANCELLED")
+                .put("debugArtifactError", "Optional debug artifacts skipped after required output adoption")
+        }
         if (debugMetadataFailure != null) {
             job.put("debugArtifactStatus", "FAILED")
                 .put(
@@ -474,14 +483,21 @@ internal fun processClassicYuvFusionJob(
                     "${debugMetadataFailure.javaClass.simpleName}: ${debugMetadataFailure.message}".take(240)
                 )
         }
-        cancellation.throwIfCancelled()
-        writeVerifiedJsonArtifact(File(jobDir, "yuv_debug.json"), job.toString(2))
+        if (!postCommitCancellation) {
+            cancellation.throwIfCancelled()
+            writeVerifiedJsonArtifact(File(jobDir, "yuv_debug.json"), job.toString(2))
+        }
         persistClassicYuvSuccess(
             jobDir = jobDir,
             job = job,
-            metadataPolicy = metadataPolicy
+            metadataPolicy = metadataPolicy,
+            attempt = processingAttempt
         )
-        cancellation.throwIfCancelled()
+        if (postCommitCancellation) {
+            markProcessingPostCommitCancellation(jobDir, processingAttempt)
+        } else {
+            cancellation.throwIfCancelled()
+        }
         onStatus("처리가 완료되었습니다.")
         return finalFile
 } catch (oom: OutOfMemoryError) {
@@ -534,7 +550,8 @@ internal fun processClassicYuvFusionJob(
             outputWidth = dimensions?.first,
             outputHeight = dimensions?.second,
             yuvWidth = dimensions?.first,
-            yuvHeight = dimensions?.second
+            yuvHeight = dimensions?.second,
+            attempt = processingAttempt
         )
         throw IllegalStateException("Classic YUV fusion failed: OutOfMemoryError; cache kept", oom)
     } catch (ce: CancellationException) {
@@ -589,7 +606,8 @@ internal fun processClassicYuvFusionJob(
             outputWidth = dimensions?.first,
             outputHeight = dimensions?.second,
             yuvWidth = dimensions?.first,
-            yuvHeight = dimensions?.second
+            yuvHeight = dimensions?.second,
+            attempt = processingAttempt
         )
         throw e
     } finally {
@@ -858,7 +876,6 @@ private fun mergeClassicFrames(
             while (batchStart < candidateFrames.size) {
                 val batchEnd = min(candidateFrames.size, batchStart + memoryPlan.candidateBatchSize)
                 candidateFrames.subList(batchStart, batchEnd).forEachIndexed frameLoop@ { frameOffset, frame ->
-        cancellation.throwIfCancelled()
         if (reportedMergeFrames.add(frame.jsonIndex)) {
             onStatus("Classic YUV fusion: merging frame ${batchStart + frameOffset + 2}/${frames.size}...")
         }
@@ -1236,7 +1253,8 @@ private fun updateAlignmentMetadata(
  *  For touched frames, also removes absent Classic-owned fields. */
 private fun mergeClassicFrameAlignmentIntoLockedJob(
     jobDir: File,
-    localJob: JSONObject
+    localJob: JSONObject,
+    attempt: ProcessingAttempt? = null
 ) {
     // Build a map of local frames by stable identity: (index, file) -> frame JSON from local job
     val localFrames = localJob.optJSONArray("frames") ?: return
@@ -1258,7 +1276,11 @@ private fun mergeClassicFrameAlignmentIntoLockedJob(
     }
 
     // Merge into locked frames by stable identity, inside the update lock
-    KeplerJobMetadata.update(jobDir) { current ->
+    val update: ((JSONObject) -> Unit) -> Unit = { mutate ->
+        if (attempt != null) updateForProcessingAttempt(jobDir, attempt, mutate)
+        else KeplerJobMetadata.update(jobDir, mutate)
+    }
+    update { current ->
         val lockedFrames = current.optJSONArray("frames") ?: return@update
         val lockedFileCount = mutableMapOf<String, Int>()
         repeat(lockedFrames.length()) { index ->
@@ -1654,7 +1676,8 @@ private fun recordClassicFailure(
     outputWidth: Int? = null,
     outputHeight: Int? = null,
     yuvWidth: Int? = null,
-    yuvHeight: Int? = null
+    yuvHeight: Int? = null,
+    attempt: ProcessingAttempt? = null
 ) {
     runCatching {
         val now = System.currentTimeMillis()
@@ -1749,7 +1772,8 @@ private fun recordClassicFailure(
         persistClassicYuvFailure(
             jobDir = jobFile.parentFile ?: error("Job directory missing"),
             job = job,
-            metadataPolicy = metadataPolicy
+            metadataPolicy = metadataPolicy,
+            attempt = attempt
         )
     }
 }
@@ -1882,11 +1906,12 @@ private val classicYuvPerFrameAlignmentFields: Set<String> = setOf(
 private fun persistClassicYuvSuccess(
     jobDir: File,
     job: JSONObject,
-    metadataPolicy: ReprocessMetadataPolicy
+    metadataPolicy: ReprocessMetadataPolicy,
+    attempt: ProcessingAttempt? = null
 ) {
     // Merge per-frame alignment data into locked job's frames array for NORMAL
     if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-        mergeClassicFrameAlignmentIntoLockedJob(jobDir, job)
+        mergeClassicFrameAlignmentIntoLockedJob(jobDir, job, attempt)
     }
     val keysToWrite = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
         classicYuvSuccessOwnedKeys
@@ -1895,7 +1920,11 @@ private fun persistClassicYuvSuccess(
     }
     val failureKeysToClear = classicYuvFailureTerminalKeys
 
-    KeplerJobMetadata.update(jobDir) { current ->
+    val update: ((JSONObject) -> Unit) -> Unit = { mutate ->
+        if (attempt != null) updateForProcessingAttempt(jobDir, attempt, mutate)
+        else KeplerJobMetadata.update(jobDir, mutate)
+    }
+    update { current ->
         // Write owned keys that are present in job; remove absent owned keys
         keysToWrite.forEach { key ->
             if (job.has(key)) current.put(key, job.get(key))
@@ -1911,11 +1940,12 @@ private fun persistClassicYuvSuccess(
 private fun persistClassicYuvFailure(
     jobDir: File,
     job: JSONObject,
-    metadataPolicy: ReprocessMetadataPolicy
+    metadataPolicy: ReprocessMetadataPolicy,
+    attempt: ProcessingAttempt? = null
 ) {
     // Merge per-frame alignment data into locked job's frames array for NORMAL
     if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-        mergeClassicFrameAlignmentIntoLockedJob(jobDir, job)
+        mergeClassicFrameAlignmentIntoLockedJob(jobDir, job, attempt)
     }
     val keysToWrite = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
         classicYuvFailureOwnedKeys + classicYuvRunResultKeys
@@ -1923,7 +1953,11 @@ private fun persistClassicYuvFailure(
         classicYuvFinalProgressKeys
     }
 
-    KeplerJobMetadata.update(jobDir) { current ->
+    val update: ((JSONObject) -> Unit) -> Unit = { mutate ->
+        if (attempt != null) updateForProcessingAttempt(jobDir, attempt, mutate)
+        else KeplerJobMetadata.update(jobDir, mutate)
+    }
+    update { current ->
         // Write owned keys that are present in job; remove absent owned keys
         keysToWrite.forEach { key ->
             if (job.has(key)) current.put(key, job.get(key))
