@@ -57,4 +57,24 @@ class ProcessingStageTransitionTest {
             dir.deleteRecursively()
         }
     }
+
+    @Test
+    fun newAttemptMayRestartAfterPriorTerminalStage() {
+        val dir = Files.createTempDirectory("processing-stage-restart").toFile()
+        try {
+            val first = beginProcessingAttempt(dir, "YUV")
+            updateProcessingStage(dir, "PROCESSING", "PROCESSING", attempt = first)
+            updateProcessingStage(dir, "PIPELINE_FAILED", "FAILED", attempt = first)
+            first.release()
+
+            val second = beginProcessingAttempt(dir, "YUV")
+            updateProcessingStage(dir, "PROCESSING", "PROCESSING", attempt = second)
+            val job = KeplerJobMetadata.read(dir)
+            assertEquals("PROCESSING", job.optString("currentPipelineStage"))
+            assertEquals(second.id, job.optString("processingStageAttemptId"))
+            second.release()
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
 }

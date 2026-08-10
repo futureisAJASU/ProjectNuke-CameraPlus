@@ -34,7 +34,8 @@ private val COMMON_PROCESSING_ATTEMPT_KEYS = setOf(
     "pipelineFailureMessage",
     "processingFinishedAt",
     "processingOutputCommitted",
-    "postCommitCancellationRequested"
+    "postCommitCancellationRequested",
+    "processingStageAttemptId"
 )
 
 internal fun beginProcessingAttempt(

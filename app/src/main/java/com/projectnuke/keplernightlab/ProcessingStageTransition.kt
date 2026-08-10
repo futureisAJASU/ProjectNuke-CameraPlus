@@ -26,7 +26,8 @@ internal fun updateProcessingStage(
             current.optString("processingAttemptId") == it.id &&
                 it.operationLease?.let { lease -> KeplerJobMetadata.isOperationOwner(jobDir, lease) } == true
         } ?: false
-        val newAttemptAfterTerminal = sameAttempt && !current.has("processingFinishedAt")
+        val stageAttemptId = current.optString("processingStageAttemptId").takeIf { it.isNotBlank() }
+        val newAttemptAfterTerminal = sameAttempt && stageAttemptId != attempt?.id
         val allowed = when (stage) {
             "PROCESSING" -> previous in setOf(
                 "CAPTURE_COMPLETE", "PROCESSING"
@@ -48,5 +49,6 @@ internal fun updateProcessingStage(
         mutate(current)
         current.put("currentPipelineStage", stage)
             .put("processStatus", status)
+        attempt?.let { current.put("processingStageAttemptId", it.id) }
     }
 }
