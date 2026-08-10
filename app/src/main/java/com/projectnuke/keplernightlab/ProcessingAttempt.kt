@@ -99,3 +99,15 @@ internal fun markProcessingArtifactClaim(
             .put("processingOutputCommitted", true)
     }
 }
+
+internal fun markProcessingPostCommitCancellation(
+    jobDir: File,
+    attempt: ProcessingAttempt,
+    skippedOptionalWork: Boolean = true
+) {
+    updateForProcessingAttempt(jobDir, attempt) { job ->
+        job.put("processingOutputCommitted", true)
+            .put("postCommitCancellationRequested", true)
+            .put("postCommitWorkSkipped", skippedOptionalWork)
+    }
+}

@@ -513,6 +513,9 @@ fun runSuperResolutionFusion(
         )
         markProcessingArtifactClaim(request.outputDir, processingAttempt, "superResolutionOutputFile", requireNotNull(result.outputFile))
         writeSuperResolutionJob(request, result, "COMPLETE", null, processingAttempt)
+        if (request.cancellation.isCancelled) {
+            markProcessingPostCommitCancellation(request.outputDir, processingAttempt)
+        }
         result
     } catch (ce: CancellationException) {
         throw ce
@@ -1638,6 +1641,9 @@ private fun runSingleFrameFallback(
         )
         markProcessingArtifactClaim(request.outputDir, processingAttempt, "superResolutionOutputFile", requireNotNull(result.outputFile))
         writeSuperResolutionJob(request, result, "COMPLETE", reason, processingAttempt)
+        if (request.cancellation.isCancelled) {
+            markProcessingPostCommitCancellation(request.outputDir, processingAttempt)
+        }
         result
     } finally {
         output?.takeUnless { it.isRecycled }?.recycle()
