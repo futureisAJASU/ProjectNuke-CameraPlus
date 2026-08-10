@@ -185,4 +185,32 @@ class ProcessingArtifactTransactionTest {
             dir.deleteRecursively()
         }
     }
+
+    @Test
+    fun cancellationAfterCommitKeepsVerifiedNewFinal() {
+        val dir = Files.createTempDirectory("processing-artifact-post-commit-cancel").toFile()
+        try {
+            val finalFile = File(dir, "result.bin")
+            val cancellation = object : KeplerPipelineCancellation {
+                var cancelled = false
+                override val isCancelled: Boolean get() = cancelled
+                override fun throwIfCancelled() {
+                    if (cancelled) throw CancellationException("cancelled")
+                }
+            }
+            val result = commitProcessingArtifact(
+                finalFile,
+                writeTemp = { it.writeBytes("new".toByteArray()) },
+                verifyFinal = { committed ->
+                    cancellation.cancelled = true
+                    check(committed.readText() == "new")
+                },
+                cancellation = cancellation
+            )
+            assertEquals(ProcessingArtifactState.ADOPTED, result.state)
+            assertEquals("new", finalFile.readText())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
 }

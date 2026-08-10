@@ -11,7 +11,6 @@ import android.os.Looper
 import android.util.Log
 import org.json.JSONObject
 import java.io.File
-import java.io.FileOutputStream
 import java.util.concurrent.CancellationException
 import kotlin.math.abs
 import kotlin.math.pow
