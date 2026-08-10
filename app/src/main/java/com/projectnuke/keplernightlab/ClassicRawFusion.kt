@@ -413,7 +413,12 @@ private fun buildRawProxy(
     val row = ShortArray(sensor.width)
     val rowBytes = ByteArray(sensor.width * 2)
     cancellation.throwIfCancelled()
-    RandomAccessFile(file, "r").use { input ->
+    val inputHandle = VerifiedRandomAccessHandle.open(
+        file,
+        sensor.width.toLong() * sensor.height.toLong() * 2L
+    )
+    try {
+        val input = inputHandle.randomAccess
         var out = 0
         var y = 0
         while (y < sensor.height && out < luma.size) {
@@ -434,6 +439,9 @@ private fun buildRawProxy(
             }
             y += step
         }
+        inputHandle.verifyPathStillMatches()
+    } finally {
+        inputHandle.close()?.let { throw it }
     }
     cancellation.throwIfCancelled()
     val mean = luma.fold(0L) { sum, value -> sum + (value.toInt() and 0xFF) }
@@ -577,7 +585,7 @@ private fun mergeClassicRawTiles(
         "RAW output range is outside the 16-bit contract"
     }
     require(whiteRange in 1..65535) { "RAW white range is invalid" }
-    val frameInputs = linkedMapOf<ClassicRawFrame, RandomAccessFile>()
+    val frameInputs = linkedMapOf<ClassicRawFrame, VerifiedRandomAccessHandle>()
     val sourceRows = frames.associateWith { ShortArray(sensor.width) }
     val memoryPlan = planFusionMemory(
         FusionMemoryPlanRequest(
@@ -599,16 +607,13 @@ private fun mergeClassicRawTiles(
     val outRow = ByteArray(sensor.width * 2)
     val rowBytes = ByteArray(sensor.width * 2)
     var descriptorCleanupFailure: Throwable? = null
-    val frameIdentities = linkedMapOf<File, NoFollowFileSystem.StableFileIdentity>()
     try {
         frames.forEach { frame ->
             cancellation.throwIfCancelled()
-            val identity = NoFollowFileSystem.stableIdentity(frame.input.file)
-            check(identity.size == sensor.width.toLong() * sensor.height.toLong() * 2L) {
-                "RAW input changed size before merge: ${frame.input.file.name}"
-            }
-            frameIdentities[frame.input.file] = identity
-            frameInputs[frame] = RandomAccessFile(frame.input.file, "r")
+            frameInputs[frame] = VerifiedRandomAccessHandle.open(
+                frame.input.file,
+                sensor.width.toLong() * sensor.height.toLong() * 2L
+            )
         }
         BufferedOutputStream(FileOutputStream(mergedRawFile)).use { output ->
             var tileTop = 0
@@ -620,7 +625,7 @@ private fun mergeClassicRawTiles(
                 for (row in 0 until tileRows) {
                     if ((row and 15) == 0) cancellation.throwIfCancelled()
                     readRawRow(
-                        frameInputs.getValue(reference),
+                        frameInputs.getValue(reference).randomAccess,
                         sensor.width,
                         tileTop + row,
                         refRows[row],
@@ -631,7 +636,7 @@ private fun mergeClassicRawTiles(
                 frames.forEachIndexed { frameIndex, frame ->
                     cancellation.throwIfCancelled()
                     onStatus("Classic RAW fusion: merging RAW tiles ${frameIndex + 1}/${frames.size}")
-                    val raf = frameInputs.getValue(frame)
+                    val raf = frameInputs.getValue(frame).randomAccess
                     val rowBuffer = sourceRows.getValue(frame)
                     val globalWeight = if (fusionAlgorithm == FusionAlgorithm.MOTION_SAFE && frame === reference) {
                         frame.globalWeight * 1.75f
@@ -701,14 +706,10 @@ private fun mergeClassicRawTiles(
                 tileTop += tileRows
             }
         }
-        frameIdentities.forEach { (file, identity) ->
-            check(NoFollowFileSystem.revalidate(file.toPath(), identity)) {
-                "RAW input changed during merge: ${file.name}"
-            }
-        }
+        frameInputs.values.forEach { it.verifyPathStillMatches() }
     } finally {
         val closeFailures = frameInputs.values.mapNotNull { input ->
-            runCatching { input.close() }.exceptionOrNull()
+            input.close()
         }
         descriptorCleanupFailure = closeFailures.firstOrNull()
         if (closeFailures.isNotEmpty()) {
