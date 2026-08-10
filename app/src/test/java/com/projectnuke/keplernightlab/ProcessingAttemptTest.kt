@@ -5,6 +5,7 @@ import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -50,6 +51,39 @@ class ProcessingAttemptTest {
             assertEquals(attempt.id, job.getString("processingAttemptId"))
             assertEquals("SUPER_RESOLUTION", job.getString("processingMode"))
         } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun concurrentAttemptIsRejectedUntilOwnerReleases() {
+        val dir = Files.createTempDirectory("processing-attempt-concurrent").toFile()
+        try {
+            val first = beginProcessingAttempt(dir, "CLASSIC_YUV")
+            assertThrows(ProcessingAlreadyActiveException::class.java) {
+                beginProcessingAttempt(dir, "SUPER_RESOLUTION")
+            }
+            first.releaseOwnedLease()
+            val second = beginProcessingAttempt(dir, "SUPER_RESOLUTION")
+            assertEquals(second.id, KeplerJobMetadata.read(dir).getString("processingAttemptId"))
+            second.releaseOwnedLease()
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun borrowedLeaseIsNotReleasedByNestedAttempt() {
+        val dir = Files.createTempDirectory("processing-attempt-borrowed").toFile()
+        val lease = KeplerJobMetadata.acquireOperation(dir)
+        requireNotNull(lease)
+        try {
+            KeplerJobMetadata.write(dir, JSONObject().put("jobType", "REPROCESS"))
+            val nested = beginProcessingAttempt(dir, "CLASSIC_YUV", operationLease = lease)
+            nested.releaseOwnedLease()
+            assertTrue(KeplerJobMetadata.isOperationOwner(dir, lease))
+        } finally {
+            lease.release()
             dir.deleteRecursively()
         }
     }

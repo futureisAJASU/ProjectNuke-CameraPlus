@@ -238,6 +238,7 @@ internal fun reprocessYuvJob(
     selectedFrameIndices: Set<Int>? = null,
     fusionParams: ClassicYuvFusionParams? = null,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
+    operationLease: JobOperationLease? = null,
     onStatus: (String) -> Unit
 ): ReprocessWorkerRun {
     val mainHandler = Handler(Looper.getMainLooper())
@@ -297,12 +298,13 @@ internal fun reprocessYuvJob(
             post("${if (singleFrame) "Single photo" else "YUV reprocess"}: using $enabledFrames/$totalFrames frames...")
             val requestedProcessingParams = fusionParams ?: loadClassicYuvFusionParams(initialJob)
             val finalFile = if (singleFrame) {
-                processSingleFrameJobSync(
+                    processSingleFrameJobSync(
                     jobDir = jobDir,
                     requestedParams = requestedProcessingParams,
                     cancellation = cancellation,
-                    metadataPolicy = ReprocessMetadataPolicy.REPROCESS_PROGRESS_ONLY,
-                    onStatus = { post(it) }
+                        metadataPolicy = ReprocessMetadataPolicy.REPROCESS_PROGRESS_ONLY,
+                        operationLease = operationLease,
+                        onStatus = { post(it) }
                 )
             } else {
                 processNightFusionJobV02Sync(

@@ -27,6 +27,7 @@ internal fun processSingleFrameJobSync(
     requestedParams: ClassicYuvFusionParams,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     metadataPolicy: ReprocessMetadataPolicy = ReprocessMetadataPolicy.NORMAL,
+    operationLease: JobOperationLease? = null,
     onStatus: (String) -> Unit
 ): File {
     cancellation.throwIfCancelled()
@@ -43,7 +44,8 @@ internal fun processSingleFrameJobSync(
     val processingAttempt = beginProcessingAttempt(
         jobDir,
         mode = "SINGLE_FRAME",
-        additionalOwnedKeys = setOf(SINGLE_FRAME_OUTPUT_FILE_NAME)
+        additionalOwnedKeys = setOf(SINGLE_FRAME_OUTPUT_FILE_NAME),
+        operationLease = operationLease
     )
     val processingAttemptId = processingAttempt.id
 
@@ -214,6 +216,7 @@ internal fun processSingleFrameJobSync(
         sourceForCleanup
             ?.takeIf { it !== processedForCleanup && !it.isRecycled }
             ?.recycle()
+        processingAttempt.releaseOwnedLease()
     }
 }
 

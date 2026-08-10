@@ -91,6 +91,7 @@ data class SuperResolutionFusionRequest(
     val denoiseAlgorithm: DenoiseAlgorithm = DenoiseAlgorithm.GUIDED,
     val tileSinkFactory: ((File) -> SuperResolutionTileSink)? = null,
     val cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
+    val operationLease: JobOperationLease? = null,
     val status: (String) -> Unit
 )
 
@@ -371,10 +372,14 @@ fun runSuperResolutionFusion(
     request: SuperResolutionFusionRequest
 ): SuperResolutionFusionResult {
     request.cancellation.throwIfCancelled()
-    val processingAttempt = beginProcessingAttempt(request.outputDir, "SUPER_RESOLUTION")
     require(request.targetPolicy.sourceMode == request.sourceMode) {
         "Target policy sourceMode must match request sourceMode."
     }
+    val processingAttempt = beginProcessingAttempt(
+        request.outputDir,
+        "SUPER_RESOLUTION",
+        operationLease = request.operationLease
+    )
     val inputFiles = request.inputFrameFiles
         .asSequence()
         .filter { it.isFile && it.length() > 0L }
@@ -383,6 +388,7 @@ fun runSuperResolutionFusion(
     request.outputDir.mkdirs()
 
     if (inputFiles.isEmpty()) {
+        processingAttempt.releaseOwnedLease()
         return failedSuperResolutionResult(
             request = request,
             inputFrameCount = 0,
@@ -390,6 +396,7 @@ fun runSuperResolutionFusion(
         )
     }
     if (request.sourceMode == SuperResolutionSourceMode.FULLRES_50MP_RAW) {
+        processingAttempt.releaseOwnedLease()
         return failedSuperResolutionResult(
             request = request,
             inputFrameCount = inputFiles.size,
@@ -521,6 +528,8 @@ fun runSuperResolutionFusion(
             message = "${error.javaClass.simpleName}: ${error.message}",
             shifts = shifts
         )
+    } finally {
+        processingAttempt.releaseOwnedLease()
     }
 }
 

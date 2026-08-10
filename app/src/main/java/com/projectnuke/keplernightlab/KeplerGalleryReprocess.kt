@@ -621,6 +621,7 @@ selectionMode = resolveSelectionMode(job, frameSelection)
                     outputSettings,
                     resolvedSelection,
                     cancellation = cancellation,
+                    operationLease = operationLease,
                     onStatus = { message -> progressScope.launch { postProgress(message) } }
                 )
             ReprocessJobKind.COLOR_BURST, ReprocessJobKind.UNSUPPORTED -> {

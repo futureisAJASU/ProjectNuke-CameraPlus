@@ -98,6 +98,7 @@ internal fun processClassicYuvFusionJob(
     externalFrameWeights: Map<Int, Float>? = null,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     metadataPolicy: ReprocessMetadataPolicy = ReprocessMetadataPolicy.NORMAL,
+    operationLease: JobOperationLease? = null,
     onStatus: (String) -> Unit
 ): File {
     cancellation.throwIfCancelled()
@@ -117,7 +118,8 @@ internal fun processClassicYuvFusionJob(
             "averageColorFile", "finalNightFusionFile", "finalFile", "galleryDisplayFile",
             "galleryThumbnailFile", "referenceFrameDebugFile", "yuvReferencePreviewFile",
             "fusedClassicDebugFile", "yuvFusedClassicDebugFile"
-        )
+        ),
+        operationLease = operationLease
     )
     job.put("processingAttemptId", processingAttempt.id)
     val params = (requestedParams ?: loadClassicYuvFusionParams(job)).clamped()
@@ -593,6 +595,7 @@ internal fun processClassicYuvFusionJob(
     } finally {
         finalBitmap?.recycle()
         merged?.recycle()
+        processingAttempt.releaseOwnedLease()
     }
 }
 

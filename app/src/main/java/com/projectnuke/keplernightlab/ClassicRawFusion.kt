@@ -102,6 +102,7 @@ internal fun runClassicRawFusionMerge(
     alignmentFile: File,
     fusionAlgorithm: FusionAlgorithm = FusionAlgorithm.ROBUST_REFERENCE,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
+    operationLease: JobOperationLease? = null,
     onStatus: (String) -> Unit
 ): ClassicRawFusionResult {
     val startedAt = System.currentTimeMillis()
@@ -111,7 +112,8 @@ internal fun runClassicRawFusionMerge(
         additionalOwnedKeys = setOf(
             "mergedRawFile", "rawFusionDebugFile", "rawReferencePreviewFile",
             "rawFusedPreviewFile", "rawComparePreviewFile", "rawDebugPreviewFile"
-        )
+        ),
+        operationLease = operationLease
     )
     job.put("processingAttemptId", processingAttempt.id)
     return try {
@@ -378,6 +380,8 @@ internal fun runClassicRawFusionMerge(
             "${e.javaClass.simpleName}: ${e.message}",
             originalFailure = e
         )
+    } finally {
+        processingAttempt.releaseOwnedLease()
     }
 }
 
