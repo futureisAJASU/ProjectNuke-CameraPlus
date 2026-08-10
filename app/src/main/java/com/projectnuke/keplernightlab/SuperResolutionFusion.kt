@@ -160,10 +160,10 @@ class BitmapTileSink(
 }
 
 /** Scanline PNG sink used when a full-resolution Bitmap would exceed the heap plan. */
-private class StreamingPngTileSink(
+internal class StreamingPngTileSink(
     private val outputFile: File
 ) : SuperResolutionTileSink {
-    private enum class State { IDLE, WRITING, COMMITTED, ABORTED }
+    private enum class State { IDLE, WRITING, FINISHING, COMMITTED, ABORTING, ABORTED, FAILED }
     private var state = State.IDLE
     private var temporary: File? = null
     private var rawOutput: FileOutputStream? = null
@@ -172,6 +172,7 @@ private class StreamingPngTileSink(
     private var width = 0
     private var height = 0
     private var nextY = 0
+    private val cleanupRecords = mutableListOf<ProcessingArtifactSettlementRecord>()
     private val compressed = ByteArray(64 * 1024)
     private var row: ByteArray? = null
 
@@ -232,41 +233,85 @@ private class StreamingPngTileSink(
     override fun finish(): File {
         check(state == State.WRITING) { "PNG sink finish in state=$state" }
         check(nextY == height)
+        state = State.FINISHING
         val out = requireNotNull(stream)
         val encoder = requireNotNull(deflater)
-        encoder.finish()
-        while (!encoder.finished()) {
-            val count = encoder.deflate(compressed)
-            if (count > 0) writeChunk(out, "IDAT", compressed, 0, count)
+        return try {
+            encoder.finish()
+            while (!encoder.finished()) {
+                val count = encoder.deflate(compressed)
+                if (count > 0) writeChunk(out, "IDAT", compressed, 0, count)
+            }
+            writeChunk(out, "IEND", ByteArray(0), 0, 0)
+            out.flush()
+            rawOutput?.fd?.sync()
+            out.close()
+            stream = null
+            rawOutput = null
+            encoder.end()
+            deflater = null
+            val sourceTemp = requireNotNull(temporary)
+            val result = commitProcessingArtifact(
+                finalFile = outputFile,
+                writeTemp = { transactionTemp ->
+                    try {
+                        java.nio.file.Files.move(
+                            sourceTemp.toPath(),
+                            transactionTemp.toPath(),
+                            java.nio.file.StandardCopyOption.ATOMIC_MOVE
+                        )
+                    } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+                        java.nio.file.Files.move(sourceTemp.toPath(), transactionTemp.toPath())
+                    }
+                },
+                verifyFinal = { committed -> verifyPngArtifact(committed, width, height) }
+            )
+            cleanupRecords += result.settlements
+            temporary = null
+            state = State.COMMITTED
+            outputFile
+        } catch (failure: Throwable) {
+            cleanupRecords += settleTemporary()
+            runCatching { encoder.end() }
+            stream = null
+            rawOutput = null
+            deflater = null
+            temporary = null
+            state = State.FAILED
+            throw failure
         }
-        writeChunk(out, "IEND", ByteArray(0), 0, 0)
-        out.flush()
-        rawOutput?.fd?.sync()
-        out.close()
-        temporary?.let { KeplerJobMetadata.atomicReplace(it, outputFile) }
-        check(NoFollowFileSystem.isRealFile(outputFile.toPath()) && outputFile.length() > 0L) {
-            "PNG sink final verification failed"
-        }
-        encoder.end()
-        stream = null
-        rawOutput = null
-        deflater = null
-        temporary = null
-        state = State.COMMITTED
-        return outputFile
     }
 
     override fun abort() {
-        if (state == State.COMMITTED) return
-        runCatching { stream?.close() }
-        deflater?.end()
-        temporary?.delete()
+        if (state == State.COMMITTED || state == State.ABORTED) return
+        check(state == State.WRITING || state == State.FAILED) { "PNG sink abort in state=$state" }
+        state = State.ABORTING
+        val streamFailure = runCatching { stream?.close() }.exceptionOrNull()
+        if (streamFailure != null) cleanupRecords += ProcessingArtifactSettlementRecord(
+            temporary ?: outputFile,
+            ProcessingArtifactResourceRole.TEMPORARY,
+            ProcessingArtifactSettlementStatus.DELETE_FAILED,
+            streamFailure
+        )
+        if (streamFailure != null) runCatching { rawOutput?.close() }
+        runCatching { deflater?.end() }
+        cleanupRecords += settleTemporary()
         stream = null
-        runCatching { rawOutput?.close() }
         rawOutput = null
         deflater = null
         temporary = null
         state = State.ABORTED
+    }
+
+    internal fun settlementRecords(): List<ProcessingArtifactSettlementRecord> = cleanupRecords.toList()
+
+    private fun settleTemporary(): ProcessingArtifactSettlementRecord {
+        return temporary?.let { settleProcessingArtifactPath(it) }
+            ?: ProcessingArtifactSettlementRecord(
+                outputFile,
+                ProcessingArtifactResourceRole.TEMPORARY,
+                ProcessingArtifactSettlementStatus.NOT_ATTEMPTED
+            )
     }
 
     private fun writeInt(target: ByteArray, offset: Int, value: Int) {

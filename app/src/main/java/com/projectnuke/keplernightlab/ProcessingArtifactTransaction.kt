@@ -91,7 +91,10 @@ private fun moveArtifact(source: File, destination: File) {
     }
 }
 
-private fun cleanupArtifact(file: File, role: ProcessingArtifactResourceRole): ProcessingArtifactSettlementRecord {
+internal fun settleProcessingArtifactPath(
+    file: File,
+    role: ProcessingArtifactResourceRole = ProcessingArtifactResourceRole.TEMPORARY
+): ProcessingArtifactSettlementRecord {
     return try {
         if (!Files.exists(file.toPath(), LinkOption.NOFOLLOW_LINKS)) {
             ProcessingArtifactSettlementRecord(file, role, ProcessingArtifactSettlementStatus.ABSENT)
@@ -169,7 +172,7 @@ internal fun commitProcessingArtifact(
         state = ProcessingArtifactState.ADOPTED
 
         if (priorBackedUp) {
-            val backupSettlement = cleanupArtifact(priorBackup, ProcessingArtifactResourceRole.PRIOR_BACKUP)
+            val backupSettlement = settleProcessingArtifactPath(priorBackup, ProcessingArtifactResourceRole.PRIOR_BACKUP)
             settlements += backupSettlement
             if (backupSettlement.status == ProcessingArtifactSettlementStatus.DELETE_FAILED) {
                 state = ProcessingArtifactState.CLEANUP_FAILED
@@ -191,7 +194,7 @@ internal fun commitProcessingArtifact(
     } catch (failure: Throwable) {
         val cleanupRecords = mutableListOf<ProcessingArtifactSettlementRecord>()
         if (newFinalCommitted) {
-            cleanupRecords += cleanupArtifact(finalFile, ProcessingArtifactResourceRole.NEW_FINAL)
+            cleanupRecords += settleProcessingArtifactPath(finalFile, ProcessingArtifactResourceRole.NEW_FINAL)
         } else {
             cleanupRecords += ProcessingArtifactSettlementRecord(
                 finalFile,
@@ -199,7 +202,7 @@ internal fun commitProcessingArtifact(
                 ProcessingArtifactSettlementStatus.NOT_ATTEMPTED
             )
         }
-        cleanupRecords += cleanupArtifact(temp, ProcessingArtifactResourceRole.TEMPORARY)
+        cleanupRecords += settleProcessingArtifactPath(temp, ProcessingArtifactResourceRole.TEMPORARY)
 
         if (priorBackedUp) {
             try {
