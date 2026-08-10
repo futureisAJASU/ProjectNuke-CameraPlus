@@ -172,7 +172,8 @@ fun processNightFusionJobV02Sync(
     onStatus: (String) -> Unit,
     requestedParams: ClassicYuvFusionParams? = null,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
-    metadataPolicy: ReprocessMetadataPolicy = ReprocessMetadataPolicy.NORMAL
+    metadataPolicy: ReprocessMetadataPolicy = ReprocessMetadataPolicy.NORMAL,
+    operationLease: JobOperationLease? = null
 ): File {
     cancellation.throwIfCancelled()
     return when {
@@ -194,7 +195,8 @@ fun processNightFusionJobV02Sync(
                 onStatus = onStatus,
                 requestedParams = requestedParams,
                 cancellation = cancellation,
-                metadataPolicy = metadataPolicy
+                metadataPolicy = metadataPolicy,
+                operationLease = operationLease
             )
             cancellation.throwIfCancelled()
             finalFile
@@ -219,7 +221,8 @@ fun processNightFusionJobV02Sync(
                 onStatus = onStatus,
                 requestedParams = requestedParams,
                 cancellation = cancellation,
-                metadataPolicy = metadataPolicy
+                metadataPolicy = metadataPolicy,
+                operationLease = operationLease
             )
             cancellation.throwIfCancelled()
             finalFile
@@ -231,7 +234,8 @@ fun processNightFusionJobV02Sync(
                 onStatus = onStatus,
                 requestedParams = requestedParams,
                 cancellation = cancellation,
-                metadataPolicy = metadataPolicy
+                metadataPolicy = metadataPolicy,
+                operationLease = operationLease
             )
             cancellation.throwIfCancelled()
             finalFile
@@ -276,7 +280,7 @@ private fun loadColorFrames(jobDir: File, job: JSONObject): List<LoadedColorFram
             is NoFollowInspection.Present -> resolved.value
             else -> continue
         }
-        val bitmap = BitmapFactory.decodeFile(frameFile.absolutePath) ?: continue
+        val bitmap = NoFollowFileSystem.decodeBitmapVerified(frameFile) ?: continue
         if (width == null || height == null) {
             width = bitmap.width
             height = bitmap.height

@@ -315,7 +315,8 @@ internal fun reprocessYuvJob(
                     onStatus = { post(it) },
                     requestedParams = requestedProcessingParams,
                     cancellation = cancellation,
-                    metadataPolicy = ReprocessMetadataPolicy.REPROCESS_PROGRESS_ONLY
+                    metadataPolicy = ReprocessMetadataPolicy.REPROCESS_PROGRESS_ONLY,
+                    operationLease = operationLease
                 )
             }
             finalOutputFile = finalFile.takeIf { it.isFile && it.length() > 0L }

@@ -1608,8 +1608,8 @@ private fun runSingleFrameFallback(
     }
     request.status("${superResolutionStatusLabel(request)}: writing output...")
     request.cancellation.throwIfCancelled()
-    val source = BitmapFactory.decodeFile(
-        reference.file.absolutePath,
+    val source = NoFollowFileSystem.decodeBitmapVerified(
+        reference.file,
         BitmapFactory.Options().apply {
             inPreferredConfig = Bitmap.Config.ARGB_8888
             inMutable = true
