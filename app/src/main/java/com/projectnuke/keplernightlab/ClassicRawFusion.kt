@@ -44,7 +44,9 @@ internal data class ClassicRawFusionResult(
     val alignmentStatus: String,
     val debugMetadata: JSONObject?,
     val errorMessage: String?,
-    val originalFailure: Throwable? = null
+    val originalFailure: Throwable? = null,
+    val outputCommitted: Boolean = false,
+    val postCommitCancellationRequested: Boolean = false
 )
 
 private data class ClassicRawFrame(
@@ -263,6 +265,23 @@ internal fun runClassicRawFusionMerge(
             onSettlement = processingArtifactSettlementObserver(jobDir, processingAttempt)
         )
         val completedMergeStats = requireNotNull(mergeStatsHolder) { "Classic RAW merge did not produce statistics" }
+        markProcessingArtifactClaim(jobDir, processingAttempt, "mergedRawFile", mergedRawFile)
+        val postCommitCancellation = cancellation.isCancelled
+        if (postCommitCancellation) {
+            markProcessingPostCommitCancellation(jobDir, processingAttempt)
+            return ClassicRawFusionResult(
+                success = true,
+                mergedRawFile = mergedRawFile,
+                alignmentFile = null,
+                referenceIndex = reference.position,
+                referenceReason = selectRawReferenceReason(frames),
+                alignmentStatus = "CLASSIC_RAW_MERGE_COMMITTED_CANCELLED",
+                debugMetadata = null,
+                errorMessage = "RAW merge committed before cancellation; optional processing skipped.",
+                outputCommitted = true,
+                postCommitCancellationRequested = true
+            )
+        }
         if (completedMergeStats.descriptorCleanupFailure != null) {
             job.put(
                 "rawDescriptorCleanupFailure",
@@ -356,6 +375,7 @@ internal fun runClassicRawFusionMerge(
             alignmentStatus = if (referenceOnlyFallback) "REFERENCE_ONLY_FALLBACK" else "CLASSIC_RAW_FUSION_V1_COMPLETE",
             debugMetadata = debug,
             errorMessage = null
+            ,outputCommitted = true
         )
     } catch (ce: CancellationException) {
         throw ce

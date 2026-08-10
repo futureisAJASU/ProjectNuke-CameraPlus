@@ -2337,6 +2337,18 @@ fun processRawFusionJob(
             cancellation = cancellation,
             onStatus = onStatus
         )
+        if (classicMerge.postCommitCancellationRequested) {
+            return RawFusionProcessResult(
+                success = true,
+                mergedRawFile = classicMerge.mergedRawFile,
+                mergedDngFile = null,
+                previewPngFile = null,
+                finalPngFile = null,
+                errorMessage = classicMerge.errorMessage,
+                outputCommitted = true,
+                postCommitCancellationRequested = true
+            )
+        }
         cancellation.throwIfCancelled()
         val mergedRawDigest = if (classicMerge.success) {
             runCatching { NoFollowFileSystem.digestVerified(mergedRawFile) }.getOrNull()

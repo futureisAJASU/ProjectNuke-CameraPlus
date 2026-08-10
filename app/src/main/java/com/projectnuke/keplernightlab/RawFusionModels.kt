@@ -18,7 +18,9 @@ data class RawFusionProcessResult(
     val errorMessage: String?,
     val nativeRgbaFile: File? = null,
     val nativeRgbaWidth: Int = 0,
-    val nativeRgbaHeight: Int = 0
+    val nativeRgbaHeight: Int = 0,
+    val outputCommitted: Boolean = false,
+    val postCommitCancellationRequested: Boolean = false
 )
 
 data class RawSizeSelection(
