@@ -581,7 +581,9 @@ fun captureProcessExportSuperResolutionFusion(
                 return@captureYuvBurstColorWithMotion
             }
             val workerThread = HandlerThread("KeplerSuperResolutionThread").apply { start() }
-            Handler(workerThread.looper).post {
+            val workerHandler = Handler(workerThread.looper)
+            val workerPosted = runCatching {
+                workerHandler.post {
                 try {
                     cancellation.throwIfCancelled()
                     val sourceFrames = readColorBurstFrameFiles(sourceJobDir)
@@ -683,6 +685,13 @@ fun captureProcessExportSuperResolutionFusion(
                 } finally {
                     workerThread.quitSafely()
                 }
+            } }.getOrElse { failure ->
+                Log.e("KeplerSuperResolution", "worker dispatch failed", failure)
+                false
+            }
+            if (!workerPosted) {
+                workerThread.quitSafely()
+                post("PIPELINE_FAILED: 24M Fusion worker could not start.")
             }
         },
         onError = { error ->
