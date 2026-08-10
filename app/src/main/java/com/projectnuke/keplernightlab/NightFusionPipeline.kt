@@ -118,7 +118,7 @@ fun captureProcessExportNightFusion(
                     cancellation.throwIfCancelled()
                     post("Exporting ${requestedOutputFormat.label}...")
                     cancellation.throwIfCancelled()
-                    val bitmap = BitmapFactory.decodeFile(finalFile.absolutePath)
+                    val bitmap = NoFollowFileSystem.decodeBitmapVerified(finalFile)
                         ?: error("Could not decode final Night Fusion image.")
                     val displayNameBase = "Kepler_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}"
                     val export = try {
@@ -315,7 +315,7 @@ internal fun reprocessYuvJob(
             }
             finalOutputFile = finalFile.takeIf { it.isFile && it.length() > 0L }
             post("YUV reprocess: exporting...")
-            val bitmap = BitmapFactory.decodeFile(finalFile.absolutePath)
+            val bitmap = NoFollowFileSystem.decodeBitmapVerified(finalFile)
                 ?: error("Could not decode reprocessed YUV image.")
             val requestedFormat = requestedOutputFormatForSetting(finalOutputFormat)
             val export = try {

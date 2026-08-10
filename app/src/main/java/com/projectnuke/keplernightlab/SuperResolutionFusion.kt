@@ -609,7 +609,7 @@ fun captureProcessExportSuperResolutionFusion(
                     }
 
                     cancellation.throwIfCancelled()
-                    val bitmap = BitmapFactory.decodeFile(outputFile.absolutePath)
+                    val bitmap = NoFollowFileSystem.decodeBitmapVerified(outputFile)
                         ?: error("Could not decode 24M Fusion output.")
                     val requestedFormat = requestedOutputFormatForSetting(finalOutputFormat)
                     val displayName = "Kepler_SR_${

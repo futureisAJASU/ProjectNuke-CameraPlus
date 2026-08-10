@@ -322,6 +322,7 @@ fun KeplerNightLabApp() {
                         modifier = Modifier.fillMaxWidth(),
                         onClick = {
                             rawStatus = "RAW 촬영 시작..."
+                            if (!BuildConfig.DEBUG) return@Button
                             captureSingleRawDng(context, cameraId = "0") { status ->
                                 rawStatus = status
                             }
@@ -334,6 +335,7 @@ fun KeplerNightLabApp() {
                         modifier = Modifier.fillMaxWidth(),
                         onClick = {
                             rawStatus = "RAW Burst 촬영 시작..."
+                            if (!BuildConfig.DEBUG) return@Button
                             captureRawBurstDng(context, cameraId = "0", frameCount = 4) { status ->
                                 rawStatus = status
                             }
@@ -346,6 +348,7 @@ fun KeplerNightLabApp() {
                         modifier = Modifier.fillMaxWidth(),
                         onClick = {
                             rawStatus = "YUV Burst + Motion 촬영 시작..."
+                            if (!BuildConfig.DEBUG) return@Button
                             captureYuvBurstGrayWithMotion(context, cameraId = "0", frameCount = 4) { status ->
                                 rawStatus = status
                             }
