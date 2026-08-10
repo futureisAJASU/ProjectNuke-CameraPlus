@@ -2168,6 +2168,7 @@ fun processRawFusionJob(
     saveNativeMp24DebugPng: Boolean = SAVE_NATIVE_MP24_DEBUG_PNG_DEFAULT,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     metadataPolicy: ReprocessMetadataPolicy = ReprocessMetadataPolicy.NORMAL,
+    operationLease: JobOperationLease? = null,
     onStatus: (String) -> Unit
 ): RawFusionProcessResult {
     val jobFile = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
@@ -2231,6 +2232,9 @@ fun processRawFusionJob(
     // metadata from an empty JSONObject or re-read job.json from a catch block.
     var currentRunJob: JSONObject? = null
 
+    val ownsOperationLease = operationLease == null
+    val processingLease = operationLease ?: KeplerJobMetadata.acquireOperation(jobDir)
+        ?: throw ProcessingAlreadyActiveException(jobDir)
     return try {
         cancellation.throwIfCancelled()
         val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
@@ -2335,6 +2339,7 @@ fun processRawFusionJob(
             alignmentFile = alignmentFile,
             fusionAlgorithm = rawProcessing.fusionAlgorithm,
             cancellation = cancellation,
+            operationLease = processingLease,
             onStatus = onStatus
         )
         if (classicMerge.postCommitCancellationRequested) {
@@ -2485,6 +2490,8 @@ fun processRawFusionJob(
             )
         }
         RawFusionProcessResult(false, null, null, null, null, failureMessage)
+    } finally {
+        if (ownsOperationLease) processingLease.release()
     }
 }
 
