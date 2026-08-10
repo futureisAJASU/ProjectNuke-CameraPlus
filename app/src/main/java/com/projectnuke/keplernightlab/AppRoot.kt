@@ -36,6 +36,8 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 fun KeplerAppRoot() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val debugBuild = BuildConfig.DEBUG &&
+        (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
     var hasCameraPermission by remember {
         mutableStateOf(
@@ -85,7 +87,7 @@ fun KeplerAppRoot() {
                 !hasCameraPermission -> PermissionScreen {
                     permissionLauncher.launch(Manifest.permission.CAMERA)
                 }
-                showDebug -> DebugScreenWrapper {
+                showDebug && debugBuild -> DebugScreenWrapper {
                     showDebug = false
                 }
                 showCacheJobs -> CacheJobsScreen {
@@ -95,7 +97,7 @@ fun KeplerAppRoot() {
                     showGallery = false
                 }
                 else -> MainCameraScreen(
-                    onOpenDebug = { showDebug = true },
+                    onOpenDebug = { if (debugBuild) showDebug = true },
                     onOpenCacheJobs = { showCacheJobs = true },
                     onOpenGallery = { showGallery = true }
                 )

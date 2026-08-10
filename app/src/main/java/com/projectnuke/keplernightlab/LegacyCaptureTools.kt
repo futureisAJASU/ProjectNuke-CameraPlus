@@ -225,8 +225,7 @@ fun KeplerNightLabApp() {
     // This diagnostic surface is not part of the release camera flow. Keep
     // the historical capability tools available for developer builds only;
     // production CameraScreen actions use the serialized capture owners.
-    val debugBuild = (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
-    if (!debugBuild) {
+    if (!isLegacyCaptureDiagnosticsEnabled(context.applicationInfo)) {
         Text("Camera diagnostics are available in debug builds only.")
         return
     }
@@ -409,6 +408,12 @@ fun KeplerNightLabApp() {
         }
     }
 }
+
+internal fun isLegacyCaptureDiagnosticsEnabled(
+    applicationInfo: android.content.pm.ApplicationInfo
+): Boolean =
+    BuildConfig.DEBUG &&
+        (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
 fun buildCameraReport(context: Context): String {
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager

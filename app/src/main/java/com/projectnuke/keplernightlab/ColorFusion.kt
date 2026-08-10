@@ -252,7 +252,7 @@ fun captureYuvBurstColorWithMotion(
     onError: (String) -> Unit = {},
     onStatus: (String) -> Unit
 ) {
-        val mainHandler = Handler(Looper.getMainLooper())
+    val mainHandler = Handler(Looper.getMainLooper())
 
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     val backgroundThread = HandlerThread("KeplerColorBurstThread").apply { start() }
@@ -1035,22 +1035,7 @@ private fun writeBitmapToTempPng(bitmap: Bitmap, finalFile: File) {
     )
 }
 
-private fun averageLatestYuvBurstColor(
-    context: Context,
-    onStatus: (String) -> Unit
-) {
-    val mainHandler = Handler(Looper.getMainLooper())
-    val callbackDispatcher = ProcessingCallbackDispatcher(mainHandler, "KeplerColorFusion")
-    fun postStatus(message: String) {
-        val result = callbackDispatcher.dispatch { onStatus(message) }
-        if (result != ProcessingCallbackDispatchResult.ACCEPTED) {
-            Log.w("KeplerColorFusion", "status dispatch $result")
-        }
-    }
-
-    val workerThread = HandlerThread("KeplerAverageColorThread").apply { start() }
-    val workerHandler = Handler(workerThread.looper)
-
+    /*
     workerHandler.post {
         try {
             val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
@@ -1201,7 +1186,7 @@ private fun averageLatestYuvBurstColor(
             workerThread.quitSafely()
         }
     }
-}
+    */
 
 fun saveRotatedColorPngFromYuv(
     image: Image,

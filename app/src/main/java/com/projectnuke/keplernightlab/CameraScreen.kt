@@ -2313,7 +2313,7 @@ fun SettingsScreen(
 
                 MiniSettingsButton(
                     text = "디버그 화면",
-                    onClick = onOpenDebug
+                    onClick = { if (BuildConfig.DEBUG) onOpenDebug() }
                 )
 
                 MiniSettingsButton(
