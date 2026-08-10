@@ -603,7 +603,8 @@ fun captureProcessExportRawNightFusion(
             Log.i("KeplerRawPipeline", "PROCESSING_STARTED jobDirAbsolutePath=${jobDir.absolutePath}")
             post("PROCESSING_STARTED: RAW capture complete; processing started.")
             val thread = HandlerThread("KeplerRawFusionPipelineThread").apply { start() }
-            Handler(thread.looper).post {
+            val workerPosted = runCatching {
+                Handler(thread.looper).post {
                 var capturedProcess: RawFusionProcessResult? = null
                 var committedExport: GalleryExportResult? = null
                 var exportVerified = false
@@ -1245,6 +1246,29 @@ fun captureProcessExportRawNightFusion(
                 } finally {
                     thread.quitSafely()
                 }
+                }
+            }.getOrElse { failure ->
+                Log.e("KeplerRawPipeline", "RAW processing worker dispatch failed", failure)
+                false
+            }
+            if (!workerPosted) {
+                thread.quitSafely()
+                runCatching {
+                    recordNormalPreCommitTerminal(
+                        jobDir,
+                        attemptStatus = "FAILED",
+                        pipelineStage = "FAILED",
+                        processStatus = "EXPORT_FAILED_KEEPING_CACHE",
+                        reason = "RAW processing worker could not start"
+                    )
+                }.onFailure { metadataError ->
+                    Log.e(
+                        "KeplerRawPipeline",
+                        "Failed to persist RAW worker-dispatch failure metadata: ${metadataError.message}",
+                        metadataError
+                    )
+                }
+                post("PIPELINE_FAILED: RAW processing worker could not start; RAW cache kept.")
             }
         },
         onError = { post("PIPELINE_FAILED: RAW capture failed; keeping cache.\n$it") }
@@ -1272,7 +1296,8 @@ internal fun reprocessRawJob(
     }
     val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
     val thread = HandlerThread("KeplerRawReprocessThread").apply { start() }
-    Handler(thread.looper).post {
+    val workerPosted = runCatching {
+        Handler(thread.looper).post {
         var terminalResult: Result<Unit> = Result.failure(IllegalStateException("RAW reprocess did not reach a terminal state."))
         var publicOutcome: RawFusionPublicExportOutcome? = null
         var currentOutputFile: File? = null
@@ -1618,6 +1643,29 @@ internal fun reprocessRawJob(
                 )
             )
         }
+    }
+    }.getOrElse { failure ->
+        Log.e("KeplerRawReprocess", "RAW reprocess worker dispatch failed", failure)
+        false
+    }
+    if (!workerPosted) {
+        thread.quitSafely()
+        val failure = IllegalStateException("RAW reprocess worker could not start")
+        terminal.complete(
+            ReprocessWorkerOutcome(
+                result = Result.failure(failure),
+                publicExportCommitted = false,
+                terminalError = failure,
+                publicOutcome = RawFusionPublicExportOutcome.UncommittedFailure(
+                    base = RawFusionProcessResult(success = false, null, null, null, null, failure.message),
+                    finalOutputFormat = finalOutputFormat,
+                    currentLocalPreview = null,
+                    currentLocalOutput = null,
+                    currentError = failure.message ?: "RAW reprocess worker could not start"
+                )
+            )
+        )
+        post("PIPELINE_FAILED: RAW reprocess worker could not start; cache kept.")
     }
     return ReprocessWorkerRun(
         terminal = terminal,
