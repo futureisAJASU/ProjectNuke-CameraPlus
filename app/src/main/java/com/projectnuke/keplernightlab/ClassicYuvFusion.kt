@@ -176,7 +176,7 @@ internal fun processClassicYuvFusionJob(
             .put("frameCount", preflightSummary.totalFrames)
             .put("yuvProcessingTotalFrames", preflightSummary.totalFrames)
             .put("yuvProcessingEnabledFrames", preflightSummary.enabledFrames)
-        KeplerJobMetadata.update(jobDir) { current ->
+        updateForProcessingAttempt(jobDir, processingAttempt) { current ->
             current.put("yuvProcessingPreflight", preflightSummary.toJson())
                 .put("processingStartedAt", job.optLong("processingStartedAt"))
                 .put("yuvProcessingPolicy", metadataPolicy.name)
@@ -208,7 +208,7 @@ internal fun processClassicYuvFusionJob(
         }
         decodedUsableFrameCount = frames.size
         job.put("yuvProcessingDecodedUsableFrames", decodedUsableFrameCount)
-        KeplerJobMetadata.update(jobDir) { current ->
+        updateForProcessingAttempt(jobDir, processingAttempt) { current ->
             current.put("yuvProcessingDecodedUsableFrames", decodedUsableFrameCount)
         }
         if (frames.isEmpty()) {
@@ -262,7 +262,7 @@ internal fun processClassicYuvFusionJob(
         sameSizeFrameCount = sameSizeFrames.size
         sameSizeFrameCountKnown = true
         job.put("yuvProcessingSameSizeFrames", sameSizeFrameCount)
-        KeplerJobMetadata.update(jobDir) { current ->
+        updateForProcessingAttempt(jobDir, processingAttempt) { current ->
             current.put("yuvProcessingSameSizeFrames", sameSizeFrameCount)
         }
         val acceptedFrames = sameSizeFrames.filter { it === reference || it.alignmentUsed }
@@ -281,7 +281,7 @@ internal fun processClassicYuvFusionJob(
         compatibleFrameCountKnown = true
         job.put("yuvProcessingCompatibleFrames", compatibleFrames.size)
         job.put("yuvSingleReferenceFallback", singleReferenceFallback)
-        KeplerJobMetadata.update(jobDir) { current ->
+        updateForProcessingAttempt(jobDir, processingAttempt) { current ->
             current.put("yuvProcessingCompatibleFrames", compatibleFrames.size)
             current.put("yuvSingleReferenceFallback", singleReferenceFallback)
         }
@@ -485,7 +485,11 @@ internal fun processClassicYuvFusionJob(
         }
         if (!postCommitCancellation) {
             cancellation.throwIfCancelled()
-            writeVerifiedJsonArtifact(File(jobDir, "yuv_debug.json"), job.toString(2))
+            writeVerifiedJsonArtifact(
+                File(jobDir, "yuv_debug.json"),
+                job.toString(2),
+                processingArtifactSettlementObserver(jobDir, processingAttempt)
+            )
         }
         persistClassicYuvSuccess(
             jobDir = jobDir,

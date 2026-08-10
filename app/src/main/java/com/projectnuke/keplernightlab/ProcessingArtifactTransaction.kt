@@ -311,9 +311,14 @@ internal fun commitProcessingArtifact(
     onSettlement = null
 )
 
-internal fun writeVerifiedJsonArtifact(finalFile: File, text: String): ProcessingArtifactResult =
+internal fun writeVerifiedJsonArtifact(
+    finalFile: File,
+    text: String,
+    onSettlement: ((ProcessingArtifactSettlementReport) -> Unit)? = null
+): ProcessingArtifactResult =
     commitProcessingArtifact(
         finalFile = finalFile,
+        onSettlement = onSettlement,
         writeTemp = { temp ->
             FileOutputStream(temp).use { output ->
                 output.write(text.toByteArray(Charsets.UTF_8))
@@ -330,9 +335,14 @@ internal fun writeVerifiedJsonArtifact(finalFile: File, text: String): Processin
         }
     )
 
-internal fun copyVerifiedArtifact(sourceFile: File, finalFile: File): ProcessingArtifactResult =
+internal fun copyVerifiedArtifact(
+    sourceFile: File,
+    finalFile: File,
+    onSettlement: ((ProcessingArtifactSettlementReport) -> Unit)? = null
+): ProcessingArtifactResult =
     commitProcessingArtifact(
         finalFile = finalFile,
+        onSettlement = onSettlement,
         writeTemp = { temp ->
             FileOutputStream(temp).use { output ->
                 NoFollowFileSystem.copyVerified(sourceFile, output)

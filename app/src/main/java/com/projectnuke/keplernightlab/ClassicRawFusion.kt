@@ -319,7 +319,11 @@ internal fun runClassicRawFusionMerge(
             .put("mergeRejectMapAvailable", false)
             .put("mergeRejectMapFile", JSONObject.NULL)
         cancellation.throwIfCancelled()
-        writeVerifiedJsonArtifact(alignmentFile, debug.toString(2))
+        writeVerifiedJsonArtifact(
+            alignmentFile,
+            debug.toString(2),
+            processingArtifactSettlementObserver(jobDir, processingAttempt)
+        )
         cancellation.throwIfCancelled()
         // Debug preview generation is optional; cancellation is checked around it.
         writeRawFusionDebugPreviews(jobDir, reference, mergedRawFile, sensor, blackLevelEstimate, job, cancellation)
