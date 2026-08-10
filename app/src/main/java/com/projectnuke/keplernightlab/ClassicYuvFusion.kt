@@ -1956,10 +1956,7 @@ private fun saveClassicBitmap(bitmap: Bitmap, file: File) {
             }
         },
         verifyFinal = { committed ->
-            val signature = committed.inputStream().use { it.readNBytes(8) }
-            check(signature.contentEquals(byteArrayOf(137.toByte(), 80, 78, 71, 13, 10, 26, 10))) {
-                "Could not verify ${file.name}"
-            }
+            verifyPngArtifact(committed)
         }
     )
 }

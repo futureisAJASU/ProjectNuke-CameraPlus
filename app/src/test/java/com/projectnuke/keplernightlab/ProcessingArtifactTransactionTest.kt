@@ -6,8 +6,11 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 import java.util.concurrent.CancellationException
 
+@RunWith(RobolectricTestRunner::class)
 class ProcessingArtifactTransactionTest {
     private class TestCancellation(var cancelled: Boolean = false) : KeplerPipelineCancellation {
         override val isCancelled: Boolean get() = cancelled
@@ -159,6 +162,25 @@ class ProcessingArtifactTransactionTest {
             }
             assertTrue(cancelled)
             assertEquals("prior", finalFile.readText())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun truncatedPngAndJpegHeadersAreRejected() {
+        val dir = Files.createTempDirectory("processing-corrupt-images").toFile()
+        try {
+            val png = File(dir, "bad.png").apply {
+                writeBytes(byteArrayOf(137.toByte(), 80, 78, 71, 13, 10, 26, 10, 0))
+            }
+            val jpeg = File(dir, "bad.jpg").apply { writeBytes(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 1, 2, 3)) }
+            var pngRejected = false
+            var jpegRejected = false
+            try { verifyPngArtifact(png) } catch (_: Throwable) { pngRejected = true }
+            try { verifyJpegArtifact(jpeg) } catch (_: Throwable) { jpegRejected = true }
+            assertTrue(pngRejected)
+            assertTrue(jpegRejected)
         } finally {
             dir.deleteRecursively()
         }
