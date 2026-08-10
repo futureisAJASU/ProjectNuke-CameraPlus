@@ -11,8 +11,39 @@ import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.Date
 import java.util.Locale
+
+/**
+ * Owns the outer RAW processing operation for the whole export/reprocess wrapper.  Nested
+ * processors borrow [lease] and release only their ProcessingAttempt sub-lease; this scope keeps
+ * the job operation held through the wrapper's terminal metadata and callback decisions.
+ */
+internal class RawProcessingOperation internal constructor(
+    val lease: JobOperationLease,
+    private val ownsLease: Boolean
+) {
+    private val released = AtomicBoolean(false)
+
+    fun release() {
+        if (!released.compareAndSet(false, true)) return
+        if (ownsLease) lease.release()
+    }
+}
+
+internal fun acquireRawProcessingOperation(
+    jobDir: File,
+    borrowedLease: JobOperationLease? = null
+): RawProcessingOperation? {
+    val ownsLease = borrowedLease == null
+    val lease = borrowedLease ?: KeplerJobMetadata.acquireOperation(jobDir) ?: return null
+    if (!KeplerJobMetadata.isOperationOwner(jobDir, lease)) {
+        if (ownsLease) lease.release()
+        return null
+    }
+    return RawProcessingOperation(lease, ownsLease)
+}
 
 /**
  * Explicit export-result model returned by [RawFusionExportCoordinator.export]. Each production
@@ -542,6 +573,9 @@ fun captureProcessExportRawNightFusion(
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ) {
+    // RAW public-export outcomes are an outer protocol boundary. The wrapper owns the job
+    // operation from capture completion through terminal export metadata; the nested classic RAW
+    // ProcessingAttempt borrows that lease and cannot release it early.
     val callbackLedger = ProcessingCallbackOutcomeLedger()
     val callbackDispatcher = ProcessingCallbackDispatcher(
         Handler(Looper.getMainLooper()),
@@ -598,14 +632,36 @@ fun captureProcessExportRawNightFusion(
                 post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 return@captureRawBurstForFusion
             }
-            KeplerJobMetadata.update(jobDir) { current ->
-                current.put("captureMode", CaptureMode.MULTI_FRAME.name)
-                    .put("processingPresetName", processingParams.presetName)
-                    .put("processingParams", processingParams.clamped().toJson())
+            val processingOperation = acquireRawProcessingOperation(jobDir)
+            if (processingOperation == null) {
+                Log.w("KeplerRawPipeline", "RAW processing operation is already owned; preserving the existing owner.")
+                post("PIPELINE_FAILED: RAW processing is already active; existing operation kept.")
+                return@captureRawBurstForFusion
+            }
+            try {
+                KeplerJobMetadata.update(jobDir) { current ->
+                    current.put("captureMode", CaptureMode.MULTI_FRAME.name)
+                        .put("processingPresetName", processingParams.presetName)
+                        .put("processingParams", processingParams.clamped().toJson())
+                }
+            } catch (failure: Throwable) {
+                processingOperation.release()
+                if (failure is Error) throw failure
+                Log.e("KeplerRawPipeline", "RAW processing metadata initialization failed", failure)
+                post("PIPELINE_FAILED: RAW processing metadata initialization failed; RAW cache kept.")
+                return@captureRawBurstForFusion
             }
             Log.i("KeplerRawPipeline", "PROCESSING_STARTED jobDirAbsolutePath=${jobDir.absolutePath}")
             post("PROCESSING_STARTED: RAW capture complete; processing started.")
-            val thread = HandlerThread("KeplerRawFusionPipelineThread").apply { start() }
+            val thread = try {
+                HandlerThread("KeplerRawFusionPipelineThread").apply { start() }
+            } catch (failure: Throwable) {
+                processingOperation.release()
+                if (failure is Error) throw failure
+                Log.e("KeplerRawPipeline", "RAW processing worker thread could not start", failure)
+                post("PIPELINE_FAILED: RAW processing worker could not start; RAW cache kept.")
+                return@captureRawBurstForFusion
+            }
             val workerPosted = runCatching {
                 Handler(thread.looper).post {
                 var capturedProcess: RawFusionProcessResult? = null
@@ -619,7 +675,8 @@ fun captureProcessExportRawNightFusion(
                         context = context,
                         jobDir = jobDir,
                         saveNativeMp24DebugPng = finalOutputFormat.isDebugPng && rawSpeedMode == RawSpeedMode.QUALITY,
-                        cancellation = cancellation
+                        cancellation = cancellation,
+                        operationLease = processingOperation.lease
                     ) { post(it) }
                     capturedProcess = process
                     if (!process.success || !process.hasExportableBitmapSource()) {
@@ -1247,6 +1304,7 @@ fun captureProcessExportRawNightFusion(
                         )
                     }
                 } finally {
+                    processingOperation.release()
                     thread.quitSafely()
                 }
                 }
@@ -1256,6 +1314,7 @@ fun captureProcessExportRawNightFusion(
             }
             if (!workerPosted) {
                 thread.quitSafely()
+                processingOperation.release()
                 runCatching {
                     recordNormalPreCommitTerminal(
                         jobDir,
@@ -1285,8 +1344,12 @@ internal fun reprocessRawJob(
     finalOutputFormat: FinalOutputFormat,
     selectedFrameIndices: Set<Int>? = null,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
+    operationLease: JobOperationLease? = null,
     onStatus: (String) -> Unit
 ): ReprocessWorkerRun {
+    // When called by KeplerGalleryReprocess, operationLease is the outer transaction's lease and
+    // remains owned through public-export terminal metadata. Standalone callers receive an
+    // equivalent wrapper-owned lease for the full worker lifetime.
     val callbackLedger = ProcessingCallbackOutcomeLedger()
     val callbackDispatcher = ProcessingCallbackDispatcher(
         Handler(Looper.getMainLooper()),
@@ -1301,7 +1364,55 @@ internal fun reprocessRawJob(
         }
     }
     val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
-    val thread = HandlerThread("KeplerRawReprocessThread").apply { start() }
+    val processingOperation = acquireRawProcessingOperation(jobDir, operationLease)
+    if (processingOperation == null) {
+        val failure = ProcessingAlreadyActiveException(jobDir)
+        val outcome = RawFusionPublicExportOutcome.UncommittedFailure(
+            base = RawFusionProcessResult(false, null, null, null, null, failure.message),
+            finalOutputFormat = finalOutputFormat,
+            currentLocalPreview = null,
+            currentLocalOutput = null,
+            currentError = failure.message ?: "RAW reprocess is already active"
+        )
+        terminal.complete(
+            ReprocessWorkerOutcome(
+                result = Result.failure(failure),
+                publicExportCommitted = false,
+                terminalError = failure,
+                publicOutcome = outcome
+            )
+        )
+        post("PIPELINE_FAILED: RAW reprocess is already active; existing operation kept.")
+        return ReprocessWorkerRun(
+            terminal = terminal,
+            cancel = { (cancellation as? KeplerPipelineCancellationToken)?.cancel() }
+        )
+    }
+    val thread = try {
+        HandlerThread("KeplerRawReprocessThread").apply { start() }
+    } catch (failure: Throwable) {
+        processingOperation.release()
+        if (failure is Error) throw failure
+        terminal.complete(
+            ReprocessWorkerOutcome(
+                result = Result.failure(failure),
+                publicExportCommitted = false,
+                terminalError = failure,
+                publicOutcome = RawFusionPublicExportOutcome.UncommittedFailure(
+                    base = RawFusionProcessResult(false, null, null, null, null, failure.message),
+                    finalOutputFormat = finalOutputFormat,
+                    currentLocalPreview = null,
+                    currentLocalOutput = null,
+                    currentError = failure.message ?: "RAW reprocess worker could not start"
+                )
+            )
+        )
+        post("PIPELINE_FAILED: RAW reprocess worker could not start; cache kept.")
+        return ReprocessWorkerRun(
+            terminal = terminal,
+            cancel = { (cancellation as? KeplerPipelineCancellationToken)?.cancel() }
+        )
+    }
     val workerPosted = runCatching {
         Handler(thread.looper).post {
         var terminalResult: Result<Unit> = Result.failure(IllegalStateException("RAW reprocess did not reach a terminal state."))
@@ -1337,8 +1448,9 @@ internal fun reprocessRawJob(
                 context = context,
                 jobDir = jobDir,
                 saveNativeMp24DebugPng = finalOutputFormat.isDebugPng,
-                cancellation = cancellation
-                , metadataPolicy = ReprocessMetadataPolicy.REPROCESS_PROGRESS_ONLY
+                cancellation = cancellation,
+                metadataPolicy = ReprocessMetadataPolicy.REPROCESS_PROGRESS_ONLY,
+                operationLease = processingOperation.lease
             ) { post(it) }
             capturedProcess = process
             currentOutputFile = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
@@ -1620,6 +1732,7 @@ internal fun reprocessRawJob(
             post("RAW reprocess failed; source frames kept. ${e.javaClass.simpleName}: ${e.message}")
             terminalResult = Result.failure(e)
         } finally {
+            processingOperation.release()
             thread.quitSafely()
             val resolved = publicOutcome
                 ?: RawFusionPublicExportOutcome.UncommittedFailure(
@@ -1656,6 +1769,7 @@ internal fun reprocessRawJob(
     }
     if (!workerPosted) {
         thread.quitSafely()
+        processingOperation.release()
         val failure = IllegalStateException("RAW reprocess worker could not start")
         terminal.complete(
             ReprocessWorkerOutcome(

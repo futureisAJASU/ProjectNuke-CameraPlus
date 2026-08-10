@@ -606,12 +606,16 @@ selectionMode = resolveSelectionMode(job, frameSelection)
         val cancellation = KeplerPipelineCancellationToken()
         val worker = when (capability.jobKind) {
             ReprocessJobKind.RAW_FUSION ->
+                // The reprocess transaction remains the outer authority for RAW public-export
+                // metadata and lease finalization. The worker borrows this lease so its nested
+                // ProcessingAttempt cannot outlive or race the transaction terminal write.
                 reprocessRawJob(
                     context,
                     target,
                     outputSettings,
                     resolvedSelection,
                     cancellation = cancellation,
+                    operationLease = operationLease,
                     onStatus = { message -> progressScope.launch { postProgress(message) } }
                 )
             ReprocessJobKind.YUV_FUSION ->
