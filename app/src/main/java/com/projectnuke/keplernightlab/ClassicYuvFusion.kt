@@ -463,7 +463,7 @@ internal fun processClassicYuvFusionJob(
                 )
         }
         cancellation.throwIfCancelled()
-        writeVerifiedTextArtifact(File(jobDir, "yuv_debug.json"), job.toString(2))
+        writeVerifiedJsonArtifact(File(jobDir, "yuv_debug.json"), job.toString(2))
         persistClassicYuvSuccess(
             jobDir = jobDir,
             job = job,
@@ -1376,8 +1376,8 @@ private fun writeFusionDebugMetadata(
         .put("processingTimeMs", processingTimeMs)
         .put("outputWidth", outputWidth)
         .put("outputHeight", outputHeight)
-    writeVerifiedTextArtifact(File(jobDir, "fusion_debug.json"), debug.toString(2))
-    writeVerifiedTextArtifact(File(jobDir, "yuv_debug.json"), debug.toString(2))
+    writeVerifiedJsonArtifact(File(jobDir, "fusion_debug.json"), debug.toString(2))
+    writeVerifiedJsonArtifact(File(jobDir, "yuv_debug.json"), debug.toString(2))
     job.put("fusionDebugFile", "fusion_debug.json")
         .put("yuvDebugFile", "yuv_debug.json")
         .put("fusionAlignmentSummary", alignments)

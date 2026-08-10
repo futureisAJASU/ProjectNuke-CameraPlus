@@ -232,16 +232,33 @@ internal fun runClassicRawFusionMerge(
         Log.i("KeplerRawPipeline", "MERGE_STARTED jobDirAbsolutePath=${jobDir.absolutePath}")
         onStatus("RAW 프레임을 병합하는 중입니다.")
         onStatus("Classic RAW fusion: merging RAW tiles...")
-        val mergeStats = mergeClassicRawTiles(
-            frames = acceptedFrames,
-            reference = reference,
-            sensor = sensor,
-            blackLevelEstimate = blackLevelEstimate,
-            mergedRawFile = mergedRawFile,
-            fusionAlgorithm = fusionAlgorithm,
+        var mergeStatsHolder: RawMergeStats? = null
+        commitProcessingArtifact(
+            finalFile = mergedRawFile,
             cancellation = cancellation,
-            onStatus = onStatus
+            writeTemp = { temp ->
+                mergeStatsHolder = mergeClassicRawTiles(
+                    frames = acceptedFrames,
+                    reference = reference,
+                    sensor = sensor,
+                    blackLevelEstimate = blackLevelEstimate,
+                    mergedRawFile = temp,
+                    fusionAlgorithm = fusionAlgorithm,
+                    cancellation = cancellation,
+                    onStatus = onStatus
+                )
+            },
+            verifyFinal = { committed -> verifyRaw16Artifact(committed, sensor) }
         )
+        val completedMergeStats = requireNotNull(mergeStatsHolder) { "Classic RAW merge did not produce statistics" }
+        if (completedMergeStats.descriptorCleanupFailure != null) {
+            job.put(
+                "rawDescriptorCleanupFailure",
+                "${completedMergeStats.descriptorCleanupFailure.javaClass.simpleName}: " +
+                    completedMergeStats.descriptorCleanupFailure.message
+            )
+        }
+        val mergeStats = completedMergeStats
         cancellation.throwIfCancelled()
         val nativeMergeMs = System.currentTimeMillis() - mergeStartedAt
         Log.i("KeplerRawPipeline", "MERGE_COMPLETE jobDirAbsolutePath=${jobDir.absolutePath} nativeMergeMs=$nativeMergeMs")
@@ -271,7 +288,7 @@ internal fun runClassicRawFusionMerge(
             .put("mergeRejectMapAvailable", false)
             .put("mergeRejectMapFile", JSONObject.NULL)
         cancellation.throwIfCancelled()
-        writeVerifiedTextArtifact(alignmentFile, debug.toString(2))
+        writeVerifiedJsonArtifact(alignmentFile, debug.toString(2))
         cancellation.throwIfCancelled()
         // Debug preview generation is optional; cancellation is checked around it.
         writeRawFusionDebugPreviews(jobDir, reference, mergedRawFile, sensor, blackLevelEstimate, job, cancellation)
@@ -359,7 +376,8 @@ private data class RawMergeStats(
     val rejectedPixels: Long,
     val comparedPixels: Long,
     val downweightedPixels: Long,
-    val memoryPlan: FusionMemoryPlan
+    val memoryPlan: FusionMemoryPlan,
+    val descriptorCleanupFailure: Throwable? = null
 ) {
     val rejectedRatio: Double get() =
         if (comparedPixels > 0L) rejectedPixels.toDouble() / comparedPixels else 0.0
@@ -566,17 +584,19 @@ private fun mergeClassicRawTiles(
     val weights = FloatArray(tileArraySize.toInt())
     val outRow = ByteArray(sensor.width * 2)
     val rowBytes = ByteArray(sensor.width * 2)
-    val mergedCandidate = File(
-        mergedRawFile.parentFile,
-        ".${mergedRawFile.name}.${System.nanoTime()}.tmp"
-    )
-
+    var descriptorCleanupFailure: Throwable? = null
+    val frameIdentities = linkedMapOf<File, NoFollowFileSystem.StableFileIdentity>()
     try {
         frames.forEach { frame ->
             cancellation.throwIfCancelled()
+            val identity = NoFollowFileSystem.stableIdentity(frame.input.file)
+            check(identity.size == sensor.width.toLong() * sensor.height.toLong() * 2L) {
+                "RAW input changed size before merge: ${frame.input.file.name}"
+            }
+            frameIdentities[frame.input.file] = identity
             frameInputs[frame] = RandomAccessFile(frame.input.file, "r")
         }
-        BufferedOutputStream(FileOutputStream(mergedCandidate)).use { output ->
+        BufferedOutputStream(FileOutputStream(mergedRawFile)).use { output ->
             var tileTop = 0
             while (tileTop < sensor.height) {
                 cancellation.throwIfCancelled()
@@ -667,18 +687,29 @@ private fun mergeClassicRawTiles(
                 tileTop += tileRows
             }
         }
-        check(mergedCandidate.length() == sensor.width.toLong() * sensor.height.toLong() * 2L) {
-            "Classic RAW merged payload has invalid size: ${mergedCandidate.length()}"
-        }
-        KeplerJobMetadata.atomicReplace(mergedCandidate, mergedRawFile)
-        check(mergedRawFile.length() == sensor.width.toLong() * sensor.height.toLong() * 2L) {
-            "Classic RAW final payload has invalid size: ${mergedRawFile.length()}"
+        frameIdentities.forEach { (file, identity) ->
+            check(NoFollowFileSystem.revalidate(file.toPath(), identity)) {
+                "RAW input changed during merge: ${file.name}"
+            }
         }
     } finally {
-        frameInputs.values.forEach { runCatching { it.close() } }
-        if (mergedCandidate.exists()) mergedCandidate.delete()
+        val closeFailures = frameInputs.values.mapNotNull { input ->
+            runCatching { input.close() }.exceptionOrNull()
+        }
+        descriptorCleanupFailure = closeFailures.firstOrNull()
+        if (closeFailures.isNotEmpty()) {
+            onStatus("Classic RAW input descriptor cleanup failed: ${closeFailures.first().message}")
+        }
     }
-    return RawMergeStats(rejected, compared, downweighted, memoryPlan)
+    return RawMergeStats(rejected, compared, downweighted, memoryPlan, descriptorCleanupFailure)
+}
+
+private fun verifyRaw16Artifact(file: File, sensor: RawFusionSensorData) {
+    val expected = sensor.width.toLong() * sensor.height.toLong() * 2L
+    val evidence = NoFollowFileSystem.digestVerified(file)
+    check(evidence.size == expected) {
+        "Classic RAW final payload has invalid size: ${evidence.size}, expected=$expected"
+    }
 }
 
 private fun readRawRow(
