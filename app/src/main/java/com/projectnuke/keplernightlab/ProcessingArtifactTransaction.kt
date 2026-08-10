@@ -46,6 +46,12 @@ internal data class ProcessingArtifactSettlementRecord(
     val failure: Throwable? = null
 )
 
+internal data class ProcessingResourceSettlementRecord(
+    val resource: String,
+    val status: String,
+    val failure: Throwable? = null
+)
+
 internal data class ProcessingArtifactResult(
     val finalFile: File,
     val state: ProcessingArtifactState,

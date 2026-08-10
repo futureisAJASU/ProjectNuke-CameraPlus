@@ -174,6 +174,7 @@ internal class StreamingPngTileSink(
     private var height = 0
     private var nextY = 0
     private val cleanupRecords = mutableListOf<ProcessingArtifactSettlementRecord>()
+    private val resourceSettlementRecords = mutableListOf<ProcessingResourceSettlementRecord>()
     private val compressed = ByteArray(64 * 1024)
     private var row: ByteArray? = null
 
@@ -247,9 +248,11 @@ internal class StreamingPngTileSink(
             out.flush()
             rawOutput?.fd?.sync()
             out.close()
+            resourceSettlementRecords += ProcessingResourceSettlementRecord("STREAM", "CLOSED")
             stream = null
             rawOutput = null
             encoder.end()
+            resourceSettlementRecords += ProcessingResourceSettlementRecord("DEFLATER", "ENDED")
             deflater = null
             val sourceTemp = requireNotNull(temporary)
             val result = commitProcessingArtifact(
@@ -274,6 +277,8 @@ internal class StreamingPngTileSink(
         } catch (failure: Throwable) {
             cleanupRecords += settleTemporary()
             runCatching { encoder.end() }
+                .onSuccess { resourceSettlementRecords += ProcessingResourceSettlementRecord("DEFLATER", "ENDED") }
+                .onFailure { resourceSettlementRecords += ProcessingResourceSettlementRecord("DEFLATER", "END_FAILED", it) }
             stream = null
             rawOutput = null
             deflater = null
@@ -288,14 +293,23 @@ internal class StreamingPngTileSink(
         check(state == State.WRITING || state == State.FAILED) { "PNG sink abort in state=$state" }
         state = State.ABORTING
         val streamFailure = runCatching { stream?.close() }.exceptionOrNull()
-        if (streamFailure != null) cleanupRecords += ProcessingArtifactSettlementRecord(
-            temporary ?: outputFile,
-            ProcessingArtifactResourceRole.TEMPORARY,
-            ProcessingArtifactSettlementStatus.DELETE_FAILED,
-            streamFailure
-        )
-        if (streamFailure != null) runCatching { rawOutput?.close() }
-        runCatching { deflater?.end() }
+        resourceSettlementRecords += if (streamFailure == null) {
+            ProcessingResourceSettlementRecord("STREAM", "CLOSED")
+        } else {
+            ProcessingResourceSettlementRecord("STREAM", "CLOSE_FAILED", streamFailure)
+        }
+        val rawFailure = runCatching { rawOutput?.close() }.exceptionOrNull()
+        resourceSettlementRecords += if (rawFailure == null) {
+            ProcessingResourceSettlementRecord("RAW_FD", "CLOSED")
+        } else {
+            ProcessingResourceSettlementRecord("RAW_FD", "CLOSE_FAILED", rawFailure)
+        }
+        val deflaterFailure = runCatching { deflater?.end() }.exceptionOrNull()
+        resourceSettlementRecords += if (deflaterFailure == null) {
+            ProcessingResourceSettlementRecord("DEFLATER", "ENDED")
+        } else {
+            ProcessingResourceSettlementRecord("DEFLATER", "END_FAILED", deflaterFailure)
+        }
         cleanupRecords += settleTemporary()
         stream = null
         rawOutput = null
@@ -305,6 +319,7 @@ internal class StreamingPngTileSink(
     }
 
     internal fun settlementRecords(): List<ProcessingArtifactSettlementRecord> = cleanupRecords.toList()
+    internal fun resourceSettlementRecords(): List<ProcessingResourceSettlementRecord> = resourceSettlementRecords.toList()
 
     private fun settleTemporary(): ProcessingArtifactSettlementRecord {
         return temporary?.let { settleProcessingArtifactPath(it) }
