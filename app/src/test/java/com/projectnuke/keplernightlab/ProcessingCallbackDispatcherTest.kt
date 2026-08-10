@@ -67,4 +67,21 @@ class ProcessingCallbackDispatcherTest {
         assertEquals(ProcessingCallbackDispatchResult.DISPATCH_THREW, dispatcher.dispatch { count.incrementAndGet() })
         assertEquals(0, count.get())
     }
+
+    @Test
+    fun outcomeLedgerRetainsDispatchAndExecutionFailure() {
+        val ledger = ProcessingCallbackOutcomeLedger()
+        val dispatcher = ProcessingCallbackDispatcher(
+            Handler(Looper.getMainLooper()),
+            "test",
+            postOperation = { it.run(); true },
+            executionObserver = ledger::recordExecution,
+            dispatchObserver = ledger::recordDispatch
+        )
+        assertEquals(ProcessingCallbackDispatchResult.ACCEPTED, dispatcher.dispatch { error("ui failed") })
+        val snapshot = ledger.snapshot()
+        assertEquals(ProcessingCallbackDispatchResult.ACCEPTED, snapshot.dispatch)
+        assertEquals(ProcessingCallbackExecutionResult.EXECUTION_FAILED, snapshot.execution)
+        assertEquals("ui failed", snapshot.failure?.message)
+    }
 }

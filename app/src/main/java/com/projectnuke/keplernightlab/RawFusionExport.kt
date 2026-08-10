@@ -542,9 +542,12 @@ fun captureProcessExportRawNightFusion(
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ) {
+    val callbackLedger = ProcessingCallbackOutcomeLedger()
     val callbackDispatcher = ProcessingCallbackDispatcher(
         Handler(Looper.getMainLooper()),
-        "KeplerRawPipeline"
+        "KeplerRawPipeline",
+        executionObserver = callbackLedger::recordExecution,
+        dispatchObserver = callbackLedger::recordDispatch
     )
     fun post(message: String) {
         val result = callbackDispatcher.dispatch { onStatus(message) }
@@ -1284,9 +1287,12 @@ internal fun reprocessRawJob(
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     onStatus: (String) -> Unit
 ): ReprocessWorkerRun {
+    val callbackLedger = ProcessingCallbackOutcomeLedger()
     val callbackDispatcher = ProcessingCallbackDispatcher(
         Handler(Looper.getMainLooper()),
-        "KeplerRawReprocess"
+        "KeplerRawReprocess",
+        executionObserver = callbackLedger::recordExecution,
+        dispatchObserver = callbackLedger::recordDispatch
     )
     fun post(message: String) {
         val result = callbackDispatcher.dispatch { onStatus(message) }

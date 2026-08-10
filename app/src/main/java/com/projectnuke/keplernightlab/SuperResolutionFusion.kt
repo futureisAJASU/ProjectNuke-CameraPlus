@@ -597,7 +597,13 @@ fun captureProcessExportSuperResolutionFusion(
     onStatus: (String) -> Unit
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
-    val callbackDispatcher = ProcessingCallbackDispatcher(mainHandler, "KeplerSuperResolution")
+    val callbackLedger = ProcessingCallbackOutcomeLedger()
+    val callbackDispatcher = ProcessingCallbackDispatcher(
+        mainHandler,
+        "KeplerSuperResolution",
+        executionObserver = callbackLedger::recordExecution,
+        dispatchObserver = callbackLedger::recordDispatch
+    )
     fun post(message: String): Boolean {
         val result = callbackDispatcher.dispatch { onStatus(message) }
         if (result != ProcessingCallbackDispatchResult.ACCEPTED) {

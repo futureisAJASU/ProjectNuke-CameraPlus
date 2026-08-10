@@ -69,11 +69,17 @@ fun processLatestNightFusionV02(
     onStatus: (String) -> Unit
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
-    val callbackDispatcher = ProcessingCallbackDispatcher(mainHandler, "KeplerYuvPipeline")
+    val callbackLedger = ProcessingCallbackOutcomeLedger()
+    val callbackDispatcher = ProcessingCallbackDispatcher(
+        mainHandler,
+        "KeplerYuvPipeline",
+        executionObserver = callbackLedger::recordExecution,
+        dispatchObserver = callbackLedger::recordDispatch
+    )
     fun postStatus(message: String) {
         val result = callbackDispatcher.dispatch { onStatus(message) }
         if (result != ProcessingCallbackDispatchResult.ACCEPTED) {
-            Log.w("KeplerYuvPipeline", "status dispatch $result")
+            Log.w("KeplerYuvPipeline", "status dispatch $result snapshot=${callbackLedger.snapshot()}")
         }
     }
 

@@ -39,7 +39,13 @@ fun captureProcessExportNightFusion(
     onStatus: (String) -> Unit
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
-    val callbackDispatcher = ProcessingCallbackDispatcher(mainHandler, "KeplerYuvPipeline")
+    val callbackLedger = ProcessingCallbackOutcomeLedger()
+    val callbackDispatcher = ProcessingCallbackDispatcher(
+        mainHandler,
+        "KeplerYuvPipeline",
+        executionObserver = callbackLedger::recordExecution,
+        dispatchObserver = callbackLedger::recordDispatch
+    )
     fun post(message: String) {
         val result = callbackDispatcher.dispatch { onStatus(message) }
         if (result != ProcessingCallbackDispatchResult.ACCEPTED) {
@@ -243,7 +249,13 @@ internal fun reprocessYuvJob(
     onStatus: (String) -> Unit
 ): ReprocessWorkerRun {
     val mainHandler = Handler(Looper.getMainLooper())
-    val callbackDispatcher = ProcessingCallbackDispatcher(mainHandler, "KeplerYuvReprocess")
+    val callbackLedger = ProcessingCallbackOutcomeLedger()
+    val callbackDispatcher = ProcessingCallbackDispatcher(
+        mainHandler,
+        "KeplerYuvReprocess",
+        executionObserver = callbackLedger::recordExecution,
+        dispatchObserver = callbackLedger::recordDispatch
+    )
     fun post(message: String): Boolean {
         val result = callbackDispatcher.dispatch { onStatus(message) }
         if (result != ProcessingCallbackDispatchResult.ACCEPTED) {
