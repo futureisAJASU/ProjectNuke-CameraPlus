@@ -164,6 +164,16 @@ object KeplerJobMetadata {
 
 class JobOperationLease internal constructor(internal val key: String) {
     private val released = AtomicBoolean(false)
+    private val processingAttemptId = java.util.concurrent.atomic.AtomicReference<String?>(null)
+
+    internal fun claimProcessingAttempt(attemptId: String): Boolean =
+        !released.get() && processingAttemptId.compareAndSet(null, attemptId)
+
+    internal fun releaseProcessingAttempt(attemptId: String): Boolean =
+        processingAttemptId.compareAndSet(attemptId, null)
+
+    internal fun isProcessingAttemptOwner(attemptId: String): Boolean =
+        !released.get() && processingAttemptId.get() == attemptId
 
     fun release() {
         if (!released.compareAndSet(false, true)) return

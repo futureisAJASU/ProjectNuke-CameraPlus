@@ -89,4 +89,27 @@ class ProcessingAttemptTest {
             dir.deleteRecursively()
         }
     }
+
+    @Test
+    fun borrowedLeaseAllowsOnlyOneProcessingSubleaseAtATime() {
+        val dir = Files.createTempDirectory("processing-attempt-sublease").toFile()
+        val lease = KeplerJobMetadata.acquireOperation(dir)
+        requireNotNull(lease)
+        try {
+            KeplerJobMetadata.write(dir, JSONObject().put("jobType", "REPROCESS"))
+            val first = beginProcessingAttempt(dir, "CLASSIC_YUV", operationLease = lease)
+            assertThrows(ProcessingAlreadyActiveException::class.java) {
+                beginProcessingAttempt(dir, "SUPER_RESOLUTION", operationLease = lease)
+            }
+            assertEquals(first.id, KeplerJobMetadata.read(dir).getString("processingAttemptId"))
+            first.release()
+            val second = beginProcessingAttempt(dir, "SUPER_RESOLUTION", operationLease = lease)
+            assertEquals(second.id, KeplerJobMetadata.read(dir).getString("processingAttemptId"))
+            second.release()
+            assertTrue(KeplerJobMetadata.isOperationOwner(dir, lease))
+        } finally {
+            lease.release()
+            dir.deleteRecursively()
+        }
+    }
 }

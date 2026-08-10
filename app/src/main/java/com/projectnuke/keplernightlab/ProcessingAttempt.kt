@@ -2,6 +2,7 @@ package com.projectnuke.keplernightlab
 
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -11,14 +12,20 @@ internal data class ProcessingAttempt(
     val mode: String,
     internal val operationLease: JobOperationLease?,
     internal val ownsOperationLease: Boolean
-)
+) {
+    private val released = AtomicBoolean(false)
+
+    internal fun release() {
+        if (!released.compareAndSet(false, true)) return
+        operationLease?.releaseProcessingAttempt(id)
+        if (ownsOperationLease) operationLease?.release()
+    }
+}
 
 internal class ProcessingAlreadyActiveException(jobDir: File) :
     IllegalStateException("Processing is already active for ${jobDir.absolutePath}")
 
-internal fun ProcessingAttempt.releaseOwnedLease() {
-    if (ownsOperationLease) operationLease?.release()
-}
+internal fun ProcessingAttempt.releaseOwnedLease() = release()
 
 private val COMMON_PROCESSING_ATTEMPT_KEYS = setOf(
     "pipelineFailed",
@@ -49,6 +56,10 @@ internal fun beginProcessingAttempt(
         operationLease = lease,
         ownsOperationLease = ownsLease
     )
+    if (!lease.claimProcessingAttempt(attempt.id)) {
+        if (ownsLease) lease.release()
+        throw ProcessingAlreadyActiveException(jobDir)
+    }
     if (NoFollowFileSystem.resolveDirectChildResult(jobDir, JOB_JSON_FILE_NAME, requireFile = true) is NoFollowInspection.Absent) {
         try {
             KeplerJobMetadata.write(jobDir, org.json.JSONObject().put("jobType", mode).put("pipeline", mode))
@@ -59,10 +70,13 @@ internal fun beginProcessingAttempt(
     }
     try {
         KeplerJobMetadata.update(jobDir) { job ->
-            check(KeplerJobMetadata.isOperationOwner(jobDir, lease)) {
-                "Processing operation lease is no longer owned"
-            }
-            (COMMON_PROCESSING_ATTEMPT_KEYS + additionalOwnedKeys).forEach(job::remove)
+        check(KeplerJobMetadata.isOperationOwner(jobDir, lease)) {
+            "Processing operation lease is no longer owned"
+        }
+        check(lease.isProcessingAttemptOwner(attempt.id)) {
+            "Processing attempt is no longer authoritative"
+        }
+        (COMMON_PROCESSING_ATTEMPT_KEYS + additionalOwnedKeys).forEach(job::remove)
             job.put("processingAttemptId", attempt.id)
                 .put("processingStartedAt", attempt.startedAt)
                 .put("processingMode", attempt.mode)
@@ -85,6 +99,9 @@ internal fun updateForProcessingAttempt(
         }
         check(attempt.operationLease?.let { KeplerJobMetadata.isOperationOwner(jobDir, it) } == true) {
             "Processing operation lease is no longer owned"
+        }
+        check(attempt.operationLease?.isProcessingAttemptOwner(attempt.id) == true) {
+            "Processing attempt is no longer authoritative"
         }
         mutate(job)
     }
