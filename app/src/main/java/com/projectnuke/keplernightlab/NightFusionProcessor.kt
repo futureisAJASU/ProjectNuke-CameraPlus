@@ -484,9 +484,3 @@ private fun motionScoreNear(
     if (nearby.isEmpty()) return 0.0
     return nearby.map { it.magnitude }.average()
 }
-
-private fun saveBitmapPng(bitmap: Bitmap, file: File) {
-    FileOutputStream(file).use { output ->
-        bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
-    }
-}

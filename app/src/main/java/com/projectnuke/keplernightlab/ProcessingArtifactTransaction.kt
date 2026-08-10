@@ -268,10 +268,6 @@ internal fun writeVerifiedJsonArtifact(finalFile: File, text: String): Processin
         }
     )
 
-@Deprecated("Use writeVerifiedJsonArtifact")
-internal fun writeVerifiedTextArtifact(finalFile: File, text: String): ProcessingArtifactResult =
-    writeVerifiedJsonArtifact(finalFile, text)
-
 internal fun copyVerifiedArtifact(sourceFile: File, finalFile: File): ProcessingArtifactResult =
     commitProcessingArtifact(
         finalFile = finalFile,

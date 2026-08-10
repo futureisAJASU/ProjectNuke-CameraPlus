@@ -24,7 +24,7 @@ class ProcessingArtifactTransactionTest {
         val dir = Files.createTempDirectory("processing-artifact").toFile()
         try {
             val finalFile = File(dir, "fusion_debug.json")
-            val result = writeVerifiedTextArtifact(finalFile, "{\"ok\":true}")
+            val result = writeVerifiedJsonArtifact(finalFile, "{\"ok\":true}")
             assertEquals(ProcessingArtifactState.ADOPTED, result.state)
             assertEquals("{\"ok\":true}", NoFollowFileSystem.readTextVerified(finalFile))
             assertTrue(dir.listFiles().orEmpty().none { it.name.endsWith(".tmp") })
@@ -79,7 +79,7 @@ class ProcessingArtifactTransactionTest {
             val final = File(dir, "debug.json")
             var rejected = false
             try {
-                writeVerifiedTextArtifact(final, "{not-json")
+                writeVerifiedJsonArtifact(final, "{not-json")
             } catch (_: ProcessingArtifactException) {
                 rejected = true
             }
