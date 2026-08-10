@@ -9,7 +9,6 @@ import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.CancellationException
-import java.util.UUID
 
 internal const val SINGLE_FRAME_OUTPUT_FILE_NAME = "single_frame_processed.png"
 private const val SINGLE_FRAME_PIPELINE_VERSION = "single_yuv_isp_v1"
@@ -41,7 +40,12 @@ internal fun processSingleFrameJobSync(
     }
     val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
     val processingStartedAt = System.currentTimeMillis()
-    val processingAttemptId = UUID.randomUUID().toString()
+    val processingAttempt = beginProcessingAttempt(
+        jobDir,
+        mode = "SINGLE_FRAME",
+        additionalOwnedKeys = setOf(SINGLE_FRAME_OUTPUT_FILE_NAME)
+    )
+    val processingAttemptId = processingAttempt.id
 
     persistSingleFrameProgress(
         jobDir = jobDir,

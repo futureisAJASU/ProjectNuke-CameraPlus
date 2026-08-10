@@ -371,6 +371,7 @@ fun runSuperResolutionFusion(
     request: SuperResolutionFusionRequest
 ): SuperResolutionFusionResult {
     request.cancellation.throwIfCancelled()
+    val processingAttempt = beginProcessingAttempt(request.outputDir, "SUPER_RESOLUTION")
     require(request.targetPolicy.sourceMode == request.sourceMode) {
         "Target policy sourceMode must match request sourceMode."
     }
@@ -502,6 +503,7 @@ fun runSuperResolutionFusion(
             message = "Multi-frame tiled super-resolution completed."
         )
         writeSuperResolutionJob(request, result, "COMPLETE", null)
+        markProcessingArtifactClaim(request.outputDir, processingAttempt, "superResolutionOutputFile", requireNotNull(result.outputFile))
         result
     } catch (ce: CancellationException) {
         throw ce

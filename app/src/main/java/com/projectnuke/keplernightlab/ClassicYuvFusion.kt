@@ -110,6 +110,16 @@ internal fun processClassicYuvFusionJob(
         is NoFollowInspection.InspectionFailed -> throw resolved.exception
     }
     val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
+    val processingAttempt = beginProcessingAttempt(
+        jobDir,
+        mode = "CLASSIC_YUV",
+        additionalOwnedKeys = setOf(
+            "averageColorFile", "finalNightFusionFile", "finalFile", "galleryDisplayFile",
+            "galleryThumbnailFile", "referenceFrameDebugFile", "yuvReferencePreviewFile",
+            "fusedClassicDebugFile", "yuvFusedClassicDebugFile"
+        )
+    )
+    job.put("processingAttemptId", processingAttempt.id)
     val params = (requestedParams ?: loadClassicYuvFusionParams(job)).clamped()
     initializeClassicYuvRunMetadata(job, params, processingStartedAt, metadataPolicy)
     resetClassicFrameMetadataForCurrentRun(jobDir, job)

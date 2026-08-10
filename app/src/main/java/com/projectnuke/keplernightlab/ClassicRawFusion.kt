@@ -105,6 +105,15 @@ internal fun runClassicRawFusionMerge(
     onStatus: (String) -> Unit
 ): ClassicRawFusionResult {
     val startedAt = System.currentTimeMillis()
+    val processingAttempt = beginProcessingAttempt(
+        jobDir,
+        mode = "CLASSIC_RAW",
+        additionalOwnedKeys = setOf(
+            "mergedRawFile", "rawFusionDebugFile", "rawReferencePreviewFile",
+            "rawFusedPreviewFile", "rawComparePreviewFile", "rawDebugPreviewFile"
+        )
+    )
+    job.put("processingAttemptId", processingAttempt.id)
     return try {
         cancellation.throwIfCancelled()
         onStatus("Classic RAW fusion: loading frames...")

@@ -23,7 +23,7 @@ internal fun updateProcessingStage(
             "PIPELINE_FAILED", "PIPELINE_CANCELLED", "FAILED", "CANCELLED" ->
                 previous != "PIPELINE_COMPLETE" && previous != "VERIFIED_EXPORT_COMPLETE" &&
                     previous != "COMPLETE"
-            else -> true
+            else -> false
         }
         check(allowed) { "Invalid processing stage transition $previous -> $stage" }
         mutate(current)
