@@ -3,6 +3,7 @@ package com.projectnuke.keplernightlab
 import android.os.Handler
 import android.os.Looper
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -23,6 +24,24 @@ class ProcessingCallbackDispatcherTest {
         assertEquals(ProcessingCallbackDispatchResult.ACCEPTED, dispatcher.dispatch { count.incrementAndGet() })
         assertEquals(1, count.get())
         assertEquals(ProcessingCallbackDispatchResult.ACCEPTED, dispatcher.dispatch { error("callback failure") })
+    }
+
+    @Test
+    fun executionFailureIsPublishedToObserver() {
+        val observed = AtomicReference<ProcessingCallbackExecutionResult>()
+        val failure = AtomicReference<Throwable>()
+        val dispatcher = ProcessingCallbackDispatcher(
+            Handler(Looper.getMainLooper()),
+            "test",
+            postOperation = { it.run(); true },
+            executionObserver = { result, throwable ->
+                observed.set(result)
+                throwable?.let(failure::set)
+            }
+        )
+        assertEquals(ProcessingCallbackDispatchResult.ACCEPTED, dispatcher.dispatch { error("callback failure") })
+        assertEquals(ProcessingCallbackExecutionResult.EXECUTION_FAILED, observed.get())
+        assertEquals("callback failure", failure.get().message)
     }
 
     @Test

@@ -30,6 +30,12 @@ class StreamingPngTileSinkTest {
                 it.role == ProcessingArtifactResourceRole.ADOPTED_FINAL &&
                     it.status == ProcessingArtifactSettlementStatus.ADOPTED
             })
+            assertTrue(sink.resourceSettlementRecords().any {
+                it.resource == "STREAM" && it.status == "CLOSED"
+            })
+            assertTrue(sink.resourceSettlementRecords().any {
+                it.resource == "DEFLATER" && it.status == "ENDED"
+            })
         } finally {
             dir.deleteRecursively()
         }
@@ -46,6 +52,12 @@ class StreamingPngTileSinkTest {
             sink.abort()
             assertFalse(output.exists())
             assertTrue(dir.listFiles().orEmpty().none { it.name.endsWith(".tmp") })
+            assertTrue(sink.resourceSettlementRecords().any {
+                it.resource == "STREAM" && it.status == "CLOSED"
+            })
+            assertTrue(sink.resourceSettlementRecords().any {
+                it.resource == "RAW_FD" && it.status == "CLOSED"
+            })
             sink.abort()
         } finally {
             dir.deleteRecursively()

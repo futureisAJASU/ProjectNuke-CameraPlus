@@ -57,7 +57,9 @@ internal data class ProcessingArtifactResult(
     val state: ProcessingArtifactState,
     val cleanupFailure: Throwable? = null,
     val settlements: List<ProcessingArtifactSettlementRecord> = emptyList(),
-    val priorFinalPreserved: Boolean = false,
+    /** Whether a verified prior final existed and was moved into the transaction. */
+    val hadPriorFinal: Boolean = false,
+    /** Whether rollback restored and verified the prior final. */
     val priorFinalRestored: Boolean = false
 )
 
@@ -194,7 +196,7 @@ internal fun commitProcessingArtifact(
             state = state,
             cleanupFailure = settlements.firstOrNull { it.failure != null }?.failure,
             settlements = settlements.toList(),
-            priorFinalPreserved = priorBackedUp,
+            hadPriorFinal = priorBackedUp,
             priorFinalRestored = false
         )
     } catch (failure: Throwable) {

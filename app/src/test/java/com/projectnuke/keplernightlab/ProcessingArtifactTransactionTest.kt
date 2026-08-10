@@ -208,6 +208,7 @@ class ProcessingArtifactTransactionTest {
                 cancellation = cancellation
             )
             assertEquals(ProcessingArtifactState.ADOPTED, result.state)
+            assertTrue(result.hadPriorFinal.not())
             assertEquals("new", finalFile.readText())
         } finally {
             dir.deleteRecursively()
