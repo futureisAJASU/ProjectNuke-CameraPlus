@@ -237,7 +237,7 @@ internal fun commitProcessingArtifact(
         } else {
             state = ProcessingArtifactState.ROLLED_BACK
         }
-        if (failure is Error) throw failure
+        if (failure is Error || failure is java.util.concurrent.CancellationException) throw failure
         throw ProcessingArtifactException(
             finalFile = finalFile,
             tempFile = temp,

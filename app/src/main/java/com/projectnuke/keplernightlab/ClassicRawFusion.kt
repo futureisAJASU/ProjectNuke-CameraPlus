@@ -887,9 +887,14 @@ private fun rawProxyToBitmap(proxy: RawProxy): Bitmap {
     return Bitmap.createBitmap(pixels, proxy.width, proxy.height, Bitmap.Config.ARGB_8888)
 }
 
-private fun saveClassicRawPng(bitmap: Bitmap, file: File) {
+private fun saveClassicRawPng(
+    bitmap: Bitmap,
+    file: File,
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
+) {
     commitProcessingArtifact(
         finalFile = file,
+        cancellation = cancellation,
         writeTemp = { temp ->
             FileOutputStream(temp).use { output ->
                 check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
