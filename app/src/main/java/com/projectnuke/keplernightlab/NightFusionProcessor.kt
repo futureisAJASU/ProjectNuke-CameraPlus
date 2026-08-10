@@ -145,7 +145,7 @@ fun estimateLatestColorBurstScene(context: Context): LatestSceneEstimate {
             is NoFollowInspection.Present -> resolved.value
             else -> null
         }
-        frameFile?.let { BitmapFactory.decodeFile(it.absolutePath) }
+        frameFile?.let { NoFollowFileSystem.decodeBitmapVerified(it) }
     }.getOrNull()
     val luma = firstFrame?.let { bitmap ->
         val value = computeMeanLuma(bitmap)

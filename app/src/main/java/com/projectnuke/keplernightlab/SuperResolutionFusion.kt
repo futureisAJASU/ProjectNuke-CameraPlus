@@ -1876,7 +1876,7 @@ private fun megapixels(width: Int, height: Int): Double =
 private fun detectSourceMegapixels(file: File?): Double {
     if (file == null) return 0.0
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    BitmapFactory.decodeFile(file.absolutePath, bounds)
+    NoFollowFileSystem.decodeBitmapVerified(file, bounds)
     return if (bounds.outWidth > 0 && bounds.outHeight > 0) {
         megapixels(bounds.outWidth, bounds.outHeight)
     } else {

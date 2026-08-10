@@ -636,7 +636,7 @@ private fun selectClassicReference(frames: List<ClassicFrame>): ClassicFrame {
 
 private fun decodeLumaThumbnail(file: File): LumaThumbnail {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    BitmapFactory.decodeFile(file.absolutePath, bounds)
+    NoFollowFileSystem.decodeBitmapVerified(file, bounds)
     require(bounds.outWidth > 0 && bounds.outHeight > 0) { "Unreadable frame: ${file.name}" }
     var sampleSize = 1
     while (
@@ -645,8 +645,8 @@ private fun decodeLumaThumbnail(file: File): LumaThumbnail {
     ) {
         sampleSize *= 2
     }
-    val bitmap = BitmapFactory.decodeFile(
-        file.absolutePath,
+    val bitmap = NoFollowFileSystem.decodeBitmapVerified(
+        file,
         BitmapFactory.Options().apply {
             inSampleSize = sampleSize
             inPreferredConfig = Bitmap.Config.ARGB_8888
@@ -1494,7 +1494,7 @@ private fun generateFusionDebugArtifacts(
 
 private fun decodeDebugPreview(file: File): Bitmap {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    BitmapFactory.decodeFile(file.absolutePath, bounds)
+    NoFollowFileSystem.decodeBitmapVerified(file, bounds)
     require(bounds.outWidth > 0 && bounds.outHeight > 0) { "Unreadable debug image" }
     var sampleSize = 1
     while (
@@ -1503,8 +1503,8 @@ private fun decodeDebugPreview(file: File): Bitmap {
     ) {
         sampleSize *= 2
     }
-    return BitmapFactory.decodeFile(
-        file.absolutePath,
+    return NoFollowFileSystem.decodeBitmapVerified(
+        file,
         BitmapFactory.Options().apply {
             inSampleSize = sampleSize
             inPreferredConfig = Bitmap.Config.ARGB_8888
@@ -1535,7 +1535,7 @@ private fun globalWeightFor(
 
 private fun decodeImageDimensions(file: File): Pair<Int, Int> {
     val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    BitmapFactory.decodeFile(file.absolutePath, options)
+    NoFollowFileSystem.decodeBitmapVerified(file, options)
     require(options.outWidth > 0 && options.outHeight > 0) { "Unreadable frame: ${file.name}" }
     return options.outWidth to options.outHeight
 }
@@ -1585,7 +1585,7 @@ private fun buildClassicYuvProcessingPreflight(
         }
         existingFrameFiles++
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeFile(file.absolutePath, bounds)
+        NoFollowFileSystem.decodeBitmapVerified(file, bounds)
         if (bounds.outWidth > 0 && bounds.outHeight > 0) {
             decodeProbePassed++
         } else {
