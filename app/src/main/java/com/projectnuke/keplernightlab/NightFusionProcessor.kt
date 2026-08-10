@@ -83,6 +83,7 @@ fun processLatestNightFusionV02(
     val workerPosted = runCatching {
         workerHandler.post {
         var jobDir: File? = null
+        var operationLease: JobOperationLease? = null
         try {
             cancellation.throwIfCancelled()
             jobDir = findLatestColorBurstJobDir(context)
@@ -90,7 +91,14 @@ fun processLatestNightFusionV02(
                     postStatus("PIPELINE_FAILED: No YUV fusion job found.")
                     return@post
                 }
-            processNightFusionJobV02Sync(jobDir, onStatus = { postStatus(it) }, cancellation = cancellation)
+            operationLease = KeplerJobMetadata.acquireOperation(jobDir)
+                ?: throw ProcessingAlreadyActiveException(jobDir)
+            processNightFusionJobV02Sync(
+                jobDir,
+                onStatus = { postStatus(it) },
+                cancellation = cancellation,
+                operationLease = operationLease
+            )
             cancellation.throwIfCancelled()
             postStatus("PIPELINE_COMPLETE: YUV Night Fusion processing complete.")
         } catch (_: CancellationException) {
@@ -114,6 +122,7 @@ fun processLatestNightFusionV02(
                 "PIPELINE_FAILED: YUV Night Fusion failed: ${e.shortMessage()}; cache kept. See logcat/job.json for details."
             )
         } finally {
+            operationLease?.release()
             workerThread.quitSafely()
         }
         }
