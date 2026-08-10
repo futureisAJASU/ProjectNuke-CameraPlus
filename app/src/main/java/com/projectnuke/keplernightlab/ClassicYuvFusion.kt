@@ -159,10 +159,10 @@ internal fun processClassicYuvFusionJob(
             job.put("currentPipelineStage", stage)
                 .put("processStatus", status)
                 .put("processingStartedAt", processingStartedAt)
-            updateProcessingStage(jobDir, stage, status) { current ->
+            updateProcessingStage(jobDir, stage, status, mutate = { current ->
                 current.put("processingStartedAt", processingStartedAt)
                     .put("yuvProcessingPolicy", metadataPolicy.name)
-            }
+            }, attempt = processingAttempt)
             Log.i("KeplerYuvPipeline", "$stage: $status")
             onStatus(status)
         }

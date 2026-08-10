@@ -58,9 +58,9 @@ internal fun processSingleFrameJobSync(
         status = "SINGLE_FRAME_PROCESSING"
     )
     if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-        updateProcessingStage(jobDir, "PROCESSING", "SINGLE_FRAME_PROCESSING") { current ->
+        updateProcessingStage(jobDir, "PROCESSING", "SINGLE_FRAME_PROCESSING", mutate = { current ->
             current.put("processingAttemptId", processingAttemptId)
-        }
+        }, attempt = processingAttempt)
     } else {
         KeplerJobMetadata.update(jobDir) { current ->
             current.put("processingAttemptId", processingAttemptId)
