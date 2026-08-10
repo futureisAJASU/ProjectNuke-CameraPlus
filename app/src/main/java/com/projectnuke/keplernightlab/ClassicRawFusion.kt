@@ -244,7 +244,7 @@ internal fun runClassicRawFusionMerge(
         onStatus("RAW 프레임을 병합하는 중입니다.")
         onStatus("Classic RAW fusion: merging RAW tiles...")
         var mergeStatsHolder: RawMergeStats? = null
-        commitProcessingArtifact(
+        val mergeArtifact = commitProcessingArtifact(
             finalFile = mergedRawFile,
             cancellation = cancellation,
             writeTemp = { temp ->
@@ -261,6 +261,7 @@ internal fun runClassicRawFusionMerge(
             },
             verifyFinal = { committed -> verifyRaw16Artifact(committed, sensor) }
         )
+        recordProcessingArtifactSettlements(jobDir, processingAttempt, mergeArtifact.settlements)
         val completedMergeStats = requireNotNull(mergeStatsHolder) { "Classic RAW merge did not produce statistics" }
         if (completedMergeStats.descriptorCleanupFailure != null) {
             job.put(

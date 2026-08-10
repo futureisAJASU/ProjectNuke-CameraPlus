@@ -2,6 +2,8 @@ package com.projectnuke.keplernightlab
 
 import java.io.File
 import java.util.UUID
+import org.json.JSONArray
+import org.json.JSONObject
 
 internal data class ProcessingAttempt(
     val id: String,
@@ -97,7 +99,46 @@ internal fun markProcessingArtifactClaim(
     updateForProcessingAttempt(jobDir, attempt) { job ->
         job.put(artifactKey, artifactFile.name)
             .put("processingOutputCommitted", true)
+        appendProcessingSettlement(job, artifactFile, "ADOPTED_FINAL", "ADOPTED", null)
     }
+}
+
+internal fun recordProcessingArtifactSettlements(
+    jobDir: File,
+    attempt: ProcessingAttempt,
+    settlements: Iterable<ProcessingArtifactSettlementRecord>
+) {
+    updateForProcessingAttempt(jobDir, attempt) { job ->
+        settlements.forEach { settlement ->
+            appendProcessingSettlement(
+                job,
+                settlement.path,
+                settlement.role.name,
+                settlement.status.name,
+                settlement.failure
+            )
+        }
+    }
+}
+
+private fun appendProcessingSettlement(
+    job: JSONObject,
+    path: File,
+    role: String,
+    status: String,
+    failure: Throwable?
+) {
+    val records = job.optJSONArray("processingArtifactSettlements") ?: JSONArray()
+    if (records.length() >= 64) return
+    records.put(
+        JSONObject()
+            .put("path", path.name)
+            .put("role", role)
+            .put("status", status)
+            .put("failure", failure?.let { "${it.javaClass.simpleName}: ${it.message}" } ?: JSONObject.NULL)
+    )
+    job.put("processingArtifactSettlements", records)
+        .put("processingArtifactSettlementCount", records.length())
 }
 
 internal fun markProcessingPostCommitCancellation(

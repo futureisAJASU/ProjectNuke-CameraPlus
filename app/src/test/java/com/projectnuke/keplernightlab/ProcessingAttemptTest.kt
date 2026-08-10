@@ -37,6 +37,8 @@ class ProcessingAttemptTest {
             val committed = KeplerJobMetadata.read(dir)
             assertEquals(output.name, committed.getString("mergedRawFile"))
             assertTrue(committed.getBoolean("processingOutputCommitted"))
+            assertEquals("ADOPTED", committed.getJSONArray("processingArtifactSettlements")
+                .getJSONObject(0).getString("status"))
         } finally {
             dir.deleteRecursively()
         }
