@@ -12,6 +12,7 @@ import android.util.Log
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.sqrt
@@ -82,6 +83,14 @@ fun processLatestNightFusionV02(
             Log.w("KeplerYuvPipeline", "status dispatch $result snapshot=${callbackLedger.snapshot()}")
         }
     }
+    val terminalPublished = AtomicBoolean(false)
+    fun postTerminal(message: String) {
+        if (terminalPublished.compareAndSet(false, true)) {
+            postStatus(message)
+        } else {
+            Log.w("KeplerYuvPipeline", "duplicate terminal notification suppressed: $message")
+        }
+    }
 
     val workerThread = HandlerThread("KeplerNightFusionV02Thread").apply { start() }
     val workerHandler = Handler(workerThread.looper)
@@ -94,7 +103,7 @@ fun processLatestNightFusionV02(
             cancellation.throwIfCancelled()
             jobDir = findLatestColorBurstJobDir(context)
                 ?: run {
-                    postStatus("PIPELINE_FAILED: No YUV fusion job found.")
+                    postTerminal("PIPELINE_FAILED: No YUV fusion job found.")
                     return@post
                 }
             operationLease = KeplerJobMetadata.acquireOperation(jobDir)
@@ -106,9 +115,9 @@ fun processLatestNightFusionV02(
                 operationLease = operationLease
             )
             cancellation.throwIfCancelled()
-            postStatus("PIPELINE_COMPLETE: YUV Night Fusion processing complete.")
+            postTerminal("PIPELINE_COMPLETE: YUV Night Fusion processing complete.")
         } catch (_: CancellationException) {
-            postStatus("PIPELINE_CANCELLED: YUV Night Fusion processing cancelled; cache kept.")
+            postTerminal("PIPELINE_CANCELLED: YUV Night Fusion processing cancelled; cache kept.")
         } catch (e: Exception) {
             Log.e("KeplerYuvPipeline", "PIPELINE_FAILED in processLatestNightFusionV02", e)
             runCatching {
@@ -124,7 +133,7 @@ fun processLatestNightFusionV02(
                         .put("updatedAt", System.currentTimeMillis())
                 }
             }
-            postStatus(
+            postTerminal(
                 "PIPELINE_FAILED: YUV Night Fusion failed: ${e.shortMessage()}; cache kept. See logcat/job.json for details."
             )
         } finally {
@@ -138,7 +147,7 @@ fun processLatestNightFusionV02(
     }
     if (!workerPosted) {
         workerThread.quitSafely()
-        postStatus("PIPELINE_FAILED: YUV Night Fusion worker could not start; cache kept.")
+        postTerminal("PIPELINE_FAILED: YUV Night Fusion worker could not start; cache kept.")
     }
 }
 
