@@ -325,7 +325,7 @@ internal fun processClassicYuvFusionJob(
         val mergeDoneAt = System.currentTimeMillis()
         val averageFile = File(jobDir, "average_color_rotated.png")
         cancellation.throwIfCancelled()
-        saveClassicBitmap(merged, averageFile, cancellation)
+        saveClassicBitmap(merged, averageFile, cancellation, processingAttempt)
 
         markStage("YUV_DENOISE_SHARPEN", "노이즈와 선명도를 보정하는 중입니다.")
         cancellation.throwIfCancelled()
@@ -335,7 +335,7 @@ internal fun processClassicYuvFusionJob(
         markStage("YUV_EXPORTING", "결과를 저장하는 중입니다.")
         val finalFile = File(jobDir, "sharpened_night_fusion.png")
         cancellation.throwIfCancelled()
-        saveClassicBitmap(finalBitmap, finalFile, cancellation)
+        saveClassicBitmap(finalBitmap, finalFile, cancellation, processingAttempt)
         markProcessingArtifactClaim(jobDir, processingAttempt, "finalFile", finalFile)
         val postCommitCancellation = cancellation.isCancelled
         if (postCommitCancellation) {
@@ -1994,11 +1994,15 @@ private fun formatClassicFailureMessage(throwable: Throwable?, reason: String): 
 private fun saveClassicBitmap(
     bitmap: Bitmap,
     file: File,
-    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
+    processingAttempt: ProcessingAttempt? = null
 ) {
     commitProcessingArtifact(
         finalFile = file,
         cancellation = cancellation,
+        onSettlement = processingAttempt?.let { attempt ->
+            processingArtifactSettlementObserver(file.parentFile ?: error("Artifact parent missing"), attempt)
+        },
         writeTemp = { candidate ->
             FileOutputStream(candidate).use { output ->
                 check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {

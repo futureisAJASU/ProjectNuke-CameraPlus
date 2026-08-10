@@ -411,20 +411,24 @@ fun runSuperResolutionFusion(
     request.outputDir.mkdirs()
 
     if (inputFiles.isEmpty()) {
-        return failedSuperResolutionResult(
+        val failure = failedSuperResolutionResult(
             request = request,
             inputFrameCount = 0,
             message = "No readable source frames.",
             processingAttempt = processingAttempt
         )
+        processingAttempt.release()
+        return failure
     }
     if (request.sourceMode == SuperResolutionSourceMode.FULLRES_50MP_RAW) {
-        return failedSuperResolutionResult(
+        val failure = failedSuperResolutionResult(
             request = request,
             inputFrameCount = inputFiles.size,
             message = "FULLRES_50MP_RAW decoder is not implemented yet.",
             processingAttempt = processingAttempt
         )
+        processingAttempt.release()
+        return failure
     }
 
     var shifts = emptyList<FrameShift>()
@@ -1657,11 +1661,11 @@ private fun runSingleFrameFallback(
             superResolutionOutputFileName(targetMegapixels)
         )
         request.cancellation.throwIfCancelled()
-        val artifact = saveJpeg(output!!, outputFile, cancellation = request.cancellation)
-        recordProcessingArtifactSettlements(
-            request.outputDir,
-            processingAttempt,
-            artifact.settlements
+        val artifact = saveJpeg(
+            output!!,
+            outputFile,
+            cancellation = request.cancellation,
+            onSettlement = processingArtifactSettlementObserver(request.outputDir, processingAttempt)
         )
         val actualOutputMegapixels = megapixels(output!!.width, output!!.height)
         val result = SuperResolutionFusionResult(
@@ -1843,11 +1847,13 @@ private fun saveJpeg(
     bitmap: Bitmap,
     outputFile: File,
     quality: Int = JPEG_QUALITY,
-    cancellation: KeplerPipelineCancellation? = null
+    cancellation: KeplerPipelineCancellation? = null,
+    onSettlement: ((ProcessingArtifactSettlementReport) -> Unit)? = null
 ): ProcessingArtifactResult {
     return commitProcessingArtifact(
         finalFile = outputFile,
         cancellation = cancellation,
+        onSettlement = onSettlement,
         writeTemp = { temporary ->
             FileOutputStream(temporary).use { output ->
                 check(bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {

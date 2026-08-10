@@ -139,6 +139,13 @@ internal fun recordProcessingArtifactSettlements(
     }
 }
 
+internal fun processingArtifactSettlementObserver(
+    jobDir: File,
+    attempt: ProcessingAttempt
+): (ProcessingArtifactSettlementReport) -> Unit = { report ->
+    recordProcessingArtifactSettlements(jobDir, attempt, report.settlements)
+}
+
 private fun appendProcessingSettlement(
     job: JSONObject,
     path: File,

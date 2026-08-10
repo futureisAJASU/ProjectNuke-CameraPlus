@@ -259,9 +259,9 @@ internal fun runClassicRawFusionMerge(
                     onStatus = onStatus
                 )
             },
-            verifyFinal = { committed -> verifyRaw16Artifact(committed, sensor) }
+            verifyFinal = { committed -> verifyRaw16Artifact(committed, sensor) },
+            onSettlement = processingArtifactSettlementObserver(jobDir, processingAttempt)
         )
-        recordProcessingArtifactSettlements(jobDir, processingAttempt, mergeArtifact.settlements)
         val completedMergeStats = requireNotNull(mergeStatsHolder) { "Classic RAW merge did not produce statistics" }
         if (completedMergeStats.descriptorCleanupFailure != null) {
             job.put(
