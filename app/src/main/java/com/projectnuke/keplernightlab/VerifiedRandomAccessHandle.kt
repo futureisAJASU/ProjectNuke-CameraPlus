@@ -17,7 +17,8 @@ internal class VerifiedRandomAccessHandle private constructor(
     val randomAccess: RandomAccessFile,
     val expectedSize: Long,
     private val openedDigest: String,
-    private val expectedIdentity: NoFollowFileSystem.StableFileIdentity
+    private val expectedIdentity: NoFollowFileSystem.StableFileIdentity,
+    private val closeAction: () -> Unit
 ) {
     private var closed = false
 
@@ -37,7 +38,30 @@ internal class VerifiedRandomAccessHandle private constructor(
     internal fun close(): Throwable? {
         if (closed) return null
         closed = true
-        return runCatching { randomAccess.close() }.exceptionOrNull()
+        return runCatching { closeAction() }.exceptionOrNull()
+    }
+
+    /**
+     * Runs one operation against the verified descriptor and settles that descriptor without
+     * allowing a secondary close failure to replace the operation's primary failure.
+     */
+    internal fun <T> use(block: (RandomAccessFile) -> T): T {
+        var primaryFailure: Throwable? = null
+        try {
+            return block(randomAccess)
+        } catch (failure: Throwable) {
+            primaryFailure = failure
+            throw failure
+        } finally {
+            val closeFailure = close()
+            if (closeFailure != null) {
+                if (primaryFailure != null) {
+                    primaryFailure.addSuppressed(closeFailure)
+                } else {
+                    throw closeFailure
+                }
+            }
+        }
     }
 
     companion object {
@@ -64,11 +88,42 @@ internal class VerifiedRandomAccessHandle private constructor(
                 check(before.sha256 == openedDigest) {
                     "RAW input was replaced while opening: ${file.name}"
                 }
-                return VerifiedRandomAccessHandle(file, randomAccess, expectedSize, openedDigest, before)
+                return VerifiedRandomAccessHandle(
+                    file,
+                    randomAccess,
+                    expectedSize,
+                    openedDigest,
+                    before,
+                    closeAction = { randomAccess.close() }
+                )
             } catch (failure: Throwable) {
                 runCatching { randomAccess.close() }
                 throw failure
             }
+        }
+
+        internal fun openForTesting(
+            file: File,
+            expectedSize: Long,
+            closeFailure: Throwable
+        ): VerifiedRandomAccessHandle {
+            val before = NoFollowFileSystem.stableIdentity(file)
+            check(before.size == expectedSize)
+            val randomAccess = RandomAccessFile(file, "r")
+            return VerifiedRandomAccessHandle(
+                file,
+                randomAccess,
+                expectedSize,
+                before.sha256,
+                before,
+                closeAction = {
+                    try {
+                        randomAccess.close()
+                    } finally {
+                        throw closeFailure
+                    }
+                }
+            )
         }
     }
 }

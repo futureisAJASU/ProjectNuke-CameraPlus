@@ -3,7 +3,9 @@ package com.projectnuke.keplernightlab
 import java.nio.file.Files
 import org.json.JSONObject
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -11,6 +13,46 @@ import org.robolectric.RobolectricTestRunner
 
 @RunWith(RobolectricTestRunner::class)
 class RawProcessingOperationTest {
+    @Test
+    fun workerDispatchFailureRetainsOuterOperationThroughTerminalMetadata() {
+        val dir = Files.createTempDirectory("raw-worker-dispatch-failure").toFile()
+        val operation = acquireRawProcessingOperation(dir)
+        assertNotNull(operation)
+        try {
+            KeplerJobMetadata.write(dir, JSONObject().put("jobType", "RAW_CAPTURE"))
+            var callbackPublished = false
+            recordRawOuterTerminalFailureWhileOwned(
+                jobDir = dir,
+                operation = operation!!,
+                reason = "RAW processing worker could not start",
+                beforeMetadata = {
+                    val competing = KeplerJobMetadata.acquireOperation(dir)
+                    assertNull("new RAW operation started before terminal metadata", competing)
+                    competing?.release()
+                }
+            ) {
+                callbackPublished = true
+            }
+            assertTrue(callbackPublished)
+            val terminal = KeplerJobMetadata.read(dir)
+            assertEquals("FAILED", terminal.getString("rawPublicExportAttemptStatus"))
+            assertEquals("FAILED", terminal.getString("currentPipelineStage"))
+            assertEquals("EXPORT_FAILED_KEEPING_CACHE", terminal.getString("processStatus"))
+        } finally {
+            operation!!.release()
+        }
+
+        val next = KeplerJobMetadata.acquireOperation(dir)
+        assertNotNull("next RAW operation must start after terminal settlement", next)
+        try {
+            KeplerJobMetadata.update(dir) { it.put("nextOperationMarker", "B") }
+            assertEquals("B", KeplerJobMetadata.read(dir).getString("nextOperationMarker"))
+        } finally {
+            next!!.release()
+            dir.deleteRecursively()
+        }
+    }
+
     @Test
     fun borrowedRawWrapperScopeDoesNotReleaseOuterOperation() {
         val dir = Files.createTempDirectory("raw-processing-operation").toFile()

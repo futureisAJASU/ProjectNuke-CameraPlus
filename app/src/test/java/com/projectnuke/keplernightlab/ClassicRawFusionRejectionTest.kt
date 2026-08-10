@@ -3,8 +3,39 @@ package com.projectnuke.keplernightlab
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
+import java.nio.file.Files
 
 class ClassicRawFusionRejectionTest {
+    @Test
+    fun multipleRawInputCloseFailuresAreRetainedWithoutOverwriting() {
+        val dir = Files.createTempDirectory("classic-raw-close-debt").toFile()
+        try {
+            val firstFile = dir.resolve("frame-a.raw16").apply { writeBytes(ByteArray(32)) }
+            val secondFile = dir.resolve("frame-b.raw16").apply { writeBytes(ByteArray(32) { 1 }) }
+            val firstFailure = IllegalStateException("close failure A")
+            val secondFailure = IllegalStateException("close failure B")
+            val first = VerifiedRandomAccessHandle.openForTesting(firstFile, 32L, firstFailure)
+            val second = VerifiedRandomAccessHandle.openForTesting(secondFile, 32L, secondFailure)
+
+            val failures = settleVerifiedRawInputHandles(
+                listOf(
+                    "frameIndex=0,file=${firstFile.name}" to first,
+                    "frameIndex=1,file=${secondFile.name}" to second
+                )
+            )
+
+            assertEquals(2, failures.size)
+            assertSame(firstFailure, failures[0].failure)
+            assertSame(secondFailure, failures[1].failure)
+            assertEquals("VERIFIED_RAW_INPUT_HANDLE", failures[0].resource)
+            assertEquals("CLOSE", failures[0].operation)
+            assertEquals("frameIndex=0,file=${firstFile.name}", failures[0].identity)
+            assertEquals("frameIndex=1,file=${secondFile.name}", failures[1].identity)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
     @Test
     fun rawOutputRangeNeverWraps() {
         assertEquals(0, clampRawOutputValue(-12f, 4095))

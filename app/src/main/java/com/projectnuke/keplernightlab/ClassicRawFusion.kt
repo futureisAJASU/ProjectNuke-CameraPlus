@@ -282,12 +282,8 @@ internal fun runClassicRawFusionMerge(
                 postCommitCancellationRequested = true
             )
         }
-        if (completedMergeStats.descriptorCleanupFailure != null) {
-            job.put(
-                "rawDescriptorCleanupFailure",
-                "${completedMergeStats.descriptorCleanupFailure.javaClass.simpleName}: " +
-                    completedMergeStats.descriptorCleanupFailure.message
-            )
+        if (completedMergeStats.descriptorCleanupFailures.isNotEmpty()) {
+            recordRawDescriptorCleanupFailures(job, completedMergeStats.descriptorCleanupFailures)
         }
         val mergeStats = completedMergeStats
         cancellation.throwIfCancelled()
@@ -415,7 +411,7 @@ private data class RawMergeStats(
     val comparedPixels: Long,
     val downweightedPixels: Long,
     val memoryPlan: FusionMemoryPlan,
-    val descriptorCleanupFailure: Throwable? = null
+    val descriptorCleanupFailures: List<ProcessingResourceSettlementRecord> = emptyList()
 ) {
     val rejectedRatio: Double get() =
         if (comparedPixels > 0L) rejectedPixels.toDouble() / comparedPixels else 0.0
@@ -441,8 +437,7 @@ private fun buildRawProxy(
         file,
         sensor.width.toLong() * sensor.height.toLong() * 2L
     )
-    try {
-        val input = inputHandle.randomAccess
+    return inputHandle.use { input ->
         var out = 0
         var y = 0
         while (y < sensor.height && out < luma.size) {
@@ -464,13 +459,11 @@ private fun buildRawProxy(
             y += step
         }
         inputHandle.verifyPathStillMatches()
-    } finally {
-        inputHandle.close()?.let { throw it }
+        cancellation.throwIfCancelled()
+        val mean = luma.fold(0L) { sum, value -> sum + (value.toInt() and 0xFF) }
+            .toFloat() / luma.size.coerceAtLeast(1)
+        RawProxy(proxyWidth, proxyHeight, step, luma, mean)
     }
-    cancellation.throwIfCancelled()
-    val mean = luma.fold(0L) { sum, value -> sum + (value.toInt() and 0xFF) }
-        .toFloat() / luma.size.coerceAtLeast(1)
-    return RawProxy(proxyWidth, proxyHeight, step, luma, mean)
 }
 
 private fun selectRawReference(frames: List<ClassicRawFrame>): ClassicRawFrame {
@@ -630,7 +623,8 @@ private fun mergeClassicRawTiles(
     val weights = FloatArray(tileArraySize.toInt())
     val outRow = ByteArray(sensor.width * 2)
     val rowBytes = ByteArray(sensor.width * 2)
-    var descriptorCleanupFailure: Throwable? = null
+    var descriptorCleanupFailures: List<ProcessingResourceSettlementRecord> = emptyList()
+    var primaryFailure: Throwable? = null
     try {
         frames.forEach { frame ->
             cancellation.throwIfCancelled()
@@ -731,16 +725,63 @@ private fun mergeClassicRawTiles(
             }
         }
         frameInputs.values.forEach { it.verifyPathStillMatches() }
+    } catch (failure: Throwable) {
+        primaryFailure = failure
+        throw failure
     } finally {
-        val closeFailures = frameInputs.values.mapNotNull { input ->
-            input.close()
-        }
-        descriptorCleanupFailure = closeFailures.firstOrNull()
-        if (closeFailures.isNotEmpty()) {
-            onStatus("Classic RAW input descriptor cleanup failed: ${closeFailures.first().message}")
+        descriptorCleanupFailures = settleVerifiedRawInputHandles(
+            frameInputs.entries.map { entry ->
+                "frameIndex=${entry.key.position},file=${entry.key.input.file.name}" to entry.value
+            }
+        )
+        if (descriptorCleanupFailures.isNotEmpty()) {
+            onStatus("Classic RAW input descriptor cleanup failed: ${descriptorCleanupFailures.size} handle(s)")
+            primaryFailure?.let { primary ->
+                descriptorCleanupFailures.forEach { debt ->
+                    debt.failure?.let(primary::addSuppressed)
+                }
+            }
         }
     }
-    return RawMergeStats(rejected, compared, downweighted, memoryPlan, descriptorCleanupFailure)
+    return RawMergeStats(rejected, compared, downweighted, memoryPlan, descriptorCleanupFailures)
+}
+
+internal fun settleVerifiedRawInputHandles(
+    handles: Iterable<Pair<String, VerifiedRandomAccessHandle>>
+): List<ProcessingResourceSettlementRecord> = handles.mapNotNull { (identity, handle) ->
+    handle.close()?.let { failure ->
+        ProcessingResourceSettlementRecord(
+            resource = "VERIFIED_RAW_INPUT_HANDLE",
+            status = "CLOSE_FAILED",
+            failure = failure,
+            identity = identity,
+            operation = "CLOSE"
+        )
+    }
+}
+
+private fun recordRawDescriptorCleanupFailures(
+    job: JSONObject,
+    failures: List<ProcessingResourceSettlementRecord>
+) {
+    job.put(
+        "rawDescriptorCleanupFailures",
+        JSONArray().apply {
+            failures.forEach { failure ->
+                put(JSONObject().apply {
+                    put("resource", failure.resource)
+                    put("operation", failure.operation ?: JSONObject.NULL)
+                    put("identity", failure.identity ?: JSONObject.NULL)
+                    put("status", failure.status)
+                    put(
+                        "failure",
+                        failure.failure?.let { "${it.javaClass.simpleName}: ${it.message}" }
+                            ?: JSONObject.NULL
+                    )
+                })
+            }
+        }
+    )
 }
 
 private fun verifyRaw16Artifact(file: File, sensor: RawFusionSensorData) {

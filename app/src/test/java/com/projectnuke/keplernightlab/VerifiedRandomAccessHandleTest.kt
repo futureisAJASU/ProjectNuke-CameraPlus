@@ -3,9 +3,13 @@ package com.projectnuke.keplernightlab
 import java.nio.file.Files
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import java.util.concurrent.CancellationException
 
 @RunWith(RobolectricTestRunner::class)
 class VerifiedRandomAccessHandleTest {
@@ -34,6 +38,71 @@ class VerifiedRandomAccessHandleTest {
         try {
             val file = dir.resolve("frame.raw16").apply { writeBytes(ByteArray(16)) }
             VerifiedRandomAccessHandle.open(file, 32L)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun successfulReadSurfacesDescriptorCloseFailure() {
+        val dir = Files.createTempDirectory("verified-raw-close-failure").toFile()
+        try {
+            val file = dir.resolve("frame.raw16").apply { writeBytes(ByteArray(32)) }
+            val closeFailure = IllegalStateException("descriptor close failed")
+            val handle = VerifiedRandomAccessHandle.openForTesting(file, 32L, closeFailure)
+            try {
+                handle.use { input -> assertNotNull(input.read()) }
+                fail("close failure was not observable")
+            } catch (failure: Throwable) {
+                assertSame(closeFailure, failure)
+            }
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun cancellationRemainsPrimaryWhenDescriptorCloseAlsoFails() {
+        val dir = Files.createTempDirectory("verified-raw-cancel-close-failure").toFile()
+        try {
+            val file = dir.resolve("frame.raw16").apply { writeBytes(ByteArray(32)) }
+            val closeFailure = IllegalStateException("descriptor close failed")
+            val cancellation = CancellationException("cancelled")
+            val handle = VerifiedRandomAccessHandle.openForTesting(file, 32L, closeFailure)
+            try {
+                handle.use { throw cancellation }
+                fail("cancellation was not propagated")
+            } catch (failure: Throwable) {
+                assertSame(cancellation, failure)
+                assertTrue(cancellation.suppressed.any { it === closeFailure })
+            }
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun verificationFailureRemainsPrimaryWhenDescriptorCloseAlsoFails() {
+        val dir = Files.createTempDirectory("verified-raw-verify-close-failure").toFile()
+        try {
+            val file = dir.resolve("frame.raw16").apply { writeBytes(ByteArray(32)) }
+            val closeFailure = IllegalStateException("descriptor close failed")
+            val handle = VerifiedRandomAccessHandle.openForTesting(file, 32L, closeFailure)
+            val verificationFailure = IllegalStateException("stable-input verification failed")
+            try {
+                handle.use {
+                    file.writeBytes(ByteArray(32) { 1 })
+                    try {
+                        handle.verifyPathStillMatches()
+                    } catch (failure: IllegalStateException) {
+                        throw verificationFailure
+                    }
+                }
+                fail("verification failure was not propagated")
+            } catch (failure: Throwable) {
+                assertSame(verificationFailure, failure)
+                assertTrue(verificationFailure.suppressed.any { it === closeFailure })
+            }
         } finally {
             dir.deleteRecursively()
         }

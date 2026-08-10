@@ -37,7 +37,7 @@ internal enum class ProcessingArtifactSettlementStatus {
     RESTORED_UNVERIFIED,
     ADOPTED,
     DELETE_FAILED,
-    RESTORE_FAILED
+    RESTORE_MOVE_FAILED
 }
 
 internal data class ProcessingArtifactSettlementRecord(
@@ -50,7 +50,9 @@ internal data class ProcessingArtifactSettlementRecord(
 internal data class ProcessingResourceSettlementRecord(
     val resource: String,
     val status: String,
-    val failure: Throwable? = null
+    val failure: Throwable? = null,
+    val identity: String? = null,
+    val operation: String? = null
 )
 
 internal data class ProcessingArtifactResult(
@@ -138,7 +140,8 @@ internal fun commitProcessingArtifact(
     writeTemp: (File) -> Unit,
     verifyFinal: (File) -> Unit,
     cancellation: KeplerPipelineCancellation? = null,
-    onSettlement: ((ProcessingArtifactSettlementReport) -> Unit)? = null
+    onSettlement: ((ProcessingArtifactSettlementReport) -> Unit)? = null,
+    move: (File, File) -> Unit = ::moveArtifact
 ): ProcessingArtifactResult {
     val parent = finalFile.parentFile ?: error("Artifact parent is missing")
     require(NoFollowFileSystem.isRealDirectory(parent.toPath())) { "Artifact parent must be a real directory" }
@@ -177,13 +180,13 @@ internal fun commitProcessingArtifact(
         checkCancelled()
 
         if (existingRegularArtifact(finalFile)) {
-            moveArtifact(finalFile, priorBackup)
+            move(finalFile, priorBackup)
             priorBackedUp = true
             state = ProcessingArtifactState.PRIOR_FINAL_BACKED_UP
         }
 
         checkCancelled()
-        moveArtifact(temp, finalFile)
+        move(temp, finalFile)
         newFinalCommitted = true
         state = ProcessingArtifactState.COMMITTED_FINAL
 
@@ -242,27 +245,40 @@ internal fun commitProcessingArtifact(
         cleanupRecords += settleProcessingArtifactPath(temp, ProcessingArtifactResourceRole.TEMPORARY)
 
         if (priorBackedUp) {
+            var restoreMoveSucceeded = false
             try {
-                moveArtifact(priorBackup, finalFile)
-                verifyFinal(finalFile)
-                priorRestored = true
+                move(priorBackup, finalFile)
+                restoreMoveSucceeded = true
+            } catch (restoreMoveFailure: Throwable) {
                 cleanupRecords += ProcessingArtifactSettlementRecord(
                     priorBackup,
                     ProcessingArtifactResourceRole.PRIOR_BACKUP,
-                    ProcessingArtifactSettlementStatus.RESTORED
+                    ProcessingArtifactSettlementStatus.RESTORE_MOVE_FAILED,
+                    restoreMoveFailure
                 )
-                cleanupRecords += ProcessingArtifactSettlementRecord(
-                    finalFile,
-                    ProcessingArtifactResourceRole.RESTORED_PRIOR,
-                    ProcessingArtifactSettlementStatus.RESTORED
-                )
-            } catch (restoreFailure: Throwable) {
-                cleanupRecords += ProcessingArtifactSettlementRecord(
-                    finalFile,
-                    ProcessingArtifactResourceRole.RESTORED_PRIOR,
-                    ProcessingArtifactSettlementStatus.RESTORED_UNVERIFIED,
-                    restoreFailure
-                )
+            }
+            if (restoreMoveSucceeded) {
+                try {
+                    verifyFinal(finalFile)
+                    priorRestored = true
+                    cleanupRecords += ProcessingArtifactSettlementRecord(
+                        priorBackup,
+                        ProcessingArtifactResourceRole.PRIOR_BACKUP,
+                        ProcessingArtifactSettlementStatus.ABSENT
+                    )
+                    cleanupRecords += ProcessingArtifactSettlementRecord(
+                        finalFile,
+                        ProcessingArtifactResourceRole.RESTORED_PRIOR,
+                        ProcessingArtifactSettlementStatus.RESTORED
+                    )
+                } catch (restoreVerificationFailure: Throwable) {
+                    cleanupRecords += ProcessingArtifactSettlementRecord(
+                        finalFile,
+                        ProcessingArtifactResourceRole.RESTORED_PRIOR,
+                        ProcessingArtifactSettlementStatus.RESTORED_UNVERIFIED,
+                        restoreVerificationFailure
+                    )
+                }
             }
         }
 

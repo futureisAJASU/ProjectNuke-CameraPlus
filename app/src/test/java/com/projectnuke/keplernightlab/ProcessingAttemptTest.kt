@@ -27,18 +27,22 @@ class ProcessingAttemptTest {
                 "CLASSIC_RAW",
                 setOf("rawFusedPreviewFile")
             )
-            val afterStart = KeplerJobMetadata.read(dir)
-            assertEquals(attempt.id, afterStart.getString("processingAttemptId"))
-            assertFalse(afterStart.has("pipelineFailed"))
-            assertFalse(afterStart.has("rawFusedPreviewFile"))
+            try {
+                val afterStart = KeplerJobMetadata.read(dir)
+                assertEquals(attempt.id, afterStart.getString("processingAttemptId"))
+                assertFalse(afterStart.has("pipelineFailed"))
+                assertFalse(afterStart.has("rawFusedPreviewFile"))
 
-            val output = dir.resolve("merged.raw16").apply { writeBytes(byteArrayOf(1, 2)) }
-            markProcessingArtifactClaim(dir, attempt, "mergedRawFile", output)
-            val committed = KeplerJobMetadata.read(dir)
-            assertEquals(output.name, committed.getString("mergedRawFile"))
-            assertTrue(committed.getBoolean("processingOutputCommitted"))
-            assertEquals("ADOPTED", committed.getJSONArray("processingArtifactSettlements")
-                .getJSONObject(0).getString("status"))
+                val output = dir.resolve("merged.raw16").apply { writeBytes(byteArrayOf(1, 2)) }
+                markProcessingArtifactClaim(dir, attempt, "mergedRawFile", output)
+                val committed = KeplerJobMetadata.read(dir)
+                assertEquals(output.name, committed.getString("mergedRawFile"))
+                assertTrue(committed.getBoolean("processingOutputCommitted"))
+                assertEquals("ADOPTED", committed.getJSONArray("processingArtifactSettlements")
+                    .getJSONObject(0).getString("status"))
+            } finally {
+                attempt.releaseOwnedLease()
+            }
         } finally {
             dir.deleteRecursively()
         }
@@ -49,9 +53,13 @@ class ProcessingAttemptTest {
         val dir = Files.createTempDirectory("processing-attempt-new").toFile()
         try {
             val attempt = beginProcessingAttempt(dir, "SUPER_RESOLUTION")
-            val job = KeplerJobMetadata.read(dir)
-            assertEquals(attempt.id, job.getString("processingAttemptId"))
-            assertEquals("SUPER_RESOLUTION", job.getString("processingMode"))
+            try {
+                val job = KeplerJobMetadata.read(dir)
+                assertEquals(attempt.id, job.getString("processingAttemptId"))
+                assertEquals("SUPER_RESOLUTION", job.getString("processingMode"))
+            } finally {
+                attempt.releaseOwnedLease()
+            }
         } finally {
             dir.deleteRecursively()
         }

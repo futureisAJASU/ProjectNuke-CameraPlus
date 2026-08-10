@@ -110,10 +110,89 @@ class ProcessingArtifactTransactionTest {
             assertTrue(thrown != null)
             assertEquals("prior", finalFile.readText())
             assertTrue(thrown!!.settlements.any {
-                it.role == ProcessingArtifactResourceRole.PRIOR_BACKUP &&
+                it.path == finalFile &&
+                    it.role == ProcessingArtifactResourceRole.RESTORED_PRIOR &&
                     it.status == ProcessingArtifactSettlementStatus.RESTORED
             })
             assertTrue(dir.listFiles().orEmpty().none { it.name.endsWith(".tmp") || it.name.endsWith(".prior") })
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun failedRestoreMoveRecordsTheSurvivingPriorBackupPath() {
+        val dir = Files.createTempDirectory("processing-artifact-restore-move-failure").toFile()
+        try {
+            val finalFile = File(dir, "result.bin").apply { writeBytes("prior".toByteArray()) }
+            var restoreMoveFailure: Throwable? = null
+            var thrown: ProcessingArtifactException? = null
+            try {
+                commitProcessingArtifact(
+                    finalFile,
+                    writeTemp = { it.writeBytes("new".toByteArray()) },
+                    verifyFinal = { error("new verification failed") },
+                    move = { source, destination ->
+                        if (source.name.endsWith(".prior")) {
+                            restoreMoveFailure = IllegalStateException("restore move failed")
+                            throw restoreMoveFailure!!
+                        }
+                        java.nio.file.Files.move(
+                            source.toPath(),
+                            destination.toPath(),
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING
+                        )
+                    }
+                )
+            } catch (failure: ProcessingArtifactException) {
+                thrown = failure
+            }
+            assertTrue(thrown != null)
+            assertTrue(thrown!!.settlements.any {
+                it.path.name.endsWith(".prior") &&
+                    it.role == ProcessingArtifactResourceRole.PRIOR_BACKUP &&
+                    it.status == ProcessingArtifactSettlementStatus.RESTORE_MOVE_FAILED &&
+                    it.failure === restoreMoveFailure
+            })
+            assertFalse(thrown!!.settlements.any {
+                it.path == finalFile && it.role == ProcessingArtifactResourceRole.RESTORED_PRIOR
+            })
+            assertEquals("prior", thrown!!.priorBackupFile!!.readText())
+            assertFalse(finalFile.exists())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun successfulRestoreWithFailedVerificationRecordsFinalPathAsUnverified() {
+        val dir = Files.createTempDirectory("processing-artifact-restore-unverified").toFile()
+        try {
+            val finalFile = File(dir, "result.bin").apply { writeBytes("prior".toByteArray()) }
+            val verificationFailures = mutableListOf<Throwable>()
+            var thrown: ProcessingArtifactException? = null
+            try {
+                commitProcessingArtifact(
+                    finalFile,
+                    writeTemp = { it.writeBytes("new".toByteArray()) },
+                    verifyFinal = {
+                        val failure = IllegalStateException("verification failed")
+                        verificationFailures += failure
+                        throw failure
+                    }
+                )
+            } catch (failure: ProcessingArtifactException) {
+                thrown = failure
+            }
+            assertTrue(thrown != null)
+            assertEquals(2, verificationFailures.size)
+            assertEquals("prior", finalFile.readText())
+            assertTrue(thrown!!.settlements.any {
+                it.path == finalFile &&
+                    it.role == ProcessingArtifactResourceRole.RESTORED_PRIOR &&
+                    it.status == ProcessingArtifactSettlementStatus.RESTORED_UNVERIFIED &&
+                    it.failure === verificationFailures[1]
+            })
         } finally {
             dir.deleteRecursively()
         }

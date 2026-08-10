@@ -46,6 +46,40 @@ internal fun acquireRawProcessingOperation(
 }
 
 /**
+ * Settles a RAW wrapper failure while its outer operation is still authoritative. The caller
+ * owns the final release in a `finally`, so no terminal metadata or callback decision can race a
+ * subsequent operation.
+ */
+internal fun recordRawOuterTerminalFailureWhileOwned(
+    jobDir: File,
+    operation: RawProcessingOperation,
+    reason: String,
+    beforeMetadata: () -> Unit = {},
+    onStatus: () -> Unit
+) {
+    check(KeplerJobMetadata.isOperationOwner(jobDir, operation.lease)) {
+        "RAW terminal failure settlement requires the owning operation"
+    }
+    beforeMetadata()
+    try {
+        recordNormalPreCommitTerminal(
+            jobDir,
+            attemptStatus = "FAILED",
+            pipelineStage = "FAILED",
+            processStatus = "EXPORT_FAILED_KEEPING_CACHE",
+            reason = reason
+        )
+    } catch (metadataError: Exception) {
+        Log.e(
+            "KeplerRawPipeline",
+            "Failed to persist RAW terminal failure metadata: ${metadataError.message}",
+            metadataError
+        )
+    }
+    onStatus()
+}
+
+/**
  * Explicit export-result model returned by [RawFusionExportCoordinator.export]. Each production
  * branch produces exactly one subclass so the export stage never collapses a local candidate
  * output, a local-render failure, or a prior verified public export into a single ambiguous
@@ -645,10 +679,22 @@ fun captureProcessExportRawNightFusion(
                         .put("processingParams", processingParams.clamped().toJson())
                 }
             } catch (failure: Throwable) {
-                processingOperation.release()
-                if (failure is Error) throw failure
+                if (failure is Error) {
+                    processingOperation.release()
+                    throw failure
+                }
                 Log.e("KeplerRawPipeline", "RAW processing metadata initialization failed", failure)
-                post("PIPELINE_FAILED: RAW processing metadata initialization failed; RAW cache kept.")
+                try {
+                    recordRawOuterTerminalFailureWhileOwned(
+                        jobDir,
+                        processingOperation,
+                        "RAW processing metadata initialization failed: ${failure.message}"
+                    ) {
+                        post("PIPELINE_FAILED: RAW processing metadata initialization failed; RAW cache kept.")
+                    }
+                } finally {
+                    processingOperation.release()
+                }
                 return@captureRawBurstForFusion
             }
             Log.i("KeplerRawPipeline", "PROCESSING_STARTED jobDirAbsolutePath=${jobDir.absolutePath}")
@@ -656,10 +702,22 @@ fun captureProcessExportRawNightFusion(
             val thread = try {
                 HandlerThread("KeplerRawFusionPipelineThread").apply { start() }
             } catch (failure: Throwable) {
-                processingOperation.release()
-                if (failure is Error) throw failure
+                if (failure is Error) {
+                    processingOperation.release()
+                    throw failure
+                }
                 Log.e("KeplerRawPipeline", "RAW processing worker thread could not start", failure)
-                post("PIPELINE_FAILED: RAW processing worker could not start; RAW cache kept.")
+                try {
+                    recordRawOuterTerminalFailureWhileOwned(
+                        jobDir,
+                        processingOperation,
+                        "RAW processing worker could not start"
+                    ) {
+                        post("PIPELINE_FAILED: RAW processing worker could not start; RAW cache kept.")
+                    }
+                } finally {
+                    processingOperation.release()
+                }
                 return@captureRawBurstForFusion
             }
             val workerPosted = runCatching {
@@ -1313,24 +1371,18 @@ fun captureProcessExportRawNightFusion(
                 false
             }
             if (!workerPosted) {
-                thread.quitSafely()
-                processingOperation.release()
-                runCatching {
-                    recordNormalPreCommitTerminal(
+                try {
+                    recordRawOuterTerminalFailureWhileOwned(
                         jobDir,
-                        attemptStatus = "FAILED",
-                        pipelineStage = "FAILED",
-                        processStatus = "EXPORT_FAILED_KEEPING_CACHE",
-                        reason = "RAW processing worker could not start"
-                    )
-                }.onFailure { metadataError ->
-                    Log.e(
-                        "KeplerRawPipeline",
-                        "Failed to persist RAW worker-dispatch failure metadata: ${metadataError.message}",
-                        metadataError
-                    )
+                        processingOperation,
+                        "RAW processing worker could not start"
+                    ) {
+                        post("PIPELINE_FAILED: RAW processing worker could not start; RAW cache kept.")
+                    }
+                } finally {
+                    processingOperation.release()
+                    thread.quitSafely()
                 }
-                post("PIPELINE_FAILED: RAW processing worker could not start; RAW cache kept.")
             }
         },
         onError = { post("PIPELINE_FAILED: RAW capture failed; keeping cache.\n$it") }
