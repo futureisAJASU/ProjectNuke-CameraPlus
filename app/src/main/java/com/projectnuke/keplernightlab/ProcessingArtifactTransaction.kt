@@ -4,12 +4,16 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.Files
 import java.nio.file.LinkOption
+import java.nio.file.StandardCopyOption
+import java.nio.file.AtomicMoveNotSupportedException
+import java.util.UUID
 import org.json.JSONObject
 
 internal enum class ProcessingArtifactState {
     PLANNED,
     TEMP_OWNED,
     TEMP_VERIFIED,
+    PRIOR_FINAL_BACKED_UP,
     COMMITTED_FINAL,
     FINAL_VERIFIED,
     ADOPTED,
@@ -17,35 +21,122 @@ internal enum class ProcessingArtifactState {
     CLEANUP_FAILED
 }
 
+internal enum class ProcessingArtifactResourceRole {
+    TEMPORARY,
+    NEW_FINAL,
+    PRIOR_BACKUP,
+    ADOPTED_FINAL,
+    RESTORED_PRIOR
+}
+
+internal enum class ProcessingArtifactSettlementStatus {
+    NOT_ATTEMPTED,
+    ABSENT,
+    DELETED,
+    RESTORED,
+    ADOPTED,
+    DELETE_FAILED,
+    RESTORE_FAILED
+}
+
+internal data class ProcessingArtifactSettlementRecord(
+    val path: File,
+    val role: ProcessingArtifactResourceRole,
+    val status: ProcessingArtifactSettlementStatus,
+    val failure: Throwable? = null
+)
+
 internal data class ProcessingArtifactResult(
     val finalFile: File,
     val state: ProcessingArtifactState,
-    val cleanupFailure: Throwable? = null
+    val cleanupFailure: Throwable? = null,
+    val settlements: List<ProcessingArtifactSettlementRecord> = emptyList(),
+    val priorFinalPreserved: Boolean = false,
+    val priorFinalRestored: Boolean = false
 )
 
 /**
- * Raised when an artifact could not be committed or verified.  The paths are
- * retained so callers can report/settle a path which survived a failed
- * cleanup attempt instead of losing ownership at the exception boundary.
+ * Raised when an artifact could not be committed or verified. All paths and
+ * per-resource settlement evidence remain attached to the exception so a
+ * caller can retain exact cleanup/recovery debt.
  */
 internal class ProcessingArtifactException(
     val finalFile: File,
     val tempFile: File,
     val cleanupFailure: Throwable?,
-    cause: Throwable
+    cause: Throwable,
+    val settlements: List<ProcessingArtifactSettlementRecord> = emptyList(),
+    val priorBackupFile: File? = null
 ) : IllegalStateException("Processing artifact transaction failed for ${finalFile.absolutePath}", cause)
+
+private fun existingRegularArtifact(file: File): Boolean {
+    val path = file.toPath()
+    check(!Files.isSymbolicLink(path)) { "Artifact destination must not be a symbolic link" }
+    return Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)
+}
+
+private fun moveArtifact(source: File, destination: File) {
+    check(!Files.isSymbolicLink(destination.toPath())) {
+        "Artifact destination must not be a symbolic link"
+    }
+    try {
+        Files.move(
+            source.toPath(),
+            destination.toPath(),
+            StandardCopyOption.ATOMIC_MOVE,
+            StandardCopyOption.REPLACE_EXISTING
+        )
+    } catch (_: AtomicMoveNotSupportedException) {
+        Files.move(source.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING)
+    }
+}
+
+private fun cleanupArtifact(file: File, role: ProcessingArtifactResourceRole): ProcessingArtifactSettlementRecord {
+    return try {
+        if (!Files.exists(file.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+            ProcessingArtifactSettlementRecord(file, role, ProcessingArtifactSettlementStatus.ABSENT)
+        } else if (Files.isSymbolicLink(file.toPath())) {
+            val failure = IllegalStateException("Refusing to delete symlink artifact ${file.absolutePath}")
+            ProcessingArtifactSettlementRecord(file, role, ProcessingArtifactSettlementStatus.DELETE_FAILED, failure)
+        } else if (Files.deleteIfExists(file.toPath())) {
+            ProcessingArtifactSettlementRecord(file, role, ProcessingArtifactSettlementStatus.DELETED)
+        } else {
+            ProcessingArtifactSettlementRecord(
+                file,
+                role,
+                ProcessingArtifactSettlementStatus.DELETE_FAILED,
+                IllegalStateException("Could not delete artifact ${file.absolutePath}")
+            )
+        }
+    } catch (failure: Throwable) {
+        ProcessingArtifactSettlementRecord(file, role, ProcessingArtifactSettlementStatus.DELETE_FAILED, failure)
+    }
+}
 
 internal fun commitProcessingArtifact(
     finalFile: File,
     writeTemp: (File) -> Unit,
-    verifyFinal: (File) -> Unit
+    verifyFinal: (File) -> Unit,
+    cancellation: KeplerPipelineCancellation? = null
 ): ProcessingArtifactResult {
     val parent = finalFile.parentFile ?: error("Artifact parent is missing")
     require(NoFollowFileSystem.isRealDirectory(parent.toPath())) { "Artifact parent must be a real directory" }
-    require(!Files.isSymbolicLink(finalFile.toPath())) { "Artifact destination must not be a symbolic link" }
-    val temp = File(parent, ".${finalFile.name}.${System.nanoTime()}.tmp")
+    check(!Files.isSymbolicLink(finalFile.toPath())) { "Artifact destination must not be a symbolic link" }
+
+    val temp = File(parent, ".${finalFile.name}.${UUID.randomUUID()}.tmp")
+    val priorBackup = File(parent, ".${finalFile.name}.${UUID.randomUUID()}.prior")
+    val settlements = mutableListOf<ProcessingArtifactSettlementRecord>()
     var state = ProcessingArtifactState.PLANNED
+    var priorBackedUp = false
+    var newFinalCommitted = false
+    var priorRestored = false
+
+    fun checkCancelled() {
+        cancellation?.throwIfCancelled()
+    }
+
     try {
+        checkCancelled()
         check(!Files.exists(temp.toPath(), LinkOption.NOFOLLOW_LINKS)) { "Artifact temp already exists" }
         state = ProcessingArtifactState.TEMP_OWNED
         writeTemp(temp)
@@ -53,57 +144,109 @@ internal fun commitProcessingArtifact(
             "Artifact temp verification failed"
         }
         state = ProcessingArtifactState.TEMP_VERIFIED
-        KeplerJobMetadata.atomicReplace(temp, finalFile)
+        checkCancelled()
+
+        if (existingRegularArtifact(finalFile)) {
+            moveArtifact(finalFile, priorBackup)
+            priorBackedUp = true
+            state = ProcessingArtifactState.PRIOR_FINAL_BACKED_UP
+        }
+
+        checkCancelled()
+        moveArtifact(temp, finalFile)
+        newFinalCommitted = true
         state = ProcessingArtifactState.COMMITTED_FINAL
+
+        // Once commit begins, cancellation cannot interrupt ownership. Verify
+        // the actual final pathname and either adopt it or roll back safely.
         verifyFinal(finalFile)
         state = ProcessingArtifactState.FINAL_VERIFIED
-        return ProcessingArtifactResult(finalFile, ProcessingArtifactState.ADOPTED)
+        settlements += ProcessingArtifactSettlementRecord(
+            finalFile,
+            ProcessingArtifactResourceRole.ADOPTED_FINAL,
+            ProcessingArtifactSettlementStatus.ADOPTED
+        )
+        state = ProcessingArtifactState.ADOPTED
+
+        if (priorBackedUp) {
+            val backupSettlement = cleanupArtifact(priorBackup, ProcessingArtifactResourceRole.PRIOR_BACKUP)
+            settlements += backupSettlement
+            if (backupSettlement.status == ProcessingArtifactSettlementStatus.DELETE_FAILED) {
+                state = ProcessingArtifactState.CLEANUP_FAILED
+            }
+        }
+        settlements += ProcessingArtifactSettlementRecord(
+            temp,
+            ProcessingArtifactResourceRole.TEMPORARY,
+            ProcessingArtifactSettlementStatus.ABSENT
+        )
+        return ProcessingArtifactResult(
+            finalFile = finalFile,
+            state = state,
+            cleanupFailure = settlements.firstOrNull { it.failure != null }?.failure,
+            settlements = settlements.toList(),
+            priorFinalPreserved = priorBackedUp,
+            priorFinalRestored = false
+        )
     } catch (failure: Throwable) {
-        val tempCleanupFailure = try {
-            if (temp.exists() && !temp.delete()) {
-                IllegalStateException("Could not delete artifact temp ${temp.absolutePath}")
-            } else {
-                null
-            }
-        } catch (cleanup: Throwable) {
-            cleanup
-        }
-        // Once atomic replacement completed, the final path belongs to this
-        // attempt.  Verification failure must not strand an unadopted final.
-        val finalCleanupFailure = if (state >= ProcessingArtifactState.COMMITTED_FINAL) {
-            try {
-                val finalPath = finalFile.toPath()
-                if (Files.isSymbolicLink(finalPath)) {
-                    IllegalStateException("Refusing to delete symlink artifact ${finalFile.absolutePath}")
-                } else if (Files.exists(finalPath, LinkOption.NOFOLLOW_LINKS) &&
-                    !Files.deleteIfExists(finalPath)
-                ) {
-                    IllegalStateException("Could not delete unverified artifact ${finalFile.absolutePath}")
-                } else {
-                    null
-                }
-            } catch (cleanup: Throwable) {
-                cleanup
-            }
+        val cleanupRecords = mutableListOf<ProcessingArtifactSettlementRecord>()
+        if (newFinalCommitted) {
+            cleanupRecords += cleanupArtifact(finalFile, ProcessingArtifactResourceRole.NEW_FINAL)
         } else {
-            null
+            cleanupRecords += ProcessingArtifactSettlementRecord(
+                finalFile,
+                ProcessingArtifactResourceRole.NEW_FINAL,
+                ProcessingArtifactSettlementStatus.NOT_ATTEMPTED
+            )
         }
-        val cleanupFailure = listOfNotNull(tempCleanupFailure, finalCleanupFailure)
-            .reduceOrNull { first, next -> first.apply { addSuppressed(next) } }
+        cleanupRecords += cleanupArtifact(temp, ProcessingArtifactResourceRole.TEMPORARY)
+
+        if (priorBackedUp) {
+            try {
+                moveArtifact(priorBackup, finalFile)
+                verifyFinal(finalFile)
+                priorRestored = true
+                cleanupRecords += ProcessingArtifactSettlementRecord(
+                    priorBackup,
+                    ProcessingArtifactResourceRole.PRIOR_BACKUP,
+                    ProcessingArtifactSettlementStatus.RESTORED
+                )
+                cleanupRecords += ProcessingArtifactSettlementRecord(
+                    finalFile,
+                    ProcessingArtifactResourceRole.RESTORED_PRIOR,
+                    ProcessingArtifactSettlementStatus.RESTORED
+                )
+            } catch (restoreFailure: Throwable) {
+                cleanupRecords += ProcessingArtifactSettlementRecord(
+                    priorBackup,
+                    ProcessingArtifactResourceRole.PRIOR_BACKUP,
+                    ProcessingArtifactSettlementStatus.RESTORE_FAILED,
+                    restoreFailure
+                )
+            }
+        }
+
+        val allSettlements = settlements + cleanupRecords
+        val cleanupFailure = allSettlements.firstOrNull { it.failure != null }?.failure
         if (cleanupFailure != null) {
             failure.addSuppressed(cleanupFailure)
             state = ProcessingArtifactState.CLEANUP_FAILED
-        } else if (state != ProcessingArtifactState.COMMITTED_FINAL) {
+        } else {
             state = ProcessingArtifactState.ROLLED_BACK
         }
-        if (failure is Error) {
-            throw failure
-        }
-        throw ProcessingArtifactException(finalFile, temp, cleanupFailure, failure)
+        if (failure is Error) throw failure
+        throw ProcessingArtifactException(
+            finalFile = finalFile,
+            tempFile = temp,
+            cleanupFailure = cleanupFailure,
+            cause = failure,
+            settlements = allSettlements,
+            priorBackupFile = priorBackup.takeIf { priorBackedUp && it.exists() }
+        )
     }
 }
 
-internal fun writeVerifiedTextArtifact(finalFile: File, text: String): ProcessingArtifactResult =
+internal fun writeVerifiedJsonArtifact(finalFile: File, text: String): ProcessingArtifactResult =
     commitProcessingArtifact(
         finalFile = finalFile,
         writeTemp = { temp ->
@@ -114,13 +257,17 @@ internal fun writeVerifiedTextArtifact(finalFile: File, text: String): Processin
         },
         verifyFinal = { committed ->
             val verified = NoFollowFileSystem.readTextVerified(committed)
-            check(verified.isNotEmpty()) { "Text artifact is empty" }
+            check(verified.isNotBlank()) { "JSON artifact is empty" }
             check(verified.trim().let { it.startsWith("{") && it.endsWith("}") }) {
-                "Text artifact is not a JSON object"
+                "JSON artifact is not an object"
             }
             JSONObject(verified)
         }
     )
+
+@Deprecated("Use writeVerifiedJsonArtifact")
+internal fun writeVerifiedTextArtifact(finalFile: File, text: String): ProcessingArtifactResult =
+    writeVerifiedJsonArtifact(finalFile, text)
 
 internal fun copyVerifiedArtifact(sourceFile: File, finalFile: File): ProcessingArtifactResult =
     commitProcessingArtifact(
@@ -139,16 +286,30 @@ internal fun copyVerifiedArtifact(sourceFile: File, finalFile: File): Processing
         }
     )
 
-internal fun verifyPngArtifact(file: File) {
+internal fun verifyPngArtifact(file: File, expectedWidth: Int? = null, expectedHeight: Int? = null) {
     val prefix = NoFollowFileSystem.digestVerified(file).prefix
     check(prefix.size >= 8 && prefix.copyOf(8).contentEquals(
         byteArrayOf(137.toByte(), 80, 78, 71, 13, 10, 26, 10)
     )) { "Invalid PNG artifact ${file.name}" }
+    val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    check(NoFollowFileSystem.decodeBitmapVerified(file, bounds) != null) {
+        "PNG decode failed ${file.name}"
+    }
+    check(bounds.outWidth > 0 && bounds.outHeight > 0) { "PNG dimensions are invalid" }
+    expectedWidth?.let { check(bounds.outWidth == it) { "PNG width mismatch" } }
+    expectedHeight?.let { check(bounds.outHeight == it) { "PNG height mismatch" } }
 }
 
-internal fun verifyJpegArtifact(file: File) {
+internal fun verifyJpegArtifact(file: File, expectedWidth: Int? = null, expectedHeight: Int? = null) {
     val prefix = NoFollowFileSystem.digestVerified(file).prefix
     check(prefix.size >= 2 && prefix[0] == 0xFF.toByte() && prefix[1] == 0xD8.toByte()) {
         "Invalid JPEG artifact ${file.name}"
     }
+    val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    check(NoFollowFileSystem.decodeBitmapVerified(file, bounds) != null) {
+        "JPEG decode failed ${file.name}"
+    }
+    check(bounds.outWidth > 0 && bounds.outHeight > 0) { "JPEG dimensions are invalid" }
+    expectedWidth?.let { check(bounds.outWidth == it) { "JPEG width mismatch" } }
+    expectedHeight?.let { check(bounds.outHeight == it) { "JPEG height mismatch" } }
 }
