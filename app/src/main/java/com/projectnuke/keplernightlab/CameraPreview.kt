@@ -182,6 +182,7 @@ private class CameraPreviewController(
     @Volatile private var latestMeteringMode: MeteringMode = MeteringModeState.mode
     private var openRequestedGeneration: Int? = null
     private var lastTextureView: TextureView? = null
+    private var cleanupDiagnostics = PreviewCleanupDiagnostics()
     private val emergencyReleaseExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "KeplerPreviewEmergencyRelease").apply { isDaemon = true }
     }
@@ -265,7 +266,7 @@ private class CameraPreviewController(
                 }
         }
         val closeResources = Runnable {
-            val cleanup = settlePreviewResources(
+            val cleanup = settleAndRecord(
                 generation = refs.generation.toLong(),
                 operations = listOf(
                     PreviewResourceOperation.STOP_REPEATING to { refs.session?.stopRepeating() },
@@ -284,7 +285,7 @@ private class CameraPreviewController(
                 finishStop(refs.generation)
                 return
             }
-            val quit = settlePreviewResources(
+            val quit = settleAndRecord(
                 generation = refs.generation.toLong(),
                 operations = listOf(PreviewResourceOperation.HANDLER_THREAD_QUIT to { thread.quitSafely() })
             )
@@ -293,7 +294,7 @@ private class CameraPreviewController(
             }
             try {
                 emergencyReleaseExecutor.execute {
-                    val termination = settlePreviewResources(
+                    val termination = settleAndRecord(
                         generation = refs.generation.toLong(),
                         operations = listOf(PreviewResourceOperation.HANDLER_THREAD_TERMINATION to {
                             thread.join(2_000L)
@@ -306,16 +307,19 @@ private class CameraPreviewController(
                     finishStop(refs.generation)
                 }
             } catch (failure: Throwable) {
-                Log.e(TAG, "preview emergency release dispatch rejected", failure)
+                    recordCleanupDispatchFailure(failure)
+                    Log.e(TAG, "preview emergency release dispatch rejected", failure)
                 finishStop(refs.generation)
             }
         }
         if (refs.handler != null) {
             val posted = refs.handler.post(closeResources)
             if (!posted) {
+                recordCleanupDispatchFailure(IllegalStateException("preview handler rejected cleanup dispatch"))
                 try {
                     emergencyReleaseExecutor.execute(closeResources)
                 } catch (failure: Throwable) {
+                    recordCleanupDispatchFailure(failure)
                     Log.e(TAG, "preview cleanup dispatch rejected", failure)
                 }
             }
@@ -324,6 +328,7 @@ private class CameraPreviewController(
             try {
                 emergencyReleaseExecutor.execute(closeResources)
             } catch (failure: Throwable) {
+                recordCleanupDispatchFailure(failure)
                 Log.e(TAG, "preview cleanup dispatch rejected", failure)
             }
             markStoppedWhenTerminated()
@@ -343,13 +348,46 @@ private class CameraPreviewController(
         operation: PreviewResourceOperation,
         release: () -> Unit
     ) {
-        settlePreviewResources(
+        settleAndRecord(
             generation = localGeneration.toLong(),
-            operations = listOf(operation to release)
+            operations = listOf(operation to release),
+            late = true
         ).failures.forEach { record ->
             Log.e(TAG, "late preview resource settlement failed generation=${record.generation} operation=${record.operation}", record.failure)
         }
     }
+
+    private fun settleAndRecord(
+        generation: Long,
+        operations: List<Pair<PreviewResourceOperation, () -> Unit>>,
+        late: Boolean = false
+    ): PreviewCleanupSnapshot {
+        val snapshot = settlePreviewResources(generation, operations)
+        synchronized(lock) {
+            val lateSnapshots = if (late) {
+                (cleanupDiagnostics.lateResourceSettlements + snapshot).takeLast(8)
+            } else {
+                cleanupDiagnostics.lateResourceSettlements
+            }
+            val termination = snapshot.records.firstOrNull {
+                it.operation == PreviewResourceOperation.HANDLER_THREAD_TERMINATION
+            } ?: cleanupDiagnostics.threadTerminationOutcome
+            cleanupDiagnostics = cleanupDiagnostics.copy(
+                lastCleanupSnapshot = snapshot,
+                lateResourceSettlements = lateSnapshots,
+                threadTerminationOutcome = termination
+            )
+        }
+        return snapshot
+    }
+
+    private fun recordCleanupDispatchFailure(failure: Throwable) {
+        synchronized(lock) {
+            cleanupDiagnostics = cleanupDiagnostics.copy(cleanupDispatchFailure = failure)
+        }
+    }
+
+    internal fun cleanupDiagnostics(): PreviewCleanupDiagnostics = synchronized(lock) { cleanupDiagnostics }
 
     fun updateFocusAeState(newState: FocusAeState) {
         val previous = latestFocusAeState
@@ -1063,6 +1101,7 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
     private fun callbackDispatchFailed(localGeneration: Int, failure: Throwable) {
         Log.e(TAG, "preview callback delivery failed generation=$localGeneration", failure)
         synchronized(lock) {
+            cleanupDiagnostics = cleanupDiagnostics.copy(callbackDispatchFailure = failure)
             if (generationOwner.snapshot().generation == localGeneration.toLong()) {
                 generationOwner.fail(localGeneration.toLong())
             }

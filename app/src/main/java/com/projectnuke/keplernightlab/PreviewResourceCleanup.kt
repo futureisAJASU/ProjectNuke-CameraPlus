@@ -24,6 +24,14 @@ data class PreviewCleanupSnapshot(
         get() = records.filterNot { it.succeeded }
 }
 
+data class PreviewCleanupDiagnostics(
+    val lastCleanupSnapshot: PreviewCleanupSnapshot? = null,
+    val lateResourceSettlements: List<PreviewCleanupSnapshot> = emptyList(),
+    val threadTerminationOutcome: PreviewResourceSettlementRecord? = null,
+    val callbackDispatchFailure: Throwable? = null,
+    val cleanupDispatchFailure: Throwable? = null
+)
+
 internal fun settlePreviewResources(
     generation: Long,
     operations: List<Pair<PreviewResourceOperation, () -> Unit>>
