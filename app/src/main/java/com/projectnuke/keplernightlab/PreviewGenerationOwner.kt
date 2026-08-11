@@ -1,6 +1,6 @@
 package com.projectnuke.keplernightlab
 
-/** Pure generation fence used by preview tests and mirrored by CameraPreviewController. */
+/** Production preview generation authority used directly by CameraPreviewController and tests. */
 internal class PreviewGenerationOwner {
     enum class State { STOPPED, STARTING, OPEN, STOPPING, FAILED }
 
@@ -42,8 +42,8 @@ internal class PreviewGenerationOwner {
     }
 
     @Synchronized
-    fun finishStop(): Boolean {
-        if (snapshot.state != State.STOPPING) return false
+    fun finishStop(stopGeneration: Long): Boolean {
+        if (snapshot.generation != stopGeneration || snapshot.state != State.STOPPING) return false
         snapshot = snapshot.copy(state = State.STOPPED)
         return snapshot.desiredRunning
     }

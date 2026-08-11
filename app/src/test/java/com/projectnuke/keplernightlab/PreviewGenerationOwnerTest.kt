@@ -13,11 +13,11 @@ class PreviewGenerationOwnerTest {
         val first = owner.start()
         assertNotNull(first)
         assertTrue(owner.markOpen(first!!))
-        owner.stop()
+        val stopGeneration = owner.stop()!!
         assertEquals(PreviewGenerationOwner.State.STOPPING, owner.snapshot().state)
         assertEquals(null, owner.start())
         assertTrue(owner.snapshot().desiredRunning)
-        assertTrue(owner.finishStop())
+        assertTrue(owner.finishStop(stopGeneration))
         val second = owner.start()
         assertNotNull(second)
         assertTrue(second!! > first)
@@ -38,5 +38,28 @@ class PreviewGenerationOwnerTest {
         val generation = owner.start()!!
         owner.stop()
         assertFalse(owner.accepts(generation))
+    }
+
+    @Test
+    fun staleStopCompletionCannotStopReplacementGeneration() {
+        val owner = PreviewGenerationOwner()
+        val first = owner.start()!!
+        val stopGeneration = owner.stop()!!
+        assertTrue(owner.snapshot().desiredRunning.not())
+        assertFalse(owner.finishStop(first))
+        assertEquals(PreviewGenerationOwner.State.STOPPING, owner.snapshot().state)
+        assertTrue(owner.finishStop(stopGeneration))
+        assertEquals(PreviewGenerationOwner.State.STOPPED, owner.snapshot().state)
+    }
+
+    @Test
+    fun failedGenerationCanBeStartedAgain() {
+        val owner = PreviewGenerationOwner()
+        val first = owner.start()!!
+        assertTrue(owner.fail(first))
+        assertFalse(owner.accepts(first))
+        val second = owner.start()
+        assertNotNull(second)
+        assertTrue(second!! > first)
     }
 }
