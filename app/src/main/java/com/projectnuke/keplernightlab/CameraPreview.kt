@@ -37,10 +37,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 import java.util.concurrent.Executors
+
+enum class PreviewAvailability { AVAILABLE, PERMISSION_REQUIRED, DISABLED, FAILED }
 
 @Composable
 fun Camera2Preview(
@@ -54,11 +59,17 @@ fun Camera2Preview(
     focusAeState: FocusAeState = FocusAeState(),
     meteringMode: MeteringMode = MeteringModeState.mode,
     enabled: Boolean = true,
-    onAeCapabilitiesChanged: (minIndex: Int, maxIndex: Int, stepEv: Float) -> Unit = { _, _, _ -> }
+    onAeCapabilitiesChanged: (minIndex: Int, maxIndex: Int, stepEv: Float) -> Unit = { _, _, _ -> },
+    onPreviewAvailabilityChanged: (PreviewAvailability) -> Unit = {}
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     var textureView by remember { mutableStateOf<TextureView?>(null) }
     val latestOnAeCapabilitiesChanged = rememberUpdatedState(onAeCapabilitiesChanged)
+    val latestOnPreviewAvailabilityChanged = rememberUpdatedState(onPreviewAvailabilityChanged)
+    var lifecycleStarted by remember {
+        mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED))
+    }
 
     val controller = remember(cameraId, physicalCameraId) {
         CameraPreviewController(
@@ -90,6 +101,29 @@ fun Camera2Preview(
         controller.updateMeteringMode(meteringMode)
     }
 
+    DisposableEffect(lifecycleOwner, controller) {
+        val observer = LifecycleEventObserver { _, event ->
+            lifecycleStarted = event == Lifecycle.Event.ON_START ||
+                event == Lifecycle.Event.ON_RESUME
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    LaunchedEffect(enabled, lifecycleStarted) {
+        val permissionGranted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+        latestOnPreviewAvailabilityChanged.value(
+            when {
+                !permissionGranted -> PreviewAvailability.PERMISSION_REQUIRED
+                !enabled || !lifecycleStarted -> PreviewAvailability.DISABLED
+                else -> PreviewAvailability.AVAILABLE
+            }
+        )
+    }
+
     AndroidView(
         modifier = modifier,
         factory = { ctx ->
@@ -102,12 +136,13 @@ fun Camera2Preview(
     DisposableEffect(
         textureView,
         enabled,
+        lifecycleStarted,
         cameraId,
         controller
     ) {
         val view = textureView
 
-        if (enabled && view != null) {
+        if (enabled && lifecycleStarted && view != null) {
             controller.start(view)
         } else {
             controller.stop()

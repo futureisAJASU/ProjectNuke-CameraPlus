@@ -319,10 +319,19 @@ fun MainCameraScreen(
 
     var status by remember { mutableStateOf("대기 중") }
     var pipelineUiState by remember { mutableStateOf(pipelineSession.snapshot()) }
-    val previewEnabled = pipelineUiState.previewAllowed
+    var currentScreen by remember { mutableStateOf(MainScreen.CAMERA) }
+    var lifecyclePreviewAllowed by remember { mutableStateOf(true) }
+    var previewAvailability by remember { mutableStateOf(PreviewAvailability.AVAILABLE) }
+    val previewEnabled = previewMayRun(
+        PreviewLifecycleInput(
+            lifecycleStarted = lifecyclePreviewAllowed,
+            cameraScreenVisible = currentScreen == MainScreen.CAMERA,
+            pipelineAllowsPreview = pipelineUiState.previewAllowed,
+            permissionGranted = previewAvailability != PreviewAvailability.PERMISSION_REQUIRED
+        )
+    )
     val isCapturing = pipelineUiState.isCapturing
     val isPipelineBusy = pipelineUiState.isBusy
-    var currentScreen by remember { mutableStateOf(MainScreen.CAMERA) }
     val captureProgress = pipelineUiState.captureProgress
 
     fun publishPipelineState() {
@@ -495,7 +504,22 @@ fun MainCameraScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, settingsPersistence) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP) settingsPersistence.flush()
+            when (event) {
+                Lifecycle.Event.ON_STOP -> {
+                    lifecyclePreviewAllowed = false
+                    settingsPersistence.flush()
+                    val snapshot = pipelineSession.snapshot()
+                    if (snapshot.phase == CameraPipelineUiSession.Phase.START_SCHEDULED ||
+                        snapshot.phase == CameraPipelineUiSession.Phase.CAPTURING
+                    ) {
+                        pipelineSession.requestCancellation(snapshot.generation, "activity stopped")
+                        publishPipelineState()
+                    }
+                }
+                Lifecycle.Event.ON_START,
+                Lifecycle.Event.ON_RESUME -> lifecyclePreviewAllowed = true
+                else -> Unit
+            }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
@@ -1014,6 +1038,12 @@ mainHandler.removeCallbacks(watchdog)
                             exposureCompensationIndex = index,
                             exposureCompensationEv = index * stepEv
                         )
+                    }
+                },
+                onPreviewAvailabilityChanged = { availability ->
+                    previewAvailability = availability
+                    if (availability == PreviewAvailability.PERMISSION_REQUIRED) {
+                        status = "카메라 권한이 필요합니다."
                     }
                 },
                 onToggleFocusLock = {

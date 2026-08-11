@@ -76,7 +76,8 @@ internal fun PreviewStage(
                 focusAeState = state.focusAeState,
                 meteringMode = meteringMode,
                 enabled = state.previewEnabled,
-                onAeCapabilitiesChanged = callbacks.onAeCapabilitiesChanged
+                onAeCapabilitiesChanged = callbacks.onAeCapabilitiesChanged,
+                onPreviewAvailabilityChanged = callbacks.onPreviewAvailabilityChanged
             )
 
             if (state.overlaySettings.showGrid) {

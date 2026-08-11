@@ -117,7 +117,8 @@ internal data class CameraPreviewPaneCallbacks(
     val onFocusPoint: (NormalizedPoint) -> Unit,
     val onAeCapabilitiesChanged: (Int, Int, Float) -> Unit,
     val onToggleFocusLock: () -> Unit,
-    val onExposureStep: (Int) -> Unit
+    val onExposureStep: (Int) -> Unit,
+    val onPreviewAvailabilityChanged: (PreviewAvailability) -> Unit = {}
 )
 
 @Composable
