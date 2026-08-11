@@ -143,7 +143,7 @@ internal class CameraPipelineUiOrchestrator(
                     token,
                     captureCancellation,
                     { display ->
-                        when (scheduler.post(0L, Runnable {
+                        when (postSafely(0L, Runnable {
                             if (session.snapshot().generation == generation) {
                                 callbacks.onStatus(display)
                                 callbacks.onStateChanged()
@@ -161,7 +161,7 @@ internal class CameraPipelineUiOrchestrator(
                             // Terminal evidence is authoritative before any UI dispatch attempt.
                             acceptEvent(event)
                         } else {
-                            when (scheduler.post(0L, Runnable {
+                            when (postSafely(0L, Runnable {
                                 if (session.snapshot().generation == generation) {
                                     when (session.accept(event)) {
                                         CameraPipelineUiSession.EventResult.ACCEPTED -> notifyNonTerminal(event)
@@ -219,6 +219,12 @@ internal class CameraPipelineUiOrchestrator(
     private fun clearScheduledWork(generation: Long) {
         session.clearWatchdog(generation)?.let(scheduler::remove)
         session.clearScheduledStart(generation)?.let(scheduler::remove)
+    }
+
+    private fun postSafely(delayMillis: Long, work: Runnable): CameraUiDispatchOutcome = try {
+        scheduler.post(delayMillis, work)
+    } catch (_: Throwable) {
+        CameraUiDispatchOutcome.DISPATCH_THREW
     }
 
     private fun dispatchTerminalNotification(
