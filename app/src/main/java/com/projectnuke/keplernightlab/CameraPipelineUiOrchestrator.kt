@@ -3,6 +3,8 @@ package com.projectnuke.keplernightlab
 import android.util.Log
 import java.util.concurrent.CancellationException
 
+internal enum class TerminalUiDeliveryOutcome { ACCEPTED, REJECTED, DISPATCH_THREW }
+
 internal typealias CameraPipelineUiJob = (
     KeplerPipelineCancellationToken,
     KeplerCaptureCancellationHandle,
@@ -22,8 +24,24 @@ internal class CameraPipelineUiOrchestrator(
         val onTerminal: (CameraPipelineEvent.Terminal) -> Unit
     )
 
+    private var pendingTerminal: CameraPipelineEvent.Terminal? = null
+    private var terminalUiNotifiedGeneration: Long? = null
+    private var terminalUiDeliveryOutcomeValue: TerminalUiDeliveryOutcome? = null
+
     fun updateCallbacks(callbacks: Callbacks) {
         this.callbacks = callbacks
+    }
+
+    internal fun terminalUiDeliveryOutcome(): TerminalUiDeliveryOutcome? =
+        synchronized(this) { terminalUiDeliveryOutcomeValue }
+
+    /** Retries only the UI notification; it never asks the native pipeline to republish. */
+    internal fun reconcileTerminalUiDelivery(): CameraUiDispatchOutcome {
+        val terminal = synchronized(this) {
+            if (terminalUiDeliveryOutcomeValue == TerminalUiDeliveryOutcome.ACCEPTED) return CameraUiDispatchOutcome.ACCEPTED
+            pendingTerminal
+        } ?: return CameraUiDispatchOutcome.REJECTED
+        return dispatchTerminalNotification(terminal)
     }
 
     fun start(
@@ -71,7 +89,7 @@ internal class CameraPipelineUiOrchestrator(
             CameraUiDispatchOutcome.ACCEPTED -> Unit
             CameraUiDispatchOutcome.REJECTED,
             CameraUiDispatchOutcome.DISPATCH_THREW -> {
-                session.clearWatchdog(generation)?.let(scheduler::remove)
+                clearScheduledWork(generation)
                 if (session.settlePreStartFailure(
                         generation,
                         "PIPELINE_FAILED: Timeout guard could not be scheduled before capture start."
@@ -84,16 +102,22 @@ internal class CameraPipelineUiOrchestrator(
             }
         }
 
+        fun notifyNonTerminal(event: CameraPipelineEvent) {
+            event.message?.let(callbacks.onStatus)
+            callbacks.onStateChanged()
+        }
+
         fun acceptEvent(event: CameraPipelineEvent) {
             when (session.accept(event)) {
                 CameraPipelineUiSession.EventResult.ACCEPTED -> {
-                    event.message?.let(callbacks.onStatus)
-                    callbacks.onStateChanged()
                     val terminal = event as? CameraPipelineEvent.Terminal ?: return
+                    synchronized(this@CameraPipelineUiOrchestrator) {
+                        pendingTerminal = terminal
+                    }
                     session.clearWatchdog(generation)?.let(scheduler::remove)
-                    callbacks.onTerminal(terminal)
+                    dispatchTerminalNotification(terminal)
                 }
-                CameraPipelineUiSession.EventResult.DUPLICATE_TERMINAL -> callbacks.onStateChanged()
+                CameraPipelineUiSession.EventResult.DUPLICATE_TERMINAL -> Unit
                 CameraPipelineUiSession.EventResult.STALE,
                 CameraPipelineUiSession.EventResult.DISPOSED -> Log.i(TAG, "stale pipeline event ignored generation=$generation")
             }
@@ -102,6 +126,7 @@ internal class CameraPipelineUiOrchestrator(
         val jobStart = Runnable {
             if (session.snapshot().generation != generation) return@Runnable
             if (token.isCancelled) {
+                clearScheduledWork(generation)
                 if (session.settleScheduledStartCancellation(
                         generation,
                         "PIPELINE_CANCELLED: Capture start was cancelled before Camera2 acquisition."
@@ -132,11 +157,25 @@ internal class CameraPipelineUiOrchestrator(
                     },
                     { native ->
                         val event = native.withGeneration(generation)
-                        when (scheduler.post(0L, Runnable { acceptEvent(event) })) {
-                            CameraUiDispatchOutcome.ACCEPTED -> Unit
-                            CameraUiDispatchOutcome.REJECTED,
-                            CameraUiDispatchOutcome.DISPATCH_THREW ->
-                                Log.e(TAG, "pipeline event dispatch failed generation=$generation")
+                        if (event is CameraPipelineEvent.Terminal) {
+                            // Terminal evidence is authoritative before any UI dispatch attempt.
+                            acceptEvent(event)
+                        } else {
+                            when (scheduler.post(0L, Runnable {
+                                if (session.snapshot().generation == generation) {
+                                    when (session.accept(event)) {
+                                        CameraPipelineUiSession.EventResult.ACCEPTED -> notifyNonTerminal(event)
+                                        CameraPipelineUiSession.EventResult.DUPLICATE_TERMINAL -> Unit
+                                        CameraPipelineUiSession.EventResult.STALE,
+                                        CameraPipelineUiSession.EventResult.DISPOSED -> Unit
+                                    }
+                                }
+                            })) {
+                                CameraUiDispatchOutcome.ACCEPTED -> Unit
+                                CameraUiDispatchOutcome.REJECTED,
+                                CameraUiDispatchOutcome.DISPATCH_THREW ->
+                                    Log.e(TAG, "pipeline event dispatch failed generation=$generation")
+                            }
                         }
                     }
                 )
@@ -157,7 +196,7 @@ internal class CameraPipelineUiOrchestrator(
             CameraUiDispatchOutcome.ACCEPTED -> Unit
             CameraUiDispatchOutcome.REJECTED,
             CameraUiDispatchOutcome.DISPATCH_THREW -> {
-                session.clearScheduledStart(generation)?.let(scheduler::remove)
+                clearScheduledWork(generation)
                 if (session.settlePreStartFailure(
                         generation,
                         "PIPELINE_FAILED: Capture could not be scheduled before Camera2 acquisition."
@@ -172,8 +211,47 @@ internal class CameraPipelineUiOrchestrator(
     }
 
     fun dispose() {
+        session.currentOperation()?.generation?.let(::clearScheduledWork)
         session.dispose()
         callbacks.onStateChanged()
+    }
+
+    private fun clearScheduledWork(generation: Long) {
+        session.clearWatchdog(generation)?.let(scheduler::remove)
+        session.clearScheduledStart(generation)?.let(scheduler::remove)
+    }
+
+    private fun dispatchTerminalNotification(
+        terminal: CameraPipelineEvent.Terminal
+    ): CameraUiDispatchOutcome {
+        synchronized(this) {
+            if (terminalUiNotifiedGeneration == terminal.generation) {
+                terminalUiDeliveryOutcomeValue = TerminalUiDeliveryOutcome.ACCEPTED
+                return CameraUiDispatchOutcome.ACCEPTED
+            }
+        }
+        val outcome = try {
+            scheduler.post(0L, Runnable {
+                synchronized(this@CameraPipelineUiOrchestrator) {
+                    if (terminalUiNotifiedGeneration == terminal.generation) return@Runnable
+                    terminalUiNotifiedGeneration = terminal.generation
+                }
+                if (session.snapshot().phase == CameraPipelineUiSession.Phase.DISPOSED) return@Runnable
+                terminal.message?.let(callbacks.onStatus)
+                callbacks.onStateChanged()
+                callbacks.onTerminal(terminal)
+            })
+        } catch (_: Throwable) {
+            CameraUiDispatchOutcome.DISPATCH_THREW
+        }
+        synchronized(this) {
+            terminalUiDeliveryOutcomeValue = when (outcome) {
+                CameraUiDispatchOutcome.ACCEPTED -> TerminalUiDeliveryOutcome.ACCEPTED
+                CameraUiDispatchOutcome.REJECTED -> TerminalUiDeliveryOutcome.REJECTED
+                CameraUiDispatchOutcome.DISPATCH_THREW -> TerminalUiDeliveryOutcome.DISPATCH_THREW
+            }
+        }
+        return outcome
     }
 
     private companion object {

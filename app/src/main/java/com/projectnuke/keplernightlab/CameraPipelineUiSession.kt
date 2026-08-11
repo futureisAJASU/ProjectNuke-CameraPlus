@@ -112,6 +112,11 @@ internal class CameraPipelineUiSession {
     @Synchronized
     fun requestCancellation(localGeneration: Long, reason: String): Boolean {
         val active = operation.takeIf { isCurrentLocked(localGeneration) } ?: return false
+        if (terminalClaimed || current.phase == Phase.TERMINAL ||
+            current.phase == Phase.UNRESOLVED || current.phase == Phase.DISPOSED
+        ) {
+            return false
+        }
         if (!current.cancellationRequested) {
             active.cancellationToken.cancel()
             active.captureCancellation.cancelCapture(reason)
@@ -150,8 +155,6 @@ internal class CameraPipelineUiSession {
             previewAllowed = true,
             captureResourcesSettled = true
         )
-        scheduledStart = null
-        watchdog = null
         return true
     }
 
@@ -179,8 +182,6 @@ internal class CameraPipelineUiSession {
             previewAllowed = true,
             captureResourcesSettled = true
         )
-        scheduledStart = null
-        watchdog = null
         return true
     }
 

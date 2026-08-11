@@ -110,4 +110,21 @@ class CameraPipelineUiSessionTest {
         assertFalse(session.settlePreStartFailure(operation.generation, "late"))
         assertEquals("first", session.snapshot().terminal?.message)
     }
+
+    @Test
+    fun cancellationCannotMutateAnySettledTerminal() {
+        listOf(
+            CameraPipelineEvent.Terminal.Kind.COMPLETE,
+            CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+            CameraPipelineEvent.Terminal.Kind.FAILED,
+            CameraPipelineEvent.Terminal.Kind.CANCELLED
+        ).forEach { kind ->
+            val session = CameraPipelineUiSession()
+            val operation = (session.start("start", 1) as CameraPipelineUiSession.StartResult.Accepted).operation
+            session.accept(CameraPipelineEvent.Terminal(operation.generation, kind))
+            assertFalse(session.requestCancellation(operation.generation, "stale watchdog"))
+            assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
+            assertEquals(kind, session.snapshot().terminal?.kind)
+        }
+    }
 }
