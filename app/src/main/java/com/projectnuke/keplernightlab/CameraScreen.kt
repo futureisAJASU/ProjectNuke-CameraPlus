@@ -847,20 +847,21 @@ LaunchedEffect(Unit) {
             }
         }
         pipelineSession.attachWatchdog(localGeneration, watchdog)
-        when (val dispatch = mainScheduler.post(timeoutMillis, watchdog)) {
+        val watchdogDispatch = mainScheduler.post(timeoutMillis, watchdog)
+        when (watchdogDispatch) {
             CameraUiDispatchOutcome.ACCEPTED -> Unit
             CameraUiDispatchOutcome.REJECTED,
             CameraUiDispatchOutcome.DISPATCH_THREW -> {
-                pipelineSession.requestCancellation(localGeneration, "watchdog dispatch failed")
-                val failure = CameraPipelineEvent.Terminal(
-                    generation = localGeneration,
-                    kind = CameraPipelineEvent.Terminal.Kind.FAILED,
-                    captureResourcesSettled = false,
-                    message = "PIPELINE_FAILED: Timeout guard could not be scheduled."
-                )
-                pipelineSession.accept(failure)
-                status = failure.message.orEmpty()
-                publishPipelineState()
+                pipelineSession.clearWatchdog(localGeneration)?.let(mainScheduler::remove)
+                if (pipelineSession.settlePreStartFailure(
+                        localGeneration,
+                        "PIPELINE_FAILED: Timeout guard could not be scheduled before capture start."
+                    )
+                ) {
+                    status = "PIPELINE_FAILED: Timeout guard could not be scheduled before capture start."
+                    publishPipelineState()
+                }
+                return
             }
         }
 
@@ -906,7 +907,18 @@ mainHandler.removeCallbacks(watchdog)
 
             */
         val jobStart = Runnable {
-            if (pipelineSession.snapshot().generation != localGeneration || cancellationToken.isCancelled) return@Runnable
+            if (pipelineSession.snapshot().generation != localGeneration) return@Runnable
+            if (cancellationToken.isCancelled) {
+                if (pipelineSession.settleScheduledStartCancellation(
+                        localGeneration,
+                        "PIPELINE_CANCELLED: Capture start was cancelled before Camera2 acquisition."
+                    )
+                ) {
+                    status = "PIPELINE_CANCELLED: Capture start was cancelled before Camera2 acquisition."
+                    publishPipelineState()
+                }
+                return@Runnable
+            }
             acceptEvent(CameraPipelineEvent.Started(localGeneration, startMessage))
             try {
                 job(
@@ -954,13 +966,14 @@ mainHandler.removeCallbacks(watchdog)
             CameraUiDispatchOutcome.REJECTED,
             CameraUiDispatchOutcome.DISPATCH_THREW -> {
                 pipelineSession.clearScheduledStart(localGeneration)?.let(mainScheduler::remove)
-                val failure = CameraPipelineEvent.Terminal(
-                    generation = localGeneration,
-                    kind = CameraPipelineEvent.Terminal.Kind.FAILED,
-                    captureResourcesSettled = false,
-                    message = "PIPELINE_FAILED: Capture could not be scheduled."
-                )
-                acceptEvent(failure)
+                if (pipelineSession.settlePreStartFailure(
+                        localGeneration,
+                        "PIPELINE_FAILED: Capture could not be scheduled before Camera2 acquisition."
+                    )
+                ) {
+                    status = "PIPELINE_FAILED: Capture could not be scheduled before Camera2 acquisition."
+                    publishPipelineState()
+                }
             }
         }
     }

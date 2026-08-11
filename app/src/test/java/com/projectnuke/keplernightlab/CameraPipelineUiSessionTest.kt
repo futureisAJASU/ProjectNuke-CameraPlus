@@ -71,4 +71,43 @@ class CameraPipelineUiSessionTest {
         assertTrue(session.snapshot().isBusy)
         assertFalse(session.snapshot().previewAllowed)
     }
+
+    @Test
+    fun preStartFailureSettlesWithNoCaptureResources() {
+        val session = CameraPipelineUiSession()
+        val operation = (session.start("start", 1) as CameraPipelineUiSession.StartResult.Accepted).operation
+
+        assertTrue(session.settlePreStartFailure(operation.generation, "watchdog rejected"))
+        assertFalse(session.snapshot().isBusy)
+        assertTrue(session.snapshot().previewAllowed)
+        assertTrue(session.snapshot().captureResourcesSettled)
+        assertEquals(CameraPipelineEvent.Terminal.Kind.FAILED, session.snapshot().terminal?.kind)
+        assertTrue(session.start("next", 1) is CameraPipelineUiSession.StartResult.Accepted)
+    }
+
+    @Test
+    fun scheduledCancellationSettlesWithoutStartingCapture() {
+        val session = CameraPipelineUiSession()
+        val operation = (session.start("start", 1) as CameraPipelineUiSession.StartResult.Accepted).operation
+        assertTrue(session.requestCancellation(operation.generation, "cancel before runnable"))
+
+        assertTrue(
+            session.settleScheduledStartCancellation(
+                operation.generation,
+                "cancelled before Camera2 acquisition"
+            )
+        )
+        assertFalse(session.snapshot().isBusy)
+        assertTrue(session.snapshot().previewAllowed)
+        assertEquals(CameraPipelineEvent.Terminal.Kind.CANCELLED, session.snapshot().terminal?.kind)
+    }
+
+    @Test
+    fun preStartFailureIsExactlyOnce() {
+        val session = CameraPipelineUiSession()
+        val operation = (session.start("start", 1) as CameraPipelineUiSession.StartResult.Accepted).operation
+        assertTrue(session.settlePreStartFailure(operation.generation, "first"))
+        assertFalse(session.settlePreStartFailure(operation.generation, "late"))
+        assertEquals("first", session.snapshot().terminal?.message)
+    }
 }

@@ -124,6 +124,66 @@ internal class CameraPipelineUiSession {
         return true
     }
 
+    /** Settles a failure that happened before Camera2 capture acquired any resource. */
+    @Synchronized
+    fun settlePreStartFailure(localGeneration: Long, message: String): Boolean {
+        if (!isCurrentLocked(localGeneration) || current.phase != Phase.START_SCHEDULED || terminalClaimed) {
+            return false
+        }
+        val terminal = CameraPipelineEvent.Terminal(
+            generation = localGeneration,
+            kind = CameraPipelineEvent.Terminal.Kind.FAILED,
+            captureResourcesSettled = true,
+            message = message
+        )
+        terminalClaimed = true
+        operation?.cancellationToken?.cancel()
+        operation?.captureCancellation?.cancelCapture("camera pipeline failed before capture start")
+        current = current.copy(
+            phase = Phase.TERMINAL,
+            terminal = terminal,
+            captureProgress = current.captureProgress.copy(
+                stage = CaptureStage.FAILED,
+                message = message,
+                progressPercent = 1f
+            ),
+            previewAllowed = true,
+            captureResourcesSettled = true
+        )
+        scheduledStart = null
+        watchdog = null
+        return true
+    }
+
+    /** Settles a scheduled start cancelled before its runnable acquired capture resources. */
+    @Synchronized
+    fun settleScheduledStartCancellation(localGeneration: Long, message: String): Boolean {
+        if (!isCurrentLocked(localGeneration) || current.phase != Phase.CANCELLATION_REQUESTED || terminalClaimed) {
+            return false
+        }
+        val terminal = CameraPipelineEvent.Terminal(
+            generation = localGeneration,
+            kind = CameraPipelineEvent.Terminal.Kind.CANCELLED,
+            captureResourcesSettled = true,
+            message = message
+        )
+        terminalClaimed = true
+        current = current.copy(
+            phase = Phase.TERMINAL,
+            terminal = terminal,
+            captureProgress = current.captureProgress.copy(
+                stage = CaptureStage.CANCELLED,
+                message = message,
+                progressPercent = 1f
+            ),
+            previewAllowed = true,
+            captureResourcesSettled = true
+        )
+        scheduledStart = null
+        watchdog = null
+        return true
+    }
+
     @Synchronized
     fun accept(event: CameraPipelineEvent): EventResult {
         if (disposed) return EventResult.DISPOSED
