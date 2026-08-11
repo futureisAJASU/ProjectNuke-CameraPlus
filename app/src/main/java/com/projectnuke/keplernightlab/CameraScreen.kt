@@ -880,26 +880,10 @@ LaunchedEffect(Unit) {
             }
         }
 
-        fun finishIfTerminal(newStatus: String) {
-            val event = legacyCameraPipelineEvent(localGeneration, newStatus, pipelineSession.snapshot().captureProgress)
-            acceptEvent(event)
-            return
-            /*
-            if (isCaptureStageCompleteButPipelineStillRunning(newStatus)) {
-                Unit
-                Unit
-                Unit
-                    stage = CaptureStage.PROCESSING,
+        /*
                     message = "캡처가 완료되었습니다.",
-                    progressPercent = max(captureProgress.progressPercent, 0.65f)
                 )
-                Log.i("KeplerPipelineState", "Capture stage complete; waiting for processing/export")
-                return
             }
-            if (isTerminalStatus(newStatus)) {
-                val terminalSuccess =
-                    newStatus.trimStart().startsWith("PIPELINE_COMPLETE", ignoreCase = true) ||
-                        newStatus.trimStart().startsWith("EXPORT_COMPLETE", ignoreCase = true)
 mainHandler.removeCallbacks(watchdog)
                 Unit
                 Unit
@@ -907,28 +891,15 @@ mainHandler.removeCallbacks(watchdog)
                 Unit
                 Unit
                 Unit
-                refreshLatestResult(showPreview = terminalSuccess)
-                Log.i("KeplerPipelineState", "pipeline final terminalSuccess=$terminalSuccess status=$newStatus")
 
-                mainHandler.postDelayed(
                     {
-                        if (false) {
-                            Log.i(
-                                "KeplerPipelineState",
-                                "stale preview enable ignored generation=$localGeneration current=$pipelineGeneration"
                             )
-                            return@postDelayed
                         }
-                        Unit
-                        Log.i("KeplerPipelineState", "preview re-enabled")
-                    },
-                    250L
                 )
             }
         }
 
             */
-        }
         val jobStart = Runnable {
             if (pipelineSession.snapshot().generation != localGeneration || cancellationToken.isCancelled) return@Runnable
             acceptEvent(CameraPipelineEvent.Started(localGeneration, startMessage))

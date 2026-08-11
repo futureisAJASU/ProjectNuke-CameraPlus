@@ -336,6 +336,19 @@ private class CameraPreviewController(
         if (restart.first && restart.second != null) start(restart.second!!)
     }
 
+    private fun settleLateResource(
+        localGeneration: Int,
+        operation: PreviewResourceOperation,
+        release: () -> Unit
+    ) {
+        settlePreviewResources(
+            generation = localGeneration.toLong(),
+            operations = listOf(operation to release)
+        ).failures.forEach { record ->
+            Log.e(TAG, "late preview resource settlement failed generation=${record.generation} operation=${record.operation}", record.failure)
+        }
+    }
+
     fun updateFocusAeState(newState: FocusAeState) {
         val previous = latestFocusAeState
         latestFocusAeState = newState
@@ -520,11 +533,11 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
 
             val surface = Surface(surfaceTexture)
             if (!isActive(localGeneration) || !textureView.isAvailable) {
-                runCatching { surface.release() }
+                settleLateResource(localGeneration, PreviewResourceOperation.SURFACE_RELEASE) { surface.release() }
                 return
             }
             if (!storePreviewSurface(localGeneration, surface)) {
-                runCatching { surface.release() }
+                settleLateResource(localGeneration, PreviewResourceOperation.SURFACE_RELEASE) { surface.release() }
                 return
             }
 
@@ -534,25 +547,25 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                     override fun onOpened(camera: CameraDevice) {
                         if (!isActive(localGeneration) || !textureView.isAvailable) {
                             Log.w(TAG, "stale onOpened ignored generation=$localGeneration")
-                            runCatching { camera.close() }
+                            settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE) { camera.close() }
                             return
                         }
                         if (!storeCameraDevice(localGeneration, camera)) {
                             Log.w(TAG, "stale onOpened dropped generation=$localGeneration")
-                            runCatching { camera.close() }
+                            settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE) { camera.close() }
                             return
                         }
                         createPreviewSession(camera, surface, characteristics, localGeneration, textureView)
                     }
 
                     override fun onDisconnected(camera: CameraDevice) {
-                        runCatching { camera.close() }
+                        settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE) { camera.close() }
                         if (isActive(localGeneration)) stop()
                     }
 
                     override fun onError(camera: CameraDevice, error: Int) {
                         Log.w(TAG, "camera error=$error generation=$localGeneration")
-                        runCatching { camera.close() }
+                        settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE) { camera.close() }
                         if (isActive(localGeneration)) stop()
                     }
                 },
@@ -571,7 +584,7 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
         textureView: TextureView
     ) {
         if (!isActive(localGeneration) || !textureView.isAvailable) {
-            runCatching { camera.close() }
+            settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE) { camera.close() }
             return
         }
         Log.i(
@@ -634,7 +647,21 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                 SessionConfiguration(
                     SessionConfiguration.SESSION_REGULAR,
                     listOf(output),
-                    { command -> handler.post(command) },
+                    { command ->
+                        val outcome = try {
+                            if (handler.post(command)) {
+                                CameraUiDispatchOutcome.ACCEPTED
+                            } else {
+                                CameraUiDispatchOutcome.REJECTED
+                            }
+                        } catch (failure: Throwable) {
+                            Log.e(TAG, "physical session callback dispatch threw generation=$localGeneration", failure)
+                            CameraUiDispatchOutcome.DISPATCH_THREW
+                        }
+                        if (outcome != CameraUiDispatchOutcome.ACCEPTED) {
+                            Log.w(TAG, "physical session callback dispatch outcome=$outcome generation=$localGeneration")
+                        }
+                    },
                     callback
                 )
             )
@@ -706,12 +733,12 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
             override fun onConfigured(session: CameraCaptureSession) {
                 if (!isActive(localGeneration) || !textureView.isAvailable) {
                     Log.w(TAG, "stale onConfigured ignored generation=$localGeneration")
-                    runCatching { session.close() }
+                    settleLateResource(localGeneration, PreviewResourceOperation.CAPTURE_SESSION_CLOSE) { session.close() }
                     return
                 }
                 if (!storeCaptureSession(localGeneration, session)) {
                     Log.w(TAG, "stale onConfigured dropped generation=$localGeneration")
-                    runCatching { session.close() }
+                    settleLateResource(localGeneration, PreviewResourceOperation.CAPTURE_SESSION_CLOSE) { session.close() }
                     return
                 }
                 Log.i(
@@ -734,7 +761,7 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                             "exception=${error.javaClass.simpleName}:${error.message}",
                         error
                     )
-                    runCatching { session.close() }
+                    settleLateResource(localGeneration, PreviewResourceOperation.CAPTURE_SESSION_CLOSE) { session.close() }
                     onFailure()
                 }
             }
@@ -745,7 +772,7 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                     "session configuration failed mode=$sessionMode cameraId=$cameraId " +
                         "requestedPhysicalCameraId=$physicalCameraId"
                 )
-                runCatching { session.close() }
+                settleLateResource(localGeneration, PreviewResourceOperation.CAPTURE_SESSION_CLOSE) { session.close() }
                 onFailure()
             }
         }
