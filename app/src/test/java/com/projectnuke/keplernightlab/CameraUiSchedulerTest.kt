@@ -12,4 +12,10 @@ class CameraUiSchedulerTest {
         }
         assertEquals(CameraUiDispatchOutcome.REJECTED, scheduler.post(250L, Runnable {}))
     }
+
+    @Test
+    fun dispatchThrowIsDistinctFromRejection() {
+        assertEquals(CameraUiDispatchOutcome.REJECTED, cameraUiDispatchOutcome { false })
+        assertEquals(CameraUiDispatchOutcome.DISPATCH_THREW, cameraUiDispatchOutcome { error("closed") })
+    }
 }
