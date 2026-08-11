@@ -920,6 +920,9 @@ LaunchedEffect(Unit) {
                 },
                 onPreviewAvailabilityChanged = { availability ->
                     previewAvailability = availability
+                    if (availability == PreviewAvailability.FAILED) {
+                        status = "카메라 미리보기를 시작하지 못했습니다."
+                    }
                     if (availability == PreviewAvailability.PERMISSION_REQUIRED) {
                         status = "카메라 권한이 필요합니다."
                     }

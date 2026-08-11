@@ -32,6 +32,24 @@ data class PreviewCleanupDiagnostics(
     val cleanupDispatchFailure: Throwable? = null
 )
 
+/** Production recorder: one bounded cumulative snapshot per preview cleanup generation. */
+internal class PreviewCleanupAccumulator {
+    private var current: PreviewCleanupSnapshot? = null
+
+    @Synchronized
+    fun record(settlement: PreviewCleanupSnapshot, late: Boolean): PreviewCleanupSnapshot {
+        if (late) return settlement
+        val previous = current
+        val next = if (previous?.generation == settlement.generation) {
+            PreviewCleanupSnapshot(settlement.generation, previous.records + settlement.records)
+        } else {
+            settlement
+        }
+        current = next
+        return next
+    }
+}
+
 internal fun settlePreviewResources(
     generation: Long,
     operations: List<Pair<PreviewResourceOperation, () -> Unit>>

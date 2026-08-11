@@ -18,3 +18,12 @@ internal data class PreviewCommandSnapshot(
     val appliedMeteringMode: MeteringMode? = null,
     val lastOutcome: PreviewCommandApplyOutcome? = null
 )
+
+internal fun PreviewCommandSnapshot.withGenerationOutcome(
+    localGeneration: Int,
+    outcome: PreviewCommandApplyOutcome
+): PreviewCommandSnapshot = if (localGeneration < generation) {
+    this
+} else {
+    copy(generation = localGeneration, lastOutcome = outcome)
+}

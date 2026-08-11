@@ -1,6 +1,7 @@
 package com.projectnuke.keplernightlab
 
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -43,5 +44,18 @@ class PreviewCommandGateTest {
         val command = PreviewCommand(4, PreviewCommandKind.FOCUS_AE)
         assertTrue(acceptsPreviewCommand(4, active = true, command = command))
         assertFalse(acceptsPreviewCommand(4, active = false, command = command))
+    }
+
+    @Test
+    fun staleOutcomeCannotOverwriteNewGenerationRequest() {
+        val current = PreviewCommandSnapshot(
+            generation = 2,
+            requestedZoomRatio = 3.0f,
+            lastOutcome = PreviewCommandApplyOutcome.APPLIED
+        )
+        val fenced = current.withGenerationOutcome(1, PreviewCommandApplyOutcome.STALE_GENERATION)
+        assertEquals(2, fenced.generation)
+        assertEquals(3.0f, fenced.requestedZoomRatio)
+        assertEquals(PreviewCommandApplyOutcome.APPLIED, fenced.lastOutcome)
     }
 }

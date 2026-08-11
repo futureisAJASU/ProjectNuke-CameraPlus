@@ -21,6 +21,7 @@ import android.hardware.camera2.params.SessionConfiguration
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.util.Log
 import android.util.Size
 import android.view.Surface
@@ -44,6 +45,7 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 import java.util.concurrent.Executors
+import java.util.concurrent.ExecutorService
 
 enum class PreviewAvailability { AVAILABLE, PERMISSION_REQUIRED, DISABLED, FAILED }
 
@@ -77,7 +79,8 @@ fun Camera2Preview(
             cameraId = cameraId,
             physicalCameraId = physicalCameraId,
             actualLensSource = actualLensSource,
-            onAeCapabilitiesChangedProvider = { latestOnAeCapabilitiesChanged.value }
+            onAeCapabilitiesChangedProvider = { latestOnAeCapabilitiesChanged.value },
+            onPreviewAvailabilityChangedProvider = { latestOnPreviewAvailabilityChanged.value }
         )
     }
 
@@ -119,9 +122,14 @@ fun Camera2Preview(
             when {
                 !permissionGranted -> PreviewAvailability.PERMISSION_REQUIRED
                 !enabled || !lifecycleStarted -> PreviewAvailability.DISABLED
+                controller.isFailed() -> PreviewAvailability.FAILED
                 else -> PreviewAvailability.AVAILABLE
             }
         )
+    }
+
+    DisposableEffect(controller) {
+        onDispose { controller.dispose() }
     }
 
     AndroidView(
@@ -154,12 +162,19 @@ fun Camera2Preview(
     }
 }
 
-private class CameraPreviewController(
-    private val context: Context,
+internal class CameraPreviewController(
+    private val context: Context?,
     private val cameraId: String,
     private val physicalCameraId: String?,
     private val actualLensSource: ActualLensSource,
-    private val onAeCapabilitiesChangedProvider: () -> (minIndex: Int, maxIndex: Int, stepEv: Float) -> Unit
+    private val onAeCapabilitiesChangedProvider: () -> (minIndex: Int, maxIndex: Int, stepEv: Float) -> Unit,
+    private val onPreviewAvailabilityChangedProvider: () -> (PreviewAvailability) -> Unit,
+    private val mainDispatch: (Runnable) -> Boolean = { runnable ->
+        Handler(Looper.getMainLooper()).post(runnable)
+    },
+    private val emergencyReleaseExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "KeplerPreviewEmergencyRelease").apply { isDaemon = true }
+    }
 ) {
     private val lock = Any()
     private val generationOwner = PreviewGenerationOwner()
@@ -183,18 +198,21 @@ private class CameraPreviewController(
     private var openRequestedGeneration: Int? = null
     private var lastTextureView: TextureView? = null
     private var cleanupDiagnostics = PreviewCleanupDiagnostics()
+    private val cleanupAccumulator = PreviewCleanupAccumulator()
     private var commandSnapshot = PreviewCommandSnapshot()
-    private val emergencyReleaseExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "KeplerPreviewEmergencyRelease").apply { isDaemon = true }
-    }
+    private var previewFailed = false
+    private var disposed = false
+    private var emergencyExecutorShutdown = false
 
     fun start(textureView: TextureView) {
         synchronized(lock) {
+            if (disposed) return
             lastTextureView = textureView
         }
+        val appContext = context ?: return
         if (
             ContextCompat.checkSelfPermission(
-                context,
+                appContext,
                 Manifest.permission.CAMERA
             ) != PackageManager.PERMISSION_GRANTED
         ) {
@@ -247,12 +265,35 @@ private class CameraPreviewController(
     }
 
     fun stop() {
+        stopInternal()
+    }
+
+    fun dispose() {
+        synchronized(lock) {
+            if (disposed) return
+            disposed = true
+        }
+        stopInternal()
+    }
+
+    private fun stopInternal() {
         val refs = synchronized(lock) {
             val ownedGeneration = generationOwner.snapshot().generation
-            val stopGeneration = generationOwner.stop() ?: return
+            val stopGeneration = generationOwner.stop()
+            if (stopGeneration == null) {
+                if (disposed) shutdownEmergencyExecutorIfNeededLocked()
+                return
+            }
             openRequestedGeneration = null
-            Log.d(TAG, "stop generation=$stopGeneration")
-            StopRefs(stopGeneration.toInt(), captureSession, cameraDevice, previewSurface, backgroundThread, backgroundHandler)
+            StopRefs(
+                cleanupGeneration = ownedGeneration.toInt(),
+                stopGeneration = stopGeneration.toInt(),
+                session = captureSession,
+                device = cameraDevice,
+                surface = previewSurface,
+                thread = backgroundThread,
+                handler = backgroundHandler
+            )
                 .also {
                     captureSession = null
                     cameraDevice = null
@@ -266,9 +307,42 @@ private class CameraPreviewController(
                     previewSurfaceSlot.clear(ownedGeneration)
                 }
         }
+        fun markStoppedWhenTerminated() {
+            val thread = refs.thread
+            if (thread == null) {
+                finishStop(refs.stopGeneration)
+                return
+            }
+            val quit = settleAndRecord(
+                generation = refs.cleanupGeneration.toLong(),
+                operations = listOf(PreviewResourceOperation.HANDLER_THREAD_QUIT to { thread.quitSafely() })
+            )
+            quit.failures.forEach { record ->
+                Log.e(TAG, "preview cleanup failed generation=${record.generation} operation=${record.operation}", record.failure)
+            }
+            try {
+                emergencyReleaseExecutor.execute {
+                    val termination = settleAndRecord(
+                        generation = refs.cleanupGeneration.toLong(),
+                        operations = listOf(PreviewResourceOperation.HANDLER_THREAD_TERMINATION to {
+                            thread.join(2_000L)
+                            if (thread.isAlive) error("THREAD_TERMINATION_TIMEOUT")
+                        })
+                    )
+                    termination.failures.forEach { record ->
+                        Log.e(TAG, "preview cleanup failed generation=${record.generation} operation=${record.operation}", record.failure)
+                    }
+                    finishStop(refs.stopGeneration)
+                }
+            } catch (failure: Throwable) {
+                    recordCleanupDispatchFailure(failure)
+                    Log.e(TAG, "preview emergency release dispatch rejected", failure)
+                finishStop(refs.stopGeneration)
+            }
+        }
         val closeResources = Runnable {
             val cleanup = settleAndRecord(
-                generation = refs.generation.toLong(),
+                generation = refs.cleanupGeneration.toLong(),
                 operations = listOf(
                     PreviewResourceOperation.STOP_REPEATING to { refs.session?.stopRepeating() },
                     PreviewResourceOperation.CAPTURE_SESSION_CLOSE to { refs.session?.close() },
@@ -279,39 +353,7 @@ private class CameraPreviewController(
             cleanup.failures.forEach { record ->
                 Log.e(TAG, "preview cleanup failed generation=${record.generation} operation=${record.operation}", record.failure)
             }
-        }
-        fun markStoppedWhenTerminated() {
-            val thread = refs.thread
-            if (thread == null) {
-                finishStop(refs.generation)
-                return
-            }
-            val quit = settleAndRecord(
-                generation = refs.generation.toLong(),
-                operations = listOf(PreviewResourceOperation.HANDLER_THREAD_QUIT to { thread.quitSafely() })
-            )
-            quit.failures.forEach { record ->
-                Log.e(TAG, "preview cleanup failed generation=${record.generation} operation=${record.operation}", record.failure)
-            }
-            try {
-                emergencyReleaseExecutor.execute {
-                    val termination = settleAndRecord(
-                        generation = refs.generation.toLong(),
-                        operations = listOf(PreviewResourceOperation.HANDLER_THREAD_TERMINATION to {
-                            thread.join(2_000L)
-                            if (thread.isAlive) error("THREAD_TERMINATION_TIMEOUT")
-                        })
-                    )
-                    termination.failures.forEach { record ->
-                        Log.e(TAG, "preview cleanup failed generation=${record.generation} operation=${record.operation}", record.failure)
-                    }
-                    finishStop(refs.generation)
-                }
-            } catch (failure: Throwable) {
-                    recordCleanupDispatchFailure(failure)
-                    Log.e(TAG, "preview emergency release dispatch rejected", failure)
-                finishStop(refs.generation)
-            }
+            markStoppedWhenTerminated()
         }
         if (refs.handler != null) {
             val posted = refs.handler.post(closeResources)
@@ -324,7 +366,6 @@ private class CameraPreviewController(
                     Log.e(TAG, "preview cleanup dispatch rejected", failure)
                 }
             }
-            markStoppedWhenTerminated()
         } else {
             try {
                 emergencyReleaseExecutor.execute(closeResources)
@@ -332,17 +373,31 @@ private class CameraPreviewController(
                 recordCleanupDispatchFailure(failure)
                 Log.e(TAG, "preview cleanup dispatch rejected", failure)
             }
-            markStoppedWhenTerminated()
         }
     }
 
     private fun finishStop(stopGeneration: Int) {
         val restart = synchronized(lock) {
             val finished = generationOwner.finishStop(stopGeneration = stopGeneration.toLong())
-            val shouldRestart = finished && generationOwner.snapshot().desiredRunning
+            val shouldRestart = finished && generationOwner.snapshot().desiredRunning && !disposed
             shouldRestart to lastTextureView
         }
         if (restart.first && restart.second != null) start(restart.second!!)
+        synchronized(lock) {
+            if (finishedStopCanShutdownLocked(stopGeneration)) {
+                shutdownEmergencyExecutorIfNeededLocked()
+            }
+        }
+    }
+
+    private fun finishedStopCanShutdownLocked(stopGeneration: Int): Boolean =
+        disposed && generationOwner.snapshot().generation == stopGeneration.toLong() &&
+            generationOwner.snapshot().state == PreviewGenerationOwner.State.STOPPED
+
+    private fun shutdownEmergencyExecutorIfNeededLocked() {
+        if (emergencyExecutorShutdown) return
+        emergencyExecutorShutdown = true
+        emergencyReleaseExecutor.shutdown()
     }
 
     private fun settleLateResource(
@@ -364,10 +419,11 @@ private class CameraPreviewController(
         operations: List<Pair<PreviewResourceOperation, () -> Unit>>,
         late: Boolean = false
     ): PreviewCleanupSnapshot {
-        val snapshot = settlePreviewResources(generation, operations)
+        val settlement = settlePreviewResources(generation, operations)
         synchronized(lock) {
+            val snapshot = cleanupAccumulator.record(settlement, late)
             val lateSnapshots = if (late) {
-                (cleanupDiagnostics.lateResourceSettlements + snapshot).takeLast(8)
+                (cleanupDiagnostics.lateResourceSettlements + settlement).takeLast(8)
             } else {
                 cleanupDiagnostics.lateResourceSettlements
             }
@@ -375,12 +431,12 @@ private class CameraPreviewController(
                 it.operation == PreviewResourceOperation.HANDLER_THREAD_TERMINATION
             } ?: cleanupDiagnostics.threadTerminationOutcome
             cleanupDiagnostics = cleanupDiagnostics.copy(
-                lastCleanupSnapshot = snapshot,
+                lastCleanupSnapshot = if (late) cleanupDiagnostics.lastCleanupSnapshot else snapshot,
                 lateResourceSettlements = lateSnapshots,
                 threadTerminationOutcome = termination
             )
+            return snapshot
         }
-        return snapshot
     }
 
     private fun recordCleanupDispatchFailure(failure: Throwable) {
@@ -392,6 +448,10 @@ private class CameraPreviewController(
     internal fun cleanupDiagnostics(): PreviewCleanupDiagnostics = synchronized(lock) { cleanupDiagnostics }
 
     fun updateFocusAeState(newState: FocusAeState) {
+        if (isDisposed()) {
+            recordCommandOutcome(currentCommandGeneration(), PreviewCommandApplyOutcome.DISPATCH_REJECTED)
+            return
+        }
         val previous = latestFocusAeState
         latestFocusAeState = newState
         val localGeneration = synchronized(lock) { generationOwner.snapshot().generation.toInt() }
@@ -411,6 +471,10 @@ private class CameraPreviewController(
     }
 
     fun updateMeteringMode(newMode: MeteringMode) {
+        if (isDisposed()) {
+            recordCommandOutcome(currentCommandGeneration(), PreviewCommandApplyOutcome.DISPATCH_REJECTED)
+            return
+        }
         val previous = latestMeteringMode
         latestMeteringMode = newMode
         val localGeneration = synchronized(lock) { generationOwner.snapshot().generation.toInt() }
@@ -434,6 +498,10 @@ private class CameraPreviewController(
     }
 
     fun updateZoomRatio(newZoomRatio: Float) {
+        if (isDisposed()) {
+            recordCommandOutcome(currentCommandGeneration(), PreviewCommandApplyOutcome.DISPATCH_REJECTED)
+            return
+        }
         val previous = latestZoomRatio
         latestZoomRatio = (if (newZoomRatio.isFinite()) newZoomRatio else 1.0f).coerceAtLeast(0.1f)
         val localGeneration = synchronized(lock) { generationOwner.snapshot().generation.toInt() }
@@ -500,12 +568,13 @@ private class CameraPreviewController(
 
     private fun recordCommandOutcome(localGeneration: Int, outcome: PreviewCommandApplyOutcome) {
         synchronized(lock) {
-            commandSnapshot = commandSnapshot.copy(generation = localGeneration, lastOutcome = outcome)
+            commandSnapshot = commandSnapshot.withGenerationOutcome(localGeneration, outcome)
         }
     }
 
     private fun recordCommandApplied(localGeneration: Int, kind: PreviewCommandKind) {
         synchronized(lock) {
+            if (localGeneration < commandSnapshot.generation) return
             commandSnapshot = when (kind) {
                 PreviewCommandKind.ZOOM -> commandSnapshot.copy(
                     generation = localGeneration,
@@ -527,6 +596,14 @@ private class CameraPreviewController(
     }
 
     internal fun commandSnapshot(): PreviewCommandSnapshot = synchronized(lock) { commandSnapshot }
+
+    internal fun isFailed(): Boolean = synchronized(lock) { previewFailed }
+
+    private fun isDisposed(): Boolean = synchronized(lock) { disposed }
+
+    private fun currentCommandGeneration(): Int = synchronized(lock) {
+        generationOwner.snapshot().generation.toInt()
+    }
 
     fun updateLensDiagnostics(
         selectedLensSlot: LensSlot,
@@ -576,17 +653,13 @@ private class CameraPreviewController(
             openRequestedGeneration = localGeneration
         }
 
-        val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val cameraManager = (context ?: return).getSystemService(Context.CAMERA_SERVICE) as CameraManager
 
         val thread = try {
             HandlerThread("KeplerPreviewThread").also { it.start() }
         } catch (failure: Throwable) {
-            synchronized(lock) {
-                if (generationOwner.snapshot().generation.toInt() == localGeneration) {
-                    generationOwner.fail(localGeneration.toLong())
-                }
-            }
             Log.e(TAG, "preview thread start failed generation=$localGeneration", failure)
+            previewThreadStartFailed(localGeneration, failure)
             return
         }
         val handler = Handler(thread.looper)
@@ -631,7 +704,7 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
 
             val surfaceTexture = textureView.surfaceTexture
             if (surfaceTexture == null) {
-                stop()
+                failPreview(localGeneration, IllegalStateException("preview surface texture unavailable"))
                 return
             }
 
@@ -678,33 +751,33 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
 
                     override fun onDisconnected(camera: CameraDevice) {
                         if (detachOwnedCamera(localGeneration, camera)) {
-                            settlePreviewResources(
+                            settleAndRecord(
                                 localGeneration.toLong(),
                                 listOf(PreviewResourceOperation.CAMERA_DEVICE_CLOSE to { camera.close() })
                             )
                         } else {
                             settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE) { camera.close() }
                         }
-                        if (isActive(localGeneration)) stop()
+                        if (isActive(localGeneration)) failPreview(localGeneration, IllegalStateException("camera disconnected"))
                     }
 
                     override fun onError(camera: CameraDevice, error: Int) {
                         Log.w(TAG, "camera error=$error generation=$localGeneration")
                         if (detachOwnedCamera(localGeneration, camera)) {
-                            settlePreviewResources(
+                            settleAndRecord(
                                 localGeneration.toLong(),
                                 listOf(PreviewResourceOperation.CAMERA_DEVICE_CLOSE to { camera.close() })
                             )
                         } else {
                             settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE) { camera.close() }
                         }
-                        if (isActive(localGeneration)) stop()
+                        if (isActive(localGeneration)) failPreview(localGeneration, IllegalStateException("camera error=$error"))
                     }
                 },
                 handler
             )
-        } catch (_: Exception) {
-            stop()
+        } catch (failure: Exception) {
+            failPreview(localGeneration, failure)
         }
     }
 
@@ -750,7 +823,11 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
         localGeneration: Int,
         textureView: TextureView
     ) {
-        val handler = backgroundHandler ?: return
+        val handler = backgroundHandler
+        if (handler == null) {
+            failPreview(localGeneration, IllegalStateException("preview callback handler unavailable"))
+            return
+        }
         try {
             val output = OutputConfiguration(surface).apply {
                 setPhysicalCameraId(physicalCameraId)
@@ -830,7 +907,7 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                     textureView = textureView,
                     sessionMode = "normalOutput",
                     onFailure = {
-                        if (isActive(localGeneration)) stop()
+                        if (isActive(localGeneration)) normalPreviewFailed(localGeneration)
                     }
                 ),
                 backgroundHandler
@@ -842,7 +919,7 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                     "exception=${error.javaClass.simpleName}:${error.message}",
                 error
             )
-            stop()
+            normalPreviewFailed(localGeneration, error)
         }
     }
 
@@ -882,7 +959,7 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                         forceTrigger = latestFocusAeState.point != null
                     )
                     check(applied) { "initial preview request was not applied" }
-                    if (!generationOwner.markOpen(localGeneration.toLong())) {
+                    if (!markPreviewOpen(localGeneration)) {
                         Log.w(TAG, "preview session request completed for stale generation=$localGeneration")
                     }
                 } catch (error: Exception) {
@@ -893,7 +970,7 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                         error
                     )
                     if (detachOwnedSession(localGeneration, session)) {
-                        settlePreviewResources(
+                        settleAndRecord(
                             localGeneration.toLong(),
                             listOf(PreviewResourceOperation.CAPTURE_SESSION_CLOSE to { session.close() })
                         )
@@ -1166,16 +1243,74 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
             ?: Rect(0, 0, 1, 1)
     }
 
-    private fun callbackDispatchFailed(localGeneration: Int, failure: Throwable) {
-        Log.e(TAG, "preview callback delivery failed generation=$localGeneration", failure)
+    internal fun callbackDispatchFailed(localGeneration: Int, failure: Throwable) {
         synchronized(lock) {
             cleanupDiagnostics = cleanupDiagnostics.copy(callbackDispatchFailure = failure)
-            if (generationOwner.snapshot().generation == localGeneration.toLong()) {
+        }
+        failPreview(localGeneration, failure)
+    }
+
+    internal fun previewThreadStartFailed(localGeneration: Int, failure: Throwable) {
+        failPreview(localGeneration, failure)
+    }
+
+    internal fun normalPreviewFailed(
+        localGeneration: Int,
+        failure: Throwable = IllegalStateException("normal preview session failed")
+    ) {
+        failPreview(localGeneration, failure)
+    }
+
+    private fun failPreview(localGeneration: Int, failure: Throwable) {
+        val shouldStop = synchronized(lock) {
+            if (disposed || generationOwner.snapshot().generation != localGeneration.toLong()) {
+                false
+            } else {
+                previewFailed = true
                 generationOwner.fail(localGeneration.toLong())
             }
         }
-        if (generationOwner.snapshot().generation == localGeneration.toLong()) stop()
+        if (!shouldStop) return
+        try {
+            if (!mainDispatch(Runnable { onPreviewAvailabilityChangedProvider().invoke(PreviewAvailability.FAILED) })) {
+                synchronized(lock) {
+                    cleanupDiagnostics = cleanupDiagnostics.copy(callbackDispatchFailure =
+                        IllegalStateException("preview availability dispatch rejected"))
+                }
+            }
+        } catch (dispatchFailure: Throwable) {
+            synchronized(lock) {
+                cleanupDiagnostics = cleanupDiagnostics.copy(callbackDispatchFailure = dispatchFailure)
+            }
+        }
+        stopInternal()
     }
+
+    private fun markPreviewOpen(localGeneration: Int): Boolean {
+        val opened = synchronized(lock) {
+            if (!generationOwner.markOpen(localGeneration.toLong())) return@synchronized false
+            previewFailed = false
+            true
+        }
+        if (opened) {
+            try {
+                mainDispatch(Runnable {
+                    onPreviewAvailabilityChangedProvider().invoke(PreviewAvailability.AVAILABLE)
+                })
+            } catch (failure: Throwable) {
+                synchronized(lock) {
+                    cleanupDiagnostics = cleanupDiagnostics.copy(callbackDispatchFailure = failure)
+                }
+            }
+        }
+        return opened
+    }
+
+    internal fun beginGenerationForTest(): Int = synchronized(lock) {
+        generationOwner.start()?.toInt() ?: error("preview generation did not start")
+    }
+
+    internal fun markOpenForTest(localGeneration: Int): Boolean = markPreviewOpen(localGeneration)
 
     private fun isActive(localGeneration: Int): Boolean = synchronized(lock) {
         isActiveLocked(localGeneration)
@@ -1327,7 +1462,8 @@ private fun storeCaptureSession(
     }
 
     private data class StopRefs(
-        val generation: Int,
+        val cleanupGeneration: Int,
+        val stopGeneration: Int,
         val session: CameraCaptureSession?,
         val device: CameraDevice?,
         val surface: Surface?,
