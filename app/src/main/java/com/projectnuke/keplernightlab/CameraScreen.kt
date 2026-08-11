@@ -1198,6 +1198,22 @@ mainHandler.removeCallbacks(watchdog)
                         }
                         is CaptureClickResult.Ready -> {
                             latestFramePlan = clickResult.prepared.framePlan
+                            val attemptSettings = CaptureAttemptUiSnapshot(
+                                lensSlot = selectedLensSlot,
+                                resolution = selectedResolution,
+                                zoomRatio = zoomUiState.zoomRatio,
+                                focusAeState = focusAeState,
+                                processingSettings = processingSettings,
+                                outputFormat = finalOutputFormat
+                            )
+                            val attemptPipelineMode = if (captureMode == CaptureMode.SINGLE_FRAME) {
+                                PipelineMode.YUV_NIGHT_FUSION
+                            } else {
+                                pipelineMode
+                            }
+                            val attemptCaptureMode = captureMode
+                            val attemptRawSpeedMode = rawSpeedMode
+                            val attemptDisplayRotation = captureDisplayRotation
                             runCameraJob(
                                 startMessage = clickResult.prepared.startMessage,
                                 requestedFrames = clickResult.prepared.framePlan.framesToCapture,
@@ -1213,20 +1229,16 @@ mainHandler.removeCallbacks(watchdog)
                                 startCapturePipeline(
                                     CapturePipelineRequest(
                                         context = context,
-                                        pipelineMode = if (captureMode == CaptureMode.SINGLE_FRAME) {
-                                            PipelineMode.YUV_NIGHT_FUSION
-                                        } else {
-                                            pipelineMode
-                                        },
+                                        pipelineMode = attemptPipelineMode,
                                         prepared = clickResult.prepared,
-                                        selectedResolution = selectedResolution,
+                                        selectedResolution = attemptSettings.resolution,
                                         resolutionPlan = clickResult.resolutionPlan,
-                                        finalOutputFormat = finalOutputFormat,
-                                        focusAeState = focusAeState,
-                                        rawSpeedMode = rawSpeedMode,
-                                        captureMode = captureMode,
-                                        processingSettings = processingSettings,
-                                        displayRotation = captureDisplayRotation,
+                                        finalOutputFormat = attemptSettings.outputFormat,
+                                        focusAeState = attemptSettings.focusAeState,
+                                        rawSpeedMode = attemptRawSpeedMode,
+                                        captureMode = attemptCaptureMode,
+                                        processingSettings = attemptSettings.processingSettings,
+                                        displayRotation = attemptDisplayRotation,
                                         captureCancellationHandle = captureCancellation,
                                         cancellation = cancellation
                                     ),
