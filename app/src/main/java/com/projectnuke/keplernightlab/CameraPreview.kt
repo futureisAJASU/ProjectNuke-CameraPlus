@@ -281,7 +281,9 @@ internal class CameraPreviewController(
             val ownedGeneration = generationOwner.snapshot().generation
             val stopGeneration = generationOwner.stop()
             if (stopGeneration == null) {
-                if (disposed) shutdownEmergencyExecutorIfNeededLocked()
+                if (disposed && generationOwner.snapshot().state == PreviewGenerationOwner.State.STOPPED) {
+                    shutdownEmergencyExecutorIfNeededLocked()
+                }
                 return
             }
             openRequestedGeneration = null
