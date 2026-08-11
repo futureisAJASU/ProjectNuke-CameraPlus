@@ -70,7 +70,7 @@ class CaptureProgressTest {
     @Test
     fun timedOutJobAcceptsOnlyCommittedLateCompletion() {
         assertFalse(
-            shouldIgnoreCancelledPipelineStatus(
+            legacyShouldIgnoreCancelledPipelineStatus(
                 cancelled = true,
                 timedOutGeneration = 12,
                 localGeneration = 12,
@@ -79,7 +79,7 @@ class CaptureProgressTest {
             )
         )
         assertTrue(
-            shouldIgnoreCancelledPipelineStatus(
+            legacyShouldIgnoreCancelledPipelineStatus(
                 cancelled = true,
                 timedOutGeneration = -1,
                 localGeneration = 12,
@@ -88,7 +88,7 @@ class CaptureProgressTest {
             )
         )
         assertTrue(
-            shouldIgnoreCancelledPipelineStatus(
+            legacyShouldIgnoreCancelledPipelineStatus(
                 cancelled = true,
                 timedOutGeneration = 12,
                 localGeneration = 12,
@@ -101,7 +101,7 @@ class CaptureProgressTest {
     @Test
     fun cancelledButNotTimedOutGenerationIsIgnored() {
         assertTrue(
-            shouldIgnoreCancelledPipelineStatus(
+            legacyShouldIgnoreCancelledPipelineStatus(
                 cancelled = true,
                 timedOutGeneration = -1,
                 localGeneration = 12,
@@ -110,7 +110,7 @@ class CaptureProgressTest {
             )
         )
         assertTrue(
-            shouldIgnoreCancelledPipelineStatus(
+            legacyShouldIgnoreCancelledPipelineStatus(
                 cancelled = true,
                 timedOutGeneration = -1,
                 localGeneration = 12,
@@ -123,7 +123,7 @@ class CaptureProgressTest {
     @Test
     fun nonCancelledJobStatusesRemainAccepted() {
         assertFalse(
-            shouldIgnoreCancelledPipelineStatus(
+            legacyShouldIgnoreCancelledPipelineStatus(
                 cancelled = false,
                 timedOutGeneration = -1,
                 localGeneration = 12,

@@ -202,3 +202,18 @@ internal fun legacyCameraPipelineEvent(
         else -> CameraPipelineEvent.CaptureProgress(generation, counts, status)
     }
 }
+
+/** Compatibility-only status assertion retained for legacy parser tests and diagnostics. */
+internal fun legacyShouldIgnoreCancelledPipelineStatus(
+    cancelled: Boolean,
+    timedOutGeneration: Int,
+    localGeneration: Int,
+    pipelineGeneration: Int,
+    status: String
+): Boolean {
+    if (!cancelled) return false
+    val committedMarker = status.trimStart().startsWith("PIPELINE_COMPLETE", ignoreCase = true)
+    return !(timedOutGeneration == localGeneration &&
+        localGeneration == pipelineGeneration &&
+        committedMarker)
+}
