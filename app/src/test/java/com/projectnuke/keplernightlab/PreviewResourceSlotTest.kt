@@ -51,4 +51,21 @@ class PreviewResourceSlotTest {
         assertSame(stale, settled)
         assertEquals(null, slot.detach(2L, stale))
     }
+
+    @Test
+    fun failedPhysicalSessionCanBeDetachedBeforeNormalFallback() {
+        val slot = PreviewResourceSlot<Resource>()
+        val physical = Resource("physical")
+        val normal = Resource("normal")
+        assertEquals(
+            PreviewResourceAttachment.ACCEPTED,
+            slot.attach(3L, 3L, physical) { }
+        )
+        assertSame(physical, slot.detach(3L, physical))
+        assertEquals(
+            PreviewResourceAttachment.ACCEPTED,
+            slot.attach(3L, 3L, normal) { }
+        )
+        assertSame(normal, slot.detach(3L, normal))
+    }
 }

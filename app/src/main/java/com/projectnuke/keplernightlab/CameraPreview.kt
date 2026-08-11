@@ -787,6 +787,9 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                         localGeneration = localGeneration,
                         forceTrigger = latestFocusAeState.point != null
                     )
+                    if (!generationOwner.markOpen(localGeneration.toLong())) {
+                        Log.w(TAG, "preview session request completed for stale generation=$localGeneration")
+                    }
                 } catch (error: Exception) {
                     Log.e(
                         "KeplerPhysicalRoute",
@@ -1141,7 +1144,6 @@ private fun storeCaptureSession(
         ) { supplied -> settleLateResource(localGeneration, PreviewResourceOperation.CAPTURE_SESSION_CLOSE) { supplied.close() } }
         if (attachment == PreviewResourceAttachment.ACCEPTED) {
             captureSession = session
-            generationOwner.markOpen(localGeneration.toLong())
         }
         attachment
     }
