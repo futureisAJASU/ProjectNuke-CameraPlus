@@ -9,6 +9,7 @@ internal class CameraPipelineUiSession {
         POST_CAPTURE_PROCESSING,
         CANCELLATION_REQUESTED,
         WAITING_FOR_TERMINAL,
+        UNRESOLVED,
         TERMINAL,
         DISPOSED
     }
@@ -179,6 +180,23 @@ internal class CameraPipelineUiSession {
             previewAllowed = false
         )
         return EventResult.ACCEPTED
+    }
+
+    @Synchronized
+    fun markTerminalDeliveryFailed(localGeneration: Long, message: String): Boolean {
+        if (!isCurrentLocked(localGeneration) || terminalClaimed) return false
+        current = current.copy(
+            phase = Phase.UNRESOLVED,
+            cancellationRequested = true,
+            captureProgress = current.captureProgress.copy(
+                stage = CaptureStage.TIMEOUT,
+                message = message,
+                progressPercent = 1f
+            ),
+            previewAllowed = false,
+            captureResourcesSettled = false
+        )
+        return true
     }
 
     @Synchronized

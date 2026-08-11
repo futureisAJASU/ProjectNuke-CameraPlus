@@ -791,6 +791,23 @@ LaunchedEffect(Unit) {
                 status = "CAPTURE_TIMEOUT: Cancellation requested; waiting for terminal settlement."
                 publishPipelineState()
                 Log.i("KeplerPipelineState", "pipeline timeout requested cancellation generation=$localGeneration")
+                val fallback = Runnable {
+                    if (pipelineSession.markTerminalDeliveryFailed(
+                            localGeneration,
+                            "CAPTURE_TIMEOUT: Terminal delivery unresolved; capture remains blocked."
+                        )
+                    ) {
+                        status = "CAPTURE_TIMEOUT: Terminal delivery unresolved; capture remains blocked."
+                        publishPipelineState()
+                        Log.e("KeplerPipelineState", "terminal delivery unresolved generation=$localGeneration")
+                    }
+                }
+                when (mainScheduler.post(15_000L, fallback)) {
+                    CameraUiDispatchOutcome.ACCEPTED -> Unit
+                    CameraUiDispatchOutcome.REJECTED,
+                    CameraUiDispatchOutcome.DISPATCH_THREW ->
+                        Log.e("KeplerPipelineState", "terminal fallback dispatch failed generation=$localGeneration")
+                }
             }
         }
         pipelineSession.attachWatchdog(localGeneration, watchdog)

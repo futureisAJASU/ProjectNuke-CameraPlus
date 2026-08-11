@@ -60,4 +60,15 @@ class CameraPipelineUiSessionTest {
         assertFalse(session.snapshot().isBusy)
         assertTrue(session.snapshot().requiredOutputCommitted)
     }
+
+    @Test
+    fun missingTerminalBecomesUnresolvedAndDoesNotPretendIdle() {
+        val session = CameraPipelineUiSession()
+        val operation = (session.start("one", 1) as CameraPipelineUiSession.StartResult.Accepted).operation
+        session.requestCancellation(operation.generation, "watchdog")
+        assertTrue(session.markTerminalDeliveryFailed(operation.generation, "unresolved"))
+        assertEquals(CameraPipelineUiSession.Phase.UNRESOLVED, session.snapshot().phase)
+        assertTrue(session.snapshot().isBusy)
+        assertFalse(session.snapshot().previewAllowed)
+    }
 }
