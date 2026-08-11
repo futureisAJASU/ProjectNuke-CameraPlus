@@ -94,7 +94,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import java.io.File
-import java.io.RandomAccessFile
 import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
@@ -488,10 +487,13 @@ fun MainCameraScreen(
                 if (!posted && !bitmap.isRecycled) bitmap.recycle()
             },
             onError = { error ->
-                previewMainHandler.post {
+                val outcome = dispatchPreviewError(previewMainHandler::post, Runnable {
                     if (currentScreen == MainScreen.SETTINGS) {
                         processingPreviewStatus = "Processing preview failed: ${error.javaClass.simpleName}"
                     }
+                })
+                if (outcome != CameraUiDispatchOutcome.ACCEPTED) {
+                    Log.e("KeplerPreview", "processing preview error dispatch outcome=$outcome", error)
                 }
             }
         )
@@ -572,7 +574,12 @@ fun MainCameraScreen(
                     result = loaded.first
                     estimate = loaded.second
 
-                    if (currentCoroutineContext()[Job]?.isActive != true || generation != refreshGeneration) {
+                    if (!acceptsPreviewResultGeneration(
+                            resultGeneration = generation,
+                            currentGeneration = refreshGeneration,
+                            coroutineActive = currentCoroutineContext()[Job]?.isActive == true
+                        )
+                    ) {
                         ownedBitmap?.takeIf { !it.isRecycled }?.recycle()
                         return@launch
                     }
@@ -3253,7 +3260,8 @@ private fun decodeNativeRgbaPreview(
     val bitmap = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
     try {
         val row = ByteArray(width * 4)
-        RandomAccessFile(file, "r").use { input ->
+        val verifiedHandle = VerifiedRandomAccessHandle.open(file, expectedBytes)
+        verifiedHandle.use { input ->
             for (y in 0 until outHeight) {
                 val sourceY = min(height - 1, y * scale)
                 input.seek((sourceY.toLong() * width.toLong()) * 4L)
@@ -3269,13 +3277,10 @@ private fun decodeNativeRgbaPreview(
                 }
             }
         }
+        verifiedHandle.verifyPathStillMatches()
     } catch (t: Throwable) {
         bitmap.recycle()
         throw t
-    }
-    if (!NoFollowFileSystem.revalidate(file.toPath(), identity)) {
-        bitmap.recycle()
-        return null
     }
     return bitmap
 }
