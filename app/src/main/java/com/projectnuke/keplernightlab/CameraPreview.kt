@@ -676,21 +676,12 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                 SessionConfiguration(
                     SessionConfiguration.SESSION_REGULAR,
                     listOf(output),
-                    { command ->
-                        val outcome = try {
-                            if (handler.post(command)) {
-                                CameraUiDispatchOutcome.ACCEPTED
-                            } else {
-                                CameraUiDispatchOutcome.REJECTED
-                            }
-                        } catch (failure: Throwable) {
-                            Log.e(TAG, "physical session callback dispatch threw generation=$localGeneration", failure)
-                            CameraUiDispatchOutcome.DISPATCH_THREW
+                    PreviewCameraCallbackExecutor(
+                        dispatch = { command -> handler.post(command) },
+                        onDispatchFailure = { failure ->
+                            callbackDispatchFailed(localGeneration, failure)
                         }
-                        if (outcome != CameraUiDispatchOutcome.ACCEPTED) {
-                            Log.w(TAG, "physical session callback dispatch outcome=$outcome generation=$localGeneration")
-                        }
-                    },
+                    ),
                     callback
                 )
             )
@@ -1067,6 +1058,16 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
         return buildCenterCropRegion(characteristics, zoomRatio)
             ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
             ?: Rect(0, 0, 1, 1)
+    }
+
+    private fun callbackDispatchFailed(localGeneration: Int, failure: Throwable) {
+        Log.e(TAG, "preview callback delivery failed generation=$localGeneration", failure)
+        synchronized(lock) {
+            if (generationOwner.snapshot().generation == localGeneration.toLong()) {
+                generationOwner.fail(localGeneration.toLong())
+            }
+        }
+        if (generationOwner.snapshot().generation == localGeneration.toLong()) stop()
     }
 
     private fun isActive(localGeneration: Int): Boolean = synchronized(lock) {
