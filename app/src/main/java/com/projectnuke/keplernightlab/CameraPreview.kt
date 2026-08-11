@@ -40,6 +40,7 @@ import androidx.core.content.ContextCompat
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
+import java.util.concurrent.Executors
 
 @Composable
 fun Camera2Preview(
@@ -146,6 +147,9 @@ private class CameraPreviewController(
     private var openRequestedGeneration: Int? = null
     private var desiredRunning = false
     private var lastTextureView: TextureView? = null
+    private val emergencyReleaseExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "KeplerPreviewEmergencyRelease").apply { isDaemon = true }
+    }
 
     fun start(textureView: TextureView) {
         synchronized(lock) {
@@ -211,7 +215,7 @@ private class CameraPreviewController(
             generation += 1
             openRequestedGeneration = null
             Log.d(TAG, "stop generation=$generation")
-            StopRefs(captureSession, cameraDevice, previewSurface, backgroundThread, backgroundHandler)
+            StopRefs(generation, captureSession, cameraDevice, previewSurface, backgroundThread, backgroundHandler)
                 .also {
                     captureSession = null
                     cameraDevice = null
@@ -223,10 +227,18 @@ private class CameraPreviewController(
                 }
         }
         val closeResources = Runnable {
-            runCatching { refs.session?.stopRepeating() }
-            runCatching { refs.session?.close() }
-            runCatching { refs.device?.close() }
-            runCatching { refs.surface?.release() }
+            val cleanup = settlePreviewResources(
+                generation = refs.generation.toLong(),
+                operations = listOf(
+                    PreviewResourceOperation.STOP_REPEATING to { refs.session?.stopRepeating() },
+                    PreviewResourceOperation.CAPTURE_SESSION_CLOSE to { refs.session?.close() },
+                    PreviewResourceOperation.CAMERA_DEVICE_CLOSE to { refs.device?.close() },
+                    PreviewResourceOperation.SURFACE_RELEASE to { refs.surface?.release() }
+                )
+            )
+            cleanup.failures.forEach { record ->
+                Log.e(TAG, "preview cleanup failed generation=${record.generation} operation=${record.operation}", record.failure)
+            }
         }
         fun markStoppedWhenTerminated() {
             val thread = refs.thread
@@ -234,22 +246,48 @@ private class CameraPreviewController(
                 finishStop()
                 return
             }
-            thread.quitSafely()
-            Thread {
-                runCatching { thread.join() }
+            val quit = settlePreviewResources(
+                generation = refs.generation.toLong(),
+                operations = listOf(PreviewResourceOperation.HANDLER_THREAD_QUIT to { thread.quitSafely() })
+            )
+            quit.failures.forEach { record ->
+                Log.e(TAG, "preview cleanup failed generation=${record.generation} operation=${record.operation}", record.failure)
+            }
+            try {
+                emergencyReleaseExecutor.execute {
+                    val termination = settlePreviewResources(
+                        generation = refs.generation.toLong(),
+                        operations = listOf(PreviewResourceOperation.HANDLER_THREAD_TERMINATION to {
+                            thread.join(2_000L)
+                            if (thread.isAlive) error("THREAD_TERMINATION_TIMEOUT")
+                        })
+                    )
+                    termination.failures.forEach { record ->
+                        Log.e(TAG, "preview cleanup failed generation=${record.generation} operation=${record.operation}", record.failure)
+                    }
+                    finishStop()
+                }
+            } catch (failure: Throwable) {
+                Log.e(TAG, "preview emergency release dispatch rejected", failure)
                 finishStop()
-            }.apply {
-                name = "KeplerPreviewStopWatcher"
-                isDaemon = true
-                start()
             }
         }
         if (refs.handler != null) {
             val posted = refs.handler.post(closeResources)
-            if (!posted) closeResources.run()
+            if (!posted) {
+                try {
+                    emergencyReleaseExecutor.execute(closeResources)
+                } catch (failure: Throwable) {
+                    Log.e(TAG, "preview cleanup dispatch rejected", failure)
+                }
+            }
             markStoppedWhenTerminated()
         } else {
-            closeResources.run()
+            try {
+                emergencyReleaseExecutor.execute(closeResources)
+            } catch (failure: Throwable) {
+                Log.e(TAG, "preview cleanup dispatch rejected", failure)
+            }
             markStoppedWhenTerminated()
         }
     }
@@ -363,7 +401,15 @@ private class CameraPreviewController(
 
         val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
 
-        val thread = HandlerThread("KeplerPreviewThread").apply { start() }
+        val thread = try {
+            HandlerThread("KeplerPreviewThread").also { it.start() }
+        } catch (failure: Throwable) {
+            synchronized(lock) {
+                if (generation == localGeneration) previewState = PreviewState.FAILED
+            }
+            Log.e(TAG, "preview thread start failed generation=$localGeneration", failure)
+            return
+        }
         val handler = Handler(thread.looper)
         synchronized(lock) {
             if (!isActiveLocked(localGeneration)) {
@@ -914,7 +960,7 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
         localGeneration: Int,
         surface: Surface
     ): Boolean = synchronized(lock) {
-        if (!isActiveLocked(localGeneration)) return false
+        if (!isActiveLocked(localGeneration) || previewSurface != null) return false
         previewSurface = surface
         true
     }
@@ -923,7 +969,7 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
         localGeneration: Int,
         camera: CameraDevice
     ): Boolean = synchronized(lock) {
-        if (!isActiveLocked(localGeneration)) return false
+        if (!isActiveLocked(localGeneration) || cameraDevice != null) return false
         cameraDevice = camera
         true
     }
@@ -932,7 +978,7 @@ private fun storeCaptureSession(
         localGeneration: Int,
         session: CameraCaptureSession
     ): Boolean = synchronized(lock) {
-        if (!isActiveLocked(localGeneration)) return false
+        if (!isActiveLocked(localGeneration) || captureSession != null) return false
         captureSession = session
         previewState = PreviewState.OPEN
         true
@@ -1009,6 +1055,7 @@ private fun storeCaptureSession(
     }
 
     private data class StopRefs(
+        val generation: Int,
         val session: CameraCaptureSession?,
         val device: CameraDevice?,
         val surface: Surface?,
