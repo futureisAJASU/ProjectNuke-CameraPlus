@@ -338,7 +338,8 @@ private class CameraPreviewController(
 
     private fun finishStop(stopGeneration: Int) {
         val restart = synchronized(lock) {
-            val shouldRestart = generationOwner.finishStop(stopGeneration = stopGeneration.toLong())
+            val finished = generationOwner.finishStop(stopGeneration = stopGeneration.toLong())
+            val shouldRestart = finished && generationOwner.snapshot().desiredRunning
             shouldRestart to lastTextureView
         }
         if (restart.first && restart.second != null) start(restart.second!!)

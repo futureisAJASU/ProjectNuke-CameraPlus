@@ -45,7 +45,7 @@ internal class PreviewGenerationOwner {
     fun finishStop(stopGeneration: Long): Boolean {
         if (snapshot.generation != stopGeneration || snapshot.state != State.STOPPING) return false
         snapshot = snapshot.copy(state = State.STOPPED)
-        return snapshot.desiredRunning
+        return true
     }
 
     @Synchronized

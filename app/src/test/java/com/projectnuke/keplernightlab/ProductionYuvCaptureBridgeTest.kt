@@ -701,6 +701,7 @@ class ProductionYuvCaptureBridgeTest {
             // Wait for the worker to drain.
             harness.session.boundedWorker.close()
             assertTrue(harness.session.boundedWorker.awaitTermination(5_000L))
+            harness.awaitCallback()
 
             val snap = harness.session.accounting.snapshot()
             assertEquals(snap.persistedFrames, snap.manifest.size)

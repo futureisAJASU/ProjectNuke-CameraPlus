@@ -55,9 +55,13 @@ class SerializedPreviewWorkerTest {
         val errorReported = CountDownLatch(1)
         val errors = Collections.synchronizedList(mutableListOf<Throwable>())
         val recycledSources = Collections.synchronizedList(mutableListOf<Int>())
+        val recycledSourcesLatch = CountDownLatch(2)
         val worker = SerializedPreviewWorker<Int, Int>(
             render = { value -> if (value == 1) { firstStarted.countDown(); error("expected") } else value },
-            recycleSource = recycledSources::add,
+            recycleSource = { value ->
+                recycledSources.add(value)
+                recycledSourcesLatch.countDown()
+            },
             recycleResult = {},
             adopt = { adopted.countDown() },
             onError = { error -> errors.add(error); errorReported.countDown() }
@@ -69,6 +73,7 @@ class SerializedPreviewWorkerTest {
             assertTrue(adopted.await(2, TimeUnit.SECONDS))
             assertTrue(errorReported.await(2, TimeUnit.SECONDS))
             assertEquals(1, errors.size)
+            assertTrue(recycledSourcesLatch.await(2, TimeUnit.SECONDS))
             assertTrue(recycledSources.containsAll(listOf(1, 2)))
         } finally {
             worker.close()
