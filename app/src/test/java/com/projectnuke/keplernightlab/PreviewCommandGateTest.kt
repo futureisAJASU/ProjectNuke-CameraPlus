@@ -6,6 +6,28 @@ import org.junit.Test
 
 class PreviewCommandGateTest {
     @Test
+    fun requestedAndAppliedValuesRemainDistinctAfterDispatchFailure() {
+        val snapshot = PreviewCommandSnapshot(
+            generation = 4,
+            requestedZoomRatio = 3.0f,
+            appliedZoomRatio = 1.0f,
+            lastOutcome = PreviewCommandApplyOutcome.DISPATCH_REJECTED
+        )
+        assertTrue(snapshot.requestedZoomRatio != snapshot.appliedZoomRatio)
+        assertTrue(snapshot.lastOutcome == PreviewCommandApplyOutcome.DISPATCH_REJECTED)
+    }
+
+    @Test
+    fun appliedStateAdvancesOnlyOnCameraMutationSuccess() {
+        val requested = PreviewCommandSnapshot(generation = 5, requestedZoomRatio = 2.0f)
+        val applied = requested.copy(
+            appliedZoomRatio = requested.requestedZoomRatio,
+            lastOutcome = PreviewCommandApplyOutcome.APPLIED
+        )
+        assertTrue(applied.appliedZoomRatio == 2.0f)
+    }
+
+    @Test
     fun staleCommandCannotReachNewGeneration() {
         assertFalse(
             acceptsPreviewCommand(

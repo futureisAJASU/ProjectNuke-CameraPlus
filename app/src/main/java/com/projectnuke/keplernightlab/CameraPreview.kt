@@ -183,6 +183,7 @@ private class CameraPreviewController(
     private var openRequestedGeneration: Int? = null
     private var lastTextureView: TextureView? = null
     private var cleanupDiagnostics = PreviewCleanupDiagnostics()
+    private var commandSnapshot = PreviewCommandSnapshot()
     private val emergencyReleaseExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "KeplerPreviewEmergencyRelease").apply { isDaemon = true }
     }
@@ -393,6 +394,12 @@ private class CameraPreviewController(
         val previous = latestFocusAeState
         latestFocusAeState = newState
         val localGeneration = synchronized(lock) { generationOwner.snapshot().generation.toInt() }
+        synchronized(lock) {
+            commandSnapshot = commandSnapshot.copy(
+                generation = localGeneration,
+                requestedFocusAeState = newState
+            )
+        }
         dispatchPreviewCommand(localGeneration, PreviewCommandKind.FOCUS_AE) {
             applyFocusAeStateOnCameraThread(
                 newState = newState,
@@ -406,8 +413,14 @@ private class CameraPreviewController(
         val previous = latestMeteringMode
         latestMeteringMode = newMode
         val localGeneration = synchronized(lock) { generationOwner.snapshot().generation.toInt() }
+        synchronized(lock) {
+            commandSnapshot = commandSnapshot.copy(
+                generation = localGeneration,
+                requestedMeteringMode = newMode
+            )
+        }
         dispatchPreviewCommand(localGeneration, PreviewCommandKind.METERING) {
-            applyFocusAeStateOnCameraThread(
+            val applied = applyFocusAeStateOnCameraThread(
                 newState = latestFocusAeState,
                 previousState = latestFocusAeState,
                 localGeneration = localGeneration
@@ -415,6 +428,7 @@ private class CameraPreviewController(
             if (previous != newMode) {
                 Log.d(TAG, "metering changed mode=$newMode")
             }
+            applied
         }
     }
 
@@ -422,8 +436,14 @@ private class CameraPreviewController(
         val previous = latestZoomRatio
         latestZoomRatio = (if (newZoomRatio.isFinite()) newZoomRatio else 1.0f).coerceAtLeast(0.1f)
         val localGeneration = synchronized(lock) { generationOwner.snapshot().generation.toInt() }
+        synchronized(lock) {
+            commandSnapshot = commandSnapshot.copy(
+                generation = localGeneration,
+                requestedZoomRatio = latestZoomRatio
+            )
+        }
         dispatchPreviewCommand(localGeneration, PreviewCommandKind.ZOOM) {
-            applyFocusAeStateOnCameraThread(
+            val applied = applyFocusAeStateOnCameraThread(
                 newState = latestFocusAeState,
                 previousState = latestFocusAeState,
                 localGeneration = localGeneration
@@ -431,13 +451,14 @@ private class CameraPreviewController(
             if (abs(previous - latestZoomRatio) >= 0.02f) {
                 Log.d(TAG, "zoom changed ratio=$latestZoomRatio")
             }
+            applied
         }
     }
 
     private fun dispatchPreviewCommand(
         localGeneration: Int,
         kind: PreviewCommandKind,
-        command: () -> Unit
+        command: () -> Boolean
     ) {
         val handler = synchronized(lock) {
             if (!acceptsPreviewCommand(localGeneration, isActiveLocked(localGeneration), PreviewCommand(localGeneration, kind))) {
@@ -446,22 +467,65 @@ private class CameraPreviewController(
                 backgroundHandler
             }
         }
-        if (handler == null) return
+        if (handler == null) {
+            recordCommandOutcome(localGeneration, PreviewCommandApplyOutcome.DISPATCH_REJECTED)
+            return
+        }
         val outcome = try {
             if (handler.post {
                     if (acceptsPreviewCommand(localGeneration, isActive(localGeneration), PreviewCommand(localGeneration, kind))) {
-                        command()
+                        if (command()) {
+                            recordCommandApplied(localGeneration, kind)
+                        } else {
+                            recordCommandOutcome(localGeneration, PreviewCommandApplyOutcome.CAMERA_REQUEST_FAILED)
+                        }
+                    } else {
+                        recordCommandOutcome(localGeneration, PreviewCommandApplyOutcome.STALE_GENERATION)
                     }
                 }
             ) CameraUiDispatchOutcome.ACCEPTED else CameraUiDispatchOutcome.REJECTED
         } catch (failure: Throwable) {
             Log.e(TAG, "preview command dispatch threw kind=$kind generation=$localGeneration", failure)
+            recordCommandOutcome(localGeneration, PreviewCommandApplyOutcome.DISPATCH_THROWN)
             CameraUiDispatchOutcome.DISPATCH_THREW
         }
         if (outcome != CameraUiDispatchOutcome.ACCEPTED) {
+            if (outcome == CameraUiDispatchOutcome.REJECTED) {
+                recordCommandOutcome(localGeneration, PreviewCommandApplyOutcome.DISPATCH_REJECTED)
+            }
             Log.w(TAG, "preview command dispatch outcome=$outcome kind=$kind generation=$localGeneration")
         }
     }
+
+    private fun recordCommandOutcome(localGeneration: Int, outcome: PreviewCommandApplyOutcome) {
+        synchronized(lock) {
+            commandSnapshot = commandSnapshot.copy(generation = localGeneration, lastOutcome = outcome)
+        }
+    }
+
+    private fun recordCommandApplied(localGeneration: Int, kind: PreviewCommandKind) {
+        synchronized(lock) {
+            commandSnapshot = when (kind) {
+                PreviewCommandKind.ZOOM -> commandSnapshot.copy(
+                    generation = localGeneration,
+                    appliedZoomRatio = commandSnapshot.requestedZoomRatio,
+                    lastOutcome = PreviewCommandApplyOutcome.APPLIED
+                )
+                PreviewCommandKind.FOCUS_AE -> commandSnapshot.copy(
+                    generation = localGeneration,
+                    appliedFocusAeState = commandSnapshot.requestedFocusAeState,
+                    lastOutcome = PreviewCommandApplyOutcome.APPLIED
+                )
+                PreviewCommandKind.METERING -> commandSnapshot.copy(
+                    generation = localGeneration,
+                    appliedMeteringMode = commandSnapshot.requestedMeteringMode,
+                    lastOutcome = PreviewCommandApplyOutcome.APPLIED
+                )
+            }
+        }
+    }
+
+    internal fun commandSnapshot(): PreviewCommandSnapshot = synchronized(lock) { commandSnapshot }
 
     fun updateLensDiagnostics(
         selectedLensSlot: LensSlot,
@@ -810,12 +874,13 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                 )
 
                 try {
-                    applyFocusAeStateOnCameraThread(
+                    val applied = applyFocusAeStateOnCameraThread(
                         newState = latestFocusAeState,
                         previousState = FocusAeState(),
                         localGeneration = localGeneration,
                         forceTrigger = latestFocusAeState.point != null
                     )
+                    check(applied) { "initial preview request was not applied" }
                     if (!generationOwner.markOpen(localGeneration.toLong())) {
                         Log.w(TAG, "preview session request completed for stale generation=$localGeneration")
                     }
@@ -881,13 +946,13 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
         previousState: FocusAeState,
         localGeneration: Int,
         forceTrigger: Boolean = false
-    ) {
-        if (!isActive(localGeneration)) return
-        val session = captureSession ?: return
-        val camera = cameraDevice ?: return
-        val surface = previewSurface ?: return
-        val characteristics = cameraCharacteristics ?: return
-        val handler = backgroundHandler ?: return
+    ): Boolean {
+        if (!isActive(localGeneration)) return false
+        val session = captureSession ?: return false
+        val camera = cameraDevice ?: return false
+        val surface = previewSurface ?: return false
+        val characteristics = cameraCharacteristics ?: return false
+        val handler = backgroundHandler ?: return false
         val zoom = latestZoomRatio
         val meteringMode = latestMeteringMode
         val pointChanged = previousState.point != newState.point
@@ -896,7 +961,7 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
         val aeRegions = buildAeMeteringRegions(characteristics, zoom, meteringMode, newState.point)
         val cropRegion = buildMeteringCropRegion(characteristics, zoom)
 
-        runCatching {
+        return try {
             if ((pointChanged || forceTrigger) && newState.point != null) {
                 session.capture(
                     buildPreviewRequest(
@@ -943,8 +1008,10 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
             if (pointChanged) Log.d(TAG, "AF/AE point applied point=${newState.point}")
             if (lockChanged) Log.d(TAG, "AE lock changed locked=${newState.locked}")
             if (evChanged) Log.d(TAG, "EV compensation changed index=${newState.exposureCompensationIndex}")
-        }.onFailure {
-            Log.w(TAG, "applyFocusAeState failed", it)
+            true
+        } catch (failure: Throwable) {
+            Log.w(TAG, "applyFocusAeState failed", failure)
+            false
         }
     }
 
