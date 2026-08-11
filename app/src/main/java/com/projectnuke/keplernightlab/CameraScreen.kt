@@ -96,7 +96,6 @@ import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
 import java.util.concurrent.CancellationException
-import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 import kotlin.math.min
@@ -314,29 +313,26 @@ fun MainCameraScreen(
 ) {
     val context = LocalContext.current
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
+    val mainScheduler = remember { HandlerCameraUiScheduler(mainHandler) }
+    val pipelineSession = remember { CameraPipelineUiSession() }
     val savedSettings = remember { CameraSettingsStore.load(context) }
 
     var status by remember { mutableStateOf("대기 중") }
-    var previewEnabled by remember { mutableStateOf(true) }
-    var isCapturing by remember { mutableStateOf(false) }
-    var isPipelineBusy by remember { mutableStateOf(false) }
+    var pipelineUiState by remember { mutableStateOf(pipelineSession.snapshot()) }
+    val previewEnabled = pipelineUiState.previewAllowed
+    val isCapturing = pipelineUiState.isCapturing
+    val isPipelineBusy = pipelineUiState.isBusy
     var currentScreen by remember { mutableStateOf(MainScreen.CAMERA) }
-    var captureProgress by remember { mutableStateOf(CaptureProgressState()) }
-    var pipelineGeneration by remember { mutableIntStateOf(0) }
-    var timedOutGeneration by remember { mutableIntStateOf(-1) }
-    val activeCancellationToken = remember { AtomicReference<KeplerPipelineCancellationToken?>(null) }
-    val activeCaptureCancellation = remember { AtomicReference<KeplerCaptureCancellationHandle?>(null) }
-    val activeWatchdog = remember { AtomicReference<Runnable?>(null) }
-    val activeJobStart = remember { AtomicReference<Runnable?>(null) }
+    val captureProgress = pipelineUiState.captureProgress
+
+    fun publishPipelineState() {
+        pipelineUiState = pipelineSession.snapshot()
+    }
 
     DisposableEffect(Unit) {
         onDispose {
-            pipelineGeneration++
-            activeCancellationToken.getAndSet(null)?.cancel()
-            activeCaptureCancellation.getAndSet(null)?.cancelCapture("camera screen disposed")
-            activeWatchdog.getAndSet(null)?.let(mainHandler::removeCallbacks)
-            activeJobStart.getAndSet(null)?.let(mainHandler::removeCallbacks)
-            timedOutGeneration = -1
+            pipelineSession.dispose()
+            publishPipelineState()
             Log.i("KeplerPipelineState", "camera screen disposed; active pipeline cancelled")
         }
     }
@@ -773,80 +769,78 @@ LaunchedEffect(Unit) {
         timeoutMillis: Long = 120_000L,
         job: (KeplerPipelineCancellationToken, KeplerCaptureCancellationHandle, (String) -> Unit) -> Unit
     ) {
-        if (isPipelineBusy) {
+        val started = pipelineSession.start(startMessage, requestedFrames)
+        if (started is CameraPipelineUiSession.StartResult.Rejected) {
             status = "Pipeline busy: current fusion/export is still running."
             Log.i("KeplerPipelineState", "capture ignored: pipeline busy status=$status")
             return
         }
-        val localGeneration = ++pipelineGeneration
-        val cancellationToken = KeplerPipelineCancellationToken()
-        val captureCancellationHandle = KeplerCaptureCancellationHandle()
-        activeCancellationToken.set(cancellationToken)
-        activeCaptureCancellation.set(captureCancellationHandle)
+        val operation = (started as CameraPipelineUiSession.StartResult.Accepted).operation
+        val localGeneration = operation.generation
+        val cancellationToken = operation.cancellationToken
+        val captureCancellationHandle = operation.captureCancellation
         status = startMessage
-        isPipelineBusy = true
-        isCapturing = true
-        previewEnabled = false
+        publishPipelineState()
         Log.i(
             "KeplerPipelineState",
             "pipeline start generation=$localGeneration message=$startMessage requestedFrames=$requestedFrames"
         )
-        captureProgress = CaptureProgressState(
-            stage = CaptureStage.PREPARING,
-            message = "Preparing capture...",
-            requestedFrames = requestedFrames,
-            progressPercent = 0.05f
-        )
-        val watchdog = Runnable {
-            if (localGeneration != pipelineGeneration) {
-                Log.i(
-                    "KeplerPipelineState",
-                    "stale watchdog ignored generation=$localGeneration current=$pipelineGeneration"
-                )
-                return@Runnable
+        lateinit var watchdog: Runnable
+        watchdog = Runnable {
+            if (pipelineSession.requestCancellation(localGeneration, "watchdog timeout")) {
+                status = "CAPTURE_TIMEOUT: Cancellation requested; waiting for terminal settlement."
+                publishPipelineState()
+                Log.i("KeplerPipelineState", "pipeline timeout requested cancellation generation=$localGeneration")
             }
-            cancellationToken.cancel()
-            captureCancellationHandle.cancelCapture("watchdog timeout")
-            activeCancellationToken.compareAndSet(cancellationToken, null)
-            activeCaptureCancellation.compareAndSet(captureCancellationHandle, null)
-            activeWatchdog.set(null)
-            timedOutGeneration = localGeneration
-            val timeoutStatus = "CAPTURE_TIMEOUT: Capture timeout. Preview recovered."
-            status = timeoutStatus
-            captureProgress = parseCaptureProgress(timeoutStatus, captureProgress)
-            isCapturing = false
-            isPipelineBusy = false
-            previewEnabled = true
-            Log.i("KeplerPipelineState", "pipeline timeout; preview re-enabled")
         }
-        activeWatchdog.set(watchdog)
-        mainHandler.postDelayed(watchdog, timeoutMillis)
+        pipelineSession.attachWatchdog(localGeneration, watchdog)
+        when (val dispatch = mainScheduler.post(timeoutMillis, watchdog)) {
+            CameraUiDispatchOutcome.ACCEPTED -> Unit
+            CameraUiDispatchOutcome.REJECTED,
+            CameraUiDispatchOutcome.DISPATCH_THREW -> {
+                pipelineSession.requestCancellation(localGeneration, "watchdog dispatch failed")
+                val failure = CameraPipelineEvent.Terminal(
+                    generation = localGeneration,
+                    kind = CameraPipelineEvent.Terminal.Kind.FAILED,
+                    captureResourcesSettled = false,
+                    message = "PIPELINE_FAILED: Timeout guard could not be scheduled."
+                )
+                pipelineSession.accept(failure)
+                status = failure.message.orEmpty()
+                publishPipelineState()
+            }
+        }
+
+        fun acceptEvent(event: CameraPipelineEvent) {
+            when (pipelineSession.accept(event)) {
+                CameraPipelineUiSession.EventResult.ACCEPTED -> {
+                    event.message?.let { status = it }
+                    publishPipelineState()
+                    val terminal = event as? CameraPipelineEvent.Terminal ?: return
+                    pipelineSession.clearWatchdog(localGeneration)?.let(mainScheduler::remove)
+                    val success = terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE ||
+                        terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+                    refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted)
+                }
+                CameraPipelineUiSession.EventResult.DUPLICATE_TERMINAL -> {
+                    publishPipelineState()
+                    Log.i("KeplerPipelineState", "duplicate terminal diagnostics generation=$localGeneration")
+                }
+                CameraPipelineUiSession.EventResult.STALE,
+                CameraPipelineUiSession.EventResult.DISPOSED ->
+                    Log.i("KeplerPipelineState", "stale pipeline event ignored generation=$localGeneration")
+            }
+        }
 
         fun finishIfTerminal(newStatus: String) {
-            if (localGeneration != pipelineGeneration) {
-                Log.i(
-                    "KeplerPipelineState",
-                    "stale terminal ignored generation=$localGeneration current=$pipelineGeneration status=$newStatus"
-                )
-                return
-            }
-            if (shouldIgnoreCancelledPipelineStatus(cancellationToken.isCancelled, timedOutGeneration, localGeneration, pipelineGeneration, newStatus)) {
-                Log.i("KeplerPipelineState", "post-timeout status ignored generation=$localGeneration status=$newStatus")
-                return
-            }
-            val acceptLateCompletion =
-                cancellationToken.isCancelled &&
-                    timedOutGeneration == localGeneration &&
-                    localGeneration == pipelineGeneration &&
-                    isCommittedPipelineCompletionStatus(newStatus)
-            if (acceptLateCompletion) {
-                timedOutGeneration = -1
-            }
-            captureProgress = parseCaptureProgress(newStatus, captureProgress)
+            val event = legacyCameraPipelineEvent(localGeneration, newStatus, pipelineSession.snapshot().captureProgress)
+            acceptEvent(event)
+            return
+            /*
             if (isCaptureStageCompleteButPipelineStillRunning(newStatus)) {
-                isCapturing = false
-                previewEnabled = false
-                captureProgress = captureProgress.copy(
+                Unit
+                Unit
+                Unit
                     stage = CaptureStage.PROCESSING,
                     message = "캡처가 완료되었습니다.",
                     progressPercent = max(captureProgress.progressPercent, 0.65f)
@@ -859,25 +853,25 @@ LaunchedEffect(Unit) {
                     newStatus.trimStart().startsWith("PIPELINE_COMPLETE", ignoreCase = true) ||
                         newStatus.trimStart().startsWith("EXPORT_COMPLETE", ignoreCase = true)
 mainHandler.removeCallbacks(watchdog)
-                activeWatchdog.compareAndSet(watchdog, null)
-                activeCancellationToken.compareAndSet(cancellationToken, null)
-                activeCaptureCancellation.compareAndSet(captureCancellationHandle, null)
-                if (timedOutGeneration == localGeneration) timedOutGeneration = -1
-                isPipelineBusy = false
-                isCapturing = false
+                Unit
+                Unit
+                Unit
+                Unit
+                Unit
+                Unit
                 refreshLatestResult(showPreview = terminalSuccess)
                 Log.i("KeplerPipelineState", "pipeline final terminalSuccess=$terminalSuccess status=$newStatus")
 
                 mainHandler.postDelayed(
                     {
-                        if (localGeneration != pipelineGeneration) {
+                        if (false) {
                             Log.i(
                                 "KeplerPipelineState",
                                 "stale preview enable ignored generation=$localGeneration current=$pipelineGeneration"
                             )
                             return@postDelayed
                         }
-                        previewEnabled = true
+                        Unit
                         Log.i("KeplerPipelineState", "preview re-enabled")
                     },
                     250L
@@ -885,41 +879,53 @@ mainHandler.removeCallbacks(watchdog)
             }
         }
 
+            */
+        }
         val jobStart = Runnable {
-                activeJobStart.set(null)
-                if (localGeneration != pipelineGeneration || cancellationToken.isCancelled) {
-                    Log.i(
-                        "KeplerPipelineState",
-                        "stale job start ignored generation=$localGeneration current=$pipelineGeneration"
+            if (pipelineSession.snapshot().generation != localGeneration || cancellationToken.isCancelled) return@Runnable
+            acceptEvent(CameraPipelineEvent.Started(localGeneration, startMessage))
+            try {
+                job(cancellationToken, captureCancellationHandle) { newStatus ->
+                    val event = legacyCameraPipelineEvent(
+                        localGeneration,
+                        newStatus,
+                        pipelineSession.snapshot().captureProgress
                     )
-                    return@Runnable
-                }
-                try {
-                    job(cancellationToken, captureCancellationHandle, jobCallback@{ newStatus ->
-                        if (localGeneration != pipelineGeneration) {
-                            Log.i(
-                                "KeplerPipelineState",
-                                "stale pipeline status ignored generation=$localGeneration current=$pipelineGeneration status=$newStatus"
-                            )
-                            return@jobCallback
-                        }
-                        if (shouldIgnoreCancelledPipelineStatus(cancellationToken.isCancelled, timedOutGeneration, localGeneration, pipelineGeneration, newStatus)) {
-                            Log.i("KeplerPipelineState", "cancelled pipeline status ignored generation=$localGeneration status=$newStatus")
-                            return@jobCallback
-                        }
-                        status = newStatus
-                        finishIfTerminal(newStatus)
-                    })
-                } catch (_: CancellationException) {
-                } catch (t: Exception) {
-                    Log.e("KeplerPipelineState", "pipeline crashed generation=$localGeneration", t)
-                    if (localGeneration == pipelineGeneration) {
-                        finishIfTerminal("PIPELINE_FAILED: ${t.javaClass.simpleName}")
+                    when (val dispatch = mainScheduler.post(0L, Runnable { acceptEvent(event) })) {
+                        CameraUiDispatchOutcome.ACCEPTED -> Unit
+                        CameraUiDispatchOutcome.REJECTED,
+                        CameraUiDispatchOutcome.DISPATCH_THREW ->
+                            Log.e("KeplerPipelineState", "pipeline event dispatch failed generation=$localGeneration")
                     }
                 }
+            } catch (_: CancellationException) {
+                // Cancellation remains pending until the pipeline publishes terminal evidence.
+            } catch (t: Exception) {
+                Log.e("KeplerPipelineState", "pipeline crashed generation=$localGeneration", t)
+                acceptEvent(
+                    CameraPipelineEvent.Terminal(
+                        generation = localGeneration,
+                        kind = CameraPipelineEvent.Terminal.Kind.FAILED,
+                        message = "PIPELINE_FAILED: ${t.javaClass.simpleName}"
+                    )
+                )
+            }
         }
-        activeJobStart.set(jobStart)
-        mainHandler.postDelayed(jobStart, 250L)
+        pipelineSession.attachScheduledStart(localGeneration, jobStart)
+        when (val dispatch = mainScheduler.post(250L, jobStart)) {
+            CameraUiDispatchOutcome.ACCEPTED -> Unit
+            CameraUiDispatchOutcome.REJECTED,
+            CameraUiDispatchOutcome.DISPATCH_THREW -> {
+                pipelineSession.clearScheduledStart(localGeneration)?.let(mainScheduler::remove)
+                val failure = CameraPipelineEvent.Terminal(
+                    generation = localGeneration,
+                    kind = CameraPipelineEvent.Terminal.Kind.FAILED,
+                    captureResourcesSettled = false,
+                    message = "PIPELINE_FAILED: Capture could not be scheduled."
+                )
+                acceptEvent(failure)
+            }
+        }
     }
 
     fun runHardenedRawDebugCapture(
@@ -1196,13 +1202,13 @@ mainHandler.removeCallbacks(watchdog)
                 onRaw = {
                     runCameraJob("RAW DNG 촬영 준비 중...", requestedFrames = 1) { cancellation, _, callback ->
                         cancellation.throwIfCancelled()
-                        runHardenedRawDebugCapture(1, cancellation, activeCaptureCancellation.get() ?: KeplerCaptureCancellationHandle(), callback)
+                        runHardenedRawDebugCapture(1, cancellation, pipelineSession.currentOperation()?.captureCancellation ?: KeplerCaptureCancellationHandle(), callback)
                     }
                 },
                 onRawBurst = {
                     runCameraJob("RAW Burst 촬영 준비 중...", requestedFrames = 4) { cancellation, _, callback ->
                         cancellation.throwIfCancelled()
-                        runHardenedRawDebugCapture(4, cancellation, activeCaptureCancellation.get() ?: KeplerCaptureCancellationHandle(), callback)
+                        runHardenedRawDebugCapture(4, cancellation, pipelineSession.currentOperation()?.captureCancellation ?: KeplerCaptureCancellationHandle(), callback)
                     }
                 },
                 onClear = {
@@ -1290,14 +1296,14 @@ mainHandler.removeCallbacks(watchdog)
                     currentScreen = MainScreen.CAMERA
                     runCameraJob("RAW DNG capture preparing...") { cancellation, _, callback ->
                         cancellation.throwIfCancelled()
-                        runHardenedRawDebugCapture(1, cancellation, activeCaptureCancellation.get() ?: KeplerCaptureCancellationHandle(), callback)
+                        runHardenedRawDebugCapture(1, cancellation, pipelineSession.currentOperation()?.captureCancellation ?: KeplerCaptureCancellationHandle(), callback)
                     }
                 },
                 onRawBurst = {
                     currentScreen = MainScreen.CAMERA
                     runCameraJob("RAW Burst capture preparing...") { cancellation, _, callback ->
                         cancellation.throwIfCancelled()
-                        runHardenedRawDebugCapture(4, cancellation, activeCaptureCancellation.get() ?: KeplerCaptureCancellationHandle(), callback)
+                        runHardenedRawDebugCapture(4, cancellation, pipelineSession.currentOperation()?.captureCancellation ?: KeplerCaptureCancellationHandle(), callback)
                     }
                 },
                 onTest50MRaw = test50@{
