@@ -267,33 +267,14 @@ internal fun startCapturePipeline(
     onEvent: ((CameraPipelineEvent) -> Unit)? = null,
     eventGeneration: Long = 0L
 ) {
-    var eventProgress = CaptureProgressState()
+    val publishEvent: CameraPipelineEventSink = { event ->
+        onEvent?.invoke(event.withGeneration(eventGeneration))
+    }
     val loggedStatus: (String) -> Unit = { newStatus ->
         newStatus.chunked(3000).forEachIndexed { index, chunk ->
             Log.i("KeplerCaptureStatus", "part=${index + 1}: $chunk")
         }
         onStatus(newStatus)
-        onEvent?.let { publish ->
-            val event = legacyCameraPipelineEvent(eventGeneration, newStatus, eventProgress)
-            eventProgress = event.counts.toCaptureProgress(
-                eventProgress,
-                when (event) {
-                    is CameraPipelineEvent.Started -> CaptureStage.PREPARING
-                    is CameraPipelineEvent.CaptureProgress -> eventProgress.stage
-                    is CameraPipelineEvent.CaptureStageComplete -> CaptureStage.PROCESSING
-                    is CameraPipelineEvent.ProcessingStage -> event.stage
-                    is CameraPipelineEvent.ExportStage -> event.stage
-                    is CameraPipelineEvent.Terminal -> when (event.kind) {
-                        CameraPipelineEvent.Terminal.Kind.COMPLETE,
-                        CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL -> CaptureStage.COMPLETE
-                        CameraPipelineEvent.Terminal.Kind.FAILED -> CaptureStage.FAILED
-                        CameraPipelineEvent.Terminal.Kind.CANCELLED -> CaptureStage.CANCELLED
-                    }
-                },
-                event.message
-            )
-            publish(event)
-        }
     }
     val selection = request.prepared.selection
     val physicalCameraId = selection.physicalCameraId
@@ -342,7 +323,8 @@ internal fun startCapturePipeline(
             processingParams = request.processingSettings.resolvedParams(),
             captureCancellationHandle = request.captureCancellationHandle,
             cancellation = request.cancellation,
-            onStatus = loggedStatus
+            onStatus = loggedStatus,
+            onPipelineEvent = publishEvent
         )
     } else if (request.selectedResolution == CaptureResolutionMode.MP24_FUSION) {
         captureProcessExportSuperResolutionFusion(
@@ -362,7 +344,8 @@ internal fun startCapturePipeline(
             processingParams = request.processingSettings.resolvedParams(),
             captureCancellationHandle = request.captureCancellationHandle,
             cancellation = request.cancellation,
-            onStatus = loggedStatus
+            onStatus = loggedStatus,
+            onPipelineEvent = publishEvent
         )
     } else if (request.pipelineMode == PipelineMode.RAW_NIGHT_FUSION) {
         captureProcessExportRawNightFusion(
@@ -388,7 +371,8 @@ internal fun startCapturePipeline(
             displayRotation = request.displayRotation,
             captureCancellationHandle = request.captureCancellationHandle,
             cancellation = request.cancellation,
-            onStatus = loggedStatus
+            onStatus = loggedStatus,
+            onPipelineEvent = publishEvent
         )
     } else {
         captureProcessExportNightFusion(
@@ -414,7 +398,8 @@ internal fun startCapturePipeline(
             processingParams = request.processingSettings.resolvedParams(),
             captureCancellationHandle = request.captureCancellationHandle,
             cancellation = request.cancellation,
-            onStatus = loggedStatus
+            onStatus = loggedStatus,
+            onPipelineEvent = publishEvent
         )
     }
 }

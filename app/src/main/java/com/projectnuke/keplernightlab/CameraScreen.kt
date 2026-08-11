@@ -798,7 +798,12 @@ LaunchedEffect(Unit) {
         startMessage: String,
         requestedFrames: Int = 0,
         timeoutMillis: Long = 120_000L,
-        job: (KeplerPipelineCancellationToken, KeplerCaptureCancellationHandle, (String) -> Unit) -> Unit
+        job: (
+            KeplerPipelineCancellationToken,
+            KeplerCaptureCancellationHandle,
+            (String) -> Unit,
+            CameraPipelineEventSink
+        ) -> Unit
     ) {
         val started = pipelineSession.start(startMessage, requestedFrames)
         if (started is CameraPipelineUiSession.StartResult.Rejected) {
@@ -904,19 +909,32 @@ mainHandler.removeCallbacks(watchdog)
             if (pipelineSession.snapshot().generation != localGeneration || cancellationToken.isCancelled) return@Runnable
             acceptEvent(CameraPipelineEvent.Started(localGeneration, startMessage))
             try {
-                job(cancellationToken, captureCancellationHandle) { newStatus ->
-                    val event = legacyCameraPipelineEvent(
-                        localGeneration,
-                        newStatus,
-                        pipelineSession.snapshot().captureProgress
-                    )
+                job(
+                    cancellationToken,
+                    captureCancellationHandle,
+                    { newStatus ->
+                        when (val dispatch = mainScheduler.post(0L, Runnable {
+                            if (pipelineSession.snapshot().generation == localGeneration) {
+                                status = newStatus
+                                publishPipelineState()
+                            }
+                        })) {
+                            CameraUiDispatchOutcome.ACCEPTED -> Unit
+                            CameraUiDispatchOutcome.REJECTED,
+                            CameraUiDispatchOutcome.DISPATCH_THREW ->
+                                Log.e("KeplerPipelineState", "pipeline display dispatch failed generation=$localGeneration")
+                        }
+                    },
+                    { nativeEvent ->
+                        val event = nativeEvent.withGeneration(localGeneration)
                     when (val dispatch = mainScheduler.post(0L, Runnable { acceptEvent(event) })) {
                         CameraUiDispatchOutcome.ACCEPTED -> Unit
                         CameraUiDispatchOutcome.REJECTED,
                         CameraUiDispatchOutcome.DISPATCH_THREW ->
                             Log.e("KeplerPipelineState", "pipeline event dispatch failed generation=$localGeneration")
                     }
-                }
+                    }
+                )
             } catch (_: CancellationException) {
                 // Cancellation remains pending until the pipeline publishes terminal evidence.
             } catch (t: Exception) {
@@ -951,7 +969,8 @@ mainHandler.removeCallbacks(watchdog)
         frameCount: Int,
         cancellation: KeplerPipelineCancellationToken,
         captureCancellation: KeplerCaptureCancellationHandle,
-        callback: (String) -> Unit
+        callback: (String) -> Unit,
+        onPipelineEvent: CameraPipelineEventSink
     ) {
         cancellation.throwIfCancelled()
         val selection = cameraState.selection
@@ -970,8 +989,28 @@ mainHandler.removeCallbacks(watchdog)
             saveDngSidecars = true,
             captureCancellationHandle = captureCancellation,
             onStatus = callback,
-            onComplete = { jobDir -> callback("PIPELINE_COMPLETE: RAW debug capture complete: ${jobDir.name}") },
-            onError = { message -> callback("PIPELINE_FAILED: RAW debug capture failed. $message") }
+            onComplete = { jobDir ->
+                callback("PIPELINE_COMPLETE: RAW debug capture complete: ${jobDir.name}")
+                onPipelineEvent(
+                    CameraPipelineEvent.Terminal(
+                        generation = 0L,
+                        kind = CameraPipelineEvent.Terminal.Kind.COMPLETE,
+                        requiredOutputCommitted = jobDir.isDirectory,
+                        verified = false,
+                        message = "RAW debug capture complete: ${jobDir.name}"
+                    )
+                )
+            },
+            onError = { message ->
+                callback("PIPELINE_FAILED: RAW debug capture failed. $message")
+                onPipelineEvent(
+                    CameraPipelineEvent.Terminal(
+                        generation = 0L,
+                        kind = CameraPipelineEvent.Terminal.Kind.FAILED,
+                        message = message
+                    )
+                )
+            }
         )
     }
 
@@ -1203,7 +1242,7 @@ mainHandler.removeCallbacks(watchdog)
                                 } else {
                                     60_000L
                                 }
-                            ) { cancellation, captureCancellation, callback ->
+                            ) { cancellation, captureCancellation, callback, onEvent ->
                                 startCapturePipeline(
                                     CapturePipelineRequest(
                                         context = context,
@@ -1220,7 +1259,8 @@ mainHandler.removeCallbacks(watchdog)
                                         captureCancellationHandle = captureCancellation,
                                         cancellation = cancellation
                                     ),
-                                    onStatus = callback
+                                    onStatus = callback,
+                                    onEvent = onEvent
                                 )
                             }
                         }
@@ -1232,20 +1272,25 @@ mainHandler.removeCallbacks(watchdog)
                         Log.i("KeplerPipelineState", "average/reprocess ignored while busy status=$status")
                         return@average
                     }
-                    runCameraJob("최근 촬영 컬러 합성 시작...") { cancellation, _, callback ->
-                        processLatestNightFusionV02(context, cancellation) { callback(it) }
+                    runCameraJob("최근 촬영 컬러 합성 시작...") { cancellation, _, callback, onEvent ->
+                        processLatestNightFusionV02(
+                            context,
+                            cancellation,
+                            onStatus = { callback(it) },
+                            onPipelineEvent = onEvent
+                        )
                     }
                 },
                 onRaw = {
-                    runCameraJob("RAW DNG 촬영 준비 중...", requestedFrames = 1) { cancellation, _, callback ->
+                    runCameraJob("RAW DNG 촬영 준비 중...", requestedFrames = 1) { cancellation, _, callback, onEvent ->
                         cancellation.throwIfCancelled()
-                        runHardenedRawDebugCapture(1, cancellation, pipelineSession.currentOperation()?.captureCancellation ?: KeplerCaptureCancellationHandle(), callback)
+                        runHardenedRawDebugCapture(1, cancellation, pipelineSession.currentOperation()?.captureCancellation ?: KeplerCaptureCancellationHandle(), callback, onEvent)
                     }
                 },
                 onRawBurst = {
-                    runCameraJob("RAW Burst 촬영 준비 중...", requestedFrames = 4) { cancellation, _, callback ->
+                    runCameraJob("RAW Burst 촬영 준비 중...", requestedFrames = 4) { cancellation, _, callback, onEvent ->
                         cancellation.throwIfCancelled()
-                        runHardenedRawDebugCapture(4, cancellation, pipelineSession.currentOperation()?.captureCancellation ?: KeplerCaptureCancellationHandle(), callback)
+                        runHardenedRawDebugCapture(4, cancellation, pipelineSession.currentOperation()?.captureCancellation ?: KeplerCaptureCancellationHandle(), callback, onEvent)
                     }
                 },
                 onClear = {
@@ -1331,16 +1376,16 @@ mainHandler.removeCallbacks(watchdog)
                 },
                 onRaw = {
                     currentScreen = MainScreen.CAMERA
-                    runCameraJob("RAW DNG capture preparing...") { cancellation, _, callback ->
+                    runCameraJob("RAW DNG capture preparing...") { cancellation, _, callback, onEvent ->
                         cancellation.throwIfCancelled()
-                        runHardenedRawDebugCapture(1, cancellation, pipelineSession.currentOperation()?.captureCancellation ?: KeplerCaptureCancellationHandle(), callback)
+                        runHardenedRawDebugCapture(1, cancellation, pipelineSession.currentOperation()?.captureCancellation ?: KeplerCaptureCancellationHandle(), callback, onEvent)
                     }
                 },
                 onRawBurst = {
                     currentScreen = MainScreen.CAMERA
-                    runCameraJob("RAW Burst capture preparing...") { cancellation, _, callback ->
+                    runCameraJob("RAW Burst capture preparing...") { cancellation, _, callback, onEvent ->
                         cancellation.throwIfCancelled()
-                        runHardenedRawDebugCapture(4, cancellation, pipelineSession.currentOperation()?.captureCancellation ?: KeplerCaptureCancellationHandle(), callback)
+                        runHardenedRawDebugCapture(4, cancellation, pipelineSession.currentOperation()?.captureCancellation ?: KeplerCaptureCancellationHandle(), callback, onEvent)
                     }
                 },
                 onTest50MRaw = test50@{
@@ -1365,7 +1410,7 @@ mainHandler.removeCallbacks(watchdog)
                                 mainCapability.raw50Reason
                         return@test50
                     }
-                    runCameraJob("Test 50M RAW Capture: cameraId=${mainSelection.cameraId}", requestedFrames = 1) { cancellation, captureCancellation, callback ->
+                    runCameraJob("Test 50M RAW Capture: cameraId=${mainSelection.cameraId}", requestedFrames = 1) { cancellation, captureCancellation, callback, onEvent ->
                         cancellation.throwIfCancelled()
                         captureRawBurstForFusion(
                             context = context,
@@ -1382,8 +1427,25 @@ mainHandler.removeCallbacks(watchdog)
                                 callback(
                                     "PIPELINE_COMPLETE: Test 50M RAW Capture success. cameraId=${mainSelection.cameraId}, size=${job.optInt("rawWidth")}x${job.optInt("rawHeight")} ${"%.1f".format(job.optInt("rawWidth") * job.optInt("rawHeight") / 1_000_000.0)}MP, source=${job.optString("rawSizeSource")}, maxPixelMode=${job.optBoolean("requiresMaximumResolutionPixelMode")}, job=${jobDir.name}"
                                 )
+                                onEvent(
+                                    CameraPipelineEvent.Terminal(
+                                        generation = 0L,
+                                        kind = CameraPipelineEvent.Terminal.Kind.COMPLETE,
+                                        requiredOutputCommitted = jobDir.isDirectory,
+                                        message = "Test 50M RAW capture complete: ${jobDir.name}"
+                                    )
+                                )
                             },
-                            onError = { callback("PIPELINE_FAILED: Test 50M RAW Capture failed. $it") }
+                            onError = {
+                                callback("PIPELINE_FAILED: Test 50M RAW Capture failed. $it")
+                                onEvent(
+                                    CameraPipelineEvent.Terminal(
+                                        generation = 0L,
+                                        kind = CameraPipelineEvent.Terminal.Kind.FAILED,
+                                        message = it
+                                    )
+                                )
+                            }
                         )
                     }
                 },
@@ -1410,7 +1472,7 @@ mainHandler.removeCallbacks(watchdog)
                     runCameraJob(
                         "Test 50M YUV Capture: cameraId=${mainSelection.cameraId}",
                         requestedFrames = 1
-                    ) { cancellation, captureCancellation, callback ->
+                    ) { cancellation, captureCancellation, callback, onEvent ->
                         cancellation.throwIfCancelled()
                         captureYuvBurstColorWithMotion(
                             context = context,
@@ -1431,9 +1493,24 @@ mainHandler.removeCallbacks(watchdog)
                                         "cameraId=${mainSelection.cameraId}, size=${job.optInt("outputWidth")}x${job.optInt("outputHeight")}, " +
                                         "job=${jobDir.name}"
                                 )
+                                onEvent(
+                                    CameraPipelineEvent.Terminal(
+                                        generation = 0L,
+                                        kind = CameraPipelineEvent.Terminal.Kind.COMPLETE,
+                                        requiredOutputCommitted = jobDir.isDirectory,
+                                        message = "Test 50M YUV capture complete: ${jobDir.name}"
+                                    )
+                                )
                             },
                             onError = { error ->
                                 callback("PIPELINE_FAILED: Test 50M YUV Capture failed. $error")
+                                onEvent(
+                                    CameraPipelineEvent.Terminal(
+                                        generation = 0L,
+                                        kind = CameraPipelineEvent.Terminal.Kind.FAILED,
+                                        message = error
+                                    )
+                                )
                             },
                             onStatus = callback
                         )

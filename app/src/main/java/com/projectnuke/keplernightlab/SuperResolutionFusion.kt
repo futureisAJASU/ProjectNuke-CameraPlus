@@ -594,7 +594,8 @@ fun captureProcessExportSuperResolutionFusion(
     processingParams: ClassicYuvFusionParams = ClassicYuvFusionPreset.NATURAL.params,
     captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
-    onStatus: (String) -> Unit
+    onStatus: (String) -> Unit,
+    onPipelineEvent: CameraPipelineEventSink = {}
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
     val callbackLedger = ProcessingCallbackOutcomeLedger()
@@ -611,6 +612,7 @@ fun captureProcessExportSuperResolutionFusion(
         }
         return result == ProcessingCallbackDispatchResult.ACCEPTED
     }
+    val terminal = CameraPipelineTerminalPublisher(onPipelineEvent)
     val captureFrames = frameCount.coerceIn(MIN_FUSION_FRAMES, 6)
 
     cancellation.throwIfCancelled()
@@ -637,12 +639,16 @@ fun captureProcessExportSuperResolutionFusion(
                 cancellation.throwIfCancelled()
             } catch (_: CancellationException) {
                 post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
+                terminal.publish(CameraPipelineEvent.Terminal.Kind.CANCELLED, message = "Capture cancelled before Super Resolution processing.")
                 return@captureYuvBurstColorWithMotion
             }
             val workerThread = HandlerThread("KeplerSuperResolutionThread").apply { start() }
             val workerHandler = Handler(workerThread.looper)
             val workerPosted = runCatching {
                 workerHandler.post {
+                var requiredOutputCommitted = false
+                var publicExportCommitted = false
+                var verified = false
                 try {
                     cancellation.throwIfCancelled()
                     val sourceFrames = readColorBurstFrameFiles(sourceJobDir)
@@ -664,6 +670,7 @@ fun captureProcessExportSuperResolutionFusion(
                     val outputFile = result.outputFile
                     if (outputFile == null || !outputFile.exists()) {
                         post("PIPELINE_FAILED: 24M Fusion failed. ${result.message}")
+                        terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = result.message)
                         return@post
                     }
 
@@ -696,10 +703,18 @@ fun captureProcessExportSuperResolutionFusion(
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
                         )
                         post("PIPELINE_FAILED: 24M Fusion export failed. ${export.errorMessage}")
+                        terminal.publish(
+                            CameraPipelineEvent.Terminal.Kind.FAILED,
+                            requiredOutputCommitted = outputFile.isFile,
+                            publicExportCommitted = export.success && !export.uriString.isNullOrBlank(),
+                            message = export.errorMessage
+                        )
                         return@post
                     }
 
-                    val verified = verifyCommittedGalleryExport(context, export) is GalleryExportVerification.Verified
+                    verified = verifyCommittedGalleryExport(context, export) is GalleryExportVerification.Verified
+                    requiredOutputCommitted = outputFile.isFile
+                    publicExportCommitted = export.success && !export.uriString.isNullOrBlank()
                     updateExportMetadata(
                         jobDir = outputDir,
                         export = export,
@@ -718,6 +733,12 @@ fun captureProcessExportSuperResolutionFusion(
                             ,export = export
                         )
                         post("PIPELINE_FAILED: 24M Fusion export verification failed.")
+                        terminal.publish(
+                            CameraPipelineEvent.Terminal.Kind.FAILED,
+                            requiredOutputCommitted = requiredOutputCommitted,
+                            publicExportCommitted = publicExportCommitted,
+                            message = "24M Fusion export verification failed."
+                        )
                         return@post
                     }
 
@@ -726,6 +747,13 @@ fun captureProcessExportSuperResolutionFusion(
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
                             postExportCancellationRequested = true, postExportWorkSkipped = true)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. Cache was kept.")
+                        terminal.publish(
+                            CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+                            requiredOutputCommitted = requiredOutputCommitted,
+                            publicExportCommitted = publicExportCommitted,
+                            verified = verified,
+                            message = "24M Fusion export committed; optional work cancelled."
+                        )
                         return@post
                     }
                     post(
@@ -734,12 +762,34 @@ fun captureProcessExportSuperResolutionFusion(
                             "used ${result.usedFrameCount}/${result.inputFrameCount} frames, " +
                             "fallback=${result.fallbackUsed}."
                     )
+                    terminal.publish(
+                        CameraPipelineEvent.Terminal.Kind.COMPLETE,
+                        requiredOutputCommitted = true,
+                        publicExportCommitted = true,
+                        verified = true,
+                        message = "24M Fusion export complete."
+                    )
                 } catch (_: CancellationException) {
                     post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
+                    terminal.publish(
+                        if (publicExportCommitted && verified) CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+                        else CameraPipelineEvent.Terminal.Kind.CANCELLED,
+                        requiredOutputCommitted = requiredOutputCommitted,
+                        publicExportCommitted = publicExportCommitted,
+                        verified = verified,
+                        message = "24M Fusion cancellation settled."
+                    )
                 } catch (error: Exception) {
                     post(
                         "PIPELINE_FAILED: 24M Fusion failed. " +
                             "${error.javaClass.simpleName}: ${error.message}"
+                    )
+                    terminal.publish(
+                        CameraPipelineEvent.Terminal.Kind.FAILED,
+                        requiredOutputCommitted = requiredOutputCommitted,
+                        publicExportCommitted = publicExportCommitted,
+                        verified = verified,
+                        message = error.message
                     )
                 } finally {
                     workerThread.quitSafely()
@@ -751,10 +801,12 @@ fun captureProcessExportSuperResolutionFusion(
             if (!workerPosted) {
                 workerThread.quitSafely()
                 post("PIPELINE_FAILED: 24M Fusion worker could not start.")
+                terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = "24M Fusion worker could not start.")
             }
         },
         onError = { error ->
             post("PIPELINE_FAILED: 24M Fusion capture failed. $error")
+            terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = error)
         },
         onStatus = { message -> post(message) }
     )

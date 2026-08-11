@@ -1,5 +1,7 @@
 package com.projectnuke.keplernightlab
 
+import java.util.concurrent.atomic.AtomicBoolean
+
 /** UI-facing authority for a camera capture/processing operation. Display text is diagnostic only. */
 sealed interface CameraPipelineEvent {
     val generation: Long
@@ -58,6 +60,48 @@ data class CameraPipelineProgressCounts(
     val receivedImages: Int = 0,
     val completedResults: Int = 0
 )
+
+internal typealias CameraPipelineEventSink = (CameraPipelineEvent) -> Unit
+
+internal class CameraPipelineTerminalPublisher(
+    private val sink: CameraPipelineEventSink
+) {
+    private val published = AtomicBoolean(false)
+
+    fun publish(
+        kind: CameraPipelineEvent.Terminal.Kind,
+        requiredOutputCommitted: Boolean = false,
+        publicExportCommitted: Boolean = false,
+        verified: Boolean = false,
+        captureResourcesSettled: Boolean = true,
+        counts: CameraPipelineProgressCounts = CameraPipelineProgressCounts(),
+        message: String? = null
+    ): Boolean {
+        if (!published.compareAndSet(false, true)) return false
+        sink(
+            CameraPipelineEvent.Terminal(
+                generation = 0L,
+                kind = kind,
+                requiredOutputCommitted = requiredOutputCommitted,
+                publicExportCommitted = publicExportCommitted,
+                verified = verified,
+                captureResourcesSettled = captureResourcesSettled,
+                counts = counts,
+                message = message
+            )
+        )
+        return true
+    }
+}
+
+internal fun CameraPipelineEvent.withGeneration(generation: Long): CameraPipelineEvent = when (this) {
+    is CameraPipelineEvent.Started -> copy(generation = generation)
+    is CameraPipelineEvent.CaptureProgress -> copy(generation = generation)
+    is CameraPipelineEvent.CaptureStageComplete -> copy(generation = generation)
+    is CameraPipelineEvent.ProcessingStage -> copy(generation = generation)
+    is CameraPipelineEvent.ExportStage -> copy(generation = generation)
+    is CameraPipelineEvent.Terminal -> copy(generation = generation)
+}
 
 internal fun CameraPipelineProgressCounts.toCaptureProgress(
     previous: CaptureProgressState,

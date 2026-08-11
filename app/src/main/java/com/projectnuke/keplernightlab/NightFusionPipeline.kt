@@ -36,7 +36,8 @@ fun captureProcessExportNightFusion(
     processingParams: ClassicYuvFusionParams = ClassicYuvFusionPreset.NATURAL.params,
     captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
-    onStatus: (String) -> Unit
+    onStatus: (String) -> Unit,
+    onPipelineEvent: CameraPipelineEventSink = {}
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
     val callbackLedger = ProcessingCallbackOutcomeLedger()
@@ -52,6 +53,7 @@ fun captureProcessExportNightFusion(
             android.util.Log.w("KeplerYuvPipeline", "status dispatch $result")
         }
     }
+    val terminal = CameraPipelineTerminalPublisher(onPipelineEvent)
 
     cancellation.throwIfCancelled()
     post("YUV capture: saved 0/$frameCount")
@@ -80,6 +82,7 @@ fun captureProcessExportNightFusion(
                 cancellation.throwIfCancelled()
             } catch (_: CancellationException) {
                 post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
+                terminal.publish(CameraPipelineEvent.Terminal.Kind.CANCELLED, message = "Capture cancelled before processing started.")
                 return@captureYuvBurstColorWithMotion
             }
             KeplerJobMetadata.update(jobDir) { current ->
@@ -95,6 +98,9 @@ fun captureProcessExportNightFusion(
             val workerThread = HandlerThread("KeplerCaptureProcessExportThread").apply { start() }
             val workerHandler = Handler(workerThread.looper)
             val workerPosted = runCatching { workerHandler.post {
+                var requiredOutputCommitted = false
+                var publicExportCommitted = false
+                var verified = false
                 try {
                     cancellation.throwIfCancelled()
                     post(if (captureMode == CaptureMode.SINGLE_FRAME) {
@@ -149,11 +155,19 @@ fun captureProcessExportNightFusion(
                             export = export
                         )
                         post("PIPELINE_FAILED: Export failed; keeping cache. ${export.errorMessage}")
+                        terminal.publish(
+                            CameraPipelineEvent.Terminal.Kind.FAILED,
+                            requiredOutputCommitted = finalFile.isFile,
+                            publicExportCommitted = export.success && !export.uriString.isNullOrBlank(),
+                            message = export.errorMessage
+                        )
                         return@post
                     }
 
                     post("Verifying gallery output...")
-                    val verified = verifyCommittedGalleryExport(context, export) is GalleryExportVerification.Verified
+                    verified = verifyCommittedGalleryExport(context, export) is GalleryExportVerification.Verified
+                    publicExportCommitted = export.success && !export.uriString.isNullOrBlank()
+                    requiredOutputCommitted = finalFile.isFile
                     updateExportMetadata(
                         jobDir = jobDir,
                         export = export,
@@ -173,6 +187,13 @@ fun captureProcessExportNightFusion(
                             ,export = export
                         )
                         post("PIPELINE_FAILED: Export verification failed; keeping source frames.")
+                        terminal.publish(
+                            CameraPipelineEvent.Terminal.Kind.FAILED,
+                            requiredOutputCommitted = requiredOutputCommitted,
+                            publicExportCommitted = publicExportCommitted,
+                            verified = false,
+                            message = "Export verification failed"
+                        )
                         return@post
                     }
 
@@ -181,6 +202,13 @@ fun captureProcessExportNightFusion(
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
                             postExportCancellationRequested = true, postExportWorkSkipped = true)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. Cache was kept.")
+                        terminal.publish(
+                            CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+                            requiredOutputCommitted = requiredOutputCommitted,
+                            publicExportCommitted = publicExportCommitted,
+                            verified = verified,
+                            message = "Image was saved; optional post-export work was cancelled."
+                        )
                         return@post
                     }
                     post("Cleanup...")
@@ -201,6 +229,13 @@ fun captureProcessExportNightFusion(
                             postExportWorkSkipped = true
                         )
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. Cache was kept.")
+                        terminal.publish(
+                            CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+                            requiredOutputCommitted = requiredOutputCommitted,
+                            publicExportCommitted = publicExportCommitted,
+                            verified = verified,
+                            message = "Image was saved; optional post-export work was cancelled."
+                        )
                         return@post
                     }
                     val album = "Pictures/Kepler/${export.displayName}"
@@ -209,13 +244,42 @@ fun captureProcessExportNightFusion(
                     }
                     if (export.fallbackUsed && requestedOutputFormat == OutputFormat.HEIF) {
                         post("PIPELINE_COMPLETE: HEIF failed, saved ${export.formatUsed.label} to Gallery: $album\nCleanup complete. Deleted ${cleanup.deletedFiles} files.")
+                        terminal.publish(
+                            CameraPipelineEvent.Terminal.Kind.COMPLETE,
+                            requiredOutputCommitted = true,
+                            publicExportCommitted = true,
+                            verified = true,
+                            message = "Night Fusion export complete."
+                        )
                     } else {
                         post("PIPELINE_COMPLETE: Saved ${export.formatUsed.label} to Gallery: $album\nCleanup complete. Deleted ${cleanup.deletedFiles} files.")
+                        terminal.publish(
+                            CameraPipelineEvent.Terminal.Kind.COMPLETE,
+                            requiredOutputCommitted = true,
+                            publicExportCommitted = true,
+                            verified = true,
+                            message = "Night Fusion export complete."
+                        )
                     }
                 } catch (_: CancellationException) {
                     post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
+                    terminal.publish(
+                        if (publicExportCommitted && verified) CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+                        else CameraPipelineEvent.Terminal.Kind.CANCELLED,
+                        requiredOutputCommitted = requiredOutputCommitted,
+                        publicExportCommitted = publicExportCommitted,
+                        verified = verified,
+                        message = "Pipeline cancellation settled."
+                    )
                 } catch (e: Exception) {
                     post("PIPELINE_FAILED: ${if (captureMode == CaptureMode.SINGLE_FRAME) "Single photo" else "Night Fusion"} pipeline failed; keeping cache.\n${e.stackTraceToString()}")
+                    terminal.publish(
+                        CameraPipelineEvent.Terminal.Kind.FAILED,
+                        requiredOutputCommitted = requiredOutputCommitted,
+                        publicExportCommitted = publicExportCommitted,
+                        verified = verified,
+                        message = e.message
+                    )
                 } finally {
                     workerThread.quitSafely()
                 }
@@ -226,10 +290,12 @@ fun captureProcessExportNightFusion(
             if (!workerPosted) {
                 workerThread.quitSafely()
                 post("PIPELINE_FAILED: Capture processing worker could not start; cache kept.")
+                terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = "Capture processing worker could not start.")
             }
         },
         onError = { error ->
             post("PIPELINE_FAILED: Capture failed; keeping cache.\n$error")
+            terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = error)
         },
         onStatus = { message ->
             post(message)

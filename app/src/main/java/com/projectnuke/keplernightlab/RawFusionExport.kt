@@ -605,7 +605,8 @@ fun captureProcessExportRawNightFusion(
     displayRotation: Int = android.view.Surface.ROTATION_0,
     captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
-    onStatus: (String) -> Unit
+    onStatus: (String) -> Unit,
+    onPipelineEvent: CameraPipelineEventSink = {}
 ) {
     // RAW public-export outcomes are an outer protocol boundary. The wrapper owns the job
     // operation from capture completion through terminal export metadata; the nested classic RAW
@@ -623,6 +624,7 @@ fun captureProcessExportRawNightFusion(
             Log.w("KeplerRawPipeline", "status dispatch $result")
         }
     }
+    val terminal = CameraPipelineTerminalPublisher(onPipelineEvent)
     cancellation.throwIfCancelled()
     post("RAW 캡처 중입니다. 기기를 움직이지 마세요. saved 0/$frameCount, images 0/$frameCount, results 0/$frameCount")
     captureRawBurstForFusion(
@@ -664,12 +666,20 @@ fun captureProcessExportRawNightFusion(
                     )
                 }
                 post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
+                terminal.publish(
+                    CameraPipelineEvent.Terminal.Kind.CANCELLED,
+                    message = "Capture cancelled before RAW processing started."
+                )
                 return@captureRawBurstForFusion
             }
             val processingOperation = acquireRawProcessingOperation(jobDir)
             if (processingOperation == null) {
                 Log.w("KeplerRawPipeline", "RAW processing operation is already owned; preserving the existing owner.")
                 post("PIPELINE_FAILED: RAW processing is already active; existing operation kept.")
+                terminal.publish(
+                    CameraPipelineEvent.Terminal.Kind.FAILED,
+                    message = "RAW processing is already active; existing operation kept."
+                )
                 return@captureRawBurstForFusion
             }
             try {
@@ -1362,6 +1372,18 @@ fun captureProcessExportRawNightFusion(
                         )
                     }
                 } finally {
+                    terminal.publish(
+                        kind = when {
+                            committedExport != null && exportVerified -> CameraPipelineEvent.Terminal.Kind.COMPLETE
+                            committedExport != null -> CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+                            cancellation.isCancelled -> CameraPipelineEvent.Terminal.Kind.CANCELLED
+                            else -> CameraPipelineEvent.Terminal.Kind.FAILED
+                        },
+                        requiredOutputCommitted = capturedProcess?.finalPngFile?.isFile == true,
+                        publicExportCommitted = committedExport != null,
+                        verified = exportVerified,
+                        message = "RAW pipeline terminal settlement"
+                    )
                     processingOperation.release()
                     thread.quitSafely()
                 }
@@ -1371,6 +1393,10 @@ fun captureProcessExportRawNightFusion(
                 false
             }
             if (!workerPosted) {
+                terminal.publish(
+                    CameraPipelineEvent.Terminal.Kind.FAILED,
+                    message = "RAW processing worker could not start; RAW cache kept."
+                )
                 try {
                     recordRawOuterTerminalFailureWhileOwned(
                         jobDir,
@@ -1385,7 +1411,13 @@ fun captureProcessExportRawNightFusion(
                 }
             }
         },
-        onError = { post("PIPELINE_FAILED: RAW capture failed; keeping cache.\n$it") }
+        onError = {
+            post("PIPELINE_FAILED: RAW capture failed; keeping cache.\n$it")
+            terminal.publish(
+                CameraPipelineEvent.Terminal.Kind.FAILED,
+                message = "RAW capture failed; keeping cache. $it"
+            )
+        }
     )
 }
 
