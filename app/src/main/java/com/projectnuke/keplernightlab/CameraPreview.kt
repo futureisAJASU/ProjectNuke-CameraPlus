@@ -574,13 +574,27 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                     }
 
                     override fun onDisconnected(camera: CameraDevice) {
-                        settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE) { camera.close() }
+                        if (detachOwnedCamera(localGeneration, camera)) {
+                            settlePreviewResources(
+                                localGeneration.toLong(),
+                                listOf(PreviewResourceOperation.CAMERA_DEVICE_CLOSE to { camera.close() })
+                            )
+                        } else {
+                            settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE) { camera.close() }
+                        }
                         if (isActive(localGeneration)) stop()
                     }
 
                     override fun onError(camera: CameraDevice, error: Int) {
                         Log.w(TAG, "camera error=$error generation=$localGeneration")
-                        settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE) { camera.close() }
+                        if (detachOwnedCamera(localGeneration, camera)) {
+                            settlePreviewResources(
+                                localGeneration.toLong(),
+                                listOf(PreviewResourceOperation.CAMERA_DEVICE_CLOSE to { camera.close() })
+                            )
+                        } else {
+                            settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE) { camera.close() }
+                        }
                         if (isActive(localGeneration)) stop()
                     }
                 },
@@ -780,7 +794,14 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                             "exception=${error.javaClass.simpleName}:${error.message}",
                         error
                     )
-                    settleLateResource(localGeneration, PreviewResourceOperation.CAPTURE_SESSION_CLOSE) { session.close() }
+                    if (detachOwnedSession(localGeneration, session)) {
+                        settlePreviewResources(
+                            localGeneration.toLong(),
+                            listOf(PreviewResourceOperation.CAPTURE_SESSION_CLOSE to { session.close() })
+                        )
+                    } else {
+                        settleLateResource(localGeneration, PreviewResourceOperation.CAPTURE_SESSION_CLOSE) { session.close() }
+                    }
                     onFailure()
                 }
             }
@@ -1082,6 +1103,18 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
         ) { supplied -> settleLateResource(localGeneration, PreviewResourceOperation.SURFACE_RELEASE) { supplied.release() } }
         if (attachment == PreviewResourceAttachment.ACCEPTED) previewSurface = surface
         attachment
+    }
+
+    private fun detachOwnedCamera(localGeneration: Int, camera: CameraDevice): Boolean = synchronized(lock) {
+        val detached = cameraDeviceSlot.detach(localGeneration.toLong(), camera) ?: return false
+        if (cameraDevice === detached) cameraDevice = null
+        true
+    }
+
+    private fun detachOwnedSession(localGeneration: Int, session: CameraCaptureSession): Boolean = synchronized(lock) {
+        val detached = captureSessionSlot.detach(localGeneration.toLong(), session) ?: return false
+        if (captureSession === detached) captureSession = null
+        true
     }
 
     private fun storeCameraDevice(
