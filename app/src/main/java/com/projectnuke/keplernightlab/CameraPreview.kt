@@ -141,11 +141,17 @@ private class CameraPreviewController(
     private var lastActivePhysicalLog: String? = null
     @Volatile private var latestFocusAeState: FocusAeState = FocusAeState()
     @Volatile private var latestMeteringMode: MeteringMode = MeteringModeState.mode
-    private enum class PreviewState { STOPPED, STARTING, OPEN, STOPPING }
+    private enum class PreviewState { STOPPED, STARTING, OPEN, STOPPING, FAILED }
     @Volatile private var previewState = PreviewState.STOPPED
     private var openRequestedGeneration: Int? = null
+    private var desiredRunning = false
+    private var lastTextureView: TextureView? = null
 
     fun start(textureView: TextureView) {
+        synchronized(lock) {
+            desiredRunning = true
+            lastTextureView = textureView
+        }
         if (
             ContextCompat.checkSelfPermission(
                 context,
@@ -199,6 +205,7 @@ private class CameraPreviewController(
 
     fun stop() {
         val refs = synchronized(lock) {
+            desiredRunning = false
             if (previewState == PreviewState.STOPPED || previewState == PreviewState.STOPPING) return
             previewState = PreviewState.STOPPING
             generation += 1
@@ -224,17 +231,13 @@ private class CameraPreviewController(
         fun markStoppedWhenTerminated() {
             val thread = refs.thread
             if (thread == null) {
-                synchronized(lock) {
-                    if (previewState == PreviewState.STOPPING) previewState = PreviewState.STOPPED
-                }
+                finishStop()
                 return
             }
             thread.quitSafely()
             Thread {
                 runCatching { thread.join() }
-                synchronized(lock) {
-                    if (previewState == PreviewState.STOPPING) previewState = PreviewState.STOPPED
-                }
+                finishStop()
             }.apply {
                 name = "KeplerPreviewStopWatcher"
                 isDaemon = true
@@ -249,6 +252,15 @@ private class CameraPreviewController(
             closeResources.run()
             markStoppedWhenTerminated()
         }
+    }
+
+    private fun finishStop() {
+        val restart = synchronized(lock) {
+            if (previewState != PreviewState.STOPPING) return
+            previewState = PreviewState.STOPPED
+            desiredRunning to lastTextureView
+        }
+        if (restart.first && restart.second != null) start(restart.second!!)
     }
 
     fun updateFocusAeState(newState: FocusAeState) {
