@@ -163,6 +163,9 @@ private class CameraPreviewController(
 ) {
     private val lock = Any()
     private val generationOwner = PreviewGenerationOwner()
+    private val cameraDeviceSlot = PreviewResourceSlot<CameraDevice>()
+    private val captureSessionSlot = PreviewResourceSlot<CameraCaptureSession>()
+    private val previewSurfaceSlot = PreviewResourceSlot<Surface>()
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var cameraCharacteristics: CameraCharacteristics? = null
@@ -243,6 +246,7 @@ private class CameraPreviewController(
 
     fun stop() {
         val refs = synchronized(lock) {
+            val ownedGeneration = generationOwner.snapshot().generation
             val stopGeneration = generationOwner.stop() ?: return
             openRequestedGeneration = null
             Log.d(TAG, "stop generation=$stopGeneration")
@@ -255,6 +259,9 @@ private class CameraPreviewController(
                     backgroundThread = null
                     backgroundHandler = null
                     currentPreviewSize = null
+                    captureSessionSlot.clear(ownedGeneration)
+                    cameraDeviceSlot.clear(ownedGeneration)
+                    previewSurfaceSlot.clear(ownedGeneration)
                 }
         }
         val closeResources = Runnable {
@@ -533,8 +540,15 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                 settleLateResource(localGeneration, PreviewResourceOperation.SURFACE_RELEASE) { surface.release() }
                 return
             }
-            if (!storePreviewSurface(localGeneration, surface)) {
-                settleLateResource(localGeneration, PreviewResourceOperation.SURFACE_RELEASE) { surface.release() }
+            when (storePreviewSurface(localGeneration, surface)) {
+                PreviewResourceAttachment.ACCEPTED,
+                PreviewResourceAttachment.ALREADY_OWNED -> Unit
+                PreviewResourceAttachment.SETTLED_DUPLICATE,
+                PreviewResourceAttachment.SETTLED_STALE -> {
+                    Log.w(TAG, "supplied preview surface was not adopted generation=$localGeneration")
+                }
+            }
+            if (previewSurfaceSlot.peek(localGeneration.toLong()) !== surface) {
                 return
             }
 
@@ -547,10 +561,14 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                             settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE) { camera.close() }
                             return
                         }
-                        if (!storeCameraDevice(localGeneration, camera)) {
+                        when (storeCameraDevice(localGeneration, camera)) {
+                            PreviewResourceAttachment.ACCEPTED -> Unit
+                            PreviewResourceAttachment.ALREADY_OWNED -> return
+                            PreviewResourceAttachment.SETTLED_DUPLICATE,
+                            PreviewResourceAttachment.SETTLED_STALE -> {
                             Log.w(TAG, "stale onOpened dropped generation=$localGeneration")
-                            settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE) { camera.close() }
                             return
+                            }
                         }
                         createPreviewSession(camera, surface, characteristics, localGeneration, textureView)
                     }
@@ -733,10 +751,14 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                     settleLateResource(localGeneration, PreviewResourceOperation.CAPTURE_SESSION_CLOSE) { session.close() }
                     return
                 }
-                if (!storeCaptureSession(localGeneration, session)) {
+                when (storeCaptureSession(localGeneration, session)) {
+                    PreviewResourceAttachment.ACCEPTED -> Unit
+                    PreviewResourceAttachment.ALREADY_OWNED -> return
+                    PreviewResourceAttachment.SETTLED_DUPLICATE,
+                    PreviewResourceAttachment.SETTLED_STALE -> {
                     Log.w(TAG, "stale onConfigured dropped generation=$localGeneration")
-                    settleLateResource(localGeneration, PreviewResourceOperation.CAPTURE_SESSION_CLOSE) { session.close() }
                     return
+                    }
                 }
                 Log.i(
                     "KeplerPhysicalRoute",
@@ -1052,29 +1074,43 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
     private fun storePreviewSurface(
         localGeneration: Int,
         surface: Surface
-    ): Boolean = synchronized(lock) {
-        if (!isActiveLocked(localGeneration) || previewSurface != null) return false
-        previewSurface = surface
-        true
+    ): PreviewResourceAttachment = synchronized(lock) {
+        val attachment = previewSurfaceSlot.attach(
+            expectedGeneration = localGeneration.toLong(),
+            currentGeneration = generationOwner.snapshot().generation,
+            supplied = surface
+        ) { supplied -> settleLateResource(localGeneration, PreviewResourceOperation.SURFACE_RELEASE) { supplied.release() } }
+        if (attachment == PreviewResourceAttachment.ACCEPTED) previewSurface = surface
+        attachment
     }
 
     private fun storeCameraDevice(
         localGeneration: Int,
         camera: CameraDevice
-    ): Boolean = synchronized(lock) {
-        if (!isActiveLocked(localGeneration) || cameraDevice != null) return false
-        cameraDevice = camera
-        true
+    ): PreviewResourceAttachment = synchronized(lock) {
+        val attachment = cameraDeviceSlot.attach(
+            expectedGeneration = localGeneration.toLong(),
+            currentGeneration = generationOwner.snapshot().generation,
+            supplied = camera
+        ) { supplied -> settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE) { supplied.close() } }
+        if (attachment == PreviewResourceAttachment.ACCEPTED) cameraDevice = camera
+        attachment
     }
 
-    private fun storeCaptureSession(
+private fun storeCaptureSession(
         localGeneration: Int,
         session: CameraCaptureSession
-    ): Boolean = synchronized(lock) {
-        if (!isActiveLocked(localGeneration) || captureSession != null) return false
-        captureSession = session
-        generationOwner.markOpen(localGeneration.toLong())
-        true
+    ): PreviewResourceAttachment = synchronized(lock) {
+        val attachment = captureSessionSlot.attach(
+            expectedGeneration = localGeneration.toLong(),
+            currentGeneration = generationOwner.snapshot().generation,
+            supplied = session
+        ) { supplied -> settleLateResource(localGeneration, PreviewResourceOperation.CAPTURE_SESSION_CLOSE) { supplied.close() } }
+        if (attachment == PreviewResourceAttachment.ACCEPTED) {
+            captureSession = session
+            generationOwner.markOpen(localGeneration.toLong())
+        }
+        attachment
     }
 
     private fun configureTransform(
