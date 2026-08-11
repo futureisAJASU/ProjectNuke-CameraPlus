@@ -842,10 +842,24 @@ private fun KeplerGalleryDetailScreenFixedV2(
     var actionStatus by remember { mutableStateOf<String?>(null) }
     var frameReviewItems by remember(job.id) { mutableStateOf<List<KeplerFrameReviewItem>>(emptyList()) }
     var frameSelectionMode by remember(job.id) { mutableStateOf(FrameSelectionMode.MANUAL) }
-    var isReprocessing by remember { mutableStateOf(false) }
+    var uiAction by remember(job.id) { mutableStateOf<GalleryUiActionSession?>(null) }
+    var actionGeneration by remember(job.id) { mutableStateOf(0L) }
     var refreshKey by remember { mutableIntStateOf(0) }
     var showReview by remember { mutableStateOf(false) }
     var showAiDialog by remember { mutableStateOf<FrameSelectionRecommendation?>(null) }
+
+    fun beginAction(action: GalleryUiAction): GalleryUiActionSession? {
+        if (!canStartGalleryUiAction(uiAction, currentJob.id, action)) return null
+        return GalleryUiActionSession(currentJob.id, action, ++actionGeneration).also { uiAction = it }
+    }
+
+    fun finishAction(session: GalleryUiActionSession) {
+        if (acceptsGalleryUiActionCompletion(uiAction, session.jobId, session.generation)) {
+            uiAction = null
+        }
+    }
+
+    val isReprocessing = uiAction?.action == GalleryUiAction.REPROCESSING
 
     LaunchedEffect(job.id, refreshKey) {
         currentJob = withContext(Dispatchers.IO) {
@@ -1015,10 +1029,11 @@ private fun KeplerGalleryDetailScreenFixedV2(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(56.dp),
-                            enabled = !isReprocessing && frameReviewItems.any { it.included },
+                            enabled = uiAction == null && frameReviewItems.any { it.included },
                             onClick = {
-                                isReprocessing = true
+                                val session = beginAction(GalleryUiAction.REPROCESSING) ?: return@Button
                                 scope.launch {
+                                    try {
                                     val selected = frameReviewItems.filter { it.included }.map { it.index }.toSet()
                                     withContext(Dispatchers.IO) {
                                         saveFrameSelection(currentJob.directory, frameSelectionMode, frameReviewItems)
@@ -1035,8 +1050,10 @@ private fun KeplerGalleryDetailScreenFixedV2(
                                     }.onFailure {
                                         actionStatus = it.message ?: "다시 합성하지 못했습니다."
                                     }
-                                    isReprocessing = false
-                                    refreshKey++
+                                    } finally {
+                                        finishAction(session)
+                                        refreshKey++
+                                    }
                                 }
                             }
                         ) {
