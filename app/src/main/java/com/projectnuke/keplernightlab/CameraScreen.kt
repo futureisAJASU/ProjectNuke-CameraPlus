@@ -608,6 +608,36 @@ fun MainCameraScreen(
         }
     }
 
+    val pipelineOrchestrator = remember {
+        CameraPipelineUiOrchestrator(
+            session = pipelineSession,
+            scheduler = mainScheduler,
+            callbacks = CameraPipelineUiOrchestrator.Callbacks(
+                onStatus = { status = it },
+                onStateChanged = { pipelineUiState = pipelineSession.snapshot() },
+                onTerminal = { terminal ->
+                    val success = terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE ||
+                        terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+                    refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted)
+                }
+            )
+        )
+    }
+    pipelineOrchestrator.updateCallbacks(
+        CameraPipelineUiOrchestrator.Callbacks(
+            onStatus = { status = it },
+            onStateChanged = { pipelineUiState = pipelineSession.snapshot() },
+            onTerminal = { terminal ->
+                val success = terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE ||
+                    terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+                refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted)
+            }
+        )
+    )
+    DisposableEffect(pipelineOrchestrator) {
+        onDispose { pipelineOrchestrator.dispose() }
+    }
+
     DisposableEffect(Unit) {
         onDispose {
             settingsPersistence.close()
@@ -805,6 +835,16 @@ LaunchedEffect(Unit) {
             CameraPipelineEventSink
         ) -> Unit
     ) {
+        pipelineOrchestrator.start(
+            startMessage = startMessage,
+            requestedFrames = requestedFrames,
+            timeoutMillis = timeoutMillis,
+            job = job
+        )
+        return
+
+        @Suppress("UNREACHABLE_CODE")
+        run {
         val started = pipelineSession.start(startMessage, requestedFrames)
         if (started is CameraPipelineUiSession.StartResult.Rejected) {
             status = "Pipeline busy: current fusion/export is still running."
@@ -975,6 +1015,7 @@ mainHandler.removeCallbacks(watchdog)
                     publishPipelineState()
                 }
             }
+        }
         }
     }
 
