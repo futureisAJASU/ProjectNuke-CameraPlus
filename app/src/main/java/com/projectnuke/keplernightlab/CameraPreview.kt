@@ -339,9 +339,8 @@ private class CameraPreviewController(
     fun updateFocusAeState(newState: FocusAeState) {
         val previous = latestFocusAeState
         latestFocusAeState = newState
-        val handler = backgroundHandler ?: return
         val localGeneration = synchronized(lock) { generation }
-        handler.post {
+        dispatchPreviewCommand(localGeneration, PreviewCommandKind.FOCUS_AE) {
             applyFocusAeStateOnCameraThread(
                 newState = newState,
                 previousState = previous,
@@ -353,10 +352,8 @@ private class CameraPreviewController(
     fun updateMeteringMode(newMode: MeteringMode) {
         val previous = latestMeteringMode
         latestMeteringMode = newMode
-        val handler = backgroundHandler ?: return
         val localGeneration = synchronized(lock) { generation }
-        handler.post {
-            if (!isActive(localGeneration)) return@post
+        dispatchPreviewCommand(localGeneration, PreviewCommandKind.METERING) {
             applyFocusAeStateOnCameraThread(
                 newState = latestFocusAeState,
                 previousState = latestFocusAeState,
@@ -371,10 +368,8 @@ private class CameraPreviewController(
     fun updateZoomRatio(newZoomRatio: Float) {
         val previous = latestZoomRatio
         latestZoomRatio = (if (newZoomRatio.isFinite()) newZoomRatio else 1.0f).coerceAtLeast(0.1f)
-        val handler = backgroundHandler ?: return
         val localGeneration = synchronized(lock) { generation }
-        handler.post {
-            if (!isActive(localGeneration)) return@post
+        dispatchPreviewCommand(localGeneration, PreviewCommandKind.ZOOM) {
             applyFocusAeStateOnCameraThread(
                 newState = latestFocusAeState,
                 previousState = latestFocusAeState,
@@ -383,6 +378,35 @@ private class CameraPreviewController(
             if (abs(previous - latestZoomRatio) >= 0.02f) {
                 Log.d(TAG, "zoom changed ratio=$latestZoomRatio")
             }
+        }
+    }
+
+    private fun dispatchPreviewCommand(
+        localGeneration: Int,
+        kind: PreviewCommandKind,
+        command: () -> Unit
+    ) {
+        val handler = synchronized(lock) {
+            if (!acceptsPreviewCommand(generation, isActiveLocked(localGeneration), PreviewCommand(localGeneration, kind))) {
+                null
+            } else {
+                backgroundHandler
+            }
+        }
+        if (handler == null) return
+        val outcome = try {
+            if (handler.post {
+                    if (acceptsPreviewCommand(localGeneration, isActive(localGeneration), PreviewCommand(localGeneration, kind))) {
+                        command()
+                    }
+                }
+            ) CameraUiDispatchOutcome.ACCEPTED else CameraUiDispatchOutcome.REJECTED
+        } catch (failure: Throwable) {
+            Log.e(TAG, "preview command dispatch threw kind=$kind generation=$localGeneration", failure)
+            CameraUiDispatchOutcome.DISPATCH_THREW
+        }
+        if (outcome != CameraUiDispatchOutcome.ACCEPTED) {
+            Log.w(TAG, "preview command dispatch outcome=$outcome kind=$kind generation=$localGeneration")
         }
     }
 
@@ -466,8 +490,18 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
             val minIndex = aeRange?.lower ?: 0
             val maxIndex = aeRange?.upper ?: 0
             val stepEv = aeStep?.toFloat() ?: 0f
-            Handler(android.os.Looper.getMainLooper()).post {
-                onAeCapabilitiesChangedProvider().invoke(minIndex, maxIndex, stepEv)
+            val posted = try {
+                Handler(android.os.Looper.getMainLooper()).post {
+                    if (isActive(localGeneration)) {
+                        onAeCapabilitiesChangedProvider().invoke(minIndex, maxIndex, stepEv)
+                    }
+                }
+            } catch (failure: Throwable) {
+                Log.e(TAG, "AE capability dispatch threw generation=$localGeneration", failure)
+                false
+            }
+            if (!posted) {
+                Log.w(TAG, "AE capability dispatch rejected generation=$localGeneration")
             }
             val previewSize = choosePreviewSize(characteristics)
             if (!storeCurrentPreviewSize(localGeneration, previewSize)) {
