@@ -263,13 +263,37 @@ internal fun handleCaptureClick(input: CaptureClickInput): CaptureClickResult {
 
 internal fun startCapturePipeline(
     request: CapturePipelineRequest,
-    onStatus: (String) -> Unit
+    onStatus: (String) -> Unit = {},
+    onEvent: ((CameraPipelineEvent) -> Unit)? = null,
+    eventGeneration: Long = 0L
 ) {
+    var eventProgress = CaptureProgressState()
     val loggedStatus: (String) -> Unit = { newStatus ->
         newStatus.chunked(3000).forEachIndexed { index, chunk ->
             Log.i("KeplerCaptureStatus", "part=${index + 1}: $chunk")
         }
         onStatus(newStatus)
+        onEvent?.let { publish ->
+            val event = legacyCameraPipelineEvent(eventGeneration, newStatus, eventProgress)
+            eventProgress = event.counts.toCaptureProgress(
+                eventProgress,
+                when (event) {
+                    is CameraPipelineEvent.Started -> CaptureStage.PREPARING
+                    is CameraPipelineEvent.CaptureProgress -> eventProgress.stage
+                    is CameraPipelineEvent.CaptureStageComplete -> CaptureStage.PROCESSING
+                    is CameraPipelineEvent.ProcessingStage -> event.stage
+                    is CameraPipelineEvent.ExportStage -> event.stage
+                    is CameraPipelineEvent.Terminal -> when (event.kind) {
+                        CameraPipelineEvent.Terminal.Kind.COMPLETE,
+                        CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL -> CaptureStage.COMPLETE
+                        CameraPipelineEvent.Terminal.Kind.FAILED -> CaptureStage.FAILED
+                        CameraPipelineEvent.Terminal.Kind.CANCELLED -> CaptureStage.CANCELLED
+                    }
+                },
+                event.message
+            )
+            publish(event)
+        }
     }
     val selection = request.prepared.selection
     val physicalCameraId = selection.physicalCameraId
