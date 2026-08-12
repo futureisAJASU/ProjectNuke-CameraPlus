@@ -103,7 +103,12 @@ fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
     }
 
     LaunchedEffect(refreshKey) {
-        runCatching { withContext(Dispatchers.IO) { loadKeplerGalleryJobs(context) } }
+        runCatching {
+            withContext(Dispatchers.IO) {
+                KeplerRecoveryCoordinator.recoverBeforeGallery(context)
+                loadKeplerGalleryJobs(context)
+            }
+        }
             .onSuccess {
                 jobs = it
                 selectedIds = selectedIds.intersect(it.map { job -> job.id }.toSet())

@@ -135,9 +135,6 @@ fun loadKeplerGalleryJobs(context: Context): List<KeplerGalleryJobSummary> {
     return keplerGalleryRoots(context).flatMap { root ->
         NoFollowFileSystem.requireDirectChildren(root)
             .filter { NoFollowFileSystem.isRealDirectory(it.toPath()) && matchesJobPrefix(root, it.name) }
-    }.onEach {
-        recoverValidatedQuarantine(it)
-        recoverStaleInterruptedJob(it)
     }.map(::readKeplerGalleryJob).sortedByDescending { it.createdAt }
 }
 
