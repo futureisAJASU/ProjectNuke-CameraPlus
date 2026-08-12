@@ -599,6 +599,9 @@ private fun GalleryFixedJobCard(
             Text(modeLabelFixed(job), style = MaterialTheme.typography.titleMedium)
             Text("${formatTimestamp(job.createdAt)} | ${routeLabelFixed(job)}", color = galleryFixedMuted)
             Text(if (job.status.contains("COMPLETE")) resolutionTextFixed(job) else job.status)
+            if (job.recoveryState != "STABLE") {
+                Text(job.recoveryMessage ?: "이 작업은 재시작 복구 확인이 필요합니다.", color = Color(0xFFFFC107))
+            }
             Text("파일 크기: ${job.storage.finalOutputSizeText}", color = galleryFixedMuted)
             if (selectionMode) {
                 Text(
@@ -628,7 +631,9 @@ private fun GalleryFixedReprocessSection(
     }
     val currentCapability = capability
     GalleryFixedSection("다시 합성") {
-        if (currentCapability == null) {
+        if (currentJob.recoveryState != "STABLE" || isReprocessQuarantined(currentJob.directory)) {
+            Text(currentJob.recoveryMessage ?: "복구되지 않은 증거가 있어 일반 재합성을 진행할 수 없습니다.", color = Color(0xFFFFC107))
+        } else if (currentCapability == null) {
             Text("원본 프레임 확인 중…", color = galleryFixedMuted)
         } else {
             GalleryFixedField("원본 프레임", "${currentCapability.sourceFrameCount}개")

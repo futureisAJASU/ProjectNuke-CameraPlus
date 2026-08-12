@@ -448,7 +448,10 @@ fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
     }
     val exportExists = finalPreview != null ||
         job?.optBoolean("exportVerified", false) == true ||
-        job?.optString("exportStatus").orEmpty().contains("SUCCESS", ignoreCase = true)
+        job?.optBoolean("galleryExportCommitted", false) == true ||
+        MediaStoreExportJournal.list(directory).any { journal ->
+            journal.state == MediaStoreExportState.VERIFIED || journal.state == MediaStoreExportState.TERMINAL_PERSISTED
+        }
 
     return KeplerGalleryJobSummary(
         id = directory.absolutePath,

@@ -168,6 +168,15 @@ internal object KeplerRecoveryCoordinator {
                     failures = listOfNotNull(exportFailure.message)
                 )
             }
+            if (exportResults.any {
+                    it.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING ||
+                        it.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED
+                }) {
+                KeplerJobMetadata.update(jobDir) {
+                    it.put("recoveryState", "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION")
+                        .put("recoveryMessage", "공개 내보내기 증거를 확인할 수 없어 복구가 필요합니다.")
+                }
+            }
             val activeOperation = job.optString(ACTIVE_OPERATION_ID)
             val captureTemps = recoverCaptureOwnedTemps(jobDir, job, activeOperation.isNotBlank())
             if (activeOperation.isNotBlank()) {
