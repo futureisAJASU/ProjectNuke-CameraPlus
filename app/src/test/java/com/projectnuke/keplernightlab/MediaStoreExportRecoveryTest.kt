@@ -20,6 +20,7 @@ class MediaStoreExportRecoveryTest {
         var deleted = false
         var deleteResult = true
         var inspectionFailed = false
+        var returnNullCursor = false
         var committed = false
         override fun inspect(uri: Uri, journal: MediaStoreExportJournal) =
             MediaStoreExportInspection(exists, pending, verified, inspectionFailed = inspectionFailed)
@@ -112,7 +113,6 @@ class MediaStoreExportRecoveryTest {
             assertTrue(MediaStoreExportJournal.list(dir).isNotEmpty())
         } finally { dir.deleteRecursively() }
     }
-
     @Test
     fun inspectionFailureIsAmbiguous() {
         val dir = Files.createTempDirectory("media-recovery-inspect-failure-").toFile()
@@ -131,6 +131,21 @@ class MediaStoreExportRecoveryTest {
             val access = FakeAccess(true, false).apply { deleteResult = false }
             assertEquals(MediaStoreExportRecoveryClassification.DELETE_FAILED, recoverMediaStoreExportJournals(dir, access).single().classification)
             assertEquals(MediaStoreExportState.ROW_INSERTED, MediaStoreExportJournal.list(dir).single().state)
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
+    fun nullCursorIsInspectionFailureNotMissingRow() {
+        val dir = Files.createTempDirectory("media-recovery-null-cursor-").toFile()
+        try {
+            journal(dir)
+            val access = object : MediaStoreExportRecoveryAccess {
+                override fun inspect(uri: Uri, journal: MediaStoreExportJournal) =
+                    MediaStoreExportInspection(false, false, false, "null cursor", inspectionFailed = true)
+                override fun setPending(uri: Uri, pending: Boolean) = true
+                override fun delete(uri: Uri) = true
+            }
+            assertEquals(MediaStoreExportRecoveryClassification.AMBIGUOUS, recoverMediaStoreExportJournals(dir, access).single().classification)
         } finally { dir.deleteRecursively() }
     }
 }

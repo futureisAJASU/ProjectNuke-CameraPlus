@@ -187,7 +187,8 @@ private fun recoverMediaStoreExportJournal(
                 inspection.message ?: "Pending MediaStore content was not verifiable."
             )
         }
-        if (!access.setPending(uri, false)) {
+        val committed = runCatching { access.setPending(uri, false) }.getOrDefault(false)
+        if (!committed) {
             return MediaStoreExportRecoveryResult(
                 journal.exportAttemptId,
                 MediaStoreExportRecoveryClassification.AMBIGUOUS,
@@ -221,17 +222,25 @@ internal class ContextMediaStoreExportRecoveryAccess(
     override fun inspect(uri: Uri, journal: MediaStoreExportJournal): MediaStoreExportInspection {
         return try {
             var pending = false
-            val exists = context.contentResolver.query(
+            val cursor = context.contentResolver.query(
                 uri,
                 arrayOf(MediaStore.MediaColumns.IS_PENDING),
                 null,
                 null,
                 null
-            )?.use { cursor ->
+            )
+            if (cursor == null) return MediaStoreExportInspection(
+                exists = false,
+                pending = false,
+                verified = false,
+                message = "MediaStore row inspection returned no cursor.",
+                inspectionFailed = true
+            )
+            val exists = cursor.use { cursor ->
                 if (!cursor.moveToFirst()) return@use false
                 pending = cursor.getInt(0) != 0
                 true
-            } ?: false
+            }
             if (!exists) return MediaStoreExportInspection(false, false, false, "The exact MediaStore row is missing.")
             val verified = when (journal.role) {
                 MediaStoreExportRole.MAIN_IMAGE -> {
