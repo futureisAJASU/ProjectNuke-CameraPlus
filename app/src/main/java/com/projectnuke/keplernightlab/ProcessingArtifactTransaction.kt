@@ -402,8 +402,9 @@ internal fun copyVerifiedArtifact(
     sourceFile: File,
     finalFile: File,
     onSettlement: ((ProcessingArtifactSettlementReport) -> Unit)? = null
-): ProcessingArtifactResult =
-    commitProcessingArtifact(
+): ProcessingArtifactResult {
+    val sourceEvidence = NoFollowFileSystem.digestVerified(sourceFile)
+    return commitProcessingArtifact(
         finalFile = finalFile,
         onSettlement = onSettlement,
         writeTemp = { temp ->
@@ -414,11 +415,14 @@ internal fun copyVerifiedArtifact(
             }
         },
         verifyFinal = { committed ->
-            check(NoFollowFileSystem.digestVerified(committed).size > 0L) {
-                "Copied artifact is empty"
+            val committedEvidence = NoFollowFileSystem.digestVerified(committed)
+            check(committedEvidence.size == sourceEvidence.size) { "Copied artifact size mismatch" }
+            check(committedEvidence.sha256.equals(sourceEvidence.sha256, ignoreCase = true)) {
+                "Copied artifact digest mismatch"
             }
         }
     )
+}
 
 internal fun verifyPngArtifact(file: File, expectedWidth: Int? = null, expectedHeight: Int? = null) {
     val prefix = NoFollowFileSystem.digestVerified(file).prefix
