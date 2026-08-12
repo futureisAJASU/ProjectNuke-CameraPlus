@@ -164,5 +164,11 @@ internal data class MediaStoreExportJournal(
             NoFollowFileSystem.requireDirectChildren(jobDir)
                 .filter { it.name.startsWith(PREFIX) && it.name.endsWith(SUFFIX) }
                 .mapNotNull { file -> runCatching { read(jobDir, file) }.getOrNull() }
+
+        /** Invalid journals remain evidence and must not disappear from recovery accounting. */
+        fun invalidFiles(jobDir: File): List<File> =
+            NoFollowFileSystem.requireDirectChildren(jobDir)
+                .filter { it.name.startsWith(PREFIX) && it.name.endsWith(SUFFIX) }
+                .filter { file -> runCatching { read(jobDir, file) }.isFailure }
     }
 }

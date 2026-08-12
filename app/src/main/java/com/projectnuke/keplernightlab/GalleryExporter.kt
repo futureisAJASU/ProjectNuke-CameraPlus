@@ -115,6 +115,9 @@ fun exportNightFusionBitmapToGallery(
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     jobDir: File? = null
 ): GalleryExportResult {
+    if (jobDir != null && NoFollowFileSystem.resolveDirectChild(jobDir, JOB_JSON_FILE_NAME, requireFile = true) != null) {
+        KeplerJobMetadata.beginActiveOperation(jobDir, kind = KeplerActiveOperationKind.PUBLIC_EXPORT)
+    }
     val attempts = when (requestedFormat) {
         OutputFormat.HEIF -> listOf(OutputFormat.HEIF, OutputFormat.JPEG, OutputFormat.PNG)
         OutputFormat.JPEG -> listOf(OutputFormat.JPEG, OutputFormat.PNG)
@@ -227,6 +230,7 @@ fun exportRawSidecarsToPublicStorage(
                 frameIndex = frame.frameIndex,
                 displayName = exportName,
                 expectedSizeBytes = sourceDigest.size
+                ,expectedSha256 = sourceDigest.sha256
             ) { journal ->
                 val uri = journal.uri?.let(Uri::parse) ?: return@findReusableRawSidecarJournal false
                 ContextMediaStoreExportRecoveryAccess(context).inspect(uri, journal).let { inspection ->
@@ -327,6 +331,7 @@ internal fun findReusableRawSidecarJournal(
     frameIndex: Int,
     displayName: String,
     expectedSizeBytes: Long,
+    expectedSha256: String,
     verifier: (MediaStoreExportJournal) -> Boolean
 ): MediaStoreExportJournal? = journals.asSequence()
     .filter { journal ->
@@ -334,6 +339,7 @@ internal fun findReusableRawSidecarJournal(
             journal.frameIndex == frameIndex &&
             journal.displayName == displayName &&
             journal.expectedSizeBytes == expectedSizeBytes &&
+            journal.expectedSha256 == expectedSha256 &&
             journal.uri != null &&
             journal.state != MediaStoreExportState.CLEANUP_REQUIRED
     }
@@ -647,6 +653,10 @@ internal fun markMediaStoreExportJournalsTerminalPersisted(jobDir: File) {
         if (journal.state != MediaStoreExportState.TERMINAL_PERSISTED) {
             journal.markTerminalPersisted(jobDir)
         }
+    }
+    val stage = runCatching { KeplerJobMetadata.read(jobDir).optString("currentPipelineStage") }.getOrNull()
+    if (stage != null && stage != "PROCESSING") {
+        KeplerJobMetadata.clearActiveOperationKind(jobDir, KeplerActiveOperationKind.PUBLIC_EXPORT)
     }
 }
 

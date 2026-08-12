@@ -90,4 +90,19 @@ class KeplerRecoveryCoordinatorTest {
             root.deleteRecursively()
         }
     }
+
+    @Test
+    fun malformedExportJournalIsPreservedAsAmbiguousEvidence() {
+        val root = File(Files.createTempDirectory("kepler-recovery-export-journal-").toFile(), "KeplerRawFusion").apply { mkdirs() }
+        val job = File(root, "KPL_RAW_FUSION_bad_export").apply { mkdirs() }
+        try {
+            KeplerJobMetadata.write(job, JSONObject().put("status", "PROCESSING"))
+            File(job, ".export_tx_broken.json").writeText("not-json")
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root))
+            assertEquals(KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED, report.jobs.single().classification)
+            assertTrue(File(job, ".export_tx_broken.json").exists())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
 }

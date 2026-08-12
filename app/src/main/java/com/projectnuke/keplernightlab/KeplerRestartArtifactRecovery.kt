@@ -50,6 +50,11 @@ internal fun reconcileJobMetadataWriteTemps(jobDir: File): KeplerMetadataTempRec
 
 internal data class KeplerCaptureTempRecovery(val deleted: List<String> = emptyList(), val failures: List<String> = emptyList())
 
+internal data class KeplerCacheCleanupResult(
+    val deleted: List<String> = emptyList(),
+    val failures: List<String> = emptyList()
+)
+
 /** Exact direct-child cleanup for manifest-owned capture transaction temps after old-process loss. */
 internal fun recoverCaptureOwnedTemps(jobDir: File, job: JSONObject, oldActiveOperation: Boolean): KeplerCaptureTempRecovery {
     if (!oldActiveOperation) return KeplerCaptureTempRecovery()
@@ -76,8 +81,22 @@ internal fun recoverCaptureOwnedTemps(jobDir: File, job: JSONObject, oldActiveOp
 }
 
 internal fun cleanStaleKeplerExportCacheFiles(cacheDir: File): List<String> {
-    if (!NoFollowFileSystem.isRealDirectory(cacheDir.toPath())) return emptyList()
-    return NoFollowFileSystem.requireDirectChildren(cacheDir).filter { file ->
+    return cleanStaleKeplerExportCacheFilesDetailed(cacheDir).deleted
+}
+
+internal fun cleanStaleKeplerExportCacheFilesDetailed(cacheDir: File): KeplerCacheCleanupResult {
+    if (!NoFollowFileSystem.isRealDirectory(cacheDir.toPath())) return KeplerCacheCleanupResult()
+    val deleted = mutableListOf<String>()
+    val failures = mutableListOf<String>()
+    NoFollowFileSystem.requireDirectChildren(cacheDir).filter { file ->
         NoFollowFileSystem.isRealFile(file.toPath()) && file.name.startsWith("kepler_export_") && file.name.endsWith(".heic")
-    }.mapNotNull { file -> if (file.delete() || !file.exists()) file.name else null }
+    }.forEach { file ->
+        runCatching {
+            if (file.delete() || !file.exists()) deleted += file.name
+            else failures += "Could not delete cache export ${file.name}."
+        }.onFailure { failure ->
+            failures += "Could not delete cache export ${file.name}: ${failure.message}"
+        }
+    }
+    return KeplerCacheCleanupResult(deleted, failures)
 }

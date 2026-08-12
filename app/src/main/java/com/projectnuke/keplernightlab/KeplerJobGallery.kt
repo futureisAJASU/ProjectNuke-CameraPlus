@@ -202,6 +202,10 @@ private const val STALE_JOB_RECOVERY_AGE_MILLIS = 15 * 60 * 1000L
 internal fun recoverStaleInterruptedJob(directory: File) {
     if (isReprocessQuarantined(directory)) return
     val job = runCatching { KeplerJobMetadata.read(directory) }.getOrNull() ?: return
+    // New jobs are reconciled from durable runtime and transaction evidence by
+    // KeplerRecoveryCoordinator. This legacy helper is only for metadata predating
+    // the runtime-session fields and must never override newer evidence.
+    if (job.has(ACTIVE_RUNTIME_SESSION_ID)) return
     val status = job.optString("status").uppercase()
     val processStatus = job.optString("processStatus").uppercase()
     val pipelineStage = job.optString("currentPipelineStage").uppercase()

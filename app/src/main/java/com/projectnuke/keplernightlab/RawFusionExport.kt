@@ -33,6 +33,13 @@ internal class RawProcessingOperation internal constructor(
         activeOperationId?.let { KeplerJobMetadata.clearActiveOperation(jobDir, it) }
         if (ownsLease) lease.release()
     }
+
+    /** Reclaims durable evidence after the nested ProcessingAttempt releases its sublease. */
+    internal fun reassertActiveOperation(kind: KeplerActiveOperationKind) {
+        activeOperationId?.let { operationId ->
+            KeplerJobMetadata.beginActiveOperation(jobDir, operationId, kind)
+        }
+    }
 }
 
 internal fun acquireRawProcessingOperation(
@@ -753,6 +760,7 @@ fun captureProcessExportRawNightFusion(
                         operationLease = processingOperation.lease
                     ) { post(it) }
                     capturedProcess = process
+                    processingOperation.reassertActiveOperation(KeplerActiveOperationKind.PUBLIC_EXPORT)
                     if (!process.success || !process.hasExportableBitmapSource()) {
                         val reason = process.errorMessage ?: "RAW fusion process failed"
                         try {
@@ -1544,6 +1552,7 @@ internal fun reprocessRawJob(
                 operationLease = processingOperation.lease
             ) { post(it) }
             capturedProcess = process
+            processingOperation.reassertActiveOperation(KeplerActiveOperationKind.PUBLIC_EXPORT)
             currentOutputFile = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
             currentPreviewFile = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L }
             if (!process.success || !process.hasExportableBitmapSource()) {

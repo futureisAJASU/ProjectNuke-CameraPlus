@@ -174,6 +174,23 @@ object KeplerJobMetadata {
         matched
     }.getOrDefault(false)
 
+    /** Clears a current-process marker when terminal metadata has already settled its owner. */
+    internal fun clearActiveOperationKind(jobDir: File, kind: KeplerActiveOperationKind): Boolean = runCatching {
+        var matched = false
+        update(jobDir) { job ->
+            if (job.optString(ACTIVE_RUNTIME_SESSION_ID) != KeplerRuntimeSession.id ||
+                job.optString(ACTIVE_OPERATION_KIND) != kind.name
+            ) return@update
+            matched = true
+            job.remove(ACTIVE_RUNTIME_SESSION_ID)
+            job.remove(ACTIVE_OPERATION_ID)
+            job.remove(ACTIVE_OPERATION_KIND)
+            job.remove(ACTIVE_OPERATION_STARTED_AT)
+            job.remove(ACTIVE_OPERATION_UPDATED_AT)
+        }
+        matched
+    }.getOrDefault(false)
+
     fun atomicWrite(file: File, text: String) {
         val parent = file.parentFile ?: error("job metadata parent missing")
         requireRealJobDirectory(parent)

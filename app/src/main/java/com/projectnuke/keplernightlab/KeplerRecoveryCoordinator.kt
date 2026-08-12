@@ -31,6 +31,7 @@ internal data class KeplerJobRecoveryResult(
 
 internal data class KeplerRecoveryReport(
     val jobs: List<KeplerJobRecoveryResult>,
+    val cacheCleanupFailures: List<String> = emptyList(),
     val completedAt: Long = System.currentTimeMillis()
 )
 
@@ -82,10 +83,18 @@ internal object KeplerRecoveryCoordinator {
         }
     }
 
-    private fun scan(context: Context): KeplerRecoveryReport = recoverRoots(
-        keplerGalleryRoots(context),
-        ContextMediaStoreExportRecoveryAccess(context)
-    ).also { runCatching { cleanStaleKeplerExportCacheFiles(context.cacheDir) } }
+    private fun scan(context: Context): KeplerRecoveryReport {
+        val report = recoverRoots(
+            keplerGalleryRoots(context),
+            ContextMediaStoreExportRecoveryAccess(context)
+        )
+        val cacheCleanup = runCatching {
+            cleanStaleKeplerExportCacheFilesDetailed(context.cacheDir)
+        }.getOrElse { failure ->
+            KeplerCacheCleanupResult(failures = listOf("Cache cleanup failed: ${failure.message}"))
+        }
+        return report.copy(cacheCleanupFailures = cacheCleanup.failures)
+    }
 
     internal fun recoverRoots(
         roots: List<File>,
@@ -151,6 +160,18 @@ internal object KeplerRecoveryCoordinator {
             }
             if (job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id) {
                 return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.SKIP_ACTIVE_CURRENT_PROCESS)
+            }
+            val invalidExportJournals = MediaStoreExportJournal.invalidFiles(jobDir)
+            if (invalidExportJournals.isNotEmpty()) {
+                KeplerJobMetadata.update(jobDir) {
+                    it.put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
+                        .put("recoveryMessage", "MediaStore export evidence is malformed and was preserved.")
+                }
+                return KeplerJobRecoveryResult(
+                    jobDir,
+                    KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED,
+                    failures = invalidExportJournals.map { "Invalid export journal: ${it.name}" }
+                )
             }
             val exportResults = exportAccess?.let { recoverMediaStoreExportJournals(jobDir, it) }.orEmpty()
             val exportFailure = exportResults.firstOrNull {

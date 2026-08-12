@@ -22,17 +22,48 @@ class RawSidecarJournalReuseTest {
                 relativePath = "Pictures/Kepler/RAW",
                 mimeType = "image/x-adobe-dng",
                 collectionUri = Uri.parse("content://media/external/file"),
-                expectedSizeBytes = 40L
+                expectedSizeBytes = 40L,
+                expectedSha256 = "digest-1"
             ).transition(dir, MediaStoreExportState.VERIFIED, "content://media/external/file/3")
             val selected = findReusableRawSidecarJournal(
                 MediaStoreExportJournal.list(dir),
                 frameIndex = 3,
                 displayName = "frame_03.dng",
                 expectedSizeBytes = 40L,
+                expectedSha256 = "digest-1",
                 verifier = { it.uri == journal.uri }
             )
             assertNotNull(selected)
             assertEquals(journal.exportAttemptId, selected?.exportAttemptId)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun sameSizedDifferentDigestIsNotReused() {
+        val dir = Files.createTempDirectory("sidecar-reuse-digest-").toFile()
+        try {
+            MediaStoreExportJournal.create(
+                jobDir = dir,
+                role = MediaStoreExportRole.RAW_DNG_SIDECAR,
+                frameIndex = 3,
+                displayName = "frame_03.dng",
+                relativePath = "Pictures/Kepler/RAW",
+                mimeType = "image/x-adobe-dng",
+                collectionUri = Uri.parse("content://media/external/file"),
+                expectedSizeBytes = 40L,
+                expectedSha256 = "old-digest"
+            ).transition(dir, MediaStoreExportState.VERIFIED, "content://media/external/file/3")
+            val selected = findReusableRawSidecarJournal(
+                MediaStoreExportJournal.list(dir),
+                frameIndex = 3,
+                displayName = "frame_03.dng",
+                expectedSizeBytes = 40L,
+                expectedSha256 = "new-digest",
+                verifier = { true }
+            )
+            assertEquals(null, selected)
         } finally {
             dir.deleteRecursively()
         }
