@@ -216,7 +216,30 @@ fun exportRawSidecarsToPublicStorage(
             val file = frame.localFile ?: return@forEach
             cancellation.throwIfCancelled()
             val exportName = "${displayNameBase}_${frame.frameIndex.toString().padStart(2, '0')}.dng"
-            var sourceDigest: NoFollowFileSystem.StreamDigest? = null
+            val sourceDigest = runCatching { NoFollowFileSystem.digestVerified(file) }.getOrElse {
+                val failure = "${file.name}: source DNG could not be hashed: ${it.message}"
+                publicFailures += failure
+                publicFailureByFrame[frame.frameIndex] = failure
+                return@forEach
+            }
+            val reusable = findReusableRawSidecarJournal(
+                journals = MediaStoreExportJournal.list(jobDir),
+                frameIndex = frame.frameIndex,
+                displayName = exportName,
+                expectedSizeBytes = sourceDigest.size
+            ) { journal ->
+                val uri = journal.uri?.let(Uri::parse) ?: return@findReusableRawSidecarJournal false
+                ContextMediaStoreExportRecoveryAccess(context).inspect(uri, journal).let { inspection ->
+                    inspection.exists && !inspection.pending && inspection.verified
+                }
+            }
+            if (reusable != null) {
+                reusable.transition(jobDir, MediaStoreExportState.VERIFIED, expectedSha256Override = sourceDigest.sha256)
+                exported += reusable.uri!!
+                publicByFrame[frame.frameIndex] = reusable.uri
+                return@forEach
+            }
+            var copiedDigest: NoFollowFileSystem.StreamDigest? = null
             val result = insertPublicFile(
                 context = context,
                 displayName = exportName,
@@ -227,9 +250,10 @@ fun exportRawSidecarsToPublicStorage(
                 jobDir = jobDir,
                 role = MediaStoreExportRole.RAW_DNG_SIDECAR,
                 frameIndex = frame.frameIndex,
-                expectedSizeBytes = file.length()
+                expectedSizeBytes = sourceDigest.size,
+                expectedSha256 = sourceDigest.sha256
             ) { output ->
-                sourceDigest = NoFollowFileSystem.copyVerified(file, output)
+                copiedDigest = NoFollowFileSystem.copyVerified(file, output)
             } ?: run {
                 cancellation.throwIfCancelled()
                 insertPublicFile(
@@ -242,9 +266,10 @@ fun exportRawSidecarsToPublicStorage(
                     jobDir = jobDir,
                     role = MediaStoreExportRole.RAW_DNG_SIDECAR,
                     frameIndex = frame.frameIndex,
-                    expectedSizeBytes = file.length()
+                    expectedSizeBytes = sourceDigest.size,
+                    expectedSha256 = sourceDigest.sha256
                 ) { output ->
-                    sourceDigest = NoFollowFileSystem.copyVerified(file, output)
+                    copiedDigest = NoFollowFileSystem.copyVerified(file, output)
                 }
             }
 
@@ -257,13 +282,13 @@ fun exportRawSidecarsToPublicStorage(
             val verificationError = verifyPublicDng(
                 context = context,
                 uri = result.uri,
-                expected = sourceDigest ?: return@forEach
+                expected = copiedDigest ?: return@forEach
             )
             result.journal?.let { journal ->
                 journal.transition(
                     jobDir,
                     journal.state,
-                    expectedSha256Override = sourceDigest?.sha256
+                    expectedSha256Override = sourceDigest.sha256
                 )
             }
             if (verificationError != null) {
@@ -296,6 +321,23 @@ internal data class RawSidecarManifestFrame(
     val localStatus: String,
     val localFailure: String?
 )
+
+internal fun findReusableRawSidecarJournal(
+    journals: List<MediaStoreExportJournal>,
+    frameIndex: Int,
+    displayName: String,
+    expectedSizeBytes: Long,
+    verifier: (MediaStoreExportJournal) -> Boolean
+): MediaStoreExportJournal? = journals.asSequence()
+    .filter { journal ->
+        journal.role == MediaStoreExportRole.RAW_DNG_SIDECAR &&
+            journal.frameIndex == frameIndex &&
+            journal.displayName == displayName &&
+            journal.expectedSizeBytes == expectedSizeBytes &&
+            journal.uri != null &&
+            journal.state != MediaStoreExportState.CLEANUP_REQUIRED
+    }
+    .firstOrNull(verifier)
 
 internal data class RawSidecarManifest(
     val frames: List<RawSidecarManifestFrame>
@@ -929,6 +971,7 @@ private fun insertPublicFile(
     role: MediaStoreExportRole = MediaStoreExportRole.MAIN_IMAGE,
     frameIndex: Int? = null,
     expectedSizeBytes: Long? = null,
+    expectedSha256: String? = null,
     expectedWidth: Int? = null,
     expectedHeight: Int? = null,
     writer: (OutputStream) -> Unit
@@ -955,6 +998,7 @@ private fun insertPublicFile(
                 mimeType = mimeType,
                 collectionUri = collectionUri,
                 expectedSizeBytes = expectedSizeBytes,
+                expectedSha256 = expectedSha256,
                 expectedWidth = expectedWidth,
                 expectedHeight = expectedHeight
             )
