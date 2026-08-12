@@ -30,6 +30,11 @@ class CameraPipelineUiOrchestratorTest {
             entries.remove(entry)
             entry.work.run()
         }
+
+        fun runEntry(entry: Entry) {
+            assertTrue(entries.remove(entry))
+            entry.work.run()
+        }
     }
 
     @Test
@@ -218,5 +223,175 @@ class CameraPipelineUiOrchestratorTest {
         sink?.invoke(CameraPipelineEvent.Terminal(0L, CameraPipelineEvent.Terminal.Kind.COMPLETE))
         assertEquals(0, effects)
         assertEquals(CameraPipelineUiSession.Phase.DISPOSED, session.snapshot().phase)
+    }
+
+    @Test
+    fun queuedProgressCannotReopenAnImmediatelySettledTerminal() {
+        val session = CameraPipelineUiSession()
+        val scheduler = ManualScheduler()
+        var sink: CameraPipelineEventSink? = null
+        var terminalEffects = 0
+        val orchestrator = CameraPipelineUiOrchestrator(
+            session,
+            scheduler,
+            CameraPipelineUiOrchestrator.Callbacks({}, {}, { terminalEffects++ })
+        )
+
+        orchestrator.start("capture") { _, _, _, events -> sink = events }
+        scheduler.run(250L)
+        sink!!.invoke(
+            CameraPipelineEvent.ProcessingStage(
+                generation = 0L,
+                stage = CaptureStage.PROCESSING,
+                counts = CameraPipelineProgressCounts(),
+                message = "processing one"
+            )
+        )
+        sink!!.invoke(
+            CameraPipelineEvent.ProcessingStage(
+                generation = 0L,
+                stage = CaptureStage.EXPORTING,
+                counts = CameraPipelineProgressCounts(),
+                message = "processing two"
+            )
+        )
+        val queuedProgress = scheduler.entries.filter { it.delay == 0L }
+        sink!!.invoke(
+            CameraPipelineEvent.Terminal(
+                generation = 0L,
+                kind = CameraPipelineEvent.Terminal.Kind.COMPLETE,
+                captureResourcesSettled = true,
+                message = "complete"
+            )
+        )
+
+        queuedProgress.forEach(scheduler::runEntry)
+        assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
+        assertEquals(CameraPipelineEvent.Terminal.Kind.COMPLETE, session.snapshot().terminal?.kind)
+        assertFalse(session.snapshot().isBusy)
+        assertTrue(session.snapshot().previewAllowed)
+        assertTrue(terminalEffects <= 1)
+    }
+
+    @Test
+    fun queuedDisplayCannotOverwriteTerminalStatus() {
+        val session = CameraPipelineUiSession()
+        val scheduler = ManualScheduler()
+        val statuses = mutableListOf<String>()
+        var sink: CameraPipelineEventSink? = null
+        val orchestrator = CameraPipelineUiOrchestrator(
+            session,
+            scheduler,
+            CameraPipelineUiOrchestrator.Callbacks(statuses::add, {}, {})
+        )
+
+        orchestrator.start("capture") { _, _, display, events ->
+            display("Processing...")
+            sink = events
+        }
+        scheduler.run(250L)
+        val displayEntry = scheduler.entries.first { it.delay == 0L }
+        sink!!.invoke(
+            CameraPipelineEvent.Terminal(
+                generation = 0L,
+                kind = CameraPipelineEvent.Terminal.Kind.COMPLETE,
+                message = "Complete"
+            )
+        )
+        scheduler.runEntry(displayEntry)
+        scheduler.run(0L)
+
+        assertEquals("Complete", statuses.last())
+        assertFalse(statuses.drop(1).contains("Processing..."))
+        assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
+    }
+
+    @Test
+    fun oldGenerationTerminalNotificationCannotApplyToNewGeneration() {
+        val session = CameraPipelineUiSession()
+        val scheduler = ManualScheduler()
+        val statuses = mutableListOf<String>()
+        var sink: CameraPipelineEventSink? = null
+        var terminalEffects = 0
+        val orchestrator = CameraPipelineUiOrchestrator(
+            session,
+            scheduler,
+            CameraPipelineUiOrchestrator.Callbacks(statuses::add, {}, { terminalEffects++ })
+        )
+
+        orchestrator.start("A") { _, _, _, events -> sink = events }
+        scheduler.run(250L)
+        sink!!.invoke(
+            CameraPipelineEvent.Terminal(
+                generation = 0L,
+                kind = CameraPipelineEvent.Terminal.Kind.COMPLETE,
+                message = "A terminal"
+            )
+        )
+        val oldNotification = scheduler.entries.first { it.delay == 0L }
+
+        assertTrue(orchestrator.start("B") { _, _, _, _ -> })
+        val statusCountBeforeOldNotification = statuses.size
+        scheduler.runEntry(oldNotification)
+
+        assertEquals(statusCountBeforeOldNotification, statuses.size)
+        assertEquals(0, terminalEffects)
+        assertEquals(2L, session.snapshot().generation)
+        assertEquals(CameraPipelineUiSession.Phase.START_SCHEDULED, session.snapshot().phase)
+    }
+
+    @Test
+    fun rejectedTerminalNotificationCannotReconcileAcrossGenerations() {
+        val session = CameraPipelineUiSession()
+        val scheduler = ManualScheduler().also { it.rejectDelay = 0L }
+        var sink: CameraPipelineEventSink? = null
+        var terminalEffects = 0
+        val orchestrator = CameraPipelineUiOrchestrator(
+            session,
+            scheduler,
+            CameraPipelineUiOrchestrator.Callbacks({}, {}, { terminalEffects++ })
+        )
+
+        orchestrator.start("A") { _, _, _, events -> sink = events }
+        scheduler.run(250L)
+        sink!!.invoke(
+            CameraPipelineEvent.Terminal(
+                generation = 0L,
+                kind = CameraPipelineEvent.Terminal.Kind.COMPLETE,
+                message = "A terminal"
+            )
+        )
+        assertEquals(TerminalUiDeliveryOutcome.REJECTED, orchestrator.terminalUiDeliveryOutcome())
+
+        scheduler.rejectDelay = null
+        assertTrue(orchestrator.start("B") { _, _, _, _ -> })
+        assertEquals(CameraUiDispatchOutcome.REJECTED, orchestrator.reconcileTerminalUiDelivery())
+        assertEquals(0, terminalEffects)
+        assertEquals(2L, session.snapshot().generation)
+    }
+
+    @Test
+    fun unexpectedJobLaunchExceptionDoesNotFabricateCaptureSettlement() {
+        val session = CameraPipelineUiSession()
+        val scheduler = ManualScheduler()
+        var sink: CameraPipelineEventSink? = null
+        val orchestrator = CameraPipelineUiOrchestrator(
+            session,
+            scheduler,
+            CameraPipelineUiOrchestrator.Callbacks({}, {}, {})
+        )
+
+        orchestrator.start("capture") { _, _, _, events ->
+            sink = events
+            error("launcher failed")
+        }
+        scheduler.run(250L)
+
+        assertTrue(sink != null)
+        assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
+        assertEquals(CameraPipelineEvent.Terminal.Kind.FAILED, session.snapshot().terminal?.kind)
+        assertFalse(session.snapshot().captureResourcesSettled)
+        assertTrue(session.snapshot().isBusy)
+        assertFalse(session.snapshot().previewAllowed)
     }
 }

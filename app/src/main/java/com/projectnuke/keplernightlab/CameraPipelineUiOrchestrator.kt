@@ -27,6 +27,7 @@ internal class CameraPipelineUiOrchestrator(
     private var pendingTerminal: CameraPipelineEvent.Terminal? = null
     private var terminalUiNotifiedGeneration: Long? = null
     private var terminalUiDeliveryOutcomeValue: TerminalUiDeliveryOutcome? = null
+    private val staleTerminalUiNotifications = ArrayDeque<Long>()
 
     fun updateCallbacks(callbacks: Callbacks) {
         this.callbacks = callbacks
@@ -41,6 +42,16 @@ internal class CameraPipelineUiOrchestrator(
             if (terminalUiDeliveryOutcomeValue == TerminalUiDeliveryOutcome.ACCEPTED) return CameraUiDispatchOutcome.ACCEPTED
             pendingTerminal
         } ?: return CameraUiDispatchOutcome.REJECTED
+        if (session.snapshot().generation != terminal.generation) {
+            synchronized(this) {
+                if (pendingTerminal?.generation == terminal.generation) {
+                    pendingTerminal = null
+                    terminalUiDeliveryOutcomeValue = null
+                }
+                recordStaleTerminalUiNotificationLocked(terminal.generation)
+            }
+            return CameraUiDispatchOutcome.REJECTED
+        }
         return dispatchTerminalNotification(terminal)
     }
 
@@ -57,6 +68,11 @@ internal class CameraPipelineUiOrchestrator(
         }
         val operation = (started as CameraPipelineUiSession.StartResult.Accepted).operation
         val generation = operation.generation
+        synchronized(this) {
+            pendingTerminal = null
+            terminalUiNotifiedGeneration = null
+            terminalUiDeliveryOutcomeValue = null
+        }
         val token = operation.cancellationToken
         val captureCancellation = operation.captureCancellation
         callbacks.onStatus(startMessage)
@@ -118,6 +134,7 @@ internal class CameraPipelineUiOrchestrator(
                     dispatchTerminalNotification(terminal)
                 }
                 CameraPipelineUiSession.EventResult.DUPLICATE_TERMINAL -> Unit
+                CameraPipelineUiSession.EventResult.LATE_AFTER_TERMINAL -> Unit
                 CameraPipelineUiSession.EventResult.STALE,
                 CameraPipelineUiSession.EventResult.DISPOSED -> Log.i(TAG, "stale pipeline event ignored generation=$generation")
             }
@@ -144,7 +161,7 @@ internal class CameraPipelineUiOrchestrator(
                     captureCancellation,
                     { display ->
                         when (postSafely(0L, Runnable {
-                            if (session.snapshot().generation == generation) {
+                            if (session.acceptsDisplayUpdate(generation)) {
                                 callbacks.onStatus(display)
                                 callbacks.onStateChanged()
                             }
@@ -165,7 +182,8 @@ internal class CameraPipelineUiOrchestrator(
                                 if (session.snapshot().generation == generation) {
                                     when (session.accept(event)) {
                                         CameraPipelineUiSession.EventResult.ACCEPTED -> notifyNonTerminal(event)
-                                        CameraPipelineUiSession.EventResult.DUPLICATE_TERMINAL -> Unit
+                                        CameraPipelineUiSession.EventResult.DUPLICATE_TERMINAL,
+                                        CameraPipelineUiSession.EventResult.LATE_AFTER_TERMINAL -> Unit
                                         CameraPipelineUiSession.EventResult.STALE,
                                         CameraPipelineUiSession.EventResult.DISPOSED -> Unit
                                     }
@@ -186,6 +204,7 @@ internal class CameraPipelineUiOrchestrator(
                     CameraPipelineEvent.Terminal(
                         generation = generation,
                         kind = CameraPipelineEvent.Terminal.Kind.FAILED,
+                        captureResourcesSettled = false,
                         message = "PIPELINE_FAILED: ${failure.javaClass.simpleName}"
                     )
                 )
@@ -238,11 +257,19 @@ internal class CameraPipelineUiOrchestrator(
         }
         val outcome = try {
             scheduler.post(0L, Runnable {
+                val snapshot = session.snapshot()
+                if (snapshot.generation != terminal.generation ||
+                    snapshot.phase == CameraPipelineUiSession.Phase.DISPOSED
+                ) {
+                    synchronized(this@CameraPipelineUiOrchestrator) {
+                        recordStaleTerminalUiNotificationLocked(terminal.generation)
+                    }
+                    return@Runnable
+                }
                 synchronized(this@CameraPipelineUiOrchestrator) {
                     if (terminalUiNotifiedGeneration == terminal.generation) return@Runnable
                     terminalUiNotifiedGeneration = terminal.generation
                 }
-                if (session.snapshot().phase == CameraPipelineUiSession.Phase.DISPOSED) return@Runnable
                 terminal.message?.let(callbacks.onStatus)
                 callbacks.onStateChanged()
                 callbacks.onTerminal(terminal)
@@ -260,7 +287,15 @@ internal class CameraPipelineUiOrchestrator(
         return outcome
     }
 
+    private fun recordStaleTerminalUiNotificationLocked(generation: Long) {
+        if (staleTerminalUiNotifications.size >= MAX_STALE_TERMINAL_UI_NOTIFICATIONS) {
+            staleTerminalUiNotifications.removeFirst()
+        }
+        staleTerminalUiNotifications.addLast(generation)
+    }
+
     private companion object {
         const val TAG = "KeplerPipelineState"
+        const val MAX_STALE_TERMINAL_UI_NOTIFICATIONS = 8
     }
 }
