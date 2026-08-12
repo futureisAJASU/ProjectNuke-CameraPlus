@@ -172,6 +172,10 @@ internal object KeplerRecoveryCoordinator {
                 return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.SKIP_ACTIVE_CURRENT_PROCESS)
             }
             val activeOperation = job.optString(ACTIVE_OPERATION_ID)
+            val handoffRuntime = job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID)
+            if (handoffRuntime == KeplerRuntimeSession.id) {
+                return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.SKIP_ACTIVE_CURRENT_PROCESS)
+            }
             val invalidExportJournals = MediaStoreExportJournal.invalidFiles(jobDir)
             if (invalidExportJournals.isNotEmpty()) {
                 KeplerJobMetadata.update(jobDir) {
@@ -231,6 +235,18 @@ internal object KeplerRecoveryCoordinator {
                 }
             }
             val captureTemps = recoverCaptureOwnedTemps(jobDir, job, activeOperation.isNotBlank())
+            if (activeOperation.isBlank() && job.optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()) {
+                KeplerJobMetadata.update(jobDir) {
+                    it.put("recoveryState", KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name)
+                        .put("recoveryMessage", "캡처 결과는 보존되었지만 처리가 시작되기 전에 이전 프로세스가 종료되었습니다.")
+                }
+                return KeplerJobRecoveryResult(
+                    jobDir,
+                    KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT,
+                    actions = captureTemps.deleted.map { "DELETED_$it" },
+                    failures = metadataTemps.failures + captureTemps.failures
+                )
+            }
             if (activeOperation.isNotBlank()) {
                 val artifactResults = recoverProcessingArtifactJournals(jobDir)
                 val artifactFailure = artifactResults.firstOrNull {
@@ -269,6 +285,21 @@ internal object KeplerRecoveryCoordinator {
                     failures = metadataTemps.failures + captureTemps.failures
                 )
             }
+            if (isLegacyActiveJob(job)) {
+                val updatedAt = job.optLong("updatedAt", job.optLong("createdAt", 0L))
+                val stale = updatedAt > 0L && System.currentTimeMillis() - updatedAt >= LEGACY_RECOVERY_AGE_MILLIS
+                if (stale) {
+                    KeplerJobMetadata.update(jobDir) {
+                        it.put("status", "INTERRUPTED")
+                            .put("processStatus", "INTERRUPTED")
+                            .put("currentPipelineStage", "INTERRUPTED")
+                            .put("recoveryState", KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name)
+                            .put("recoveryMessage", "이전 프로세스의 작업 소유권을 확인할 수 없어 안전하게 중단된 작업으로 표시했습니다.")
+                    }
+                    return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT)
+                }
+                return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.LEGACY_REQUIRES_RECONCILIATION)
+            }
             return KeplerJobRecoveryResult(
                 jobDir,
                 if (metadataTemps.classification == KeplerMetadataTempClassification.AMBIGUOUS) KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED else KeplerJobRecoveryClassification.RECOVERED,
@@ -279,4 +310,18 @@ internal object KeplerRecoveryCoordinator {
             lease.release()
         }
     }
+
+    private fun isLegacyActiveJob(job: org.json.JSONObject): Boolean {
+        if (job.has(ACTIVE_RUNTIME_SESSION_ID) || job.has(ACTIVE_OPERATION_ID) ||
+            job.has(PROCESSING_HANDOFF_OPERATION_ID)) return false
+        val active = setOf(
+            "CAPTURING", "PROCESSING", "EXPORTING", "YUV_ALIGNING", "YUV_MERGING",
+            "YUV_DENOISE_SHARPEN", "YUV_EXPORTING", "RAW_PROCESSING_IN_PROGRESS"
+        )
+        return job.optString("status").uppercase() in active ||
+            job.optString("processStatus").uppercase() in active ||
+            job.optString("currentPipelineStage").uppercase() in active
+    }
+
+    private const val LEGACY_RECOVERY_AGE_MILLIS = 15 * 60 * 1000L
 }

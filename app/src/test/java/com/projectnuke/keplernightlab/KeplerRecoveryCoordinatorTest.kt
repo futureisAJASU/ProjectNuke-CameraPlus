@@ -1,5 +1,6 @@
 package com.projectnuke.keplernightlab
 
+import android.net.Uri
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -11,6 +12,16 @@ import java.nio.file.Files
 
 @RunWith(RobolectricTestRunner::class)
 class KeplerRecoveryCoordinatorTest {
+    private class ExactExportAccess(
+        private val failingUri: String? = null
+    ) : MediaStoreExportRecoveryAccess {
+        override fun inspect(uri: Uri, journal: MediaStoreExportJournal): MediaStoreExportInspection {
+            if (uri.toString() == failingUri) throw IllegalStateException("injected inspection failure")
+            return MediaStoreExportInspection(exists = true, pending = false, verified = true)
+        }
+        override fun setPending(uri: Uri, pending: Boolean) = true
+        override fun delete(uri: Uri) = true
+    }
     @Test
     fun oneBrokenJobDoesNotAbortHealthyRootScan() {
         val root = File(Files.createTempDirectory("kepler-recovery-root-").toFile(), "KeplerRawFusion").apply { mkdirs() }
@@ -104,5 +115,87 @@ class KeplerRecoveryCoordinatorTest {
         } finally {
             root.deleteRecursively()
         }
+    }
+
+    @Test
+    fun unconsumedProcessingHandoffIsInterruptedWithoutClaimingProcessingSuccess() {
+        val root = File(Files.createTempDirectory("kepler-recovery-handoff-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_handoff").apply { mkdirs() }
+        try {
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("status", "PROCESSING")
+                .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, "old-runtime")
+                .put(PROCESSING_HANDOFF_OPERATION_ID, "handoff-1")
+                .put(PROCESSING_HANDOFF_KIND, "PROCESSING_YUV"))
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root))
+            assertEquals(KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT, report.jobs.single().classification)
+            assertEquals(false, KeplerJobMetadata.read(job).optBoolean("processingOutputCommitted", false))
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test
+    fun verifiedMainCommitReconstructsJobTruthForOwningDeadExportOperation() {
+        val root = File(Files.createTempDirectory("kepler-recovery-main-export-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_export").apply { mkdirs() }
+        try {
+            val operationId = "dead-export-operation"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("status", "EXPORTING")
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, operationId)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name))
+            MediaStoreExportJournal.create(
+                jobDir = job,
+                role = MediaStoreExportRole.MAIN_IMAGE,
+                frameIndex = null,
+                displayName = "result.jpg",
+                relativePath = "Pictures/Kepler",
+                mimeType = "image/jpeg",
+                collectionUri = Uri.parse("content://media/external/images/media"),
+                ownerOperationId = operationId
+            ).transition(job, MediaStoreExportState.PUBLIC_COMMITTED, "content://media/external/images/media/77")
+                .transition(job, MediaStoreExportState.VERIFIED)
+
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
+            assertEquals(KeplerJobRecoveryClassification.PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL, report.jobs.single().classification)
+            val recovered = KeplerJobMetadata.read(job)
+            assertTrue(recovered.getBoolean("galleryExportCommitted"))
+            assertTrue(recovered.getBoolean("exportVerified"))
+            assertEquals("content://media/external/images/media/77", recovered.getString("exportUri"))
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test
+    fun oneMediaStoreRecoveryFailureDoesNotAbortLaterJobs() {
+        val root = File(Files.createTempDirectory("kepler-recovery-isolation-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val broken = File(root, "KPL_YUV_FUSION_broken").apply { mkdirs() }
+        val healthy = File(root, "KPL_YUV_FUSION_healthy").apply { mkdirs() }
+        try {
+            val brokenUri = "content://media/external/images/media/101"
+            listOf(broken to brokenUri, healthy to "content://media/external/images/media/102").forEach { (job, uri) ->
+                val operationId = "operation-${job.name}"
+                KeplerJobMetadata.write(job, JSONObject()
+                    .put("jobType", "YUV_NIGHT_FUSION")
+                    .put("status", "EXPORTING")
+                    .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                    .put(ACTIVE_OPERATION_ID, operationId))
+                MediaStoreExportJournal.create(
+                    jobDir = job,
+                    role = MediaStoreExportRole.MAIN_IMAGE,
+                    frameIndex = null,
+                    displayName = "result.jpg",
+                    relativePath = "Pictures/Kepler",
+                    mimeType = "image/jpeg",
+                    collectionUri = Uri.parse("content://media/external/images/media"),
+                    ownerOperationId = operationId
+                ).transition(job, MediaStoreExportState.PUBLIC_COMMITTED, uri)
+            }
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess(brokenUri))
+            assertEquals(2, report.jobs.size)
+            assertEquals(KeplerJobRecoveryClassification.RECOVERY_FAILED, report.jobs.first { it.jobDir == broken }.classification)
+            assertEquals(KeplerJobRecoveryClassification.PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL, report.jobs.first { it.jobDir == healthy }.classification)
+        } finally { root.deleteRecursively() }
     }
 }

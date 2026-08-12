@@ -35,7 +35,7 @@ internal fun reconcileJobMetadataWriteTemps(jobDir: File): KeplerMetadataTempRec
     val valid = candidates.mapNotNull { candidate ->
         runCatching {
             val json = JSONObject(NoFollowFileSystem.readTextVerified(candidate))
-            require(json.optString("jobType").isNotBlank() || json.optString("status").isNotBlank())
+            requireValidMetadataReplacement(jobDir, json)
             candidate
         }.getOrNull()
     }
@@ -46,6 +46,34 @@ internal fun reconcileJobMetadataWriteTemps(jobDir: File): KeplerMetadataTempRec
         KeplerJobMetadata.atomicReplace(valid.single(), File(jobDir, JOB_JSON_FILE_NAME))
         KeplerMetadataTempRecovery(KeplerMetadataTempClassification.PROMOTED_SINGLE_VALID, actions = listOf("PROMOTED_${valid.single().name}"))
     }.getOrElse { KeplerMetadataTempRecovery(KeplerMetadataTempClassification.AMBIGUOUS, failures = listOf("Valid metadata replacement could not be promoted: ${it.message}")) }
+}
+
+private fun requireValidMetadataReplacement(jobDir: File, job: JSONObject) {
+    require(job.optInt("schemaVersion", 1) == 1) { "Unsupported metadata schema" }
+    val jobType = job.optString("jobType").trim()
+    require(jobType in setOf(
+        "RAW", "RAW_NIGHT_FUSION", "YUV_NIGHT_FUSION", "YUV_SINGLE_FRAME",
+        "SUPER_RESOLUTION", "SUPER_RESOLUTION_FUSION"
+    )) { "Unknown job type" }
+    require(job.has("status") || job.has("currentPipelineStage") || job.has("frames")) {
+        "Metadata has no critical job evidence"
+    }
+    job.optJSONArray("frames")?.let { frames ->
+        for (index in 0 until frames.length()) require(frames.optJSONObject(index) != null) {
+            "Invalid frame metadata at index $index"
+        }
+    }
+    job.optString("jobDirAbsolutePath").takeIf { it.isNotBlank() }?.let { path ->
+        require(File(path).canonicalFile == jobDir.canonicalFile) { "Metadata job identity mismatch" }
+    }
+    val dirName = jobDir.name
+    if (dirName.startsWith("KPL_RAW_FUSION_")) {
+        require(jobType == "RAW" || jobType == "RAW_NIGHT_FUSION") { "RAW directory has incompatible job type" }
+    } else if (dirName.startsWith("KPL_YUV_FUSION_")) {
+        require(jobType == "YUV_NIGHT_FUSION" || jobType == "YUV_SINGLE_FRAME") { "YUV directory has incompatible job type" }
+    } else if (dirName.startsWith("KPL_SUPER_RES_")) {
+        require(jobType == "SUPER_RESOLUTION" || jobType == "SUPER_RESOLUTION_FUSION") { "Super-resolution directory has incompatible job type" }
+    }
 }
 
 internal data class KeplerCaptureTempRecovery(val deleted: List<String> = emptyList(), val failures: List<String> = emptyList())

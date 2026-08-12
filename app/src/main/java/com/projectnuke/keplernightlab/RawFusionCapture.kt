@@ -869,7 +869,14 @@ fun captureRawBurstForFusion(
                         )
                     } finally {
                         if (durableCaptureTerminalPersisted) {
-                            KeplerJobMetadata.clearActiveOperation(jobDir, durableCaptureOperationId)
+                            if (KeplerJobMetadata.publishProcessingHandoff(
+                                    jobDir,
+                                    durableCaptureOperationId,
+                                    KeplerActiveOperationKind.PROCESSING_RAW
+                                )
+                            ) {
+                                KeplerJobMetadata.clearActiveOperation(jobDir, durableCaptureOperationId)
+                            }
                         }
                         cleanup()
                         publishRawTerminalSnapshot(

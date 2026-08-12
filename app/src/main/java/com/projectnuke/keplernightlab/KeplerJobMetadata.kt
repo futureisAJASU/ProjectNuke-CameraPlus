@@ -144,6 +144,27 @@ object KeplerJobMetadata {
         return operationId
     }
 
+    /** Records the durable capture-to-processing handoff before capture ownership is released. */
+    internal fun publishProcessingHandoff(
+        jobDir: File,
+        captureOperationId: String,
+        kind: KeplerActiveOperationKind,
+        createdAt: Long = System.currentTimeMillis()
+    ): Boolean = runCatching {
+        var matched = false
+        update(jobDir) { job ->
+            if (job.optString(ACTIVE_RUNTIME_SESSION_ID) != KeplerRuntimeSession.id ||
+                job.optString(ACTIVE_OPERATION_ID) != captureOperationId
+            ) return@update
+            matched = true
+            job.put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(PROCESSING_HANDOFF_OPERATION_ID, UUID.randomUUID().toString())
+                .put(PROCESSING_HANDOFF_KIND, kind.name)
+                .put(PROCESSING_HANDOFF_CREATED_AT, createdAt)
+        }
+        matched
+    }.getOrDefault(false)
+
     /** Updates only the heartbeat; it is diagnostic/recovery evidence, not a runtime lock. */
     internal fun touchActiveOperation(jobDir: File, operationId: String): Boolean = runCatching {
         var matched = false

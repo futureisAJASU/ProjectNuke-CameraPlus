@@ -611,18 +611,28 @@ fun captureYuvBurstColorWithMotion(
                 RealYuvFinalFileVerifier.verify(file, frameIndex)
             },
             onSessionTerminal = { request ->
-                durableCaptureOperationId?.let { operationId ->
-                    KeplerJobMetadata.clearActiveOperation(currentBurstDir, operationId)
-                }
                 // Session terminal observer: consumes the SOLE published request and
                 // dispatches exactly one user callback.  Runs on Main (the owner's
                 // dispatchCallback already posted it); never infers the terminal
                 // result from counters or elapsed time.
                 when (request.completionKind) {
                     TerminalCompletionKind.SUCCESS -> {
+                        durableCaptureOperationId?.let { operationId ->
+                            if (KeplerJobMetadata.publishProcessingHandoff(
+                                    currentBurstDir,
+                                    operationId,
+                                    KeplerActiveOperationKind.PROCESSING_YUV
+                                )
+                            ) {
+                                KeplerJobMetadata.clearActiveOperation(currentBurstDir, operationId)
+                            }
+                        }
                         onComplete(currentBurstDir)
                     }
                     TerminalCompletionKind.ERROR -> {
+                        durableCaptureOperationId?.let { operationId ->
+                            KeplerJobMetadata.clearActiveOperation(currentBurstDir, operationId)
+                        }
                         logYuvCaptureFailure(
                             stage = "terminal",
                             throwable = request.cause,

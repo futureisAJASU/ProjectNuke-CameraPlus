@@ -196,41 +196,6 @@ internal fun recoveryGallerySummary(directory: File, failure: Throwable): Kepler
     )
 }
 
-private const val STALE_JOB_RECOVERY_AGE_MILLIS = 15 * 60 * 1000L
-
-/** Jobs have no live worker after process death; stale in-progress metadata must not remain active forever. */
-internal fun recoverStaleInterruptedJob(directory: File) {
-    if (isReprocessQuarantined(directory)) return
-    val job = runCatching { KeplerJobMetadata.read(directory) }.getOrNull() ?: return
-    // New jobs are reconciled from durable runtime and transaction evidence by
-    // KeplerRecoveryCoordinator. This legacy helper is only for metadata predating
-    // the runtime-session fields and must never override newer evidence.
-    if (job.has(ACTIVE_RUNTIME_SESSION_ID)) return
-    val status = job.optString("status").uppercase()
-    val processStatus = job.optString("processStatus").uppercase()
-    val pipelineStage = job.optString("currentPipelineStage").uppercase()
-    val active = setOf(
-        "CAPTURING", "PROCESSING", "YUV_ALIGNING", "YUV_MERGING",
-        "YUV_DENOISE_SHARPEN", "YUV_EXPORTING"
-    )
-    if (status !in active && processStatus !in active && pipelineStage !in active) return
-    val updatedAt = job.optLong("updatedAt", job.optLong("createdAt", 0L))
-    if (updatedAt <= 0L || System.currentTimeMillis() - updatedAt < STALE_JOB_RECOVERY_AGE_MILLIS) return
-    val lease = KeplerJobMetadata.acquireOperation(directory) ?: return
-    try {
-        KeplerJobMetadata.update(directory) {
-            it.put("status", "INTERRUPTED")
-                .put("processStatus", "INTERRUPTED")
-                .put("currentPipelineStage", "INTERRUPTED")
-                .put("interruptedAt", System.currentTimeMillis())
-                .put("interruptionReason", "App process was not running when stale job was recovered.")
-                .put("updatedAt", System.currentTimeMillis())
-        }
-    } finally {
-        lease.release()
-    }
-}
-
 data class KeplerGalleryStorageSummary(
     val totalBytes: Long,
     val finalOutputBytes: Long,

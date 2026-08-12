@@ -81,6 +81,10 @@ internal fun beginProcessingAttempt(
             "Processing attempt is no longer authoritative"
         }
         (COMMON_PROCESSING_ATTEMPT_KEYS + additionalOwnedKeys).forEach(job::remove)
+            job.remove(PROCESSING_HANDOFF_RUNTIME_SESSION_ID)
+            job.remove(PROCESSING_HANDOFF_OPERATION_ID)
+            job.remove(PROCESSING_HANDOFF_KIND)
+            job.remove(PROCESSING_HANDOFF_CREATED_AT)
             job.put("processingAttemptId", attempt.id)
                 .put("processingStartedAt", attempt.startedAt)
                 .put("processingMode", attempt.mode)

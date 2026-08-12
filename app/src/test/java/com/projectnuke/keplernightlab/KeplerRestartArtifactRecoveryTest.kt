@@ -47,6 +47,21 @@ class KeplerRestartArtifactRecoveryTest {
     }
 
     @Test
+    fun parseableButUnsupportedMetadataTempIsPreserved() {
+        val dir = Files.createTempDirectory("metadata-temp-invalid-").toFile()
+        try {
+            java.io.File(dir, ".job.json.1.tmp").writeText(JSONObject()
+                .put("schemaVersion", 99)
+                .put("jobType", "UNKNOWN")
+                .put("status", "PROCESSING")
+                .toString())
+            val result = reconcileJobMetadataWriteTemps(dir)
+            assertEquals(KeplerMetadataTempClassification.AMBIGUOUS, result.classification)
+            assertTrue(java.io.File(dir, ".job.json.1.tmp").exists())
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
     fun oldActiveCaptureDeletesOnlyManifestOwnedTemp() {
         val dir = Files.createTempDirectory("capture-temp-recovery-").toFile()
         try {
