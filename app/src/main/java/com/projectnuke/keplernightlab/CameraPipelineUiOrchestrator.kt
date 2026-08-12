@@ -28,6 +28,8 @@ internal class CameraPipelineUiOrchestrator(
     private var terminalUiNotifiedGeneration: Long? = null
     private var terminalUiDeliveryOutcomeValue: TerminalUiDeliveryOutcome? = null
     private val staleTerminalUiNotifications = ArrayDeque<Long>()
+    private var launcherFailureValue: Throwable? = null
+    private var terminalFallbackDispatchFailureValue: Throwable? = null
 
     fun updateCallbacks(callbacks: Callbacks) {
         this.callbacks = callbacks
@@ -35,6 +37,11 @@ internal class CameraPipelineUiOrchestrator(
 
     internal fun terminalUiDeliveryOutcome(): TerminalUiDeliveryOutcome? =
         synchronized(this) { terminalUiDeliveryOutcomeValue }
+
+    internal fun launcherFailure(): Throwable? = synchronized(this) { launcherFailureValue }
+
+    internal fun terminalFallbackDispatchFailure(): Throwable? =
+        synchronized(this) { terminalFallbackDispatchFailureValue }
 
     /** Retries only the UI notification; it never asks the native pipeline to republish. */
     internal fun reconcileTerminalUiDelivery(): CameraUiDispatchOutcome {
@@ -55,6 +62,10 @@ internal class CameraPipelineUiOrchestrator(
         return dispatchTerminalNotification(terminal)
     }
 
+    /**
+     * Returns true only when the asynchronous job launch was scheduled. A busy/rejected request or
+     * a proven pre-resource scheduling failure returns false; job-body failures settle separately.
+     */
     fun start(
         startMessage: String,
         requestedFrames: Int = 0,
@@ -72,6 +83,8 @@ internal class CameraPipelineUiOrchestrator(
             pendingTerminal = null
             terminalUiNotifiedGeneration = null
             terminalUiDeliveryOutcomeValue = null
+            launcherFailureValue = null
+            terminalFallbackDispatchFailureValue = null
         }
         val token = operation.cancellationToken
         val captureCancellation = operation.captureCancellation
@@ -80,10 +93,12 @@ internal class CameraPipelineUiOrchestrator(
 
         lateinit var watchdog: Runnable
         watchdog = Runnable {
+            session.clearWatchdog(generation)?.let(scheduler::remove)
             if (!session.requestCancellation(generation, "watchdog timeout")) return@Runnable
             callbacks.onStatus("CAPTURE_TIMEOUT: Cancellation requested; waiting for terminal settlement.")
             callbacks.onStateChanged()
             val fallback = Runnable {
+                session.clearTerminalFallback(generation)
                 if (session.markTerminalDeliveryFailed(
                         generation,
                         "CAPTURE_TIMEOUT: Terminal delivery unresolved; capture remains blocked."
@@ -93,11 +108,22 @@ internal class CameraPipelineUiOrchestrator(
                     callbacks.onStateChanged()
                 }
             }
-            when (scheduler.post(15_000L, fallback)) {
+            session.attachTerminalFallback(generation, fallback)
+            when (postSafely(15_000L, fallback)) {
                 CameraUiDispatchOutcome.ACCEPTED -> Unit
                 CameraUiDispatchOutcome.REJECTED,
-                CameraUiDispatchOutcome.DISPATCH_THREW ->
-                    Log.e(TAG, "terminal fallback dispatch failed generation=$generation")
+                CameraUiDispatchOutcome.DISPATCH_THREW -> {
+                    session.clearTerminalFallback(generation)
+                    recordTerminalFallbackDispatchFailure(IllegalStateException("terminal fallback dispatch failed"))
+                    if (session.markTerminalDeliveryFailed(
+                            generation,
+                            "CAPTURE_TIMEOUT: Terminal delivery fallback could not be scheduled; capture remains blocked."
+                        )
+                    ) {
+                        callbacks.onStatus("CAPTURE_TIMEOUT: Terminal delivery fallback could not be scheduled; capture remains blocked.")
+                        callbacks.onStateChanged()
+                    }
+                }
             }
         }
         session.attachWatchdog(generation, watchdog)
@@ -130,7 +156,7 @@ internal class CameraPipelineUiOrchestrator(
                     synchronized(this@CameraPipelineUiOrchestrator) {
                         pendingTerminal = terminal
                     }
-                    session.clearWatchdog(generation)?.let(scheduler::remove)
+                    clearScheduledWork(generation)
                     dispatchTerminalNotification(terminal)
                 }
                 CameraPipelineUiSession.EventResult.DUPLICATE_TERMINAL -> Unit
@@ -200,14 +226,7 @@ internal class CameraPipelineUiOrchestrator(
             } catch (_: CancellationException) {
                 // The pipeline must still publish terminal evidence.
             } catch (failure: Exception) {
-                acceptEvent(
-                    CameraPipelineEvent.Terminal(
-                        generation = generation,
-                        kind = CameraPipelineEvent.Terminal.Kind.FAILED,
-                        captureResourcesSettled = false,
-                        message = "PIPELINE_FAILED: ${failure.javaClass.simpleName}"
-                    )
-                )
+                recordLauncherFailure(generation, failure)
             }
         }
         session.attachScheduledStart(generation, jobStart)
@@ -224,6 +243,7 @@ internal class CameraPipelineUiOrchestrator(
                     callbacks.onStatus("PIPELINE_FAILED: Capture could not be scheduled before Camera2 acquisition.")
                     callbacks.onStateChanged()
                 }
+                return false
             }
         }
         return true
@@ -238,6 +258,51 @@ internal class CameraPipelineUiOrchestrator(
     private fun clearScheduledWork(generation: Long) {
         session.clearWatchdog(generation)?.let(scheduler::remove)
         session.clearScheduledStart(generation)?.let(scheduler::remove)
+        session.clearTerminalFallback(generation)?.let(scheduler::remove)
+    }
+
+    private fun recordLauncherFailure(generation: Long, failure: Throwable) {
+        synchronized(this) {
+            launcherFailureValue = failure
+        }
+        val message = "PIPELINE_FAILED: ${failure.javaClass.simpleName}"
+        if (!session.markLauncherFailureAwaitingTerminal(generation, message)) return
+        session.clearWatchdog(generation)?.let(scheduler::remove)
+        session.clearScheduledStart(generation)?.let(scheduler::remove)
+        val fallback = Runnable {
+            session.clearTerminalFallback(generation)
+            if (session.markTerminalDeliveryFailed(
+                    generation,
+                    "PIPELINE_FAILED: Terminal delivery unresolved after launcher failure; capture remains blocked."
+                )
+            ) {
+                callbacks.onStatus("PIPELINE_FAILED: Terminal delivery unresolved after launcher failure; capture remains blocked.")
+                callbacks.onStateChanged()
+            }
+        }
+        session.attachTerminalFallback(generation, fallback)
+        when (postSafely(15_000L, fallback)) {
+            CameraUiDispatchOutcome.ACCEPTED -> Unit
+            CameraUiDispatchOutcome.REJECTED,
+            CameraUiDispatchOutcome.DISPATCH_THREW -> {
+                session.clearTerminalFallback(generation)
+                recordTerminalFallbackDispatchFailure(IllegalStateException("launcher failure terminal fallback dispatch failed"))
+                if (session.markTerminalDeliveryFailed(
+                        generation,
+                        "PIPELINE_FAILED: Terminal delivery fallback could not be scheduled; capture remains blocked."
+                    )
+                ) {
+                    callbacks.onStatus("PIPELINE_FAILED: Terminal delivery fallback could not be scheduled; capture remains blocked.")
+                    callbacks.onStateChanged()
+                }
+            }
+        }
+    }
+
+    private fun recordTerminalFallbackDispatchFailure(failure: Throwable) {
+        synchronized(this) {
+            terminalFallbackDispatchFailureValue = failure
+        }
     }
 
     private fun postSafely(delayMillis: Long, work: Runnable): CameraUiDispatchOutcome = try {

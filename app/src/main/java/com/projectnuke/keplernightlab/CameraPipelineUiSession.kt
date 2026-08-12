@@ -56,6 +56,7 @@ internal class CameraPipelineUiSession {
     private var disposed = false
     private var scheduledStart: Runnable? = null
     private var watchdog: Runnable? = null
+    private var terminalFallback: Runnable? = null
     private var current = Snapshot()
 
     @Synchronized
@@ -67,6 +68,10 @@ internal class CameraPipelineUiSession {
             !terminalClaimed &&
             current.phase != Phase.UNRESOLVED &&
             current.phase != Phase.DISPOSED
+
+    @Synchronized
+    fun hasTerminalClaimed(localGeneration: Long): Boolean =
+        isCurrentLocked(localGeneration) && terminalClaimed
 
     @Synchronized
     fun currentOperation(): Operation? = operation?.takeIf { current.isBusy }
@@ -120,6 +125,19 @@ internal class CameraPipelineUiSession {
     fun clearWatchdog(localGeneration: Long): Runnable? {
         if (!isCurrentLocked(localGeneration)) return null
         return watchdog.also { watchdog = null }
+    }
+
+    @Synchronized
+    fun attachTerminalFallback(localGeneration: Long, runnable: Runnable): Boolean {
+        if (!isCurrentLocked(localGeneration)) return false
+        terminalFallback = runnable
+        return true
+    }
+
+    @Synchronized
+    fun clearTerminalFallback(localGeneration: Long): Runnable? {
+        if (!isCurrentLocked(localGeneration)) return null
+        return terminalFallback.also { terminalFallback = null }
     }
 
     @Synchronized
@@ -194,6 +212,29 @@ internal class CameraPipelineUiSession {
             ),
             previewAllowed = true,
             captureResourcesSettled = true
+        )
+        return true
+    }
+
+    /** Records an unknown launcher failure without claiming that capture resources settled. */
+    @Synchronized
+    fun markLauncherFailureAwaitingTerminal(localGeneration: Long, message: String): Boolean {
+        val active = operation.takeIf { isCurrentLocked(localGeneration) } ?: return false
+        if (terminalClaimed || current.phase == Phase.TERMINAL ||
+            current.phase == Phase.WAITING_FOR_TERMINAL || current.phase == Phase.UNRESOLVED
+        ) {
+            return false
+        }
+        if (!current.cancellationRequested) {
+            active.cancellationToken.cancel()
+            active.captureCancellation.cancelCapture("camera pipeline launcher failed: $message")
+        }
+        current = current.copy(
+            phase = Phase.WAITING_FOR_TERMINAL,
+            cancellationRequested = true,
+            captureProgress = current.captureProgress.copy(message = message),
+            previewAllowed = false,
+            captureResourcesSettled = false
         )
         return true
     }
@@ -286,6 +327,7 @@ internal class CameraPipelineUiSession {
         }
         scheduledStart = null
         watchdog = null
+        terminalFallback = null
         current = current.copy(phase = Phase.DISPOSED, previewAllowed = false)
         return true
     }
