@@ -74,4 +74,20 @@ class KeplerRecoveryCoordinatorTest {
             root.deleteRecursively()
         }
     }
+
+    @Test
+    fun unresolvedReprocessQuarantineStopsGenericRecovery() {
+        val root = File(Files.createTempDirectory("kepler-recovery-quarantine-").toFile(), "KeplerRawFusion").apply { mkdirs() }
+        val job = File(root, "KPL_RAW_FUSION_quarantine").apply { mkdirs() }
+        try {
+            KeplerJobMetadata.write(job, JSONObject().put("status", "PROCESSING").put("activeOperationId", "old"))
+            File(job, ".reprocess_unresolved").writeText("unresolved")
+            val evidence = File(job, ".processing_tx_keep.json").apply { writeText("preserve") }
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root))
+            assertEquals(KeplerJobRecoveryClassification.REPROCESS_QUARANTINED, report.jobs.single().classification)
+            assertTrue(evidence.exists())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
 }

@@ -42,6 +42,35 @@ internal fun recoverMediaStoreExportJournals(
     recoverMediaStoreExportJournal(jobDir, journal, access)
 }
 
+internal fun reconstructRawSidecarJournalEvidence(
+    jobDir: File,
+    job: org.json.JSONObject,
+    journals: List<MediaStoreExportJournal> = MediaStoreExportJournal.list(jobDir)
+): Int {
+    val verified = journals.filter {
+        it.role == MediaStoreExportRole.RAW_DNG_SIDECAR &&
+            it.frameIndex != null &&
+            it.uri != null &&
+            (it.state == MediaStoreExportState.VERIFIED || it.state == MediaStoreExportState.TERMINAL_PERSISTED)
+    }.associateBy { it.frameIndex }
+    var count = 0
+    val frames = job.optJSONArray("frames") ?: return 0
+    for (index in 0 until frames.length()) {
+        val frame = frames.optJSONObject(index) ?: continue
+        val frameIndex = frame.optInt("frameIndex", frame.optInt("index", index))
+        val journal = verified[frameIndex] ?: continue
+        frame.put("dngSidecarPublicStatus", "PUBLIC_EXPORTED")
+            .put("publicDngUri", journal.uri)
+            .remove("publicDngError")
+        count += 1
+    }
+    if (count > 0) {
+        job.put("rawSidecarPublicExportedCount", count)
+            .put("rawSidecarRecoveryEvidence", "DURABLE_EXPORT_JOURNAL")
+    }
+    return count
+}
+
 private fun recoverMediaStoreExportJournal(
     jobDir: File,
     journal: MediaStoreExportJournal,
@@ -172,4 +201,3 @@ private fun verifyDngJournalContent(context: Context, uri: Uri, journal: MediaSt
     } ?: return false
     return size == expectedSize && digest.digest().joinToString("") { "%02x".format(it) } == expectedSha
 }
-

@@ -177,6 +177,16 @@ internal object KeplerRecoveryCoordinator {
                         .put("recoveryMessage", "공개 내보내기 증거를 확인할 수 없어 복구가 필요합니다.")
                 }
             }
+            if (exportResults.isNotEmpty()) {
+                val reconstructed = reconstructRawSidecarJournalEvidence(jobDir, job)
+                if (reconstructed > 0) {
+                    KeplerJobMetadata.update(jobDir) { current ->
+                        reconstructRawSidecarJournalEvidence(jobDir, current, exportResults.mapNotNull { result ->
+                            MediaStoreExportJournal.list(jobDir).firstOrNull { it.exportAttemptId == result.attemptId }
+                        })
+                    }
+                }
+            }
             val activeOperation = job.optString(ACTIVE_OPERATION_ID)
             val captureTemps = recoverCaptureOwnedTemps(jobDir, job, activeOperation.isNotBlank())
             if (activeOperation.isNotBlank()) {
