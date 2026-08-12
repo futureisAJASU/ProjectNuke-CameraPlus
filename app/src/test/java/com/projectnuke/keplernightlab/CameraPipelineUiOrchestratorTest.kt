@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CancellationException
 
 class CameraPipelineUiOrchestratorTest {
     private class ManualScheduler : CameraUiScheduler {
@@ -552,5 +553,210 @@ class CameraPipelineUiOrchestratorTest {
         assertEquals(2L, session.snapshot().generation)
         assertEquals(CameraPipelineUiSession.Phase.START_SCHEDULED, session.snapshot().phase)
         assertFalse(session.snapshot().previewAllowed)
+    }
+
+    @Test
+    fun cancellationBeforeJobStartIsProvenPreResourceTerminal() {
+        val session = CameraPipelineUiSession()
+        val scheduler = ManualScheduler()
+        val orchestrator = CameraPipelineUiOrchestrator(
+            session,
+            scheduler,
+            CameraPipelineUiOrchestrator.Callbacks({}, {}, {})
+        )
+        assertTrue(orchestrator.start("capture") { _, _, _, _ -> error("job must not start") })
+        val generation = session.snapshot().generation
+        assertTrue(session.requestCancellation(generation, "activity stopped"))
+        val watchdog = scheduler.entries.single { it.delay == 120_000L }.work
+
+        scheduler.run(250L)
+
+        assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
+        assertEquals(CameraPipelineEvent.Terminal.Kind.CANCELLED, session.snapshot().terminal?.kind)
+        assertTrue(session.snapshot().captureResourcesSettled)
+        assertTrue(session.snapshot().previewAllowed)
+        assertFalse(session.snapshot().isBusy)
+        assertTrue(scheduler.removed.contains(watchdog))
+    }
+
+    @Test
+    fun synchronousCancellationWaitsImmediatelyAndInstallsOneFallback() {
+        val session = CameraPipelineUiSession()
+        val scheduler = ManualScheduler()
+        val statuses = mutableListOf<String>()
+        var stateChanges = 0
+        var sink: CameraPipelineEventSink? = null
+        val orchestrator = CameraPipelineUiOrchestrator(
+            session,
+            scheduler,
+            CameraPipelineUiOrchestrator.Callbacks(statuses::add, { stateChanges++ }, {})
+        )
+        assertTrue(orchestrator.start("capture") { _, _, _, events ->
+            sink = events
+            throw CancellationException("cancelled before owner launch")
+        })
+        val watchdog = scheduler.entries.single { it.delay == 120_000L }.work
+
+        scheduler.run(250L)
+
+        assertEquals(CameraPipelineUiSession.Phase.WAITING_FOR_TERMINAL, session.snapshot().phase)
+        assertEquals(null, session.snapshot().terminal)
+        assertFalse(session.hasTerminalClaimed(session.snapshot().generation))
+        assertTrue(session.snapshot().cancellationRequested)
+        assertFalse(session.snapshot().captureResourcesSettled)
+        assertFalse(session.snapshot().previewAllowed)
+        assertTrue(session.snapshot().isBusy)
+        assertTrue(scheduler.removed.contains(watchdog))
+        assertEquals(1, scheduler.entries.count { it.delay == 15_000L })
+        assertTrue(statuses.contains("취소 요청을 처리하고 있습니다."))
+        assertTrue(stateChanges >= 2)
+        assertTrue(sink != null)
+    }
+
+    @Test
+    fun synchronousCancellationThenRealTerminalKindsRecoverAndRemoveFallback() {
+        listOf(
+            CameraPipelineEvent.Terminal.Kind.CANCELLED,
+            CameraPipelineEvent.Terminal.Kind.FAILED,
+            CameraPipelineEvent.Terminal.Kind.COMPLETE,
+            CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+        ).forEach { kind ->
+            val session = CameraPipelineUiSession()
+            val scheduler = ManualScheduler()
+            var sink: CameraPipelineEventSink? = null
+            var terminalEffects = 0
+            val orchestrator = CameraPipelineUiOrchestrator(
+                session,
+                scheduler,
+                CameraPipelineUiOrchestrator.Callbacks({}, {}, { terminalEffects++ })
+            )
+            assertTrue(orchestrator.start("capture") { _, _, _, events ->
+                sink = events
+                throw CancellationException("cancelled synchronously")
+            })
+            scheduler.run(250L)
+            val fallback = scheduler.entries.single { it.delay == 15_000L }.work
+
+            sink!!.invoke(
+                CameraPipelineEvent.Terminal(
+                    generation = 0L,
+                    kind = kind,
+                    requiredOutputCommitted = kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+                    publicExportCommitted = kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+                    verified = kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+                    captureResourcesSettled = true
+                )
+            )
+            assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
+            assertEquals(kind, session.snapshot().terminal?.kind)
+            assertFalse(session.snapshot().isBusy)
+            assertTrue(session.snapshot().previewAllowed)
+            assertTrue(scheduler.removed.contains(fallback))
+            scheduler.run(0L)
+            assertEquals(1, terminalEffects)
+        }
+    }
+
+    @Test
+    fun synchronousCancellationPreservesCompletePartialFacts() {
+        val session = CameraPipelineUiSession()
+        val scheduler = ManualScheduler()
+        var sink: CameraPipelineEventSink? = null
+        var terminalEffects = 0
+        val orchestrator = CameraPipelineUiOrchestrator(
+            session,
+            scheduler,
+            CameraPipelineUiOrchestrator.Callbacks({}, {}, { terminalEffects++ })
+        )
+        assertTrue(orchestrator.start("capture") { _, _, _, events ->
+            sink = events
+            throw CancellationException("cancelled synchronously")
+        })
+        scheduler.run(250L)
+        sink!!.invoke(
+            CameraPipelineEvent.Terminal(
+                generation = 0L,
+                kind = CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+                requiredOutputCommitted = true,
+                publicExportCommitted = true,
+                verified = true,
+                captureResourcesSettled = true
+            )
+        )
+        scheduler.run(0L)
+
+        assertEquals(CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL, session.snapshot().terminal?.kind)
+        assertTrue(session.snapshot().terminal?.requiredOutputCommitted == true)
+        assertTrue(session.snapshot().terminal?.publicExportCommitted == true)
+        assertTrue(session.snapshot().terminal?.verified == true)
+        assertFalse(session.snapshot().isBusy)
+        assertTrue(session.snapshot().previewAllowed)
+        assertEquals(1, terminalEffects)
+    }
+
+    @Test
+    fun synchronousCancellationFallbackBecomesUnresolvedAndLateTerminalRecovers() {
+        val session = CameraPipelineUiSession()
+        val scheduler = ManualScheduler()
+        var sink: CameraPipelineEventSink? = null
+        var terminalEffects = 0
+        val orchestrator = CameraPipelineUiOrchestrator(
+            session,
+            scheduler,
+            CameraPipelineUiOrchestrator.Callbacks({}, {}, { terminalEffects++ })
+        )
+        assertTrue(orchestrator.start("capture") { _, _, _, events ->
+            sink = events
+            throw CancellationException("cancelled synchronously")
+        })
+        scheduler.run(250L)
+        scheduler.run(15_000L)
+
+        assertEquals(CameraPipelineUiSession.Phase.UNRESOLVED, session.snapshot().phase)
+        assertEquals(null, session.snapshot().terminal)
+        assertFalse(session.hasTerminalClaimed(session.snapshot().generation))
+        assertFalse(session.snapshot().captureResourcesSettled)
+        assertFalse(session.snapshot().previewAllowed)
+        assertTrue(session.snapshot().isBusy)
+
+        sink!!.invoke(
+            CameraPipelineEvent.Terminal(
+                generation = 0L,
+                kind = CameraPipelineEvent.Terminal.Kind.CANCELLED,
+                captureResourcesSettled = true
+            )
+        )
+        assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
+        assertEquals(CameraPipelineEvent.Terminal.Kind.CANCELLED, session.snapshot().terminal?.kind)
+        assertFalse(session.snapshot().isBusy)
+        assertEquals(0, terminalEffects)
+    }
+
+    @Test
+    fun synchronousCancellationAfterNativeTerminalDoesNotInstallFallbackOrDuplicateEffects() {
+        val session = CameraPipelineUiSession()
+        val scheduler = ManualScheduler()
+        var terminalEffects = 0
+        val orchestrator = CameraPipelineUiOrchestrator(
+            session,
+            scheduler,
+            CameraPipelineUiOrchestrator.Callbacks({}, {}, { terminalEffects++ })
+        )
+        assertTrue(orchestrator.start("capture") { _, _, _, events ->
+            events(
+                CameraPipelineEvent.Terminal(
+                    generation = 0L,
+                    kind = CameraPipelineEvent.Terminal.Kind.COMPLETE,
+                    captureResourcesSettled = true
+                )
+            )
+            throw CancellationException("late cancellation")
+        })
+        scheduler.run(250L)
+
+        assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
+        assertFalse(scheduler.entries.any { it.delay == 15_000L })
+        scheduler.run(0L)
+        assertEquals(1, terminalEffects)
     }
 }
