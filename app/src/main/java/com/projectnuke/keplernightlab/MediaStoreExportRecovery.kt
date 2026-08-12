@@ -112,8 +112,7 @@ internal fun reconstructMainExportEvidence(
         .mapNotNull { candidate ->
             val result = resultByAttempt[candidate.exportAttemptId]
             val verified = result?.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
-                result?.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED ||
-                candidate.state == MediaStoreExportState.VERIFIED
+                result?.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED
             val committed = verified || result?.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED
             if (!committed) null else candidate to verified
         }

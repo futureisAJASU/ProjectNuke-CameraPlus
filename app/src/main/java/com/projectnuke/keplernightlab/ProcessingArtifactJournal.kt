@@ -183,22 +183,26 @@ internal fun recoverProcessingArtifactJournals(
     fun valid(file: File?, prior: Boolean = false): Boolean = file != null && runCatching {
         verifyProcessingArtifactRecovery(journal, file, prior)
     }.isSuccess
-    fun deleteExact(file: File?) { file?.let { settleProcessingArtifactPath(it) } }
-    fun settleJournalIfOwned(journal: ProcessingArtifactJournal): Boolean {
-        journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED)
-            .deleteIfOwned(jobDir)
-        return true
+    fun deleteExact(file: File?): Boolean = file == null || settleProcessingArtifactPath(file).status != ProcessingArtifactSettlementStatus.DELETE_FAILED
+    fun movePriorToFinal(source: File, destination: File) {
+        require(NoFollowFileSystem.isRealFile(source.toPath()))
+        require(!java.nio.file.Files.isSymbolicLink(destination.toPath()))
+        try {
+            Files.move(source.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE)
+        } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+            Files.move(source.toPath(), destination.toPath())
+        }
     }
     when (journal.state) {
         ProcessingArtifactJournalState.PREPARED,
         ProcessingArtifactJournalState.TEMP_WRITTEN,
         ProcessingArtifactJournalState.TEMP_VERIFIED -> {
             if (final != null && valid(final)) {
-                deleteExact(temp)
+                if (!deleteExact(temp)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "temporary cleanup failed")
                 journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED).deleteIfOwned(jobDir)
                 ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT)
             } else {
-                deleteExact(temp)
+                if (!deleteExact(temp)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "temporary cleanup failed")
                 journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED).deleteIfOwned(jobDir)
                 ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.SETTLED_TEMP)
             }
@@ -207,15 +211,15 @@ internal fun recoverProcessingArtifactJournals(
         ProcessingArtifactJournalState.ROLLBACK_STARTED -> when {
             final == null && valid(prior, prior = true) -> {
                 val priorFile = prior ?: return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS)
-                Files.move(priorFile.toPath(), File(jobDir, journal.finalName).toPath(), StandardCopyOption.REPLACE_EXISTING)
+                movePriorToFinal(priorFile, File(jobDir, journal.finalName))
                 val restored = NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true)
                 if (!valid(restored, prior = true)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "restored prior failed verification")
-                deleteExact(temp)
+                if (!deleteExact(temp)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "temporary cleanup failed after prior restoration")
                 journal.transition(jobDir, ProcessingArtifactJournalState.PRIOR_RESTORED).transition(jobDir, ProcessingArtifactJournalState.SETTLED).deleteIfOwned(jobDir)
                 ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.RESTORED_PRIOR)
             }
             valid(final) -> {
-                deleteExact(temp)
+                if (!deleteExact(temp)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "temporary cleanup failed")
                 val priorSettlement = prior?.let {
                     settleProcessingArtifactPath(it, ProcessingArtifactResourceRole.PRIOR_BACKUP)
                 }
@@ -245,10 +249,10 @@ internal fun recoverProcessingArtifactJournals(
             }
             valid(prior, prior = true) -> {
                 val priorFile = prior ?: return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS)
-                Files.move(priorFile.toPath(), File(jobDir, journal.finalName).toPath(), StandardCopyOption.REPLACE_EXISTING)
+                movePriorToFinal(priorFile, File(jobDir, journal.finalName))
                 val restored = NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true)
                 if (!valid(restored, prior = true)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "restored prior failed verification")
-                deleteExact(temp)
+                if (!deleteExact(temp)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "temporary cleanup failed after prior restoration")
                 journal.transition(jobDir, ProcessingArtifactJournalState.PRIOR_RESTORED).transition(jobDir, ProcessingArtifactJournalState.SETTLED).deleteIfOwned(jobDir)
                 ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.RESTORED_PRIOR)
             }

@@ -224,6 +224,12 @@ internal object KeplerRecoveryCoordinator {
                         result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
                             result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED
                     }
+                    .filter { result ->
+                        MediaStoreExportJournal.list(jobDir).any { journal ->
+                            journal.exportAttemptId == result.attemptId &&
+                                (activeOperation.isBlank() || journal.ownerOperationId == activeOperation)
+                        }
+                    }
                     .mapTo(mutableSetOf()) { it.attemptId }
                 job = KeplerJobMetadata.update(jobDir) { current ->
                     reconstructRawSidecarJournalEvidence(
