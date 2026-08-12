@@ -163,6 +163,9 @@ private fun recoverMediaStoreExportJournal(
         )
     }
     if (!inspection.exists) {
+        if (journal.state == MediaStoreExportState.VERIFIED) {
+            journal.transition(jobDir, MediaStoreExportState.PUBLIC_COMMITTED)
+        }
         return MediaStoreExportRecoveryResult(
             journal.exportAttemptId,
             MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING,
@@ -202,6 +205,9 @@ private fun recoverMediaStoreExportJournal(
         )
     }
     if (!inspection.verified) {
+        if (journal.state == MediaStoreExportState.VERIFIED) {
+            journal.transition(jobDir, MediaStoreExportState.PUBLIC_COMMITTED)
+        }
         return MediaStoreExportRecoveryResult(
             journal.exportAttemptId,
             MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED,

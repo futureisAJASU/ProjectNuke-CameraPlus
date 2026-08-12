@@ -96,6 +96,18 @@ class MediaStoreExportRecoveryTest {
     }
 
     @Test
+    fun verificationFailureDowngradesLegacyVerifiedJournalWithoutDeletingUri() {
+        val dir = Files.createTempDirectory("media-recovery-downgrade-").toFile()
+        try {
+            journal(dir, MediaStoreExportState.VERIFIED)
+            val result = recoverMediaStoreExportJournals(dir, FakeAccess(pending = false, verified = false)).single()
+            assertEquals(MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED, result.classification)
+            assertEquals(MediaStoreExportState.PUBLIC_COMMITTED, MediaStoreExportJournal.list(dir).single().state)
+            assertTrue(MediaStoreExportJournal.list(dir).single().uri!!.contains("/7"))
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
     fun insertWithoutUriIsAmbiguousAndJournalIsPreserved() {
         val dir = Files.createTempDirectory("media-recovery-unknown-").toFile()
         try {
