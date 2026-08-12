@@ -211,9 +211,7 @@ internal object KeplerRecoveryCoordinator {
             val activeOperation = job.optString(ACTIVE_OPERATION_ID)
             val captureTemps = recoverCaptureOwnedTemps(jobDir, job, activeOperation.isNotBlank())
             if (activeOperation.isNotBlank()) {
-                val artifactResults = recoverProcessingArtifactJournals(jobDir) { artifact ->
-                    check(NoFollowFileSystem.digestVerified(artifact).size > 0L)
-                }
+                val artifactResults = recoverProcessingArtifactJournals(jobDir)
                 val artifactFailure = artifactResults.firstOrNull {
                     it.classification == ProcessingArtifactRecoveryClassification.AMBIGUOUS ||
                         it.classification == ProcessingArtifactRecoveryClassification.INVALID_JOURNAL

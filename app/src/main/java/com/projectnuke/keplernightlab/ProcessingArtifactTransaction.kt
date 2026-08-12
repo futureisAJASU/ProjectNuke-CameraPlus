@@ -155,7 +155,7 @@ internal fun commitProcessingArtifact(
     var priorBackedUp = false
     var newFinalCommitted = false
     var priorRestored = false
-    val journal = ProcessingArtifactJournal.create(
+    var journal = ProcessingArtifactJournal.create(
         jobDir = parent,
         transactionId = UUID.randomUUID().toString(),
         processingAttemptId = processingAttemptId,
@@ -165,8 +165,17 @@ internal fun commitProcessingArtifact(
         priorName = priorBackup.name
     )
 
-    fun journalTransition(state: ProcessingArtifactJournalState) {
-        journal.transition(parent, state)
+    fun journalTransition(
+        next: ProcessingArtifactJournalState,
+        evidence: NoFollowFileSystem.StreamDigest? = null
+    ) {
+        journal = journal.transition(
+            parent,
+            next,
+            verificationKindOverride = evidence?.let { finalFile.extension.uppercase().ifBlank { "BINARY" } } ?: journal.verificationKind,
+            expectedSizeBytesOverride = evidence?.size ?: journal.expectedSizeBytes,
+            expectedSha256Override = evidence?.sha256 ?: journal.expectedSha256
+        )
     }
 
     fun notifySettlement(report: ProcessingArtifactSettlementReport) {
@@ -188,19 +197,25 @@ internal fun commitProcessingArtifact(
         state = ProcessingArtifactState.TEMP_OWNED
         writeTemp(temp)
         journalTransition(ProcessingArtifactJournalState.TEMP_WRITTEN)
-        check(Files.isRegularFile(temp.toPath(), LinkOption.NOFOLLOW_LINKS) && temp.length() > 0L) {
-            "Artifact temp verification failed"
-        }
+        check(Files.isRegularFile(temp.toPath(), LinkOption.NOFOLLOW_LINKS) && temp.length() > 0L) { "Artifact temp verification failed" }
+        verifyFinal(temp)
+        val tempEvidence = NoFollowFileSystem.digestVerified(temp)
         state = ProcessingArtifactState.TEMP_VERIFIED
-        journalTransition(ProcessingArtifactJournalState.TEMP_VERIFIED)
+        journalTransition(ProcessingArtifactJournalState.TEMP_VERIFIED, tempEvidence)
         checkCancelled()
 
         if (existingRegularArtifact(finalFile)) {
             journalTransition(ProcessingArtifactJournalState.PRIOR_BACKED_UP)
+            val priorEvidence = NoFollowFileSystem.digestVerified(finalFile)
             move(finalFile, priorBackup)
             priorBackedUp = true
             state = ProcessingArtifactState.PRIOR_FINAL_BACKED_UP
-            journalTransition(ProcessingArtifactJournalState.PRIOR_BACKED_UP)
+            journal = journal.transition(
+                parent,
+                ProcessingArtifactJournalState.PRIOR_BACKED_UP,
+                priorExpectedSizeBytesOverride = priorEvidence.size,
+                priorExpectedSha256Override = priorEvidence.sha256
+            )
         }
 
         checkCancelled()

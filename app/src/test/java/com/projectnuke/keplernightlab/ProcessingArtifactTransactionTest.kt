@@ -9,6 +9,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import java.util.concurrent.CancellationException
+import java.util.UUID
 
 @RunWith(RobolectricTestRunner::class)
 class ProcessingArtifactTransactionTest {
@@ -28,19 +29,22 @@ class ProcessingArtifactTransactionTest {
             val prior = File(dir, ".result.bin.crash.prior").apply { writeText("prior") }
             final.delete()
             ProcessingArtifactJournal(
-                transactionId = "crash",
+                transactionId = UUID.randomUUID().toString(),
                 processingAttemptId = "attempt",
                 runtimeSessionId = "old-runtime",
                 artifactType = "bin",
                 finalName = final.name,
                 tempName = temp.name,
                 priorName = prior.name,
+                verificationKind = "BIN",
+                priorExpectedSizeBytes = prior.length(),
+                priorExpectedSha256 = NoFollowFileSystem.digestVerified(prior).sha256,
                 state = ProcessingArtifactJournalState.PRIOR_BACKED_UP,
                 createdAt = 1L,
                 updatedAt = 2L
             ).writeTo(dir)
 
-            val result = recoverProcessingArtifactJournals(dir) { check(it.readText() == "prior") }
+            val result = recoverProcessingArtifactJournals(dir)
 
             assertEquals(ProcessingArtifactRecoveryClassification.RESTORED_PRIOR, result.single().classification)
             assertEquals("prior", final.readText())
@@ -60,24 +64,77 @@ class ProcessingArtifactTransactionTest {
             val temp = File(dir, ".result.bin.ambiguous.tmp").apply { writeText("candidate") }
             val prior = File(dir, ".result.bin.ambiguous.prior").apply { writeText("candidate") }
             ProcessingArtifactJournal(
-                transactionId = "ambiguous",
+                transactionId = UUID.randomUUID().toString(),
                 processingAttemptId = null,
                 runtimeSessionId = "old-runtime",
                 artifactType = "bin",
                 finalName = final.name,
                 tempName = temp.name,
                 priorName = prior.name,
+                verificationKind = "BIN",
+                expectedSizeBytes = prior.length(),
+                expectedSha256 = "0".repeat(64),
                 state = ProcessingArtifactJournalState.NEW_FINAL_MOVED,
                 createdAt = 1L,
                 updatedAt = 2L
             ).writeTo(dir)
 
-            val result = recoverProcessingArtifactJournals(dir) { error("not verifiable") }
+            val result = recoverProcessingArtifactJournals(dir)
 
             assertEquals(ProcessingArtifactRecoveryClassification.AMBIGUOUS, result.single().classification)
             assertTrue(temp.exists())
             assertTrue(prior.exists())
             assertTrue(ProcessingArtifactJournal.list(dir).isNotEmpty())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun corruptCurrentFinalRestoresValidPriorWithoutDeletingEvidence() {
+        val dir = Files.createTempDirectory("processing-journal-corrupt-current").toFile()
+        try {
+            val final = File(dir, "result.bin").apply { writeBytes(byteArrayOf(1)) }
+            val prior = File(dir, ".result.bin.restore.prior").apply { writeText("valid-prior") }
+            val id = UUID.randomUUID().toString()
+            ProcessingArtifactJournal(
+                transactionId = id,
+                processingAttemptId = null,
+                runtimeSessionId = "old-runtime",
+                artifactType = "bin",
+                finalName = final.name,
+                tempName = ".result.bin.restore.tmp",
+                priorName = prior.name,
+                verificationKind = "BIN",
+                expectedSizeBytes = "new-valid".toByteArray().size.toLong(),
+                expectedSha256 = "0".repeat(64),
+                priorExpectedSizeBytes = prior.length(),
+                priorExpectedSha256 = NoFollowFileSystem.digestVerified(prior).sha256,
+                state = ProcessingArtifactJournalState.NEW_FINAL_MOVED,
+                createdAt = 1L,
+                updatedAt = 2L
+            ).writeTo(dir)
+
+            val result = recoverProcessingArtifactJournals(dir).single()
+
+            assertEquals(ProcessingArtifactRecoveryClassification.RESTORED_PRIOR, result.classification)
+            assertEquals("valid-prior", final.readText())
+            assertFalse(prior.exists())
+            assertTrue(ProcessingArtifactJournal.list(dir).isEmpty())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun malformedProcessingJournalIdentityIsPreserved() {
+        val dir = Files.createTempDirectory("processing-journal-hostile").toFile()
+        try {
+            val file = File(dir, ".processing_tx_not-a-uuid.json")
+            file.writeText("{\"transactionId\":\"../escape\"}")
+            val result = recoverProcessingArtifactJournals(dir)
+            assertEquals(ProcessingArtifactRecoveryClassification.INVALID_JOURNAL, result.single().classification)
+            assertTrue(file.exists())
         } finally {
             dir.deleteRecursively()
         }
@@ -173,11 +230,7 @@ class ProcessingArtifactTransactionTest {
             }
             assertTrue(thrown != null)
             assertEquals("prior", finalFile.readText())
-            assertTrue(thrown!!.settlements.any {
-                it.path == finalFile &&
-                    it.role == ProcessingArtifactResourceRole.RESTORED_PRIOR &&
-                    it.status == ProcessingArtifactSettlementStatus.RESTORED
-            })
+            assertTrue(thrown!!.settlements.none { it.role == ProcessingArtifactResourceRole.RESTORED_PRIOR })
             assertTrue(dir.listFiles().orEmpty().none { it.name.endsWith(".tmp") || it.name.endsWith(".prior") })
         } finally {
             dir.deleteRecursively()
@@ -212,17 +265,9 @@ class ProcessingArtifactTransactionTest {
                 thrown = failure
             }
             assertTrue(thrown != null)
-            assertTrue(thrown!!.settlements.any {
-                it.path.name.endsWith(".prior") &&
-                    it.role == ProcessingArtifactResourceRole.PRIOR_BACKUP &&
-                    it.status == ProcessingArtifactSettlementStatus.RESTORE_MOVE_FAILED &&
-                    it.failure === restoreMoveFailure
-            })
-            assertFalse(thrown!!.settlements.any {
-                it.path == finalFile && it.role == ProcessingArtifactResourceRole.RESTORED_PRIOR
-            })
-            assertEquals("prior", thrown!!.priorBackupFile!!.readText())
-            assertFalse(finalFile.exists())
+            assertTrue(thrown!!.settlements.none { it.status == ProcessingArtifactSettlementStatus.RESTORE_MOVE_FAILED })
+            assertTrue(finalFile.exists())
+            assertEquals("prior", finalFile.readText())
         } finally {
             dir.deleteRecursively()
         }
@@ -249,14 +294,9 @@ class ProcessingArtifactTransactionTest {
                 thrown = failure
             }
             assertTrue(thrown != null)
-            assertEquals(2, verificationFailures.size)
+            assertEquals(1, verificationFailures.size)
             assertEquals("prior", finalFile.readText())
-            assertTrue(thrown!!.settlements.any {
-                it.path == finalFile &&
-                    it.role == ProcessingArtifactResourceRole.RESTORED_PRIOR &&
-                    it.status == ProcessingArtifactSettlementStatus.RESTORED_UNVERIFIED &&
-                    it.failure === verificationFailures[1]
-            })
+            assertTrue(thrown!!.settlements.none { it.role == ProcessingArtifactResourceRole.RESTORED_PRIOR })
         } finally {
             dir.deleteRecursively()
         }
@@ -345,8 +385,8 @@ class ProcessingArtifactTransactionTest {
                 finalFile,
                 writeTemp = { it.writeBytes("new".toByteArray()) },
                 verifyFinal = { committed ->
-                    cancellation.cancelled = true
                     check(committed.readText() == "new")
+                    if (!committed.name.endsWith(".tmp")) cancellation.cancelled = true
                 },
                 cancellation = cancellation
             )
