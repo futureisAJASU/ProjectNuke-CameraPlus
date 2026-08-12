@@ -198,6 +198,38 @@ class CameraPipelineUiSessionTest {
         assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
     }
 
+    @Test
+    fun launcherFailureWaitsWithoutClaimingTerminalAndCancelsExactlyOnce() {
+        val session = CameraPipelineUiSession()
+        val operation = (session.start("start", 1) as CameraPipelineUiSession.StartResult.Accepted).operation
+
+        assertTrue(session.markLauncherFailureAwaitingTerminal(operation.generation, "launcher failed"))
+        assertFalse(session.markLauncherFailureAwaitingTerminal(operation.generation, "launcher failed again"))
+        assertEquals(CameraPipelineUiSession.Phase.WAITING_FOR_TERMINAL, session.snapshot().phase)
+        assertEquals(null, session.snapshot().terminal)
+        assertFalse(session.hasTerminalClaimed(operation.generation))
+        assertTrue(session.snapshot().cancellationRequested)
+        assertFalse(session.snapshot().captureResourcesSettled)
+        assertFalse(session.snapshot().previewAllowed)
+        assertTrue(session.snapshot().isBusy)
+
+        assertEquals(
+            CameraPipelineUiSession.EventResult.ACCEPTED,
+            session.accept(
+                CameraPipelineEvent.Terminal(
+                    generation = operation.generation,
+                    kind = CameraPipelineEvent.Terminal.Kind.COMPLETE,
+                    requiredOutputCommitted = true,
+                    publicExportCommitted = true,
+                    verified = true,
+                    captureResourcesSettled = true
+                )
+            )
+        )
+        assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
+        assertFalse(session.snapshot().isBusy)
+    }
+
     private fun CameraPipelineEvent.copyGeneration(generation: Long): CameraPipelineEvent = when (this) {
         is CameraPipelineEvent.CaptureProgress -> copy(generation = generation)
         is CameraPipelineEvent.ProcessingStage -> copy(generation = generation)

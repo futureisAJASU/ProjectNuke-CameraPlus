@@ -87,7 +87,7 @@ class CameraPipelineUiOrchestratorTest {
             CameraPipelineUiOrchestrator.Callbacks({}, {}, {})
         )
 
-        assertTrue(orchestrator.start("capture") { _, _, _, _ -> starts++ })
+        assertFalse(orchestrator.start("capture") { _, _, _, _ -> starts++ })
         assertEquals(0, starts)
         assertFalse(session.snapshot().isBusy)
         assertTrue(session.snapshot().previewAllowed)
@@ -102,7 +102,7 @@ class CameraPipelineUiOrchestratorTest {
             scheduler,
             CameraPipelineUiOrchestrator.Callbacks({}, {}, {})
         )
-        assertTrue(orchestrator.start("capture") { _, _, _, _ -> })
+        assertFalse(orchestrator.start("capture") { _, _, _, _ -> })
         val staleWatchdog = scheduler.removed.first()
 
         assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
@@ -373,14 +373,15 @@ class CameraPipelineUiOrchestratorTest {
     }
 
     @Test
-    fun unexpectedJobLaunchExceptionDoesNotFabricateCaptureSettlement() {
+    fun unexpectedJobExceptionWaitsForRealCompleteTerminalAndPreservesFacts() {
         val session = CameraPipelineUiSession()
         val scheduler = ManualScheduler()
         var sink: CameraPipelineEventSink? = null
+        var terminalEffects = 0
         val orchestrator = CameraPipelineUiOrchestrator(
             session,
             scheduler,
-            CameraPipelineUiOrchestrator.Callbacks({}, {}, {})
+            CameraPipelineUiOrchestrator.Callbacks({}, {}, { terminalEffects++ })
         )
 
         orchestrator.start("capture") { _, _, _, events ->
@@ -390,10 +391,166 @@ class CameraPipelineUiOrchestratorTest {
         scheduler.run(250L)
 
         assertTrue(sink != null)
-        assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
-        assertEquals(CameraPipelineEvent.Terminal.Kind.FAILED, session.snapshot().terminal?.kind)
+        assertEquals(CameraPipelineUiSession.Phase.WAITING_FOR_TERMINAL, session.snapshot().phase)
+        assertEquals(null, session.snapshot().terminal)
+        assertFalse(session.hasTerminalClaimed(session.snapshot().generation))
         assertFalse(session.snapshot().captureResourcesSettled)
         assertTrue(session.snapshot().isBusy)
+        assertFalse(session.snapshot().previewAllowed)
+        assertEquals(0, terminalEffects)
+        assertTrue(orchestrator.launcherFailure() != null)
+
+        sink!!.invoke(
+            CameraPipelineEvent.Terminal(
+                generation = 0L,
+                kind = CameraPipelineEvent.Terminal.Kind.COMPLETE,
+                requiredOutputCommitted = true,
+                publicExportCommitted = true,
+                verified = true,
+                captureResourcesSettled = true,
+                message = "real complete"
+            )
+        )
+        assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
+        assertEquals(CameraPipelineEvent.Terminal.Kind.COMPLETE, session.snapshot().terminal?.kind)
+        assertTrue(session.snapshot().terminal?.requiredOutputCommitted == true)
+        assertTrue(session.snapshot().terminal?.publicExportCommitted == true)
+        assertTrue(session.snapshot().terminal?.verified == true)
+        assertFalse(session.snapshot().isBusy)
+        assertTrue(session.snapshot().previewAllowed)
+        scheduler.run(0L)
+        assertEquals(1, terminalEffects)
+    }
+
+    @Test
+    fun unexpectedJobExceptionWaitsForRealFailedCancelledAndPartialTerminals() {
+        listOf(
+            CameraPipelineEvent.Terminal.Kind.FAILED,
+            CameraPipelineEvent.Terminal.Kind.CANCELLED,
+            CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+        ).forEach { kind ->
+            val session = CameraPipelineUiSession()
+            val scheduler = ManualScheduler()
+            var sink: CameraPipelineEventSink? = null
+            val orchestrator = CameraPipelineUiOrchestrator(
+                session,
+                scheduler,
+                CameraPipelineUiOrchestrator.Callbacks({}, {}, {})
+            )
+            assertTrue(orchestrator.start("capture") { _, _, _, events ->
+                sink = events
+                error("launcher failed")
+            })
+            scheduler.run(250L)
+            assertEquals(CameraPipelineUiSession.Phase.WAITING_FOR_TERMINAL, session.snapshot().phase)
+
+            sink!!.invoke(
+                CameraPipelineEvent.Terminal(
+                    generation = 0L,
+                    kind = kind,
+                    requiredOutputCommitted = kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+                    publicExportCommitted = kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+                    verified = kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+                    captureResourcesSettled = true
+                )
+            )
+            assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
+            assertEquals(kind, session.snapshot().terminal?.kind)
+            assertFalse(session.snapshot().isBusy)
+            assertTrue(session.snapshot().previewAllowed)
+        }
+    }
+
+    @Test
+    fun unexpectedJobExceptionFallsBackToUnresolvedWithoutFabricatingTerminal() {
+        val session = CameraPipelineUiSession()
+        val scheduler = ManualScheduler()
+        var sink: CameraPipelineEventSink? = null
+        var terminalEffects = 0
+        val orchestrator = CameraPipelineUiOrchestrator(
+            session,
+            scheduler,
+            CameraPipelineUiOrchestrator.Callbacks({}, {}, { terminalEffects++ })
+        )
+        assertTrue(orchestrator.start("capture") { _, _, _, events ->
+            sink = events
+            error("launcher failed")
+        })
+        scheduler.run(250L)
+        scheduler.run(15_000L)
+
+        assertEquals(CameraPipelineUiSession.Phase.UNRESOLVED, session.snapshot().phase)
+        assertEquals(null, session.snapshot().terminal)
+        assertFalse(session.hasTerminalClaimed(session.snapshot().generation))
+        assertFalse(session.snapshot().captureResourcesSettled)
+        assertFalse(session.snapshot().previewAllowed)
+        assertTrue(session.snapshot().isBusy)
+        assertEquals(0, terminalEffects)
+
+        sink!!.invoke(
+            CameraPipelineEvent.Terminal(
+                generation = 0L,
+                kind = CameraPipelineEvent.Terminal.Kind.CANCELLED,
+                captureResourcesSettled = true
+            )
+        )
+        assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
+        assertEquals(CameraPipelineEvent.Terminal.Kind.CANCELLED, session.snapshot().terminal?.kind)
+        assertFalse(session.snapshot().isBusy)
+    }
+
+    @Test
+    fun launcherFailureFallbackRejectionPreservesUnresolvedAuthority() {
+        val session = CameraPipelineUiSession()
+        val scheduler = ManualScheduler().also { it.rejectDelay = 15_000L }
+        var sink: CameraPipelineEventSink? = null
+        val orchestrator = CameraPipelineUiOrchestrator(
+            session,
+            scheduler,
+            CameraPipelineUiOrchestrator.Callbacks({}, {}, {})
+        )
+        assertTrue(orchestrator.start("capture") { _, _, _, events ->
+            sink = events
+            error("launcher failed")
+        })
+        scheduler.run(250L)
+
+        assertEquals(CameraPipelineUiSession.Phase.UNRESOLVED, session.snapshot().phase)
+        assertEquals(null, session.snapshot().terminal)
+        assertTrue(orchestrator.terminalFallbackDispatchFailure() != null)
+        assertTrue(sink != null)
+    }
+
+    @Test
+    fun realTerminalRemovesLauncherFallbackAndStaleFallbackCannotMutateNextGeneration() {
+        val session = CameraPipelineUiSession()
+        val scheduler = ManualScheduler()
+        var sink: CameraPipelineEventSink? = null
+        val orchestrator = CameraPipelineUiOrchestrator(
+            session,
+            scheduler,
+            CameraPipelineUiOrchestrator.Callbacks({}, {}, {})
+        )
+        assertTrue(orchestrator.start("A") { _, _, _, events ->
+            sink = events
+            error("launcher failed")
+        })
+        scheduler.run(250L)
+        val staleFallback = scheduler.entries.single { it.delay == 15_000L }.work
+
+        sink!!.invoke(
+            CameraPipelineEvent.Terminal(
+                generation = 0L,
+                kind = CameraPipelineEvent.Terminal.Kind.COMPLETE,
+                captureResourcesSettled = true
+            )
+        )
+        assertTrue(scheduler.removed.contains(staleFallback))
+        assertTrue(orchestrator.start("B") { _, _, _, _ -> })
+        staleFallback.run()
+
+        assertEquals(2L, session.snapshot().generation)
+        assertEquals(CameraPipelineUiSession.Phase.START_SCHEDULED, session.snapshot().phase)
         assertFalse(session.snapshot().previewAllowed)
     }
 }
