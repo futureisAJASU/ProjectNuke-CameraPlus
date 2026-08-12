@@ -127,4 +127,81 @@ class CameraPipelineUiSessionTest {
             assertEquals(kind, session.snapshot().terminal?.kind)
         }
     }
+
+    @Test
+    fun terminalIsAbsorbingForLateNonTerminalEvents() {
+        val cases = listOf(
+            CameraPipelineEvent.Terminal.Kind.FAILED to CameraPipelineEvent.CaptureProgress(
+                generation = 1L,
+                counts = CameraPipelineProgressCounts(savedFrames = 1),
+                message = "late capture"
+            ),
+            CameraPipelineEvent.Terminal.Kind.CANCELLED to CameraPipelineEvent.ProcessingStage(
+                generation = 1L,
+                stage = CaptureStage.PROCESSING,
+                counts = CameraPipelineProgressCounts(),
+                message = "late processing"
+            ),
+            CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL to CameraPipelineEvent.ExportStage(
+                generation = 1L,
+                stage = CaptureStage.EXPORTING,
+                counts = CameraPipelineProgressCounts(),
+                message = "late export"
+            )
+        )
+
+        cases.forEach { (kind, lateEvent) ->
+            val session = CameraPipelineUiSession()
+            val operation = (session.start("start", 1) as CameraPipelineUiSession.StartResult.Accepted).operation
+            val terminal = CameraPipelineEvent.Terminal(
+                generation = operation.generation,
+                kind = kind,
+                captureResourcesSettled = true,
+                message = "terminal"
+            )
+            assertEquals(CameraPipelineUiSession.EventResult.ACCEPTED, session.accept(terminal))
+            assertEquals(CameraPipelineUiSession.EventResult.LATE_AFTER_TERMINAL, session.accept(lateEvent.copyGeneration(operation.generation)))
+            assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
+            assertEquals(kind, session.snapshot().terminal?.kind)
+            assertFalse(session.snapshot().isBusy)
+            assertTrue(session.snapshot().previewAllowed)
+        }
+    }
+
+    @Test
+    fun unresolvedOnlyAcceptsARealTerminalResolution() {
+        val session = CameraPipelineUiSession()
+        val operation = (session.start("start", 1) as CameraPipelineUiSession.StartResult.Accepted).operation
+        session.requestCancellation(operation.generation, "watchdog")
+        assertTrue(session.markTerminalDeliveryFailed(operation.generation, "unresolved"))
+
+        val lateProgress = CameraPipelineEvent.CaptureProgress(
+            generation = operation.generation,
+            counts = CameraPipelineProgressCounts(savedFrames = 1),
+            message = "late progress"
+        )
+        assertEquals(CameraPipelineUiSession.EventResult.LATE_AFTER_TERMINAL, session.accept(lateProgress))
+        assertEquals(CameraPipelineUiSession.Phase.UNRESOLVED, session.snapshot().phase)
+        assertTrue(session.snapshot().isBusy)
+        assertFalse(session.snapshot().previewAllowed)
+
+        assertEquals(
+            CameraPipelineUiSession.EventResult.ACCEPTED,
+            session.accept(
+                CameraPipelineEvent.Terminal(
+                    generation = operation.generation,
+                    kind = CameraPipelineEvent.Terminal.Kind.CANCELLED,
+                    captureResourcesSettled = true
+                )
+            )
+        )
+        assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
+    }
+
+    private fun CameraPipelineEvent.copyGeneration(generation: Long): CameraPipelineEvent = when (this) {
+        is CameraPipelineEvent.CaptureProgress -> copy(generation = generation)
+        is CameraPipelineEvent.ProcessingStage -> copy(generation = generation)
+        is CameraPipelineEvent.ExportStage -> copy(generation = generation)
+        else -> error("test event must be non-terminal")
+    }
 }

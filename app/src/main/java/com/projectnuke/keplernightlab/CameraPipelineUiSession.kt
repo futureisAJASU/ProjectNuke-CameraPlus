@@ -42,7 +42,13 @@ internal class CameraPipelineUiSession {
         data object Rejected : StartResult
     }
 
-    enum class EventResult { ACCEPTED, STALE, DUPLICATE_TERMINAL, DISPOSED }
+    enum class EventResult {
+        ACCEPTED,
+        STALE,
+        DUPLICATE_TERMINAL,
+        LATE_AFTER_TERMINAL,
+        DISPOSED
+    }
 
     private var nextGeneration = 0L
     private var operation: Operation? = null
@@ -54,6 +60,13 @@ internal class CameraPipelineUiSession {
 
     @Synchronized
     fun snapshot(): Snapshot = current
+
+    @Synchronized
+    fun acceptsDisplayUpdate(localGeneration: Long): Boolean =
+        isCurrentLocked(localGeneration) &&
+            !terminalClaimed &&
+            current.phase != Phase.UNRESOLVED &&
+            current.phase != Phase.DISPOSED
 
     @Synchronized
     fun currentOperation(): Operation? = operation?.takeIf { current.isBusy }
@@ -218,6 +231,9 @@ internal class CameraPipelineUiSession {
                 requiredOutputCommitted = event.requiredOutputCommitted
             )
             return EventResult.ACCEPTED
+        }
+        if (terminalClaimed || current.phase == Phase.UNRESOLVED) {
+            return EventResult.LATE_AFTER_TERMINAL
         }
         val nextPhase = when (event) {
             is CameraPipelineEvent.Started -> Phase.CAPTURING
