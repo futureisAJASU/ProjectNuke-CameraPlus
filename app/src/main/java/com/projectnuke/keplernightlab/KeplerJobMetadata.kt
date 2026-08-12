@@ -10,6 +10,7 @@ import java.nio.file.LinkOption
 import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.UUID
 
 private const val KEPLER_JOB_SCHEMA_VERSION = 1
 
@@ -125,6 +126,53 @@ object KeplerJobMetadata {
         atomicWrite(File(jobDir, JOB_JSON_FILE_NAME), job.toString(2))
         job
     }
+
+    /** Persists restart-reconciliation ownership without replacing the live in-process lease. */
+    internal fun beginActiveOperation(
+        jobDir: File,
+        operationId: String = UUID.randomUUID().toString(),
+        kind: KeplerActiveOperationKind,
+        startedAt: Long = System.currentTimeMillis()
+    ): String {
+        update(jobDir) { job ->
+            job.put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, operationId)
+                .put(ACTIVE_OPERATION_KIND, kind.name)
+                .put(ACTIVE_OPERATION_STARTED_AT, startedAt)
+                .put(ACTIVE_OPERATION_UPDATED_AT, startedAt)
+        }
+        return operationId
+    }
+
+    /** Updates only the heartbeat; it is diagnostic/recovery evidence, not a runtime lock. */
+    internal fun touchActiveOperation(jobDir: File, operationId: String): Boolean = runCatching {
+        var matched = false
+        update(jobDir) { job ->
+            if (job.optString(ACTIVE_RUNTIME_SESSION_ID) != KeplerRuntimeSession.id ||
+                job.optString(ACTIVE_OPERATION_ID) != operationId
+            ) return@update
+            matched = true
+            job.put(ACTIVE_OPERATION_UPDATED_AT, System.currentTimeMillis())
+        }
+        matched
+    }.getOrDefault(false)
+
+    /** Clears only the marker owned by this runtime and operation. */
+    internal fun clearActiveOperation(jobDir: File, operationId: String): Boolean = runCatching {
+        var matched = false
+        update(jobDir) { job ->
+            if (job.optString(ACTIVE_RUNTIME_SESSION_ID) != KeplerRuntimeSession.id ||
+                job.optString(ACTIVE_OPERATION_ID) != operationId
+            ) return@update
+            matched = true
+            job.remove(ACTIVE_RUNTIME_SESSION_ID)
+            job.remove(ACTIVE_OPERATION_ID)
+            job.remove(ACTIVE_OPERATION_KIND)
+            job.remove(ACTIVE_OPERATION_STARTED_AT)
+            job.remove(ACTIVE_OPERATION_UPDATED_AT)
+        }
+        matched
+    }.getOrDefault(false)
 
     fun atomicWrite(file: File, text: String) {
         val parent = file.parentFile ?: error("job metadata parent missing")

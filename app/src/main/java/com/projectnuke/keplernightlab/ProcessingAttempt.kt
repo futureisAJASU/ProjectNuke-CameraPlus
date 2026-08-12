@@ -10,6 +10,7 @@ internal data class ProcessingAttempt(
     val id: String,
     val startedAt: Long,
     val mode: String,
+    internal val jobDir: File,
     internal val operationLease: JobOperationLease?,
     internal val ownsOperationLease: Boolean
 ) {
@@ -17,6 +18,7 @@ internal data class ProcessingAttempt(
 
     internal fun release() {
         if (!released.compareAndSet(false, true)) return
+        KeplerJobMetadata.clearActiveOperation(jobDir, id)
         operationLease?.releaseProcessingAttempt(id)
         if (ownsOperationLease) operationLease?.release()
     }
@@ -54,6 +56,7 @@ internal fun beginProcessingAttempt(
         id = UUID.randomUUID().toString(),
         startedAt = System.currentTimeMillis(),
         mode = mode,
+        jobDir = jobDir,
         operationLease = lease,
         ownsOperationLease = ownsLease
     )
@@ -81,6 +84,11 @@ internal fun beginProcessingAttempt(
             job.put("processingAttemptId", attempt.id)
                 .put("processingStartedAt", attempt.startedAt)
                 .put("processingMode", attempt.mode)
+                .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, attempt.id)
+                .put(ACTIVE_OPERATION_KIND, processingOperationKind(attempt.mode).name)
+                .put(ACTIVE_OPERATION_STARTED_AT, attempt.startedAt)
+                .put(ACTIVE_OPERATION_UPDATED_AT, attempt.startedAt)
         }
     } catch (failure: Throwable) {
         attempt.releaseOwnedLease()
