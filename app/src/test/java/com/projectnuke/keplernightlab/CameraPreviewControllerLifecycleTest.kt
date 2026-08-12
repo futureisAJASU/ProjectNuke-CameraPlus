@@ -126,4 +126,105 @@ class CameraPreviewControllerLifecycleTest {
             controller.dispose()
         }
     }
+
+    @Test
+    fun rejectedAvailableNotificationIsRecordedWhileControllerRemainsOpen() {
+        val executor = TrackingExecutor()
+        val availability = mutableListOf<PreviewAvailability>()
+        val controller = CameraPreviewController(
+            context = null,
+            cameraId = "0",
+            physicalCameraId = null,
+            actualLensSource = ActualLensSource.MAIN_1X,
+            onAeCapabilitiesChangedProvider = { { _, _, _ -> } },
+            onPreviewAvailabilityChangedProvider = { { availability += it } },
+            mainDispatch = { false },
+            emergencyReleaseExecutor = executor
+        )
+
+        val generation = controller.beginGenerationForTest()
+        assertTrue(controller.markOpenForTest(generation))
+        assertEquals(PreviewGenerationOwner.State.OPEN, controller.generationSnapshotForTest().state)
+        assertTrue(availability.isEmpty())
+        assertTrue(controller.cleanupDiagnostics().availabilityDispatchFailure != null)
+        controller.dispose()
+    }
+
+    @Test
+    fun authoritativeCameraCallbackSettlementClosesOnceAndRetainsFailure() {
+        listOf("disconnected", "error").forEach { callback ->
+            val availability = mutableListOf<PreviewAvailability>()
+            val controller = CameraPreviewController(
+                context = null,
+                cameraId = "0",
+                physicalCameraId = null,
+                actualLensSource = ActualLensSource.MAIN_1X,
+                onAeCapabilitiesChangedProvider = { { _, _, _ -> } },
+                onPreviewAvailabilityChangedProvider = { { availability += it } },
+                mainDispatch = { it.run(); true },
+                emergencyReleaseExecutor = TrackingExecutor()
+            )
+            val generation = controller.beginGenerationForTest()
+            controller.stop()
+            var closeCount = 0
+
+            controller.settleAuthoritativeCameraCallback(
+                localGeneration = generation,
+                detach = { true },
+                close = {
+                    closeCount++
+                    error("$callback close failed")
+                },
+                failure = IllegalStateException(callback)
+            )
+
+            assertEquals(1, closeCount)
+            assertTrue(availability.isEmpty())
+            val cleanup = controller.cleanupDiagnostics().lastCleanupSnapshot
+            assertTrue(cleanup?.failures?.any {
+                it.operation == PreviewResourceOperation.CAMERA_DEVICE_CLOSE
+            } == true)
+            controller.dispose()
+        }
+    }
+
+    @Test
+    fun adoptedSessionRequestFailureRetainsCloseFailureAndTransitionsToFallback() {
+        val controller = controller(TrackingExecutor())
+        val generation = controller.beginGenerationForTest()
+        controller.stop()
+        var closeCount = 0
+        var fallbackCount = 0
+
+        controller.settleAdoptedSessionRequestFailure(
+            localGeneration = generation,
+            detach = { true },
+            close = {
+                closeCount++
+                error("session close failed")
+            },
+            onFailure = { fallbackCount++ }
+        )
+
+        assertEquals(1, closeCount)
+        assertEquals(1, fallbackCount)
+        assertTrue(
+            controller.cleanupDiagnostics().lastCleanupSnapshot?.failures?.any {
+                it.operation == PreviewResourceOperation.CAPTURE_SESSION_CLOSE
+            } == true
+        )
+        controller.dispose()
+    }
+
+    @Test
+    fun physicalFailureUsesOneNormalPreviewFallbackWhileGenerationIsActive() {
+        val controller = controller(TrackingExecutor())
+        val generation = controller.beginGenerationForTest()
+        var fallbackCount = 0
+
+        controller.transitionPhysicalToNormalPreview(generation) { fallbackCount++ }
+
+        assertEquals(1, fallbackCount)
+        controller.dispose()
+    }
 }

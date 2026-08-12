@@ -416,6 +416,50 @@ internal class CameraPreviewController(
         }
     }
 
+    /** Shared production callback settlement for an owned CameraDevice failure callback. */
+    internal fun settleAuthoritativeCameraCallback(
+        localGeneration: Int,
+        detach: () -> Boolean,
+        close: () -> Unit,
+        failure: Throwable
+    ) {
+        if (detach()) {
+            settleAndRecord(
+                localGeneration.toLong(),
+                listOf(PreviewResourceOperation.CAMERA_DEVICE_CLOSE to close)
+            )
+        } else {
+            settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE, close)
+        }
+        if (isActive(localGeneration)) failPreview(localGeneration, failure)
+    }
+
+    /** Shared production callback settlement after an adopted session request fails. */
+    internal fun settleAdoptedSessionRequestFailure(
+        localGeneration: Int,
+        detach: () -> Boolean,
+        close: () -> Unit,
+        onFailure: () -> Unit
+    ) {
+        if (detach()) {
+            settleAndRecord(
+                localGeneration.toLong(),
+                listOf(PreviewResourceOperation.CAPTURE_SESSION_CLOSE to close)
+            )
+        } else {
+            settleLateResource(localGeneration, PreviewResourceOperation.CAPTURE_SESSION_CLOSE, close)
+        }
+        onFailure()
+    }
+
+    /** Shared physical-session callback transition; a failed physical route gets one normal fallback. */
+    internal fun transitionPhysicalToNormalPreview(
+        localGeneration: Int,
+        startNormal: () -> Unit
+    ) {
+        if (isActive(localGeneration)) startNormal()
+    }
+
     private fun settleAndRecord(
         generation: Long,
         operations: List<Pair<PreviewResourceOperation, () -> Unit>>,
@@ -752,28 +796,22 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                     }
 
                     override fun onDisconnected(camera: CameraDevice) {
-                        if (detachOwnedCamera(localGeneration, camera)) {
-                            settleAndRecord(
-                                localGeneration.toLong(),
-                                listOf(PreviewResourceOperation.CAMERA_DEVICE_CLOSE to { camera.close() })
-                            )
-                        } else {
-                            settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE) { camera.close() }
-                        }
-                        if (isActive(localGeneration)) failPreview(localGeneration, IllegalStateException("camera disconnected"))
+                        settleAuthoritativeCameraCallback(
+                            localGeneration = localGeneration,
+                            detach = { detachOwnedCamera(localGeneration, camera) },
+                            close = { camera.close() },
+                            failure = IllegalStateException("camera disconnected")
+                        )
                     }
 
                     override fun onError(camera: CameraDevice, error: Int) {
                         Log.w(TAG, "camera error=$error generation=$localGeneration")
-                        if (detachOwnedCamera(localGeneration, camera)) {
-                            settleAndRecord(
-                                localGeneration.toLong(),
-                                listOf(PreviewResourceOperation.CAMERA_DEVICE_CLOSE to { camera.close() })
-                            )
-                        } else {
-                            settleLateResource(localGeneration, PreviewResourceOperation.CAMERA_DEVICE_CLOSE) { camera.close() }
-                        }
-                        if (isActive(localGeneration)) failPreview(localGeneration, IllegalStateException("camera error=$error"))
+                        settleAuthoritativeCameraCallback(
+                            localGeneration = localGeneration,
+                            detach = { detachOwnedCamera(localGeneration, camera) },
+                            close = { camera.close() },
+                            failure = IllegalStateException("camera error=$error")
+                        )
                     }
                 },
                 handler
@@ -846,12 +884,14 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                             "actualLensSource=$latestActualLensSource cameraId=$cameraId " +
                             "physicalCameraId=$physicalCameraId"
                     )
-                    createNormalPreviewSession(
-                        camera = camera,
-                        surface = surface,
-                        localGeneration = localGeneration,
-                        textureView = textureView
-                    )
+                    transitionPhysicalToNormalPreview(localGeneration) {
+                        createNormalPreviewSession(
+                            camera = camera,
+                            surface = surface,
+                            localGeneration = localGeneration,
+                            textureView = textureView
+                        )
+                    }
                 }
             )
             camera.createCaptureSession(
@@ -885,12 +925,14 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                     "actualLensSource=$latestActualLensSource cameraId=$cameraId " +
                     "physicalCameraId=$physicalCameraId"
             )
-            createNormalPreviewSession(
-                camera = camera,
-                surface = surface,
-                localGeneration = localGeneration,
-                textureView = textureView
-            )
+            transitionPhysicalToNormalPreview(localGeneration) {
+                createNormalPreviewSession(
+                    camera = camera,
+                    surface = surface,
+                    localGeneration = localGeneration,
+                    textureView = textureView
+                )
+            }
         }
     }
 
@@ -971,15 +1013,12 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
                             "exception=${error.javaClass.simpleName}:${error.message}",
                         error
                     )
-                    if (detachOwnedSession(localGeneration, session)) {
-                        settleAndRecord(
-                            localGeneration.toLong(),
-                            listOf(PreviewResourceOperation.CAPTURE_SESSION_CLOSE to { session.close() })
-                        )
-                    } else {
-                        settleLateResource(localGeneration, PreviewResourceOperation.CAPTURE_SESSION_CLOSE) { session.close() }
-                    }
-                    onFailure()
+                    settleAdoptedSessionRequestFailure(
+                        localGeneration = localGeneration,
+                        detach = { detachOwnedSession(localGeneration, session) },
+                        close = { session.close() },
+                        onFailure = onFailure
+                    )
                 }
             }
 
@@ -1296,12 +1335,21 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
         }
         if (opened) {
             try {
-                mainDispatch(Runnable {
+                val accepted = mainDispatch(Runnable {
                     onPreviewAvailabilityChangedProvider().invoke(PreviewAvailability.AVAILABLE)
                 })
+                if (!accepted) {
+                    synchronized(lock) {
+                        cleanupDiagnostics = cleanupDiagnostics.copy(
+                            availabilityDispatchFailure = IllegalStateException(
+                                "preview availability dispatch rejected"
+                            )
+                        )
+                    }
+                }
             } catch (failure: Throwable) {
                 synchronized(lock) {
-                    cleanupDiagnostics = cleanupDiagnostics.copy(callbackDispatchFailure = failure)
+                    cleanupDiagnostics = cleanupDiagnostics.copy(availabilityDispatchFailure = failure)
                 }
             }
         }
@@ -1313,6 +1361,9 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
     }
 
     internal fun markOpenForTest(localGeneration: Int): Boolean = markPreviewOpen(localGeneration)
+
+    internal fun generationSnapshotForTest(): PreviewGenerationOwner.Snapshot =
+        synchronized(lock) { generationOwner.snapshot() }
 
     private fun isActive(localGeneration: Int): Boolean = synchronized(lock) {
         isActiveLocked(localGeneration)

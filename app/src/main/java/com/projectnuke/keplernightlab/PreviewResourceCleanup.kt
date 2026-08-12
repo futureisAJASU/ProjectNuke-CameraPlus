@@ -29,7 +29,8 @@ data class PreviewCleanupDiagnostics(
     val lateResourceSettlements: List<PreviewCleanupSnapshot> = emptyList(),
     val threadTerminationOutcome: PreviewResourceSettlementRecord? = null,
     val callbackDispatchFailure: Throwable? = null,
-    val cleanupDispatchFailure: Throwable? = null
+    val cleanupDispatchFailure: Throwable? = null,
+    val availabilityDispatchFailure: Throwable? = null
 )
 
 /** Production recorder: one bounded cumulative snapshot per preview cleanup generation. */
