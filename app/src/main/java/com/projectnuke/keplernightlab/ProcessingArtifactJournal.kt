@@ -78,6 +78,8 @@ internal data class ProcessingArtifactJournal(
         require(verificationKind == null || verificationKind.matches(VERIFICATION_KIND_PATTERN))
         require(expectedSizeBytes == null || expectedSizeBytes >= 0L)
         require(expectedSha256 == null || expectedSha256.matches(SHA256_PATTERN))
+        require(priorExpectedSizeBytes == null || priorExpectedSizeBytes >= 0L)
+        require(priorExpectedSha256 == null || priorExpectedSha256.matches(SHA256_PATTERN))
     }
 
     fun toJson(): JSONObject = JSONObject()
@@ -182,6 +184,11 @@ internal fun recoverProcessingArtifactJournals(
         verifyProcessingArtifactRecovery(journal, file, prior)
     }.isSuccess
     fun deleteExact(file: File?) { file?.let { settleProcessingArtifactPath(it) } }
+    fun settleJournalIfOwned(journal: ProcessingArtifactJournal): Boolean {
+        journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED)
+            .deleteIfOwned(jobDir)
+        return true
+    }
     when (journal.state) {
         ProcessingArtifactJournalState.PREPARED,
         ProcessingArtifactJournalState.TEMP_WRITTEN,
@@ -209,7 +216,15 @@ internal fun recoverProcessingArtifactJournals(
             }
             valid(final) -> {
                 deleteExact(temp)
-                ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT, "current final preserved; prior evidence retained")
+                val priorSettlement = prior?.let {
+                    settleProcessingArtifactPath(it, ProcessingArtifactResourceRole.PRIOR_BACKUP)
+                }
+                if (priorSettlement != null && priorSettlement.status == ProcessingArtifactSettlementStatus.DELETE_FAILED) {
+                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "current final verified but prior cleanup failed")
+                } else {
+                    journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED).deleteIfOwned(jobDir)
+                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT)
+                }
             }
             else -> ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "neither final nor prior is verifiable")
         }
@@ -218,9 +233,15 @@ internal fun recoverProcessingArtifactJournals(
         ProcessingArtifactJournalState.ADOPTED -> when {
             valid(final) -> {
                 deleteExact(temp)
-                deleteExact(prior)
-                journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED).deleteIfOwned(jobDir)
-                ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT)
+                val priorSettlement = prior?.let {
+                    settleProcessingArtifactPath(it, ProcessingArtifactResourceRole.PRIOR_BACKUP)
+                }
+                if (priorSettlement != null && priorSettlement.status == ProcessingArtifactSettlementStatus.DELETE_FAILED) {
+                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "current final verified but prior cleanup failed")
+                } else {
+                    journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED).deleteIfOwned(jobDir)
+                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT)
+                }
             }
             valid(prior, prior = true) -> {
                 val priorFile = prior ?: return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS)

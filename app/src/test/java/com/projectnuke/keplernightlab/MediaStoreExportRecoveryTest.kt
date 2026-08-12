@@ -18,9 +18,11 @@ class MediaStoreExportRecoveryTest {
         var commitSucceeds: Boolean = true
     ) : MediaStoreExportRecoveryAccess {
         var deleted = false
+        var deleteResult = true
+        var inspectionFailed = false
         var committed = false
         override fun inspect(uri: Uri, journal: MediaStoreExportJournal) =
-            MediaStoreExportInspection(exists, pending, verified)
+            MediaStoreExportInspection(exists, pending, verified, inspectionFailed = inspectionFailed)
         override fun setPending(uri: Uri, pending: Boolean): Boolean {
             if (!commitSucceeds) return false
             this.pending = pending
@@ -29,6 +31,7 @@ class MediaStoreExportRecoveryTest {
         }
         override fun delete(uri: Uri): Boolean {
             deleted = true
+            if (!deleteResult) return false
             exists = false
             return true
         }
@@ -89,5 +92,45 @@ class MediaStoreExportRecoveryTest {
         } finally {
             dir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun insertWithoutUriIsAmbiguousAndJournalIsPreserved() {
+        val dir = Files.createTempDirectory("media-recovery-unknown-").toFile()
+        try {
+            MediaStoreExportJournal.create(
+                jobDir = dir,
+                role = MediaStoreExportRole.MAIN_IMAGE,
+                frameIndex = null,
+                displayName = "result.jpg",
+                relativePath = "Pictures/Kepler",
+                mimeType = "image/jpeg",
+                collectionUri = Uri.parse("content://media/external/images/media")
+            )
+            val result = recoverMediaStoreExportJournals(dir, FakeAccess(false, false)).single()
+            assertEquals(MediaStoreExportRecoveryClassification.INSERT_RESULT_UNKNOWN, result.classification)
+            assertTrue(MediaStoreExportJournal.list(dir).isNotEmpty())
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
+    fun inspectionFailureIsAmbiguous() {
+        val dir = Files.createTempDirectory("media-recovery-inspect-failure-").toFile()
+        try {
+            journal(dir)
+            val access = FakeAccess(false, false).apply { inspectionFailed = true }
+            assertEquals(MediaStoreExportRecoveryClassification.AMBIGUOUS, recoverMediaStoreExportJournals(dir, access).single().classification)
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
+    fun pendingDeleteFailureIsRetainedAsRecoveryDebt() {
+        val dir = Files.createTempDirectory("media-recovery-delete-failure-").toFile()
+        try {
+            journal(dir)
+            val access = FakeAccess(true, false).apply { deleteResult = false }
+            assertEquals(MediaStoreExportRecoveryClassification.DELETE_FAILED, recoverMediaStoreExportJournals(dir, access).single().classification)
+            assertEquals(MediaStoreExportState.ROW_INSERTED, MediaStoreExportJournal.list(dir).single().state)
+        } finally { dir.deleteRecursively() }
     }
 }

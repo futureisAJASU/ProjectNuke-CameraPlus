@@ -13,6 +13,8 @@ internal enum class MediaStoreExportRecoveryClassification {
     PUBLIC_VERIFIED,
     PUBLIC_COMMITTED_UNVERIFIED,
     PUBLIC_COMMIT_MISSING,
+    INSERT_RESULT_UNKNOWN,
+    DELETE_FAILED,
     AMBIGUOUS
 }
 
@@ -32,7 +34,8 @@ internal data class MediaStoreExportInspection(
     val exists: Boolean,
     val pending: Boolean,
     val verified: Boolean,
-    val message: String? = null
+    val message: String? = null,
+    val inspectionFailed: Boolean = false
 )
 
 internal fun recoverMediaStoreExportJournals(
@@ -45,30 +48,93 @@ internal fun recoverMediaStoreExportJournals(
 internal fun reconstructRawSidecarJournalEvidence(
     jobDir: File,
     job: org.json.JSONObject,
-    journals: List<MediaStoreExportJournal> = MediaStoreExportJournal.list(jobDir)
+    journals: List<MediaStoreExportJournal> = MediaStoreExportJournal.list(jobDir),
+    verifiedAttemptIds: Set<String>? = null
 ): Int {
-    val verified = journals.filter {
+    val manifest = runCatching { loadRawSidecarManifest(jobDir) }.getOrNull()
+        ?: return 0
+    val candidates = journals.filter {
         it.role == MediaStoreExportRole.RAW_DNG_SIDECAR &&
             it.frameIndex != null &&
             it.uri != null &&
-            (it.state == MediaStoreExportState.VERIFIED || it.state == MediaStoreExportState.TERMINAL_PERSISTED)
-    }.associateBy { it.frameIndex }
+            it.state == MediaStoreExportState.VERIFIED &&
+            (verifiedAttemptIds == null || it.exportAttemptId in verifiedAttemptIds)
+    }
     var count = 0
     val frames = job.optJSONArray("frames") ?: return 0
     for (index in 0 until frames.length()) {
         val frame = frames.optJSONObject(index) ?: continue
         val frameIndex = frame.optInt("frameIndex", frame.optInt("index", index))
-        val journal = verified[frameIndex] ?: continue
-        frame.put("dngSidecarPublicStatus", "PUBLIC_EXPORTED")
-            .put("publicDngUri", journal.uri)
-            .remove("publicDngError")
-        count += 1
+        val manifestFrame = manifest.frames.firstOrNull { it.frameIndex == frameIndex }
+        val localFile = manifestFrame?.localFile
+        val digest = localFile?.let { runCatching { NoFollowFileSystem.digestVerified(it) }.getOrNull() }
+        val journal = candidates.asSequence()
+            .filter { candidate ->
+                candidate.frameIndex == frameIndex &&
+                    digest != null &&
+                    candidate.expectedSizeBytes == digest.size &&
+                    candidate.expectedSha256.equals(digest.sha256, ignoreCase = true)
+            }
+            .sortedWith(compareByDescending<MediaStoreExportJournal> { it.updatedAt }
+                .thenByDescending { it.exportAttemptId })
+            .firstOrNull()
+        if (journal != null) {
+            frame.put("dngSidecarPublicStatus", "PUBLIC_EXPORTED")
+                .put("publicDngUri", journal.uri)
+                .remove("publicDngError")
+            count += 1
+        } else if (manifestFrame?.requested == true) {
+            frame.put("dngSidecarPublicStatus", "PUBLIC_NOT_RECOVERED")
+                .remove("publicDngUri")
+        }
     }
-    if (count > 0) {
-        job.put("rawSidecarPublicExportedCount", count)
-            .put("rawSidecarRecoveryEvidence", "DURABLE_EXPORT_JOURNAL")
-    }
+    val requestedCount = manifest.expected.size
+    job.put("rawSidecarPublicExportedCount", count)
+        .put("rawSidecarPublicFailedCount", (requestedCount - count).coerceAtLeast(0))
+        .put("rawSidecarRecoveryEvidence", "DURABLE_EXPORT_JOURNAL_CURRENT_SOURCE")
     return count
+}
+
+internal fun reconstructMainExportEvidence(
+    jobDir: File,
+    job: org.json.JSONObject,
+    activeOperationId: String,
+    results: List<MediaStoreExportRecoveryResult>
+): Boolean {
+    if (activeOperationId.isBlank()) return false
+    val resultByAttempt = results.associateBy { it.attemptId }
+    val journal = MediaStoreExportJournal.list(jobDir)
+        .asSequence()
+        .filter { it.role == MediaStoreExportRole.MAIN_IMAGE }
+        .filter { it.ownerOperationId == activeOperationId }
+        .filter { it.uri != null }
+        .filter { it.state == MediaStoreExportState.VERIFIED || it.state == MediaStoreExportState.PUBLIC_COMMITTED }
+        .mapNotNull { candidate ->
+            val result = resultByAttempt[candidate.exportAttemptId]
+            val verified = result?.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
+                result?.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED ||
+                candidate.state == MediaStoreExportState.VERIFIED
+            val committed = verified || result?.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED
+            if (!committed) null else candidate to verified
+        }
+        .sortedWith(compareByDescending<Pair<MediaStoreExportJournal, Boolean>> { it.first.updatedAt }
+            .thenByDescending { it.first.exportAttemptId })
+        .firstOrNull()
+        ?: return false
+    val (selected, verified) = journal
+    job.put("galleryExportCommitted", true)
+        .put("exportVerified", verified)
+        .put("exportUri", selected.uri)
+        .put("galleryPublicExportLinkage", selected.uri)
+        .put("exportDisplayName", selected.displayName)
+        .put("exportMimeType", selected.mimeType)
+        .put("recoveryState", if (verified) "PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL" else "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION")
+        .put("recoveryMessage", if (verified) {
+            "Public export was verified after the previous process ended."
+        } else {
+            "Public export was committed but requires verification."
+        })
+    return true
 }
 
 private fun recoverMediaStoreExportJournal(
@@ -78,11 +144,10 @@ private fun recoverMediaStoreExportJournal(
 ): MediaStoreExportRecoveryResult {
     val uriString = journal.uri
     if (uriString.isNullOrBlank()) {
-        journal.transition(jobDir, MediaStoreExportState.CLEANUP_REQUIRED)
         return MediaStoreExportRecoveryResult(
             journal.exportAttemptId,
-            MediaStoreExportRecoveryClassification.NO_PUBLIC_OWNERSHIP,
-            "Export was prepared before MediaStore returned an exact URI."
+            MediaStoreExportRecoveryClassification.INSERT_RESULT_UNKNOWN,
+            "MediaStore insert result is unknown because no exact URI was durably recorded."
         )
     }
     val uri = runCatching { Uri.parse(uriString) }.getOrNull()
@@ -92,8 +157,14 @@ private fun recoverMediaStoreExportJournal(
             "Export journal contains an invalid URI."
         )
     val inspection = access.inspect(uri, journal)
+    if (inspection.inspectionFailed) {
+        return MediaStoreExportRecoveryResult(
+            journal.exportAttemptId,
+            MediaStoreExportRecoveryClassification.AMBIGUOUS,
+            inspection.message ?: "MediaStore row inspection failed."
+        )
+    }
     if (!inspection.exists) {
-        journal.transition(jobDir, MediaStoreExportState.CLEANUP_REQUIRED)
         return MediaStoreExportRecoveryResult(
             journal.exportAttemptId,
             MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING,
@@ -102,7 +173,14 @@ private fun recoverMediaStoreExportJournal(
     }
     if (inspection.pending) {
         if (!inspection.verified) {
-            access.delete(uri)
+            val deleted = runCatching { access.delete(uri) }.getOrDefault(false)
+            if (!deleted) {
+                return MediaStoreExportRecoveryResult(
+                    journal.exportAttemptId,
+                    MediaStoreExportRecoveryClassification.DELETE_FAILED,
+                    "Unverifiable pending MediaStore row could not be deleted."
+                )
+            }
             journal.transition(jobDir, MediaStoreExportState.CLEANUP_REQUIRED)
             return MediaStoreExportRecoveryResult(
                 journal.exportAttemptId,
@@ -125,7 +203,6 @@ private fun recoverMediaStoreExportJournal(
         )
     }
     if (!inspection.verified) {
-        journal.transition(jobDir, MediaStoreExportState.CLEANUP_REQUIRED)
         return MediaStoreExportRecoveryResult(
             journal.exportAttemptId,
             MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED,
@@ -144,13 +221,19 @@ internal class ContextMediaStoreExportRecoveryAccess(
 ) : MediaStoreExportRecoveryAccess {
     override fun inspect(uri: Uri, journal: MediaStoreExportJournal): MediaStoreExportInspection {
         return try {
-            val pending = context.contentResolver.query(
+            var pending = false
+            val exists = context.contentResolver.query(
                 uri,
                 arrayOf(MediaStore.MediaColumns.IS_PENDING),
                 null,
                 null,
                 null
-            )?.use { cursor -> cursor.moveToFirst() && cursor.getInt(0) != 0 } ?: false
+            )?.use { cursor ->
+                if (!cursor.moveToFirst()) return@use false
+                pending = cursor.getInt(0) != 0
+                true
+            } ?: false
+            if (!exists) return MediaStoreExportInspection(false, false, false, "The exact MediaStore row is missing.")
             val verified = when (journal.role) {
                 MediaStoreExportRole.MAIN_IMAGE -> {
                     val format = when (journal.mimeType) {
@@ -170,7 +253,7 @@ internal class ContextMediaStoreExportRecoveryAccess(
             }
             MediaStoreExportInspection(true, pending, verified)
         } catch (failure: Exception) {
-            MediaStoreExportInspection(true, false, false, "MediaStore inspection failed: ${failure.message}")
+            MediaStoreExportInspection(false, false, false, "MediaStore inspection failed: ${failure.message}", inspectionFailed = true)
         }
     }
 

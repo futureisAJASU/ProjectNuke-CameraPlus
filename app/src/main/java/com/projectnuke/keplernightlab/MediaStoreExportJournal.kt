@@ -16,6 +16,7 @@ internal enum class MediaStoreExportState {
     CONTENT_WRITTEN,
     PUBLIC_COMMITTED,
     VERIFIED,
+    /** Legacy on-disk value; new code never transitions to this state. */
     TERMINAL_PERSISTED,
     CLEANUP_REQUIRED
 }
@@ -36,6 +37,10 @@ internal data class MediaStoreExportJournal(
     val expectedSha256: String?,
     val expectedWidth: Int?,
     val expectedHeight: Int?,
+    val ownerOperationId: String? = null,
+    val ownerRuntimeSessionId: String = runtimeSessionId,
+    val terminalMetadataPersisted: Boolean = false,
+    val terminalMetadataPersistedAt: Long? = null,
     val state: MediaStoreExportState,
     val createdAt: Long,
     val updatedAt: Long
@@ -58,7 +63,11 @@ internal data class MediaStoreExportJournal(
         updatedAt = System.currentTimeMillis()
     ).writeTo(jobDir)
 
-    fun markTerminalPersisted(jobDir: File): MediaStoreExportJournal = transition(jobDir, MediaStoreExportState.TERMINAL_PERSISTED)
+    fun markTerminalPersisted(jobDir: File): MediaStoreExportJournal = copy(
+        terminalMetadataPersisted = true,
+        terminalMetadataPersistedAt = System.currentTimeMillis(),
+        updatedAt = System.currentTimeMillis()
+    ).writeTo(jobDir)
 
     fun deleteIfOwned(jobDir: File) {
         val file = fileFor(jobDir, exportAttemptId)
@@ -80,6 +89,10 @@ internal data class MediaStoreExportJournal(
         .put("expectedSha256", expectedSha256 ?: JSONObject.NULL)
         .put("expectedWidth", expectedWidth ?: JSONObject.NULL)
         .put("expectedHeight", expectedHeight ?: JSONObject.NULL)
+        .put("ownerOperationId", ownerOperationId ?: JSONObject.NULL)
+        .put("ownerRuntimeSessionId", ownerRuntimeSessionId)
+        .put("terminalMetadataPersisted", terminalMetadataPersisted)
+        .put("terminalMetadataPersistedAt", terminalMetadataPersistedAt ?: JSONObject.NULL)
         .put("state", state.name)
         .put("createdAt", createdAt)
         .put("updatedAt", updatedAt)
@@ -100,6 +113,7 @@ internal data class MediaStoreExportJournal(
             expectedSha256: String? = null,
             expectedWidth: Int? = null,
             expectedHeight: Int? = null
+            ,ownerOperationId: String? = null
         ): MediaStoreExportJournal {
             require(NoFollowFileSystem.isRealDirectory(jobDir.toPath()))
             require(displayName.isNotBlank() && !displayName.contains('/') && !displayName.contains('\\'))
@@ -120,6 +134,10 @@ internal data class MediaStoreExportJournal(
                 expectedSha256 = expectedSha256,
                 expectedWidth = expectedWidth,
                 expectedHeight = expectedHeight,
+                ownerOperationId = ownerOperationId,
+                ownerRuntimeSessionId = KeplerRuntimeSession.id,
+                terminalMetadataPersisted = false,
+                terminalMetadataPersistedAt = null,
                 state = MediaStoreExportState.PREPARED,
                 createdAt = now,
                 updatedAt = now
@@ -149,11 +167,15 @@ internal data class MediaStoreExportJournal(
                 json.getString("relativePath"),
                 json.getString("mimeType"),
                 json.getString("collectionUri"),
-                json.optString("uri").takeIf { it.isNotBlank() },
+                json.optString("uri").takeIf { it.isNotBlank() && it != "null" },
                 json.optLong("expectedSizeBytes").takeIf { json.has("expectedSizeBytes") && !json.isNull("expectedSizeBytes") },
                 json.optString("expectedSha256").takeIf { it.isNotBlank() && it != "null" },
                 json.optInt("expectedWidth").takeIf { json.has("expectedWidth") && !json.isNull("expectedWidth") },
                 json.optInt("expectedHeight").takeIf { json.has("expectedHeight") && !json.isNull("expectedHeight") },
+                json.optString("ownerOperationId").takeIf { it.isNotBlank() && it != "null" },
+                json.optString("ownerRuntimeSessionId", json.optString("runtimeSessionId")),
+                json.optBoolean("terminalMetadataPersisted", false) || json.optString("state") == "TERMINAL_PERSISTED",
+                json.optLong("terminalMetadataPersistedAt").takeIf { json.has("terminalMetadataPersistedAt") && !json.isNull("terminalMetadataPersistedAt") },
                 state,
                 json.getLong("createdAt"),
                 json.getLong("updatedAt")

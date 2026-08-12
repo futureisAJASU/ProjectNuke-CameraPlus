@@ -115,9 +115,9 @@ fun exportNightFusionBitmapToGallery(
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
     jobDir: File? = null
 ): GalleryExportResult {
-    if (jobDir != null && NoFollowFileSystem.resolveDirectChild(jobDir, JOB_JSON_FILE_NAME, requireFile = true) != null) {
+    val exportOperationId = if (jobDir != null && NoFollowFileSystem.resolveDirectChild(jobDir, JOB_JSON_FILE_NAME, requireFile = true) != null) {
         KeplerJobMetadata.beginActiveOperation(jobDir, kind = KeplerActiveOperationKind.PUBLIC_EXPORT)
-    }
+    } else null
     val attempts = when (requestedFormat) {
         OutputFormat.HEIF -> listOf(OutputFormat.HEIF, OutputFormat.JPEG, OutputFormat.PNG)
         OutputFormat.JPEG -> listOf(OutputFormat.JPEG, OutputFormat.PNG)
@@ -135,7 +135,8 @@ fun exportNightFusionBitmapToGallery(
             quality = quality,
             fallbackUsed = format != requestedFormat,
             cancellation = cancellation,
-            jobDir = jobDir
+            jobDir = jobDir,
+            ownerOperationId = exportOperationId
         )
         if (!result.success) {
             cancellation.throwIfCancelled()
@@ -203,6 +204,7 @@ fun exportRawSidecarsToPublicStorage(
     relativeRawPath: String = "Pictures/Kepler/RAW",
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
 ): RawSidecarExportResult {
+    val ownerOperationId = KeplerJobMetadata.read(jobDir).optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }
     val manifest = runCatching { loadRawSidecarManifest(jobDir) }.getOrElse {
         return RawSidecarExportResult.failed("Invalid RAW sidecar manifest: ${it.message}")
     }
@@ -256,6 +258,7 @@ fun exportRawSidecarsToPublicStorage(
                 frameIndex = frame.frameIndex,
                 expectedSizeBytes = sourceDigest.size,
                 expectedSha256 = sourceDigest.sha256
+                ,ownerOperationId = ownerOperationId
             ) { output ->
                 copiedDigest = NoFollowFileSystem.copyVerified(file, output)
             } ?: run {
@@ -272,6 +275,7 @@ fun exportRawSidecarsToPublicStorage(
                     frameIndex = frame.frameIndex,
                     expectedSizeBytes = sourceDigest.size,
                     expectedSha256 = sourceDigest.sha256
+                    ,ownerOperationId = ownerOperationId
                 ) { output ->
                     copiedDigest = NoFollowFileSystem.copyVerified(file, output)
                 }
@@ -649,8 +653,11 @@ fun updateExportFailure(
 }
 
 internal fun markMediaStoreExportJournalsTerminalPersisted(jobDir: File) {
+    val ownerOperationId = runCatching { KeplerJobMetadata.read(jobDir).optString(ACTIVE_OPERATION_ID) }
+        .getOrNull()
+        ?.takeIf { it.isNotBlank() }
     MediaStoreExportJournal.list(jobDir).forEach { journal ->
-        if (journal.state != MediaStoreExportState.TERMINAL_PERSISTED) {
+        if (journal.ownerOperationId == ownerOperationId && !journal.terminalMetadataPersisted) {
             journal.markTerminalPersisted(jobDir)
         }
     }
@@ -884,7 +891,8 @@ private fun writeGalleryBitmap(
     quality: Int,
     fallbackUsed: Boolean,
     cancellation: KeplerPipelineCancellation,
-    jobDir: File?
+    jobDir: File?,
+    ownerOperationId: String? = null
 ): GalleryExportResult {
     val inserted = insertPublicFile(
         context = context,
@@ -896,7 +904,8 @@ private fun writeGalleryBitmap(
         jobDir = jobDir,
         role = MediaStoreExportRole.MAIN_IMAGE,
         expectedWidth = bitmap.width,
-        expectedHeight = bitmap.height
+        expectedHeight = bitmap.height,
+        ownerOperationId = ownerOperationId
     ) { output ->
         val ok = when (format) {
             OutputFormat.HEIF -> writeHeifViaTempFile(context, bitmap, quality, output)
@@ -984,6 +993,7 @@ private fun insertPublicFile(
     expectedSha256: String? = null,
     expectedWidth: Int? = null,
     expectedHeight: Int? = null,
+    ownerOperationId: String? = null,
     writer: (OutputStream) -> Unit
 ): InsertedPublicFile? {
     val resolver = context.contentResolver
@@ -1011,6 +1021,7 @@ private fun insertPublicFile(
                 expectedSha256 = expectedSha256,
                 expectedWidth = expectedWidth,
                 expectedHeight = expectedHeight
+                ,ownerOperationId = ownerOperationId
             )
         }
         uri = resolver.insert(collectionUri, values) ?: return null

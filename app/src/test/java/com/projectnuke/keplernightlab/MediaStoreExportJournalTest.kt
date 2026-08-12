@@ -40,7 +40,9 @@ class MediaStoreExportJournalTest {
             assertEquals(MediaStoreExportRole.MAIN_IMAGE, reloaded.role)
 
             reloaded.markTerminalPersisted(jobDir)
-            assertEquals(MediaStoreExportState.TERMINAL_PERSISTED, MediaStoreExportJournal.list(jobDir).single().state)
+            val settled = MediaStoreExportJournal.list(jobDir).single()
+            assertEquals(MediaStoreExportState.VERIFIED, settled.state)
+            assertTrue(settled.terminalMetadataPersisted)
         } finally {
             jobDir.deleteRecursively()
         }

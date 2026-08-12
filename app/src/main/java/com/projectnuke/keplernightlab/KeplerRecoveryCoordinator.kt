@@ -114,7 +114,17 @@ internal object KeplerRecoveryCoordinator {
             }
             children
                 .filter { NoFollowFileSystem.isRealDirectory(it.toPath()) && matchesJobPrefix(root, it.name) }
-                .forEach { results += recoverOne(it, exportAccess) }
+                .forEach { jobDir ->
+                    try {
+                        results += recoverOne(jobDir, exportAccess)
+                    } catch (failure: Exception) {
+                        results += KeplerJobRecoveryResult(
+                            jobDir = jobDir,
+                            classification = KeplerJobRecoveryClassification.RECOVERY_FAILED,
+                            failures = listOf("${failure.javaClass.simpleName}: ${failure.message}")
+                        )
+                    }
+                }
         }
         return KeplerRecoveryReport(results)
     }
@@ -142,7 +152,7 @@ internal object KeplerRecoveryCoordinator {
             ?: return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.SKIP_ACTIVE_CURRENT_PROCESS)
         try {
             val metadataTemps = reconcileJobMetadataWriteTemps(jobDir)
-            val job = try {
+            var job = try {
                 KeplerJobMetadata.read(jobDir)
             } catch (_: KeplerJobMetadataMissing) {
                 return KeplerJobRecoveryResult(
@@ -161,6 +171,7 @@ internal object KeplerRecoveryCoordinator {
             if (job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id) {
                 return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.SKIP_ACTIVE_CURRENT_PROCESS)
             }
+            val activeOperation = job.optString(ACTIVE_OPERATION_ID)
             val invalidExportJournals = MediaStoreExportJournal.invalidFiles(jobDir)
             if (invalidExportJournals.isNotEmpty()) {
                 KeplerJobMetadata.update(jobDir) {
@@ -198,17 +209,27 @@ internal object KeplerRecoveryCoordinator {
                         .put("recoveryMessage", "공개 내보내기 증거를 확인할 수 없어 복구가 필요합니다.")
                 }
             }
-            if (exportResults.isNotEmpty()) {
-                val reconstructed = reconstructRawSidecarJournalEvidence(jobDir, job)
-                if (reconstructed > 0) {
-                    KeplerJobMetadata.update(jobDir) { current ->
-                        reconstructRawSidecarJournalEvidence(jobDir, current, exportResults.mapNotNull { result ->
-                            MediaStoreExportJournal.list(jobDir).firstOrNull { it.exportAttemptId == result.attemptId }
-                        })
-                    }
+            if (activeOperation.isNotBlank() && exportResults.isNotEmpty()) {
+                job = KeplerJobMetadata.update(jobDir) { current ->
+                    reconstructMainExportEvidence(jobDir, current, activeOperation, exportResults)
                 }
             }
-            val activeOperation = job.optString(ACTIVE_OPERATION_ID)
+            if (exportResults.isNotEmpty()) {
+                val recoveredAttemptIds = exportResults
+                    .filter { result ->
+                        result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
+                            result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED
+                    }
+                    .mapTo(mutableSetOf()) { it.attemptId }
+                job = KeplerJobMetadata.update(jobDir) { current ->
+                    reconstructRawSidecarJournalEvidence(
+                        jobDir,
+                        current,
+                        MediaStoreExportJournal.list(jobDir),
+                        recoveredAttemptIds
+                    )
+                }
+            }
             val captureTemps = recoverCaptureOwnedTemps(jobDir, job, activeOperation.isNotBlank())
             if (activeOperation.isNotBlank()) {
                 val artifactResults = recoverProcessingArtifactJournals(jobDir)
