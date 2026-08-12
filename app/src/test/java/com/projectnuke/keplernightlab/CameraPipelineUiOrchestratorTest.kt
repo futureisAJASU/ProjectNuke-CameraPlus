@@ -155,7 +155,9 @@ class CameraPipelineUiOrchestratorTest {
         )
         orchestrator.start("capture") { _, _, _, events -> sink = events }
         scheduler.run(250L)
-        sink!!.invoke(CameraPipelineEvent.Terminal(0L, CameraPipelineEvent.Terminal.Kind.FAILED))
+        val publisher = CameraPipelineTerminalPublisher(sink!!)
+        assertTrue(publisher.publish(CameraPipelineEvent.Terminal.Kind.FAILED))
+        assertFalse(publisher.publish(CameraPipelineEvent.Terminal.Kind.COMPLETE))
 
         assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
         assertFalse(session.snapshot().isBusy)
