@@ -112,7 +112,8 @@ fun exportNightFusionBitmapToGallery(
     requestedFormat: OutputFormat,
     relativeAlbumPath: String = "Pictures/Kepler",
     quality: Int = 92,
-    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
+    cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
+    jobDir: File? = null
 ): GalleryExportResult {
     val attempts = when (requestedFormat) {
         OutputFormat.HEIF -> listOf(OutputFormat.HEIF, OutputFormat.JPEG, OutputFormat.PNG)
@@ -130,7 +131,8 @@ fun exportNightFusionBitmapToGallery(
             relativeAlbumPath = relativeAlbumPath,
             quality = quality,
             fallbackUsed = format != requestedFormat,
-            cancellation = cancellation
+            cancellation = cancellation,
+            jobDir = jobDir
         )
         if (!result.success) {
             cancellation.throwIfCancelled()
@@ -221,7 +223,11 @@ fun exportRawSidecarsToPublicStorage(
                 mimeType = "image/x-adobe-dng",
                 relativePath = relativeRawPath,
                 collectionUri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
-                cancellation = cancellation
+                cancellation = cancellation,
+                jobDir = jobDir,
+                role = MediaStoreExportRole.RAW_DNG_SIDECAR,
+                frameIndex = frame.frameIndex,
+                expectedSizeBytes = file.length()
             ) { output ->
                 sourceDigest = NoFollowFileSystem.copyVerified(file, output)
             } ?: run {
@@ -232,7 +238,11 @@ fun exportRawSidecarsToPublicStorage(
                     mimeType = "image/x-adobe-dng",
                     relativePath = "Download/Kepler/RAW",
                     collectionUri = MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                    cancellation = cancellation
+                    cancellation = cancellation,
+                    jobDir = jobDir,
+                    role = MediaStoreExportRole.RAW_DNG_SIDECAR,
+                    frameIndex = frame.frameIndex,
+                    expectedSizeBytes = file.length()
                 ) { output ->
                     sourceDigest = NoFollowFileSystem.copyVerified(file, output)
                 }
@@ -246,17 +256,19 @@ fun exportRawSidecarsToPublicStorage(
             }
             val verificationError = verifyPublicDng(
                 context = context,
-                uri = result.first,
+                uri = result.uri,
                 expected = sourceDigest ?: return@forEach
             )
             if (verificationError != null) {
-                runCatching { context.contentResolver.delete(result.first, null, null) }
+                result.journal?.transition(jobDir, MediaStoreExportState.CLEANUP_REQUIRED)
+                runCatching { context.contentResolver.delete(result.uri, null, null) }
                 val failure = "${file.name}: $verificationError"
                 publicFailures += failure
                 publicFailureByFrame[frame.frameIndex] = failure
             } else {
-                exported += result.first.toString()
-                publicByFrame[frame.frameIndex] = result.first.toString()
+                result.journal?.transition(jobDir, MediaStoreExportState.VERIFIED)
+                exported += result.uri.toString()
+                publicByFrame[frame.frameIndex] = result.uri.toString()
             }
         }
     } catch (ce: CancellationException) {
@@ -553,6 +565,7 @@ fun updateExportMetadata(
             "nativePostprocessRgbaFile=$nativePostprocessRgbaFileForLog " +
             "rawRenderDebugFile=$rawRenderDebugFileForLog"
     )
+    markMediaStoreExportJournalsTerminalPersisted(jobDir)
 }
 
 fun updateExportFailure(
@@ -576,6 +589,15 @@ fun updateExportFailure(
             .put("rawSidecarError", if (rawSidecarIgnored) "RAW sidecar unavailable for YUV pipeline." else JSONObject.NULL)
             .put("cleanupStatus", "SKIPPED")
             .put("exportedAt", System.currentTimeMillis())
+    }
+    markMediaStoreExportJournalsTerminalPersisted(jobDir)
+}
+
+internal fun markMediaStoreExportJournalsTerminalPersisted(jobDir: File) {
+    MediaStoreExportJournal.list(jobDir).forEach { journal ->
+        if (journal.state != MediaStoreExportState.TERMINAL_PERSISTED) {
+            journal.markTerminalPersisted(jobDir)
+        }
     }
 }
 
@@ -785,6 +807,7 @@ internal fun updateRawPublicExportOutcome(
             job.remove("galleryPublicExportLinkage")
         }
     }
+    markMediaStoreExportJournalsTerminalPersisted(jobDir)
 }
 
 fun requestedOutputFormatForSetting(finalOutputFormat: FinalOutputFormat): OutputFormat = when {
@@ -801,7 +824,8 @@ private fun writeGalleryBitmap(
     relativeAlbumPath: String,
     quality: Int,
     fallbackUsed: Boolean,
-    cancellation: KeplerPipelineCancellation
+    cancellation: KeplerPipelineCancellation,
+    jobDir: File?
 ): GalleryExportResult {
     val inserted = insertPublicFile(
         context = context,
@@ -809,7 +833,11 @@ private fun writeGalleryBitmap(
         mimeType = format.mimeType,
         relativePath = relativeAlbumPath,
         collectionUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-        cancellation = cancellation
+        cancellation = cancellation,
+        jobDir = jobDir,
+        role = MediaStoreExportRole.MAIN_IMAGE,
+        expectedWidth = bitmap.width,
+        expectedHeight = bitmap.height
     ) { output ->
         val ok = when (format) {
             OutputFormat.HEIF -> writeHeifViaTempFile(context, bitmap, quality, output)
@@ -828,7 +856,7 @@ private fun writeGalleryBitmap(
         errorMessage = "MediaStore insert/write failed"
     )
 
-    val committedUri = inserted.first
+    val committedUri = inserted.uri
     val verification = verifyGalleryExportResult(
         context = context,
         uriString = committedUri.toString(),
@@ -840,13 +868,16 @@ private fun writeGalleryBitmap(
     )
 
     if (verification !is GalleryExportVerification.Verified) {
+        jobDir?.let { owner ->
+            inserted.journal?.transition(owner, MediaStoreExportState.CLEANUP_REQUIRED)
+        }
         runCatching { context.contentResolver.delete(committedUri, null, null) }
         return GalleryExportResult(
             success = false,
             uriString = committedUri.toString(),
             displayName = displayName,
             mimeType = format.mimeType,
-            fileSizeBytes = inserted.second,
+            fileSizeBytes = inserted.size,
             formatUsed = format,
             fallbackUsed = fallbackUsed,
             errorMessage = "Verification failed: ${(verification as? GalleryExportVerification.RetryableFailure)?.reason ?: (verification as? GalleryExportVerification.PermanentFailure)?.reason}",
@@ -854,6 +885,10 @@ private fun writeGalleryBitmap(
             candidateFailureReasons = listOf((verification as? GalleryExportVerification.RetryableFailure)?.reason ?: (verification as? GalleryExportVerification.PermanentFailure)?.reason.orEmpty()),
             verification = verification
         )
+    }
+
+    jobDir?.let { owner ->
+        inserted.journal?.transition(owner, MediaStoreExportState.VERIFIED)
     }
 
     return GalleryExportResult(
@@ -870,6 +905,12 @@ private fun writeGalleryBitmap(
     )
 }
 
+private data class InsertedPublicFile(
+    val uri: Uri,
+    val size: Long,
+    val journal: MediaStoreExportJournal?
+)
+
 private fun insertPublicFile(
     context: Context,
     displayName: String,
@@ -877,8 +918,14 @@ private fun insertPublicFile(
     relativePath: String,
     collectionUri: Uri,
     cancellation: KeplerPipelineCancellation,
+    jobDir: File? = null,
+    role: MediaStoreExportRole = MediaStoreExportRole.MAIN_IMAGE,
+    frameIndex: Int? = null,
+    expectedSizeBytes: Long? = null,
+    expectedWidth: Int? = null,
+    expectedHeight: Int? = null,
     writer: (OutputStream) -> Unit
-): Pair<Uri, Long>? {
+): InsertedPublicFile? {
     val resolver = context.contentResolver
     val values = ContentValues().apply {
         put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
@@ -888,11 +935,28 @@ private fun insertPublicFile(
         put(MediaStore.MediaColumns.IS_PENDING, 1)
     }
     var uri: Uri? = null
+    var journal: MediaStoreExportJournal? = null
     return try {
         cancellation.throwIfCancelled()
+        journal = jobDir?.let {
+            MediaStoreExportJournal.create(
+                jobDir = it,
+                role = role,
+                frameIndex = frameIndex,
+                displayName = displayName,
+                relativePath = relativePath,
+                mimeType = mimeType,
+                collectionUri = collectionUri,
+                expectedSizeBytes = expectedSizeBytes,
+                expectedWidth = expectedWidth,
+                expectedHeight = expectedHeight
+            )
+        }
         uri = resolver.insert(collectionUri, values) ?: return null
+        journal = journal?.transition(jobDir!!, MediaStoreExportState.ROW_INSERTED, uri.toString())
         cancellation.throwIfCancelled()
         resolver.openOutputStream(uri)?.use(writer) ?: error("openOutputStream returned null")
+        journal = journal?.transition(jobDir!!, MediaStoreExportState.CONTENT_WRITTEN)
         cancellation.throwIfCancelled()
         val updateCount = resolver.update(
             uri,
@@ -901,14 +965,18 @@ private fun insertPublicFile(
             null
         )
         if (updateCount != 1) {
+            journal = journal?.transition(jobDir!!, MediaStoreExportState.CLEANUP_REQUIRED)
             runCatching { resolver.delete(uri, null, null) }
             return null
         }
-        uri to runCatching { queryMediaSize(context, uri) }.getOrDefault(0L)
+        journal = journal?.transition(jobDir!!, MediaStoreExportState.PUBLIC_COMMITTED)
+        InsertedPublicFile(uri, runCatching { queryMediaSize(context, uri) }.getOrDefault(0L), journal)
     } catch (ce: CancellationException) {
+        journal?.let { runCatching { it.transition(jobDir!!, MediaStoreExportState.CLEANUP_REQUIRED) } }
         uri?.let { runCatching { resolver.delete(it, null, null) } }
         throw ce
     } catch (error: Throwable) {
+        journal?.let { runCatching { it.transition(jobDir!!, MediaStoreExportState.CLEANUP_REQUIRED) } }
         uri?.let { runCatching { resolver.delete(it, null, null) } }
         if (error is Error) throw error
         null

@@ -841,7 +841,8 @@ fun captureProcessExportRawNightFusion(
                                 ).format(Date())
                             }",
                             requestedFormat = requestedOutputFormat,
-                            cancellation = cancellation
+                            cancellation = cancellation,
+                            jobDir = jobDir
                         )
                     } finally {
                         exportBitmap?.takeUnless { it.isRecycled }?.recycle()
@@ -1589,7 +1590,8 @@ internal fun reprocessRawJob(
                         SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                     }",
                     requestedFormat = requestedFormat,
-                    cancellation = cancellation
+                    cancellation = cancellation,
+                    jobDir = jobDir
                 )
             } catch (exportError: Throwable) {
                 exportBitmap?.takeUnless { it.isRecycled }?.recycle()

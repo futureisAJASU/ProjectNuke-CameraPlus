@@ -690,7 +690,8 @@ fun captureProcessExportSuperResolutionFusion(
                             bitmap = bitmap,
                             displayNameBase = displayName,
                             requestedFormat = requestedFormat,
-                            cancellation = cancellation
+                            cancellation = cancellation,
+                            jobDir = outputDir
                         )
                     } finally {
                         bitmap.recycle()

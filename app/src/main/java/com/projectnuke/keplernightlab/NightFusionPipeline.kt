@@ -140,7 +140,8 @@ fun captureProcessExportNightFusion(
                             bitmap = bitmap,
                             displayNameBase = displayNameBase,
                             requestedFormat = requestedOutputFormat,
-                            cancellation = cancellation
+                            cancellation = cancellation,
+                            jobDir = jobDir
                         )
                     } finally {
                         bitmap.recycle()
@@ -410,7 +411,8 @@ internal fun reprocessYuvJob(
                         SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                     }",
                     requestedFormat = requestedFormat,
-                    cancellation = cancellation
+                    cancellation = cancellation,
+                    jobDir = jobDir
                 )
             } finally {
                 bitmap.recycle()
