@@ -681,6 +681,11 @@ fun captureRawBurstForFusion(
             .put("createdAt", System.currentTimeMillis())
             .put("notes", "True RAW fusion input. Stores RAW_SENSOR DNG backup plus compact raw16 per frame. TODO retry budget: targetFrames=8, maxAttempts=9 or 10, continue until target saved or maxAttempts/timeout.")
         KeplerJobMetadata.write(jobDir, baseJob)
+        val durableCaptureOperationId = KeplerJobMetadata.beginActiveOperation(
+            jobDir,
+            kind = KeplerActiveOperationKind.CAPTURE_RAW
+        )
+        var durableCaptureTerminalPersisted = false
 
         fun updateFinalRouteMetadata(captureRoute: PhysicalCaptureRoute) {
             finalCaptureRoute = captureRoute
@@ -837,11 +842,13 @@ fun captureRawBurstForFusion(
                             try {
                                 KeplerJobMetadata.write(jobDir, terminalJob)
                                 metadataOutcome = RawTerminalOperationOutcome.Succeeded
+                                durableCaptureTerminalPersisted = true
                             } catch (failure: Throwable) {
                                 metadataOutcome = RawTerminalOperationOutcome.Failed(failure)
                             }
                         } else {
                             metadataOutcome = writeJobStatus(jobFile, baseJob, request.jobStatus, message)
+                            durableCaptureTerminalPersisted = metadataOutcome is RawTerminalOperationOutcome.Succeeded
                         }
                         statusOutcome = if (post(message)) {
                             RawTerminalOperationOutcome.Succeeded
@@ -861,6 +868,9 @@ fun captureRawBurstForFusion(
                             status = statusOutcome
                         )
                     } finally {
+                        if (durableCaptureTerminalPersisted) {
+                            KeplerJobMetadata.clearActiveOperation(jobDir, durableCaptureOperationId)
+                        }
                         cleanup()
                         publishRawTerminalSnapshot(
                             RawTerminalSettlementPhase.SETTLED,

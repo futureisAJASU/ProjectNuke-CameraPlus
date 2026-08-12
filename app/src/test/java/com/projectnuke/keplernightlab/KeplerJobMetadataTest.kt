@@ -68,4 +68,23 @@ class KeplerJobMetadataTest {
             directory.deleteRecursively()
         }
     }
+
+    @Test
+    fun newOperationReplacesOldDurableMarkerAndOldOwnerCannotClearIt() {
+        val directory = Files.createTempDirectory("kepler-runtime-replacement-").toFile()
+        try {
+            KeplerJobMetadata.write(directory, JSONObject().put("status", "PROCESSING"))
+            val first = KeplerJobMetadata.beginActiveOperation(directory, kind = KeplerActiveOperationKind.CAPTURE_RAW)
+            val second = KeplerJobMetadata.beginActiveOperation(directory, kind = KeplerActiveOperationKind.PUBLIC_EXPORT)
+            assertTrue(first != second)
+            val current = KeplerJobMetadata.read(directory)
+            assertEquals(second, current.getString(ACTIVE_OPERATION_ID))
+            assertEquals("PUBLIC_EXPORT", current.getString(ACTIVE_OPERATION_KIND))
+            assertFalse(KeplerJobMetadata.clearActiveOperation(directory, first))
+            assertEquals(second, KeplerJobMetadata.read(directory).getString(ACTIVE_OPERATION_ID))
+            assertTrue(KeplerJobMetadata.clearActiveOperation(directory, second))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
 }

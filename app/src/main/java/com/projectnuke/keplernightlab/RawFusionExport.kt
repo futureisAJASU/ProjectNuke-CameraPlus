@@ -22,12 +22,15 @@ import java.util.Locale
  */
 internal class RawProcessingOperation internal constructor(
     val lease: JobOperationLease,
-    private val ownsLease: Boolean
+    private val ownsLease: Boolean,
+    private val jobDir: File,
+    private val activeOperationId: String?
 ) {
     private val released = AtomicBoolean(false)
 
     fun release() {
         if (!released.compareAndSet(false, true)) return
+        activeOperationId?.let { KeplerJobMetadata.clearActiveOperation(jobDir, it) }
         if (ownsLease) lease.release()
     }
 }
@@ -42,7 +45,10 @@ internal fun acquireRawProcessingOperation(
         if (ownsLease) lease.release()
         return null
     }
-    return RawProcessingOperation(lease, ownsLease)
+    val operationId = if (NoFollowFileSystem.resolveDirectChild(jobDir, JOB_JSON_FILE_NAME, requireFile = true) != null) {
+        KeplerJobMetadata.beginActiveOperation(jobDir, kind = KeplerActiveOperationKind.PROCESSING_RAW)
+    } else null
+    return RawProcessingOperation(lease, ownsLease, jobDir, operationId)
 }
 
 /**

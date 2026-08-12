@@ -290,6 +290,7 @@ fun captureYuvBurstColorWithMotion(
     var metadataWriter: ProductionMetadataWriter? = null
     var yuvSession: YuvCaptureSession? = null
     var jobFileHolder: JobFileHolder? = null
+    var durableCaptureOperationId: String? = null
 
     fun logLateCameraCallback(callback: String) {
         val isFinished = yuvSession?.let { !it.terminalState.status().equals(CaptureTerminalStatus.ACTIVE) } ?: finished.get()
@@ -543,6 +544,10 @@ fun captureYuvBurstColorWithMotion(
             finalRequestZoom = finalRequestZoom,
             requestedZoomRatio = zoomRatio
         )
+        durableCaptureOperationId = KeplerJobMetadata.beginActiveOperation(
+            currentBurstDir,
+            kind = KeplerActiveOperationKind.CAPTURE_YUV
+        )
 
         metadataWriter = ProductionMetadataWriter(
             jobFileHolder = jobFileHolder!!,
@@ -606,6 +611,9 @@ fun captureYuvBurstColorWithMotion(
                 RealYuvFinalFileVerifier.verify(file, frameIndex)
             },
             onSessionTerminal = { request ->
+                durableCaptureOperationId?.let { operationId ->
+                    KeplerJobMetadata.clearActiveOperation(currentBurstDir, operationId)
+                }
                 // Session terminal observer: consumes the SOLE published request and
                 // dispatches exactly one user callback.  Runs on Main (the owner's
                 // dispatchCallback already posted it); never infers the terminal
