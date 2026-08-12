@@ -127,6 +127,35 @@ class ProcessingArtifactTransactionTest {
     }
 
     @Test
+    fun corruptCurrentFinalIsReplacedByVerifiedPriorUsingAtomicReplacement() {
+        val dir = Files.createTempDirectory("processing-journal-replace-").toFile()
+        try {
+            val final = File(dir, "result.bin").apply { writeText("corrupt") }
+            val prior = File(dir, ".result.bin.replace.prior").apply { writeText("verified-prior") }
+            val id = UUID.randomUUID().toString()
+            ProcessingArtifactJournal(
+                transactionId = id,
+                processingAttemptId = null,
+                runtimeSessionId = "old-runtime",
+                artifactType = "bin",
+                finalName = final.name,
+                tempName = ".result.bin.replace.tmp",
+                priorName = prior.name,
+                verificationKind = "BIN",
+                expectedSizeBytes = 7L,
+                expectedSha256 = "0".repeat(64),
+                priorExpectedSizeBytes = prior.length(),
+                priorExpectedSha256 = NoFollowFileSystem.digestVerified(prior).sha256,
+                state = ProcessingArtifactJournalState.NEW_FINAL_MOVED,
+                createdAt = 1L,
+                updatedAt = 2L
+            ).writeTo(dir)
+            assertEquals(ProcessingArtifactRecoveryClassification.RESTORED_PRIOR, recoverProcessingArtifactJournals(dir).single().classification)
+            assertEquals("verified-prior", final.readText())
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
     fun malformedProcessingJournalIdentityIsPreserved() {
         val dir = Files.createTempDirectory("processing-journal-hostile").toFile()
         try {

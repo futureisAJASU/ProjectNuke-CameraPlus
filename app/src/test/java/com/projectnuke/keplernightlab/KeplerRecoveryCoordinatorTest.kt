@@ -198,4 +198,23 @@ class KeplerRecoveryCoordinatorTest {
             assertEquals(KeplerJobRecoveryClassification.PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL, report.jobs.first { it.jobDir == healthy }.classification)
         } finally { root.deleteRecursively() }
     }
+
+    @Test
+    fun unknownInsertResultIsAmbiguousJobEvidence() {
+        val root = File(Files.createTempDirectory("kepler-recovery-unknown-export-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_unknown").apply { mkdirs() }
+        try {
+            val operationId = "unknown-export"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, operationId))
+            MediaStoreExportJournal.create(
+                job, MediaStoreExportRole.MAIN_IMAGE, null, "result.jpg", "Pictures/Kepler",
+                "image/jpeg", Uri.parse("content://media/external/images/media"), ownerOperationId = operationId
+            )
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
+            assertEquals(KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED, report.jobs.single().classification)
+        } finally { root.deleteRecursively() }
+    }
 }

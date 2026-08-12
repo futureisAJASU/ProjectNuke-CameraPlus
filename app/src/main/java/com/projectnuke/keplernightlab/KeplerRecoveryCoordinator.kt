@@ -190,7 +190,9 @@ internal object KeplerRecoveryCoordinator {
             }
             val exportResults = exportAccess?.let { recoverMediaStoreExportJournals(jobDir, it) }.orEmpty()
             val exportFailure = exportResults.firstOrNull {
-                it.classification == MediaStoreExportRecoveryClassification.AMBIGUOUS
+                it.classification == MediaStoreExportRecoveryClassification.AMBIGUOUS ||
+                    it.classification == MediaStoreExportRecoveryClassification.INSERT_RESULT_UNKNOWN ||
+                    it.classification == MediaStoreExportRecoveryClassification.DELETE_FAILED
             }
             if (exportFailure != null) {
                 KeplerJobMetadata.update(jobDir) {

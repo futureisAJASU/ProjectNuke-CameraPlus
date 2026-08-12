@@ -7,7 +7,6 @@ import android.provider.MediaStore
 import java.io.File
 
 internal enum class MediaStoreExportRecoveryClassification {
-    NO_PUBLIC_OWNERSHIP,
     PENDING_DELETED,
     PENDING_VERIFIED_AND_COMMITTED,
     PUBLIC_VERIFIED,

@@ -188,9 +188,14 @@ internal fun recoverProcessingArtifactJournals(
         require(NoFollowFileSystem.isRealFile(source.toPath()))
         require(!java.nio.file.Files.isSymbolicLink(destination.toPath()))
         try {
-            Files.move(source.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE)
+            Files.move(
+                source.toPath(),
+                destination.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING
+            )
         } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
-            Files.move(source.toPath(), destination.toPath())
+            Files.move(source.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING)
         }
     }
     when (journal.state) {
