@@ -33,6 +33,7 @@ internal data class MediaStoreExportJournal(
     val collectionUri: String,
     val uri: String?,
     val expectedSizeBytes: Long?,
+    val expectedSha256: String?,
     val expectedWidth: Int?,
     val expectedHeight: Int?,
     val state: MediaStoreExportState,
@@ -45,8 +46,17 @@ internal data class MediaStoreExportJournal(
         return this
     }
 
-    fun transition(jobDir: File, next: MediaStoreExportState, uriOverride: String? = uri): MediaStoreExportJournal =
-        copy(state = next, uri = uriOverride, updatedAt = System.currentTimeMillis()).writeTo(jobDir)
+    fun transition(
+        jobDir: File,
+        next: MediaStoreExportState,
+        uriOverride: String? = uri,
+        expectedSha256Override: String? = expectedSha256
+    ): MediaStoreExportJournal = copy(
+        state = next,
+        uri = uriOverride,
+        expectedSha256 = expectedSha256Override,
+        updatedAt = System.currentTimeMillis()
+    ).writeTo(jobDir)
 
     fun markTerminalPersisted(jobDir: File): MediaStoreExportJournal = transition(jobDir, MediaStoreExportState.TERMINAL_PERSISTED)
 
@@ -67,6 +77,7 @@ internal data class MediaStoreExportJournal(
         .put("collectionUri", collectionUri)
         .put("uri", uri ?: JSONObject.NULL)
         .put("expectedSizeBytes", expectedSizeBytes ?: JSONObject.NULL)
+        .put("expectedSha256", expectedSha256 ?: JSONObject.NULL)
         .put("expectedWidth", expectedWidth ?: JSONObject.NULL)
         .put("expectedHeight", expectedHeight ?: JSONObject.NULL)
         .put("state", state.name)
@@ -86,6 +97,7 @@ internal data class MediaStoreExportJournal(
             mimeType: String,
             collectionUri: Uri,
             expectedSizeBytes: Long? = null,
+            expectedSha256: String? = null,
             expectedWidth: Int? = null,
             expectedHeight: Int? = null
         ): MediaStoreExportJournal {
@@ -105,6 +117,7 @@ internal data class MediaStoreExportJournal(
                 collectionUri = collectionUri.toString(),
                 uri = null,
                 expectedSizeBytes = expectedSizeBytes,
+                expectedSha256 = expectedSha256,
                 expectedWidth = expectedWidth,
                 expectedHeight = expectedHeight,
                 state = MediaStoreExportState.PREPARED,
@@ -138,6 +151,7 @@ internal data class MediaStoreExportJournal(
                 json.getString("collectionUri"),
                 json.optString("uri").takeIf { it.isNotBlank() },
                 json.optLong("expectedSizeBytes").takeIf { json.has("expectedSizeBytes") && !json.isNull("expectedSizeBytes") },
+                json.optString("expectedSha256").takeIf { it.isNotBlank() && it != "null" },
                 json.optInt("expectedWidth").takeIf { json.has("expectedWidth") && !json.isNull("expectedWidth") },
                 json.optInt("expectedHeight").takeIf { json.has("expectedHeight") && !json.isNull("expectedHeight") },
                 state,

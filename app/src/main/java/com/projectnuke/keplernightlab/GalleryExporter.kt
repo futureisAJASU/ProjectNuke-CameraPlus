@@ -259,6 +259,13 @@ fun exportRawSidecarsToPublicStorage(
                 uri = result.uri,
                 expected = sourceDigest ?: return@forEach
             )
+            result.journal?.let { journal ->
+                journal.transition(
+                    jobDir,
+                    journal.state,
+                    expectedSha256Override = sourceDigest?.sha256
+                )
+            }
             if (verificationError != null) {
                 result.journal?.transition(jobDir, MediaStoreExportState.CLEANUP_REQUIRED)
                 runCatching { context.contentResolver.delete(result.uri, null, null) }

@@ -82,9 +82,15 @@ internal object KeplerRecoveryCoordinator {
         }
     }
 
-    private fun scan(context: Context): KeplerRecoveryReport = recoverRoots(keplerGalleryRoots(context))
+    private fun scan(context: Context): KeplerRecoveryReport = recoverRoots(
+        keplerGalleryRoots(context),
+        ContextMediaStoreExportRecoveryAccess(context)
+    )
 
-    internal fun recoverRoots(roots: List<File>): KeplerRecoveryReport {
+    internal fun recoverRoots(
+        roots: List<File>,
+        exportAccess: MediaStoreExportRecoveryAccess? = null
+    ): KeplerRecoveryReport {
         val results = mutableListOf<KeplerJobRecoveryResult>()
         roots.forEach { root ->
             val children = try {
@@ -99,12 +105,15 @@ internal object KeplerRecoveryCoordinator {
             }
             children
                 .filter { NoFollowFileSystem.isRealDirectory(it.toPath()) && matchesJobPrefix(root, it.name) }
-                .forEach { results += recoverOne(it) }
+                .forEach { results += recoverOne(it, exportAccess) }
         }
         return KeplerRecoveryReport(results)
     }
 
-    private fun recoverOne(jobDir: File): KeplerJobRecoveryResult {
+    private fun recoverOne(
+        jobDir: File,
+        exportAccess: MediaStoreExportRecoveryAccess?
+    ): KeplerJobRecoveryResult {
         val quarantineFailure = try {
             recoverValidatedQuarantine(jobDir)
             null
@@ -136,6 +145,22 @@ internal object KeplerRecoveryCoordinator {
             }
             if (job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id) {
                 return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.SKIP_ACTIVE_CURRENT_PROCESS)
+            }
+            val exportResults = exportAccess?.let { recoverMediaStoreExportJournals(jobDir, it) }.orEmpty()
+            val exportFailure = exportResults.firstOrNull {
+                it.classification == MediaStoreExportRecoveryClassification.AMBIGUOUS
+            }
+            if (exportFailure != null) {
+                KeplerJobMetadata.update(jobDir) {
+                    it.put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
+                        .put("recoveryMessage", exportFailure.message ?: "MediaStore export recovery requires manual review.")
+                }
+                return KeplerJobRecoveryResult(
+                    jobDir,
+                    KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED,
+                    actions = exportResults.map { it.classification.name },
+                    failures = listOfNotNull(exportFailure.message)
+                )
             }
             val activeOperation = job.optString(ACTIVE_OPERATION_ID)
             if (activeOperation.isNotBlank()) {
