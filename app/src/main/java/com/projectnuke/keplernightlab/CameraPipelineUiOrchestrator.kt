@@ -108,7 +108,7 @@ internal class CameraPipelineUiOrchestrator(
                     callbacks.onStateChanged()
                 }
             }
-            session.attachTerminalFallback(generation, fallback)
+            if (!session.attachTerminalFallback(generation, fallback)) return@Runnable
             when (postSafely(15_000L, fallback)) {
                 CameraUiDispatchOutcome.ACCEPTED -> Unit
                 CameraUiDispatchOutcome.REJECTED,
@@ -223,10 +223,18 @@ internal class CameraPipelineUiOrchestrator(
                         }
                     }
                 )
-            } catch (_: CancellationException) {
-                // The pipeline must still publish terminal evidence.
+            } catch (interruption: CancellationException) {
+                recordLauncherInterruption(
+                    generation = generation,
+                    failure = interruption,
+                    status = "취소 요청을 처리하고 있습니다."
+                )
             } catch (failure: Exception) {
-                recordLauncherFailure(generation, failure)
+                recordLauncherInterruption(
+                    generation = generation,
+                    failure = failure,
+                    status = "카메라 파이프라인 오류를 처리하고 있습니다."
+                )
             }
         }
         session.attachScheduledStart(generation, jobStart)
@@ -261,7 +269,11 @@ internal class CameraPipelineUiOrchestrator(
         session.clearTerminalFallback(generation)?.let(scheduler::remove)
     }
 
-    private fun recordLauncherFailure(generation: Long, failure: Throwable) {
+    private fun recordLauncherInterruption(
+        generation: Long,
+        failure: Throwable,
+        status: String
+    ) {
         synchronized(this) {
             launcherFailureValue = failure
         }
@@ -269,6 +281,9 @@ internal class CameraPipelineUiOrchestrator(
         if (!session.markLauncherFailureAwaitingTerminal(generation, message)) return
         session.clearWatchdog(generation)?.let(scheduler::remove)
         session.clearScheduledStart(generation)?.let(scheduler::remove)
+        if (session.hasTerminalClaimed(generation)) return
+        callbacks.onStatus(status)
+        callbacks.onStateChanged()
         val fallback = Runnable {
             session.clearTerminalFallback(generation)
             if (session.markTerminalDeliveryFailed(
@@ -280,7 +295,7 @@ internal class CameraPipelineUiOrchestrator(
                 callbacks.onStateChanged()
             }
         }
-        session.attachTerminalFallback(generation, fallback)
+        if (!session.attachTerminalFallback(generation, fallback)) return
         when (postSafely(15_000L, fallback)) {
             CameraUiDispatchOutcome.ACCEPTED -> Unit
             CameraUiDispatchOutcome.REJECTED,

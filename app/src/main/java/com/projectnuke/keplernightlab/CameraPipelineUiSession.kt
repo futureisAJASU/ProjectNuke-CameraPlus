@@ -129,7 +129,11 @@ internal class CameraPipelineUiSession {
 
     @Synchronized
     fun attachTerminalFallback(localGeneration: Long, runnable: Runnable): Boolean {
-        if (!isCurrentLocked(localGeneration)) return false
+        if (!isCurrentLocked(localGeneration) || terminalClaimed ||
+            current.phase == Phase.TERMINAL || current.phase == Phase.UNRESOLVED
+        ) {
+            return false
+        }
         terminalFallback = runnable
         return true
     }
@@ -225,10 +229,7 @@ internal class CameraPipelineUiSession {
         ) {
             return false
         }
-        if (!current.cancellationRequested) {
-            active.cancellationToken.cancel()
-            active.captureCancellation.cancelCapture("camera pipeline launcher failed: $message")
-        }
+        val shouldRequestCancellation = !current.cancellationRequested
         current = current.copy(
             phase = Phase.WAITING_FOR_TERMINAL,
             cancellationRequested = true,
@@ -236,6 +237,10 @@ internal class CameraPipelineUiSession {
             previewAllowed = false,
             captureResourcesSettled = false
         )
+        if (shouldRequestCancellation) {
+            active.cancellationToken.cancel()
+            active.captureCancellation.cancelCapture("camera pipeline launcher failed: $message")
+        }
         return true
     }
 
