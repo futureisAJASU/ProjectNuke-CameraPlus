@@ -196,6 +196,7 @@ internal fun commitProcessingArtifact(
         checkCancelled()
 
         if (existingRegularArtifact(finalFile)) {
+            journalTransition(ProcessingArtifactJournalState.PRIOR_BACKED_UP)
             move(finalFile, priorBackup)
             priorBackedUp = true
             state = ProcessingArtifactState.PRIOR_FINAL_BACKED_UP
@@ -203,6 +204,7 @@ internal fun commitProcessingArtifact(
         }
 
         checkCancelled()
+        journalTransition(ProcessingArtifactJournalState.NEW_FINAL_MOVED)
         move(temp, finalFile)
         newFinalCommitted = true
         state = ProcessingArtifactState.COMMITTED_FINAL

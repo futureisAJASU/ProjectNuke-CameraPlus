@@ -9,6 +9,11 @@ internal enum class KeplerJobRecoveryClassification {
     RECOVERED,
     SKIP_ACTIVE_CURRENT_PROCESS,
     LEGACY_REQUIRES_RECONCILIATION,
+    INTERRUPTED_PRE_COMMIT,
+    LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL,
+    PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION,
+    PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL,
+    AMBIGUOUS_RECOVERY_REQUIRED,
     ORPHANED_JOB_METADATA,
     CORRUPT_JOB_METADATA,
     REPROCESS_QUARANTINED,
@@ -134,10 +139,41 @@ internal object KeplerRecoveryCoordinator {
             }
             val activeOperation = job.optString(ACTIVE_OPERATION_ID)
             if (activeOperation.isNotBlank()) {
+                val artifactResults = recoverProcessingArtifactJournals(jobDir) { artifact ->
+                    check(NoFollowFileSystem.digestVerified(artifact).size > 0L)
+                }
+                val artifactFailure = artifactResults.firstOrNull {
+                    it.classification == ProcessingArtifactRecoveryClassification.AMBIGUOUS ||
+                        it.classification == ProcessingArtifactRecoveryClassification.INVALID_JOURNAL
+                }
+                if (artifactFailure != null) {
+                    KeplerJobMetadata.update(jobDir) {
+                        it.put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
+                            .put("recoveryMessage", artifactFailure.message ?: "Artifact recovery requires manual review.")
+                    }
+                    return KeplerJobRecoveryResult(
+                        jobDir,
+                        KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED,
+                        failures = listOfNotNull(artifactFailure.message)
+                    )
+                }
+                val localCommitted = job.optBoolean("processingOutputCommitted", false)
+                val publicCommitted = job.optBoolean("galleryExportCommitted", false)
+                val publicVerified = job.optBoolean("exportVerified", false)
+                val classification = when {
+                    publicVerified -> KeplerJobRecoveryClassification.PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL
+                    publicCommitted -> KeplerJobRecoveryClassification.PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION
+                    localCommitted -> KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL
+                    else -> KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT
+                }
+                KeplerJobMetadata.update(jobDir) {
+                    it.put("recoveryState", classification.name)
+                        .put("recoveryMessage", "Durable evidence reconciled after the previous process ended.")
+                }
                 return KeplerJobRecoveryResult(
                     jobDir,
-                    KeplerJobRecoveryClassification.LEGACY_REQUIRES_RECONCILIATION,
-                    actions = listOf("durable active operation requires evidence reconciliation")
+                    classification,
+                    actions = artifactResults.map { it.classification.name }
                 )
             }
             return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.RECOVERED)
