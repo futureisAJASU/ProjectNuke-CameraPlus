@@ -85,7 +85,7 @@ internal object KeplerRecoveryCoordinator {
     private fun scan(context: Context): KeplerRecoveryReport = recoverRoots(
         keplerGalleryRoots(context),
         ContextMediaStoreExportRecoveryAccess(context)
-    )
+    ).also { runCatching { cleanStaleKeplerExportCacheFiles(context.cacheDir) } }
 
     internal fun recoverRoots(
         roots: List<File>,
@@ -132,10 +132,16 @@ internal object KeplerRecoveryCoordinator {
         val lease = KeplerJobMetadata.acquireOperation(jobDir)
             ?: return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.SKIP_ACTIVE_CURRENT_PROCESS)
         try {
+            val metadataTemps = reconcileJobMetadataWriteTemps(jobDir)
             val job = try {
                 KeplerJobMetadata.read(jobDir)
             } catch (_: KeplerJobMetadataMissing) {
-                return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.ORPHANED_JOB_METADATA)
+                return KeplerJobRecoveryResult(
+                    jobDir,
+                    if (metadataTemps.classification == KeplerMetadataTempClassification.AMBIGUOUS) KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED else KeplerJobRecoveryClassification.ORPHANED_JOB_METADATA,
+                    actions = metadataTemps.actions,
+                    failures = metadataTemps.failures
+                )
             } catch (failure: Exception) {
                 return KeplerJobRecoveryResult(
                     jobDir,
@@ -163,6 +169,7 @@ internal object KeplerRecoveryCoordinator {
                 )
             }
             val activeOperation = job.optString(ACTIVE_OPERATION_ID)
+            val captureTemps = recoverCaptureOwnedTemps(jobDir, job, activeOperation.isNotBlank())
             if (activeOperation.isNotBlank()) {
                 val artifactResults = recoverProcessingArtifactJournals(jobDir) { artifact ->
                     check(NoFollowFileSystem.digestVerified(artifact).size > 0L)
@@ -179,7 +186,8 @@ internal object KeplerRecoveryCoordinator {
                     return KeplerJobRecoveryResult(
                         jobDir,
                         KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED,
-                        failures = listOfNotNull(artifactFailure.message)
+                        actions = metadataTemps.actions + captureTemps.deleted.map { "DELETED_$it" },
+                        failures = metadataTemps.failures + captureTemps.failures + listOfNotNull(artifactFailure.message)
                     )
                 }
                 val localCommitted = job.optBoolean("processingOutputCommitted", false)
@@ -198,10 +206,16 @@ internal object KeplerRecoveryCoordinator {
                 return KeplerJobRecoveryResult(
                     jobDir,
                     classification,
-                    actions = artifactResults.map { it.classification.name }
+                    actions = artifactResults.map { it.classification.name } + metadataTemps.actions + captureTemps.deleted.map { "DELETED_$it" },
+                    failures = metadataTemps.failures + captureTemps.failures
                 )
             }
-            return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.RECOVERED)
+            return KeplerJobRecoveryResult(
+                jobDir,
+                if (metadataTemps.classification == KeplerMetadataTempClassification.AMBIGUOUS) KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED else KeplerJobRecoveryClassification.RECOVERED,
+                actions = metadataTemps.actions,
+                failures = metadataTemps.failures
+            )
         } finally {
             lease.release()
         }
