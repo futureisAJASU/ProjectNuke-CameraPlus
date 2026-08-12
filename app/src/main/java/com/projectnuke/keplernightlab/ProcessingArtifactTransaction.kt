@@ -141,6 +141,7 @@ internal fun commitProcessingArtifact(
     verifyFinal: (File) -> Unit,
     cancellation: KeplerPipelineCancellation? = null,
     onSettlement: ((ProcessingArtifactSettlementReport) -> Unit)? = null,
+    processingAttemptId: String? = null,
     move: (File, File) -> Unit = ::moveArtifact
 ): ProcessingArtifactResult {
     val parent = finalFile.parentFile ?: error("Artifact parent is missing")
@@ -154,6 +155,19 @@ internal fun commitProcessingArtifact(
     var priorBackedUp = false
     var newFinalCommitted = false
     var priorRestored = false
+    val journal = ProcessingArtifactJournal.create(
+        jobDir = parent,
+        transactionId = UUID.randomUUID().toString(),
+        processingAttemptId = processingAttemptId,
+        artifactType = finalFile.extension.ifBlank { "UNKNOWN" },
+        finalName = finalFile.name,
+        tempName = temp.name,
+        priorName = priorBackup.name
+    )
+
+    fun journalTransition(state: ProcessingArtifactJournalState) {
+        journal.transition(parent, state)
+    }
 
     fun notifySettlement(report: ProcessingArtifactSettlementReport) {
         try {
@@ -173,33 +187,39 @@ internal fun commitProcessingArtifact(
         check(!Files.exists(temp.toPath(), LinkOption.NOFOLLOW_LINKS)) { "Artifact temp already exists" }
         state = ProcessingArtifactState.TEMP_OWNED
         writeTemp(temp)
+        journalTransition(ProcessingArtifactJournalState.TEMP_WRITTEN)
         check(Files.isRegularFile(temp.toPath(), LinkOption.NOFOLLOW_LINKS) && temp.length() > 0L) {
             "Artifact temp verification failed"
         }
         state = ProcessingArtifactState.TEMP_VERIFIED
+        journalTransition(ProcessingArtifactJournalState.TEMP_VERIFIED)
         checkCancelled()
 
         if (existingRegularArtifact(finalFile)) {
             move(finalFile, priorBackup)
             priorBackedUp = true
             state = ProcessingArtifactState.PRIOR_FINAL_BACKED_UP
+            journalTransition(ProcessingArtifactJournalState.PRIOR_BACKED_UP)
         }
 
         checkCancelled()
         move(temp, finalFile)
         newFinalCommitted = true
         state = ProcessingArtifactState.COMMITTED_FINAL
+        journalTransition(ProcessingArtifactJournalState.NEW_FINAL_MOVED)
 
         // Once commit begins, cancellation cannot interrupt ownership. Verify
         // the actual final pathname and either adopt it or roll back safely.
         verifyFinal(finalFile)
         state = ProcessingArtifactState.FINAL_VERIFIED
+        journalTransition(ProcessingArtifactJournalState.NEW_FINAL_VERIFIED)
         settlements += ProcessingArtifactSettlementRecord(
             finalFile,
             ProcessingArtifactResourceRole.ADOPTED_FINAL,
             ProcessingArtifactSettlementStatus.ADOPTED
         )
         state = ProcessingArtifactState.ADOPTED
+        journalTransition(ProcessingArtifactJournalState.ADOPTED)
 
         if (priorBackedUp) {
             val backupSettlement = settleProcessingArtifactPath(priorBackup, ProcessingArtifactResourceRole.PRIOR_BACKUP)
@@ -221,6 +241,8 @@ internal fun commitProcessingArtifact(
             hadPriorFinal = priorBackedUp,
             priorFinalRestored = false
         )
+        journalTransition(ProcessingArtifactJournalState.SETTLED)
+        journal.deleteIfOwned(parent)
         notifySettlement(
             ProcessingArtifactSettlementReport(
                 state = result.state,
@@ -232,6 +254,7 @@ internal fun commitProcessingArtifact(
         )
         return result
     } catch (failure: Throwable) {
+        runCatching { journalTransition(ProcessingArtifactJournalState.ROLLBACK_STARTED) }
         val cleanupRecords = mutableListOf<ProcessingArtifactSettlementRecord>()
         if (newFinalCommitted) {
             cleanupRecords += settleProcessingArtifactPath(finalFile, ProcessingArtifactResourceRole.NEW_FINAL)
@@ -266,6 +289,7 @@ internal fun commitProcessingArtifact(
                         ProcessingArtifactResourceRole.PRIOR_BACKUP,
                         ProcessingArtifactSettlementStatus.ABSENT
                     )
+                    runCatching { journalTransition(ProcessingArtifactJournalState.PRIOR_RESTORED) }
                     cleanupRecords += ProcessingArtifactSettlementRecord(
                         finalFile,
                         ProcessingArtifactResourceRole.RESTORED_PRIOR,
@@ -289,6 +313,12 @@ internal fun commitProcessingArtifact(
             state = ProcessingArtifactState.CLEANUP_FAILED
         } else {
             state = ProcessingArtifactState.ROLLED_BACK
+            if (priorRestored || !priorBackedUp) {
+                runCatching {
+                    journalTransition(if (priorRestored) ProcessingArtifactJournalState.PRIOR_RESTORED else ProcessingArtifactJournalState.SETTLED)
+                    journal.deleteIfOwned(parent)
+                }
+            }
         }
         notifySettlement(
             ProcessingArtifactSettlementReport(

@@ -20,6 +20,70 @@ class ProcessingArtifactTransactionTest {
     }
 
     @Test
+    fun durableJournalExplainsAndRestoresPriorAfterSimulatedCrash() {
+        val dir = Files.createTempDirectory("processing-journal-restore").toFile()
+        try {
+            val final = File(dir, "result.bin").apply { writeText("prior") }
+            val temp = File(dir, ".result.bin.crash.tmp").apply { writeText("new") }
+            val prior = File(dir, ".result.bin.crash.prior").apply { writeText("prior") }
+            final.delete()
+            ProcessingArtifactJournal(
+                transactionId = "crash",
+                processingAttemptId = "attempt",
+                runtimeSessionId = "old-runtime",
+                artifactType = "bin",
+                finalName = final.name,
+                tempName = temp.name,
+                priorName = prior.name,
+                state = ProcessingArtifactJournalState.PRIOR_BACKED_UP,
+                createdAt = 1L,
+                updatedAt = 2L
+            ).writeTo(dir)
+
+            val result = recoverProcessingArtifactJournals(dir) { check(it.readText() == "prior") }
+
+            assertEquals(ProcessingArtifactRecoveryClassification.RESTORED_PRIOR, result.single().classification)
+            assertEquals("prior", final.readText())
+            assertFalse(temp.exists())
+            assertFalse(prior.exists())
+            assertTrue(ProcessingArtifactJournal.list(dir).isEmpty())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun ambiguousJournalPreservesCandidates() {
+        val dir = Files.createTempDirectory("processing-journal-ambiguous").toFile()
+        try {
+            val final = File(dir, "result.bin")
+            val temp = File(dir, ".result.bin.ambiguous.tmp").apply { writeText("candidate") }
+            val prior = File(dir, ".result.bin.ambiguous.prior").apply { writeText("candidate") }
+            ProcessingArtifactJournal(
+                transactionId = "ambiguous",
+                processingAttemptId = null,
+                runtimeSessionId = "old-runtime",
+                artifactType = "bin",
+                finalName = final.name,
+                tempName = temp.name,
+                priorName = prior.name,
+                state = ProcessingArtifactJournalState.NEW_FINAL_MOVED,
+                createdAt = 1L,
+                updatedAt = 2L
+            ).writeTo(dir)
+
+            val result = recoverProcessingArtifactJournals(dir) { error("not verifiable") }
+
+            assertEquals(ProcessingArtifactRecoveryClassification.AMBIGUOUS, result.single().classification)
+            assertTrue(temp.exists())
+            assertTrue(prior.exists())
+            assertTrue(ProcessingArtifactJournal.list(dir).isNotEmpty())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
     fun textArtifactCommitsThroughTempAndVerifiesFinal() {
         val dir = Files.createTempDirectory("processing-artifact").toFile()
         try {
