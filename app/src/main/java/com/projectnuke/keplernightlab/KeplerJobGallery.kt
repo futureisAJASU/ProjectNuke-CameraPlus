@@ -416,8 +416,8 @@ fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
         else -> "COLOR/YUV"
     }
     val exportExists = finalPreview != null ||
-        job?.optBoolean("exportVerified", false) == true ||
-        job?.optBoolean("galleryExportCommitted", false) == true ||
+        (job?.optBoolean("exportVerified", false) == true && job.optString("exportUri").isNotBlank()) ||
+        (job?.optBoolean("galleryExportCommitted", false) == true && job.optString("exportUri").isNotBlank()) ||
         MediaStoreExportJournal.list(directory).any { journal ->
             journal.role == MediaStoreExportRole.MAIN_IMAGE &&
                 journal.state == MediaStoreExportState.VERIFIED &&
