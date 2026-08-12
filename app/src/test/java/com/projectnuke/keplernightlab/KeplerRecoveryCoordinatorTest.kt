@@ -48,4 +48,30 @@ class KeplerRecoveryCoordinatorTest {
             root.deleteRecursively()
         }
     }
+
+    @Test
+    fun corruptAndMissingMetadataProduceRecoverySummariesWithoutDroppingJobs() {
+        val root = Files.createTempDirectory("kepler-gallery-isolation-").toFile()
+        try {
+            val corrupt = File(root, "KPL_RAW_FUSION_corrupt").apply { mkdirs() }
+            File(corrupt, JOB_JSON_FILE_NAME).writeText("not-json")
+            val orphan = File(root, "KPL_YUV_FUSION_orphan").apply { mkdirs() }
+            File(orphan, "frame_00.yuv").writeBytes(byteArrayOf(1))
+
+            val summaries = listOf(corrupt, orphan).map { directory ->
+                val metadata = NoFollowFileSystem.resolveDirectChildResult(directory, JOB_JSON_FILE_NAME, requireFile = true)
+                if (metadata is NoFollowInspection.Absent) {
+                    recoveryGallerySummary(directory, KeplerJobMetadataMissing(directory))
+                } else {
+                    runCatching { readKeplerGalleryJob(directory) }
+                        .getOrElse { recoveryGallerySummary(directory, it) }
+                }
+            }
+
+            assertEquals(setOf("METADATA_CORRUPT", "ORPHANED_JOB_METADATA"), summaries.map { it.recoveryState }.toSet())
+            assertTrue(summaries.all { !it.recoveryMessage.isNullOrBlank() })
+        } finally {
+            root.deleteRecursively()
+        }
+    }
 }

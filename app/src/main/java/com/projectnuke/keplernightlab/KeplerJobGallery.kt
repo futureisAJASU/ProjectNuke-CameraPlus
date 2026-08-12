@@ -22,7 +22,9 @@ data class KeplerGalleryJobSummary(
     val finalPreviewFile: File?,
     val finalExportExists: Boolean,
     val frames: List<KeplerGalleryFrame>,
-    val metadata: JSONObject?
+    val metadata: JSONObject?,
+    val recoveryState: String = "STABLE",
+    val recoveryMessage: String? = null
 )
 
 data class KeplerJobStorageInfo(
@@ -135,7 +137,63 @@ fun loadKeplerGalleryJobs(context: Context): List<KeplerGalleryJobSummary> {
     return keplerGalleryRoots(context).flatMap { root ->
         NoFollowFileSystem.requireDirectChildren(root)
             .filter { NoFollowFileSystem.isRealDirectory(it.toPath()) && matchesJobPrefix(root, it.name) }
-    }.map(::readKeplerGalleryJob).sortedByDescending { it.createdAt }
+    }.map { directory ->
+        val metadata = NoFollowFileSystem.resolveDirectChildResult(directory, JOB_JSON_FILE_NAME, requireFile = true)
+        if (metadata is NoFollowInspection.Absent) {
+            recoveryGallerySummary(directory, KeplerJobMetadataMissing(directory))
+        } else {
+            runCatching { readKeplerGalleryJob(directory) }
+                .getOrElse { failure -> recoveryGallerySummary(directory, failure) }
+        }
+    }.sortedByDescending { it.createdAt }
+}
+
+internal fun recoveryGallerySummary(directory: File, failure: Throwable): KeplerGalleryJobSummary {
+    val metadataFile = NoFollowFileSystem.resolveDirectChild(directory, JOB_JSON_FILE_NAME, requireFile = true)
+    val missing = metadataFile == null
+    val recoveryState = if (missing) "ORPHANED_JOB_METADATA" else "METADATA_CORRUPT"
+    val recoveryMessage = if (missing) {
+        "이 작업의 메타데이터가 없어 복구가 필요합니다."
+    } else {
+        "이 작업의 메타데이터를 읽을 수 없어 복구가 필요합니다."
+    }
+    val frames = runCatching {
+        listFilesNoFollow(directory)
+            .filter { NoFollowFileSystem.isRealFile(it.toPath()) && isSourceFrame(it) }
+            .sortedBy { it.name }
+            .mapIndexed { index, file ->
+                KeplerGalleryFrame(
+                    index, file.name, null, true, false, null, file,
+                    null, null, null, null, null, null, null, null, null, false, null
+                )
+            }
+    }.getOrDefault(emptyList())
+    val storage = runCatching { computeKeplerJobStorage(directory, null, null) }
+        .getOrElse { KeplerJobStorageInfo(0L, "0 B", 0L, "0 B", 0L, 0L, 0L, 0L, 0L, 0L, 0) }
+    return KeplerGalleryJobSummary(
+        id = directory.absolutePath,
+        jobType = when {
+            directory.name.startsWith("KPL_RAW_FUSION_") -> "RAW_NIGHT_FUSION"
+            directory.name.startsWith("KPL_YUV_FUSION_") -> "YUV_NIGHT_FUSION"
+            directory.name.startsWith("KPL_SUPER_RES_") -> "SUPER_RESOLUTION"
+            else -> "COLOR/YUV"
+        },
+        directory = directory,
+        createdAt = directory.lastModified(),
+        status = recoveryState,
+        requestedFrames = frames.size,
+        savedFrames = frames.size,
+        width = null,
+        height = null,
+        folderSizeBytes = storage.totalJobBytes,
+        storage = storage,
+        finalPreviewFile = null,
+        finalExportExists = false,
+        frames = frames,
+        metadata = null,
+        recoveryState = recoveryState,
+        recoveryMessage = recoveryMessage + " (${failure.javaClass.simpleName})"
+    )
 }
 
 private const val STALE_JOB_RECOVERY_AGE_MILLIS = 15 * 60 * 1000L
@@ -407,7 +465,9 @@ fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
         finalPreviewFile = finalPreview,
         finalExportExists = exportExists,
         frames = frames,
-        metadata = job
+        metadata = job,
+        recoveryState = job?.optString("recoveryState").orEmpty().ifBlank { "STABLE" },
+        recoveryMessage = job?.optString("recoveryMessage").orEmpty().ifBlank { null }
     )
 }
 

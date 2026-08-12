@@ -378,6 +378,7 @@ private fun Set<String>.toggleGalleryId(id: String): Set<String> =
     if (id in this) this - id else this + id
 
 private fun KeplerGalleryJobSummary.isFailedGalleryJob(): Boolean {
+    if (recoveryState != "STABLE") return false
     val process = metadata?.optString("processStatus").orEmpty()
     val export = metadata?.optString("exportStatus").orEmpty()
     val combined = listOf(status, process, export).joinToString(" ").uppercase()
