@@ -40,6 +40,9 @@ internal enum class ProcessingArtifactSettlementStatus {
     RESTORE_MOVE_FAILED
 }
 
+@Volatile
+internal var processingArtifactDeleteFailureForTest: Boolean = false
+
 internal data class ProcessingArtifactSettlementRecord(
     val path: File,
     val role: ProcessingArtifactResourceRole,
@@ -115,6 +118,14 @@ internal fun settleProcessingArtifactPath(
     role: ProcessingArtifactResourceRole = ProcessingArtifactResourceRole.TEMPORARY
 ): ProcessingArtifactSettlementRecord {
     return try {
+        if (processingArtifactDeleteFailureForTest) {
+            return ProcessingArtifactSettlementRecord(
+                file,
+                role,
+                ProcessingArtifactSettlementStatus.DELETE_FAILED,
+                IllegalStateException("Injected processing artifact cleanup failure")
+            )
+        }
         if (!Files.exists(file.toPath(), LinkOption.NOFOLLOW_LINKS)) {
             ProcessingArtifactSettlementRecord(file, role, ProcessingArtifactSettlementStatus.ABSENT)
         } else if (Files.isSymbolicLink(file.toPath())) {

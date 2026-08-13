@@ -129,9 +129,9 @@ internal fun reconstructMainExportEvidence(
         .put("exportMimeType", selected.mimeType)
         .put("recoveryState", if (verified) "PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL" else "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION")
         .put("recoveryMessage", if (verified) {
-            "Public export was verified after the previous process ended."
+            "이전 실행이 종료된 후 공개 내보내기 결과를 확인했습니다."
         } else {
-            "Public export was committed but requires verification."
+            "공개 내보내기 결과가 저장되었지만 확인이 필요합니다."
         })
     return true
 }

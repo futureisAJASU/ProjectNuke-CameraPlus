@@ -179,6 +179,51 @@ class KeplerRecoveryCoordinatorTest {
     }
 
     @Test
+    fun processingCleanupDebtBlocksNewAttemptUntilARecoveryRetrySettlesIt() {
+        val root = File(Files.createTempDirectory("kepler-recovery-cleanup-debt-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_cleanup-debt").apply { mkdirs() }
+        val priorBytes = byteArrayOf(9, 8, 7)
+        val finalBytes = byteArrayOf(1, 2, 3)
+        try {
+            KeplerJobMetadata.write(job, JSONObject().put("jobType", "YUV_NIGHT_FUSION"))
+            val attempt = beginProcessingAttempt(job, "CLASSIC_YUV")
+            val final = File(job, "final.bin")
+            final.writeBytes(priorBytes)
+            processingArtifactDeleteFailureForTest = true
+            try {
+                commitProcessingArtifact(
+                    finalFile = final,
+                    writeTemp = { it.writeBytes(finalBytes) },
+                    verifyFinal = { check(it.readBytes().contentEquals(finalBytes)) },
+                    processingAttemptId = attempt.id,
+                    claimKey = "finalFile"
+                )
+                markProcessingArtifactClaim(job, attempt, "finalFile", final)
+            } finally {
+                attempt.releaseOwnedLease()
+            }
+
+            val first = KeplerRecoveryCoordinator.recoverRoots(listOf(root))
+            assertEquals(KeplerJobRecoveryClassification.PROCESSING_CLEANUP_REQUIRED, first.jobs.single().classification)
+            assertEquals(PROCESSING_CLEANUP_REQUIRED, KeplerJobMetadata.read(job).getString("recoveryState"))
+            assertEquals(finalBytes.toList(), final.readBytes().toList())
+            org.junit.Assert.assertThrows(ProcessingCleanupRequiredException::class.java) {
+                beginProcessingAttempt(job, "CLASSIC_YUV")
+            }
+
+            processingArtifactDeleteFailureForTest = false
+            val second = KeplerRecoveryCoordinator.recoverRoots(listOf(root))
+            assertEquals("report=$second", KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL, second.jobs.single().classification)
+            assertEquals("STABLE", KeplerJobMetadata.read(job).getString("recoveryState"))
+            assertTrue(ProcessingArtifactJournal.list(job).isEmpty())
+            assertEquals(finalBytes.toList(), final.readBytes().toList())
+        } finally {
+            processingArtifactDeleteFailureForTest = false
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun failedInterruptedFinalizationIsNotReportedAsRecovered() {
         val root = File(Files.createTempDirectory("kepler-recovery-finalize-failure-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
         val job = File(root, "KPL_YUV_FUSION_finalize-failure").apply { mkdirs() }

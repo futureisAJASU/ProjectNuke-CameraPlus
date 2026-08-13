@@ -1,6 +1,7 @@
 package com.projectnuke.keplernightlab
 
 import org.json.JSONException
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -18,6 +19,10 @@ private const val KEPLER_JOB_SCHEMA_VERSION = 1
 sealed class KeplerJobMetadataException(message: String, cause: Throwable? = null) : Exception(message, cause)
 class KeplerJobMetadataMissing(jobDir: File) : KeplerJobMetadataException("Job metadata missing in ${jobDir.absolutePath}")
 class KeplerJobMetadataCorrupt(jobDir: File, cause: Throwable? = null) : KeplerJobMetadataException("Job metadata corrupt in ${jobDir.absolutePath}", cause)
+internal class ProcessingCleanupRequiredException : IllegalStateException(
+    "이전 처리 작업의 파일 정리가 완료되지 않아 지금은 다시 합성할 수 없습니다."
+)
+internal const val PROCESSING_CLEANUP_REQUIRED = "PROCESSING_CLEANUP_REQUIRED"
 
 /** Serializes each job's read-modify-write updates and never truncates a valid job.json. */
 object KeplerJobMetadata {
@@ -54,6 +59,58 @@ object KeplerJobMetadata {
         val key = jobDir.toPath().toAbsolutePath().normalize().toString()
         val lease = JobOperationLease(key)
         return if (operationLeases.putIfAbsent(key, lease) == null) lease else null
+    }
+
+    internal fun hasProcessingCleanupBlocker(jobDir: File): Boolean = runCatching {
+        val job = read(jobDir)
+        job.optString("recoveryState") == PROCESSING_CLEANUP_REQUIRED ||
+            ProcessingArtifactJournal.list(jobDir).any { file ->
+                runCatching { ProcessingArtifactJournal.read(file) }
+                    .getOrNull()
+                    ?.let(::isUnresolvedAuthoritativeProcessingJournal) == true
+            }
+    }.getOrDefault(false)
+
+    internal fun recordProcessingCleanupRequired(
+        jobDir: File,
+        operationId: String?,
+        failures: List<String>
+    ): Boolean {
+        var matched = false
+        update(jobDir) { job ->
+            if (operationId != null &&
+                (job.optString(ACTIVE_OPERATION_ID) != operationId ||
+                    job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id)
+            ) return@update
+            matched = true
+            job.put("recoveryState", PROCESSING_CLEANUP_REQUIRED)
+                .put("processingCleanupDebt", JSONArray(failures.distinct()))
+                .put("lastRecoveryClassification", "LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL")
+                .put("lastRecoveryMessage", "처리 결과는 보존되었지만 이전 작업의 파일 정리가 아직 완료되지 않았습니다.")
+                .put("recoveredAt", System.currentTimeMillis())
+                .put("recoveryMessage", "이전 처리 작업의 파일 정리가 완료되지 않아 지금은 다시 합성할 수 없습니다.")
+            if (operationId != null) {
+                job.remove(ACTIVE_RUNTIME_SESSION_ID)
+                job.remove(ACTIVE_OPERATION_ID)
+                job.remove(ACTIVE_OPERATION_KIND)
+                job.remove(ACTIVE_OPERATION_STARTED_AT)
+                job.remove(ACTIVE_OPERATION_UPDATED_AT)
+            }
+        }
+        return matched
+    }
+
+    internal fun clearProcessingCleanupRequired(jobDir: File): Boolean {
+        var changed = false
+        update(jobDir) { job ->
+            if (job.optString("recoveryState") != PROCESSING_CLEANUP_REQUIRED) return@update
+            changed = true
+            job.put("recoveryState", "STABLE")
+                .put("recoveredAt", System.currentTimeMillis())
+            job.remove("processingCleanupDebt")
+            job.remove("recoveryMessage")
+        }
+        return changed
     }
 
     fun isOperationActive(jobDir: File): Boolean = operationLeases.containsKey(
@@ -245,7 +302,7 @@ object KeplerJobMetadata {
             matched = true
             job.put("recoveryState", "STABLE")
                 .put("lastRecoveryClassification", "RECOVERED")
-                .put("lastRecoveryMessage", "Terminal metadata and export evidence were finalized after restart.")
+                .put("lastRecoveryMessage", "앱이 다시 시작된 후 완료된 내보내기 결과를 확인했습니다.")
                 .put("recoveredAt", System.currentTimeMillis())
             job.remove("recoveryMessage")
             job.remove(ACTIVE_RUNTIME_SESSION_ID)
@@ -272,8 +329,9 @@ object KeplerJobMetadata {
             matched = true
             val blocksCurrentActions = classification in setOf(
                 KeplerJobRecoveryClassification.PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION,
-                KeplerJobRecoveryClassification.PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL,
-                KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED
+                KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED,
+                KeplerJobRecoveryClassification.PUBLIC_COMMIT_MISSING,
+                KeplerJobRecoveryClassification.PROCESSING_CLEANUP_REQUIRED
             )
             job.put("recoveryState", if (blocksCurrentActions) classification.name else "STABLE")
                 .put("lastRecoveryClassification", classification.name)
@@ -298,7 +356,7 @@ object KeplerJobMetadata {
             matched = true
             job.put("recoveryState", "STABLE")
                 .put("lastRecoveryClassification", KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name)
-                .put("lastRecoveryMessage", "Processing handoff was safely finalized after the previous process ended.")
+                .put("lastRecoveryMessage", "처리가 시작되기 전 이전 실행이 종료되었지만 원본 프레임을 다시 사용할 수 있습니다.")
                 .put("recoveredAt", System.currentTimeMillis())
                 .put(PROCESSING_HANDOFF_FINALIZED, true)
             job.remove("recoveryMessage")

@@ -13,6 +13,8 @@ internal enum class KeplerJobRecoveryClassification {
     LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL,
     PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION,
     PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL,
+    PUBLIC_COMMIT_MISSING,
+    PROCESSING_CLEANUP_REQUIRED,
     AMBIGUOUS_RECOVERY_REQUIRED,
     ORPHANED_JOB_METADATA,
     CORRUPT_JOB_METADATA,
@@ -75,7 +77,7 @@ internal object KeplerRecoveryCoordinator {
                             )
                     }
                     synchronized(lock) {
-                        if (!force) completed = report
+                        completed = report
                         inFlight = null
                     }
                     future.complete(report)
@@ -193,7 +195,7 @@ internal object KeplerRecoveryCoordinator {
             if (!processingRecoveryOwnsAuthority && invalidExportJournals.isNotEmpty() && !terminalResultAlreadyProven) {
                 KeplerJobMetadata.update(jobDir) {
                     it.put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
-                        .put("recoveryMessage", "MediaStore export evidence is malformed and was preserved.")
+                        .put("recoveryMessage", "미디어 저장소 내보내기 증거를 읽을 수 없어 보존했습니다.")
                 }
                 return KeplerJobRecoveryResult(
                     jobDir,
@@ -236,7 +238,7 @@ internal object KeplerRecoveryCoordinator {
             if (exportFailure != null) {
                 KeplerJobMetadata.update(jobDir) {
                     it.put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
-                        .put("recoveryMessage", exportFailure.message ?: "MediaStore export recovery requires manual review.")
+                        .put("recoveryMessage", exportFailure.message ?: "내보내기 복구 증거를 확인할 수 없어 추가 확인이 필요합니다.")
                 }
                 return KeplerJobRecoveryResult(
                     jobDir,
@@ -263,7 +265,7 @@ internal object KeplerRecoveryCoordinator {
             if (missingMainCommit != null) {
                 KeplerJobMetadata.update(jobDir) {
                     it.put("recoveryState", "PUBLIC_COMMIT_MISSING")
-                        .put("recoveryMessage", missingMainCommit.message ?: "The committed public result is missing and was preserved as recovery evidence.")
+                        .put("recoveryMessage", missingMainCommit.message ?: "커밋된 공개 결과를 찾을 수 없어 복구 증거로 보존했습니다.")
                 }
                 return KeplerJobRecoveryResult(
                     jobDir,
@@ -335,7 +337,7 @@ internal object KeplerRecoveryCoordinator {
                 if (artifactFailure != null) {
                     KeplerJobMetadata.update(jobDir) {
                         it.put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
-                            .put("recoveryMessage", artifactFailure.message ?: "Retained processing artifact evidence requires manual review.")
+                            .put("recoveryMessage", "보존된 처리 파일 증거를 확인할 수 없어 추가 확인이 필요합니다.")
                     }
                     return KeplerJobRecoveryResult(
                         jobDir,
@@ -343,6 +345,23 @@ internal object KeplerRecoveryCoordinator {
                         actions = artifactResults.map { it.classification.name },
                         failures = listOfNotNull(artifactFailure.message)
                     )
+                }
+                val artifactCleanupDebt = artifactResults
+                    .filter { it.classification == ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT }
+                    .mapNotNull { it.message ?: "처리 파일 정리 결과를 확인할 수 없습니다." }
+                if (artifactCleanupDebt.isNotEmpty()) {
+                    check(KeplerJobMetadata.recordProcessingCleanupRequired(jobDir, null, artifactCleanupDebt)) {
+                        "Could not durably record processing cleanup debt"
+                    }
+                    return KeplerJobRecoveryResult(
+                        jobDir,
+                        KeplerJobRecoveryClassification.PROCESSING_CLEANUP_REQUIRED,
+                        actions = artifactResults.map { it.classification.name },
+                        cleanupFailures = artifactCleanupDebt
+                    )
+                }
+                if (job.optString("recoveryState") == PROCESSING_CLEANUP_REQUIRED) {
+                    KeplerJobMetadata.clearProcessingCleanupRequired(jobDir)
                 }
                 val classification = if (job.optBoolean("processingOutputCommitted", false)) {
                     KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL
@@ -352,7 +371,7 @@ internal object KeplerRecoveryCoordinator {
                 KeplerJobMetadata.update(jobDir) {
                     it.put("recoveryState", "STABLE")
                         .put("lastRecoveryClassification", classification.name)
-                        .put("lastRecoveryMessage", "Durable local processing evidence was reconciled after the previous process ended.")
+                        .put("lastRecoveryMessage", "이전 실행에서 남은 로컬 처리 결과를 안전하게 확인했습니다.")
                         .put("recoveredAt", System.currentTimeMillis())
                         .remove("recoveryMessage")
                 }
@@ -372,7 +391,7 @@ internal object KeplerRecoveryCoordinator {
                 if (artifactFailure != null) {
                     KeplerJobMetadata.update(jobDir) {
                         it.put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
-                            .put("recoveryMessage", artifactFailure.message ?: "Artifact recovery requires manual review.")
+                            .put("recoveryMessage", "처리 파일 복구 증거를 확인할 수 없어 추가 확인이 필요합니다.")
                     }
                     return KeplerJobRecoveryResult(
                         jobDir,
@@ -385,7 +404,7 @@ internal object KeplerRecoveryCoordinator {
                 val localCommitted = job.optBoolean("processingOutputCommitted", false)
                 val artifactCleanupDebt = artifactResults
                     .filter { it.classification == ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT }
-                    .mapNotNull { it.message }
+                    .mapNotNull { it.message ?: "처리 파일 정리 결과를 확인할 수 없습니다." }
                 val publicCommitted = job.optBoolean("galleryExportCommitted", false)
                 val publicVerified = job.optBoolean("exportVerified", false)
                 val classification = when {
@@ -399,12 +418,16 @@ internal object KeplerRecoveryCoordinator {
                         jobDir,
                         activeOperation,
                         classification,
-                        "Durable evidence reconciled after the previous process ended."
+                        "이전 실행에서 남은 처리 증거를 안전하게 확인했습니다."
                     )) { "Could not durably finalize interrupted operation $activeOperation" }
+                } else {
+                    check(KeplerJobMetadata.recordProcessingCleanupRequired(jobDir, activeOperation, artifactCleanupDebt)) {
+                        "Could not durably record processing cleanup debt"
+                    }
                 }
                 return KeplerJobRecoveryResult(
                     jobDir,
-                    classification,
+                    if (artifactCleanupDebt.isEmpty()) classification else KeplerJobRecoveryClassification.PROCESSING_CLEANUP_REQUIRED,
                     actions = artifactResults.map { it.classification.name } + metadataTemps.actions + captureTemps.deleted.map { "DELETED_$it" },
                     failures = metadataTemps.failures + captureTemps.failures,
                     cleanupFailures = cleanupFailures + artifactCleanupDebt
@@ -413,7 +436,7 @@ internal object KeplerRecoveryCoordinator {
             if (invalidExportJournals.isNotEmpty() && !terminalResultAlreadyProven) {
                 KeplerJobMetadata.update(jobDir) {
                     it.put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
-                        .put("recoveryMessage", "MediaStore export evidence is malformed and was preserved.")
+                        .put("recoveryMessage", "미디어 저장소 내보내기 증거를 읽을 수 없어 보존했습니다.")
                 }
                 return KeplerJobRecoveryResult(
                     jobDir,
@@ -433,7 +456,7 @@ internal object KeplerRecoveryCoordinator {
                 KeplerJobMetadata.update(jobDir) {
                     it.put("recoveryState", "STABLE")
                         .put("lastRecoveryClassification", KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL.name)
-                        .put("lastRecoveryMessage", "A verified local processing result was retained after the previous process ended before terminal metadata.")
+                        .put("lastRecoveryMessage", "이전 실행이 종료되기 전에 확인된 로컬 처리 결과를 보존했습니다.")
                         .put("recoveredAt", System.currentTimeMillis())
                         .remove("recoveryMessage")
                 }
@@ -454,11 +477,9 @@ internal object KeplerRecoveryCoordinator {
                             .put("recoveryState", "STABLE")
                             .put("lastRecoveryClassification", KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name)
                             .put("recoveredAt", System.currentTimeMillis())
-                            .put("lastRecoveryMessage", "Legacy interruption was recorded after the previous process ended.")
-                            .also { current -> current.remove("recoveryMessage") }
-                            .put("recoveryMessage", "이전 프로세스의 작업 소유권을 확인할 수 없어 안전하게 중단된 작업으로 표시했습니다.")
+                            .put("lastRecoveryMessage", "이전 실행의 작업 소유권을 확인할 수 없어 안전하게 중단된 작업으로 기록했습니다.")
+                        it.remove("recoveryMessage")
                     }
-                    KeplerJobMetadata.update(jobDir) { current -> current.remove("recoveryMessage") }
                     return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT)
                 }
                 return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.LEGACY_REQUIRES_RECONCILIATION)

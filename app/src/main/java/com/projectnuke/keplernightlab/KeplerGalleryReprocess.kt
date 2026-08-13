@@ -493,6 +493,9 @@ suspend fun reprocessKeplerGalleryJob(
     catch (ie: InternalError) { throw ie }
     catch (e: Error) { throw e }
     catch (sf: Exception) { return@withContext Result.failure(sf) }
+    if (KeplerJobMetadata.hasProcessingCleanupBlocker(target)) {
+        return@withContext Result.failure(ProcessingCleanupRequiredException())
+    }
     val session = ReprocessTransactionSession(target)
     val operationLease = session.acquireLease() ?: run {
         return@withContext Result.failure(IllegalStateException("A job mutation is already in progress."))
