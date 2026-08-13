@@ -230,6 +230,51 @@ object KeplerJobMetadata {
         matched
     }.getOrDefault(false)
 
+    /** Atomically settles a dead terminal export owner and removes obsolete recovery gating. */
+    internal fun finalizeRecoveredTerminalOperation(jobDir: File, operationId: String): Boolean = runCatching {
+        var matched = false
+        update(jobDir) { job ->
+            if (job.optString(ACTIVE_OPERATION_ID) != operationId ||
+                job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id ||
+                job.optString(TERMINAL_OPERATION_ID) != operationId ||
+                job.optString("currentPipelineStage") !in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")
+            ) return@update
+            matched = true
+            job.put("recoveryState", "STABLE")
+            job.remove("recoveryMessage")
+            job.remove(ACTIVE_RUNTIME_SESSION_ID)
+            job.remove(ACTIVE_OPERATION_ID)
+            job.remove(ACTIVE_OPERATION_KIND)
+            job.remove(ACTIVE_OPERATION_STARTED_AT)
+            job.remove(ACTIVE_OPERATION_UPDATED_AT)
+        }
+        matched
+    }.getOrDefault(false)
+
+    /** Atomically records a successful recovery classification before releasing a dead owner. */
+    internal fun finalizeRecoveredInterruptedOperation(
+        jobDir: File,
+        operationId: String,
+        classification: KeplerJobRecoveryClassification,
+        recoveryMessage: String
+    ): Boolean = runCatching {
+        var matched = false
+        update(jobDir) { job ->
+            if (job.optString(ACTIVE_OPERATION_ID) != operationId ||
+                job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id
+            ) return@update
+            matched = true
+            job.put("recoveryState", classification.name)
+                .put("recoveryMessage", recoveryMessage)
+            job.remove(ACTIVE_RUNTIME_SESSION_ID)
+            job.remove(ACTIVE_OPERATION_ID)
+            job.remove(ACTIVE_OPERATION_KIND)
+            job.remove(ACTIVE_OPERATION_STARTED_AT)
+            job.remove(ACTIVE_OPERATION_UPDATED_AT)
+        }
+        matched
+    }.getOrDefault(false)
+
     fun atomicWrite(file: File, text: String) {
         val parent = file.parentFile ?: error("job metadata parent missing")
         requireRealJobDirectory(parent)

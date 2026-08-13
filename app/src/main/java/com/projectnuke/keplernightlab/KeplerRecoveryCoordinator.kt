@@ -185,7 +185,12 @@ internal object KeplerRecoveryCoordinator {
                 KeplerActiveOperationKind.SUPER_RESOLUTION.name
             )
             val invalidExportJournals = MediaStoreExportJournal.invalidFiles(jobDir)
-            if (!processingRecoveryOwnsAuthority && invalidExportJournals.isNotEmpty()) {
+            val terminalResultAlreadyProven = activeOperation.isBlank() &&
+                job.optString("currentPipelineStage") in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED") &&
+                job.optBoolean("galleryExportCommitted", false) &&
+                job.optBoolean("exportVerified", false) &&
+                job.optString("exportUri").isNotBlank()
+            if (!processingRecoveryOwnsAuthority && invalidExportJournals.isNotEmpty() && !terminalResultAlreadyProven) {
                 KeplerJobMetadata.update(jobDir) {
                     it.put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
                         .put("recoveryMessage", "MediaStore export evidence is malformed and was preserved.")
@@ -264,7 +269,7 @@ internal object KeplerRecoveryCoordinator {
                     .filter { result ->
                         MediaStoreExportJournal.list(jobDir).any { journal ->
                             journal.exportAttemptId == result.attemptId &&
-                                (activeOperation.isBlank() || journal.ownerOperationId == activeOperation)
+                                journal.role == MediaStoreExportRole.RAW_DNG_SIDECAR
                         }
                     }
                     .mapTo(mutableSetOf()) { it.attemptId }
@@ -273,14 +278,14 @@ internal object KeplerRecoveryCoordinator {
                         jobDir,
                         current,
                         MediaStoreExportJournal.list(jobDir),
-                        null
+                        recoveredAttemptIds
                     )
                 }
             }
             if (terminalOperationId == activeOperation && activeOperation.isNotBlank() &&
                 job.optString("currentPipelineStage") in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")) {
                 markMediaStoreExportJournalsTerminalPersisted(jobDir)
-                KeplerJobMetadata.clearRecoveredActiveOperation(jobDir, activeOperation)
+                KeplerJobMetadata.finalizeRecoveredTerminalOperation(jobDir, activeOperation)
                 return KeplerJobRecoveryResult(
                     jobDir,
                     KeplerJobRecoveryClassification.RECOVERED,
@@ -329,10 +334,12 @@ internal object KeplerRecoveryCoordinator {
                     localCommitted -> KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL
                     else -> KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT
                 }
-                KeplerJobMetadata.update(jobDir) {
-                    it.put("recoveryState", classification.name)
-                        .put("recoveryMessage", "Durable evidence reconciled after the previous process ended.")
-                }
+                KeplerJobMetadata.finalizeRecoveredInterruptedOperation(
+                    jobDir,
+                    activeOperation,
+                    classification,
+                    "Durable evidence reconciled after the previous process ended."
+                )
                 return KeplerJobRecoveryResult(
                     jobDir,
                     classification,
@@ -341,7 +348,7 @@ internal object KeplerRecoveryCoordinator {
                     cleanupFailures = cleanupFailures
                 )
             }
-            if (invalidExportJournals.isNotEmpty()) {
+            if (invalidExportJournals.isNotEmpty() && !terminalResultAlreadyProven) {
                 KeplerJobMetadata.update(jobDir) {
                     it.put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
                         .put("recoveryMessage", "MediaStore export evidence is malformed and was preserved.")
@@ -352,6 +359,11 @@ internal object KeplerRecoveryCoordinator {
                     failures = invalidExportJournals.map { "Invalid export journal: ${it.name}" },
                     cleanupFailures = cleanupFailures
                 )
+            }
+            if (terminalResultAlreadyProven) {
+                KeplerJobMetadata.update(jobDir) {
+                    it.put("recoveryState", "STABLE").remove("recoveryMessage")
+                }
             }
             if (isLegacyActiveJob(job)) {
                 val updatedAt = job.optLong("updatedAt", job.optLong("createdAt", 0L))
