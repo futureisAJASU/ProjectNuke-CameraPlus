@@ -279,6 +279,57 @@ class KeplerRecoveryCoordinatorTest {
     }
 
     @Test
+    fun sidecarInspectionFailureDoesNotReconstructHistoricalUri() {
+        val root = File(Files.createTempDirectory("kepler-recovery-sidecar-failure-").toFile(), "KeplerRawFusion").apply { mkdirs() }
+        val job = File(root, "KPL_RAW_FUSION_sidecar-failure").apply { mkdirs() }
+        try {
+            val dng = File(job, "frame_05.dng").apply { writeBytes(byteArrayOf(0x49, 0x49, 0x2a, 0x00, 6)) }
+            val sidecarUri = "content://media/external/file/95"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "RAW_NIGHT_FUSION")
+                .put("status", "EXPORTING")
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, "current-export")
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name)
+                .put("frames", JSONArray().put(JSONObject().put("frameIndex", 5).put("dngFile", dng.name).put("dngSidecarStatus", "LOCAL_SAVED"))))
+            MediaStoreExportJournal.create(
+                job, MediaStoreExportRole.RAW_DNG_SIDECAR, 5, dng.name, "Pictures/Kepler/RAW",
+                "image/x-adobe-dng", Uri.parse("content://media/external/file"),
+                expectedSizeBytes = dng.length(), expectedSha256 = NoFollowFileSystem.digestVerified(dng).sha256,
+                ownerOperationId = "historical-export"
+            ).transition(job, MediaStoreExportState.VERIFIED, sidecarUri)
+            MediaStoreExportJournal.create(
+                job, MediaStoreExportRole.MAIN_IMAGE, null, "result.jpg", "Pictures/Kepler",
+                "image/jpeg", Uri.parse("content://media/external/images/media"), ownerOperationId = "current-export"
+            ).transition(job, MediaStoreExportState.VERIFIED, "content://media/external/images/media/97")
+            KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess(sidecarUri))
+            val frame = KeplerJobMetadata.read(job).getJSONArray("frames").getJSONObject(0)
+            assertTrue(!frame.has("publicDngUri") || frame.optString("publicDngUri").isBlank())
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test
+    fun historicalMalformedExportDebtDoesNotBlockProvenStableResult() {
+        val root = File(Files.createTempDirectory("kepler-recovery-historical-malformed-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_historical-malformed").apply { mkdirs() }
+        try {
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("currentPipelineStage", "COMPLETE")
+                .put("galleryExportCommitted", true)
+                .put("exportVerified", true)
+                .put("exportUri", "content://media/external/images/media/96")
+                .put("recoveryState", "STABLE"))
+            File(job, ".export_tx_historical.json").writeText("not-json")
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
+            assertEquals(KeplerJobRecoveryClassification.RECOVERED, report.jobs.single().classification)
+            assertEquals("STABLE", KeplerJobMetadata.read(job).getString("recoveryState"))
+            assertTrue(File(job, ".export_tx_historical.json").exists())
+            assertTrue(report.jobs.single().failures.isEmpty())
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test
     fun oneMediaStoreRecoveryFailureDoesNotAbortLaterJobs() {
         val root = File(Files.createTempDirectory("kepler-recovery-isolation-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
         val broken = File(root, "KPL_YUV_FUSION_broken").apply { mkdirs() }
