@@ -10,6 +10,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import java.util.concurrent.CancellationException
 import java.util.UUID
+import org.json.JSONObject
 
 @RunWith(RobolectricTestRunner::class)
 class ProcessingArtifactTransactionTest {
@@ -52,6 +53,87 @@ class ProcessingArtifactTransactionTest {
             assertFalse(temp.exists())
             assertFalse(prior.exists())
             assertTrue(ProcessingArtifactJournal.list(dir).isEmpty())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun conflictingAuthoritativeJournalsArePreflightedWithoutJobMutation() {
+        val dir = Files.createTempDirectory("processing-journal-conflict").toFile()
+        try {
+            val job = JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("processingMode", "CLASSIC_YUV")
+                .put("processingAttemptId", "attempt-conflict")
+            KeplerJobMetadata.write(dir, job)
+            val first = File(dir, "first.png")
+            val second = File(dir, "second.png")
+            val common = ProcessingArtifactJournal(
+                transactionId = UUID.randomUUID().toString(),
+                processingAttemptId = "attempt-conflict",
+                runtimeSessionId = "old-runtime",
+                artifactType = "PNG",
+                finalName = first.name,
+                tempName = ".first.tmp",
+                priorName = ".first.prior",
+                verificationKind = "PNG",
+                expectedSizeBytes = 1,
+                expectedSha256 = "0".repeat(64),
+                adoptedResult = "NEW_FINAL",
+                claimKey = "finalFile",
+                state = ProcessingArtifactJournalState.ADOPTED,
+                createdAt = 1,
+                updatedAt = 1
+            )
+            common.copy(transactionId = UUID.randomUUID().toString(), finalName = second.name, updatedAt = 2).also {
+                first.writeBytes(byteArrayOf(1))
+                second.writeBytes(byteArrayOf(2))
+                common.writeTo(dir)
+                it.writeTo(dir)
+            }
+            val before = KeplerJobMetadata.read(dir).toString()
+            val results = recoverProcessingArtifactJournals(dir, KeplerJobMetadata.read(dir))
+            assertTrue(results.all { it.classification == ProcessingArtifactRecoveryClassification.AMBIGUOUS })
+            assertEquals(before, KeplerJobMetadata.read(dir).toString())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun existingDurableClaimDominatesDifferentFinalJournal() {
+        val dir = Files.createTempDirectory("processing-journal-claimed-conflict").toFile()
+        try {
+            val job = JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("processingMode", "CLASSIC_YUV")
+                .put("processingAttemptId", "attempt-claimed")
+                .put("processingArtifactClaimAttemptId", "attempt-claimed")
+                .put("processingOutputCommitted", true)
+                .put("finalFile", "first.png")
+            KeplerJobMetadata.write(dir, job)
+            File(dir, "second.png").writeBytes(byteArrayOf(2))
+            ProcessingArtifactJournal(
+                transactionId = UUID.randomUUID().toString(),
+                processingAttemptId = "attempt-claimed",
+                runtimeSessionId = "old-runtime",
+                artifactType = "PNG",
+                finalName = "second.png",
+                tempName = ".second.tmp",
+                priorName = ".second.prior",
+                verificationKind = "PNG",
+                expectedSizeBytes = 1,
+                expectedSha256 = "0".repeat(64),
+                adoptedResult = "NEW_FINAL",
+                claimKey = "finalFile",
+                state = ProcessingArtifactJournalState.ADOPTED,
+                createdAt = 1,
+                updatedAt = 1
+            ).writeTo(dir)
+            val results = recoverProcessingArtifactJournals(dir, KeplerJobMetadata.read(dir))
+            assertEquals(ProcessingArtifactRecoveryClassification.AMBIGUOUS, results.single().classification)
+            assertEquals("first.png", KeplerJobMetadata.read(dir).getString("finalFile"))
         } finally {
             dir.deleteRecursively()
         }

@@ -47,6 +47,9 @@ internal fun beginProcessingAttempt(
     additionalOwnedKeys: Set<String> = emptySet(),
     operationLease: JobOperationLease? = null
 ): ProcessingAttempt {
+    if (KeplerJobMetadata.hasProcessingCleanupBlocker(jobDir)) {
+        throw ProcessingCleanupRequiredException()
+    }
     val ownsLease = operationLease == null
     val lease = operationLease ?: KeplerJobMetadata.acquireOperation(jobDir)
         ?: throw ProcessingAlreadyActiveException(jobDir)
@@ -132,12 +135,19 @@ internal fun markProcessingArtifactClaim(
         .filter {
             it.processingAttemptId == attempt.id &&
                 it.adoptedResult == "NEW_FINAL" &&
-                it.claimKey == artifactKey &&
-                it.finalName == artifactFile.name
+                it.claimKey == artifactKey
         }
         .toList()
     check(matchingJournals.size == 1) {
-        "Expected exactly one processing artifact journal for claim=$artifactKey final=${artifactFile.name}, found=${matchingJournals.size}"
+        throw ProcessingArtifactClaimConflictException(
+            "Expected exactly one authoritative processing artifact journal for claim=$artifactKey, found=${matchingJournals.size}"
+        )
+    }
+    val journal = matchingJournals.single()
+    check(journal.finalName == artifactFile.name) {
+        throw ProcessingArtifactClaimConflictException(
+            "Processing artifact claim final mismatch for claim=$artifactKey: expected=${journal.finalName}, actual=${artifactFile.name}"
+        )
     }
     updateForProcessingAttempt(jobDir, attempt) { job ->
         job.put(artifactKey, artifactFile.name)
@@ -145,14 +155,12 @@ internal fun markProcessingArtifactClaim(
             .put("processingArtifactClaimAttemptId", attempt.id)
         appendProcessingSettlement(job, artifactFile, "ADOPTED_FINAL", "ADOPTED", null)
     }
-    matchingJournals.single().let { journal ->
-        journal.transition(jobDir, ProcessingArtifactJournalState.JOB_CLAIM_PERSISTED)
-        val temp = NoFollowFileSystem.resolveDirectChild(jobDir, journal.tempName, requireFile = true)
-        val prior = NoFollowFileSystem.resolveDirectChild(jobDir, journal.priorName, requireFile = true)
-        if (temp == null && prior == null) {
-            journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED, adoptedResultOverride = "NEW_FINAL")
-                .deleteIfOwned(jobDir)
-        }
+    journal.transition(jobDir, ProcessingArtifactJournalState.JOB_CLAIM_PERSISTED)
+    val temp = NoFollowFileSystem.resolveDirectChild(jobDir, journal.tempName, requireFile = true)
+    val prior = NoFollowFileSystem.resolveDirectChild(jobDir, journal.priorName, requireFile = true)
+    if (temp == null && prior == null) {
+        journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED, adoptedResultOverride = "NEW_FINAL")
+            .deleteIfOwned(jobDir)
     }
 }
 

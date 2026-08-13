@@ -21,6 +21,37 @@ internal enum class ProcessingArtifactJournalState {
     SETTLED
 }
 
+internal class ProcessingArtifactClaimConflictException(message: String) : IllegalStateException(message)
+
+private val UNRESOLVED_AUTHORITATIVE_JOURNAL_STATES = setOf(
+    ProcessingArtifactJournalState.PREPARED,
+    ProcessingArtifactJournalState.TEMP_WRITTEN,
+    ProcessingArtifactJournalState.TEMP_VERIFIED,
+    ProcessingArtifactJournalState.PRIOR_BACKED_UP,
+    ProcessingArtifactJournalState.NEW_FINAL_MOVED,
+    ProcessingArtifactJournalState.NEW_FINAL_VERIFIED,
+    ProcessingArtifactJournalState.ADOPTED,
+    ProcessingArtifactJournalState.JOB_CLAIM_PERSISTED,
+    ProcessingArtifactJournalState.ROLLBACK_STARTED,
+    ProcessingArtifactJournalState.PRIOR_RESTORED
+)
+
+internal fun isUnresolvedAuthoritativeProcessingJournal(journal: ProcessingArtifactJournal): Boolean =
+    journal.claimKey != null && journal.processingAttemptId != null &&
+        journal.state in UNRESOLVED_AUTHORITATIVE_JOURNAL_STATES
+
+internal fun isKnownProcessingArtifactClaimKey(job: JSONObject?, claimKey: String): Boolean {
+    val mode = job?.optString("processingMode").orEmpty().uppercase()
+    val jobType = job?.optString("jobType").orEmpty().uppercase()
+    return when {
+        mode == "CLASSIC_RAW" || jobType == "RAW" || jobType == "RAW_NIGHT_FUSION" -> claimKey == "mergedRawFile"
+        mode == "SUPER_RESOLUTION" || jobType.contains("SUPER") -> claimKey == "superResolutionOutputFile"
+        mode == "CLASSIC_YUV" || mode == "SINGLE_FRAME" ||
+            jobType == "YUV_NIGHT_FUSION" || jobType == "YUV_SINGLE_FRAME" -> claimKey == "finalFile"
+        else -> false
+    }
+}
+
 internal data class ProcessingArtifactJournal(
     val transactionId: String,
     val processingAttemptId: String?,
@@ -131,11 +162,29 @@ internal data class ProcessingArtifactJournal(
             priorName: String,
             now: Long = System.currentTimeMillis(),
             claimKey: String? = null
-        ): ProcessingArtifactJournal = ProcessingArtifactJournal(
+        ): ProcessingArtifactJournal {
+            val existing = list(jobDir).mapNotNull { file -> runCatching { read(file) }.getOrNull() }
+                .filter { isUnresolvedAuthoritativeProcessingJournal(it) &&
+                    it.processingAttemptId == processingAttemptId && it.claimKey == claimKey }
+            if (existing.isNotEmpty()) {
+                throw ProcessingArtifactClaimConflictException(
+                    "An unresolved processing artifact claim already exists for attempt=$processingAttemptId key=$claimKey"
+                )
+            }
+            if (claimKey != null) {
+                val job = runCatching { KeplerJobMetadata.read(jobDir) }.getOrNull()
+                if (job != null && !isKnownProcessingArtifactClaimKey(job, claimKey)) {
+                    throw ProcessingArtifactClaimConflictException(
+                        "Claim key $claimKey is not valid for processing mode ${job.optString("processingMode")}"
+                    )
+                }
+            }
+            return ProcessingArtifactJournal(
             transactionId, processingAttemptId, KeplerRuntimeSession.id, artifactType,
             finalName, tempName, priorName, null, null, null, null, null, false, null,
             claimKey, ProcessingArtifactJournalState.PREPARED, now, now
-        ).also { it.writeTo(jobDir) }
+            ).also { it.writeTo(jobDir) }
+        }
 
         fun fileFor(jobDir: File, transactionId: String): File =
             File(jobDir, "$PREFIX${transactionId.also { require(it.matches(UUID_PATTERN)) }}$SUFFIX")
@@ -194,16 +243,40 @@ internal data class ProcessingArtifactRecoveryResult(
 internal fun recoverProcessingArtifactJournals(
     jobDir: File,
     job: JSONObject? = null
-): List<ProcessingArtifactRecoveryResult> = ProcessingArtifactJournal.list(jobDir).map { journalFile ->
-    val journal = runCatching { ProcessingArtifactJournal.read(journalFile) }.getOrElse {
-        return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.INVALID_JOURNAL, it.message)
+): List<ProcessingArtifactRecoveryResult> {
+    val journalFiles = ProcessingArtifactJournal.list(jobDir)
+    val parsedByFile = journalFiles.associateWith { journalFile ->
+        runCatching { ProcessingArtifactJournal.read(journalFile) }
     }
+    val parsedJournals = parsedByFile.values.mapNotNull { it.getOrNull() }
+    val conflictingTransactions = parsedJournals
+        .filter(::isUnresolvedAuthoritativeProcessingJournal)
+        .groupBy { it.processingAttemptId to it.claimKey }
+        .values
+        .filter { it.size > 1 }
+        .flatMap { it.map(ProcessingArtifactJournal::transactionId) }
+        .toSet()
+    val invalidClaimTransactions = parsedJournals
+        .filter { it.claimKey != null && !isKnownProcessingArtifactClaimKey(job, it.claimKey) }
+        .map { it.transactionId }
+        .toSet()
+
+    return journalFiles.map { journalFile ->
+    val parsed = parsedByFile.getValue(journalFile)
+    if (parsed.isFailure) {
+        return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.INVALID_JOURNAL, parsed.exceptionOrNull()?.message)
+    }
+    val preflightJournal = parsed.getOrThrow()
+    if (preflightJournal.transactionId in conflictingTransactions) {
+        return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "conflicting authoritative processing artifact claims were preserved")
+    }
+    if (preflightJournal.transactionId in invalidClaimTransactions) {
+        return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.INVALID_JOURNAL, "processing artifact claim key is not valid for this processing mode")
+    }
+    val journal = preflightJournal
     val final = NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true)
     val temp = NoFollowFileSystem.resolveDirectChild(jobDir, journal.tempName, requireFile = true)
     val prior = NoFollowFileSystem.resolveDirectChild(jobDir, journal.priorName, requireFile = true)
-    val parsedJournals = ProcessingArtifactJournal.list(jobDir).mapNotNull { candidate ->
-        runCatching { ProcessingArtifactJournal.read(candidate) }.getOrNull()
-    }
     fun valid(file: File?, prior: Boolean = false): Boolean = file != null && runCatching {
         verifyProcessingArtifactRecovery(journal, file, prior)
     }.isSuccess
@@ -278,6 +351,13 @@ internal fun recoverProcessingArtifactJournals(
                     val claimDurable = job?.optString(journal.claimKey) == journal.finalName &&
                         job.optBoolean("processingOutputCommitted", false) &&
                         job.optString("processingAttemptId") == journal.processingAttemptId
+                    val conflictingDurableClaim = job?.optBoolean("processingOutputCommitted", false) == true &&
+                        job.optString("processingArtifactClaimAttemptId") == journal.processingAttemptId &&
+                        job.optString(journal.claimKey).isNotBlank() &&
+                        job.optString(journal.claimKey) != journal.finalName
+                    if (conflictingDurableClaim) {
+                        return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "durable processing claim conflicts with this artifact journal")
+                    }
                     if (!claimDurable) {
                         val operationMatches = job != null &&
                             job.optString(ACTIVE_OPERATION_ID) == journal.processingAttemptId &&
@@ -379,6 +459,7 @@ internal fun recoverProcessingArtifactJournals(
             if (priorResult) ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.RESTORED_PRIOR)
             else ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT)
         }
+    }
     }
 }
 

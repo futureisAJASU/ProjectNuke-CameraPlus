@@ -87,18 +87,19 @@ class ProcessingAttemptTest {
                     processingAttemptId = attempt.id,
                     claimKey = "finalFile"
                 )
-                commitProcessingArtifact(
-                    finalFile = second,
-                    writeTemp = { it.writeBytes(byteArrayOf(3, 4)) },
-                    verifyFinal = { check(it.readBytes().contentEquals(byteArrayOf(3, 4))) },
-                    processingAttemptId = attempt.id,
-                    claimKey = "finalFile"
-                )
+                assertThrows(ProcessingArtifactClaimConflictException::class.java) {
+                    commitProcessingArtifact(
+                        finalFile = second,
+                        writeTemp = { it.writeBytes(byteArrayOf(3, 4)) },
+                        verifyFinal = { check(it.readBytes().contentEquals(byteArrayOf(3, 4))) },
+                        processingAttemptId = attempt.id,
+                        claimKey = "finalFile"
+                    )
+                }
                 markProcessingArtifactClaim(dir, attempt, "finalFile", first)
                 val remaining = ProcessingArtifactJournal.list(dir)
                     .map { ProcessingArtifactJournal.read(it) }
-                assertEquals(1, remaining.size)
-                assertEquals("second.png", remaining.single().finalName)
+                assertTrue(remaining.isEmpty())
                 assertTrue(KeplerJobMetadata.read(dir).optBoolean("processingOutputCommitted", false))
             } finally {
                 attempt.releaseOwnedLease()
