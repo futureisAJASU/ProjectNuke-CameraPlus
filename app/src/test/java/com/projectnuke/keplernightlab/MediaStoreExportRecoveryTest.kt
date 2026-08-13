@@ -133,6 +133,19 @@ class MediaStoreExportRecoveryTest {
     }
 
     @Test
+    fun cleanupDebtDoesNotBecomePublicAfterRestart() {
+        val dir = Files.createTempDirectory("media-recovery-abandoned-restart-").toFile()
+        try {
+            journal(dir, MediaStoreExportState.CLEANUP_REQUIRED)
+            val access = FakeAccess(pending = true, verified = true).apply { deleteResult = false }
+            val result = recoverMediaStoreExportJournals(dir, access).single()
+            assertEquals(MediaStoreExportRecoveryClassification.DELETE_FAILED, result.classification)
+            assertFalse(access.committed)
+            assertEquals(MediaStoreExportState.CLEANUP_REQUIRED, MediaStoreExportJournal.list(dir).single().state)
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
     fun missingCommittedUriIsPreservedAsRecoveryDebt() {
         val dir = Files.createTempDirectory("media-recovery-missing-").toFile()
         try {

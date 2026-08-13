@@ -535,7 +535,9 @@ fun updateExportMetadata(
     lateinit var nativePostprocessRgbaFileForLog: String
     lateinit var rawRenderDebugFileForLog: String
     KeplerJobMetadata.update(jobDir) { job ->
-        job.optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }?.let { job.put(TERMINAL_OPERATION_ID, it) }
+        if (verified) {
+            job.optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }?.let { job.put(TERMINAL_OPERATION_ID, it) }
+        }
         job.put("finalOutputFormatSetting", finalOutputFormat.name)
             .put("currentPipelineStage", if (verified) "COMPLETE" else "PROCESSING")
             .put("exportStatus", when {
