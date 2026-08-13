@@ -87,11 +87,13 @@ fun loadJobJson(jobDir: File): JSONObject =
     KeplerJobMetadata.read(jobDir)
 
 fun saveJobJson(jobDir: File, job: JSONObject) {
+    KeplerJobMetadata.requireRecoveryMutationAllowed(jobDir)
     KeplerJobMetadata.write(jobDir, job)
 }
 
 fun setFrameExcluded(jobDir: File, frameIndex: Int, excluded: Boolean) {
     // External mutation: acquire own operation lease, reject unresolved transactions
+    KeplerJobMetadata.requireRecoveryMutationAllowed(jobDir)
     val lease = KeplerJobMetadata.acquireOperation(jobDir)
         ?: throw IllegalStateException("Job mutation is in progress.")
     try {
@@ -230,10 +232,10 @@ fun summarizeKeplerGalleryStorage(jobs: List<KeplerGalleryJobSummary>): KeplerGa
 
 fun deleteKeplerGalleryJob(context: Context, jobDirectory: File): Result<KeplerJobCleanupResult> = runCatching {
     val target = requireCleanupSafeJobDirectory(context, jobDirectory)
+    KeplerJobMetadata.requireRecoveryMutationAllowed(target)
     val lease = KeplerJobMetadata.acquireOperation(target) ?: error("Job mutation is in progress.")
     try {
         require(target.isDirectory) { "Job directory no longer exists." }
-        require(!isReprocessQuarantined(target)) { "Reprocess quarantined job cannot be deleted; it retains pending transaction evidence." }
         val (status, failedPaths) = deleteRecursivelySafe(target)
         if (status == CleanupStatus.COMPLETE) KeplerJobMetadata.removeLockEntry(target)
         KeplerJobCleanupResult(
@@ -254,11 +256,9 @@ fun cleanupKeplerGalleryJob(
     cleanupType: KeplerJobCleanupType
 ): Result<KeplerJobCleanupResult> = runCatching {
     val target = requireCleanupSafeJobDirectory(context, jobDirectory)
+    KeplerJobMetadata.requireRecoveryMutationAllowed(target)
     val lease = KeplerJobMetadata.acquireOperation(target) ?: error("Job mutation is in progress.")
     try {
-        if (isReprocessQuarantined(target)) {
-            throw IllegalStateException("Reprocess quarantined job cannot be cleaned; it retains pending transaction evidence.")
-        }
     val before = folderSizeBytes(target)
     val job = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
         target, JOB_JSON_FILE_NAME, requireFile = true

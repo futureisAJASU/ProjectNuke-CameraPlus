@@ -9,6 +9,14 @@ import java.nio.file.AtomicMoveNotSupportedException
 import java.util.UUID
 import org.json.JSONObject
 
+internal class ProcessingArtifactSimulatedCrashForTest : Error("simulated process death")
+
+@Volatile
+internal var processingArtifactCrashAfterMoveIntentForTest: Boolean = false
+
+@Volatile
+internal var processingArtifactCrashAfterMoveForTest: Boolean = false
+
 internal enum class ProcessingArtifactState {
     PLANNED,
     TEMP_OWNED,
@@ -242,10 +250,12 @@ internal fun commitProcessingArtifact(
         }
 
         checkCancelled()
-        journalTransition(ProcessingArtifactJournalState.NEW_FINAL_MOVED)
+        journalTransition(ProcessingArtifactJournalState.NEW_FINAL_MOVE_STARTED)
+        if (processingArtifactCrashAfterMoveIntentForTest) throw ProcessingArtifactSimulatedCrashForTest()
         move(temp, finalFile)
         newFinalCommitted = true
         state = ProcessingArtifactState.COMMITTED_FINAL
+        if (processingArtifactCrashAfterMoveForTest) throw ProcessingArtifactSimulatedCrashForTest()
         journalTransition(ProcessingArtifactJournalState.NEW_FINAL_MOVED)
 
         // Once commit begins, cancellation cannot interrupt ownership. Verify
@@ -296,6 +306,7 @@ internal fun commitProcessingArtifact(
         )
         return result
     } catch (failure: Throwable) {
+        if (failure is ProcessingArtifactSimulatedCrashForTest) throw failure
         runCatching { journalTransition(ProcessingArtifactJournalState.ROLLBACK_STARTED) }
         val cleanupRecords = mutableListOf<ProcessingArtifactSettlementRecord>()
         if (newFinalCommitted) {

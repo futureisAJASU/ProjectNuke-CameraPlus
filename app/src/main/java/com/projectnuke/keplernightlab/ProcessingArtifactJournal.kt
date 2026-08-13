@@ -12,6 +12,7 @@ internal enum class ProcessingArtifactJournalState {
     TEMP_WRITTEN,
     TEMP_VERIFIED,
     PRIOR_BACKED_UP,
+    NEW_FINAL_MOVE_STARTED,
     NEW_FINAL_MOVED,
     NEW_FINAL_VERIFIED,
     ADOPTED,
@@ -23,11 +24,17 @@ internal enum class ProcessingArtifactJournalState {
 
 internal class ProcessingArtifactClaimConflictException(message: String) : IllegalStateException(message)
 
+internal data class ProcessingArtifactJournalScan(
+    val validJournals: List<Pair<File, ProcessingArtifactJournal>>,
+    val invalidFiles: List<File>
+)
+
 private val UNRESOLVED_AUTHORITATIVE_JOURNAL_STATES = setOf(
     ProcessingArtifactJournalState.PREPARED,
     ProcessingArtifactJournalState.TEMP_WRITTEN,
     ProcessingArtifactJournalState.TEMP_VERIFIED,
     ProcessingArtifactJournalState.PRIOR_BACKED_UP,
+    ProcessingArtifactJournalState.NEW_FINAL_MOVE_STARTED,
     ProcessingArtifactJournalState.NEW_FINAL_MOVED,
     ProcessingArtifactJournalState.NEW_FINAL_VERIFIED,
     ProcessingArtifactJournalState.ADOPTED,
@@ -162,8 +169,14 @@ internal data class ProcessingArtifactJournal(
             priorName: String,
             now: Long = System.currentTimeMillis(),
             claimKey: String? = null
-        ): ProcessingArtifactJournal {
-            val existing = list(jobDir).mapNotNull { file -> runCatching { read(file) }.getOrNull() }
+        ): ProcessingArtifactJournal = KeplerJobMetadata.withJobLock(jobDir) {
+            val scan = scan(jobDir)
+            if (scan.invalidFiles.isNotEmpty()) {
+                throw ProcessingArtifactClaimConflictException(
+                    "Invalid processing journal evidence prevents authoritative journal creation"
+                )
+            }
+            val existing = scan.validJournals.map { it.second }
                 .filter { isUnresolvedAuthoritativeProcessingJournal(it) &&
                     it.processingAttemptId == processingAttemptId && it.claimKey == claimKey }
             if (existing.isNotEmpty()) {
@@ -179,10 +192,10 @@ internal data class ProcessingArtifactJournal(
                     )
                 }
             }
-            return ProcessingArtifactJournal(
-            transactionId, processingAttemptId, KeplerRuntimeSession.id, artifactType,
-            finalName, tempName, priorName, null, null, null, null, null, false, null,
-            claimKey, ProcessingArtifactJournalState.PREPARED, now, now
+            ProcessingArtifactJournal(
+                transactionId, processingAttemptId, KeplerRuntimeSession.id, artifactType,
+                finalName, tempName, priorName, null, null, null, null, null, false, null,
+                claimKey, ProcessingArtifactJournalState.PREPARED, now, now
             ).also { it.writeTo(jobDir) }
         }
 
@@ -222,6 +235,18 @@ internal data class ProcessingArtifactJournal(
 
         fun list(jobDir: File): List<File> = NoFollowFileSystem.requireDirectChildren(jobDir)
             .filter { it.name.startsWith(PREFIX) && it.name.endsWith(SUFFIX) && NoFollowFileSystem.isRealFile(it.toPath()) }
+
+        internal fun scan(jobDir: File): ProcessingArtifactJournalScan {
+            val files = list(jobDir)
+            val valid = mutableListOf<Pair<File, ProcessingArtifactJournal>>()
+            val invalid = mutableListOf<File>()
+            files.forEach { file ->
+                runCatching { read(file) }
+                    .onSuccess { valid += file to it }
+                    .onFailure { invalid += file }
+            }
+            return ProcessingArtifactJournalScan(valid, invalid)
+        }
     }
 }
 
@@ -342,6 +367,37 @@ internal fun recoverProcessingArtifactJournals(
                 }
             }
             else -> ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "neither final nor prior is verifiable")
+        }
+        ProcessingArtifactJournalState.NEW_FINAL_MOVE_STARTED -> when {
+            temp != null && valid(temp) && final == null && prior == null -> {
+                if (!deleteExact(temp)) {
+                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "unadopted temporary cleanup failed")
+                } else {
+                    journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED).deleteIfOwned(jobDir)
+                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.SETTLED_TEMP, "move did not begin before process interruption")
+                }
+            }
+            final != null && valid(final) && temp == null -> {
+                // The move completed before the post-move journal transition. Re-enter the
+                // same adoption path used by NEW_FINAL_MOVED without guessing from existence.
+                journal.transition(jobDir, ProcessingArtifactJournalState.NEW_FINAL_MOVED)
+                return@map recoverProcessingArtifactJournals(jobDir, job).firstOrNull { it.journalFile == journalFile }
+                    ?: ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS)
+            }
+            prior != null && valid(prior, prior = true) && final == null -> {
+                val priorFile = prior
+                movePriorToFinal(priorFile, File(jobDir, journal.finalName))
+                val restored = NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true)
+                if (!valid(restored, prior = true) || !deleteExact(temp)) {
+                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "move-intent recovery could not settle prior and temporary evidence")
+                } else {
+                    journal.transition(jobDir, ProcessingArtifactJournalState.PRIOR_RESTORED, adoptedResultOverride = "PRIOR_FINAL")
+                        .transition(jobDir, ProcessingArtifactJournalState.SETTLED, adoptedResultOverride = "PRIOR_FINAL")
+                        .deleteIfOwned(jobDir)
+                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.RESTORED_PRIOR)
+                }
+            }
+            else -> ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "move-intent paths are not safely classifiable")
         }
         ProcessingArtifactJournalState.NEW_FINAL_MOVED,
         ProcessingArtifactJournalState.NEW_FINAL_VERIFIED,

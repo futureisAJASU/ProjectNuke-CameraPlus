@@ -168,10 +168,10 @@ fun saveFrameSelection(
     frames: List<KeplerFrameReviewItem>
 ): Result<Unit> = runCatching {
     // External mutation: acquire own operation lease, reject unresolved transactions
+    KeplerJobMetadata.requireRecoveryMutationAllowed(jobDir)
     val lease = KeplerJobMetadata.acquireOperation(jobDir)
         ?: throw IllegalStateException("Job mutation is in progress.")
     try {
-        require(!isReprocessQuarantined(jobDir)) { "Cannot save frame selection for a quarantined or unresolved reprocess job." }
         writeFrameSelection(jobDir, mode, frames)
     } finally {
         lease.release()

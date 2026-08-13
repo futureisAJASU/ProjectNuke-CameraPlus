@@ -127,6 +127,20 @@ class ProcessingAttemptTest {
     }
 
     @Test
+    fun malformedProcessingJournalBlocksNewAttempt() {
+        val dir = Files.createTempDirectory("processing-attempt-invalid-journal").toFile()
+        try {
+            KeplerJobMetadata.write(dir, org.json.JSONObject().put("jobType", "YUV_NIGHT_FUSION"))
+            dir.resolve(".processing_tx_broken.json").writeText("not-json")
+            assertThrows(JobRecoveryMutationBlockedException::class.java) {
+                beginProcessingAttempt(dir, "CLASSIC_YUV")
+            }
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
     fun borrowedLeaseIsNotReleasedByNestedAttempt() {
         val dir = Files.createTempDirectory("processing-attempt-borrowed").toFile()
         val lease = KeplerJobMetadata.acquireOperation(dir)

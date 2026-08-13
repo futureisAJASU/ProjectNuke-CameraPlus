@@ -24,6 +24,32 @@ internal class ProcessingCleanupRequiredException : IllegalStateException(
 )
 internal const val PROCESSING_CLEANUP_REQUIRED = "PROCESSING_CLEANUP_REQUIRED"
 
+internal enum class JobRecoveryMutationGateOutcome {
+    ALLOWED,
+    BLOCKED_PROCESSING_CLEANUP,
+    BLOCKED_AMBIGUOUS_RECOVERY,
+    BLOCKED_PUBLIC_COMMIT_MISSING,
+    BLOCKED_EXPORT_VERIFICATION,
+    BLOCKED_INVALID_PROCESSING_JOURNAL,
+    BLOCKED_REPROCESS_QUARANTINE,
+    INSPECTION_FAILED
+}
+
+internal class JobRecoveryMutationBlockedException(
+    val outcome: JobRecoveryMutationGateOutcome
+) : IllegalStateException(
+    when (outcome) {
+        JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP -> "이전 처리 작업의 파일 정리가 완료되지 않아 지금은 작업을 변경할 수 없습니다."
+        JobRecoveryMutationGateOutcome.BLOCKED_AMBIGUOUS_RECOVERY -> "복구되지 않은 작업 증거가 있어 지금은 작업을 변경할 수 없습니다."
+        JobRecoveryMutationGateOutcome.BLOCKED_PUBLIC_COMMIT_MISSING -> "공개 결과의 커밋 증거가 없어 지금은 작업을 변경할 수 없습니다."
+        JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION -> "공개 결과를 확인하지 못해 지금은 작업을 변경할 수 없습니다."
+        JobRecoveryMutationGateOutcome.BLOCKED_INVALID_PROCESSING_JOURNAL -> "처리 복구 기록을 읽을 수 없어 지금은 작업을 변경할 수 없습니다."
+        JobRecoveryMutationGateOutcome.BLOCKED_REPROCESS_QUARANTINE -> "복구 중인 작업은 지금 변경할 수 없습니다."
+        JobRecoveryMutationGateOutcome.INSPECTION_FAILED -> "작업 복구 상태를 확인하지 못해 지금은 작업을 변경할 수 없습니다."
+        JobRecoveryMutationGateOutcome.ALLOWED -> ""
+    }
+)
+
 /** Serializes each job's read-modify-write updates and never truncates a valid job.json. */
 object KeplerJobMetadata {
     // Strongly reachable striped locks keep one stable lock choice per job
@@ -55,6 +81,43 @@ object KeplerJobMetadata {
         (jobDir.toPath().toAbsolutePath().normalize().toString().hashCode() and Int.MAX_VALUE) % _locks.size
     ]
 
+    internal fun <T> withJobLock(jobDir: File, block: () -> T): T =
+        synchronized(lockFor(jobDir), block)
+
+    internal fun inspectRecoveryMutationGate(jobDir: File): JobRecoveryMutationGateOutcome =
+        withJobLock(jobDir) {
+            try {
+                if (isReprocessQuarantined(jobDir)) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_REPROCESS_QUARANTINE
+                val scan = ProcessingArtifactJournal.scan(jobDir)
+                if (scan.invalidFiles.isNotEmpty()) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_INVALID_PROCESSING_JOURNAL
+                if (scan.validJournals.any { isUnresolvedAuthoritativeProcessingJournal(it.second) }) {
+                    return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP
+                }
+                val job = try {
+                    read(jobDir)
+                } catch (_: KeplerJobMetadataMissing) {
+                    return@withJobLock JobRecoveryMutationGateOutcome.ALLOWED
+                }
+                when (job.optString("recoveryState")) {
+                    PROCESSING_CLEANUP_REQUIRED -> JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP
+                    "AMBIGUOUS_RECOVERY_REQUIRED" -> JobRecoveryMutationGateOutcome.BLOCKED_AMBIGUOUS_RECOVERY
+                    "PUBLIC_COMMIT_MISSING" -> JobRecoveryMutationGateOutcome.BLOCKED_PUBLIC_COMMIT_MISSING
+                    "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION" -> JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION
+                    else -> JobRecoveryMutationGateOutcome.ALLOWED
+                }
+            } catch (_: Exception) {
+                JobRecoveryMutationGateOutcome.INSPECTION_FAILED
+            }
+        }
+
+    internal fun requireRecoveryMutationAllowed(jobDir: File) {
+        val outcome = inspectRecoveryMutationGate(jobDir)
+        if (outcome == JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP) {
+            throw ProcessingCleanupRequiredException()
+        }
+        if (outcome != JobRecoveryMutationGateOutcome.ALLOWED) throw JobRecoveryMutationBlockedException(outcome)
+    }
+
     fun acquireOperation(jobDir: File): JobOperationLease? {
         val key = jobDir.toPath().toAbsolutePath().normalize().toString()
         val lease = JobOperationLease(key)
@@ -64,10 +127,8 @@ object KeplerJobMetadata {
     internal fun hasProcessingCleanupBlocker(jobDir: File): Boolean = runCatching {
         val job = read(jobDir)
         job.optString("recoveryState") == PROCESSING_CLEANUP_REQUIRED ||
-            ProcessingArtifactJournal.list(jobDir).any { file ->
-                runCatching { ProcessingArtifactJournal.read(file) }
-                    .getOrNull()
-                    ?.let(::isUnresolvedAuthoritativeProcessingJournal) == true
+            ProcessingArtifactJournal.scan(jobDir).let { scan ->
+                scan.invalidFiles.isNotEmpty() || scan.validJournals.any { isUnresolvedAuthoritativeProcessingJournal(it.second) }
             }
     }.getOrDefault(false)
 

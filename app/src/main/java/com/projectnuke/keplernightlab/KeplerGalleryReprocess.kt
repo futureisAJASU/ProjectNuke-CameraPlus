@@ -493,8 +493,10 @@ suspend fun reprocessKeplerGalleryJob(
     catch (ie: InternalError) { throw ie }
     catch (e: Error) { throw e }
     catch (sf: Exception) { return@withContext Result.failure(sf) }
-    if (KeplerJobMetadata.hasProcessingCleanupBlocker(target)) {
-        return@withContext Result.failure(ProcessingCleanupRequiredException())
+    try {
+        KeplerJobMetadata.requireRecoveryMutationAllowed(target)
+    } catch (blocked: JobRecoveryMutationBlockedException) {
+        return@withContext Result.failure(blocked)
     }
     val session = ReprocessTransactionSession(target)
     val operationLease = session.acquireLease() ?: run {

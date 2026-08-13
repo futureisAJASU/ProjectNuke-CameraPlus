@@ -10,6 +10,8 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import java.util.concurrent.CancellationException
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import org.json.JSONObject
 
 @RunWith(RobolectricTestRunner::class)
@@ -18,6 +20,116 @@ class ProcessingArtifactTransactionTest {
         override val isCancelled: Boolean get() = cancelled
         override fun throwIfCancelled() {
             if (cancelled) throw CancellationException("cancelled")
+        }
+    }
+
+    @Test
+    fun moveIntentWithoutPriorSettlesVerifiedUnadoptedTempAfterCrash() {
+        val dir = Files.createTempDirectory("processing-move-intent-").toFile()
+        try {
+            val temp = File(dir, ".result.tmp").apply { writeBytes(byteArrayOf(1, 2, 3)) }
+            val final = File(dir, "result.bin")
+            val journal = ProcessingArtifactJournal(
+                transactionId = UUID.randomUUID().toString(),
+                processingAttemptId = null,
+                runtimeSessionId = "old-runtime",
+                artifactType = "BIN",
+                finalName = final.name,
+                tempName = temp.name,
+                priorName = ".result.prior",
+                verificationKind = "BIN",
+                expectedSizeBytes = temp.length(),
+                expectedSha256 = NoFollowFileSystem.digestVerified(temp).sha256,
+                state = ProcessingArtifactJournalState.NEW_FINAL_MOVE_STARTED,
+                createdAt = 1L,
+                updatedAt = 2L
+            )
+            journal.writeTo(dir)
+
+            val result = recoverProcessingArtifactJournals(dir).single()
+
+            assertEquals(ProcessingArtifactRecoveryClassification.SETTLED_TEMP, result.classification)
+            assertFalse(temp.exists())
+            assertFalse(final.exists())
+            assertTrue(ProcessingArtifactJournal.list(dir).isEmpty())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun productionMoveIntentCrashCutConvergesWithoutPrior() {
+        val dir = Files.createTempDirectory("processing-move-cut-").toFile()
+        try {
+            val final = File(dir, "result.bin")
+            processingArtifactCrashAfterMoveIntentForTest = true
+            try {
+                org.junit.Assert.assertThrows(ProcessingArtifactSimulatedCrashForTest::class.java) {
+                    commitProcessingArtifact(
+                        finalFile = final,
+                        writeTemp = { it.writeBytes(byteArrayOf(4, 5, 6)) },
+                        verifyFinal = { check(it.readBytes().contentEquals(byteArrayOf(4, 5, 6))) }
+                    )
+                }
+            } finally {
+                processingArtifactCrashAfterMoveIntentForTest = false
+            }
+            assertEquals(ProcessingArtifactRecoveryClassification.SETTLED_TEMP, recoverProcessingArtifactJournals(dir).single().classification)
+            assertFalse(final.exists())
+
+            processingArtifactCrashAfterMoveForTest = true
+            try {
+                org.junit.Assert.assertThrows(ProcessingArtifactSimulatedCrashForTest::class.java) {
+                    commitProcessingArtifact(
+                        finalFile = final,
+                        writeTemp = { it.writeBytes(byteArrayOf(7, 8, 9)) },
+                        verifyFinal = { check(it.readBytes().contentEquals(byteArrayOf(7, 8, 9))) }
+                    )
+                }
+            } finally {
+                processingArtifactCrashAfterMoveForTest = false
+            }
+            assertTrue(final.exists())
+            assertEquals(ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT, recoverProcessingArtifactJournals(dir).single().classification)
+            assertTrue(final.readBytes().contentEquals(byteArrayOf(7, 8, 9)))
+        } finally {
+            processingArtifactCrashAfterMoveIntentForTest = false
+            processingArtifactCrashAfterMoveForTest = false
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun authoritativeJournalCreationIsSerializedPerJob() {
+        val dir = Files.createTempDirectory("processing-journal-concurrent-").toFile()
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            KeplerJobMetadata.write(dir, JSONObject().put("jobType", "YUV_NIGHT_FUSION").put("processingMode", "CLASSIC_YUV"))
+            val start = CountDownLatch(1)
+            val results = (1..2).map { index ->
+                executor.submit<Result<ProcessingArtifactJournal>> {
+                    start.await()
+                    runCatching {
+                        ProcessingArtifactJournal.create(
+                            jobDir = dir,
+                            transactionId = UUID.randomUUID().toString(),
+                            processingAttemptId = "same-attempt",
+                            artifactType = "PNG",
+                            finalName = "result-$index.png",
+                            tempName = ".result-$index.tmp",
+                            priorName = ".result-$index.prior",
+                            claimKey = "finalFile"
+                        )
+                    }
+                }
+            }
+            start.countDown()
+            val completed: List<Result<ProcessingArtifactJournal>> = results.map { it.get() }
+            assertEquals(1, completed.count { it.isSuccess })
+            assertEquals(1, completed.count { it.exceptionOrNull() is ProcessingArtifactClaimConflictException })
+        } finally {
+            executor.shutdownNow()
+            dir.deleteRecursively()
         }
     }
 
