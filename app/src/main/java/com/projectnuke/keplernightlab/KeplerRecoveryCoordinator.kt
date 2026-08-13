@@ -172,6 +172,7 @@ internal object KeplerRecoveryCoordinator {
                 return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.SKIP_ACTIVE_CURRENT_PROCESS)
             }
             val activeOperation = job.optString(ACTIVE_OPERATION_ID)
+            val activeOperationKind = job.optString(ACTIVE_OPERATION_KIND)
             val handoffRuntime = job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID)
             if (handoffRuntime == KeplerRuntimeSession.id) {
                 return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.SKIP_ACTIVE_CURRENT_PROCESS)
@@ -188,11 +189,37 @@ internal object KeplerRecoveryCoordinator {
                     failures = invalidExportJournals.map { "Invalid export journal: ${it.name}" }
                 )
             }
-            val exportResults = exportAccess?.let { recoverMediaStoreExportJournals(jobDir, it) }.orEmpty()
+            val processingRecoveryOwnsAuthority = activeOperation.isNotBlank() && activeOperationKind in setOf(
+                KeplerActiveOperationKind.PROCESSING_YUV.name,
+                KeplerActiveOperationKind.PROCESSING_RAW.name,
+                KeplerActiveOperationKind.SUPER_RESOLUTION.name
+            )
+            val exportResults = if (processingRecoveryOwnsAuthority) {
+                emptyList()
+            } else {
+                exportAccess?.let { recoverMediaStoreExportJournals(jobDir, it) }.orEmpty()
+            }
+            val exportJournalsById = MediaStoreExportJournal.list(jobDir).associateBy { it.exportAttemptId }
+            val recoveredMainCommit = exportResults.any { result ->
+                result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
+                    result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED
+            } && exportResults.any { result ->
+                exportJournalsById[result.attemptId]?.let { journal ->
+                    journal.role == MediaStoreExportRole.MAIN_IMAGE &&
+                        (activeOperation.isBlank() || journal.ownerOperationId == activeOperation)
+                } == true
+            }
+            val selectedExportTruth = job.optBoolean("galleryExportCommitted", false) &&
+                job.optString("exportUri").isNotBlank() || recoveredMainCommit
             val exportFailure = exportResults.firstOrNull {
-                it.classification == MediaStoreExportRecoveryClassification.AMBIGUOUS ||
-                    it.classification == MediaStoreExportRecoveryClassification.INSERT_RESULT_UNKNOWN ||
-                    it.classification == MediaStoreExportRecoveryClassification.DELETE_FAILED
+                val journal = exportJournalsById[it.attemptId]
+                val abandonedDebt = journal?.state == MediaStoreExportState.CLEANUP_REQUIRED
+                val knownNoRow = journal?.state == MediaStoreExportState.INSERT_FAILED_NO_ROW ||
+                    journal?.state == MediaStoreExportState.CLEANED
+                !abandonedDebt && !knownNoRow && !selectedExportTruth &&
+                    (it.classification == MediaStoreExportRecoveryClassification.AMBIGUOUS ||
+                        it.classification == MediaStoreExportRecoveryClassification.INSERT_RESULT_UNKNOWN ||
+                        it.classification == MediaStoreExportRecoveryClassification.DELETE_FAILED)
             }
             if (exportFailure != null) {
                 KeplerJobMetadata.update(jobDir) {
@@ -220,7 +247,7 @@ internal object KeplerRecoveryCoordinator {
                     reconstructMainExportEvidence(jobDir, current, activeOperation, exportResults)
                 }
             }
-            if (exportResults.isNotEmpty()) {
+            if (exportResults.isNotEmpty() || activeOperation.isNotBlank()) {
                 val recoveredAttemptIds = exportResults
                     .filter { result ->
                         result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
@@ -238,7 +265,7 @@ internal object KeplerRecoveryCoordinator {
                         jobDir,
                         current,
                         MediaStoreExportJournal.list(jobDir),
-                        recoveredAttemptIds
+                        recoveredAttemptIds.takeIf { activeOperationKind == KeplerActiveOperationKind.PUBLIC_EXPORT.name }
                     )
                 }
             }

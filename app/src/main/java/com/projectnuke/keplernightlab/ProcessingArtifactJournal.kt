@@ -33,6 +33,8 @@ internal data class ProcessingArtifactJournal(
     val expectedSha256: String? = null,
     val priorExpectedSizeBytes: Long? = null,
     val priorExpectedSha256: String? = null,
+    val priorSemanticVerified: Boolean = false,
+    val adoptedResult: String? = null,
     val state: ProcessingArtifactJournalState,
     val createdAt: Long,
     val updatedAt: Long
@@ -53,7 +55,9 @@ internal data class ProcessingArtifactJournal(
         expectedSizeBytesOverride: Long? = expectedSizeBytes,
         expectedSha256Override: String? = expectedSha256,
         priorExpectedSizeBytesOverride: Long? = priorExpectedSizeBytes,
-        priorExpectedSha256Override: String? = priorExpectedSha256
+        priorExpectedSha256Override: String? = priorExpectedSha256,
+        priorSemanticVerifiedOverride: Boolean = priorSemanticVerified,
+        adoptedResultOverride: String? = adoptedResult
     ): ProcessingArtifactJournal = copy(
         state = next,
         verificationKind = verificationKindOverride,
@@ -61,6 +65,8 @@ internal data class ProcessingArtifactJournal(
         expectedSha256 = expectedSha256Override,
         priorExpectedSizeBytes = priorExpectedSizeBytesOverride,
         priorExpectedSha256 = priorExpectedSha256Override,
+        priorSemanticVerified = priorSemanticVerifiedOverride,
+        adoptedResult = adoptedResultOverride,
         updatedAt = System.currentTimeMillis()
     ).also { it.writeTo(jobDir) }
 
@@ -95,6 +101,8 @@ internal data class ProcessingArtifactJournal(
         .put("expectedSha256", expectedSha256 ?: JSONObject.NULL)
         .put("priorExpectedSizeBytes", priorExpectedSizeBytes ?: JSONObject.NULL)
         .put("priorExpectedSha256", priorExpectedSha256 ?: JSONObject.NULL)
+        .put("priorSemanticVerified", priorSemanticVerified)
+        .put("adoptedResult", adoptedResult ?: JSONObject.NULL)
         .put("state", state.name)
         .put("createdAt", createdAt)
         .put("updatedAt", updatedAt)
@@ -117,7 +125,7 @@ internal data class ProcessingArtifactJournal(
             now: Long = System.currentTimeMillis()
         ): ProcessingArtifactJournal = ProcessingArtifactJournal(
             transactionId, processingAttemptId, KeplerRuntimeSession.id, artifactType,
-            finalName, tempName, priorName, null, null, null, null, null,
+            finalName, tempName, priorName, null, null, null, null, null, false, null,
             ProcessingArtifactJournalState.PREPARED, now, now
         ).also { it.writeTo(jobDir) }
 
@@ -146,6 +154,8 @@ internal data class ProcessingArtifactJournal(
                 expectedSha256 = json.optString("expectedSha256").takeIf { it.isNotBlank() && it != "null" },
                 priorExpectedSizeBytes = json.optLong("priorExpectedSizeBytes").takeIf { json.has("priorExpectedSizeBytes") && !json.isNull("priorExpectedSizeBytes") },
                 priorExpectedSha256 = json.optString("priorExpectedSha256").takeIf { it.isNotBlank() && it != "null" },
+                priorSemanticVerified = json.optBoolean("priorSemanticVerified", false),
+                adoptedResult = json.optString("adoptedResult").takeIf { it.isNotBlank() && it != "null" },
                 state = state,
                 createdAt = json.getLong("createdAt"),
                 updatedAt = json.getLong("updatedAt")
@@ -220,7 +230,9 @@ internal fun recoverProcessingArtifactJournals(
                 val restored = NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true)
                 if (!valid(restored, prior = true)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "restored prior failed verification")
                 if (!deleteExact(temp)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "temporary cleanup failed after prior restoration")
-                journal.transition(jobDir, ProcessingArtifactJournalState.PRIOR_RESTORED).transition(jobDir, ProcessingArtifactJournalState.SETTLED).deleteIfOwned(jobDir)
+                journal.transition(jobDir, ProcessingArtifactJournalState.PRIOR_RESTORED, adoptedResultOverride = "PRIOR_FINAL")
+                    .transition(jobDir, ProcessingArtifactJournalState.SETTLED, adoptedResultOverride = "PRIOR_FINAL")
+                    .deleteIfOwned(jobDir)
                 ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.RESTORED_PRIOR)
             }
             valid(final) -> {
@@ -258,14 +270,17 @@ internal fun recoverProcessingArtifactJournals(
                 val restored = NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true)
                 if (!valid(restored, prior = true)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "restored prior failed verification")
                 if (!deleteExact(temp)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "temporary cleanup failed after prior restoration")
-                journal.transition(jobDir, ProcessingArtifactJournalState.PRIOR_RESTORED).transition(jobDir, ProcessingArtifactJournalState.SETTLED).deleteIfOwned(jobDir)
+                journal.transition(jobDir, ProcessingArtifactJournalState.PRIOR_RESTORED, adoptedResultOverride = "PRIOR_FINAL")
+                    .transition(jobDir, ProcessingArtifactJournalState.SETTLED, adoptedResultOverride = "PRIOR_FINAL")
+                    .deleteIfOwned(jobDir)
                 ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.RESTORED_PRIOR)
             }
             else -> ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "no verifiable candidate")
         }
         ProcessingArtifactJournalState.PRIOR_RESTORED,
         ProcessingArtifactJournalState.SETTLED -> {
-            if (valid(final)) journalFile.delete() else return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "settled journal final is not verifiable")
+            val priorResult = journal.adoptedResult == "PRIOR_FINAL" || journal.state == ProcessingArtifactJournalState.PRIOR_RESTORED
+            if (valid(final, prior = priorResult)) journalFile.delete() else return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "settled journal final is not verifiable")
             ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.RESTORED_PRIOR)
         }
     }
@@ -280,6 +295,9 @@ private fun verifyProcessingArtifactRecovery(journal: ProcessingArtifactJournal,
     }
     check(digest.size == expectedSize) { "Processing artifact size mismatch" }
     check(digest.sha256.equals(expectedSha256, ignoreCase = true)) { "Processing artifact digest mismatch" }
+    if (prior && journal.verificationKind?.uppercase() in setOf("PNG", "JPG", "JPEG", "JSON", "RAW16") && !journal.priorSemanticVerified) {
+        error("Processing journal prior lacks semantic verification evidence")
+    }
     when (journal.verificationKind?.uppercase()) {
         "PNG" -> verifyPngArtifact(file)
         "JPG", "JPEG" -> verifyJpegArtifact(file)

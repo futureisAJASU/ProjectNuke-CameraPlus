@@ -200,6 +200,46 @@ class KeplerRecoveryCoordinatorTest {
     }
 
     @Test
+    fun historicalAmbiguousExportDoesNotBlockDeadProcessingArtifactRecovery() {
+        val root = File(Files.createTempDirectory("kepler-recovery-processing-authority-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_processing-authority").apply { mkdirs() }
+        try {
+            val processingOperation = "processing-operation"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("status", "PROCESSING")
+                .put("processingOutputCommitted", true)
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, processingOperation)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PROCESSING_YUV.name))
+            MediaStoreExportJournal.create(
+                job, MediaStoreExportRole.MAIN_IMAGE, null, "old.jpg", "Pictures/Kepler",
+                "image/jpeg", Uri.parse("content://media/external/images/media"), ownerOperationId = "old-export"
+            )
+            val prior = File(job, "result.bin").apply { writeBytes(byteArrayOf(4, 5, 6, 7)) }
+            val journal = ProcessingArtifactJournal.create(
+                jobDir = job,
+                transactionId = java.util.UUID.randomUUID().toString(),
+                processingAttemptId = null,
+                artifactType = "BINARY",
+                finalName = prior.name,
+                tempName = ".result.tmp",
+                priorName = ".result.prior"
+            ).transition(job, ProcessingArtifactJournalState.PRIOR_BACKED_UP)
+            val movedPrior = File(job, journal.priorName)
+            prior.renameTo(movedPrior)
+            val expected = NoFollowFileSystem.digestVerified(movedPrior)
+            ProcessingArtifactJournal.read(ProcessingArtifactJournal.fileFor(job, journal.transactionId))
+                .transition(job, ProcessingArtifactJournalState.PRIOR_BACKED_UP,
+                    priorExpectedSizeBytesOverride = expected.size,
+                    priorExpectedSha256Override = expected.sha256)
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
+            assertEquals(KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL, report.jobs.single().classification)
+            assertTrue(File(job, "result.bin").exists())
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test
     fun unknownInsertResultIsAmbiguousJobEvidence() {
         val root = File(Files.createTempDirectory("kepler-recovery-unknown-export-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
         val job = File(root, "KPL_YUV_FUSION_unknown").apply { mkdirs() }

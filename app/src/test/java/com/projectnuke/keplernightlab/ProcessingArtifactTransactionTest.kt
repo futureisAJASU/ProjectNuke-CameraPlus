@@ -156,6 +156,38 @@ class ProcessingArtifactTransactionTest {
     }
 
     @Test
+    fun priorRestoredJournalIsVerifiedAgainstPriorEvidenceAfterRestart() {
+        val dir = Files.createTempDirectory("processing-journal-prior-restored-").toFile()
+        try {
+            val final = File(dir, "result.bin")
+            val prior = File(dir, ".result.bin.prior").apply { writeText("restored") }
+            val priorEvidence = NoFollowFileSystem.digestVerified(prior)
+            val id = UUID.randomUUID().toString()
+            ProcessingArtifactJournal(
+                transactionId = id,
+                processingAttemptId = null,
+                runtimeSessionId = "old-runtime",
+                artifactType = "BIN",
+                finalName = final.name,
+                tempName = ".result.bin.tmp",
+                priorName = prior.name,
+                verificationKind = "BIN",
+                priorExpectedSizeBytes = priorEvidence.size,
+                priorExpectedSha256 = priorEvidence.sha256,
+                priorSemanticVerified = true,
+                adoptedResult = "PRIOR_FINAL",
+                state = ProcessingArtifactJournalState.PRIOR_RESTORED,
+                createdAt = 1L,
+                updatedAt = 2L
+            ).writeTo(dir)
+            final.writeText("restored")
+            val result = recoverProcessingArtifactJournals(dir).single()
+            assertEquals(ProcessingArtifactRecoveryClassification.RESTORED_PRIOR, result.classification)
+            assertTrue(ProcessingArtifactJournal.list(dir).isEmpty())
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
     fun malformedProcessingJournalIdentityIsPreserved() {
         val dir = Files.createTempDirectory("processing-journal-hostile").toFile()
         try {

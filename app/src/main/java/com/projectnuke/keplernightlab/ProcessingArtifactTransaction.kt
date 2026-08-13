@@ -167,7 +167,9 @@ internal fun commitProcessingArtifact(
 
     fun journalTransition(
         next: ProcessingArtifactJournalState,
-        evidence: NoFollowFileSystem.StreamDigest? = null
+        evidence: NoFollowFileSystem.StreamDigest? = null,
+        priorSemanticVerified: Boolean = journal.priorSemanticVerified,
+        adoptedResult: String? = journal.adoptedResult
     ) {
         journal = journal.transition(
             parent,
@@ -175,6 +177,8 @@ internal fun commitProcessingArtifact(
             verificationKindOverride = evidence?.let { finalFile.extension.uppercase().ifBlank { "BINARY" } } ?: journal.verificationKind,
             expectedSizeBytesOverride = evidence?.size ?: journal.expectedSizeBytes,
             expectedSha256Override = evidence?.sha256 ?: journal.expectedSha256
+            ,priorSemanticVerifiedOverride = priorSemanticVerified
+            ,adoptedResultOverride = adoptedResult
         )
     }
 
@@ -207,6 +211,10 @@ internal fun commitProcessingArtifact(
         if (existingRegularArtifact(finalFile)) {
             journalTransition(ProcessingArtifactJournalState.PRIOR_BACKED_UP)
             val priorEvidence = NoFollowFileSystem.digestVerified(finalFile)
+            val priorSemanticEvidence = runCatching {
+                verifyFinal(finalFile)
+                true
+            }.getOrDefault(false)
             move(finalFile, priorBackup)
             priorBackedUp = true
             state = ProcessingArtifactState.PRIOR_FINAL_BACKED_UP
@@ -214,7 +222,8 @@ internal fun commitProcessingArtifact(
                 parent,
                 ProcessingArtifactJournalState.PRIOR_BACKED_UP,
                 priorExpectedSizeBytesOverride = priorEvidence.size,
-                priorExpectedSha256Override = priorEvidence.sha256
+                priorExpectedSha256Override = priorEvidence.sha256,
+                priorSemanticVerifiedOverride = priorSemanticEvidence
             )
         }
 
@@ -236,7 +245,7 @@ internal fun commitProcessingArtifact(
             ProcessingArtifactSettlementStatus.ADOPTED
         )
         state = ProcessingArtifactState.ADOPTED
-        journalTransition(ProcessingArtifactJournalState.ADOPTED)
+        journalTransition(ProcessingArtifactJournalState.ADOPTED, adoptedResult = "NEW_FINAL")
 
         if (priorBackedUp) {
             val backupSettlement = settleProcessingArtifactPath(priorBackup, ProcessingArtifactResourceRole.PRIOR_BACKUP)
@@ -306,7 +315,7 @@ internal fun commitProcessingArtifact(
                         ProcessingArtifactResourceRole.PRIOR_BACKUP,
                         ProcessingArtifactSettlementStatus.ABSENT
                     )
-                    runCatching { journalTransition(ProcessingArtifactJournalState.PRIOR_RESTORED) }
+                    runCatching { journalTransition(ProcessingArtifactJournalState.PRIOR_RESTORED, adoptedResult = "PRIOR_FINAL") }
                     cleanupRecords += ProcessingArtifactSettlementRecord(
                         finalFile,
                         ProcessingArtifactResourceRole.RESTORED_PRIOR,
@@ -332,7 +341,10 @@ internal fun commitProcessingArtifact(
             state = ProcessingArtifactState.ROLLED_BACK
             if (priorRestored || !priorBackedUp) {
                 runCatching {
-                    journalTransition(if (priorRestored) ProcessingArtifactJournalState.PRIOR_RESTORED else ProcessingArtifactJournalState.SETTLED)
+                    journalTransition(
+                        if (priorRestored) ProcessingArtifactJournalState.PRIOR_RESTORED else ProcessingArtifactJournalState.SETTLED,
+                        adoptedResult = if (priorRestored) "PRIOR_FINAL" else journal.adoptedResult
+                    )
                     journal.deleteIfOwned(parent)
                 }
             }

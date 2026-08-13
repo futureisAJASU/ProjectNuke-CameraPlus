@@ -70,4 +70,26 @@ class RawSidecarJournalRecoveryTest {
             dir.deleteRecursively()
         }
     }
+
+    @Test
+    fun verifiedHistoricalSidecarCanBeReconstructedForCurrentOperationByExactSourceIdentity() {
+        val dir = Files.createTempDirectory("sidecar-historical-reuse-").toFile()
+        try {
+            val dng = File(dir, "frame_04.dng").apply { writeBytes(byteArrayOf(0x49, 0x49, 0x2a, 0x00, 5)) }
+            val journal = MediaStoreExportJournal.create(
+                dir, MediaStoreExportRole.RAW_DNG_SIDECAR, 4, dng.name,
+                "Pictures/Kepler/RAW", "image/x-adobe-dng", Uri.parse("content://media/external/file"),
+                expectedSizeBytes = dng.length(),
+                expectedSha256 = NoFollowFileSystem.digestVerified(dng).sha256,
+                ownerOperationId = "historical-operation"
+            ).transition(dir, MediaStoreExportState.VERIFIED, "content://media/external/file/4")
+            val job = JSONObject().put("frames", JSONArray().put(JSONObject()
+                .put("frameIndex", 4)
+                .put("dngFile", dng.name)
+                .put("dngSidecarStatus", "LOCAL_SAVED")))
+            KeplerJobMetadata.write(dir, job)
+            assertEquals(1, reconstructRawSidecarJournalEvidence(dir, job, listOf(journal)))
+            assertEquals("content://media/external/file/4", job.getJSONArray("frames").getJSONObject(0).getString("publicDngUri"))
+        } finally { dir.deleteRecursively() }
+    }
 }
