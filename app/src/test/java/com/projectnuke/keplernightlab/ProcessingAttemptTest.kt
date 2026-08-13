@@ -33,7 +33,14 @@ class ProcessingAttemptTest {
                 assertFalse(afterStart.has("pipelineFailed"))
                 assertFalse(afterStart.has("rawFusedPreviewFile"))
 
-                val output = dir.resolve("merged.raw16").apply { writeBytes(byteArrayOf(1, 2)) }
+                val output = dir.resolve("merged.raw16")
+                commitProcessingArtifact(
+                    finalFile = output,
+                    writeTemp = { it.writeBytes(byteArrayOf(1, 2)) },
+                    verifyFinal = { check(it.readBytes().contentEquals(byteArrayOf(1, 2))) },
+                    processingAttemptId = attempt.id,
+                    claimKey = "mergedRawFile"
+                )
                 markProcessingArtifactClaim(dir, attempt, "mergedRawFile", output)
                 val committed = KeplerJobMetadata.read(dir)
                 assertEquals(output.name, committed.getString("mergedRawFile"))
@@ -57,6 +64,42 @@ class ProcessingAttemptTest {
                 val job = KeplerJobMetadata.read(dir)
                 assertEquals(attempt.id, job.getString("processingAttemptId"))
                 assertEquals("SUPER_RESOLUTION", job.getString("processingMode"))
+            } finally {
+                attempt.releaseOwnedLease()
+            }
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun claimAckRequiresOneExactAttemptKeyAndFinalJournal() {
+        val dir = Files.createTempDirectory("processing-attempt-exact-claim").toFile()
+        try {
+            val attempt = beginProcessingAttempt(dir, "CLASSIC_YUV")
+            try {
+                val first = dir.resolve("first.png")
+                val second = dir.resolve("second.png")
+                commitProcessingArtifact(
+                    finalFile = first,
+                    writeTemp = { it.writeBytes(byteArrayOf(1, 2)) },
+                    verifyFinal = { check(it.readBytes().contentEquals(byteArrayOf(1, 2))) },
+                    processingAttemptId = attempt.id,
+                    claimKey = "finalFile"
+                )
+                commitProcessingArtifact(
+                    finalFile = second,
+                    writeTemp = { it.writeBytes(byteArrayOf(3, 4)) },
+                    verifyFinal = { check(it.readBytes().contentEquals(byteArrayOf(3, 4))) },
+                    processingAttemptId = attempt.id,
+                    claimKey = "finalFile"
+                )
+                markProcessingArtifactClaim(dir, attempt, "finalFile", first)
+                val remaining = ProcessingArtifactJournal.list(dir)
+                    .map { ProcessingArtifactJournal.read(it) }
+                assertEquals(1, remaining.size)
+                assertEquals("second.png", remaining.single().finalName)
+                assertTrue(KeplerJobMetadata.read(dir).optBoolean("processingOutputCommitted", false))
             } finally {
                 attempt.releaseOwnedLease()
             }

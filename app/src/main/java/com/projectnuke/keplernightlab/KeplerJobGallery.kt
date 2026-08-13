@@ -24,7 +24,9 @@ data class KeplerGalleryJobSummary(
     val frames: List<KeplerGalleryFrame>,
     val metadata: JSONObject?,
     val recoveryState: String = "STABLE",
-    val recoveryMessage: String? = null
+    val recoveryMessage: String? = null,
+    val lastRecoveryClassification: String? = null,
+    val lastRecoveryMessage: String? = null
 )
 
 data class KeplerJobStorageInfo(
@@ -441,7 +443,9 @@ fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
         frames = frames,
         metadata = job,
         recoveryState = job?.optString("recoveryState").orEmpty().ifBlank { "STABLE" },
-        recoveryMessage = job?.optString("recoveryMessage").orEmpty().ifBlank { null }
+        recoveryMessage = job?.optString("recoveryMessage").orEmpty().ifBlank { null },
+        lastRecoveryClassification = job?.optString("lastRecoveryClassification").orEmpty().ifBlank { null },
+        lastRecoveryMessage = job?.optString("lastRecoveryMessage").orEmpty().ifBlank { null }
     )
 }
 

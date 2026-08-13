@@ -67,11 +67,6 @@ internal fun processSingleFrameJobSync(
     var sourceForCleanup: Bitmap? = null
     var processedForCleanup: Bitmap? = null
     var outputFile: File? = null
-    var outputWritten = false
-    var outputExistedBefore = false
-    var previousOutputHash: String? = null
-    var candidateFile: File? = null
-    var backupFile: File? = null
     var committedFinalVerified = false
     try {
         val frames = job.optJSONArray("frames")
@@ -104,32 +99,27 @@ internal fun processSingleFrameJobSync(
         cancellation.throwIfCancelled()
 
         outputFile = File(jobDir, SINGLE_FRAME_OUTPUT_FILE_NAME)
-        val outputPath = outputFile.toPath()
-        outputExistedBefore = Files.exists(outputPath, LinkOption.NOFOLLOW_LINKS)
-        require(!Files.isSymbolicLink(outputPath)) {
-            "Single-frame output path must not be a symbolic link"
-        }
-        require(
-            !outputExistedBefore || Files.isRegularFile(outputPath, LinkOption.NOFOLLOW_LINKS)
-        ) {
-            "Single-frame output path is not a regular file"
-        }
-        if (outputExistedBefore) previousOutputHash = sha256NoFollow(outputPath)
-        candidateFile = writeBitmapPngCandidate(processedBitmap, outputFile)
-        if (outputExistedBefore) {
-            backupFile = File(jobDir, ".${outputFile.name}.${System.nanoTime()}.bak")
-            KeplerJobMetadata.atomicReplace(outputFile, backupFile)
-        }
-        KeplerJobMetadata.atomicReplace(requireNotNull(candidateFile), outputFile)
-        outputWritten = true
-        check(
-            !Files.isSymbolicLink(outputPath) &&
-                Files.isRegularFile(outputPath, LinkOption.NOFOLLOW_LINKS) &&
-                Files.size(outputPath) > 0L
-        ) {
-            "Single-frame output verification failed"
-        }
+        commitProcessingArtifact(
+            finalFile = outputFile,
+            processingAttemptId = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) processingAttempt.id else null,
+            claimKey = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) "finalFile" else null,
+            cancellation = cancellation,
+            writeTemp = { temp ->
+                FileOutputStream(temp).use { stream ->
+                    check(processedBitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)) {
+                        "Could not encode ${outputFile.name}"
+                    }
+                    stream.fd.sync()
+                }
+            },
+            verifyFinal = { candidate ->
+                verifyPngArtifact(candidate, processedBitmap.width, processedBitmap.height)
+            }
+        )
         committedFinalVerified = true
+        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+            markProcessingArtifactClaim(jobDir, processingAttempt, "finalFile", outputFile)
+        }
         cancellation.throwIfCancelled()
         val finishedAt = System.currentTimeMillis()
 
@@ -146,30 +136,12 @@ internal fun processSingleFrameJobSync(
             metadataPolicy = metadataPolicy,
             attempt = processingAttempt
         )
-        backupFile?.let { backup ->
-            if (Files.exists(backup.toPath(), LinkOption.NOFOLLOW_LINKS) &&
-                !Files.deleteIfExists(backup.toPath())
-            ) {
-                error("Could not settle previous single-frame output backup")
-            }
-            backupFile = null
-        }
         onStatus("일반 사진 후처리가 완료되었습니다.")
         return completedOutput
     } catch (ce: CancellationException) {
         if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            val settlement = if (committedFinalVerified) {
-                SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
-            } else {
-                cleanupCancelledSingleFrameOutput(
-                    outputFile = outputFile,
-                    outputWritten = outputWritten,
-                    outputExistedBefore = outputExistedBefore,
-                    candidateFile = candidateFile,
-                    backupFile = backupFile,
-                    previousOutputHash = previousOutputHash
-                )
-            }
+            val settlement = if (committedFinalVerified) SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
+            else SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
             persistSingleFrameCancellation(
                 jobDir = jobDir,
                 params = params,
@@ -182,7 +154,7 @@ internal fun processSingleFrameJobSync(
         throw ce
     } catch (oom: OutOfMemoryError) {
         val settlement = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            cleanupCancelledSingleFrameOutput(outputFile, outputWritten, outputExistedBefore, candidateFile, backupFile, previousOutputHash)
+            SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
         } else {
             SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
         }
@@ -198,7 +170,7 @@ internal fun processSingleFrameJobSync(
         throw oom
     } catch (e: Exception) {
         val settlement = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            cleanupCancelledSingleFrameOutput(outputFile, outputWritten, outputExistedBefore, candidateFile, backupFile, previousOutputHash)
+            SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
         } else {
             SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
         }
@@ -220,7 +192,6 @@ internal fun processSingleFrameJobSync(
         processingAttempt.releaseOwnedLease()
     }
 }
-
 private fun resolveSingleFrameSourceFile(jobDir: File, rawName: String): File {
     require(rawName == rawName.trim()) { "Single-frame source name has surrounding whitespace" }
     require(rawName.isNotEmpty() && rawName != "." && rawName != "..") {
@@ -252,66 +223,6 @@ private fun resolveSingleFrameSourceFile(jobDir: File, rawName: String): File {
     require(Files.size(sourcePath) > 0L) { "Single-frame source is empty: $rawName" }
     return source
 }
-
-private fun cleanupCancelledSingleFrameOutput(
-    outputFile: File?,
-    outputWritten: Boolean,
-    outputExistedBefore: Boolean,
-    candidateFile: File?,
-    backupFile: File?,
-    previousOutputHash: String?
-): SingleFrameCleanupResult {
-    return try {
-        if (candidateFile != null && Files.exists(candidateFile.toPath(), LinkOption.NOFOLLOW_LINKS)) {
-            require(!Files.isSymbolicLink(candidateFile.toPath()))
-            require(Files.deleteIfExists(candidateFile.toPath()))
-        }
-        val output = outputFile ?: return SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
-        if (backupFile != null && Files.exists(backupFile.toPath(), LinkOption.NOFOLLOW_LINKS)) {
-            require(!Files.isSymbolicLink(backupFile.toPath()))
-            if (Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)) {
-                require(!Files.isSymbolicLink(output.toPath()))
-                Files.deleteIfExists(output.toPath())
-            }
-            KeplerJobMetadata.atomicReplace(backupFile, output)
-            require(isValidSingleFrameOutput(output))
-            if (previousOutputHash != null) require(sha256NoFollow(output.toPath()) == previousOutputHash)
-            SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED
-        } else if (outputExistedBefore && isValidSingleFrameOutput(output) &&
-            (previousOutputHash == null || sha256NoFollow(output.toPath()) == previousOutputHash)
-        ) {
-            SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED
-        } else if (outputExistedBefore) {
-            if (Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)) {
-                require(!Files.isSymbolicLink(output.toPath()))
-                Files.deleteIfExists(output.toPath())
-            }
-            if (Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)) {
-                SingleFrameCleanupResult.UNCOMMITTED_OUTPUT_REMAINS
-            } else {
-                SingleFrameCleanupResult.NEW_OUTPUT_REMOVED
-            }
-        } else if (outputWritten && !outputExistedBefore) {
-            if (Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)) {
-                require(!Files.isSymbolicLink(output.toPath()))
-                Files.deleteIfExists(output.toPath())
-            }
-            if (Files.exists(output.toPath(), LinkOption.NOFOLLOW_LINKS)) {
-                SingleFrameCleanupResult.UNCOMMITTED_OUTPUT_REMAINS
-            } else {
-                SingleFrameCleanupResult.NEW_OUTPUT_REMOVED
-            }
-        } else {
-            SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
-        }
-    } catch (_: Exception) {
-        SingleFrameCleanupResult.CLEANUP_FAILED
-    }
-}
-
-private fun isValidSingleFrameOutput(file: File): Boolean = runCatching {
-    NoFollowFileSystem.digestVerified(file).size > 0L
-}.getOrDefault(false)
 
 private fun persistSingleFrameCancellation(
     jobDir: File,
@@ -481,23 +392,3 @@ private fun persistSingleFrameFailure(
         }
     }
 }
-
-private fun writeBitmapPngCandidate(bitmap: Bitmap, outputFile: File): File {
-    val temp = File(outputFile.parentFile, ".${outputFile.name}.${System.nanoTime()}.candidate")
-    var writeSucceeded = false
-    try {
-        FileOutputStream(temp).use { stream ->
-            check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)) {
-                "Could not encode ${outputFile.name}"
-            }
-            stream.fd.sync()
-        }
-        writeSucceeded = true
-        return temp
-    } finally {
-        if (!writeSucceeded && temp.exists()) runCatching { temp.delete() }
-    }
-}
-
-private fun sha256NoFollow(path: java.nio.file.Path): String = NoFollowFileSystem.digestVerified(path.toFile()).sha256
-

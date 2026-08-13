@@ -244,6 +244,9 @@ object KeplerJobMetadata {
             ) return@update
             matched = true
             job.put("recoveryState", "STABLE")
+                .put("lastRecoveryClassification", "RECOVERED")
+                .put("lastRecoveryMessage", "Terminal metadata and export evidence were finalized after restart.")
+                .put("recoveredAt", System.currentTimeMillis())
             job.remove("recoveryMessage")
             job.remove(ACTIVE_RUNTIME_SESSION_ID)
             job.remove(ACTIVE_OPERATION_ID)
@@ -267,8 +270,16 @@ object KeplerJobMetadata {
                 job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id
             ) return@update
             matched = true
-            job.put("recoveryState", classification.name)
-                .put("recoveryMessage", recoveryMessage)
+            val blocksCurrentActions = classification in setOf(
+                KeplerJobRecoveryClassification.PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION,
+                KeplerJobRecoveryClassification.PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL,
+                KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED
+            )
+            job.put("recoveryState", if (blocksCurrentActions) classification.name else "STABLE")
+                .put("lastRecoveryClassification", classification.name)
+                .put("lastRecoveryMessage", recoveryMessage)
+                .put("recoveredAt", System.currentTimeMillis())
+            if (blocksCurrentActions) job.put("recoveryMessage", recoveryMessage) else job.remove("recoveryMessage")
             job.remove(ACTIVE_RUNTIME_SESSION_ID)
             job.remove(ACTIVE_OPERATION_ID)
             job.remove(ACTIVE_OPERATION_KIND)
@@ -285,9 +296,12 @@ object KeplerJobMetadata {
                 job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id
             ) return@update
             matched = true
-            job.put("recoveryState", KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name)
-                .put("recoveryMessage", "Processing handoff was safely finalized after the previous process ended.")
+            job.put("recoveryState", "STABLE")
+                .put("lastRecoveryClassification", KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name)
+                .put("lastRecoveryMessage", "Processing handoff was safely finalized after the previous process ended.")
+                .put("recoveredAt", System.currentTimeMillis())
                 .put(PROCESSING_HANDOFF_FINALIZED, true)
+            job.remove("recoveryMessage")
             job.remove(PROCESSING_HANDOFF_RUNTIME_SESSION_ID)
             job.remove(PROCESSING_HANDOFF_OPERATION_ID)
             job.remove(PROCESSING_HANDOFF_KIND)

@@ -599,6 +599,9 @@ private fun GalleryFixedJobCard(
             Text(modeLabelFixed(job), style = MaterialTheme.typography.titleMedium)
             Text("${formatTimestamp(job.createdAt)} | ${routeLabelFixed(job)}", color = galleryFixedMuted)
             Text(if (job.status.contains("COMPLETE")) resolutionTextFixed(job) else job.status)
+            if (job.recoveryState == "STABLE" && !job.lastRecoveryMessage.isNullOrBlank()) {
+                Text(job.lastRecoveryMessage, color = galleryFixedMuted)
+            }
             if (job.recoveryState != "STABLE") {
                 Text(job.recoveryMessage ?: "이 작업은 재시작 복구 확인이 필요합니다.", color = Color(0xFFFFC107))
             }

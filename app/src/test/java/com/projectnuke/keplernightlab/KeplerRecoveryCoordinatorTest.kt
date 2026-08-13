@@ -133,6 +133,8 @@ class KeplerRecoveryCoordinatorTest {
             assertEquals(KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT, report.jobs.single().classification)
             val recovered = KeplerJobMetadata.read(job)
             assertEquals(false, recovered.optBoolean("processingOutputCommitted", false))
+            assertEquals("STABLE", recovered.getString("recoveryState"))
+            assertEquals("INTERRUPTED_PRE_COMMIT", recovered.getString("lastRecoveryClassification"))
             assertEquals("", recovered.optString(PROCESSING_HANDOFF_OPERATION_ID))
             assertEquals("", recovered.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID))
             val second = KeplerRecoveryCoordinator.recoverRoots(listOf(root))

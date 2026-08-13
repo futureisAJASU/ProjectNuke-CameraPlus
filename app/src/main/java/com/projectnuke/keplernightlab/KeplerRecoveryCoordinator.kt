@@ -344,13 +344,21 @@ internal object KeplerRecoveryCoordinator {
                         failures = listOfNotNull(artifactFailure.message)
                     )
                 }
+                val classification = if (job.optBoolean("processingOutputCommitted", false)) {
+                    KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL
+                } else {
+                    KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT
+                }
+                KeplerJobMetadata.update(jobDir) {
+                    it.put("recoveryState", "STABLE")
+                        .put("lastRecoveryClassification", classification.name)
+                        .put("lastRecoveryMessage", "Durable local processing evidence was reconciled after the previous process ended.")
+                        .put("recoveredAt", System.currentTimeMillis())
+                        .remove("recoveryMessage")
+                }
                 return KeplerJobRecoveryResult(
                     jobDir,
-                    if (job.optBoolean("processingOutputCommitted", false)) {
-                        KeplerJobRecoveryClassification.RECOVERED
-                    } else {
-                        KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT
-                    },
+                    classification,
                     actions = artifactResults.map { it.classification.name },
                     cleanupFailures = artifactResults.mapNotNull { it.message }
                 )
@@ -386,14 +394,12 @@ internal object KeplerRecoveryCoordinator {
                     localCommitted -> KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL
                     else -> KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT
                 }
-                if (artifactCleanupDebt.isEmpty()) {
-                    check(KeplerJobMetadata.finalizeRecoveredInterruptedOperation(
-                        jobDir,
-                        activeOperation,
-                        classification,
-                        "Durable evidence reconciled after the previous process ended."
-                    )) { "Could not durably finalize interrupted operation $activeOperation" }
-                }
+                check(KeplerJobMetadata.finalizeRecoveredInterruptedOperation(
+                    jobDir,
+                    activeOperation,
+                    classification,
+                    "Durable evidence reconciled after the previous process ended."
+                )) { "Could not durably finalize interrupted operation $activeOperation" }
                 return KeplerJobRecoveryResult(
                     jobDir,
                     classification,
@@ -419,6 +425,22 @@ internal object KeplerRecoveryCoordinator {
                     it.put("recoveryState", "STABLE").remove("recoveryMessage")
                 }
             }
+            if (activeOperation.isBlank() &&
+                job.optBoolean("processingOutputCommitted", false) &&
+                job.optString("currentPipelineStage") !in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")) {
+                KeplerJobMetadata.update(jobDir) {
+                    it.put("recoveryState", "STABLE")
+                        .put("lastRecoveryClassification", KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL.name)
+                        .put("lastRecoveryMessage", "A verified local processing result was retained after the previous process ended before terminal metadata.")
+                        .put("recoveredAt", System.currentTimeMillis())
+                        .remove("recoveryMessage")
+                }
+                return KeplerJobRecoveryResult(
+                    jobDir,
+                    KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL,
+                    cleanupFailures = cleanupFailures
+                )
+            }
             if (isLegacyActiveJob(job)) {
                 val updatedAt = job.optLong("updatedAt", job.optLong("createdAt", 0L))
                 val stale = updatedAt > 0L && System.currentTimeMillis() - updatedAt >= LEGACY_RECOVERY_AGE_MILLIS
@@ -427,9 +449,14 @@ internal object KeplerRecoveryCoordinator {
                         it.put("status", "INTERRUPTED")
                             .put("processStatus", "INTERRUPTED")
                             .put("currentPipelineStage", "INTERRUPTED")
-                            .put("recoveryState", KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name)
+                            .put("recoveryState", "STABLE")
+                            .put("lastRecoveryClassification", KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name)
+                            .put("recoveredAt", System.currentTimeMillis())
+                            .put("lastRecoveryMessage", "Legacy interruption was recorded after the previous process ended.")
+                            .also { it.remove("recoveryMessage") }
                             .put("recoveryMessage", "이전 프로세스의 작업 소유권을 확인할 수 없어 안전하게 중단된 작업으로 표시했습니다.")
                     }
+                    KeplerJobMetadata.update(jobDir) { current -> current.remove("recoveryMessage") }
                     return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT)
                 }
                 return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.LEGACY_REQUIRES_RECONCILIATION)

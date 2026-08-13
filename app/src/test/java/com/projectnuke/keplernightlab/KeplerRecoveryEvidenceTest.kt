@@ -25,7 +25,8 @@ class KeplerRecoveryEvidenceTest {
             )
             val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root))
             assertEquals(KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL, report.jobs.single().classification)
-            assertEquals("LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL", KeplerJobMetadata.read(job).getString("recoveryState"))
+            assertEquals("STABLE", KeplerJobMetadata.read(job).getString("recoveryState"))
+            assertEquals("LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL", KeplerJobMetadata.read(job).getString("lastRecoveryClassification"))
         } finally {
             root.deleteRecursively()
         }

@@ -201,6 +201,9 @@ internal fun recoverProcessingArtifactJournals(
     val final = NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true)
     val temp = NoFollowFileSystem.resolveDirectChild(jobDir, journal.tempName, requireFile = true)
     val prior = NoFollowFileSystem.resolveDirectChild(jobDir, journal.priorName, requireFile = true)
+    val parsedJournals = ProcessingArtifactJournal.list(jobDir).mapNotNull { candidate ->
+        runCatching { ProcessingArtifactJournal.read(candidate) }.getOrNull()
+    }
     fun valid(file: File?, prior: Boolean = false): Boolean = file != null && runCatching {
         verifyProcessingArtifactRecovery(journal, file, prior)
     }.isSuccess
@@ -282,8 +285,22 @@ internal fun recoverProcessingArtifactJournals(
                                 KeplerActiveOperationKind.PROCESSING_YUV.name,
                                 KeplerActiveOperationKind.PROCESSING_RAW.name,
                                 KeplerActiveOperationKind.SUPER_RESOLUTION.name
-                            )
-                        if (!operationMatches || job?.optString("processingAttemptId") != journal.processingAttemptId) {
+                        )
+                        val orphanClaimMatches = job != null &&
+                            job.optString(ACTIVE_OPERATION_ID).isBlank() &&
+                            journal.runtimeSessionId != KeplerRuntimeSession.id &&
+                            job.optString("processingAttemptId") == journal.processingAttemptId &&
+                            job.optString("processingArtifactClaimAttemptId").let {
+                                it.isBlank() || it == journal.processingAttemptId
+                            } &&
+                            parsedJournals.none { competing ->
+                                competing !== journal &&
+                                    competing.claimKey != null &&
+                                    competing.processingAttemptId != journal.processingAttemptId &&
+                                    competing.updatedAt > journal.updatedAt
+                            }
+                        if ((!operationMatches && !orphanClaimMatches) ||
+                            job?.optString("processingAttemptId") != journal.processingAttemptId) {
                             return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "adopted artifact claim identity is not current")
                         }
                         job.put(journal.claimKey, journal.finalName)

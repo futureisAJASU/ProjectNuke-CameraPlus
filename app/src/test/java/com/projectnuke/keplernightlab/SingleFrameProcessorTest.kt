@@ -81,8 +81,13 @@ class SingleFrameProcessorTest {
             assertEquals(CaptureMode.SINGLE_FRAME.name, job.getString("captureMode"))
             assertEquals("PIPELINE_COMPLETE", job.getString("processStatus"))
             assertEquals(SINGLE_FRAME_OUTPUT_FILE_NAME, job.getString("finalFile"))
+            assertTrue(job.getBoolean("processingOutputCommitted"))
+            assertEquals(job.getString("processingAttemptId"), job.getString("processingArtifactClaimAttemptId"))
             assertEquals(params.presetName, job.getString("fusionPresetName"))
             assertEquals(1, job.getInt("usedFrameCount"))
+            assertTrue(Files.list(jobDir.toPath()).use { stream ->
+                stream.noneMatch { it.fileName.toString().endsWith(".candidate") || it.fileName.toString().endsWith(".bak") }
+            })
         } finally {
             jobDir.deleteRecursively()
         }
@@ -130,6 +135,8 @@ class SingleFrameProcessorTest {
             assertEquals("TERMINAL_SENTINEL", job.getString("processStatus"))
             assertEquals("existing_terminal.png", job.getString("finalFile"))
             assertEquals(ClassicYuvFusionPreset.SHARP.name, job.getString("fusionPresetName"))
+            assertFalse(job.optBoolean("processingOutputCommitted", false))
+            assertTrue(ProcessingArtifactJournal.list(jobDir).isEmpty())
         } finally {
             jobDir.deleteRecursively()
         }
