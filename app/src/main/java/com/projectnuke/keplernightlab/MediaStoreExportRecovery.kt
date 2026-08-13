@@ -7,6 +7,7 @@ import android.provider.MediaStore
 import java.io.File
 
 internal enum class MediaStoreExportRecoveryClassification {
+    CLEANED,
     PENDING_DELETED,
     PENDING_VERIFIED_AND_COMMITTED,
     PUBLIC_VERIFIED,
@@ -140,6 +141,62 @@ private fun recoverMediaStoreExportJournal(
     journal: MediaStoreExportJournal,
     access: MediaStoreExportRecoveryAccess
 ): MediaStoreExportRecoveryResult {
+    if (journal.state == MediaStoreExportState.CLEANED) {
+        return MediaStoreExportRecoveryResult(
+            journal.exportAttemptId,
+            MediaStoreExportRecoveryClassification.CLEANED,
+            "Abandoned MediaStore cleanup was already settled."
+        )
+    }
+    if (journal.state == MediaStoreExportState.INSERT_FAILED_NO_ROW) {
+        journal.transition(jobDir, MediaStoreExportState.CLEANED)
+        return MediaStoreExportRecoveryResult(
+            journal.exportAttemptId,
+            MediaStoreExportRecoveryClassification.CLEANED,
+            "MediaStore insert was known to return no row."
+        )
+    }
+    if (journal.state == MediaStoreExportState.CLEANUP_REQUIRED) {
+        val abandonedUri = journal.uri?.let { runCatching { Uri.parse(it) }.getOrNull() }
+            ?: run {
+                journal.transition(jobDir, MediaStoreExportState.CLEANED)
+                return MediaStoreExportRecoveryResult(
+                    journal.exportAttemptId,
+                    MediaStoreExportRecoveryClassification.CLEANED,
+                    "Abandoned MediaStore attempt had no owned URI."
+                )
+            }
+        val inspection = access.inspect(abandonedUri, journal)
+        if (inspection.inspectionFailed) {
+            return MediaStoreExportRecoveryResult(
+                journal.exportAttemptId,
+                MediaStoreExportRecoveryClassification.DELETE_FAILED,
+                inspection.message ?: "Abandoned MediaStore row could not be inspected."
+            )
+        }
+        if (!inspection.exists) {
+            journal.transition(jobDir, MediaStoreExportState.CLEANED)
+            return MediaStoreExportRecoveryResult(
+                journal.exportAttemptId,
+                MediaStoreExportRecoveryClassification.CLEANED,
+                "Abandoned MediaStore row was already absent."
+            )
+        }
+        val deleted = runCatching { access.delete(abandonedUri) }.getOrDefault(false)
+        if (!deleted) {
+            return MediaStoreExportRecoveryResult(
+                journal.exportAttemptId,
+                MediaStoreExportRecoveryClassification.DELETE_FAILED,
+                "Abandoned MediaStore row could not be deleted."
+            )
+        }
+        journal.transition(jobDir, MediaStoreExportState.CLEANED)
+        return MediaStoreExportRecoveryResult(
+            journal.exportAttemptId,
+            MediaStoreExportRecoveryClassification.CLEANED,
+            "Abandoned MediaStore row was deleted."
+        )
+    }
     val uriString = journal.uri
     if (uriString.isNullOrBlank()) {
         return MediaStoreExportRecoveryResult(

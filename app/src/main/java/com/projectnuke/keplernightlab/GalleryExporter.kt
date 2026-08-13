@@ -300,8 +300,7 @@ fun exportRawSidecarsToPublicStorage(
                 )
             }
             if (verificationError != null) {
-                result.journal?.transition(jobDir, MediaStoreExportState.CLEANUP_REQUIRED)
-                runCatching { context.contentResolver.delete(result.uri, null, null) }
+                result.journal?.let { abandonMediaStoreAttempt(context, jobDir, it, result.uri) }
                 val failure = "${file.name}: $verificationError"
                 publicFailures += failure
                 publicFailureByFrame[frame.frameIndex] = failure
@@ -345,7 +344,7 @@ internal fun findReusableRawSidecarJournal(
             journal.expectedSizeBytes == expectedSizeBytes &&
             journal.expectedSha256 == expectedSha256 &&
             journal.uri != null &&
-            journal.state != MediaStoreExportState.CLEANUP_REQUIRED
+            journal.state == MediaStoreExportState.VERIFIED
     }
     .firstOrNull(verifier)
 
@@ -937,9 +936,8 @@ private fun writeGalleryBitmap(
 
     if (verification !is GalleryExportVerification.Verified) {
         jobDir?.let { owner ->
-            inserted.journal?.transition(owner, MediaStoreExportState.CLEANUP_REQUIRED)
+            inserted.journal?.let { abandonMediaStoreAttempt(context, owner, it, committedUri) }
         }
-        runCatching { context.contentResolver.delete(committedUri, null, null) }
         return GalleryExportResult(
             success = false,
             uriString = committedUri.toString(),
@@ -971,6 +969,17 @@ private fun writeGalleryBitmap(
         attemptedFormats = listOf(format),
         verification = verification
     )
+}
+
+private fun abandonMediaStoreAttempt(
+    context: Context,
+    jobDir: File,
+    journal: MediaStoreExportJournal,
+    uri: Uri
+): MediaStoreExportJournal {
+    val abandoned = journal.transition(jobDir, MediaStoreExportState.CLEANUP_REQUIRED, uri.toString())
+    val deleted = runCatching { context.contentResolver.delete(uri, null, null) == 1 }.getOrDefault(false)
+    return if (deleted) abandoned.transition(jobDir, MediaStoreExportState.CLEANED) else abandoned
 }
 
 private data class InsertedPublicFile(
@@ -1006,6 +1015,7 @@ private fun insertPublicFile(
     }
     var uri: Uri? = null
     var journal: MediaStoreExportJournal? = null
+    var insertReturned = false
     return try {
         cancellation.throwIfCancelled()
         journal = jobDir?.let {
@@ -1024,7 +1034,13 @@ private fun insertPublicFile(
                 ,ownerOperationId = ownerOperationId
             )
         }
-        uri = resolver.insert(collectionUri, values) ?: return null
+        val insertedUri = resolver.insert(collectionUri, values)
+        insertReturned = true
+        if (insertedUri == null) {
+            journal = journal?.transition(jobDir!!, MediaStoreExportState.INSERT_FAILED_NO_ROW)
+            return null
+        }
+        uri = insertedUri
         journal = journal?.transition(jobDir!!, MediaStoreExportState.ROW_INSERTED, uri.toString())
         cancellation.throwIfCancelled()
         resolver.openOutputStream(uri)?.use(writer) ?: error("openOutputStream returned null")
@@ -1037,19 +1053,20 @@ private fun insertPublicFile(
             null
         )
         if (updateCount != 1) {
-            journal = journal?.transition(jobDir!!, MediaStoreExportState.CLEANUP_REQUIRED)
-            runCatching { resolver.delete(uri, null, null) }
+            journal?.let { journal = abandonMediaStoreAttempt(context, jobDir!!, it, uri!!) }
             return null
         }
         journal = journal?.transition(jobDir!!, MediaStoreExportState.PUBLIC_COMMITTED)
         InsertedPublicFile(uri, runCatching { queryMediaSize(context, uri) }.getOrDefault(0L), journal)
     } catch (ce: CancellationException) {
-        journal?.let { runCatching { it.transition(jobDir!!, MediaStoreExportState.CLEANUP_REQUIRED) } }
-        uri?.let { runCatching { resolver.delete(it, null, null) } }
+        if (insertReturned && uri != null && journal != null) {
+            runCatching { journal = abandonMediaStoreAttempt(context, jobDir!!, journal!!, uri!!) }
+        }
         throw ce
     } catch (error: Throwable) {
-        journal?.let { runCatching { it.transition(jobDir!!, MediaStoreExportState.CLEANUP_REQUIRED) } }
-        uri?.let { runCatching { resolver.delete(it, null, null) } }
+        if (insertReturned && uri != null && journal != null) {
+            runCatching { journal = abandonMediaStoreAttempt(context, jobDir!!, journal!!, uri!!) }
+        }
         if (error is Error) throw error
         null
     }

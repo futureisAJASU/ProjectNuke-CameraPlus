@@ -12,13 +12,15 @@ internal enum class MediaStoreExportRole {
 
 internal enum class MediaStoreExportState {
     PREPARED,
+    INSERT_FAILED_NO_ROW,
     ROW_INSERTED,
     CONTENT_WRITTEN,
     PUBLIC_COMMITTED,
     VERIFIED,
     /** Legacy on-disk value; new code never transitions to this state. */
     TERMINAL_PERSISTED,
-    CLEANUP_REQUIRED
+    CLEANUP_REQUIRED,
+    CLEANED
 }
 
 /** Direct-child, filename-only evidence for one MediaStore insert attempt. */
