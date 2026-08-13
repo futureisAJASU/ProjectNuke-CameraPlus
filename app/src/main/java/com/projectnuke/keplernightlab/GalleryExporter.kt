@@ -656,7 +656,7 @@ fun updateExportFailure(
 internal fun markMediaStoreExportJournalsTerminalPersisted(jobDir: File) {
     val metadata = runCatching { KeplerJobMetadata.read(jobDir) }.getOrNull()
     val ownerOperationId = metadata?.optString(TERMINAL_OPERATION_ID)?.takeIf { it.isNotBlank() }
-        ?: metadata?.optString(ACTIVE_OPERATION_ID)?.takeIf { it.isNotBlank() }
+        ?: return
     MediaStoreExportJournal.list(jobDir).forEach { journal ->
         if (journal.ownerOperationId == ownerOperationId && !journal.terminalMetadataPersisted) {
             journal.markTerminalPersisted(jobDir, ownerOperationId)
@@ -699,7 +699,6 @@ internal fun updateRawPublicExportOutcome(
     outcome: RawFusionPublicExportOutcome
 ) {
     KeplerJobMetadata.update(jobDir) { job ->
-        job.optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }?.let { job.put(TERMINAL_OPERATION_ID, it) }
         val requested = requestedOutputFormatForSetting(outcome.finalOutputFormat)
         job.put("finalOutputFormatSetting", outcome.finalOutputFormat.name)
             .put("exportStatus", when (outcome) {
@@ -867,6 +866,9 @@ internal fun updateRawPublicExportOutcome(
                     .put("userCanMoveDevice", true)
                     .put("exportError", outcome.currentError)
             }
+        }
+        if (job.optString("currentPipelineStage") in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")) {
+            job.optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }?.let { job.put(TERMINAL_OPERATION_ID, it) }
         }
         val exportUri = outcome.export?.uriString
         if (exportUri != null) {

@@ -140,6 +140,7 @@ object KeplerJobMetadata {
                 .put(ACTIVE_OPERATION_KIND, kind.name)
                 .put(ACTIVE_OPERATION_STARTED_AT, startedAt)
                 .put(ACTIVE_OPERATION_UPDATED_AT, startedAt)
+            job.remove(TERMINAL_OPERATION_ID)
         }
         return operationId
     }
