@@ -130,20 +130,24 @@ internal fun markProcessingArtifactClaim(
     artifactKey: String,
     artifactFile: File
 ) {
-    val matchingJournals = ProcessingArtifactJournal.list(jobDir).asSequence()
+    val authoritativeJournals = ProcessingArtifactJournal.list(jobDir).asSequence()
         .mapNotNull { file -> runCatching { ProcessingArtifactJournal.read(file) }.getOrNull() }
         .filter {
-            it.processingAttemptId == attempt.id &&
-                it.adoptedResult == "NEW_FINAL" &&
-                it.claimKey == artifactKey
+            isUnresolvedAuthoritativeProcessingJournal(it) &&
+                it.processingAttemptId == attempt.id && it.claimKey == artifactKey
         }
         .toList()
-    check(matchingJournals.size == 1) {
+    check(authoritativeJournals.size == 1) {
         throw ProcessingArtifactClaimConflictException(
-            "Expected exactly one authoritative processing artifact journal for claim=$artifactKey, found=${matchingJournals.size}"
+            "Expected exactly one unresolved processing artifact journal for claim=$artifactKey, found=${authoritativeJournals.size}"
         )
     }
-    val journal = matchingJournals.single()
+    val journal = authoritativeJournals.single()
+    check(journal.adoptedResult == "NEW_FINAL" && journal.state == ProcessingArtifactJournalState.ADOPTED) {
+        throw ProcessingArtifactClaimConflictException(
+            "Processing artifact claim is not ready for acknowledgement: ${journal.state}"
+        )
+    }
     check(journal.finalName == artifactFile.name) {
         throw ProcessingArtifactClaimConflictException(
             "Processing artifact claim final mismatch for claim=$artifactKey: expected=${journal.finalName}, actual=${artifactFile.name}"
