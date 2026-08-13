@@ -316,7 +316,8 @@ internal object KeplerRecoveryCoordinator {
                         jobDir,
                         KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED,
                         actions = metadataTemps.actions + captureTemps.deleted.map { "DELETED_$it" },
-                        failures = metadataTemps.failures + captureTemps.failures + listOfNotNull(artifactFailure.message)
+                        failures = metadataTemps.failures + captureTemps.failures + listOfNotNull(artifactFailure.message),
+                        cleanupFailures = cleanupFailures
                     )
                 }
                 val localCommitted = job.optBoolean("processingOutputCommitted", false)
@@ -336,7 +337,8 @@ internal object KeplerRecoveryCoordinator {
                     jobDir,
                     classification,
                     actions = artifactResults.map { it.classification.name } + metadataTemps.actions + captureTemps.deleted.map { "DELETED_$it" },
-                    failures = metadataTemps.failures + captureTemps.failures
+                    failures = metadataTemps.failures + captureTemps.failures,
+                    cleanupFailures = cleanupFailures
                 )
             }
             if (invalidExportJournals.isNotEmpty()) {
@@ -370,7 +372,8 @@ internal object KeplerRecoveryCoordinator {
                 jobDir,
                 if (metadataTemps.classification == KeplerMetadataTempClassification.AMBIGUOUS) KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED else KeplerJobRecoveryClassification.RECOVERED,
                 actions = metadataTemps.actions,
-                failures = metadataTemps.failures
+                failures = metadataTemps.failures,
+                cleanupFailures = cleanupFailures
             )
         } finally {
             lease.release()
