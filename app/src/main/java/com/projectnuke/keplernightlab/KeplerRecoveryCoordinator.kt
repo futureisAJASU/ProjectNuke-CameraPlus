@@ -394,12 +394,14 @@ internal object KeplerRecoveryCoordinator {
                     localCommitted -> KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL
                     else -> KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT
                 }
-                check(KeplerJobMetadata.finalizeRecoveredInterruptedOperation(
-                    jobDir,
-                    activeOperation,
-                    classification,
-                    "Durable evidence reconciled after the previous process ended."
-                )) { "Could not durably finalize interrupted operation $activeOperation" }
+                if (artifactCleanupDebt.isEmpty()) {
+                    check(KeplerJobMetadata.finalizeRecoveredInterruptedOperation(
+                        jobDir,
+                        activeOperation,
+                        classification,
+                        "Durable evidence reconciled after the previous process ended."
+                    )) { "Could not durably finalize interrupted operation $activeOperation" }
+                }
                 return KeplerJobRecoveryResult(
                     jobDir,
                     classification,
@@ -453,10 +455,9 @@ internal object KeplerRecoveryCoordinator {
                             .put("lastRecoveryClassification", KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name)
                             .put("recoveredAt", System.currentTimeMillis())
                             .put("lastRecoveryMessage", "Legacy interruption was recorded after the previous process ended.")
-                            .also { it.remove("recoveryMessage") }
+                            .remove("recoveryMessage")
                             .put("recoveryMessage", "이전 프로세스의 작업 소유권을 확인할 수 없어 안전하게 중단된 작업으로 표시했습니다.")
                     }
-                    KeplerJobMetadata.update(jobDir) { current -> current.remove("recoveryMessage") }
                     return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT)
                 }
                 return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.LEGACY_REQUIRES_RECONCILIATION)
