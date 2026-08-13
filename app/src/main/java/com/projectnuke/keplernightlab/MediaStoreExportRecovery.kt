@@ -239,7 +239,7 @@ private fun recoverMediaStoreExportJournal(
                     "Unverifiable pending MediaStore row could not be deleted."
                 )
             }
-            journal.transition(jobDir, MediaStoreExportState.CLEANUP_REQUIRED)
+            journal.transition(jobDir, MediaStoreExportState.CLEANED)
             return MediaStoreExportRecoveryResult(
                 journal.exportAttemptId,
                 MediaStoreExportRecoveryClassification.PENDING_DELETED,

@@ -209,15 +209,11 @@ internal fun commitProcessingArtifact(
         checkCancelled()
 
         if (existingRegularArtifact(finalFile)) {
-            journalTransition(ProcessingArtifactJournalState.PRIOR_BACKED_UP)
             val priorEvidence = NoFollowFileSystem.digestVerified(finalFile)
             val priorSemanticEvidence = runCatching {
                 verifyFinal(finalFile)
                 true
             }.getOrDefault(false)
-            move(finalFile, priorBackup)
-            priorBackedUp = true
-            state = ProcessingArtifactState.PRIOR_FINAL_BACKED_UP
             journal = journal.transition(
                 parent,
                 ProcessingArtifactJournalState.PRIOR_BACKED_UP,
@@ -225,6 +221,9 @@ internal fun commitProcessingArtifact(
                 priorExpectedSha256Override = priorEvidence.sha256,
                 priorSemanticVerifiedOverride = priorSemanticEvidence
             )
+            move(finalFile, priorBackup)
+            priorBackedUp = true
+            state = ProcessingArtifactState.PRIOR_FINAL_BACKED_UP
         }
 
         checkCancelled()

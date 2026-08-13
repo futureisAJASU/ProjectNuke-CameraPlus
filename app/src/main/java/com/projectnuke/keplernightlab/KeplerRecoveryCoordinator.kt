@@ -177,18 +177,6 @@ internal object KeplerRecoveryCoordinator {
             if (handoffRuntime == KeplerRuntimeSession.id) {
                 return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.SKIP_ACTIVE_CURRENT_PROCESS)
             }
-            val invalidExportJournals = MediaStoreExportJournal.invalidFiles(jobDir)
-            if (invalidExportJournals.isNotEmpty()) {
-                KeplerJobMetadata.update(jobDir) {
-                    it.put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
-                        .put("recoveryMessage", "MediaStore export evidence is malformed and was preserved.")
-                }
-                return KeplerJobRecoveryResult(
-                    jobDir,
-                    KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED,
-                    failures = invalidExportJournals.map { "Invalid export journal: ${it.name}" }
-                )
-            }
             val processingRecoveryOwnsAuthority = activeOperation.isNotBlank() && activeOperationKind in setOf(
                 KeplerActiveOperationKind.PROCESSING_YUV.name,
                 KeplerActiveOperationKind.PROCESSING_RAW.name,
@@ -318,6 +306,18 @@ internal object KeplerRecoveryCoordinator {
                     classification,
                     actions = artifactResults.map { it.classification.name } + metadataTemps.actions + captureTemps.deleted.map { "DELETED_$it" },
                     failures = metadataTemps.failures + captureTemps.failures
+                )
+            }
+            val invalidExportJournals = MediaStoreExportJournal.invalidFiles(jobDir)
+            if (invalidExportJournals.isNotEmpty()) {
+                KeplerJobMetadata.update(jobDir) {
+                    it.put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
+                        .put("recoveryMessage", "MediaStore export evidence is malformed and was preserved.")
+                }
+                return KeplerJobRecoveryResult(
+                    jobDir,
+                    KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED,
+                    failures = invalidExportJournals.map { "Invalid export journal: ${it.name}" }
                 )
             }
             if (isLegacyActiveJob(job)) {

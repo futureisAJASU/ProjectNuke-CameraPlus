@@ -76,7 +76,7 @@ class MediaStoreExportRecoveryTest {
             val result = recoverMediaStoreExportJournals(dir, access).single()
             assertEquals(MediaStoreExportRecoveryClassification.PENDING_DELETED, result.classification)
             assertTrue(access.deleted)
-            assertEquals(MediaStoreExportState.CLEANUP_REQUIRED, MediaStoreExportJournal.list(dir).single().state)
+            assertEquals(MediaStoreExportState.CLEANED, MediaStoreExportJournal.list(dir).single().state)
         } finally {
             dir.deleteRecursively()
         }
