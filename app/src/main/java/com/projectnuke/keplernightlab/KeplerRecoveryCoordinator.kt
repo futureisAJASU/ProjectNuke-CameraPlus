@@ -255,6 +255,24 @@ internal object KeplerRecoveryCoordinator {
                         .put("recoveryMessage", "공개 내보내기 증거를 확인할 수 없어 복구가 필요합니다.")
                 }
             }
+            val missingMainCommit = exportResults.firstOrNull { result ->
+                result.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING &&
+                    exportJournalsById[result.attemptId]?.role == MediaStoreExportRole.MAIN_IMAGE &&
+                    (activeOperation.isBlank() || exportJournalsById[result.attemptId]?.ownerOperationId == activeOperation)
+            }
+            if (missingMainCommit != null) {
+                KeplerJobMetadata.update(jobDir) {
+                    it.put("recoveryState", "PUBLIC_COMMIT_MISSING")
+                        .put("recoveryMessage", missingMainCommit.message ?: "The committed public result is missing and was preserved as recovery evidence.")
+                }
+                return KeplerJobRecoveryResult(
+                    jobDir,
+                    KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED,
+                    actions = exportResults.map { it.classification.name },
+                    failures = listOfNotNull(missingMainCommit.message),
+                    cleanupFailures = cleanupFailures
+                )
+            }
             if (activeOperation.isNotBlank() && exportResults.isNotEmpty()) {
                 job = KeplerJobMetadata.update(jobDir) { current ->
                     reconstructMainExportEvidence(jobDir, current, activeOperation, exportResults)
@@ -285,7 +303,9 @@ internal object KeplerRecoveryCoordinator {
             if (terminalOperationId == activeOperation && activeOperation.isNotBlank() &&
                 job.optString("currentPipelineStage") in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")) {
                 markMediaStoreExportJournalsTerminalPersisted(jobDir)
-                KeplerJobMetadata.finalizeRecoveredTerminalOperation(jobDir, activeOperation)
+                check(KeplerJobMetadata.finalizeRecoveredTerminalOperation(jobDir, activeOperation)) {
+                    "Could not durably finalize terminal operation $activeOperation"
+                }
                 return KeplerJobRecoveryResult(
                     jobDir,
                     KeplerJobRecoveryClassification.RECOVERED,
@@ -295,9 +315,8 @@ internal object KeplerRecoveryCoordinator {
             }
             val captureTemps = recoverCaptureOwnedTemps(jobDir, job, activeOperation.isNotBlank())
             if (activeOperation.isBlank() && job.optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()) {
-                KeplerJobMetadata.update(jobDir) {
-                    it.put("recoveryState", KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name)
-                        .put("recoveryMessage", "캡처 결과는 보존되었지만 처리가 시작되기 전에 이전 프로세스가 종료되었습니다.")
+                check(KeplerJobMetadata.finalizeRecoveredProcessingHandoff(jobDir)) {
+                    "Could not durably finalize processing handoff"
                 }
                 return KeplerJobRecoveryResult(
                     jobDir,
@@ -306,8 +325,38 @@ internal object KeplerRecoveryCoordinator {
                     failures = metadataTemps.failures + captureTemps.failures
                 )
             }
+            val processingJournalFiles = ProcessingArtifactJournal.list(jobDir)
+            if (activeOperation.isBlank() && processingJournalFiles.isNotEmpty()) {
+                val artifactResults = recoverProcessingArtifactJournals(jobDir, job)
+                val artifactFailure = artifactResults.firstOrNull {
+                    it.classification == ProcessingArtifactRecoveryClassification.AMBIGUOUS ||
+                        it.classification == ProcessingArtifactRecoveryClassification.INVALID_JOURNAL
+                }
+                if (artifactFailure != null) {
+                    KeplerJobMetadata.update(jobDir) {
+                        it.put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
+                            .put("recoveryMessage", artifactFailure.message ?: "Retained processing artifact evidence requires manual review.")
+                    }
+                    return KeplerJobRecoveryResult(
+                        jobDir,
+                        KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED,
+                        actions = artifactResults.map { it.classification.name },
+                        failures = listOfNotNull(artifactFailure.message)
+                    )
+                }
+                return KeplerJobRecoveryResult(
+                    jobDir,
+                    if (job.optBoolean("processingOutputCommitted", false)) {
+                        KeplerJobRecoveryClassification.RECOVERED
+                    } else {
+                        KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT
+                    },
+                    actions = artifactResults.map { it.classification.name },
+                    cleanupFailures = artifactResults.mapNotNull { it.message }
+                )
+            }
             if (activeOperation.isNotBlank()) {
-                val artifactResults = recoverProcessingArtifactJournals(jobDir)
+                val artifactResults = recoverProcessingArtifactJournals(jobDir, job)
                 val artifactFailure = artifactResults.firstOrNull {
                     it.classification == ProcessingArtifactRecoveryClassification.AMBIGUOUS ||
                         it.classification == ProcessingArtifactRecoveryClassification.INVALID_JOURNAL
@@ -326,6 +375,9 @@ internal object KeplerRecoveryCoordinator {
                     )
                 }
                 val localCommitted = job.optBoolean("processingOutputCommitted", false)
+                val artifactCleanupDebt = artifactResults
+                    .filter { it.classification == ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT }
+                    .mapNotNull { it.message }
                 val publicCommitted = job.optBoolean("galleryExportCommitted", false)
                 val publicVerified = job.optBoolean("exportVerified", false)
                 val classification = when {
@@ -334,18 +386,20 @@ internal object KeplerRecoveryCoordinator {
                     localCommitted -> KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL
                     else -> KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT
                 }
-                KeplerJobMetadata.finalizeRecoveredInterruptedOperation(
-                    jobDir,
-                    activeOperation,
-                    classification,
-                    "Durable evidence reconciled after the previous process ended."
-                )
+                if (artifactCleanupDebt.isEmpty()) {
+                    check(KeplerJobMetadata.finalizeRecoveredInterruptedOperation(
+                        jobDir,
+                        activeOperation,
+                        classification,
+                        "Durable evidence reconciled after the previous process ended."
+                    )) { "Could not durably finalize interrupted operation $activeOperation" }
+                }
                 return KeplerJobRecoveryResult(
                     jobDir,
                     classification,
                     actions = artifactResults.map { it.classification.name } + metadataTemps.actions + captureTemps.deleted.map { "DELETED_$it" },
                     failures = metadataTemps.failures + captureTemps.failures,
-                    cleanupFailures = cleanupFailures
+                    cleanupFailures = cleanupFailures + artifactCleanupDebt
                 )
             }
             if (invalidExportJournals.isNotEmpty() && !terminalResultAlreadyProven) {

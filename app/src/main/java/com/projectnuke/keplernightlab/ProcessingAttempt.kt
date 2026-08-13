@@ -36,6 +36,7 @@ private val COMMON_PROCESSING_ATTEMPT_KEYS = setOf(
     "pipelineFailureMessage",
     "processingFinishedAt",
     "processingOutputCommitted",
+    "processingArtifactClaimAttemptId",
     "postCommitCancellationRequested",
     "processingStageAttemptId"
 )
@@ -129,8 +130,21 @@ internal fun markProcessingArtifactClaim(
     updateForProcessingAttempt(jobDir, attempt) { job ->
         job.put(artifactKey, artifactFile.name)
             .put("processingOutputCommitted", true)
+            .put("processingArtifactClaimAttemptId", attempt.id)
         appendProcessingSettlement(job, artifactFile, "ADOPTED_FINAL", "ADOPTED", null)
     }
+    ProcessingArtifactJournal.list(jobDir).asSequence()
+        .mapNotNull { file -> runCatching { ProcessingArtifactJournal.read(file) }.getOrNull() }
+        .filter { it.processingAttemptId == attempt.id && it.adoptedResult == "NEW_FINAL" && it.claimKey == artifactKey }
+        .forEach { journal ->
+            journal.transition(jobDir, ProcessingArtifactJournalState.JOB_CLAIM_PERSISTED)
+            val temp = NoFollowFileSystem.resolveDirectChild(jobDir, journal.tempName, requireFile = true)
+            val prior = NoFollowFileSystem.resolveDirectChild(jobDir, journal.priorName, requireFile = true)
+            if (temp == null && prior == null) {
+                journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED, adoptedResultOverride = "NEW_FINAL")
+                    .deleteIfOwned(jobDir)
+            }
+        }
 }
 
 internal fun recordProcessingArtifactSettlements(

@@ -130,6 +130,11 @@ class BitmapTileSink(
     private val outputFile: File,
     private val quality: Int = JPEG_QUALITY
 ) : SuperResolutionTileSink {
+    private var processingAttempt: ProcessingAttempt? = null
+
+    internal fun bindProcessingAttempt(attempt: ProcessingAttempt) {
+        processingAttempt = attempt
+    }
     private var bitmap: Bitmap? = null
 
     override fun begin(width: Int, height: Int) {
@@ -146,7 +151,7 @@ class BitmapTileSink(
     override fun finish(): File {
         val output = bitmap ?: error("Tile sink not started.")
         return try {
-            saveJpeg(output, outputFile, quality)
+            saveJpeg(output, outputFile, quality, processingAttempt = processingAttempt, claimKey = "superResolutionOutputFile")
             outputFile
         } finally {
             output.recycle()
@@ -162,7 +167,8 @@ class BitmapTileSink(
 
 /** Scanline PNG sink used when a full-resolution Bitmap would exceed the heap plan. */
 internal class StreamingPngTileSink(
-    private val outputFile: File
+    private val outputFile: File,
+    private val processingAttempt: ProcessingAttempt? = null
 ) : SuperResolutionTileSink {
     private enum class State { IDLE, WRITING, FINISHING, COMMITTED, ABORTING, ABORTED, FAILED }
     private var state = State.IDLE
@@ -269,6 +275,8 @@ internal class StreamingPngTileSink(
                     }
                 },
                 verifyFinal = { committed -> verifyPngArtifact(committed, width, height) }
+                ,processingAttemptId = processingAttempt?.id
+                ,claimKey = processingAttempt?.let { "superResolutionOutputFile" }
             )
             cleanupRecords += result.settlements
             temporary = null
@@ -509,7 +517,7 @@ fun runSuperResolutionFusion(
             }
         )
         val tileSink = request.tileSinkFactory?.invoke(outputFile) ?:
-            if (bitmapSinkAllowed) BitmapTileSink(outputFile) else StreamingPngTileSink(outputFile)
+            if (bitmapSinkAllowed) BitmapTileSink(outputFile).also { it.bindProcessingAttempt(processingAttempt) } else StreamingPngTileSink(outputFile, processingAttempt)
         request.status("$statusLabel: writing output...")
         val writtenFile = fuseFramesTiled(
             frames = acceptedFrames,
@@ -1724,7 +1732,9 @@ private fun runSingleFrameFallback(
             output!!,
             outputFile,
             cancellation = request.cancellation,
-            onSettlement = processingArtifactSettlementObserver(request.outputDir, processingAttempt)
+            onSettlement = processingArtifactSettlementObserver(request.outputDir, processingAttempt),
+            processingAttempt = processingAttempt,
+            claimKey = "superResolutionOutputFile"
         )
         val actualOutputMegapixels = megapixels(output!!.width, output!!.height)
         val result = SuperResolutionFusionResult(
@@ -1908,11 +1918,15 @@ private fun saveJpeg(
     quality: Int = JPEG_QUALITY,
     cancellation: KeplerPipelineCancellation? = null,
     onSettlement: ((ProcessingArtifactSettlementReport) -> Unit)? = null
+    ,processingAttempt: ProcessingAttempt? = null
+    ,claimKey: String? = null
 ): ProcessingArtifactResult {
     return commitProcessingArtifact(
         finalFile = outputFile,
         cancellation = cancellation,
         onSettlement = onSettlement,
+        processingAttemptId = processingAttempt?.id,
+        claimKey = claimKey,
         writeTemp = { temporary ->
             FileOutputStream(temporary).use { output ->
                 check(bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {

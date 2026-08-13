@@ -32,6 +32,9 @@ object KeplerJobMetadata {
     internal var atomicWriteCount: Int = 0
         private set
 
+    @Volatile
+    internal var atomicWriteFailureForTest: Throwable? = null
+
     /** Narrow lease/metadata test seam: incremented each time a lease is actually released (the
      *  idempotent guard has NOT skipped the release). Tests must save & restore in `finally`. */
     @Volatile
@@ -275,7 +278,29 @@ object KeplerJobMetadata {
         matched
     }.getOrDefault(false)
 
+    internal fun finalizeRecoveredProcessingHandoff(jobDir: File): Boolean = runCatching {
+        var matched = false
+        update(jobDir) { job ->
+            if (job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID).isBlank() ||
+                job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id
+            ) return@update
+            matched = true
+            job.put("recoveryState", KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name)
+                .put("recoveryMessage", "Processing handoff was safely finalized after the previous process ended.")
+                .put(PROCESSING_HANDOFF_FINALIZED, true)
+            job.remove(PROCESSING_HANDOFF_RUNTIME_SESSION_ID)
+            job.remove(PROCESSING_HANDOFF_OPERATION_ID)
+            job.remove(PROCESSING_HANDOFF_KIND)
+            job.remove(PROCESSING_HANDOFF_CREATED_AT)
+        }
+        matched
+    }.getOrDefault(false)
+
     fun atomicWrite(file: File, text: String) {
+        atomicWriteFailureForTest?.let { failure ->
+            atomicWriteFailureForTest = null
+            throw failure
+        }
         val parent = file.parentFile ?: error("job metadata parent missing")
         requireRealJobDirectory(parent)
         check(!Files.isSymbolicLink(file.toPath())) { "Metadata destination must not be a symbolic link" }

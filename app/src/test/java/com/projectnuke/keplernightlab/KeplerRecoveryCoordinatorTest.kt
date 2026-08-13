@@ -131,8 +131,71 @@ class KeplerRecoveryCoordinatorTest {
                 .put(PROCESSING_HANDOFF_KIND, "PROCESSING_YUV"))
             val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root))
             assertEquals(KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT, report.jobs.single().classification)
-            assertEquals(false, KeplerJobMetadata.read(job).optBoolean("processingOutputCommitted", false))
+            val recovered = KeplerJobMetadata.read(job)
+            assertEquals(false, recovered.optBoolean("processingOutputCommitted", false))
+            assertEquals("", recovered.optString(PROCESSING_HANDOFF_OPERATION_ID))
+            assertEquals("", recovered.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID))
+            val second = KeplerRecoveryCoordinator.recoverRoots(listOf(root))
+            assertTrue(second.jobs.single().classification != KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT)
         } finally { root.deleteRecursively() }
+    }
+
+    @Test
+    fun adoptedProcessingArtifactReconstructsMissingJobClaimBeforeClearingDeadOwner() {
+        val root = File(Files.createTempDirectory("kepler-recovery-adopted-claim-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_adopted-claim").apply { mkdirs() }
+        try {
+            val attemptId = "processing-attempt-1"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "RAW_NIGHT_FUSION")
+                .put("status", "PROCESSING")
+                .put("processingAttemptId", attemptId)
+                .put("processingOutputCommitted", false)
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, attemptId)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PROCESSING_RAW.name))
+            val final = File(job, "merged.raw")
+            commitProcessingArtifact(
+                finalFile = final,
+                writeTemp = { it.writeBytes(byteArrayOf(1, 2, 3, 4)) },
+                verifyFinal = { check(it.readBytes().contentEquals(byteArrayOf(1, 2, 3, 4))) },
+                processingAttemptId = attemptId,
+                claimKey = "mergedRawFile"
+            )
+
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root))
+
+            assertEquals(KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL, report.jobs.single().classification)
+            val recovered = KeplerJobMetadata.read(job)
+            assertTrue(recovered.getBoolean("processingOutputCommitted"))
+            assertEquals(final.name, recovered.getString("mergedRawFile"))
+            assertEquals(attemptId, recovered.getString("processingArtifactClaimAttemptId"))
+            assertEquals("", recovered.optString(ACTIVE_OPERATION_ID))
+            assertTrue(ProcessingArtifactJournal.list(job).isEmpty())
+            assertTrue(final.exists())
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test
+    fun failedInterruptedFinalizationIsNotReportedAsRecovered() {
+        val root = File(Files.createTempDirectory("kepler-recovery-finalize-failure-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_finalize-failure").apply { mkdirs() }
+        try {
+            val operationId = "dead-processing-finalize-failure"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("status", "PROCESSING")
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, operationId)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PROCESSING_YUV.name))
+            KeplerJobMetadata.atomicWriteFailureForTest = IllegalStateException("injected metadata failure")
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root))
+            assertEquals(KeplerJobRecoveryClassification.RECOVERY_FAILED, report.jobs.single().classification)
+            assertEquals(operationId, KeplerJobMetadata.read(job).optString(ACTIVE_OPERATION_ID))
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            root.deleteRecursively()
+        }
     }
 
     @Test

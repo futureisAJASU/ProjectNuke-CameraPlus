@@ -325,7 +325,7 @@ internal fun processClassicYuvFusionJob(
         val mergeDoneAt = System.currentTimeMillis()
         val averageFile = File(jobDir, "average_color_rotated.png")
         cancellation.throwIfCancelled()
-        saveClassicBitmap(merged, averageFile, cancellation, processingAttempt)
+        saveClassicBitmap(merged, averageFile, cancellation)
 
         markStage("YUV_DENOISE_SHARPEN", "노이즈와 선명도를 보정하는 중입니다.")
         cancellation.throwIfCancelled()
@@ -2017,7 +2017,9 @@ private fun saveClassicBitmap(
         },
         verifyFinal = { committed ->
             verifyPngArtifact(committed)
-        }
+        },
+        processingAttemptId = processingAttempt?.id,
+        claimKey = processingAttempt?.let { "finalFile" }
     )
 }
 

@@ -142,6 +142,7 @@ internal fun commitProcessingArtifact(
     cancellation: KeplerPipelineCancellation? = null,
     onSettlement: ((ProcessingArtifactSettlementReport) -> Unit)? = null,
     processingAttemptId: String? = null,
+    claimKey: String? = null,
     move: (File, File) -> Unit = ::moveArtifact
 ): ProcessingArtifactResult {
     val parent = finalFile.parentFile ?: error("Artifact parent is missing")
@@ -162,23 +163,26 @@ internal fun commitProcessingArtifact(
         artifactType = finalFile.extension.ifBlank { "UNKNOWN" },
         finalName = finalFile.name,
         tempName = temp.name,
-        priorName = priorBackup.name
+        priorName = priorBackup.name,
+        claimKey = claimKey
     )
 
     fun journalTransition(
         next: ProcessingArtifactJournalState,
         evidence: NoFollowFileSystem.StreamDigest? = null,
         priorSemanticVerified: Boolean = journal.priorSemanticVerified,
-        adoptedResult: String? = journal.adoptedResult
+        adoptedResult: String? = journal.adoptedResult,
+        claimKey: String? = journal.claimKey
     ) {
         journal = journal.transition(
             parent,
             next,
             verificationKindOverride = evidence?.let { finalFile.extension.uppercase().ifBlank { "BINARY" } } ?: journal.verificationKind,
             expectedSizeBytesOverride = evidence?.size ?: journal.expectedSizeBytes,
-            expectedSha256Override = evidence?.sha256 ?: journal.expectedSha256
-            ,priorSemanticVerifiedOverride = priorSemanticVerified
-            ,adoptedResultOverride = adoptedResult
+            expectedSha256Override = evidence?.sha256 ?: journal.expectedSha256,
+            priorSemanticVerifiedOverride = priorSemanticVerified,
+            adoptedResultOverride = adoptedResult,
+            claimKeyOverride = claimKey
         )
     }
 
@@ -244,7 +248,7 @@ internal fun commitProcessingArtifact(
             ProcessingArtifactSettlementStatus.ADOPTED
         )
         state = ProcessingArtifactState.ADOPTED
-        journalTransition(ProcessingArtifactJournalState.ADOPTED, adoptedResult = "NEW_FINAL")
+        journalTransition(ProcessingArtifactJournalState.ADOPTED, adoptedResult = "NEW_FINAL", claimKey = claimKey)
 
         if (priorBackedUp) {
             val backupSettlement = settleProcessingArtifactPath(priorBackup, ProcessingArtifactResourceRole.PRIOR_BACKUP)
@@ -266,8 +270,10 @@ internal fun commitProcessingArtifact(
             hadPriorFinal = priorBackedUp,
             priorFinalRestored = false
         )
-        journalTransition(ProcessingArtifactJournalState.SETTLED)
-        journal.deleteIfOwned(parent)
+        if (claimKey == null) {
+            journalTransition(ProcessingArtifactJournalState.SETTLED)
+            journal.deleteIfOwned(parent)
+        }
         notifySettlement(
             ProcessingArtifactSettlementReport(
                 state = result.state,

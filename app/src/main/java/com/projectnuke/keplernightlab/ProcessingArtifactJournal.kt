@@ -15,6 +15,7 @@ internal enum class ProcessingArtifactJournalState {
     NEW_FINAL_MOVED,
     NEW_FINAL_VERIFIED,
     ADOPTED,
+    JOB_CLAIM_PERSISTED,
     ROLLBACK_STARTED,
     PRIOR_RESTORED,
     SETTLED
@@ -35,6 +36,7 @@ internal data class ProcessingArtifactJournal(
     val priorExpectedSha256: String? = null,
     val priorSemanticVerified: Boolean = false,
     val adoptedResult: String? = null,
+    val claimKey: String? = null,
     val state: ProcessingArtifactJournalState,
     val createdAt: Long,
     val updatedAt: Long
@@ -57,7 +59,8 @@ internal data class ProcessingArtifactJournal(
         priorExpectedSizeBytesOverride: Long? = priorExpectedSizeBytes,
         priorExpectedSha256Override: String? = priorExpectedSha256,
         priorSemanticVerifiedOverride: Boolean = priorSemanticVerified,
-        adoptedResultOverride: String? = adoptedResult
+        adoptedResultOverride: String? = adoptedResult,
+        claimKeyOverride: String? = claimKey
     ): ProcessingArtifactJournal = copy(
         state = next,
         verificationKind = verificationKindOverride,
@@ -67,6 +70,7 @@ internal data class ProcessingArtifactJournal(
         priorExpectedSha256 = priorExpectedSha256Override,
         priorSemanticVerified = priorSemanticVerifiedOverride,
         adoptedResult = adoptedResultOverride,
+        claimKey = claimKeyOverride,
         updatedAt = System.currentTimeMillis()
     ).also { it.writeTo(jobDir) }
 
@@ -86,6 +90,7 @@ internal data class ProcessingArtifactJournal(
         require(expectedSha256 == null || expectedSha256.matches(SHA256_PATTERN))
         require(priorExpectedSizeBytes == null || priorExpectedSizeBytes >= 0L)
         require(priorExpectedSha256 == null || priorExpectedSha256.matches(SHA256_PATTERN))
+        require(claimKey == null || claimKey.matches(CLAIM_KEY_PATTERN))
     }
 
     fun toJson(): JSONObject = JSONObject()
@@ -103,6 +108,7 @@ internal data class ProcessingArtifactJournal(
         .put("priorExpectedSha256", priorExpectedSha256 ?: JSONObject.NULL)
         .put("priorSemanticVerified", priorSemanticVerified)
         .put("adoptedResult", adoptedResult ?: JSONObject.NULL)
+        .put("claimKey", claimKey ?: JSONObject.NULL)
         .put("state", state.name)
         .put("createdAt", createdAt)
         .put("updatedAt", updatedAt)
@@ -113,6 +119,7 @@ internal data class ProcessingArtifactJournal(
         private val UUID_PATTERN = Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}")
         private val SHA256_PATTERN = Regex("[0-9a-fA-F]{64}")
         private val VERIFICATION_KIND_PATTERN = Regex("[A-Z0-9_]{1,40}")
+        private val CLAIM_KEY_PATTERN = Regex("[A-Za-z][A-Za-z0-9_]{0,80}")
 
         fun create(
             jobDir: File,
@@ -122,11 +129,12 @@ internal data class ProcessingArtifactJournal(
             finalName: String,
             tempName: String,
             priorName: String,
-            now: Long = System.currentTimeMillis()
+            now: Long = System.currentTimeMillis(),
+            claimKey: String? = null
         ): ProcessingArtifactJournal = ProcessingArtifactJournal(
             transactionId, processingAttemptId, KeplerRuntimeSession.id, artifactType,
             finalName, tempName, priorName, null, null, null, null, null, false, null,
-            ProcessingArtifactJournalState.PREPARED, now, now
+            claimKey, ProcessingArtifactJournalState.PREPARED, now, now
         ).also { it.writeTo(jobDir) }
 
         fun fileFor(jobDir: File, transactionId: String): File =
@@ -156,6 +164,7 @@ internal data class ProcessingArtifactJournal(
                 priorExpectedSha256 = json.optString("priorExpectedSha256").takeIf { it.isNotBlank() && it != "null" },
                 priorSemanticVerified = json.optBoolean("priorSemanticVerified", false),
                 adoptedResult = json.optString("adoptedResult").takeIf { it.isNotBlank() && it != "null" },
+                claimKey = json.optString("claimKey").takeIf { it.isNotBlank() && it != "null" },
                 state = state,
                 createdAt = json.getLong("createdAt"),
                 updatedAt = json.getLong("updatedAt")
@@ -183,7 +192,8 @@ internal data class ProcessingArtifactRecoveryResult(
 )
 
 internal fun recoverProcessingArtifactJournals(
-    jobDir: File
+    jobDir: File,
+    job: JSONObject? = null
 ): List<ProcessingArtifactRecoveryResult> = ProcessingArtifactJournal.list(jobDir).map { journalFile ->
     val journal = runCatching { ProcessingArtifactJournal.read(journalFile) }.getOrElse {
         return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.INVALID_JOURNAL, it.message)
@@ -261,6 +271,41 @@ internal fun recoverProcessingArtifactJournals(
         ProcessingArtifactJournalState.NEW_FINAL_VERIFIED,
         ProcessingArtifactJournalState.ADOPTED -> when {
             valid(final) -> {
+                if (journal.claimKey != null && journal.processingAttemptId != null) {
+                    val claimDurable = job?.optString(journal.claimKey) == journal.finalName &&
+                        job.optBoolean("processingOutputCommitted", false) &&
+                        job.optString("processingAttemptId") == journal.processingAttemptId
+                    if (!claimDurable) {
+                        val operationMatches = job != null &&
+                            job.optString(ACTIVE_OPERATION_ID) == journal.processingAttemptId &&
+                            job.optString(ACTIVE_OPERATION_KIND) in setOf(
+                                KeplerActiveOperationKind.PROCESSING_YUV.name,
+                                KeplerActiveOperationKind.PROCESSING_RAW.name,
+                                KeplerActiveOperationKind.SUPER_RESOLUTION.name
+                            )
+                        if (!operationMatches || job?.optString("processingAttemptId") != journal.processingAttemptId) {
+                            return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "adopted artifact claim identity is not current")
+                        }
+                        job.put(journal.claimKey, journal.finalName)
+                            .put("processingOutputCommitted", true)
+                            .put("processingArtifactClaimAttemptId", journal.processingAttemptId)
+                        KeplerJobMetadata.update(jobDir) { current ->
+                            current.put(journal.claimKey, journal.finalName)
+                                .put("processingOutputCommitted", true)
+                                .put("processingArtifactClaimAttemptId", journal.processingAttemptId)
+                        }
+                    }
+                    journal.transition(jobDir, ProcessingArtifactJournalState.JOB_CLAIM_PERSISTED)
+                    val tempSettled = deleteExact(temp)
+                    val priorSettled = prior?.let { settleProcessingArtifactPath(it, ProcessingArtifactResourceRole.PRIOR_BACKUP).status != ProcessingArtifactSettlementStatus.DELETE_FAILED } ?: true
+                    if (tempSettled && priorSettled) {
+                        journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED, adoptedResultOverride = "NEW_FINAL")
+                            .deleteIfOwned(jobDir)
+                    } else {
+                        return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT, "processing claim persisted but cleanup remains outstanding")
+                    }
+                    return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT)
+                }
                 val tempSettled = deleteExact(temp)
                 val priorSettlement = prior?.let {
                     settleProcessingArtifactPath(it, ProcessingArtifactResourceRole.PRIOR_BACKUP)
@@ -288,10 +333,27 @@ internal fun recoverProcessingArtifactJournals(
             else -> ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "no verifiable candidate")
         }
         ProcessingArtifactJournalState.PRIOR_RESTORED,
+        ProcessingArtifactJournalState.JOB_CLAIM_PERSISTED,
         ProcessingArtifactJournalState.SETTLED -> {
             val priorResult = journal.adoptedResult == "PRIOR_FINAL" || journal.state == ProcessingArtifactJournalState.PRIOR_RESTORED
             if (!priorResult && journal.adoptedResult != "NEW_FINAL") {
                 return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "settled journal has no adopted result")
+            }
+            if (journal.state == ProcessingArtifactJournalState.JOB_CLAIM_PERSISTED) {
+                val claimDurable = job != null && journal.claimKey != null && journal.processingAttemptId != null &&
+                    job.optString(journal.claimKey) == journal.finalName &&
+                    job.optBoolean("processingOutputCommitted", false) &&
+                    job.optString("processingAttemptId") == journal.processingAttemptId &&
+                    job.optString("processingArtifactClaimAttemptId") == journal.processingAttemptId
+                if (!claimDurable) {
+                    return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "processing claim acknowledgement is not durable")
+                }
+                val tempSettled = deleteExact(temp)
+                val priorSettled = prior?.let { settleProcessingArtifactPath(it, ProcessingArtifactResourceRole.PRIOR_BACKUP).status != ProcessingArtifactSettlementStatus.DELETE_FAILED } ?: true
+                if (!tempSettled || !priorSettled) {
+                    return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT, "processing claim acknowledged but cleanup remains outstanding")
+                }
+                journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED, adoptedResultOverride = "NEW_FINAL")
             }
             if (priorResult && !journal.priorSemanticVerified) {
                 return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "settled prior lacks semantic verification evidence")
