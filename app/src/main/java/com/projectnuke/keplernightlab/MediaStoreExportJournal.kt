@@ -43,6 +43,7 @@ internal data class MediaStoreExportJournal(
     val ownerRuntimeSessionId: String = runtimeSessionId,
     val terminalMetadataPersisted: Boolean = false,
     val terminalMetadataPersistedAt: Long? = null,
+    val terminalOperationId: String? = null,
     val state: MediaStoreExportState,
     val createdAt: Long,
     val updatedAt: Long
@@ -65,9 +66,10 @@ internal data class MediaStoreExportJournal(
         updatedAt = System.currentTimeMillis()
     ).writeTo(jobDir)
 
-    fun markTerminalPersisted(jobDir: File): MediaStoreExportJournal = copy(
+    fun markTerminalPersisted(jobDir: File, operationId: String? = terminalOperationId): MediaStoreExportJournal = copy(
         terminalMetadataPersisted = true,
         terminalMetadataPersistedAt = System.currentTimeMillis(),
+        terminalOperationId = operationId,
         updatedAt = System.currentTimeMillis()
     ).writeTo(jobDir)
 
@@ -95,6 +97,7 @@ internal data class MediaStoreExportJournal(
         .put("ownerRuntimeSessionId", ownerRuntimeSessionId)
         .put("terminalMetadataPersisted", terminalMetadataPersisted)
         .put("terminalMetadataPersistedAt", terminalMetadataPersistedAt ?: JSONObject.NULL)
+        .put("terminalOperationId", terminalOperationId ?: JSONObject.NULL)
         .put("state", state.name)
         .put("createdAt", createdAt)
         .put("updatedAt", updatedAt)
@@ -140,6 +143,7 @@ internal data class MediaStoreExportJournal(
                 ownerRuntimeSessionId = KeplerRuntimeSession.id,
                 terminalMetadataPersisted = false,
                 terminalMetadataPersistedAt = null,
+                terminalOperationId = null,
                 state = MediaStoreExportState.PREPARED,
                 createdAt = now,
                 updatedAt = now
@@ -178,6 +182,7 @@ internal data class MediaStoreExportJournal(
                 json.optString("ownerRuntimeSessionId", json.optString("runtimeSessionId")),
                 json.optBoolean("terminalMetadataPersisted", false) || json.optString("state") == "TERMINAL_PERSISTED",
                 json.optLong("terminalMetadataPersistedAt").takeIf { json.has("terminalMetadataPersistedAt") && !json.isNull("terminalMetadataPersistedAt") },
+                json.optString("terminalOperationId").takeIf { it.isNotBlank() && it != "null" },
                 state,
                 json.getLong("createdAt"),
                 json.getLong("updatedAt")

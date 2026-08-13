@@ -171,6 +171,7 @@ internal enum class ProcessingArtifactRecoveryClassification {
     SETTLED_TEMP,
     RESTORED_PRIOR,
     ADOPTED_CURRENT,
+    ADOPTED_CURRENT_WITH_CLEANUP_DEBT,
     AMBIGUOUS,
     INVALID_JOURNAL
 }
@@ -224,6 +225,13 @@ internal fun recoverProcessingArtifactJournals(
         }
         ProcessingArtifactJournalState.PRIOR_BACKED_UP,
         ProcessingArtifactJournalState.ROLLBACK_STARTED -> when {
+            prior == null && journal.priorSemanticVerified && valid(final, prior = true) -> {
+                if (!deleteExact(temp)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT, "restored prior verified but temporary cleanup failed")
+                journal.transition(jobDir, ProcessingArtifactJournalState.PRIOR_RESTORED, adoptedResultOverride = "PRIOR_FINAL")
+                    .transition(jobDir, ProcessingArtifactJournalState.SETTLED, adoptedResultOverride = "PRIOR_FINAL")
+                    .deleteIfOwned(jobDir)
+                ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.RESTORED_PRIOR)
+            }
             final == null && valid(prior, prior = true) -> {
                 val priorFile = prior ?: return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS)
                 movePriorToFinal(priorFile, File(jobDir, journal.finalName))
@@ -253,14 +261,16 @@ internal fun recoverProcessingArtifactJournals(
         ProcessingArtifactJournalState.NEW_FINAL_VERIFIED,
         ProcessingArtifactJournalState.ADOPTED -> when {
             valid(final) -> {
-                deleteExact(temp)
+                val tempSettled = deleteExact(temp)
                 val priorSettlement = prior?.let {
                     settleProcessingArtifactPath(it, ProcessingArtifactResourceRole.PRIOR_BACKUP)
                 }
-                if (priorSettlement != null && priorSettlement.status == ProcessingArtifactSettlementStatus.DELETE_FAILED) {
-                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "current final verified but prior cleanup failed")
+                if (!tempSettled) {
+                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT, "current final verified but temporary cleanup failed")
+                } else if (priorSettlement != null && priorSettlement.status == ProcessingArtifactSettlementStatus.DELETE_FAILED) {
+                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT, "current final verified but prior cleanup failed")
                 } else {
-                    journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED).deleteIfOwned(jobDir)
+                    journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED, adoptedResultOverride = "NEW_FINAL").deleteIfOwned(jobDir)
                     ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT)
                 }
             }
@@ -280,8 +290,15 @@ internal fun recoverProcessingArtifactJournals(
         ProcessingArtifactJournalState.PRIOR_RESTORED,
         ProcessingArtifactJournalState.SETTLED -> {
             val priorResult = journal.adoptedResult == "PRIOR_FINAL" || journal.state == ProcessingArtifactJournalState.PRIOR_RESTORED
+            if (!priorResult && journal.adoptedResult != "NEW_FINAL") {
+                return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "settled journal has no adopted result")
+            }
+            if (priorResult && !journal.priorSemanticVerified) {
+                return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "settled prior lacks semantic verification evidence")
+            }
             if (valid(final, prior = priorResult)) journalFile.delete() else return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "settled journal final is not verifiable")
-            ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.RESTORED_PRIOR)
+            if (priorResult) ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.RESTORED_PRIOR)
+            else ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT)
         }
     }
 }
@@ -295,7 +312,7 @@ private fun verifyProcessingArtifactRecovery(journal: ProcessingArtifactJournal,
     }
     check(digest.size == expectedSize) { "Processing artifact size mismatch" }
     check(digest.sha256.equals(expectedSha256, ignoreCase = true)) { "Processing artifact digest mismatch" }
-    if (prior && journal.verificationKind?.uppercase() in setOf("PNG", "JPG", "JPEG", "JSON", "RAW16") && !journal.priorSemanticVerified) {
+    if (prior && !journal.priorSemanticVerified) {
         error("Processing journal prior lacks semantic verification evidence")
     }
     when (journal.verificationKind?.uppercase()) {

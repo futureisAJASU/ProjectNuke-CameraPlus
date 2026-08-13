@@ -168,6 +168,53 @@ class KeplerRecoveryCoordinatorTest {
     }
 
     @Test
+    fun verifiedSidecarCannotSuppressCurrentMainInsertAmbiguity() {
+        val root = File(Files.createTempDirectory("kepler-recovery-correlated-main-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_correlated-main").apply { mkdirs() }
+        try {
+            val operationId = "current-export"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("status", "EXPORTING")
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, operationId)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name))
+            MediaStoreExportJournal.create(
+                job, MediaStoreExportRole.RAW_DNG_SIDECAR, 0, "frame.dng", "Pictures/Kepler",
+                "image/x-adobe-dng", Uri.parse("content://media/external/images/media"),
+                ownerOperationId = "historical-export"
+            ).transition(job, MediaStoreExportState.VERIFIED, "content://media/external/images/media/90")
+            MediaStoreExportJournal.create(
+                job, MediaStoreExportRole.MAIN_IMAGE, null, "result.jpg", "Pictures/Kepler",
+                "image/jpeg", Uri.parse("content://media/external/images/media"), ownerOperationId = operationId)
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
+            assertEquals(KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED, report.jobs.single().classification)
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test
+    fun terminalOperationIdClearsDeadExportMarkerAfterRestart() {
+        val root = File(Files.createTempDirectory("kepler-recovery-terminal-owner-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_terminal-owner").apply { mkdirs() }
+        try {
+            val operationId = "terminal-export"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("currentPipelineStage", "COMPLETE")
+                .put("galleryExportCommitted", true)
+                .put("exportVerified", true)
+                .put("exportUri", "content://media/external/images/media/91")
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, operationId)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name)
+                .put(TERMINAL_OPERATION_ID, operationId))
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
+            assertEquals(KeplerJobRecoveryClassification.RECOVERED, report.jobs.single().classification)
+            assertEquals("", KeplerJobMetadata.read(job).optString(ACTIVE_OPERATION_ID))
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test
     fun oneMediaStoreRecoveryFailureDoesNotAbortLaterJobs() {
         val root = File(Files.createTempDirectory("kepler-recovery-isolation-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
         val broken = File(root, "KPL_YUV_FUSION_broken").apply { mkdirs() }
@@ -232,7 +279,8 @@ class KeplerRecoveryCoordinatorTest {
             ProcessingArtifactJournal.read(ProcessingArtifactJournal.fileFor(job, journal.transactionId))
                 .transition(job, ProcessingArtifactJournalState.PRIOR_BACKED_UP,
                     priorExpectedSizeBytesOverride = expected.size,
-                    priorExpectedSha256Override = expected.sha256)
+                    priorExpectedSha256Override = expected.sha256,
+                    priorSemanticVerifiedOverride = true)
             val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
             assertEquals(KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL, report.jobs.single().classification)
             assertTrue(File(job, "result.bin").exists())

@@ -39,6 +39,7 @@ class ProcessingArtifactTransactionTest {
                 verificationKind = "BIN",
                 priorExpectedSizeBytes = prior.length(),
                 priorExpectedSha256 = NoFollowFileSystem.digestVerified(prior).sha256,
+                priorSemanticVerified = true,
                 state = ProcessingArtifactJournalState.PRIOR_BACKED_UP,
                 createdAt = 1L,
                 updatedAt = 2L
@@ -110,6 +111,7 @@ class ProcessingArtifactTransactionTest {
                 expectedSha256 = "0".repeat(64),
                 priorExpectedSizeBytes = prior.length(),
                 priorExpectedSha256 = NoFollowFileSystem.digestVerified(prior).sha256,
+                priorSemanticVerified = true,
                 state = ProcessingArtifactJournalState.NEW_FINAL_MOVED,
                 createdAt = 1L,
                 updatedAt = 2L
@@ -146,6 +148,7 @@ class ProcessingArtifactTransactionTest {
                 expectedSha256 = "0".repeat(64),
                 priorExpectedSizeBytes = prior.length(),
                 priorExpectedSha256 = NoFollowFileSystem.digestVerified(prior).sha256,
+                priorSemanticVerified = true,
                 state = ProcessingArtifactJournalState.NEW_FINAL_MOVED,
                 createdAt = 1L,
                 updatedAt = 2L
@@ -183,6 +186,37 @@ class ProcessingArtifactTransactionTest {
             final.writeText("restored")
             val result = recoverProcessingArtifactJournals(dir).single()
             assertEquals(ProcessingArtifactRecoveryClassification.RESTORED_PRIOR, result.classification)
+            assertTrue(ProcessingArtifactJournal.list(dir).isEmpty())
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
+    fun rollbackStartedAfterPriorMoveIsIdempotentlyRecognizedAsRestored() {
+        val dir = Files.createTempDirectory("processing-journal-rollback-cut-").toFile()
+        try {
+            val final = File(dir, "result.bin").apply { writeText("restored-prior") }
+            val prior = File(dir, ".result.bin.prior").apply { delete() }
+            val evidence = NoFollowFileSystem.digestVerified(final)
+            ProcessingArtifactJournal(
+                transactionId = UUID.randomUUID().toString(),
+                processingAttemptId = null,
+                runtimeSessionId = "old-runtime",
+                artifactType = "BIN",
+                finalName = final.name,
+                tempName = ".result.bin.tmp",
+                priorName = prior.name,
+                verificationKind = "BIN",
+                expectedSizeBytes = 1L,
+                expectedSha256 = "0".repeat(64),
+                priorExpectedSizeBytes = evidence.size,
+                priorExpectedSha256 = evidence.sha256,
+                priorSemanticVerified = true,
+                state = ProcessingArtifactJournalState.ROLLBACK_STARTED,
+                createdAt = 1L,
+                updatedAt = 2L
+            ).writeTo(dir)
+            assertEquals(ProcessingArtifactRecoveryClassification.RESTORED_PRIOR, recoverProcessingArtifactJournals(dir).single().classification)
+            assertTrue(final.exists())
             assertTrue(ProcessingArtifactJournal.list(dir).isEmpty())
         } finally { dir.deleteRecursively() }
     }

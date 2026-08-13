@@ -535,6 +535,7 @@ fun updateExportMetadata(
     lateinit var nativePostprocessRgbaFileForLog: String
     lateinit var rawRenderDebugFileForLog: String
     KeplerJobMetadata.update(jobDir) { job ->
+        job.optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }?.let { job.put(TERMINAL_OPERATION_ID, it) }
         job.put("finalOutputFormatSetting", finalOutputFormat.name)
             .put("currentPipelineStage", if (verified) "COMPLETE" else "PROCESSING")
             .put("exportStatus", when {
@@ -634,6 +635,7 @@ fun updateExportFailure(
     export: GalleryExportResult? = null
 ) {
     KeplerJobMetadata.update(jobDir) { job ->
+        job.optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }?.let { job.put(TERMINAL_OPERATION_ID, it) }
         job.put("finalOutputFormatSetting", finalOutputFormat.name)
             .put("processStatus", "EXPORT_FAILED_KEEPING_CACHE")
             .put("currentPipelineStage", "FAILED")
@@ -652,12 +654,12 @@ fun updateExportFailure(
 }
 
 internal fun markMediaStoreExportJournalsTerminalPersisted(jobDir: File) {
-    val ownerOperationId = runCatching { KeplerJobMetadata.read(jobDir).optString(ACTIVE_OPERATION_ID) }
-        .getOrNull()
-        ?.takeIf { it.isNotBlank() }
+    val metadata = runCatching { KeplerJobMetadata.read(jobDir) }.getOrNull()
+    val ownerOperationId = metadata?.optString(TERMINAL_OPERATION_ID)?.takeIf { it.isNotBlank() }
+        ?: metadata?.optString(ACTIVE_OPERATION_ID)?.takeIf { it.isNotBlank() }
     MediaStoreExportJournal.list(jobDir).forEach { journal ->
         if (journal.ownerOperationId == ownerOperationId && !journal.terminalMetadataPersisted) {
-            journal.markTerminalPersisted(jobDir)
+            journal.markTerminalPersisted(jobDir, ownerOperationId)
         }
     }
     val stage = runCatching { KeplerJobMetadata.read(jobDir).optString("currentPipelineStage") }.getOrNull()
@@ -697,6 +699,7 @@ internal fun updateRawPublicExportOutcome(
     outcome: RawFusionPublicExportOutcome
 ) {
     KeplerJobMetadata.update(jobDir) { job ->
+        job.optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }?.let { job.put(TERMINAL_OPERATION_ID, it) }
         val requested = requestedOutputFormatForSetting(outcome.finalOutputFormat)
         job.put("finalOutputFormatSetting", outcome.finalOutputFormat.name)
             .put("exportStatus", when (outcome) {

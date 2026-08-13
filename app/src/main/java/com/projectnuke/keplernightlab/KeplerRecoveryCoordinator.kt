@@ -26,7 +26,8 @@ internal data class KeplerJobRecoveryResult(
     val classification: KeplerJobRecoveryClassification,
     val actions: List<String> = emptyList(),
     val failures: List<String> = emptyList(),
-    val quarantined: Boolean = false
+    val quarantined: Boolean = false,
+    val cleanupFailures: List<String> = emptyList()
 )
 
 internal data class KeplerRecoveryReport(
@@ -173,6 +174,7 @@ internal object KeplerRecoveryCoordinator {
             }
             val activeOperation = job.optString(ACTIVE_OPERATION_ID)
             val activeOperationKind = job.optString(ACTIVE_OPERATION_KIND)
+            val terminalOperationId = job.optString(TERMINAL_OPERATION_ID)
             val handoffRuntime = job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID)
             if (handoffRuntime == KeplerRuntimeSession.id) {
                 return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.SKIP_ACTIVE_CURRENT_PROCESS)
@@ -182,6 +184,18 @@ internal object KeplerRecoveryCoordinator {
                 KeplerActiveOperationKind.PROCESSING_RAW.name,
                 KeplerActiveOperationKind.SUPER_RESOLUTION.name
             )
+            val invalidExportJournals = MediaStoreExportJournal.invalidFiles(jobDir)
+            if (!processingRecoveryOwnsAuthority && invalidExportJournals.isNotEmpty()) {
+                KeplerJobMetadata.update(jobDir) {
+                    it.put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
+                        .put("recoveryMessage", "MediaStore export evidence is malformed and was preserved.")
+                }
+                return KeplerJobRecoveryResult(
+                    jobDir,
+                    KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED,
+                    failures = invalidExportJournals.map { "Invalid export journal: ${it.name}" }
+                )
+            }
             val exportResults = if (processingRecoveryOwnsAuthority) {
                 emptyList()
             } else {
@@ -189,16 +203,21 @@ internal object KeplerRecoveryCoordinator {
             }
             val exportJournalsById = MediaStoreExportJournal.list(jobDir).associateBy { it.exportAttemptId }
             val recoveredMainCommit = exportResults.any { result ->
-                result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
+                val journal = exportJournalsById[result.attemptId]
+                val verified = result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
                     result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED
-            } && exportResults.any { result ->
-                exportJournalsById[result.attemptId]?.let { journal ->
-                    journal.role == MediaStoreExportRole.MAIN_IMAGE &&
-                        (activeOperation.isBlank() || journal.ownerOperationId == activeOperation)
-                } == true
+                val committed = verified || result.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED
+                committed && journal?.role == MediaStoreExportRole.MAIN_IMAGE &&
+                    (activeOperation.isBlank() || journal.ownerOperationId == activeOperation)
             }
-            val selectedExportTruth = job.optBoolean("galleryExportCommitted", false) &&
-                job.optString("exportUri").isNotBlank() || recoveredMainCommit
+            val selectedExportTruth = recoveredMainCommit ||
+                (activeOperationKind != KeplerActiveOperationKind.PUBLIC_EXPORT.name &&
+                    job.optBoolean("galleryExportCommitted", false) && job.optString("exportUri").isNotBlank()) ||
+                (terminalOperationId == activeOperation && activeOperation.isNotBlank() &&
+                    job.optBoolean("galleryExportCommitted", false) && job.optString("exportUri").isNotBlank())
+            val cleanupFailures = exportResults
+                .filter { it.classification == MediaStoreExportRecoveryClassification.DELETE_FAILED }
+                .map { it.message ?: "MediaStore cleanup failed for ${it.attemptId}." }
             val exportFailure = exportResults.firstOrNull {
                 val journal = exportJournalsById[it.attemptId]
                 val abandonedDebt = journal?.state == MediaStoreExportState.CLEANUP_REQUIRED
@@ -218,7 +237,8 @@ internal object KeplerRecoveryCoordinator {
                     jobDir,
                     KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED,
                     actions = exportResults.map { it.classification.name },
-                    failures = listOfNotNull(exportFailure.message)
+                    failures = listOfNotNull(exportFailure.message),
+                    cleanupFailures = cleanupFailures
                 )
             }
             if (exportResults.any {
@@ -253,9 +273,20 @@ internal object KeplerRecoveryCoordinator {
                         jobDir,
                         current,
                         MediaStoreExportJournal.list(jobDir),
-                        recoveredAttemptIds.takeIf { activeOperationKind == KeplerActiveOperationKind.PUBLIC_EXPORT.name }
+                        null
                     )
                 }
+            }
+            if (terminalOperationId == activeOperation && activeOperation.isNotBlank() &&
+                job.optString("currentPipelineStage") in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")) {
+                markMediaStoreExportJournalsTerminalPersisted(jobDir)
+                KeplerJobMetadata.clearRecoveredActiveOperation(jobDir, activeOperation)
+                return KeplerJobRecoveryResult(
+                    jobDir,
+                    KeplerJobRecoveryClassification.RECOVERED,
+                    actions = exportResults.map { it.classification.name },
+                    cleanupFailures = cleanupFailures
+                )
             }
             val captureTemps = recoverCaptureOwnedTemps(jobDir, job, activeOperation.isNotBlank())
             if (activeOperation.isBlank() && job.optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()) {
@@ -308,7 +339,6 @@ internal object KeplerRecoveryCoordinator {
                     failures = metadataTemps.failures + captureTemps.failures
                 )
             }
-            val invalidExportJournals = MediaStoreExportJournal.invalidFiles(jobDir)
             if (invalidExportJournals.isNotEmpty()) {
                 KeplerJobMetadata.update(jobDir) {
                     it.put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
@@ -317,7 +347,8 @@ internal object KeplerRecoveryCoordinator {
                 return KeplerJobRecoveryResult(
                     jobDir,
                     KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED,
-                    failures = invalidExportJournals.map { "Invalid export journal: ${it.name}" }
+                    failures = invalidExportJournals.map { "Invalid export journal: ${it.name}" },
+                    cleanupFailures = cleanupFailures
                 )
             }
             if (isLegacyActiveJob(job)) {

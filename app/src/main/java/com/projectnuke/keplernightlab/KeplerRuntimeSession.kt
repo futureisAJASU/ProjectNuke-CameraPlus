@@ -27,6 +27,7 @@ internal const val PROCESSING_HANDOFF_RUNTIME_SESSION_ID = "processingHandoffRun
 internal const val PROCESSING_HANDOFF_OPERATION_ID = "processingHandoffOperationId"
 internal const val PROCESSING_HANDOFF_KIND = "processingHandoffKind"
 internal const val PROCESSING_HANDOFF_CREATED_AT = "processingHandoffCreatedAt"
+internal const val TERMINAL_OPERATION_ID = "terminalOperationId"
 
 internal fun processingOperationKind(mode: String): KeplerActiveOperationKind = when {
     mode.contains("SUPER", ignoreCase = true) -> KeplerActiveOperationKind.SUPER_RESOLUTION

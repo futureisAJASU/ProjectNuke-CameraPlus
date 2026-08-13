@@ -212,6 +212,23 @@ object KeplerJobMetadata {
         matched
     }.getOrDefault(false)
 
+    /** Clears a dead-process marker only after recovery has matched its exact operation. */
+    internal fun clearRecoveredActiveOperation(jobDir: File, operationId: String): Boolean = runCatching {
+        var matched = false
+        update(jobDir) { job ->
+            if (job.optString(ACTIVE_OPERATION_ID) != operationId ||
+                job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id
+            ) return@update
+            matched = true
+            job.remove(ACTIVE_RUNTIME_SESSION_ID)
+            job.remove(ACTIVE_OPERATION_ID)
+            job.remove(ACTIVE_OPERATION_KIND)
+            job.remove(ACTIVE_OPERATION_STARTED_AT)
+            job.remove(ACTIVE_OPERATION_UPDATED_AT)
+        }
+        matched
+    }.getOrDefault(false)
+
     fun atomicWrite(file: File, text: String) {
         val parent = file.parentFile ?: error("job metadata parent missing")
         requireRealJobDirectory(parent)
