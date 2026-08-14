@@ -33,6 +33,20 @@ internal enum class JobRecoveryMutationIntent {
     JOB_DELETE
 }
 
+/**
+ * Process-local retry input for a PUBLIC_EXPORT terminal settlement which
+ * could not complete before its owning worker scope returned.  The durable
+ * journals and job metadata remain the authority; this record only preserves
+ * the exact operation/disposition needed to retry that ordered protocol while
+ * the original lease is still registered.
+ */
+internal data class PendingPublicExportSettlement(
+    val operationId: String,
+    val failureMessage: String,
+    val finalOutputFormat: FinalOutputFormat?,
+    val disposition: PublicExportInterruptionDisposition
+)
+
 internal enum class JobRecoveryMutationGateOutcome {
     ALLOWED,
     BLOCKED_DEAD_OPERATION,
@@ -85,6 +99,9 @@ object KeplerJobMetadata {
 
     @Volatile
     internal var atomicWriteFailureForTest: Throwable? = null
+
+    /** Optional ordered test failures; null entries allow a write to pass. */
+    internal var atomicWriteFailureSequenceForTest: MutableList<Throwable?>? = null
 
     /** Narrow lease/metadata test seam: incremented each time a lease is actually released (the
      *  idempotent guard has NOT skipped the release). Tests must save & restore in `finally`. */
@@ -262,6 +279,26 @@ object KeplerJobMetadata {
         jobDir: File,
         lease: JobOperationLease
     ): Boolean {
+        val pendingPublicExport = lease.pendingPublicExportSettlement()
+        if (pendingPublicExport != null) {
+            val settled = try {
+                settleOwnedPublicExportInterruption(
+                    jobDir = jobDir,
+                    ownerLease = lease,
+                    failureMessage = pendingPublicExport.failureMessage,
+                    finalOutputFormat = pendingPublicExport.finalOutputFormat,
+                    disposition = pendingPublicExport.disposition
+                )
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                false
+            }
+            if (!settled) return false
+            lease.completePublicExportSettlement(pendingPublicExport.operationId)
+            lease.release()
+            return true
+        }
         if (lease.hasPendingProcessingHandoffSettlement()) {
             val handoffPresent = try {
                 read(jobDir).optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()
@@ -496,6 +533,7 @@ object KeplerJobMetadata {
                     .put(ACTIVE_OPERATION_UPDATED_AT, startedAt)
                 job.remove(TERMINAL_OPERATION_ID)
             }
+            lease.markDurableOperation(operationId, kind)
             operationId
         } catch (failure: Throwable) {
             if (ownerLease == null) {
@@ -594,6 +632,7 @@ object KeplerJobMetadata {
                 job.remove(ACTIVE_OPERATION_UPDATED_AT)
             }
             if (matched) releaseAutoOperation(jobDir)
+            if (matched) ownerLease?.clearDurableOperation(operationId)
             matched
         } catch (failure: Error) {
             ownerLease?.markDurableSettlementPending(operationId)
@@ -826,6 +865,11 @@ object KeplerJobMetadata {
     }
 
     fun atomicWrite(file: File, text: String) {
+        atomicWriteFailureSequenceForTest?.let { failures ->
+            if (failures.isNotEmpty()) {
+                failures.removeAt(0)?.let { throw it }
+            }
+        }
         atomicWriteFailureForTest?.let { failure ->
             atomicWriteFailureForTest = null
             throw failure
@@ -871,6 +915,12 @@ class JobOperationLease internal constructor(internal val key: String) {
     private val lastProcessingAttemptId = java.util.concurrent.atomic.AtomicReference<String?>(null)
     private val pendingDurableSettlementId = java.util.concurrent.atomic.AtomicReference<String?>(null)
     private val pendingProcessingHandoffSettlement = AtomicBoolean(false)
+    private val pendingPublicExportSettlement =
+        java.util.concurrent.atomic.AtomicReference<PendingPublicExportSettlement?>(null)
+    private val currentDurableOperationId =
+        java.util.concurrent.atomic.AtomicReference<String?>(null)
+    private val currentDurableOperationKind =
+        java.util.concurrent.atomic.AtomicReference<KeplerActiveOperationKind?>(null)
 
     internal fun claimProcessingAttempt(attemptId: String): Boolean {
         if (released.get() || !processingAttemptId.compareAndSet(null, attemptId)) return false
@@ -889,6 +939,44 @@ class JobOperationLease internal constructor(internal val key: String) {
     internal fun markDurableSettlementPending(operationId: String) {
         pendingDurableSettlementId.compareAndSet(null, operationId)
     }
+
+    internal fun markDurableOperation(operationId: String, kind: KeplerActiveOperationKind) {
+        currentDurableOperationId.set(operationId)
+        currentDurableOperationKind.set(kind)
+    }
+
+    internal fun clearDurableOperation(operationId: String) {
+        if (currentDurableOperationId.compareAndSet(operationId, null)) {
+            currentDurableOperationKind.set(null)
+        }
+    }
+
+    internal fun currentDurableOperationId(): String? = currentDurableOperationId.get()
+
+    internal fun currentDurableOperationKind(): KeplerActiveOperationKind? =
+        currentDurableOperationKind.get()
+
+    internal fun markPublicExportSettlementPending(
+        settlement: PendingPublicExportSettlement
+    ): Boolean {
+        val existing = pendingPublicExportSettlement.get()
+        if (existing != null) {
+            check(existing.operationId == settlement.operationId) {
+                "A different PUBLIC_EXPORT settlement already owns this lease"
+            }
+            return false
+        }
+        return pendingPublicExportSettlement.compareAndSet(null, settlement)
+    }
+
+    internal fun pendingPublicExportSettlement(): PendingPublicExportSettlement? =
+        pendingPublicExportSettlement.get()
+
+    internal fun completePublicExportSettlement(operationId: String): Boolean =
+        pendingPublicExportSettlement.get()?.let { pending ->
+            if (pending.operationId != operationId) return false
+            pendingPublicExportSettlement.compareAndSet(pending, null)
+        } ?: true
 
     internal fun markProcessingSettlementPending(attemptId: String) {
         lastProcessingAttemptId.compareAndSet(null, attemptId)
@@ -920,6 +1008,7 @@ class JobOperationLease internal constructor(internal val key: String) {
      * current-runtime marker.
      */
     internal fun releaseIfProcessingSettled(): Boolean {
+        if (pendingPublicExportSettlement.get() != null) return false
         val attemptId = lastProcessingAttemptId.get()
         if (attemptId != null && isProcessingAttemptOwner(attemptId)) return false
         release()

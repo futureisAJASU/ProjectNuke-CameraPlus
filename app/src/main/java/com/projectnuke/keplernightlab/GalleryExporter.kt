@@ -180,12 +180,29 @@ internal enum class PublicExportInterruptionDisposition {
     FAILED
 }
 
+private fun JobOperationLease.registerPublicExportSettlement(
+    operationId: String,
+    failureMessage: String,
+    finalOutputFormat: FinalOutputFormat?,
+    disposition: PublicExportInterruptionDisposition
+) {
+    markPublicExportSettlementPending(
+        PendingPublicExportSettlement(
+            operationId = operationId,
+            failureMessage = failureMessage,
+            finalOutputFormat = finalOutputFormat,
+            disposition = disposition
+        )
+    )
+}
+
 internal fun publicExportInterruptionTerminalKind(
     evidence: OwnedPublicExportEvidence?,
     cancellationRequested: Boolean,
-    committedFallback: Boolean = false
+    committedFallback: Boolean = false,
+    requiredOutputCommitted: Boolean = false
 ): CameraPipelineEvent.Terminal.Kind = when {
-    evidence?.committed == true || committedFallback -> CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+    evidence?.committed == true || committedFallback || requiredOutputCommitted -> CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
     cancellationRequested -> CameraPipelineEvent.Terminal.Kind.CANCELLED
     else -> CameraPipelineEvent.Terminal.Kind.FAILED
 }
@@ -236,14 +253,35 @@ internal fun settleOwnedPublicExportInterruption(
     check(KeplerJobMetadata.isOperationOwner(jobDir, ownerLease)) {
         "Public export settlement requires the exact owning lease"
     }
+    val rememberedOperationId = ownerLease.currentDurableOperationId()
+    if (rememberedOperationId != null &&
+        ownerLease.currentDurableOperationKind() == KeplerActiveOperationKind.PUBLIC_EXPORT
+    ) {
+        ownerLease.registerPublicExportSettlement(
+            operationId = rememberedOperationId,
+            failureMessage = failureMessage,
+            finalOutputFormat = finalOutputFormat,
+            disposition = disposition
+        )
+    }
     val metadata = KeplerJobMetadata.read(jobDir)
     val operationId = metadata.optString(ACTIVE_OPERATION_ID)
     if (operationId.isBlank() || metadata.optString(ACTIVE_OPERATION_KIND) != KeplerActiveOperationKind.PUBLIC_EXPORT.name) {
+        ownerLease.pendingPublicExportSettlement()?.let {
+            ownerLease.completePublicExportSettlement(it.operationId)
+        }
+        if (operationId.isBlank()) rememberedOperationId?.let(ownerLease::clearDurableOperation)
         return true
     }
     check(metadata.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id) {
         "Public export settlement requires a current-runtime owner"
     }
+    ownerLease.registerPublicExportSettlement(
+        operationId = operationId,
+        failureMessage = failureMessage,
+        finalOutputFormat = finalOutputFormat,
+        disposition = disposition
+    )
     val invalid = MediaStoreExportJournal.invalidFiles(jobDir)
     val ownerJournals = MediaStoreExportJournal.list(jobDir)
         .filter { it.ownerOperationId == operationId }
@@ -321,6 +359,10 @@ internal fun settleOwnedPublicExportInterruption(
         job.remove(ACTIVE_OPERATION_STARTED_AT)
         job.remove(ACTIVE_OPERATION_UPDATED_AT)
     }
+    check(ownerLease.completePublicExportSettlement(operationId)) {
+        "Public export settlement debt changed during successful settlement"
+    }
+    ownerLease.clearDurableOperation(operationId)
     return true
 }
 
