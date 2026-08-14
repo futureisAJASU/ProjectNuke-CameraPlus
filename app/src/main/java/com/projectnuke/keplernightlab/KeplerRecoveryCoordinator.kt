@@ -347,10 +347,21 @@ internal object KeplerRecoveryCoordinator {
                     )
                 }
                 val artifactCleanupDebt = artifactResults
-                    .filter { it.classification == ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT }
+                    .filter {
+                        it.classification == ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT ||
+                            it.classification == ProcessingArtifactRecoveryClassification.RESTORED_PRIOR_WITH_CLEANUP_DEBT
+                    }
                     .mapNotNull { it.message ?: "처리 파일 정리 결과를 확인할 수 없습니다." }
                 if (artifactCleanupDebt.isNotEmpty()) {
-                    check(KeplerJobMetadata.recordProcessingCleanupRequired(jobDir, null, artifactCleanupDebt)) {
+                    val cleanupHistory = if (artifactResults.any {
+                            it.classification == ProcessingArtifactRecoveryClassification.RESTORED_PRIOR ||
+                                it.classification == ProcessingArtifactRecoveryClassification.RESTORED_PRIOR_WITH_CLEANUP_DEBT
+                        }) {
+                        KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name
+                    } else {
+                        KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL.name
+                    }
+                    check(KeplerJobMetadata.recordProcessingCleanupRequired(jobDir, null, artifactCleanupDebt, cleanupHistory)) {
                         "Could not durably record processing cleanup debt"
                     }
                     return KeplerJobRecoveryResult(
@@ -403,8 +414,19 @@ internal object KeplerRecoveryCoordinator {
                 }
                 val localCommitted = job.optBoolean("processingOutputCommitted", false)
                 val artifactCleanupDebt = artifactResults
-                    .filter { it.classification == ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT }
+                    .filter {
+                        it.classification == ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT ||
+                            it.classification == ProcessingArtifactRecoveryClassification.RESTORED_PRIOR_WITH_CLEANUP_DEBT
+                    }
                     .mapNotNull { it.message ?: "처리 파일 정리 결과를 확인할 수 없습니다." }
+                val cleanupHistory = if (artifactResults.any {
+                        it.classification == ProcessingArtifactRecoveryClassification.RESTORED_PRIOR ||
+                            it.classification == ProcessingArtifactRecoveryClassification.RESTORED_PRIOR_WITH_CLEANUP_DEBT
+                    }) {
+                    KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name
+                } else {
+                    KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL.name
+                }
                 val publicCommitted = job.optBoolean("galleryExportCommitted", false)
                 val publicVerified = job.optBoolean("exportVerified", false)
                 val classification = when {
@@ -421,7 +443,7 @@ internal object KeplerRecoveryCoordinator {
                         "이전 실행에서 남은 처리 증거를 안전하게 확인했습니다."
                     )) { "Could not durably finalize interrupted operation $activeOperation" }
                 } else {
-                    check(KeplerJobMetadata.recordProcessingCleanupRequired(jobDir, activeOperation, artifactCleanupDebt)) {
+                    check(KeplerJobMetadata.recordProcessingCleanupRequired(jobDir, activeOperation, artifactCleanupDebt, cleanupHistory)) {
                         "Could not durably record processing cleanup debt"
                     }
                 }

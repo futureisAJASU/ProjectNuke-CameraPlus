@@ -1819,8 +1819,7 @@ fun deleteKeplerCache(context: Context): Pair<Int, CleanupStatus> {
     val targets = listOf(
         File(picturesDir, "KeplerRaw"),
         File(picturesDir, "KeplerRawBurst"),
-        File(picturesDir, "KeplerYuvBurst"),
-        File(picturesDir, "KeplerColorBurst")
+        File(picturesDir, "KeplerYuvBurst")
     )
 
     var deletedCount = 0

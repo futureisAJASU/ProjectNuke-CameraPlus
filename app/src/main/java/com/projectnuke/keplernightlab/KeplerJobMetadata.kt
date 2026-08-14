@@ -24,13 +24,27 @@ internal class ProcessingCleanupRequiredException : IllegalStateException(
 )
 internal const val PROCESSING_CLEANUP_REQUIRED = "PROCESSING_CLEANUP_REQUIRED"
 
+internal enum class JobRecoveryMutationIntent {
+    PROCESSING_START,
+    REPROCESS,
+    FRAME_SELECTION,
+    METADATA_EDIT,
+    JOB_CLEANUP,
+    JOB_DELETE
+}
+
 internal enum class JobRecoveryMutationGateOutcome {
     ALLOWED,
+    BLOCKED_DEAD_OPERATION,
+    BLOCKED_HANDOFF,
+    BLOCKED_ORPHANED_JOB_METADATA,
     BLOCKED_PROCESSING_CLEANUP,
     BLOCKED_AMBIGUOUS_RECOVERY,
     BLOCKED_PUBLIC_COMMIT_MISSING,
     BLOCKED_EXPORT_VERIFICATION,
     BLOCKED_INVALID_PROCESSING_JOURNAL,
+    BLOCKED_INVALID_EXPORT_JOURNAL,
+    BLOCKED_SETTLED_JOURNAL,
     BLOCKED_REPROCESS_QUARANTINE,
     INSPECTION_FAILED
 }
@@ -39,6 +53,9 @@ internal class JobRecoveryMutationBlockedException(
     val outcome: JobRecoveryMutationGateOutcome
 ) : IllegalStateException(
     when (outcome) {
+        JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION -> "이전 실행의 작업 소유권이 아직 복구되지 않아 지금은 작업을 변경할 수 없습니다."
+        JobRecoveryMutationGateOutcome.BLOCKED_HANDOFF -> "촬영 결과의 처리 인계가 아직 완료되지 않아 지금은 작업을 변경할 수 없습니다."
+        JobRecoveryMutationGateOutcome.BLOCKED_ORPHANED_JOB_METADATA -> "작업 메타데이터가 없어 복구 확인 전에는 작업을 변경할 수 없습니다."
         JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP -> "이전 처리 작업의 파일 정리가 완료되지 않아 지금은 작업을 변경할 수 없습니다."
         JobRecoveryMutationGateOutcome.BLOCKED_AMBIGUOUS_RECOVERY -> "복구되지 않은 작업 증거가 있어 지금은 작업을 변경할 수 없습니다."
         JobRecoveryMutationGateOutcome.BLOCKED_PUBLIC_COMMIT_MISSING -> "공개 결과의 커밋 증거가 없어 지금은 작업을 변경할 수 없습니다."
@@ -46,6 +63,8 @@ internal class JobRecoveryMutationBlockedException(
         JobRecoveryMutationGateOutcome.BLOCKED_INVALID_PROCESSING_JOURNAL -> "처리 복구 기록을 읽을 수 없어 지금은 작업을 변경할 수 없습니다."
         JobRecoveryMutationGateOutcome.BLOCKED_REPROCESS_QUARANTINE -> "복구 중인 작업은 지금 변경할 수 없습니다."
         JobRecoveryMutationGateOutcome.INSPECTION_FAILED -> "작업 복구 상태를 확인하지 못해 지금은 작업을 변경할 수 없습니다."
+        JobRecoveryMutationGateOutcome.BLOCKED_INVALID_EXPORT_JOURNAL -> "내보내기 복구 기록을 읽을 수 없어 지금은 작업을 변경할 수 없습니다."
+        JobRecoveryMutationGateOutcome.BLOCKED_SETTLED_JOURNAL -> "완료된 처리 기록의 정리가 끝나지 않아 지금은 결과 경로를 변경할 수 없습니다."
         JobRecoveryMutationGateOutcome.ALLOWED -> ""
     }
 )
@@ -84,34 +103,85 @@ object KeplerJobMetadata {
     internal fun <T> withJobLock(jobDir: File, block: () -> T): T =
         synchronized(lockFor(jobDir), block)
 
-    internal fun inspectRecoveryMutationGate(jobDir: File): JobRecoveryMutationGateOutcome =
-        withJobLock(jobDir) {
-            try {
-                if (isReprocessQuarantined(jobDir)) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_REPROCESS_QUARANTINE
-                val scan = ProcessingArtifactJournal.scan(jobDir)
-                if (scan.invalidFiles.isNotEmpty()) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_INVALID_PROCESSING_JOURNAL
-                if (scan.validJournals.any { isUnresolvedAuthoritativeProcessingJournal(it.second) }) {
-                    return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP
+    internal fun inspectRecoveryMutationGate(
+        jobDir: File,
+        intent: JobRecoveryMutationIntent,
+        consumesProcessingHandoff: Boolean = false
+    ): JobRecoveryMutationGateOutcome = withJobLock(jobDir) {
+        try {
+            if (isReprocessQuarantined(jobDir)) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_REPROCESS_QUARANTINE
+            val processingScan = ProcessingArtifactJournal.scan(jobDir)
+            if (processingScan.invalidFiles.isNotEmpty()) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_INVALID_PROCESSING_JOURNAL
+            val exportInvalid = MediaStoreExportJournal.invalidFiles(jobDir)
+            if (exportInvalid.isNotEmpty()) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_INVALID_EXPORT_JOURNAL
+            val children = NoFollowFileSystem.requireDirectChildren(jobDir)
+            val job = try {
+                read(jobDir)
+            } catch (_: KeplerJobMetadataMissing) {
+                val empty = children.isEmpty()
+                return@withJobLock if (intent == JobRecoveryMutationIntent.PROCESSING_START && empty) {
+                    JobRecoveryMutationGateOutcome.ALLOWED
+                } else {
+                    JobRecoveryMutationGateOutcome.BLOCKED_ORPHANED_JOB_METADATA
                 }
-                val job = try {
-                    read(jobDir)
-                } catch (_: KeplerJobMetadataMissing) {
-                    return@withJobLock JobRecoveryMutationGateOutcome.ALLOWED
-                }
-                when (job.optString("recoveryState")) {
-                    PROCESSING_CLEANUP_REQUIRED -> JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP
-                    "AMBIGUOUS_RECOVERY_REQUIRED" -> JobRecoveryMutationGateOutcome.BLOCKED_AMBIGUOUS_RECOVERY
-                    "PUBLIC_COMMIT_MISSING" -> JobRecoveryMutationGateOutcome.BLOCKED_PUBLIC_COMMIT_MISSING
-                    "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION" -> JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION
-                    else -> JobRecoveryMutationGateOutcome.ALLOWED
-                }
-            } catch (_: Exception) {
-                JobRecoveryMutationGateOutcome.INSPECTION_FAILED
             }
+            val activeId = job.optString(ACTIVE_OPERATION_ID)
+            val activeRuntime = job.optString(ACTIVE_RUNTIME_SESSION_ID)
+            val handoffId = job.optString(PROCESSING_HANDOFF_OPERATION_ID)
+            val handoffRuntime = job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID)
+            if (activeId.isNotBlank()) {
+                val handoffConsumerAllowed = intent == JobRecoveryMutationIntent.PROCESSING_START &&
+                    consumesProcessingHandoff &&
+                    handoffId.isNotBlank() &&
+                    handoffRuntime == KeplerRuntimeSession.id &&
+                    activeRuntime == KeplerRuntimeSession.id &&
+                    job.optString(ACTIVE_OPERATION_KIND) in setOf(
+                        KeplerActiveOperationKind.CAPTURE_YUV.name,
+                        KeplerActiveOperationKind.CAPTURE_RAW.name
+                    )
+                if (!handoffConsumerAllowed) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION
+            } else if (handoffId.isNotBlank()) {
+                if (!(intent == JobRecoveryMutationIntent.PROCESSING_START &&
+                        consumesProcessingHandoff && handoffRuntime == KeplerRuntimeSession.id)) {
+                    return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_HANDOFF
+                }
+            }
+            val settledAuthoritative = processingScan.validJournals.any {
+                it.second.state == ProcessingArtifactJournalState.SETTLED &&
+                    it.second.claimKey != null && it.second.processingAttemptId != null
+            }
+            if (settledAuthoritative && !reconcileSettledAuthoritativeProcessingJournals(jobDir, job)) {
+                return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_SETTLED_JOURNAL
+            }
+            val exportJournals = MediaStoreExportJournal.list(jobDir)
+            val exportBlocks = exportJournals.any { journal ->
+                journal.state in setOf(
+                    MediaStoreExportState.PREPARED,
+                    MediaStoreExportState.ROW_INSERTED,
+                    MediaStoreExportState.CONTENT_WRITTEN,
+                    MediaStoreExportState.PUBLIC_COMMITTED,
+                    MediaStoreExportState.CLEANUP_REQUIRED
+                )
+            }
+            if (exportBlocks) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION
+            when (job.optString("recoveryState")) {
+                PROCESSING_CLEANUP_REQUIRED -> JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP
+                "AMBIGUOUS_RECOVERY_REQUIRED" -> JobRecoveryMutationGateOutcome.BLOCKED_AMBIGUOUS_RECOVERY
+                "PUBLIC_COMMIT_MISSING" -> JobRecoveryMutationGateOutcome.BLOCKED_PUBLIC_COMMIT_MISSING
+                "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION" -> JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION
+                else -> JobRecoveryMutationGateOutcome.ALLOWED
+            }
+        } catch (_: Exception) {
+            JobRecoveryMutationGateOutcome.INSPECTION_FAILED
         }
+    }
 
-    internal fun requireRecoveryMutationAllowed(jobDir: File) {
-        val outcome = inspectRecoveryMutationGate(jobDir)
+    internal fun requireRecoveryMutationAllowed(
+        jobDir: File,
+        intent: JobRecoveryMutationIntent,
+        consumesProcessingHandoff: Boolean = false
+    ) {
+        val outcome = inspectRecoveryMutationGate(jobDir, intent, consumesProcessingHandoff)
         if (outcome == JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP) {
             throw ProcessingCleanupRequiredException()
         }
@@ -135,7 +205,8 @@ object KeplerJobMetadata {
     internal fun recordProcessingCleanupRequired(
         jobDir: File,
         operationId: String?,
-        failures: List<String>
+        failures: List<String>,
+        historicalClassification: String = "LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL"
     ): Boolean {
         var matched = false
         update(jobDir) { job ->
@@ -146,7 +217,7 @@ object KeplerJobMetadata {
             matched = true
             job.put("recoveryState", PROCESSING_CLEANUP_REQUIRED)
                 .put("processingCleanupDebt", JSONArray(failures.distinct()))
-                .put("lastRecoveryClassification", "LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL")
+                .put("lastRecoveryClassification", historicalClassification)
                 .put("lastRecoveryMessage", "처리 결과는 보존되었지만 이전 작업의 파일 정리가 아직 완료되지 않았습니다.")
                 .put("recoveredAt", System.currentTimeMillis())
                 .put("recoveryMessage", "이전 처리 작업의 파일 정리가 완료되지 않아 지금은 다시 합성할 수 없습니다.")
@@ -419,7 +490,6 @@ object KeplerJobMetadata {
                 .put("lastRecoveryClassification", KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name)
                 .put("lastRecoveryMessage", "처리가 시작되기 전 이전 실행이 종료되었지만 원본 프레임을 다시 사용할 수 있습니다.")
                 .put("recoveredAt", System.currentTimeMillis())
-                .put(PROCESSING_HANDOFF_FINALIZED, true)
             job.remove("recoveryMessage")
             job.remove(PROCESSING_HANDOFF_RUNTIME_SESSION_ID)
             job.remove(PROCESSING_HANDOFF_OPERATION_ID)

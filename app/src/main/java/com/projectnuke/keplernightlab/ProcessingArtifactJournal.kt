@@ -24,6 +24,9 @@ internal enum class ProcessingArtifactJournalState {
 
 internal class ProcessingArtifactClaimConflictException(message: String) : IllegalStateException(message)
 
+@Volatile
+internal var processingArtifactJournalDeleteFailureForTest: Boolean = false
+
 internal data class ProcessingArtifactJournalScan(
     val validJournals: List<Pair<File, ProcessingArtifactJournal>>,
     val invalidFiles: List<File>
@@ -57,6 +60,32 @@ internal fun isKnownProcessingArtifactClaimKey(job: JSONObject?, claimKey: Strin
             jobType == "YUV_NIGHT_FUSION" || jobType == "YUV_SINGLE_FRAME" -> claimKey == "finalFile"
         else -> false
     }
+}
+
+internal fun reconcileSettledAuthoritativeProcessingJournals(
+    jobDir: File,
+    job: JSONObject
+): Boolean {
+    val settled = ProcessingArtifactJournal.scan(jobDir).validJournals
+        .map { it.second }
+        .filter {
+            it.state == ProcessingArtifactJournalState.SETTLED &&
+                it.claimKey != null && it.processingAttemptId != null
+        }
+    settled.forEach { journal ->
+        val claimKey = journal.claimKey ?: return@forEach
+        val attemptId = journal.processingAttemptId ?: return@forEach
+        val exactClaim = journal.adoptedResult == "NEW_FINAL" &&
+            job.optString(claimKey) == journal.finalName &&
+            job.optBoolean("processingOutputCommitted", false) &&
+            job.optString("processingArtifactClaimAttemptId") == attemptId
+        if (!exactClaim) return false
+        val final = NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true)
+            ?: return false
+        if (runCatching { verifyProcessingArtifactRecovery(journal, final, prior = false) }.isFailure) return false
+        if (!journal.deleteIfOwned(jobDir)) return false
+    }
+    return true
 }
 
 internal data class ProcessingArtifactJournal(
@@ -112,10 +141,15 @@ internal data class ProcessingArtifactJournal(
         updatedAt = System.currentTimeMillis()
     ).also { it.writeTo(jobDir) }
 
-    fun deleteIfOwned(jobDir: File) {
+    fun deleteIfOwned(jobDir: File): Boolean {
         require(NoFollowFileSystem.isRealDirectory(jobDir.toPath()))
         val file = fileFor(jobDir)
-        if (NoFollowFileSystem.isRealFile(file.toPath())) Files.deleteIfExists(file.toPath())
+        if (processingArtifactJournalDeleteFailureForTest) return false
+        if (!Files.exists(file.toPath(), LinkOption.NOFOLLOW_LINKS)) return true
+        if (!NoFollowFileSystem.isRealFile(file.toPath())) return false
+        return runCatching {
+            Files.deleteIfExists(file.toPath()) && !Files.exists(file.toPath(), LinkOption.NOFOLLOW_LINKS)
+        }.getOrDefault(false)
     }
 
     private fun validateNames() {
@@ -233,17 +267,24 @@ internal data class ProcessingArtifactJournal(
             ).also { it.validateNames() }
         }
 
-        fun list(jobDir: File): List<File> = NoFollowFileSystem.requireDirectChildren(jobDir)
-            .filter { it.name.startsWith(PREFIX) && it.name.endsWith(SUFFIX) && NoFollowFileSystem.isRealFile(it.toPath()) }
+        private fun namespaceFiles(jobDir: File): List<File> = NoFollowFileSystem.requireDirectChildren(jobDir)
+            .filter { it.name.startsWith(PREFIX) && it.name.endsWith(SUFFIX) }
+
+        fun list(jobDir: File): List<File> = namespaceFiles(jobDir)
+            .filter { NoFollowFileSystem.isRealFile(it.toPath()) }
 
         internal fun scan(jobDir: File): ProcessingArtifactJournalScan {
-            val files = list(jobDir)
+            val files = namespaceFiles(jobDir)
             val valid = mutableListOf<Pair<File, ProcessingArtifactJournal>>()
             val invalid = mutableListOf<File>()
             files.forEach { file ->
-                runCatching { read(file) }
-                    .onSuccess { valid += file to it }
-                    .onFailure { invalid += file }
+                if (!NoFollowFileSystem.isRealFile(file.toPath())) {
+                    invalid += file
+                } else {
+                    runCatching { read(file) }
+                        .onSuccess { valid += file to it }
+                        .onFailure { invalid += file }
+                }
             }
             return ProcessingArtifactJournalScan(valid, invalid)
         }
@@ -253,6 +294,7 @@ internal data class ProcessingArtifactJournal(
 internal enum class ProcessingArtifactRecoveryClassification {
     SETTLED_TEMP,
     RESTORED_PRIOR,
+    RESTORED_PRIOR_WITH_CLEANUP_DEBT,
     ADOPTED_CURRENT,
     ADOPTED_CURRENT_WITH_CLEANUP_DEBT,
     AMBIGUOUS,
@@ -269,9 +311,11 @@ internal fun recoverProcessingArtifactJournals(
     jobDir: File,
     job: JSONObject? = null
 ): List<ProcessingArtifactRecoveryResult> {
-    val journalFiles = ProcessingArtifactJournal.list(jobDir)
+    val scan = ProcessingArtifactJournal.scan(jobDir)
+    val journalFiles = scan.validJournals.map { it.first } + scan.invalidFiles
     val parsedByFile = journalFiles.associateWith { journalFile ->
-        runCatching { ProcessingArtifactJournal.read(journalFile) }
+        scan.validJournals.firstOrNull { it.first == journalFile }?.second?.let { Result.success(it) }
+            ?: Result.failure<ProcessingArtifactJournal>(IllegalStateException("Invalid processing journal evidence"))
     }
     val parsedJournals = parsedByFile.values.mapNotNull { it.getOrNull() }
     val conflictingTransactions = parsedJournals
@@ -298,7 +342,7 @@ internal fun recoverProcessingArtifactJournals(
     if (preflightJournal.transactionId in invalidClaimTransactions) {
         return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.INVALID_JOURNAL, "processing artifact claim key is not valid for this processing mode")
     }
-    val journal = preflightJournal
+    var journal = preflightJournal
     val final = NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true)
     val temp = NoFollowFileSystem.resolveDirectChild(jobDir, journal.tempName, requireFile = true)
     val prior = NoFollowFileSystem.resolveDirectChild(jobDir, journal.priorName, requireFile = true)
@@ -320,6 +364,12 @@ internal fun recoverProcessingArtifactJournals(
             Files.move(source.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING)
         }
     }
+    // A move may have completed before the post-move journal transition. Advance this
+    // transaction in place so the continuation below cannot rescan unrelated journals.
+    if (journal.state == ProcessingArtifactJournalState.NEW_FINAL_MOVE_STARTED &&
+        final != null && valid(final) && temp == null) {
+        journal = journal.transition(jobDir, ProcessingArtifactJournalState.NEW_FINAL_MOVED)
+    }
     when (journal.state) {
         ProcessingArtifactJournalState.PREPARED,
         ProcessingArtifactJournalState.TEMP_WRITTEN,
@@ -337,7 +387,7 @@ internal fun recoverProcessingArtifactJournals(
         ProcessingArtifactJournalState.PRIOR_BACKED_UP,
         ProcessingArtifactJournalState.ROLLBACK_STARTED -> when {
             prior == null && journal.priorSemanticVerified && valid(final, prior = true) -> {
-                if (!deleteExact(temp)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT, "restored prior verified but temporary cleanup failed")
+                if (!deleteExact(temp)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.RESTORED_PRIOR_WITH_CLEANUP_DEBT, "restored prior verified but temporary cleanup failed")
                 journal.transition(jobDir, ProcessingArtifactJournalState.PRIOR_RESTORED, adoptedResultOverride = "PRIOR_FINAL")
                     .transition(jobDir, ProcessingArtifactJournalState.SETTLED, adoptedResultOverride = "PRIOR_FINAL")
                     .deleteIfOwned(jobDir)
@@ -377,19 +427,14 @@ internal fun recoverProcessingArtifactJournals(
                     ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.SETTLED_TEMP, "move did not begin before process interruption")
                 }
             }
-            final != null && valid(final) && temp == null -> {
-                // The move completed before the post-move journal transition. Re-enter the
-                // same adoption path used by NEW_FINAL_MOVED without guessing from existence.
-                journal.transition(jobDir, ProcessingArtifactJournalState.NEW_FINAL_MOVED)
-                return@map recoverProcessingArtifactJournals(jobDir, job).firstOrNull { it.journalFile == journalFile }
-                    ?: ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS)
-            }
             prior != null && valid(prior, prior = true) && final == null -> {
                 val priorFile = prior
                 movePriorToFinal(priorFile, File(jobDir, journal.finalName))
                 val restored = NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true)
-                if (!valid(restored, prior = true) || !deleteExact(temp)) {
-                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "move-intent recovery could not settle prior and temporary evidence")
+                if (!valid(restored, prior = true)) {
+                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "move-intent recovery could not verify restored prior")
+                } else if (!deleteExact(temp)) {
+                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.RESTORED_PRIOR_WITH_CLEANUP_DEBT, "restored prior verified but temporary cleanup failed")
                 } else {
                     journal.transition(jobDir, ProcessingArtifactJournalState.PRIOR_RESTORED, adoptedResultOverride = "PRIOR_FINAL")
                         .transition(jobDir, ProcessingArtifactJournalState.SETTLED, adoptedResultOverride = "PRIOR_FINAL")
@@ -477,7 +522,7 @@ internal fun recoverProcessingArtifactJournals(
                 movePriorToFinal(priorFile, File(jobDir, journal.finalName))
                 val restored = NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true)
                 if (!valid(restored, prior = true)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "restored prior failed verification")
-                if (!deleteExact(temp)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "temporary cleanup failed after prior restoration")
+                if (!deleteExact(temp)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.RESTORED_PRIOR_WITH_CLEANUP_DEBT, "restored prior verified but temporary cleanup failed")
                 journal.transition(jobDir, ProcessingArtifactJournalState.PRIOR_RESTORED, adoptedResultOverride = "PRIOR_FINAL")
                     .transition(jobDir, ProcessingArtifactJournalState.SETTLED, adoptedResultOverride = "PRIOR_FINAL")
                     .deleteIfOwned(jobDir)
@@ -511,7 +556,15 @@ internal fun recoverProcessingArtifactJournals(
             if (priorResult && !journal.priorSemanticVerified) {
                 return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "settled prior lacks semantic verification evidence")
             }
-            if (valid(final, prior = priorResult)) journalFile.delete() else return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "settled journal final is not verifiable")
+            if (valid(final, prior = priorResult)) {
+                if (!journal.deleteIfOwned(jobDir)) {
+                    return@map ProcessingArtifactRecoveryResult(
+                        journalFile,
+                        ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT,
+                        "settled processing journal cleanup failed"
+                    )
+                }
+            } else return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "settled journal final is not verifiable")
             if (priorResult) ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.RESTORED_PRIOR)
             else ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT)
         }

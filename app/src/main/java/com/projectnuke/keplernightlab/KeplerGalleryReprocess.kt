@@ -494,8 +494,10 @@ suspend fun reprocessKeplerGalleryJob(
     catch (e: Error) { throw e }
     catch (sf: Exception) { return@withContext Result.failure(sf) }
     try {
-        KeplerJobMetadata.requireRecoveryMutationAllowed(target)
+        KeplerJobMetadata.requireRecoveryMutationAllowed(target, JobRecoveryMutationIntent.REPROCESS)
     } catch (blocked: JobRecoveryMutationBlockedException) {
+        return@withContext Result.failure(blocked)
+    } catch (blocked: ProcessingCleanupRequiredException) {
         return@withContext Result.failure(blocked)
     }
     val session = ReprocessTransactionSession(target)
