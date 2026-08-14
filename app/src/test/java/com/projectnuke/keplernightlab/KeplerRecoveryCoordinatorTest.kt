@@ -621,6 +621,65 @@ class KeplerRecoveryCoordinatorTest {
     }
 
     @Test
+    fun historicalMalformedExportDoesNotBlockCurrentCorrelatedPublicExportSettlement() {
+        val root = File(Files.createTempDirectory("kepler-recovery-historical-invalid-current-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_historical-invalid-current").apply { mkdirs() }
+        try {
+            val historical = File(job, ".export_tx_historical-corrupt.json").apply {
+                writeText("not-json")
+                setLastModified(1L)
+            }
+            val operationId = "current-public-export"
+            val startedAt = System.currentTimeMillis()
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("status", "EXPORTING")
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, operationId)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name)
+                .put(ACTIVE_OPERATION_STARTED_AT, startedAt))
+            MediaStoreExportJournal.create(
+                job, MediaStoreExportRole.MAIN_IMAGE, null, "new.jpg", "Pictures/Kepler",
+                "image/jpeg", Uri.parse("content://media/external/images/media"), ownerOperationId = operationId
+            ).transition(job, MediaStoreExportState.VERIFIED, "content://media/external/images/media/new")
+
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
+
+            assertEquals(KeplerJobRecoveryClassification.PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL, report.jobs.single().classification)
+            val recovered = KeplerJobMetadata.read(job)
+            assertEquals("STABLE", recovered.getString("recoveryState"))
+            assertEquals("content://media/external/images/media/new", recovered.getString("exportUri"))
+            assertTrue(historical.exists())
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test
+    fun clearedCurrentExportOperationReconstructsItsNewUriInsteadOfStaleMetadata() {
+        val root = File(Files.createTempDirectory("kepler-recovery-cleared-export-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_cleared-export").apply { mkdirs() }
+        try {
+            val operationId = "cleared-current-export"
+            val newUri = "content://media/external/images/media/new-after-clear"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("currentPipelineStage", "PARTIAL")
+                .put("galleryExportCommitted", true)
+                .put("exportVerified", true)
+                .put("exportUri", "content://media/external/images/media/old")
+                .put("recoveryState", "STABLE")
+                .put(TERMINAL_OPERATION_ID, operationId))
+            MediaStoreExportJournal.create(
+                job, MediaStoreExportRole.MAIN_IMAGE, null, "new.jpg", "Pictures/Kepler",
+                "image/jpeg", Uri.parse("content://media/external/images/media"), ownerOperationId = operationId
+            ).transition(job, MediaStoreExportState.VERIFIED, newUri)
+
+            KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
+
+            assertEquals(newUri, KeplerJobMetadata.read(job).getString("exportUri"))
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test
     fun oneMediaStoreRecoveryFailureDoesNotAbortLaterJobs() {
         val root = File(Files.createTempDirectory("kepler-recovery-isolation-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
         val broken = File(root, "KPL_YUV_FUSION_broken").apply { mkdirs() }

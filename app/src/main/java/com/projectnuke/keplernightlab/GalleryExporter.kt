@@ -168,6 +168,44 @@ fun exportNightFusionBitmapToGallery(
     )
 }
 
+internal data class OwnedPublicExportEvidence(
+    val operationId: String,
+    val committed: Boolean,
+    val verified: Boolean,
+    val uri: String?
+)
+
+/** Reads only evidence owned by the exact current PUBLIC_EXPORT operation. */
+internal fun inspectOwnedPublicExportEvidence(
+    jobDir: File,
+    ownerLease: JobOperationLease
+): OwnedPublicExportEvidence? {
+    check(KeplerJobMetadata.isOperationOwner(jobDir, ownerLease)) {
+        "Public export evidence requires the exact owning lease"
+    }
+    val metadata = KeplerJobMetadata.read(jobDir)
+    val operationId = metadata.optString(ACTIVE_OPERATION_ID)
+    if (operationId.isBlank() || metadata.optString(ACTIVE_OPERATION_KIND) != KeplerActiveOperationKind.PUBLIC_EXPORT.name) {
+        return null
+    }
+    check(metadata.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id) {
+        "Public export evidence requires a current-runtime owner"
+    }
+    val main = MediaStoreExportJournal.list(jobDir)
+        .asSequence()
+        .filter { it.ownerOperationId == operationId && it.role == MediaStoreExportRole.MAIN_IMAGE }
+        .maxByOrNull { it.updatedAt }
+    val hasUri = !main?.uri.isNullOrBlank()
+    val verified = hasUri && main?.state == MediaStoreExportState.VERIFIED
+    val committed = hasUri && (verified || main?.state == MediaStoreExportState.PUBLIC_COMMITTED)
+    return OwnedPublicExportEvidence(
+        operationId = operationId,
+        committed = committed,
+        verified = verified,
+        uri = main?.uri?.takeIf { committed && it.isNotBlank() }
+    )
+}
+
 /**
  * Settles a PUBLIC_EXPORT marker while the enclosing pipeline still owns its lease.
  * The export journal is the authority for commit progress when the caller did not
@@ -191,41 +229,41 @@ internal fun settleOwnedPublicExportInterruption(
         "Public export settlement requires a current-runtime owner"
     }
     val invalid = MediaStoreExportJournal.invalidFiles(jobDir)
-    check(invalid.isEmpty()) { "Invalid export journal evidence prevents public export settlement" }
     val ownerJournals = MediaStoreExportJournal.list(jobDir)
         .filter { it.ownerOperationId == operationId }
-    val main = ownerJournals
-        .filter { it.role == MediaStoreExportRole.MAIN_IMAGE }
-        .maxByOrNull { it.updatedAt }
-    val verified = main?.state == MediaStoreExportState.VERIFIED
-    val committed = verified || main?.state == MediaStoreExportState.PUBLIC_COMMITTED
-    val uri = metadata.optString("exportUri").takeIf { it.isNotBlank() }
-        ?: main?.uri?.takeIf { it.isNotBlank() }
+    val activeStartedAt = metadata.optLong(ACTIVE_OPERATION_STARTED_AT, 0L)
+    val currentInvalid = invalid.filter { activeStartedAt <= 0L || it.lastModified() > activeStartedAt }
+    val evidence = inspectOwnedPublicExportEvidence(jobDir, ownerLease)
+        ?: return true
+    check(currentInvalid.isEmpty() && (invalid.isEmpty() || ownerJournals.any {
+        it.role == MediaStoreExportRole.MAIN_IMAGE
+    })) { "Invalid export evidence may belong to the current public export operation" }
 
-    // Journal terminal acknowledgement is written before the job owner is cleared.
-    // If the metadata write below fails, the active marker remains recoverable.
-    ownerJournals.forEach { it.markTerminalPersisted(jobDir, operationId) }
+    // Durable terminal metadata must be written before journal acknowledgement.
+    // The active marker remains until both writes succeed, so the exact lease can
+    // be retained if either persistence boundary fails.
     KeplerJobMetadata.update(jobDir) { job ->
-        check(job.optString(ACTIVE_OPERATION_ID) == operationId &&
+        check(job.optString(ACTIVE_OPERATION_ID) == evidence.operationId &&
             job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id &&
             job.optString(ACTIVE_OPERATION_KIND) == KeplerActiveOperationKind.PUBLIC_EXPORT.name
         ) { "Public export owner changed during settlement" }
         finalOutputFormat?.let { job.put("finalOutputFormatSetting", it.name) }
-        job.put(TERMINAL_OPERATION_ID, operationId)
-            .put("exportUri", uri ?: JSONObject.NULL)
-            .put("galleryExportCommitted", committed)
-            .put("exportVerified", verified)
+        job.put(TERMINAL_OPERATION_ID, evidence.operationId)
+            .put("exportUri", evidence.uri ?: JSONObject.NULL)
+            .put("galleryPublicExportLinkage", evidence.uri ?: JSONObject.NULL)
+            .put("galleryExportCommitted", evidence.committed)
+            .put("exportVerified", evidence.verified)
             .put("exportError", failureMessage)
             .put("exportedAt", System.currentTimeMillis())
         when {
-            verified -> job.put("currentPipelineStage", "PARTIAL")
+            evidence.verified -> job.put("currentPipelineStage", "PARTIAL")
                 .put("processStatus", "EXPORT_VERIFIED_INTERRUPTED")
                 .put("exportStatus", "EXPORTED")
                 .put("recoveryState", "STABLE")
                 .put("lastRecoveryClassification", KeplerJobRecoveryClassification.PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL.name)
                 .put("lastRecoveryMessage", "공개 내보내기 결과를 확인했지만 이전 실행이 종료되어 후속 처리가 중단되었습니다.")
                 .remove("recoveryMessage")
-            committed -> job.put("currentPipelineStage", "PARTIAL")
+            evidence.committed -> job.put("currentPipelineStage", "PARTIAL")
                 .put("processStatus", "EXPORT_COMMITTED_PENDING_VERIFICATION")
                 .put("exportStatus", "EXPORT_UNVERIFIED")
                 .put("recoveryState", "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION")
@@ -240,6 +278,14 @@ internal fun settleOwnedPublicExportInterruption(
                 .put("lastRecoveryMessage", "공개 내보내기 전에 이전 실행이 종료되어 원본 작업 자료를 보존했습니다.")
                 .remove("recoveryMessage")
         }
+    }
+    // A journal may acknowledge only after the matching terminal metadata write.
+    ownerJournals.forEach { it.markTerminalPersisted(jobDir, evidence.operationId) }
+    KeplerJobMetadata.update(jobDir) { job ->
+        check(job.optString(ACTIVE_OPERATION_ID) == evidence.operationId &&
+            job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id &&
+            job.optString(TERMINAL_OPERATION_ID) == evidence.operationId
+        ) { "Public export owner changed before release" }
         job.remove(ACTIVE_RUNTIME_SESSION_ID)
         job.remove(ACTIVE_OPERATION_ID)
         job.remove(ACTIVE_OPERATION_KIND)

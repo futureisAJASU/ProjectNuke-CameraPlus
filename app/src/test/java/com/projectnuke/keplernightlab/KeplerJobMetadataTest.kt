@@ -164,7 +164,11 @@ class KeplerJobMetadataTest {
         val directory = Files.createTempDirectory("kepler-public-export-settlement-").toFile()
         var lease: JobOperationLease? = null
         try {
-            KeplerJobMetadata.write(directory, JSONObject().put("currentPipelineStage", "PROCESSING"))
+            KeplerJobMetadata.write(directory, JSONObject()
+                .put("currentPipelineStage", "PROCESSING")
+                .put("exportUri", "content://media/old-uri")
+                .put("galleryExportCommitted", true)
+                .put("exportVerified", true))
             lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.PROCESSING_START
@@ -201,8 +205,50 @@ class KeplerJobMetadataTest {
             assertTrue(settled.getBoolean("galleryExportCommitted"))
             assertTrue(settled.getBoolean("exportVerified"))
             assertEquals("content://media/42", settled.getString("exportUri"))
+            assertEquals("content://media/42", settled.getString("galleryPublicExportLinkage"))
             assertTrue(MediaStoreExportJournal.list(directory).single().terminalMetadataPersisted)
         } finally {
+            lease?.release()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun publicExportSettlementFailureRetainsExactLeaseAndLeavesJournalUnacknowledged() {
+        val directory = Files.createTempDirectory("kepler-public-export-settlement-failure-").toFile()
+        var lease: JobOperationLease? = null
+        val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
+        try {
+            KeplerJobMetadata.write(directory, JSONObject().put("currentPipelineStage", "PROCESSING"))
+            lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                directory,
+                JobRecoveryMutationIntent.PROCESSING_START
+            )
+            val operationId = KeplerJobMetadata.beginActiveOperation(
+                directory,
+                kind = KeplerActiveOperationKind.PUBLIC_EXPORT,
+                ownerLease = lease
+            )
+            val journal = MediaStoreExportJournal.create(
+                directory,
+                MediaStoreExportRole.MAIN_IMAGE,
+                null,
+                "result.jpg",
+                "Pictures/Kepler",
+                "image/jpeg",
+                Uri.parse("content://media/external/images/media"),
+                ownerOperationId = operationId
+            ).transition(directory, MediaStoreExportState.VERIFIED, "content://media/new-uri")
+            KeplerJobMetadata.atomicWriteFailureForTest = IllegalStateException("terminal metadata write failed")
+
+            assertThrows(Exception::class.java) {
+                settleOwnedPublicExportInterruption(directory, lease!!, "injected failure")
+            }
+            assertTrue(KeplerJobMetadata.isOperationOwner(directory, lease!!))
+            assertEquals(operationId, KeplerJobMetadata.read(directory).getString(ACTIVE_OPERATION_ID))
+            assertFalse(MediaStoreExportJournal.read(directory, MediaStoreExportJournal.fileFor(directory, journal.exportAttemptId)).terminalMetadataPersisted)
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
             lease?.release()
             directory.deleteRecursively()
         }
