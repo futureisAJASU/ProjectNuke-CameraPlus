@@ -886,16 +886,28 @@ fun captureRawBurstForFusion(
                         )
                     } finally {
                         if (durableCaptureTerminalPersisted) {
-                            if (KeplerJobMetadata.publishProcessingHandoff(
+                            val handoffPublished = KeplerJobMetadata.publishProcessingHandoff(
                                     jobDir,
                                     durableCaptureOperationId,
                                     KeplerActiveOperationKind.PROCESSING_RAW
                                 )
-                            ) {
+                            val ownerSettled = if (handoffPublished) {
                                 KeplerJobMetadata.clearActiveOperation(jobDir, durableCaptureOperationId)
+                            } else {
+                                KeplerJobMetadata.settleCaptureOwnerAfterHandoffFailure(
+                                    jobDir,
+                                    durableCaptureOperationId,
+                                    durableCaptureLease
+                                )
                             }
+                            if (!ownerSettled) {
+                                Log.e("KeplerRawCapture", "retaining capture lease after handoff settlement failure")
+                            } else {
+                                durableCaptureLease.release()
+                            }
+                        } else {
+                            Log.e("KeplerRawCapture", "retaining capture lease after terminal metadata settlement failure")
                         }
-                        durableCaptureLease.release()
                         cleanup()
                         publishRawTerminalSnapshot(
                             RawTerminalSettlementPhase.SETTLED,

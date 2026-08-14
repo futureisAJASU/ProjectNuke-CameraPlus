@@ -633,17 +633,32 @@ fun captureYuvBurstColorWithMotion(
                 when (request.completionKind) {
                     TerminalCompletionKind.SUCCESS -> {
                         durableCaptureOperationId?.let { operationId ->
-                            if (KeplerJobMetadata.publishProcessingHandoff(
+                            val handoffPublished = KeplerJobMetadata.publishProcessingHandoff(
                                     currentBurstDir,
                                     operationId,
                                     KeplerActiveOperationKind.PROCESSING_YUV
                                 )
-                            ) {
+                            val ownerSettled = if (handoffPublished) {
                                 KeplerJobMetadata.clearActiveOperation(currentBurstDir, operationId)
+                            } else {
+                                KeplerJobMetadata.settleCaptureOwnerAfterHandoffFailure(
+                                    currentBurstDir,
+                                    operationId,
+                                    requireNotNull(durableCaptureLease)
+                                )
                             }
-                            durableCaptureLease?.release()
-                        }
-                        onComplete(currentBurstDir)
+                            if (ownerSettled) {
+                                durableCaptureLease?.release()
+                                onComplete(currentBurstDir)
+                            } else {
+                                logYuvCaptureFailure(
+                                    stage = "handoff",
+                                    throwable = IllegalStateException("Processing handoff could not be durably settled"),
+                                    detail = "YUV capture completed but processing ownership was retained."
+                                )
+                                onError("YUV processing handoff could not be durably settled")
+                            }
+                        } ?: onComplete(currentBurstDir)
                     }
                     TerminalCompletionKind.ERROR -> {
                         durableCaptureOperationId?.let { operationId ->

@@ -450,6 +450,34 @@ object KeplerJobMetadata {
         matched
     }.getOrDefault(false)
 
+    /**
+     * Clears a capture owner only when its handoff could not be published and
+     * the exact lease still owns the durable marker. A failed metadata write
+     * leaves the lease retained so the marker cannot become ownerless.
+     */
+    internal fun settleCaptureOwnerAfterHandoffFailure(
+        jobDir: File,
+        captureOperationId: String,
+        ownerLease: JobOperationLease
+    ): Boolean {
+        check(isOperationOwner(jobDir, ownerLease)) {
+            "Capture handoff settlement requires the exact owning lease"
+        }
+        val job = try {
+            read(jobDir)
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            return false
+        }
+        val activeId = job.optString(ACTIVE_OPERATION_ID)
+        if (activeId.isBlank()) return true
+        if (activeId != captureOperationId ||
+            job.optString(ACTIVE_RUNTIME_SESSION_ID) != KeplerRuntimeSession.id
+        ) return false
+        return clearActiveOperation(jobDir, captureOperationId)
+    }
+
     /** Updates only the heartbeat; it is diagnostic/recovery evidence, not a runtime lock. */
     internal fun touchActiveOperation(jobDir: File, operationId: String): Boolean = runCatching {
         var matched = false

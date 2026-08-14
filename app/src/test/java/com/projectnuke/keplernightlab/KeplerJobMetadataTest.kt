@@ -142,6 +142,47 @@ class KeplerJobMetadataTest {
     }
 
     @Test
+    fun failedHandoffPublicationRetainsExactCaptureOwner() {
+        val directory = Files.createTempDirectory("kepler-handoff-publication-failure-").toFile()
+        var lease: JobOperationLease? = null
+        val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
+        try {
+            KeplerJobMetadata.write(directory, JSONObject().put("status", "CAPTURING"))
+            lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                directory,
+                JobRecoveryMutationIntent.PROCESSING_START
+            )
+            val operationId = KeplerJobMetadata.beginActiveOperation(
+                directory,
+                kind = KeplerActiveOperationKind.CAPTURE_YUV,
+                ownerLease = lease
+            )
+            KeplerJobMetadata.atomicWriteFailureForTest = IllegalStateException("handoff write failed")
+            assertFalse(
+                KeplerJobMetadata.publishProcessingHandoff(
+                    directory,
+                    operationId,
+                    KeplerActiveOperationKind.PROCESSING_YUV
+                )
+            )
+            KeplerJobMetadata.atomicWriteFailureForTest = IllegalStateException("owner clear failed")
+            assertFalse(
+                KeplerJobMetadata.settleCaptureOwnerAfterHandoffFailure(
+                    directory,
+                    operationId,
+                    lease!!
+                )
+            )
+            assertTrue(KeplerJobMetadata.isOperationOwner(directory, lease!!))
+            assertEquals(operationId, KeplerJobMetadata.read(directory).getString(ACTIVE_OPERATION_ID))
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
+            lease?.release()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun recoveryCheckedAcquisitionSerializesCompetingMutations() {
         val directory = Files.createTempDirectory("kepler-atomic-owner-").toFile()
         val executor = Executors.newFixedThreadPool(2)
