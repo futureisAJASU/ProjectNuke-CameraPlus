@@ -204,6 +204,52 @@ class KeplerJobMetadataTest {
     }
 
     @Test
+    fun ownerSuppliedHandoffSettlementRetriesThroughNextProductionAcquisition() {
+        val directory = Files.createTempDirectory("kepler-dispatch-handoff-owner-retry-").toFile()
+        var lease: JobOperationLease? = null
+        var replacement: JobOperationLease? = null
+        val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
+        try {
+            KeplerJobMetadata.write(
+                directory,
+                JSONObject()
+                    .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                    .put(PROCESSING_HANDOFF_OPERATION_ID, "handoff-operation")
+                    .put(PROCESSING_HANDOFF_KIND, KeplerActiveOperationKind.PROCESSING_YUV.name)
+            )
+            lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                directory,
+                JobRecoveryMutationIntent.PROCESSING_START,
+                consumesProcessingHandoff = true
+            )
+            KeplerJobMetadata.atomicWriteFailureForTest = IllegalStateException("handoff settlement failed")
+
+            assertFalse(
+                KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
+                    directory,
+                    requireNotNull(lease)
+                )
+            )
+            assertTrue(KeplerJobMetadata.isOperationActive(directory))
+            assertTrue(KeplerJobMetadata.read(directory).has(PROCESSING_HANDOFF_OPERATION_ID))
+
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            replacement = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                directory,
+                JobRecoveryMutationIntent.PROCESSING_START,
+                consumesProcessingHandoff = true
+            )
+            assertFalse(KeplerJobMetadata.read(directory).has(PROCESSING_HANDOFF_OPERATION_ID))
+            assertTrue(KeplerJobMetadata.isOperationOwner(directory, replacement!!))
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
+            replacement?.release()
+            lease?.release()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun failedHandoffPublicationRetainsExactCaptureOwner() {
         val directory = Files.createTempDirectory("kepler-handoff-publication-failure-").toFile()
         var lease: JobOperationLease? = null

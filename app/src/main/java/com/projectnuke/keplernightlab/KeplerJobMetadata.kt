@@ -262,6 +262,40 @@ object KeplerJobMetadata {
         jobDir: File,
         lease: JobOperationLease
     ): Boolean {
+        if (lease.hasPendingProcessingHandoffSettlement()) {
+            val handoffPresent = try {
+                read(jobDir).optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                return false
+            }
+            if (handoffPresent) {
+                val settled = try {
+                    finalizeRecoveredProcessingHandoff(jobDir, lease)
+                } catch (failure: Error) {
+                    throw failure
+                } catch (_: Exception) {
+                    false
+                }
+                if (!settled) return false
+            }
+            lease.completeProcessingHandoffSettlement()
+            val current = try {
+                read(jobDir)
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                return false
+            }
+            val activeId = current.optString(ACTIVE_OPERATION_ID)
+            if (activeId.isBlank()) {
+                lease.release()
+                return true
+            }
+            lease.markDurableSettlementPending(activeId)
+            return false
+        }
         val pendingId = lease.pendingDurableSettlementId() ?: return false
         val job = try {
             read(jobDir)
@@ -734,11 +768,30 @@ object KeplerJobMetadata {
         val handoffPresent = try {
             read(jobDir).optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()
         } catch (failure: Error) {
+            ownerLease?.markProcessingHandoffSettlementPending()
             throw failure
         } catch (_: Exception) {
+            ownerLease?.markProcessingHandoffSettlementPending()
             return false
         }
-        if (!handoffPresent) return true
+        if (!handoffPresent) {
+            if (ownerLease == null) return true
+            val current = try {
+                read(jobDir)
+            } catch (failure: Error) {
+                ownerLease.markProcessingHandoffSettlementPending()
+                throw failure
+            } catch (_: Exception) {
+                ownerLease.markProcessingHandoffSettlementPending()
+                return false
+            }
+            if (current.optString(ACTIVE_OPERATION_ID).isBlank()) {
+                ownerLease.release()
+                return true
+            }
+            ownerLease.markDurableSettlementPending(current.optString(ACTIVE_OPERATION_ID))
+            return false
+        }
 
         val lease = ownerLease ?: try {
             acquireRecoveryCheckedOperation(
@@ -755,12 +808,20 @@ object KeplerJobMetadata {
         val settled = try {
             finalizeRecoveredProcessingHandoff(jobDir, lease)
         } catch (failure: Error) {
-            if (ownerLease == null) lease.release()
+            if (ownerLease == null) {
+                lease.release()
+            } else {
+                ownerLease.markProcessingHandoffSettlementPending()
+            }
             throw failure
         } catch (_: Exception) {
             false
         }
-        if (settled || ownerLease == null) lease.release()
+        if (settled || ownerLease == null) {
+            lease.release()
+        } else {
+            ownerLease.markProcessingHandoffSettlementPending()
+        }
         return settled
     }
 
@@ -809,6 +870,7 @@ class JobOperationLease internal constructor(internal val key: String) {
     private val processingAttemptId = java.util.concurrent.atomic.AtomicReference<String?>(null)
     private val lastProcessingAttemptId = java.util.concurrent.atomic.AtomicReference<String?>(null)
     private val pendingDurableSettlementId = java.util.concurrent.atomic.AtomicReference<String?>(null)
+    private val pendingProcessingHandoffSettlement = AtomicBoolean(false)
 
     internal fun claimProcessingAttempt(attemptId: String): Boolean {
         if (released.get() || !processingAttemptId.compareAndSet(null, attemptId)) return false
@@ -832,6 +894,16 @@ class JobOperationLease internal constructor(internal val key: String) {
         lastProcessingAttemptId.compareAndSet(null, attemptId)
         markDurableSettlementPending(attemptId)
     }
+
+    internal fun markProcessingHandoffSettlementPending() {
+        pendingProcessingHandoffSettlement.set(true)
+    }
+
+    internal fun hasPendingProcessingHandoffSettlement(): Boolean =
+        pendingProcessingHandoffSettlement.get()
+
+    internal fun completeProcessingHandoffSettlement(): Boolean =
+        pendingProcessingHandoffSettlement.compareAndSet(true, false)
 
     internal fun pendingDurableSettlementId(): String? = pendingDurableSettlementId.get()
 
