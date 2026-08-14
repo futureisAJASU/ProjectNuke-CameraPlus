@@ -658,11 +658,13 @@ fun captureProcessExportSuperResolutionFusion(
                 var publicExportCommitted = false
                 var verified = false
                 var outputLease: JobOperationLease? = null
+                var outputDirForSettlement: File? = null
                 try {
                     cancellation.throwIfCancelled()
                     val sourceFrames = readColorBurstFrameFiles(sourceJobDir)
                     cancellation.throwIfCancelled()
                     val outputDir = createSuperResolutionJobDirectory(context)
+                    outputDirForSettlement = outputDir
                     outputLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                         outputDir,
                         JobRecoveryMutationIntent.PROCESSING_START
@@ -808,6 +810,20 @@ fun captureProcessExportSuperResolutionFusion(
                         message = error.message
                     )
                 } finally {
+                    outputLease?.let { lease ->
+                        val settlementDir = outputDirForSettlement
+                        if (settlementDir == null) return@let
+                        runCatching {
+                            settleOwnedPublicExportInterruption(
+                                jobDir = settlementDir,
+                                ownerLease = lease,
+                                failureMessage = "Super Resolution public export ended before terminal metadata was settled.",
+                                finalOutputFormat = finalOutputFormat
+                            )
+                        }.onFailure { settlementFailure ->
+                            Log.e("KeplerSuperResolution", "public export owner settlement failed", settlementFailure)
+                        }
+                    }
                     outputLease?.release()
                     workerThread.quitSafely()
                 }

@@ -299,6 +299,16 @@ fun captureProcessExportNightFusion(
                         message = e.message
                     )
                 } finally {
+                    runCatching {
+                        settleOwnedPublicExportInterruption(
+                            jobDir = jobDir,
+                            ownerLease = pipelineLease,
+                            failureMessage = "Night Fusion public export ended before terminal metadata was settled.",
+                            finalOutputFormat = finalOutputFormat
+                        )
+                    }.onFailure { settlementFailure ->
+                        android.util.Log.e("KeplerYuvPipeline", "public export owner settlement failed", settlementFailure)
+                    }
                     pipelineLease.release()
                     workerThread.quitSafely()
                 }

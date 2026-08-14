@@ -114,8 +114,6 @@ object KeplerJobMetadata {
             if (isReprocessQuarantined(jobDir)) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_REPROCESS_QUARANTINE
             val processingScan = ProcessingArtifactJournal.scan(jobDir)
             if (processingScan.invalidFiles.isNotEmpty()) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_INVALID_PROCESSING_JOURNAL
-            val exportInvalid = MediaStoreExportJournal.invalidFiles(jobDir)
-            if (exportInvalid.isNotEmpty()) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_INVALID_EXPORT_JOURNAL
             val children = NoFollowFileSystem.requireDirectChildren(jobDir)
             val job = try {
                 read(jobDir)
@@ -151,6 +149,24 @@ object KeplerJobMetadata {
                         consumesProcessingHandoff && handoffRuntime == KeplerRuntimeSession.id)) {
                     return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_HANDOFF
                 }
+            }
+            val exportInvalid = MediaStoreExportJournal.invalidFiles(jobDir)
+            val terminalResultProven = activeId.isBlank() &&
+                job.optString("currentPipelineStage") in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED") &&
+                job.optBoolean("galleryExportCommitted", false) &&
+                job.optBoolean("exportVerified", false) &&
+                job.optString("exportUri").isNotBlank() &&
+                job.optString("recoveryState").ifBlank { "STABLE" } == "STABLE"
+            val nonDestructiveHistoricalExportInspection = intent in setOf(
+                JobRecoveryMutationIntent.PROCESSING_START,
+                JobRecoveryMutationIntent.REPROCESS,
+                JobRecoveryMutationIntent.FRAME_SELECTION,
+                JobRecoveryMutationIntent.METADATA_EDIT
+            )
+            if (exportInvalid.isNotEmpty() &&
+                !(terminalResultProven && nonDestructiveHistoricalExportInspection)
+            ) {
+                return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_INVALID_EXPORT_JOURNAL
             }
             val settledAuthoritative = processingScan.validJournals.any {
                 it.second.state == ProcessingArtifactJournalState.SETTLED &&
@@ -501,11 +517,16 @@ object KeplerJobMetadata {
     }.getOrDefault(false)
 
     /** Atomically settles a dead terminal export owner and removes obsolete recovery gating. */
-    internal fun finalizeRecoveredTerminalOperation(jobDir: File, operationId: String): Boolean = runCatching {
+    internal fun finalizeRecoveredTerminalOperation(
+        jobDir: File,
+        operationId: String,
+        recoveryLease: JobOperationLease? = null
+    ): Boolean = runCatching {
         var matched = false
         update(jobDir) { job ->
             if (job.optString(ACTIVE_OPERATION_ID) != operationId ||
-                job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id ||
+                (job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id &&
+                    (recoveryLease == null || !isOperationOwner(jobDir, recoveryLease))) ||
                 job.optString(TERMINAL_OPERATION_ID) != operationId ||
                 job.optString("currentPipelineStage") !in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")
             ) return@update
@@ -529,12 +550,14 @@ object KeplerJobMetadata {
         jobDir: File,
         operationId: String,
         classification: KeplerJobRecoveryClassification,
-        recoveryMessage: String
+        recoveryMessage: String,
+        recoveryLease: JobOperationLease? = null
     ): Boolean = runCatching {
         var matched = false
         update(jobDir) { job ->
             if (job.optString(ACTIVE_OPERATION_ID) != operationId ||
-                job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id
+                (job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id &&
+                    (recoveryLease == null || !isOperationOwner(jobDir, recoveryLease)))
             ) return@update
             matched = true
             val blocksCurrentActions = classification in setOf(
@@ -557,11 +580,15 @@ object KeplerJobMetadata {
         matched
     }.getOrDefault(false)
 
-    internal fun finalizeRecoveredProcessingHandoff(jobDir: File): Boolean = runCatching {
+    internal fun finalizeRecoveredProcessingHandoff(
+        jobDir: File,
+        recoveryLease: JobOperationLease? = null
+    ): Boolean = runCatching {
         var matched = false
         update(jobDir) { job ->
             if (job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID).isBlank() ||
-                job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id
+                (job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id &&
+                    (recoveryLease == null || !isOperationOwner(jobDir, recoveryLease)))
             ) return@update
             matched = true
             job.put("recoveryState", "STABLE")

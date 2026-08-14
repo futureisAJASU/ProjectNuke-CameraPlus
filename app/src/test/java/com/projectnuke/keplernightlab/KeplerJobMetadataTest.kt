@@ -1,5 +1,6 @@
 package com.projectnuke.keplernightlab
 
+import android.net.Uri
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -129,6 +130,80 @@ class KeplerJobMetadataTest {
             assertEquals(1, futures.count { it.get() })
         } finally {
             executor.shutdownNow()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun historicalMalformedExportAllowsNonDestructiveWorkButBlocksDeletion() {
+        val directory = Files.createTempDirectory("kepler-historical-invalid-export-").toFile()
+        try {
+            KeplerJobMetadata.write(directory, JSONObject()
+                .put("currentPipelineStage", "COMPLETE")
+                .put("galleryExportCommitted", true)
+                .put("exportVerified", true)
+                .put("exportUri", "content://media/current")
+                .put("recoveryState", "STABLE"))
+            File(directory, ".export_tx_corrupt.json").writeText("not-json")
+
+            assertEquals(
+                JobRecoveryMutationGateOutcome.ALLOWED,
+                KeplerJobMetadata.inspectRecoveryMutationGate(directory, JobRecoveryMutationIntent.REPROCESS)
+            )
+            assertEquals(
+                JobRecoveryMutationGateOutcome.BLOCKED_INVALID_EXPORT_JOURNAL,
+                KeplerJobMetadata.inspectRecoveryMutationGate(directory, JobRecoveryMutationIntent.JOB_DELETE)
+            )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun ownedPublicExportSettlementPreservesVerifiedJournalBeforeLeaseRelease() {
+        val directory = Files.createTempDirectory("kepler-public-export-settlement-").toFile()
+        var lease: JobOperationLease? = null
+        try {
+            KeplerJobMetadata.write(directory, JSONObject().put("currentPipelineStage", "PROCESSING"))
+            lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                directory,
+                JobRecoveryMutationIntent.PROCESSING_START
+            )
+            val operationId = KeplerJobMetadata.beginActiveOperation(
+                directory,
+                kind = KeplerActiveOperationKind.PUBLIC_EXPORT,
+                ownerLease = lease
+            )
+            val journal = MediaStoreExportJournal.create(
+                directory,
+                MediaStoreExportRole.MAIN_IMAGE,
+                null,
+                "result.jpg",
+                "Pictures/Kepler",
+                "image/jpeg",
+                Uri.parse("content://media/external/images/media"),
+                ownerOperationId = operationId
+            )
+            journal.transition(directory, MediaStoreExportState.ROW_INSERTED, "content://media/42")
+                .transition(directory, MediaStoreExportState.CONTENT_WRITTEN)
+                .transition(directory, MediaStoreExportState.PUBLIC_COMMITTED)
+                .transition(directory, MediaStoreExportState.VERIFIED)
+
+            settleOwnedPublicExportInterruption(
+                directory,
+                lease!!,
+                "test interruption"
+            )
+
+            val settled = KeplerJobMetadata.read(directory)
+            assertFalse(settled.has(ACTIVE_OPERATION_ID))
+            assertEquals("PARTIAL", settled.getString("currentPipelineStage"))
+            assertTrue(settled.getBoolean("galleryExportCommitted"))
+            assertTrue(settled.getBoolean("exportVerified"))
+            assertEquals("content://media/42", settled.getString("exportUri"))
+            assertTrue(MediaStoreExportJournal.list(directory).single().terminalMetadataPersisted)
+        } finally {
+            lease?.release()
             directory.deleteRecursively()
         }
     }

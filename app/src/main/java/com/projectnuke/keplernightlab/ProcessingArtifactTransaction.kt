@@ -191,6 +191,7 @@ internal fun commitProcessingArtifact(
         evidence: NoFollowFileSystem.StreamDigest? = null,
         priorSemanticVerified: Boolean = journal.priorSemanticVerified,
         adoptedResult: String? = journal.adoptedResult,
+        noOutputDisposition: String? = journal.noOutputDisposition,
         claimKey: String? = journal.claimKey
     ) {
         journal = journal.transition(
@@ -201,6 +202,7 @@ internal fun commitProcessingArtifact(
             expectedSha256Override = evidence?.sha256 ?: journal.expectedSha256,
             priorSemanticVerifiedOverride = priorSemanticVerified,
             adoptedResultOverride = adoptedResult,
+            noOutputDispositionOverride = noOutputDisposition,
             claimKeyOverride = claimKey
         )
     }
@@ -370,7 +372,12 @@ internal fun commitProcessingArtifact(
                 runCatching {
                     journalTransition(
                         if (priorRestored) ProcessingArtifactJournalState.PRIOR_RESTORED else ProcessingArtifactJournalState.SETTLED,
-                        adoptedResult = if (priorRestored) "PRIOR_FINAL" else "NO_OUTPUT"
+                        adoptedResult = if (priorRestored) "PRIOR_FINAL" else "NO_OUTPUT",
+                        noOutputDisposition = when {
+                            priorRestored -> null
+                            finalFile.isFile -> "PREVIOUS_FINAL_UNTOUCHED"
+                            else -> "FINAL_ABSENT"
+                        }
                     )
                     journal.deleteIfOwned(parent)
                 }

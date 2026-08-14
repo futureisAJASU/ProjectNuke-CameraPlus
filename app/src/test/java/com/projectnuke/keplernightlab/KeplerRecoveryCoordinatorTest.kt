@@ -86,6 +86,27 @@ class KeplerRecoveryCoordinatorTest {
     }
 
     @Test
+    fun currentRuntimeMarkerWithoutProcessLeaseIsReconciledByForcedRecovery() {
+        val parent = Files.createTempDirectory("kepler-recovery-current-owner-").toFile()
+        val root = File(parent, "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_ORPHAN").apply { mkdirs() }
+        try {
+            KeplerJobMetadata.write(job, JSONObject()
+                .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, "orphan-current-operation")
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PROCESSING_YUV.name)
+                .put("currentPipelineStage", "PROCESSING")
+                .put("recoveryState", "STABLE"))
+
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root))
+            assertEquals(KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT, report.jobs.single().classification)
+            assertTrue(!KeplerJobMetadata.read(job).has(ACTIVE_OPERATION_ID))
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    @Test
     fun activeExportJournalBlocksDestructiveMutationBeforeRecovery() {
         val job = Files.createTempDirectory("kepler-gate-export-").toFile()
         try {

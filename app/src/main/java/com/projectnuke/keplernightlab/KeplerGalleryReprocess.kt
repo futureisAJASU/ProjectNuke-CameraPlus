@@ -502,6 +502,8 @@ suspend fun reprocessKeplerGalleryJob(
         return@withContext Result.failure(blocked)
     } catch (blocked: ProcessingCleanupRequiredException) {
         return@withContext Result.failure(blocked)
+    } catch (busy: ProcessingAlreadyActiveException) {
+        return@withContext Result.failure(busy)
     } ?: run {
         return@withContext Result.failure(IllegalStateException("A job mutation is already in progress."))
     }
@@ -1703,6 +1705,18 @@ internal fun rollback(
             )
         }
     val metadataError = try {
+        try {
+            settleOwnedPublicExportInterruption(
+                jobDir = jobDir,
+                ownerLease = operationLease,
+                failureMessage = error.message ?: "Reprocess public export ended before terminal metadata was settled."
+            )
+        } catch (settlementFailure: Exception) {
+            return quarantineWithPersistence(
+                transaction,
+                combineCauseWithMessage(error, "Public export owner settlement failed during rollback", settlementFailure)
+            )
+        }
         if (outcome.disposition == ReprocessTerminalDisposition.CANCELLED) {
             writeReprocessCancelled(jobDir, error.message)
         } else {
@@ -1816,6 +1830,27 @@ private fun performTerminalCleanupDebt(
             }
         }
     } finally {
+        try {
+            val activeOperationId = KeplerJobMetadata.read(jobDir)
+                .optString(ACTIVE_OPERATION_ID)
+                .takeIf { it.isNotBlank() }
+            if (activeOperationId != null) {
+                check(KeplerJobMetadata.isOperationOwner(jobDir, lease)) {
+                    "Reprocess terminal cleanup lost the exact owner lease"
+                }
+                check(KeplerJobMetadata.clearActiveOperation(jobDir, activeOperationId)) {
+                    "Reprocess terminal cleanup could not clear durable active ownership"
+                }
+            }
+        } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+        catch (oom: OutOfMemoryError) { throw oom }
+        catch (td: ThreadDeath) { throw td }
+        catch (le: LinkageError) { throw le }
+        catch (ie: InternalError) { throw ie }
+        catch (e: Error) { throw e }
+        catch (failure: Exception) {
+            warnings += "Durable reprocess owner cleanup failed: ${failure.message}"
+        }
         try { lease.release() }
         catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
         catch (oom: OutOfMemoryError) { throw oom }
@@ -4012,6 +4047,9 @@ private fun recordReprocessTerminalMetadata(
     reprocessStatus: String,
     error: String?
 ) {
+    job.optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }?.let {
+        job.put(TERMINAL_OPERATION_ID, it)
+    }
     val succeeded = reprocessStatus == "COMPLETE"
     val previousCount = job.optInt("reprocessCount", 0)
     job.put("reprocessCount", previousCount + 1)

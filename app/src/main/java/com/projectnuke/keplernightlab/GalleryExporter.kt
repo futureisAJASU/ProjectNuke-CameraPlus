@@ -168,6 +168,87 @@ fun exportNightFusionBitmapToGallery(
     )
 }
 
+/**
+ * Settles a PUBLIC_EXPORT marker while the enclosing pipeline still owns its lease.
+ * The export journal is the authority for commit progress when the caller did not
+ * receive a GalleryExportResult (for example, cancellation after IS_PENDING=0).
+ */
+internal fun settleOwnedPublicExportInterruption(
+    jobDir: File,
+    ownerLease: JobOperationLease,
+    failureMessage: String,
+    finalOutputFormat: FinalOutputFormat? = null
+): Boolean {
+    check(KeplerJobMetadata.isOperationOwner(jobDir, ownerLease)) {
+        "Public export settlement requires the exact owning lease"
+    }
+    val metadata = KeplerJobMetadata.read(jobDir)
+    val operationId = metadata.optString(ACTIVE_OPERATION_ID)
+    if (operationId.isBlank() || metadata.optString(ACTIVE_OPERATION_KIND) != KeplerActiveOperationKind.PUBLIC_EXPORT.name) {
+        return true
+    }
+    check(metadata.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id) {
+        "Public export settlement requires a current-runtime owner"
+    }
+    val invalid = MediaStoreExportJournal.invalidFiles(jobDir)
+    check(invalid.isEmpty()) { "Invalid export journal evidence prevents public export settlement" }
+    val ownerJournals = MediaStoreExportJournal.list(jobDir)
+        .filter { it.ownerOperationId == operationId }
+    val main = ownerJournals
+        .filter { it.role == MediaStoreExportRole.MAIN_IMAGE }
+        .maxByOrNull { it.updatedAt }
+    val verified = main?.state == MediaStoreExportState.VERIFIED
+    val committed = verified || main?.state == MediaStoreExportState.PUBLIC_COMMITTED
+    val uri = metadata.optString("exportUri").takeIf { it.isNotBlank() }
+        ?: main?.uri?.takeIf { it.isNotBlank() }
+
+    // Journal terminal acknowledgement is written before the job owner is cleared.
+    // If the metadata write below fails, the active marker remains recoverable.
+    ownerJournals.forEach { it.markTerminalPersisted(jobDir, operationId) }
+    KeplerJobMetadata.update(jobDir) { job ->
+        check(job.optString(ACTIVE_OPERATION_ID) == operationId &&
+            job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id &&
+            job.optString(ACTIVE_OPERATION_KIND) == KeplerActiveOperationKind.PUBLIC_EXPORT.name
+        ) { "Public export owner changed during settlement" }
+        finalOutputFormat?.let { job.put("finalOutputFormatSetting", it.name) }
+        job.put(TERMINAL_OPERATION_ID, operationId)
+            .put("exportUri", uri ?: JSONObject.NULL)
+            .put("galleryExportCommitted", committed)
+            .put("exportVerified", verified)
+            .put("exportError", failureMessage)
+            .put("exportedAt", System.currentTimeMillis())
+        when {
+            verified -> job.put("currentPipelineStage", "PARTIAL")
+                .put("processStatus", "EXPORT_VERIFIED_INTERRUPTED")
+                .put("exportStatus", "EXPORTED")
+                .put("recoveryState", "STABLE")
+                .put("lastRecoveryClassification", KeplerJobRecoveryClassification.PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL.name)
+                .put("lastRecoveryMessage", "공개 내보내기 결과를 확인했지만 이전 실행이 종료되어 후속 처리가 중단되었습니다.")
+                .remove("recoveryMessage")
+            committed -> job.put("currentPipelineStage", "PARTIAL")
+                .put("processStatus", "EXPORT_COMMITTED_PENDING_VERIFICATION")
+                .put("exportStatus", "EXPORT_UNVERIFIED")
+                .put("recoveryState", "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION")
+                .put("recoveryMessage", "공개 내보내기 결과의 확인이 완료되지 않아 추가 확인이 필요합니다.")
+                .put("lastRecoveryClassification", KeplerJobRecoveryClassification.PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION.name)
+                .put("lastRecoveryMessage", "공개 내보내기는 완료되었지만 결과 확인이 완료되지 않았습니다.")
+            else -> job.put("currentPipelineStage", "FAILED")
+                .put("processStatus", "EXPORT_FAILED_KEEPING_CACHE")
+                .put("exportStatus", "FAILED")
+                .put("recoveryState", "STABLE")
+                .put("lastRecoveryClassification", KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name)
+                .put("lastRecoveryMessage", "공개 내보내기 전에 이전 실행이 종료되어 원본 작업 자료를 보존했습니다.")
+                .remove("recoveryMessage")
+        }
+        job.remove(ACTIVE_RUNTIME_SESSION_ID)
+        job.remove(ACTIVE_OPERATION_ID)
+        job.remove(ACTIVE_OPERATION_KIND)
+        job.remove(ACTIVE_OPERATION_STARTED_AT)
+        job.remove(ACTIVE_OPERATION_UPDATED_AT)
+    }
+    return true
+}
+
 data class RawSidecarFrameResult(
     val frameIndex: Int,
     val requested: Boolean,

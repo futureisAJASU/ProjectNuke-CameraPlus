@@ -58,6 +58,47 @@ class ProcessingArtifactTransactionTest {
     }
 
     @Test
+    fun preExistingFinalRemainsUntouchedWhenPreparedTransactionSettlesNoOutput() {
+        val dir = Files.createTempDirectory("processing-no-output-previous-final-").toFile()
+        val priorFinal = File(dir, "result.bin").apply { writeText("old-valid-result") }
+        val temp = File(dir, ".result.bin.tmp").apply { writeText("new-candidate") }
+        val journal = ProcessingArtifactJournal(
+            transactionId = UUID.randomUUID().toString(),
+            processingAttemptId = null,
+            runtimeSessionId = "old-runtime",
+            artifactType = "BIN",
+            finalName = priorFinal.name,
+            tempName = temp.name,
+            priorName = ".result.bin.prior",
+            verificationKind = "BIN",
+            expectedSizeBytes = temp.length(),
+            expectedSha256 = NoFollowFileSystem.digestVerified(temp).sha256,
+            state = ProcessingArtifactJournalState.PREPARED,
+            createdAt = 1L,
+            updatedAt = 2L
+        )
+        try {
+            journal.writeTo(dir)
+            processingArtifactJournalDeleteFailureForTest = true
+            val first = recoverProcessingArtifactJournals(dir).single()
+            assertEquals(ProcessingArtifactRecoveryClassification.SETTLED_NO_OUTPUT_WITH_CLEANUP_DEBT, first.classification)
+            assertEquals("old-valid-result", priorFinal.readText())
+            assertFalse(temp.exists())
+            val retainedJournalFile = ProcessingArtifactJournal.list(dir).single()
+            assertEquals("PREVIOUS_FINAL_UNTOUCHED", ProcessingArtifactJournal.read(retainedJournalFile).noOutputDisposition)
+
+            processingArtifactJournalDeleteFailureForTest = false
+            val second = recoverProcessingArtifactJournals(dir).single()
+            assertEquals(ProcessingArtifactRecoveryClassification.SETTLED_TEMP, second.classification)
+            assertEquals("old-valid-result", priorFinal.readText())
+            assertTrue(ProcessingArtifactJournal.list(dir).isEmpty())
+        } finally {
+            processingArtifactJournalDeleteFailureForTest = false
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
     fun productionMoveIntentCrashCutConvergesWithoutPrior() {
         val dir = Files.createTempDirectory("processing-move-cut-").toFile()
         try {

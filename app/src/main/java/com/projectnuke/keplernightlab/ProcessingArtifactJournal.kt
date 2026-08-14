@@ -74,9 +74,14 @@ internal fun reconcileSettledAuthoritativeProcessingJournals(
         }
     settled.forEach { journal ->
         if (journal.adoptedResult == "NO_OUTPUT") {
-            if (NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true) != null ||
-                NoFollowFileSystem.resolveDirectChild(jobDir, journal.tempName, requireFile = true) != null ||
+            if (NoFollowFileSystem.resolveDirectChild(jobDir, journal.tempName, requireFile = true) != null ||
                 NoFollowFileSystem.resolveDirectChild(jobDir, journal.priorName, requireFile = true) != null
+            ) return false
+            if (journal.noOutputDisposition == "FINAL_ABSENT" &&
+                NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true) != null
+            ) return false
+            if (journal.noOutputDisposition == null &&
+                NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true) != null
             ) return false
             if (!journal.deleteIfOwned(jobDir)) return false
             return@forEach
@@ -111,6 +116,8 @@ internal data class ProcessingArtifactJournal(
     val priorExpectedSha256: String? = null,
     val priorSemanticVerified: Boolean = false,
     val adoptedResult: String? = null,
+    /** For NO_OUTPUT, records whether the pre-existing final was never touched. */
+    val noOutputDisposition: String? = null,
     val claimKey: String? = null,
     val state: ProcessingArtifactJournalState,
     val createdAt: Long,
@@ -135,6 +142,7 @@ internal data class ProcessingArtifactJournal(
         priorExpectedSha256Override: String? = priorExpectedSha256,
         priorSemanticVerifiedOverride: Boolean = priorSemanticVerified,
         adoptedResultOverride: String? = adoptedResult,
+        noOutputDispositionOverride: String? = noOutputDisposition,
         claimKeyOverride: String? = claimKey
     ): ProcessingArtifactJournal = copy(
         state = next,
@@ -145,6 +153,7 @@ internal data class ProcessingArtifactJournal(
         priorExpectedSha256 = priorExpectedSha256Override,
         priorSemanticVerified = priorSemanticVerifiedOverride,
         adoptedResult = adoptedResultOverride,
+        noOutputDisposition = noOutputDispositionOverride,
         claimKey = claimKeyOverride,
         updatedAt = System.currentTimeMillis()
     ).also { it.writeTo(jobDir) }
@@ -171,6 +180,7 @@ internal data class ProcessingArtifactJournal(
         require(priorExpectedSizeBytes == null || priorExpectedSizeBytes >= 0L)
         require(priorExpectedSha256 == null || priorExpectedSha256.matches(SHA256_PATTERN))
         require(claimKey == null || claimKey.matches(CLAIM_KEY_PATTERN))
+        require(noOutputDisposition == null || noOutputDisposition.matches(NO_OUTPUT_DISPOSITION_PATTERN))
     }
 
     fun toJson(): JSONObject = JSONObject()
@@ -188,6 +198,7 @@ internal data class ProcessingArtifactJournal(
         .put("priorExpectedSha256", priorExpectedSha256 ?: JSONObject.NULL)
         .put("priorSemanticVerified", priorSemanticVerified)
         .put("adoptedResult", adoptedResult ?: JSONObject.NULL)
+        .put("noOutputDisposition", noOutputDisposition ?: JSONObject.NULL)
         .put("claimKey", claimKey ?: JSONObject.NULL)
         .put("state", state.name)
         .put("createdAt", createdAt)
@@ -200,6 +211,7 @@ internal data class ProcessingArtifactJournal(
         private val SHA256_PATTERN = Regex("[0-9a-fA-F]{64}")
         private val VERIFICATION_KIND_PATTERN = Regex("[A-Z0-9_]{1,40}")
         private val CLAIM_KEY_PATTERN = Regex("[A-Za-z][A-Za-z0-9_]{0,80}")
+        private val NO_OUTPUT_DISPOSITION_PATTERN = Regex("[A-Z_]{1,40}")
 
         fun create(
             jobDir: File,
@@ -236,7 +248,7 @@ internal data class ProcessingArtifactJournal(
             }
             ProcessingArtifactJournal(
                 transactionId, processingAttemptId, KeplerRuntimeSession.id, artifactType,
-                finalName, tempName, priorName, null, null, null, null, null, false, null,
+                finalName, tempName, priorName, null, null, null, null, null, false, null, null,
                 claimKey, ProcessingArtifactJournalState.PREPARED, now, now
             ).also { it.writeTo(jobDir) }
         }
@@ -268,6 +280,7 @@ internal data class ProcessingArtifactJournal(
                 priorExpectedSha256 = json.optString("priorExpectedSha256").takeIf { it.isNotBlank() && it != "null" },
                 priorSemanticVerified = json.optBoolean("priorSemanticVerified", false),
                 adoptedResult = json.optString("adoptedResult").takeIf { it.isNotBlank() && it != "null" },
+                noOutputDisposition = json.optString("noOutputDisposition").takeIf { it.isNotBlank() && it != "null" },
                 claimKey = json.optString("claimKey").takeIf { it.isNotBlank() && it != "null" },
                 state = state,
                 createdAt = json.getLong("createdAt"),
@@ -383,22 +396,19 @@ internal fun recoverProcessingArtifactJournals(
         ProcessingArtifactJournalState.PREPARED,
         ProcessingArtifactJournalState.TEMP_WRITTEN,
         ProcessingArtifactJournalState.TEMP_VERIFIED -> {
-            if (final != null && valid(final)) {
-                if (!deleteExact(temp)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "temporary cleanup failed")
-                journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED).deleteIfOwned(jobDir)
-                ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT)
+            // Before PRIOR_BACKED_UP or NEW_FINAL_MOVE_STARTED, the final pathname is
+            // still the pre-existing result. It cannot be adopted by this transaction.
+            if (!deleteExact(temp)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "temporary cleanup failed")
+            val settled = journal.transition(
+                jobDir,
+                ProcessingArtifactJournalState.SETTLED,
+                adoptedResultOverride = "NO_OUTPUT",
+                noOutputDispositionOverride = if (final != null) "PREVIOUS_FINAL_UNTOUCHED" else "FINAL_ABSENT"
+            )
+            if (settled.deleteIfOwned(jobDir)) {
+                ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.SETTLED_TEMP)
             } else {
-                if (!deleteExact(temp)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "temporary cleanup failed")
-                val settled = journal.transition(
-                    jobDir,
-                    ProcessingArtifactJournalState.SETTLED,
-                    adoptedResultOverride = "NO_OUTPUT"
-                )
-                if (settled.deleteIfOwned(jobDir)) {
-                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.SETTLED_TEMP)
-                } else {
-                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.SETTLED_NO_OUTPUT_WITH_CLEANUP_DEBT, "settled no-output journal cleanup remains")
-                }
+                ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.SETTLED_NO_OUTPUT_WITH_CLEANUP_DEBT, "settled no-output journal cleanup remains")
             }
         }
         ProcessingArtifactJournalState.PRIOR_BACKED_UP,
@@ -443,7 +453,8 @@ internal fun recoverProcessingArtifactJournals(
                     val settled = journal.transition(
                         jobDir,
                         ProcessingArtifactJournalState.SETTLED,
-                        adoptedResultOverride = "NO_OUTPUT"
+                        adoptedResultOverride = "NO_OUTPUT",
+                        noOutputDispositionOverride = "FINAL_ABSENT"
                     )
                     if (settled.deleteIfOwned(jobDir)) {
                         ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.SETTLED_TEMP, "move did not begin before process interruption")
@@ -559,7 +570,10 @@ internal fun recoverProcessingArtifactJournals(
         ProcessingArtifactJournalState.JOB_CLAIM_PERSISTED,
         ProcessingArtifactJournalState.SETTLED -> {
             if (journal.adoptedResult == "NO_OUTPUT") {
-                if (final != null || temp != null || prior != null) {
+                if (temp != null || prior != null ||
+                    (journal.noOutputDisposition == "FINAL_ABSENT" && final != null) ||
+                    (journal.noOutputDisposition == null && final != null)
+                ) {
                     return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "settled no-output transaction still owns an artifact path")
                 }
                 return@map if (journal.deleteIfOwned(jobDir)) {

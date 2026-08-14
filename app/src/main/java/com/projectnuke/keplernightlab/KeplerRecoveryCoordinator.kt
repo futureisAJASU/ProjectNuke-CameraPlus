@@ -171,16 +171,9 @@ internal object KeplerRecoveryCoordinator {
                     failures = listOf("${failure.javaClass.simpleName}: ${failure.message}")
                 )
             }
-            if (job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id) {
-                return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.SKIP_ACTIVE_CURRENT_PROCESS)
-            }
             val activeOperation = job.optString(ACTIVE_OPERATION_ID)
             val activeOperationKind = job.optString(ACTIVE_OPERATION_KIND)
             val terminalOperationId = job.optString(TERMINAL_OPERATION_ID)
-            val handoffRuntime = job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID)
-            if (handoffRuntime == KeplerRuntimeSession.id) {
-                return KeplerJobRecoveryResult(jobDir, KeplerJobRecoveryClassification.SKIP_ACTIVE_CURRENT_PROCESS)
-            }
             val processingRecoveryOwnsAuthority = activeOperation.isNotBlank() && activeOperationKind in setOf(
                 KeplerActiveOperationKind.PROCESSING_YUV.name,
                 KeplerActiveOperationKind.PROCESSING_RAW.name,
@@ -305,7 +298,7 @@ internal object KeplerRecoveryCoordinator {
             if (terminalOperationId == activeOperation && activeOperation.isNotBlank() &&
                 job.optString("currentPipelineStage") in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")) {
                 markMediaStoreExportJournalsTerminalPersisted(jobDir)
-                check(KeplerJobMetadata.finalizeRecoveredTerminalOperation(jobDir, activeOperation)) {
+                check(KeplerJobMetadata.finalizeRecoveredTerminalOperation(jobDir, activeOperation, lease)) {
                     "Could not durably finalize terminal operation $activeOperation"
                 }
                 return KeplerJobRecoveryResult(
@@ -317,7 +310,7 @@ internal object KeplerRecoveryCoordinator {
             }
             val captureTemps = recoverCaptureOwnedTemps(jobDir, job, activeOperation.isNotBlank())
             if (activeOperation.isBlank() && job.optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()) {
-                check(KeplerJobMetadata.finalizeRecoveredProcessingHandoff(jobDir)) {
+                check(KeplerJobMetadata.finalizeRecoveredProcessingHandoff(jobDir, lease)) {
                     "Could not durably finalize processing handoff"
                 }
                 return KeplerJobRecoveryResult(
@@ -446,7 +439,8 @@ internal object KeplerRecoveryCoordinator {
                         jobDir,
                         activeOperation,
                         classification,
-                        "이전 실행에서 남은 처리 증거를 안전하게 확인했습니다."
+                        "이전 실행에서 남은 처리 증거를 안전하게 확인했습니다.",
+                        recoveryLease = lease
                     )) { "Could not durably finalize interrupted operation $activeOperation" }
                 } else {
                     check(KeplerJobMetadata.recordProcessingCleanupRequired(jobDir, activeOperation, artifactCleanupDebt, cleanupHistory)) {
