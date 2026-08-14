@@ -4,6 +4,7 @@ import android.net.Uri
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertThrows
 import org.junit.Test
@@ -978,7 +979,7 @@ class KeplerJobMetadataTest {
                 "image/jpeg",
                 Uri.parse("content://media/external/images/media"),
                 ownerOperationId = operationId
-            )
+            ).transition(directory, MediaStoreExportState.INSERT_FAILED_NO_ROW)
             KeplerJobMetadata.atomicWriteFailureForTest = AssertionError("fatal settlement failure")
 
             assertThrows(AssertionError::class.java) {
@@ -986,6 +987,17 @@ class KeplerJobMetadataTest {
             }
             assertTrue(KeplerJobMetadata.isOperationOwner(directory, lease!!))
             assertEquals(operationId, KeplerJobMetadata.read(directory).getString(ACTIVE_OPERATION_ID))
+            assertNotNull(lease!!.pendingPublicExportSettlement())
+
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            val oldLease = lease!!
+            val nextLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                directory,
+                JobRecoveryMutationIntent.REPROCESS
+            )
+            lease = nextLease
+            assertFalse(KeplerJobMetadata.isOperationOwner(directory, oldLease))
+            assertFalse(KeplerJobMetadata.read(directory).has(ACTIVE_OPERATION_ID))
         } finally {
             KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
             lease?.release()
