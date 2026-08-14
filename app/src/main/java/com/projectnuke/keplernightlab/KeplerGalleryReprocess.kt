@@ -1709,7 +1709,12 @@ internal fun rollback(
             settleOwnedPublicExportInterruption(
                 jobDir = jobDir,
                 ownerLease = operationLease,
-                failureMessage = error.message ?: "Reprocess public export ended before terminal metadata was settled."
+                failureMessage = error.message ?: "Reprocess public export ended before terminal metadata was settled.",
+                disposition = if (outcome.disposition == ReprocessTerminalDisposition.CANCELLED) {
+                    PublicExportInterruptionDisposition.CANCELLED
+                } else {
+                    PublicExportInterruptionDisposition.FAILED
+                }
             )
         } catch (settlementFailure: Exception) {
             return quarantineWithPersistence(

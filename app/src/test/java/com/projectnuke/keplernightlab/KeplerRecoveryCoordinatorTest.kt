@@ -691,6 +691,34 @@ class KeplerRecoveryCoordinatorTest {
     }
 
     @Test
+    fun equalTimestampMalformedExportBlocksDeadCurrentPublicExportRecovery() {
+        val root = File(Files.createTempDirectory("kepler-recovery-equal-timestamp-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_equal-timestamp").apply { mkdirs() }
+        try {
+            val startedAt = System.currentTimeMillis()
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("currentPipelineStage", "PROCESSING")
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, "current-public-export")
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name)
+                .put(ACTIVE_OPERATION_STARTED_AT, startedAt))
+            val malformed = File(job, ".export_tx_equal-corrupt.json").apply {
+                writeText("not-json")
+                setLastModified(startedAt)
+            }
+
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
+            assertEquals(KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED, report.jobs.single().classification)
+            assertEquals("AMBIGUOUS_RECOVERY_REQUIRED", KeplerJobMetadata.read(job).getString("recoveryState"))
+            assertTrue(malformed.exists())
+            assertEquals("current-public-export", KeplerJobMetadata.read(job).getString(ACTIVE_OPERATION_ID))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun clearedCurrentExportOperationReconstructsItsNewUriInsteadOfStaleMetadata() {
         val root = File(Files.createTempDirectory("kepler-recovery-cleared-export-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
         val job = File(root, "KPL_YUV_FUSION_cleared-export").apply { mkdirs() }

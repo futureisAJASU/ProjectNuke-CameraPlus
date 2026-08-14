@@ -119,7 +119,9 @@ fun captureProcessExportNightFusion(
                 var verified = false
                 var exportSettlementAttempted = false
                 var exportSettlementSucceeded = false
-                fun settleInterruptedExportForTerminal(): OwnedPublicExportEvidence? {
+                fun settleInterruptedExportForTerminal(
+                    disposition: PublicExportInterruptionDisposition
+                ): OwnedPublicExportEvidence? {
                     val evidence = try {
                         inspectOwnedPublicExportEvidence(jobDir, pipelineLease)
                     } catch (failure: Error) {
@@ -133,7 +135,8 @@ fun captureProcessExportNightFusion(
                             jobDir = jobDir,
                             ownerLease = pipelineLease,
                             failureMessage = "Night Fusion public export ended before terminal metadata was settled.",
-                            finalOutputFormat = finalOutputFormat
+                            finalOutputFormat = finalOutputFormat,
+                            disposition = disposition
                         )
                         if (settled) exportSettlementSucceeded = true
                     } catch (failure: Error) {
@@ -309,7 +312,7 @@ fun captureProcessExportNightFusion(
                     }
                 } catch (_: CancellationException) {
                     post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
-                    val evidence = settleInterruptedExportForTerminal()
+                    val evidence = settleInterruptedExportForTerminal(PublicExportInterruptionDisposition.CANCELLED)
                     terminal.publish(
                         publicExportInterruptionTerminalKind(
                             evidence,
@@ -323,7 +326,7 @@ fun captureProcessExportNightFusion(
                     )
                 } catch (e: Exception) {
                     post("PIPELINE_FAILED: ${if (captureMode == CaptureMode.SINGLE_FRAME) "Single photo" else "Night Fusion"} pipeline failed; keeping cache.\n${e.stackTraceToString()}")
-                    val evidence = settleInterruptedExportForTerminal()
+                    val evidence = settleInterruptedExportForTerminal(PublicExportInterruptionDisposition.FAILED)
                     terminal.publish(
                         publicExportInterruptionTerminalKind(
                             evidence,
@@ -341,9 +344,10 @@ fun captureProcessExportNightFusion(
                             exportSettlementAttempted = true
                             val settled = settleOwnedPublicExportInterruption(
                                 jobDir = jobDir,
-                                ownerLease = pipelineLease,
-                                failureMessage = "Night Fusion public export ended before terminal metadata was settled.",
-                                finalOutputFormat = finalOutputFormat
+                            ownerLease = pipelineLease,
+                            failureMessage = "Night Fusion public export ended before terminal metadata was settled.",
+                            finalOutputFormat = finalOutputFormat,
+                            disposition = PublicExportInterruptionDisposition.FAILED
                             )
                             if (settled) exportSettlementSucceeded = true
                         } catch (failure: Error) {

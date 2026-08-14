@@ -661,7 +661,11 @@ fun captureProcessExportSuperResolutionFusion(
                 var outputDirForSettlement: File? = null
                 var exportSettlementAttempted = false
                 var exportSettlementSucceeded = false
-                fun settleInterruptedExportForTerminal(jobDir: File, lease: JobOperationLease): OwnedPublicExportEvidence? {
+                fun settleInterruptedExportForTerminal(
+                    jobDir: File,
+                    lease: JobOperationLease,
+                    disposition: PublicExportInterruptionDisposition
+                ): OwnedPublicExportEvidence? {
                     val evidence = try {
                         inspectOwnedPublicExportEvidence(jobDir, lease)
                     } catch (failure: Error) {
@@ -675,7 +679,8 @@ fun captureProcessExportSuperResolutionFusion(
                             jobDir = jobDir,
                             ownerLease = lease,
                             failureMessage = "Super Resolution public export ended before terminal metadata was settled.",
-                            finalOutputFormat = finalOutputFormat
+                            finalOutputFormat = finalOutputFormat,
+                            disposition = disposition
                         )
                         if (settled) exportSettlementSucceeded = true
                     } catch (failure: Error) {
@@ -816,7 +821,9 @@ fun captureProcessExportSuperResolutionFusion(
                 } catch (_: CancellationException) {
                     post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                     val evidence = outputLease?.let { lease ->
-                        outputDirForSettlement?.let { dir -> settleInterruptedExportForTerminal(dir, lease) }
+                        outputDirForSettlement?.let { dir ->
+                            settleInterruptedExportForTerminal(dir, lease, PublicExportInterruptionDisposition.CANCELLED)
+                        }
                     }
                     terminal.publish(
                         publicExportInterruptionTerminalKind(
@@ -835,7 +842,9 @@ fun captureProcessExportSuperResolutionFusion(
                             "${error.javaClass.simpleName}: ${error.message}"
                     )
                     val evidence = outputLease?.let { lease ->
-                        outputDirForSettlement?.let { dir -> settleInterruptedExportForTerminal(dir, lease) }
+                        outputDirForSettlement?.let { dir ->
+                            settleInterruptedExportForTerminal(dir, lease, PublicExportInterruptionDisposition.FAILED)
+                        }
                     }
                     terminal.publish(
                         publicExportInterruptionTerminalKind(
@@ -859,7 +868,8 @@ fun captureProcessExportSuperResolutionFusion(
                                     jobDir = settlementDir,
                                     ownerLease = lease,
                                     failureMessage = "Super Resolution public export ended before terminal metadata was settled.",
-                                    finalOutputFormat = finalOutputFormat
+                                    finalOutputFormat = finalOutputFormat,
+                                    disposition = PublicExportInterruptionDisposition.FAILED
                                 )
                                 if (settled) exportSettlementSucceeded = true
                             } catch (failure: Error) {

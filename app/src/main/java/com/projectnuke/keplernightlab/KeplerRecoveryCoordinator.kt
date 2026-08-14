@@ -185,7 +185,7 @@ internal object KeplerRecoveryCoordinator {
                 .filter { it.ownerOperationId == activeOperation }
             val activeStartedAt = job.optLong(ACTIVE_OPERATION_STARTED_AT, 0L)
             val invalidCurrentExportJournals = if (activeOperationKind == KeplerActiveOperationKind.PUBLIC_EXPORT.name) {
-                invalidExportJournals.filter { activeStartedAt <= 0L || it.lastModified() > activeStartedAt }
+                invalidExportJournals.filter { activeStartedAt <= 0L || it.lastModified() >= activeStartedAt }
             } else emptyList()
             val terminalResultAlreadyProven = activeOperation.isBlank() &&
                 job.optString("currentPipelineStage") in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED") &&

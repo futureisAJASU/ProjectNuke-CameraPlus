@@ -175,6 +175,11 @@ internal data class OwnedPublicExportEvidence(
     val uri: String?
 )
 
+internal enum class PublicExportInterruptionDisposition {
+    CANCELLED,
+    FAILED
+}
+
 internal fun publicExportInterruptionTerminalKind(
     evidence: OwnedPublicExportEvidence?,
     cancellationRequested: Boolean,
@@ -225,7 +230,8 @@ internal fun settleOwnedPublicExportInterruption(
     jobDir: File,
     ownerLease: JobOperationLease,
     failureMessage: String,
-    finalOutputFormat: FinalOutputFormat? = null
+    finalOutputFormat: FinalOutputFormat? = null,
+    disposition: PublicExportInterruptionDisposition = PublicExportInterruptionDisposition.FAILED
 ): Boolean {
     check(KeplerJobMetadata.isOperationOwner(jobDir, ownerLease)) {
         "Public export settlement requires the exact owning lease"
@@ -242,7 +248,7 @@ internal fun settleOwnedPublicExportInterruption(
     val ownerJournals = MediaStoreExportJournal.list(jobDir)
         .filter { it.ownerOperationId == operationId }
     val activeStartedAt = metadata.optLong(ACTIVE_OPERATION_STARTED_AT, 0L)
-    val currentInvalid = invalid.filter { activeStartedAt <= 0L || it.lastModified() > activeStartedAt }
+    val currentInvalid = invalid.filter { activeStartedAt <= 0L || it.lastModified() >= activeStartedAt }
     val evidence = inspectOwnedPublicExportEvidence(jobDir, ownerLease)
         ?: return true
     // A malformed file created before this operation is historical forensic
@@ -289,9 +295,13 @@ internal fun settleOwnedPublicExportInterruption(
                 .put("recoveryMessage", "공개 내보내기 결과의 확인이 완료되지 않아 추가 확인이 필요합니다.")
                 .put("lastRecoveryClassification", KeplerJobRecoveryClassification.PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION.name)
                 .put("lastRecoveryMessage", "공개 내보내기는 완료되었지만 결과 확인이 완료되지 않았습니다.")
-            else -> job.put("currentPipelineStage", "FAILED")
-                .put("processStatus", "EXPORT_FAILED_KEEPING_CACHE")
-                .put("exportStatus", "FAILED")
+            else -> job.put("currentPipelineStage", if (disposition == PublicExportInterruptionDisposition.CANCELLED) "CANCELLED" else "FAILED")
+                .put("processStatus", if (disposition == PublicExportInterruptionDisposition.CANCELLED) {
+                    "EXPORT_CANCELLED_BEFORE_COMMIT"
+                } else {
+                    "EXPORT_FAILED_KEEPING_CACHE"
+                })
+                .put("exportStatus", if (disposition == PublicExportInterruptionDisposition.CANCELLED) "CANCELLED" else "FAILED")
                 .put("recoveryState", "STABLE")
                 .put("lastRecoveryClassification", KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name)
                 .put("lastRecoveryMessage", "공개 내보내기 전에 이전 실행이 종료되어 원본 작업 자료를 보존했습니다.")
