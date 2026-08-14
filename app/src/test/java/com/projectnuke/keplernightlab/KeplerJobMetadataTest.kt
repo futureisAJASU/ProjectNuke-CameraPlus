@@ -157,6 +157,15 @@ class KeplerJobMetadataTest {
                 kind = KeplerActiveOperationKind.CAPTURE_YUV,
                 ownerLease = lease
             )
+            KeplerJobMetadata.atomicWriteFailureForTest = AssertionError("fatal handoff write failed")
+            assertThrows(AssertionError::class.java) {
+                KeplerJobMetadata.publishProcessingHandoff(
+                    directory,
+                    operationId,
+                    KeplerActiveOperationKind.PROCESSING_YUV
+                )
+            }
+            assertTrue(KeplerJobMetadata.isOperationOwner(directory, lease!!))
             KeplerJobMetadata.atomicWriteFailureForTest = IllegalStateException("handoff write failed")
             assertFalse(
                 KeplerJobMetadata.publishProcessingHandoff(

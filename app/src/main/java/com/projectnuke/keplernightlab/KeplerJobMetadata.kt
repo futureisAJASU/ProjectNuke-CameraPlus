@@ -435,20 +435,26 @@ object KeplerJobMetadata {
         captureOperationId: String,
         kind: KeplerActiveOperationKind,
         createdAt: Long = System.currentTimeMillis()
-    ): Boolean = runCatching {
-        var matched = false
-        update(jobDir) { job ->
-            if (job.optString(ACTIVE_RUNTIME_SESSION_ID) != KeplerRuntimeSession.id ||
-                job.optString(ACTIVE_OPERATION_ID) != captureOperationId
-            ) return@update
-            matched = true
-            job.put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
-                .put(PROCESSING_HANDOFF_OPERATION_ID, UUID.randomUUID().toString())
-                .put(PROCESSING_HANDOFF_KIND, kind.name)
-                .put(PROCESSING_HANDOFF_CREATED_AT, createdAt)
+    ): Boolean {
+        return try {
+            var matched = false
+            update(jobDir) { job ->
+                if (job.optString(ACTIVE_RUNTIME_SESSION_ID) != KeplerRuntimeSession.id ||
+                    job.optString(ACTIVE_OPERATION_ID) != captureOperationId
+                ) return@update
+                matched = true
+                job.put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                    .put(PROCESSING_HANDOFF_OPERATION_ID, UUID.randomUUID().toString())
+                    .put(PROCESSING_HANDOFF_KIND, kind.name)
+                    .put(PROCESSING_HANDOFF_CREATED_AT, createdAt)
+            }
+            matched
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            false
         }
-        matched
-    }.getOrDefault(false)
+    }
 
     /**
      * Clears a capture owner only when its handoff could not be published and
@@ -492,22 +498,28 @@ object KeplerJobMetadata {
     }.getOrDefault(false)
 
     /** Clears only the marker owned by this runtime and operation. */
-    internal fun clearActiveOperation(jobDir: File, operationId: String): Boolean = runCatching {
-        var matched = false
-        update(jobDir) { job ->
-            if (job.optString(ACTIVE_RUNTIME_SESSION_ID) != KeplerRuntimeSession.id ||
-                job.optString(ACTIVE_OPERATION_ID) != operationId
-            ) return@update
-            matched = true
-            job.remove(ACTIVE_RUNTIME_SESSION_ID)
-            job.remove(ACTIVE_OPERATION_ID)
-            job.remove(ACTIVE_OPERATION_KIND)
-            job.remove(ACTIVE_OPERATION_STARTED_AT)
-            job.remove(ACTIVE_OPERATION_UPDATED_AT)
+    internal fun clearActiveOperation(jobDir: File, operationId: String): Boolean {
+        return try {
+            var matched = false
+            update(jobDir) { job ->
+                if (job.optString(ACTIVE_RUNTIME_SESSION_ID) != KeplerRuntimeSession.id ||
+                    job.optString(ACTIVE_OPERATION_ID) != operationId
+                ) return@update
+                matched = true
+                job.remove(ACTIVE_RUNTIME_SESSION_ID)
+                job.remove(ACTIVE_OPERATION_ID)
+                job.remove(ACTIVE_OPERATION_KIND)
+                job.remove(ACTIVE_OPERATION_STARTED_AT)
+                job.remove(ACTIVE_OPERATION_UPDATED_AT)
+            }
+            if (matched) releaseAutoOperation(jobDir)
+            matched
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            false
         }
-        if (matched) releaseAutoOperation(jobDir)
-        matched
-    }.getOrDefault(false)
+    }
 
     /** Clears a current-process marker when terminal metadata has already settled its owner. */
     internal fun clearActiveOperationKind(jobDir: File, kind: KeplerActiveOperationKind): Boolean = runCatching {
@@ -611,7 +623,8 @@ object KeplerJobMetadata {
     internal fun finalizeRecoveredProcessingHandoff(
         jobDir: File,
         recoveryLease: JobOperationLease? = null
-    ): Boolean = runCatching {
+    ): Boolean {
+        return try {
         var matched = false
         update(jobDir) { job ->
             if (job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID).isBlank() ||
@@ -630,7 +643,12 @@ object KeplerJobMetadata {
             job.remove(PROCESSING_HANDOFF_CREATED_AT)
         }
         matched
-    }.getOrDefault(false)
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            false
+        }
+    }
 
     /**
      * Settles a capture handoff when its processing worker could not be posted.
