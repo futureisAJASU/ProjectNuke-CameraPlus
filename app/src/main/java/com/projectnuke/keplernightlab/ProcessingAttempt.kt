@@ -29,6 +29,13 @@ internal class ProcessingAlreadyActiveException(jobDir: File) :
 
 internal fun ProcessingAttempt.releaseOwnedLease() = release()
 
+/**
+ * Processing entry points return only after their required artifact claim is
+ * durable. Preserve that claim in a terminal event across an immediate
+ * cancellation/failure boundary.
+ */
+internal fun requiredOutputCommittedAfterProcessing(finalFile: File): Boolean = finalFile.isFile
+
 private val COMMON_PROCESSING_ATTEMPT_KEYS = setOf(
     "pipelineFailed",
     "pipelineFailureSource",

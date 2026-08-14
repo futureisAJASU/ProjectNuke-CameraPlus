@@ -13,6 +13,19 @@ import org.robolectric.RobolectricTestRunner
 @RunWith(RobolectricTestRunner::class)
 class ProcessingAttemptTest {
     @Test
+    fun returnedClaimedFinalPreservesRequiredOutputTerminalFlag() {
+        val dir = Files.createTempDirectory("processing-terminal-output").toFile()
+        try {
+            val output = dir.resolve("final.png")
+            assertFalse(requiredOutputCommittedAfterProcessing(output))
+            output.writeBytes(byteArrayOf(1, 2, 3))
+            assertTrue(requiredOutputCommittedAfterProcessing(output))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
     fun newAttemptClearsPriorRunClaimsAndOwnsItsCommittedArtifact() {
         val dir = Files.createTempDirectory("processing-attempt").toFile()
         try {

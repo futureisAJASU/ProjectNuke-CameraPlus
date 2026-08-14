@@ -604,6 +604,47 @@ object KeplerJobMetadata {
         matched
     }.getOrDefault(false)
 
+    /**
+     * Settles a capture handoff when its processing worker could not be posted.
+     * The exact lease is retained if the metadata settlement fails so a durable
+     * handoff cannot become ownerless while the process is still alive.
+     */
+    internal fun settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
+        jobDir: File,
+        ownerLease: JobOperationLease? = null
+    ): Boolean {
+        val handoffPresent = try {
+            read(jobDir).optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            return false
+        }
+        if (!handoffPresent) return true
+
+        val lease = ownerLease ?: try {
+            acquireRecoveryCheckedOperation(
+                jobDir,
+                JobRecoveryMutationIntent.PROCESSING_START,
+                consumesProcessingHandoff = true
+            )
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            return false
+        }
+
+        val settled = try {
+            finalizeRecoveredProcessingHandoff(jobDir, lease)
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            false
+        }
+        if (settled) lease.release()
+        return settled
+    }
+
     fun atomicWrite(file: File, text: String) {
         atomicWriteFailureForTest?.let { failure ->
             atomicWriteFailureForTest = null

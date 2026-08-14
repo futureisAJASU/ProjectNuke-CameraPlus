@@ -171,6 +171,7 @@ fun captureProcessExportNightFusion(
                             operationLease = pipelineLease
                         )
                     }
+                    requiredOutputCommitted = requiredOutputCommittedAfterProcessing(finalFile)
                     cancellation.throwIfCancelled()
 
                     val requestedOutputFormat = requestedOutputFormatForSetting(finalOutputFormat)
@@ -370,7 +371,20 @@ fun captureProcessExportNightFusion(
                 false
             }
             if (!workerPosted) {
-                pipelineLease.release()
+                val handoffSettled = try {
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
+                        jobDir,
+                        pipelineLease
+                    )
+                } catch (failure: Error) {
+                    throw failure
+                } catch (failure: Exception) {
+                    android.util.Log.e("KeplerYuvPipeline", "processing handoff settlement failed", failure)
+                    false
+                }
+                if (!handoffSettled) {
+                    android.util.Log.e("KeplerYuvPipeline", "retaining processing lease after handoff settlement failure")
+                }
                 workerThread.quitSafely()
                 post("PIPELINE_FAILED: Capture processing worker could not start; cache kept.")
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = "Capture processing worker could not start.")

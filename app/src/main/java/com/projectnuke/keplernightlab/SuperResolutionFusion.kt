@@ -721,6 +721,7 @@ fun captureProcessExportSuperResolutionFusion(
                         return@post
                     }
 
+                    requiredOutputCommitted = requiredOutputCommittedAfterProcessing(outputFile)
                     cancellation.throwIfCancelled()
                     val bitmap = NoFollowFileSystem.decodeBitmapVerified(outputFile)
                         ?: error("Could not decode 24M Fusion output.")
@@ -891,6 +892,17 @@ fun captureProcessExportSuperResolutionFusion(
             }
             if (!workerPosted) {
                 // The worker never reached its finally block.
+                val handoffSettled = try {
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(sourceJobDir)
+                } catch (failure: Error) {
+                    throw failure
+                } catch (failure: Exception) {
+                    Log.e("KeplerSuperResolution", "processing handoff settlement failed", failure)
+                    false
+                }
+                if (!handoffSettled) {
+                    Log.e("KeplerSuperResolution", "processing handoff remains protected after dispatch failure")
+                }
                 workerThread.quitSafely()
                 post("PIPELINE_FAILED: 24M Fusion worker could not start.")
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = "24M Fusion worker could not start.")

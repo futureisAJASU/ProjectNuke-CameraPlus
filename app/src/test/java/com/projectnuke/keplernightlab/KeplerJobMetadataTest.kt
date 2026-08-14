@@ -93,6 +93,55 @@ class KeplerJobMetadataTest {
     }
 
     @Test
+    fun failedWorkerDispatchConsumesCaptureHandoffExactlyOnce() {
+        val directory = Files.createTempDirectory("kepler-dispatch-handoff-").toFile()
+        var lease: JobOperationLease? = null
+        try {
+            KeplerJobMetadata.write(directory, JSONObject().put("status", "CAPTURING"))
+            lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                directory,
+                JobRecoveryMutationIntent.PROCESSING_START
+            )
+            val captureOperationId = KeplerJobMetadata.beginActiveOperation(
+                directory,
+                kind = KeplerActiveOperationKind.CAPTURE_YUV,
+                ownerLease = lease
+            )
+            assertTrue(
+                KeplerJobMetadata.publishProcessingHandoff(
+                    directory,
+                    captureOperationId,
+                    KeplerActiveOperationKind.PROCESSING_YUV
+                )
+            )
+            assertTrue(KeplerJobMetadata.clearActiveOperation(directory, captureOperationId))
+            assertTrue(KeplerJobMetadata.isOperationOwner(directory, lease!!))
+
+            assertTrue(
+                KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
+                    directory,
+                    lease
+                )
+            )
+            val settled = KeplerJobMetadata.read(directory)
+            assertFalse(settled.has(PROCESSING_HANDOFF_OPERATION_ID))
+            assertEquals("STABLE", settled.getString("recoveryState"))
+            assertEquals("INTERRUPTED_PRE_COMMIT", settled.getString("lastRecoveryClassification"))
+
+            assertTrue(
+                KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
+                    directory,
+                    lease
+                )
+            )
+            assertFalse(KeplerJobMetadata.read(directory).has(PROCESSING_HANDOFF_OPERATION_ID))
+        } finally {
+            lease?.release()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun recoveryCheckedAcquisitionSerializesCompetingMutations() {
         val directory = Files.createTempDirectory("kepler-atomic-owner-").toFile()
         val executor = Executors.newFixedThreadPool(2)

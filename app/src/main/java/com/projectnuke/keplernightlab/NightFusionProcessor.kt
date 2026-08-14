@@ -116,6 +116,7 @@ fun processLatestNightFusionV02(
         workerHandler.post {
         var jobDir: File? = null
         var operationLease: JobOperationLease? = null
+        var requiredOutputCommitted = false
         try {
             cancellation.throwIfCancelled()
             jobDir = findLatestColorBurstJobDir(context)
@@ -128,20 +129,25 @@ fun processLatestNightFusionV02(
                 JobRecoveryMutationIntent.PROCESSING_START,
                 consumesProcessingHandoff = true
             )
-            processNightFusionJobV02Sync(
+            val finalFile = processNightFusionJobV02Sync(
                 jobDir,
                 onStatus = { postStatus(it) },
                 cancellation = cancellation,
                 operationLease = operationLease
             )
+            requiredOutputCommitted = requiredOutputCommittedAfterProcessing(finalFile)
             cancellation.throwIfCancelled()
             postTerminal(
                 CameraPipelineEvent.Terminal.Kind.COMPLETE,
                 "PIPELINE_COMPLETE: YUV Night Fusion processing complete.",
-                requiredOutputCommitted = true
+                requiredOutputCommitted = requiredOutputCommitted
             )
         } catch (_: CancellationException) {
-            postTerminal(CameraPipelineEvent.Terminal.Kind.CANCELLED, "PIPELINE_CANCELLED: YUV Night Fusion processing cancelled; cache kept.")
+            postTerminal(
+                CameraPipelineEvent.Terminal.Kind.CANCELLED,
+                "PIPELINE_CANCELLED: YUV Night Fusion processing cancelled; cache kept.",
+                requiredOutputCommitted = requiredOutputCommitted
+            )
         } catch (e: Exception) {
             Log.e("KeplerYuvPipeline", "PIPELINE_FAILED in processLatestNightFusionV02", e)
             runCatching {
@@ -159,7 +165,8 @@ fun processLatestNightFusionV02(
             }
             postTerminal(
                 CameraPipelineEvent.Terminal.Kind.FAILED,
-                "PIPELINE_FAILED: YUV Night Fusion failed: ${e.shortMessage()}; cache kept. See logcat/job.json for details."
+                "PIPELINE_FAILED: YUV Night Fusion failed: ${e.shortMessage()}; cache kept. See logcat/job.json for details.",
+                requiredOutputCommitted = requiredOutputCommitted
             )
         } finally {
             operationLease?.release()
@@ -171,6 +178,18 @@ fun processLatestNightFusionV02(
         false
     }
     if (!workerPosted) {
+        val handoffSettled = try {
+            val jobDir = findLatestColorBurstJobDir(context)
+            jobDir == null || KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(jobDir)
+        } catch (failure: Error) {
+            throw failure
+        } catch (failure: Exception) {
+            Log.e("KeplerYuvPipeline", "processing handoff settlement failed", failure)
+            false
+        }
+        if (!handoffSettled) {
+            Log.e("KeplerYuvPipeline", "processing handoff remains protected after dispatch failure")
+        }
         workerThread.quitSafely()
         postTerminal(CameraPipelineEvent.Terminal.Kind.FAILED, "PIPELINE_FAILED: YUV Night Fusion worker could not start; cache kept.")
     }
