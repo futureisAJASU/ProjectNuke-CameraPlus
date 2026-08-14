@@ -57,4 +57,44 @@ class PublicExportTerminalTruthTest {
             )
         )
     }
+
+    @Test
+    fun committedLocalOutputKeepsCancellationAndFailureAsPartialTruth() {
+        assertEquals(
+            CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+            publicExportInterruptionTerminalKind(
+                evidence = OwnedPublicExportEvidence("local", committed = false, verified = false, uri = null),
+                cancellationRequested = true,
+                requiredOutputCommitted = true
+            )
+        )
+        assertEquals(
+            CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+            publicExportInterruptionTerminalKind(
+                evidence = OwnedPublicExportEvidence("local", committed = false, verified = false, uri = null),
+                cancellationRequested = false,
+                requiredOutputCommitted = true
+            )
+        )
+    }
+
+    @Test
+    fun noCommittedOutputKeepsPreCommitCancellationAndFailureDistinct() {
+        assertEquals(
+            CameraPipelineEvent.Terminal.Kind.CANCELLED,
+            publicExportInterruptionTerminalKind(
+                evidence = null,
+                cancellationRequested = true,
+                requiredOutputCommitted = false
+            )
+        )
+        assertEquals(
+            CameraPipelineEvent.Terminal.Kind.FAILED,
+            publicExportInterruptionTerminalKind(
+                evidence = null,
+                cancellationRequested = false,
+                requiredOutputCommitted = false
+            )
+        )
+    }
 }

@@ -322,7 +322,8 @@ fun captureProcessExportNightFusion(
                         publicExportInterruptionTerminalKind(
                             evidence,
                             cancellationRequested = true,
-                            committedFallback = publicExportCommitted
+                            committedFallback = publicExportCommitted,
+                            requiredOutputCommitted = requiredOutputCommitted
                         ),
                         requiredOutputCommitted = requiredOutputCommitted,
                         publicExportCommitted = evidence?.committed ?: publicExportCommitted,
@@ -338,7 +339,8 @@ fun captureProcessExportNightFusion(
                         publicExportInterruptionTerminalKind(
                             evidence,
                             cancellationRequested = false,
-                            committedFallback = publicExportCommitted
+                            committedFallback = publicExportCommitted,
+                            requiredOutputCommitted = requiredOutputCommitted
                         ),
                         requiredOutputCommitted = requiredOutputCommitted,
                         publicExportCommitted = evidence?.committed ?: publicExportCommitted,

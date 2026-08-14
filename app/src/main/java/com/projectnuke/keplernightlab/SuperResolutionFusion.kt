@@ -842,7 +842,8 @@ fun captureProcessExportSuperResolutionFusion(
                         publicExportInterruptionTerminalKind(
                             evidence,
                             cancellationRequested = true,
-                            committedFallback = publicExportCommitted
+                            committedFallback = publicExportCommitted,
+                            requiredOutputCommitted = requiredOutputCommitted
                         ),
                         requiredOutputCommitted = requiredOutputCommitted,
                         publicExportCommitted = evidence?.committed ?: publicExportCommitted,
@@ -866,7 +867,8 @@ fun captureProcessExportSuperResolutionFusion(
                         publicExportInterruptionTerminalKind(
                             evidence,
                             cancellationRequested = false,
-                            committedFallback = publicExportCommitted
+                            committedFallback = publicExportCommitted,
+                            requiredOutputCommitted = requiredOutputCommitted
                         ),
                         requiredOutputCommitted = requiredOutputCommitted,
                         publicExportCommitted = evidence?.committed ?: publicExportCommitted,
