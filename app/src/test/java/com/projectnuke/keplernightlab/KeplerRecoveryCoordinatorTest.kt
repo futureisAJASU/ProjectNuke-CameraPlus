@@ -23,6 +23,146 @@ class KeplerRecoveryCoordinatorTest {
         override fun setPending(uri: Uri, pending: Boolean) = true
         override fun delete(uri: Uri) = true
     }
+
+    @Test
+    fun foreignDurableOwnerBlocksMutationBeforeStartupRecovery() {
+        val job = Files.createTempDirectory("kepler-gate-owner-").toFile()
+        try {
+            KeplerJobMetadata.write(job, JSONObject()
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, "old-export")
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name)
+                .put("recoveryState", "STABLE"))
+            assertEquals(
+                JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION,
+                KeplerJobMetadata.inspectRecoveryMutationGate(job, JobRecoveryMutationIntent.JOB_DELETE)
+            )
+        } finally {
+            job.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun currentHandoffOnlyAllowsItsExplicitProcessingConsumer() {
+        val job = Files.createTempDirectory("kepler-gate-handoff-").toFile()
+        try {
+            KeplerJobMetadata.write(job, JSONObject()
+                .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, "capture-1")
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.CAPTURE_YUV.name)
+                .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(PROCESSING_HANDOFF_OPERATION_ID, "capture-1")
+                .put(PROCESSING_HANDOFF_KIND, "PROCESSING_YUV"))
+            assertEquals(
+                JobRecoveryMutationGateOutcome.ALLOWED,
+                KeplerJobMetadata.inspectRecoveryMutationGate(
+                    job,
+                    JobRecoveryMutationIntent.PROCESSING_START,
+                    consumesProcessingHandoff = true
+                )
+            )
+            assertEquals(
+                JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION,
+                KeplerJobMetadata.inspectRecoveryMutationGate(job, JobRecoveryMutationIntent.JOB_CLEANUP)
+            )
+        } finally {
+            job.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun malformedProcessingNamespaceEntryBlocksEveryOrdinaryMutation() {
+        val job = Files.createTempDirectory("kepler-gate-invalid-").toFile()
+        try {
+            KeplerJobMetadata.write(job, JSONObject().put("recoveryState", "STABLE"))
+            File(job, ".processing_tx_invalid.json").mkdirs()
+            assertEquals(
+                JobRecoveryMutationGateOutcome.BLOCKED_INVALID_PROCESSING_JOURNAL,
+                KeplerJobMetadata.inspectRecoveryMutationGate(job, JobRecoveryMutationIntent.JOB_CLEANUP)
+            )
+        } finally {
+            job.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun activeExportJournalBlocksDestructiveMutationBeforeRecovery() {
+        val job = Files.createTempDirectory("kepler-gate-export-").toFile()
+        try {
+            KeplerJobMetadata.write(job, JSONObject().put("recoveryState", "STABLE"))
+            MediaStoreExportJournal.create(
+                job, MediaStoreExportRole.MAIN_IMAGE, null, "result.jpg",
+                "Pictures/Kepler", "image/jpeg", Uri.parse("content://media/external/images/media"),
+                ownerOperationId = "old-export"
+            )
+            assertEquals(
+                JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION,
+                KeplerJobMetadata.inspectRecoveryMutationGate(job, JobRecoveryMutationIntent.JOB_DELETE)
+            )
+        } finally {
+            job.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun residualSettledProcessingJournalBlocksReplacementUntilItIsRemoved() {
+        val job = Files.createTempDirectory("kepler-gate-settled-").toFile()
+        try {
+            KeplerJobMetadata.write(job, JSONObject().put("jobType", "YUV_NIGHT_FUSION"))
+            val attempt = beginProcessingAttempt(job, "CLASSIC_YUV")
+            val final = File(job, "final.bin")
+            processingArtifactJournalDeleteFailureForTest = true
+            try {
+                commitProcessingArtifact(
+                    finalFile = final,
+                    writeTemp = { it.writeBytes(byteArrayOf(1, 2, 3)) },
+                    verifyFinal = { check(it.readBytes().contentEquals(byteArrayOf(1, 2, 3))) },
+                    processingAttemptId = attempt.id,
+                    claimKey = "finalFile"
+                )
+                markProcessingArtifactClaim(job, attempt, "finalFile", final)
+            } finally {
+                attempt.releaseOwnedLease()
+            }
+            assertEquals(
+                JobRecoveryMutationGateOutcome.BLOCKED_SETTLED_JOURNAL,
+                KeplerJobMetadata.inspectRecoveryMutationGate(job, JobRecoveryMutationIntent.PROCESSING_START)
+            )
+            assertTrue(ProcessingArtifactJournal.list(job).isNotEmpty())
+            processingArtifactJournalDeleteFailureForTest = false
+            assertEquals(
+                JobRecoveryMutationGateOutcome.ALLOWED,
+                KeplerJobMetadata.inspectRecoveryMutationGate(job, JobRecoveryMutationIntent.PROCESSING_START)
+            )
+            assertTrue(ProcessingArtifactJournal.list(job).isEmpty())
+        } finally {
+            processingArtifactJournalDeleteFailureForTest = false
+            job.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun missingMetadataWithEvidenceIsNotAnEmptyInitializationTarget() {
+        val job = Files.createTempDirectory("kepler-gate-orphan-").toFile()
+        try {
+            File(job, "frame_00.yuv").writeBytes(byteArrayOf(1))
+            assertEquals(
+                JobRecoveryMutationGateOutcome.BLOCKED_ORPHANED_JOB_METADATA,
+                KeplerJobMetadata.inspectRecoveryMutationGate(job, JobRecoveryMutationIntent.JOB_DELETE)
+            )
+            val empty = Files.createTempDirectory("kepler-gate-empty-").toFile()
+            try {
+                assertEquals(
+                    JobRecoveryMutationGateOutcome.ALLOWED,
+                    KeplerJobMetadata.inspectRecoveryMutationGate(empty, JobRecoveryMutationIntent.PROCESSING_START)
+                )
+            } finally {
+                empty.deleteRecursively()
+            }
+        } finally {
+            job.deleteRecursively()
+        }
+    }
     @Test
     fun oneBrokenJobDoesNotAbortHealthyRootScan() {
         val root = File(Files.createTempDirectory("kepler-recovery-root-").toFile(), "KeplerRawFusion").apply { mkdirs() }
