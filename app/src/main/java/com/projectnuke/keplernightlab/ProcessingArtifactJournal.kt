@@ -70,9 +70,17 @@ internal fun reconcileSettledAuthoritativeProcessingJournals(
         .map { it.second }
         .filter {
             it.state == ProcessingArtifactJournalState.SETTLED &&
-                it.claimKey != null && it.processingAttemptId != null
+                ((it.claimKey != null && it.processingAttemptId != null) || it.adoptedResult == "NO_OUTPUT")
         }
     settled.forEach { journal ->
+        if (journal.adoptedResult == "NO_OUTPUT") {
+            if (NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true) != null ||
+                NoFollowFileSystem.resolveDirectChild(jobDir, journal.tempName, requireFile = true) != null ||
+                NoFollowFileSystem.resolveDirectChild(jobDir, journal.priorName, requireFile = true) != null
+            ) return false
+            if (!journal.deleteIfOwned(jobDir)) return false
+            return@forEach
+        }
         val claimKey = journal.claimKey ?: return@forEach
         val attemptId = journal.processingAttemptId ?: return@forEach
         val exactClaim = journal.adoptedResult == "NEW_FINAL" &&
@@ -220,9 +228,9 @@ internal data class ProcessingArtifactJournal(
             }
             if (claimKey != null) {
                 val job = runCatching { KeplerJobMetadata.read(jobDir) }.getOrNull()
-                if (job != null && !isKnownProcessingArtifactClaimKey(job, claimKey)) {
+                if (job == null || !isKnownProcessingArtifactClaimKey(job, claimKey)) {
                     throw ProcessingArtifactClaimConflictException(
-                        "Claim key $claimKey is not valid for processing mode ${job.optString("processingMode")}"
+                        "Claim key $claimKey is not valid for processing mode ${job?.optString("processingMode").orEmpty()}"
                     )
                 }
             }
@@ -293,6 +301,7 @@ internal data class ProcessingArtifactJournal(
 
 internal enum class ProcessingArtifactRecoveryClassification {
     SETTLED_TEMP,
+    SETTLED_NO_OUTPUT_WITH_CLEANUP_DEBT,
     RESTORED_PRIOR,
     RESTORED_PRIOR_WITH_CLEANUP_DEBT,
     ADOPTED_CURRENT,
@@ -380,8 +389,16 @@ internal fun recoverProcessingArtifactJournals(
                 ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT)
             } else {
                 if (!deleteExact(temp)) return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "temporary cleanup failed")
-                journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED).deleteIfOwned(jobDir)
-                ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.SETTLED_TEMP)
+                val settled = journal.transition(
+                    jobDir,
+                    ProcessingArtifactJournalState.SETTLED,
+                    adoptedResultOverride = "NO_OUTPUT"
+                )
+                if (settled.deleteIfOwned(jobDir)) {
+                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.SETTLED_TEMP)
+                } else {
+                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.SETTLED_NO_OUTPUT_WITH_CLEANUP_DEBT, "settled no-output journal cleanup remains")
+                }
             }
         }
         ProcessingArtifactJournalState.PRIOR_BACKED_UP,
@@ -423,8 +440,16 @@ internal fun recoverProcessingArtifactJournals(
                 if (!deleteExact(temp)) {
                     ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "unadopted temporary cleanup failed")
                 } else {
-                    journal.transition(jobDir, ProcessingArtifactJournalState.SETTLED).deleteIfOwned(jobDir)
-                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.SETTLED_TEMP, "move did not begin before process interruption")
+                    val settled = journal.transition(
+                        jobDir,
+                        ProcessingArtifactJournalState.SETTLED,
+                        adoptedResultOverride = "NO_OUTPUT"
+                    )
+                    if (settled.deleteIfOwned(jobDir)) {
+                        ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.SETTLED_TEMP, "move did not begin before process interruption")
+                    } else {
+                        ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.SETTLED_NO_OUTPUT_WITH_CLEANUP_DEBT, "unadopted transaction settled; journal cleanup remains")
+                    }
                 }
             }
             prior != null && valid(prior, prior = true) && final == null -> {
@@ -533,6 +558,16 @@ internal fun recoverProcessingArtifactJournals(
         ProcessingArtifactJournalState.PRIOR_RESTORED,
         ProcessingArtifactJournalState.JOB_CLAIM_PERSISTED,
         ProcessingArtifactJournalState.SETTLED -> {
+            if (journal.adoptedResult == "NO_OUTPUT") {
+                if (final != null || temp != null || prior != null) {
+                    return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "settled no-output transaction still owns an artifact path")
+                }
+                return@map if (journal.deleteIfOwned(jobDir)) {
+                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.SETTLED_TEMP)
+                } else {
+                    ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.SETTLED_NO_OUTPUT_WITH_CLEANUP_DEBT, "settled no-output journal cleanup remains")
+                }
+            }
             val priorResult = journal.adoptedResult == "PRIOR_FINAL" || journal.state == ProcessingArtifactJournalState.PRIOR_RESTORED
             if (!priorResult && journal.adoptedResult != "NEW_FINAL") {
                 return@map ProcessingArtifactRecoveryResult(journalFile, ProcessingArtifactRecoveryClassification.AMBIGUOUS, "settled journal has no adopted result")

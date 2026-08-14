@@ -100,6 +100,45 @@ class ProcessingArtifactTransactionTest {
     }
 
     @Test
+    fun settledNoOutputJournalUnlinkFailureRemainsRetryableNotAmbiguous() {
+        val dir = Files.createTempDirectory("processing-no-output-cleanup-").toFile()
+        try {
+            val temp = File(dir, ".result.tmp")
+            val journal = ProcessingArtifactJournal(
+                transactionId = UUID.randomUUID().toString(),
+                processingAttemptId = null,
+                runtimeSessionId = "old-runtime",
+                artifactType = "BIN",
+                finalName = "result.bin",
+                tempName = temp.name,
+                priorName = ".result.prior",
+                verificationKind = "BIN",
+                expectedSizeBytes = null,
+                expectedSha256 = null,
+                adoptedResult = "NO_OUTPUT",
+                state = ProcessingArtifactJournalState.SETTLED,
+                createdAt = 1L,
+                updatedAt = 2L
+            )
+            journal.writeTo(dir)
+            processingArtifactJournalDeleteFailureForTest = true
+            try {
+                val first = recoverProcessingArtifactJournals(dir).single()
+                assertEquals(ProcessingArtifactRecoveryClassification.SETTLED_NO_OUTPUT_WITH_CLEANUP_DEBT, first.classification)
+            } finally {
+                processingArtifactJournalDeleteFailureForTest = false
+            }
+            assertTrue(ProcessingArtifactJournal.list(dir).isNotEmpty())
+            val second = recoverProcessingArtifactJournals(dir).single()
+            assertEquals(ProcessingArtifactRecoveryClassification.SETTLED_TEMP, second.classification)
+            assertTrue(ProcessingArtifactJournal.list(dir).isEmpty())
+        } finally {
+            processingArtifactJournalDeleteFailureForTest = false
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
     fun authoritativeJournalCreationIsSerializedPerJob() {
         val dir = Files.createTempDirectory("processing-journal-concurrent-").toFile()
         val executor = Executors.newFixedThreadPool(2)

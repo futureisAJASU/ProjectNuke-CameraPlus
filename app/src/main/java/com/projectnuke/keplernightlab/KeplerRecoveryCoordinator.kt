@@ -327,8 +327,10 @@ internal object KeplerRecoveryCoordinator {
                     failures = metadataTemps.failures + captureTemps.failures
                 )
             }
-            val processingJournalFiles = ProcessingArtifactJournal.list(jobDir)
-            if (activeOperation.isBlank() && processingJournalFiles.isNotEmpty()) {
+            val processingScan = ProcessingArtifactJournal.scan(jobDir)
+            val processingEvidenceExists = processingScan.validJournals.isNotEmpty() ||
+                processingScan.invalidFiles.isNotEmpty()
+            if (activeOperation.isBlank() && processingEvidenceExists) {
                 val artifactResults = recoverProcessingArtifactJournals(jobDir, job)
                 val artifactFailure = artifactResults.firstOrNull {
                     it.classification == ProcessingArtifactRecoveryClassification.AMBIGUOUS ||
@@ -349,13 +351,15 @@ internal object KeplerRecoveryCoordinator {
                 val artifactCleanupDebt = artifactResults
                     .filter {
                         it.classification == ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT ||
-                            it.classification == ProcessingArtifactRecoveryClassification.RESTORED_PRIOR_WITH_CLEANUP_DEBT
+                            it.classification == ProcessingArtifactRecoveryClassification.RESTORED_PRIOR_WITH_CLEANUP_DEBT ||
+                            it.classification == ProcessingArtifactRecoveryClassification.SETTLED_NO_OUTPUT_WITH_CLEANUP_DEBT
                     }
                     .mapNotNull { it.message ?: "처리 파일 정리 결과를 확인할 수 없습니다." }
                 if (artifactCleanupDebt.isNotEmpty()) {
                     val cleanupHistory = if (artifactResults.any {
                             it.classification == ProcessingArtifactRecoveryClassification.RESTORED_PRIOR ||
-                                it.classification == ProcessingArtifactRecoveryClassification.RESTORED_PRIOR_WITH_CLEANUP_DEBT
+                                it.classification == ProcessingArtifactRecoveryClassification.RESTORED_PRIOR_WITH_CLEANUP_DEBT ||
+                                it.classification == ProcessingArtifactRecoveryClassification.SETTLED_NO_OUTPUT_WITH_CLEANUP_DEBT
                         }) {
                         KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name
                     } else {
@@ -416,12 +420,14 @@ internal object KeplerRecoveryCoordinator {
                 val artifactCleanupDebt = artifactResults
                     .filter {
                         it.classification == ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT ||
-                            it.classification == ProcessingArtifactRecoveryClassification.RESTORED_PRIOR_WITH_CLEANUP_DEBT
+                            it.classification == ProcessingArtifactRecoveryClassification.RESTORED_PRIOR_WITH_CLEANUP_DEBT ||
+                            it.classification == ProcessingArtifactRecoveryClassification.SETTLED_NO_OUTPUT_WITH_CLEANUP_DEBT
                     }
                     .mapNotNull { it.message ?: "처리 파일 정리 결과를 확인할 수 없습니다." }
                 val cleanupHistory = if (artifactResults.any {
                         it.classification == ProcessingArtifactRecoveryClassification.RESTORED_PRIOR ||
-                            it.classification == ProcessingArtifactRecoveryClassification.RESTORED_PRIOR_WITH_CLEANUP_DEBT
+                            it.classification == ProcessingArtifactRecoveryClassification.RESTORED_PRIOR_WITH_CLEANUP_DEBT ||
+                            it.classification == ProcessingArtifactRecoveryClassification.SETTLED_NO_OUTPUT_WITH_CLEANUP_DEBT
                     }) {
                     KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name
                 } else {

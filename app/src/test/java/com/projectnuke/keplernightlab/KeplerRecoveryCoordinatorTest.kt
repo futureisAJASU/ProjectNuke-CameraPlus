@@ -259,6 +259,26 @@ class KeplerRecoveryCoordinatorTest {
     }
 
     @Test
+    fun processingJournalOnlyInvalidEvidenceIsVisibleToStartupRecovery() {
+        val root = File(Files.createTempDirectory("kepler-recovery-processing-journal-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_bad_processing").apply { mkdirs() }
+        try {
+            KeplerJobMetadata.write(job, JSONObject().put("status", "COMPLETE").put("recoveryState", "STABLE"))
+            File(job, ".processing_tx_broken.json").mkdirs()
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root))
+            assertEquals(KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED, report.jobs.single().classification)
+            assertEquals("AMBIGUOUS_RECOVERY_REQUIRED", KeplerJobMetadata.read(job).getString("recoveryState"))
+            assertEquals(
+                JobRecoveryMutationGateOutcome.BLOCKED_INVALID_PROCESSING_JOURNAL,
+                KeplerJobMetadata.inspectRecoveryMutationGate(job, JobRecoveryMutationIntent.JOB_DELETE)
+            )
+            assertTrue(File(job, ".processing_tx_broken.json").exists())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun unconsumedProcessingHandoffIsInterruptedWithoutClaimingProcessingSuccess() {
         val root = File(Files.createTempDirectory("kepler-recovery-handoff-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
         val job = File(root, "KPL_YUV_FUSION_handoff").apply { mkdirs() }

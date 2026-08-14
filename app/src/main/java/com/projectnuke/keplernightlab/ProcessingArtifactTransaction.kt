@@ -292,7 +292,7 @@ internal fun commitProcessingArtifact(
             priorFinalRestored = false
         )
         if (claimKey == null) {
-            journalTransition(ProcessingArtifactJournalState.SETTLED)
+            journalTransition(ProcessingArtifactJournalState.SETTLED, adoptedResult = "NEW_FINAL")
             journal.deleteIfOwned(parent)
         }
         notifySettlement(
@@ -370,7 +370,7 @@ internal fun commitProcessingArtifact(
                 runCatching {
                     journalTransition(
                         if (priorRestored) ProcessingArtifactJournalState.PRIOR_RESTORED else ProcessingArtifactJournalState.SETTLED,
-                        adoptedResult = if (priorRestored) "PRIOR_FINAL" else journal.adoptedResult
+                        adoptedResult = if (priorRestored) "PRIOR_FINAL" else "NO_OUTPUT"
                     )
                     journal.deleteIfOwned(parent)
                 }
