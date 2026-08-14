@@ -13,6 +13,11 @@ import java.util.concurrent.CancellationException
 internal const val SINGLE_FRAME_OUTPUT_FILE_NAME = "single_frame_processed.png"
 private const val SINGLE_FRAME_PIPELINE_VERSION = "single_yuv_isp_v1"
 
+/** Narrow deterministic seam for a post-claim failure before the success writer returns. */
+internal var singleFrameSuccessFailureForTest: Throwable? = null
+/** Narrow deterministic seam for a fatal failure while recording an ordinary terminal failure. */
+internal var singleFrameFailureMetadataFailureForTest: Throwable? = null
+
 internal enum class SingleFrameCleanupResult {
     PREVIOUS_OUTPUT_RESTORED,
     COMMITTED_FINAL_RETAINED,
@@ -172,9 +177,26 @@ internal fun processSingleFrameJobSync(
             processingAttempt
         )
         throw oom
+    } catch (fatal: Error) {
+        val settlement = if (committedFinalClaimed) {
+            SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
+        } else {
+            SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
+        }
+        persistSingleFrameFailure(
+            jobDir,
+            params,
+            processingStartedAt,
+            metadataPolicy,
+            fatal,
+            settlement,
+            processingAttempt
+        )
+        throw fatal
     } catch (e: Exception) {
         val settlement = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
+            if (committedFinalClaimed) SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
+            else SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
         } else {
             SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
         }
@@ -236,7 +258,7 @@ private fun persistSingleFrameCancellation(
     cancellation: CancellationException,
     attempt: ProcessingAttempt
 ) {
-    runCatching {
+    try {
         updateForProcessingAttempt(jobDir, attempt) { current ->
             current.put("processingStartedAt", processingStartedAt)
                 .put("processingTimeMs", System.currentTimeMillis() - processingStartedAt)
@@ -266,6 +288,10 @@ private fun persistSingleFrameCancellation(
                 current.remove("galleryDisplaySource")
             }
         }
+    } catch (failure: Error) {
+        throw failure
+    } catch (failure: Exception) {
+        android.util.Log.e("KeplerSingleFrame", "cancellation metadata persistence failed", failure)
     }
 }
 
@@ -308,6 +334,10 @@ private fun persistSingleFrameSuccess(
     metadataPolicy: ReprocessMetadataPolicy,
     attempt: ProcessingAttempt
 ) {
+    singleFrameSuccessFailureForTest?.let { injected ->
+        singleFrameSuccessFailureForTest = null
+        throw injected
+    }
     updateForProcessingAttempt(jobDir, attempt) { current ->
         current.put("processingStartedAt", processingStartedAt)
             .put("processingTimeMs", finishedAt - processingStartedAt)
@@ -362,7 +392,11 @@ private fun persistSingleFrameFailure(
     settlement: SingleFrameCleanupResult = SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT,
     attempt: ProcessingAttempt
 ) {
-    runCatching {
+    singleFrameFailureMetadataFailureForTest?.let { injected ->
+        singleFrameFailureMetadataFailureForTest = null
+        throw injected
+    }
+    try {
         updateForProcessingAttempt(jobDir, attempt) { current ->
             current.put("processingStartedAt", processingStartedAt)
                 .put("processingTimeMs", System.currentTimeMillis() - processingStartedAt)
@@ -378,9 +412,15 @@ private fun persistSingleFrameFailure(
                         failure.message ?: "Single-frame processing failed"
                     )
                     .put("singleFrameCleanupResult", settlement.name)
-                    .put("singleFrameFailedOutputRetained", settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED)
+                    .put(
+                        "singleFrameFailedOutputRetained",
+                        settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED ||
+                            settlement == SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
+                    )
                     .put("userCanMoveDevice", true)
-                if (settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED) {
+                if (settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED ||
+                    settlement == SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
+                ) {
                     current.put("galleryDisplayUnavailable", false)
                         .put("finalOutputAvailable", true)
                 } else {
@@ -394,5 +434,9 @@ private fun persistSingleFrameFailure(
                 }
             }
         }
+    } catch (failure: Error) {
+        throw failure
+    } catch (failure: Exception) {
+        android.util.Log.e("KeplerSingleFrame", "failure metadata persistence failed", failure)
     }
 }
