@@ -1516,7 +1516,7 @@ internal fun finalizeTransaction(
     when (currentManifest.state) {
         ReprocessTransactionState.COMMITTED -> {
             if (operationLease != null && KeplerJobMetadata.isOperationOwner(jobDir, operationLease)) {
-                try { operationLease.release() } catch (_: Exception) {}
+                try { operationLease.releaseIfProcessingSettled() } catch (_: Exception) {}
             }
             val saved = ReprocessFinalizationResult(
                 ReprocessFinalizationState.COMMITTED, Result.success(
@@ -1528,7 +1528,7 @@ internal fun finalizeTransaction(
         }
         ReprocessTransactionState.ROLLED_BACK -> {
             if (operationLease != null && KeplerJobMetadata.isOperationOwner(jobDir, operationLease)) {
-                try { operationLease.release() } catch (_: Exception) {}
+                try { operationLease.releaseIfProcessingSettled() } catch (_: Exception) {}
             }
             val saved = ReprocessFinalizationResult(
                 ReprocessFinalizationState.ROLLED_BACK, Result.failure(IllegalStateException("Already finalized: ROLLED_BACK"))
@@ -1844,7 +1844,7 @@ private fun performTerminalCleanupDebt(
                 check(KeplerJobMetadata.isOperationOwner(jobDir, lease)) {
                     "Reprocess terminal cleanup lost the exact owner lease"
                 }
-                val cleared = KeplerJobMetadata.clearActiveOperation(jobDir, activeOperationId)
+                val cleared = KeplerJobMetadata.clearActiveOperation(jobDir, activeOperationId, lease)
                 ownerSettled = cleared || !KeplerJobMetadata.isCurrentActiveOperation(jobDir, activeOperationId)
                 if (!ownerSettled) {
                     warnings += "Durable reprocess owner cleanup remains pending."
@@ -1860,14 +1860,19 @@ private fun performTerminalCleanupDebt(
             warnings += "Durable reprocess owner cleanup failed: ${failure.message}"
             ownerSettled = false
         }
-        if (ownerSettled) try { lease.release() }
-        catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-        catch (oom: OutOfMemoryError) { throw oom }
-        catch (td: ThreadDeath) { throw td }
-        catch (le: LinkageError) { throw le }
-        catch (ie: InternalError) { throw ie }
-        catch (e: Error) { throw e }
-        catch (_: Exception) {}
+        if (ownerSettled) {
+            try {
+                if (!lease.releaseIfProcessingSettled()) {
+                    warnings += "Processing owner settlement remains pending."
+                }
+            } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+            catch (oom: OutOfMemoryError) { throw oom }
+            catch (td: ThreadDeath) { throw td }
+            catch (le: LinkageError) { throw le }
+            catch (ie: InternalError) { throw ie }
+            catch (e: Error) { throw e }
+            catch (_: Exception) {}
+        }
     }
     return warnings
 }

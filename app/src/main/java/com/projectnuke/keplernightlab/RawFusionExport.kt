@@ -31,7 +31,7 @@ internal class RawProcessingOperation internal constructor(
     fun release() {
         if (released.get()) return
         val operationId = activeOperationId
-        val cleared = operationId?.let { KeplerJobMetadata.clearActiveOperation(jobDir, it) } ?: true
+        val cleared = operationId?.let { KeplerJobMetadata.clearActiveOperation(jobDir, it, lease) } ?: true
         if (!cleared && operationId?.let { KeplerJobMetadata.isCurrentActiveOperation(jobDir, it) } == true) {
             Log.e("KeplerRawPipeline", "retaining RAW operation lease after durable owner clear failure")
             return

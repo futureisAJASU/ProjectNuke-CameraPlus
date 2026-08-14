@@ -18,10 +18,16 @@ internal data class ProcessingAttempt(
 
     internal fun release() {
         if (released.get()) return
-        val cleared = KeplerJobMetadata.clearActiveOperation(jobDir, id)
+        val cleared = try {
+            KeplerJobMetadata.clearActiveOperation(jobDir, id, operationLease)
+        } catch (failure: Error) {
+            operationLease?.markProcessingSettlementPending(id)
+            throw failure
+        }
         if (!cleared && KeplerJobMetadata.isCurrentActiveOperation(jobDir, id)) {
             // A failed metadata write leaves the durable owner in place. Keep both
             // the sublease and its top-level lease so another mutation cannot overlap it.
+            operationLease?.markProcessingSettlementPending(id)
             return
         }
         if (!released.compareAndSet(false, true)) return
@@ -110,20 +116,12 @@ internal fun beginProcessingAttempt(
     additionalOwnedKeys: Set<String> = emptySet(),
     operationLease: JobOperationLease? = null
 ): ProcessingAttempt {
-    // An existing process-local owner is the explicit internal concurrency proof. Let the
-    // lease/sublease checks below return the established ProcessingAlreadyActive outcome;
-    // a durable owner with no local proof still goes through the restart mutation gate.
     val ownsLease = operationLease == null
-    val lease = operationLease ?: if (KeplerJobMetadata.isOperationActive(jobDir)) {
-        KeplerJobMetadata.acquireOperation(jobDir)
-    } else {
-        KeplerJobMetadata.acquireRecoveryCheckedOperation(
-            jobDir,
-            JobRecoveryMutationIntent.PROCESSING_START,
-            consumesProcessingHandoff = true
-        )
-    }
-        ?: throw ProcessingAlreadyActiveException(jobDir)
+    val lease = operationLease ?: KeplerJobMetadata.acquireRecoveryCheckedOperation(
+        jobDir,
+        JobRecoveryMutationIntent.PROCESSING_START,
+        consumesProcessingHandoff = true
+    )
     check(KeplerJobMetadata.isOperationOwner(jobDir, lease)) {
         "Processing operation lease is not owned by this attempt"
     }

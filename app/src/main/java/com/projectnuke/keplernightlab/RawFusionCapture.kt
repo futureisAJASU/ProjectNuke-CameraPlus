@@ -892,7 +892,11 @@ fun captureRawBurstForFusion(
                                     KeplerActiveOperationKind.PROCESSING_RAW
                                 )
                             val ownerSettled = if (handoffPublished) {
-                                KeplerJobMetadata.clearActiveOperation(jobDir, durableCaptureOperationId)
+                                KeplerJobMetadata.clearActiveOperation(
+                                    jobDir,
+                                    durableCaptureOperationId,
+                                    durableCaptureLease
+                                )
                             } else {
                                 KeplerJobMetadata.settleCaptureOwnerAfterHandoffFailure(
                                     jobDir,
@@ -2541,7 +2545,9 @@ fun processRawFusionJob(
         }
         RawFusionProcessResult(false, null, null, null, null, failureMessage)
     } finally {
-        if (ownsOperationLease) processingLease.release()
+        if (ownsOperationLease && !processingLease.releaseIfProcessingSettled()) {
+            Log.e("KeplerRawFusion", "retaining processing lease after nested attempt settlement failure")
+        }
     }
 }
 

@@ -102,7 +102,8 @@ class RawProcessingOperationTest {
 
             assertTrue(KeplerJobMetadata.isOperationOwner(dir, scope.lease))
             assertNotNull(KeplerJobMetadata.read(dir).optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() })
-            assertThrows(JobRecoveryMutationBlockedException::class.java) {
+            KeplerJobMetadata.atomicWriteFailureForTest = IllegalStateException("RAW retry clear failed")
+            assertThrows(ProcessingAlreadyActiveException::class.java) {
                 KeplerJobMetadata.acquireRecoveryCheckedOperation(
                     dir,
                     JobRecoveryMutationIntent.REPROCESS
@@ -110,7 +111,11 @@ class RawProcessingOperationTest {
             }
 
             KeplerJobMetadata.atomicWriteFailureForTest = null
-            scope.release()
+            val next = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                dir,
+                JobRecoveryMutationIntent.REPROCESS
+            )
+            next.release()
             assertFalse(KeplerJobMetadata.isOperationOwner(dir, scope.lease))
             assertFalse(KeplerJobMetadata.read(dir).has(ACTIVE_OPERATION_ID))
         } finally {
@@ -133,7 +138,11 @@ class RawProcessingOperationTest {
             assertNotNull(KeplerJobMetadata.read(dir).optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() })
 
             KeplerJobMetadata.atomicWriteFailureForTest = null
-            scope.release()
+            val next = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                dir,
+                JobRecoveryMutationIntent.REPROCESS
+            )
+            next.release()
             assertFalse(KeplerJobMetadata.isOperationOwner(dir, scope.lease))
         } finally {
             KeplerJobMetadata.atomicWriteFailureForTest = previousFailure

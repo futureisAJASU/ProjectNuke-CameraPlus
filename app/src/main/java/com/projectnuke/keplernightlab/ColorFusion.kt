@@ -639,7 +639,11 @@ fun captureYuvBurstColorWithMotion(
                                     KeplerActiveOperationKind.PROCESSING_YUV
                                 )
                             val ownerSettled = if (handoffPublished) {
-                                KeplerJobMetadata.clearActiveOperation(currentBurstDir, operationId)
+                                KeplerJobMetadata.clearActiveOperation(
+                                    currentBurstDir,
+                                    operationId,
+                                    durableCaptureLease
+                                )
                             } else {
                                 KeplerJobMetadata.settleCaptureOwnerAfterHandoffFailure(
                                     currentBurstDir,
@@ -668,7 +672,11 @@ fun captureYuvBurstColorWithMotion(
                                     operationId,
                                     lease
                                 )
-                            } ?: KeplerJobMetadata.clearActiveOperation(currentBurstDir, operationId)
+                            } ?: KeplerJobMetadata.clearActiveOperation(
+                                currentBurstDir,
+                                operationId,
+                                durableCaptureLease
+                            )
                         } ?: true
                         if (ownerSettled) {
                             durableCaptureLease?.release()

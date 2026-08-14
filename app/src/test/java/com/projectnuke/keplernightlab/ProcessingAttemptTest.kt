@@ -13,6 +13,43 @@ import org.robolectric.RobolectricTestRunner
 @RunWith(RobolectricTestRunner::class)
 class ProcessingAttemptTest {
     @Test
+    fun nextProductionAcquisitionRetriesAProcessingClearAfterScopeReturns() {
+        val dir = Files.createTempDirectory("processing-terminal-convergence").toFile()
+        var retainedLease: JobOperationLease? = null
+        val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
+        try {
+            KeplerJobMetadata.write(dir, JSONObject().put("jobType", "YUV_NIGHT_FUSION"))
+            fun runProcessingProductionScope() {
+                val attempt = beginProcessingAttempt(dir, "CLASSIC_YUV")
+                retainedLease = requireNotNull(attempt.operationLease)
+                KeplerJobMetadata.atomicWriteFailureForTest = IllegalStateException("one-shot clear failure")
+                try {
+                    // The real processing function's finally is the only release call in this scope.
+                } finally {
+                    attempt.releaseOwnedLease()
+                }
+            }
+            runProcessingProductionScope()
+
+            val oldLease = requireNotNull(retainedLease)
+            assertTrue(KeplerJobMetadata.isOperationOwner(dir, oldLease))
+            assertTrue(KeplerJobMetadata.read(dir).has(ACTIVE_OPERATION_ID))
+
+            val next = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                dir,
+                JobRecoveryMutationIntent.REPROCESS
+            )
+            assertFalse(KeplerJobMetadata.isOperationOwner(dir, oldLease))
+            assertFalse(KeplerJobMetadata.read(dir).has(ACTIVE_OPERATION_ID))
+            next.release()
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
+            retainedLease?.release()
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
     fun durableCurrentClaimPreservesRequiredOutputAfterAttemptReturnsThroughFailureBoundary() {
         val dir = Files.createTempDirectory("processing-terminal-output").toFile()
         try {

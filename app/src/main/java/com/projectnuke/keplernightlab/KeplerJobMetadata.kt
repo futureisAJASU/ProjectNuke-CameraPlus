@@ -212,9 +212,15 @@ object KeplerJobMetadata {
     }
 
     fun acquireOperation(jobDir: File): JobOperationLease? {
-        val key = jobDir.toPath().toAbsolutePath().normalize().toString()
-        val lease = JobOperationLease(key)
-        return if (operationLeases.putIfAbsent(key, lease) == null) lease else null
+        return withJobLock(jobDir) {
+            val key = jobDir.toPath().toAbsolutePath().normalize().toString()
+            val existing = operationLeases[key]
+            if (existing != null) {
+                if (!reconcilePendingDurableSettlement(jobDir, existing)) return@withJobLock null
+            }
+            val lease = JobOperationLease(key)
+            if (operationLeases.putIfAbsent(key, lease) == null) lease else null
+        }
     }
 
     /** Checks durable recovery authority and reserves the process-local owner under one lock. */
@@ -223,6 +229,11 @@ object KeplerJobMetadata {
         intent: JobRecoveryMutationIntent,
         consumesProcessingHandoff: Boolean = false
     ): JobOperationLease = withJobLock(jobDir) {
+        val key = jobDir.toPath().toAbsolutePath().normalize().toString()
+        val existing = operationLeases[key]
+        if (existing != null && !reconcilePendingDurableSettlement(jobDir, existing)) {
+            throw ProcessingAlreadyActiveException(jobDir)
+        }
         val outcome = inspectRecoveryMutationGate(
             jobDir,
             intent,
@@ -234,12 +245,44 @@ object KeplerJobMetadata {
         if (outcome != JobRecoveryMutationGateOutcome.ALLOWED) {
             throw JobRecoveryMutationBlockedException(outcome)
         }
-        val key = jobDir.toPath().toAbsolutePath().normalize().toString()
         val lease = JobOperationLease(key)
         if (operationLeases.putIfAbsent(key, lease) != null) {
             throw ProcessingAlreadyActiveException(jobDir)
         }
         lease
+    }
+
+    /**
+     * Retries a terminal owner clear recorded by an operation scope that has already returned.
+     * The retained lease is still the only process-local authority, so a successful retry can
+     * release it immediately; a failed retry leaves the exact owner protected for the next
+     * production mutation/recovery entry.
+     */
+    private fun reconcilePendingDurableSettlement(
+        jobDir: File,
+        lease: JobOperationLease
+    ): Boolean {
+        val pendingId = lease.pendingDurableSettlementId() ?: return false
+        val job = try {
+            read(jobDir)
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            return false
+        }
+        val activeId = job.optString(ACTIVE_OPERATION_ID)
+        val activeRuntime = job.optString(ACTIVE_RUNTIME_SESSION_ID)
+        if (activeId.isBlank()) {
+            lease.completeDurableSettlement(pendingId)
+            lease.release()
+            return true
+        }
+        if (activeId != pendingId || activeRuntime != KeplerRuntimeSession.id) return false
+        val cleared = clearActiveOperation(jobDir, pendingId, lease)
+        if (!cleared && isCurrentActiveOperation(jobDir, pendingId)) return false
+        lease.completeDurableSettlement(pendingId)
+        lease.release()
+        return true
     }
 
     internal fun hasProcessingCleanupBlocker(jobDir: File): Boolean = runCatching {
@@ -481,7 +524,7 @@ object KeplerJobMetadata {
         if (activeId != captureOperationId ||
             job.optString(ACTIVE_RUNTIME_SESSION_ID) != KeplerRuntimeSession.id
         ) return false
-        return clearActiveOperation(jobDir, captureOperationId)
+        return clearActiveOperation(jobDir, captureOperationId, ownerLease)
     }
 
     /** Updates only the heartbeat; it is diagnostic/recovery evidence, not a runtime lock. */
@@ -498,7 +541,11 @@ object KeplerJobMetadata {
     }.getOrDefault(false)
 
     /** Clears only the marker owned by this runtime and operation. */
-    internal fun clearActiveOperation(jobDir: File, operationId: String): Boolean {
+    internal fun clearActiveOperation(
+        jobDir: File,
+        operationId: String,
+        ownerLease: JobOperationLease? = null
+    ): Boolean {
         return try {
             var matched = false
             update(jobDir) { job ->
@@ -515,8 +562,14 @@ object KeplerJobMetadata {
             if (matched) releaseAutoOperation(jobDir)
             matched
         } catch (failure: Error) {
+            ownerLease?.markDurableSettlementPending(operationId)
             throw failure
         } catch (_: Exception) {
+            if (ownerLease != null && isOperationOwner(jobDir, ownerLease) &&
+                isCurrentActiveOperation(jobDir, operationId)
+            ) {
+                ownerLease.markDurableSettlementPending(operationId)
+            }
             false
         }
     }
@@ -702,11 +755,12 @@ object KeplerJobMetadata {
         val settled = try {
             finalizeRecoveredProcessingHandoff(jobDir, lease)
         } catch (failure: Error) {
+            if (ownerLease == null) lease.release()
             throw failure
         } catch (_: Exception) {
             false
         }
-        if (settled) lease.release()
+        if (settled || ownerLease == null) lease.release()
         return settled
     }
 
@@ -754,6 +808,7 @@ class JobOperationLease internal constructor(internal val key: String) {
     private val released = AtomicBoolean(false)
     private val processingAttemptId = java.util.concurrent.atomic.AtomicReference<String?>(null)
     private val lastProcessingAttemptId = java.util.concurrent.atomic.AtomicReference<String?>(null)
+    private val pendingDurableSettlementId = java.util.concurrent.atomic.AtomicReference<String?>(null)
 
     internal fun claimProcessingAttempt(attemptId: String): Boolean {
         if (released.get() || !processingAttemptId.compareAndSet(null, attemptId)) return false
@@ -768,6 +823,23 @@ class JobOperationLease internal constructor(internal val key: String) {
         !released.get() && processingAttemptId.get() == attemptId
 
     internal fun lastProcessingAttemptId(): String? = lastProcessingAttemptId.get()
+
+    internal fun markDurableSettlementPending(operationId: String) {
+        pendingDurableSettlementId.compareAndSet(null, operationId)
+    }
+
+    internal fun markProcessingSettlementPending(attemptId: String) {
+        lastProcessingAttemptId.compareAndSet(null, attemptId)
+        markDurableSettlementPending(attemptId)
+    }
+
+    internal fun pendingDurableSettlementId(): String? = pendingDurableSettlementId.get()
+
+    internal fun completeDurableSettlement(operationId: String): Boolean {
+        if (!pendingDurableSettlementId.compareAndSet(operationId, null)) return false
+        processingAttemptId.compareAndSet(operationId, null)
+        return true
+    }
 
     /**
      * Releases the top-level lease only when a borrowed processing sublease has
