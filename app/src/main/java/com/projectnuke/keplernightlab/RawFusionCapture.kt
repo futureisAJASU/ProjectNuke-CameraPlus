@@ -680,11 +680,28 @@ fun captureRawBurstForFusion(
             .put("frames", frameObjectsSnapshot())
             .put("createdAt", System.currentTimeMillis())
             .put("notes", "True RAW fusion input. Stores RAW_SENSOR DNG backup plus compact raw16 per frame. TODO retry budget: targetFrames=8, maxAttempts=9 or 10, continue until target saved or maxAttempts/timeout.")
-        KeplerJobMetadata.write(jobDir, baseJob)
-        val durableCaptureOperationId = KeplerJobMetadata.beginActiveOperation(
+        val durableCaptureOperationId = UUID.randomUUID().toString()
+        val durableCaptureLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
             jobDir,
-            kind = KeplerActiveOperationKind.CAPTURE_RAW
+            JobRecoveryMutationIntent.PROCESSING_START
         )
+        baseJob.put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+            .put(ACTIVE_OPERATION_ID, durableCaptureOperationId)
+            .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.CAPTURE_RAW.name)
+            .put(ACTIVE_OPERATION_STARTED_AT, System.currentTimeMillis())
+            .put(ACTIVE_OPERATION_UPDATED_AT, System.currentTimeMillis())
+        try {
+            KeplerJobMetadata.write(jobDir, baseJob)
+            KeplerJobMetadata.beginActiveOperation(
+                jobDir,
+                operationId = durableCaptureOperationId,
+                kind = KeplerActiveOperationKind.CAPTURE_RAW,
+                ownerLease = durableCaptureLease
+            )
+        } catch (failure: Throwable) {
+            durableCaptureLease.release()
+            throw failure
+        }
         var durableCaptureTerminalPersisted = false
 
         fun updateFinalRouteMetadata(captureRoute: PhysicalCaptureRoute) {
@@ -878,6 +895,7 @@ fun captureRawBurstForFusion(
                                 KeplerJobMetadata.clearActiveOperation(jobDir, durableCaptureOperationId)
                             }
                         }
+                        durableCaptureLease.release()
                         cleanup()
                         publishRawTerminalSnapshot(
                             RawTerminalSettlementPhase.SETTLED,
@@ -2250,8 +2268,11 @@ fun processRawFusionJob(
     var currentRunJob: JSONObject? = null
 
     val ownsOperationLease = operationLease == null
-    val processingLease = operationLease ?: KeplerJobMetadata.acquireOperation(jobDir)
-        ?: throw ProcessingAlreadyActiveException(jobDir)
+    val processingLease = operationLease ?: KeplerJobMetadata.acquireRecoveryCheckedOperation(
+        jobDir,
+        JobRecoveryMutationIntent.PROCESSING_START,
+        consumesProcessingHandoff = true
+    )
     return try {
         cancellation.throwIfCancelled()
         val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))

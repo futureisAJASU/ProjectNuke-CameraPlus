@@ -123,8 +123,11 @@ fun processLatestNightFusionV02(
                     postTerminal(CameraPipelineEvent.Terminal.Kind.FAILED, "PIPELINE_FAILED: No YUV fusion job found.")
                     return@post
                 }
-            operationLease = KeplerJobMetadata.acquireOperation(jobDir)
-                ?: throw ProcessingAlreadyActiveException(jobDir)
+            operationLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                jobDir,
+                JobRecoveryMutationIntent.PROCESSING_START,
+                consumesProcessingHandoff = true
+            )
             processNightFusionJobV02Sync(
                 jobDir,
                 onStatus = { postStatus(it) },

@@ -87,15 +87,23 @@ fun loadJobJson(jobDir: File): JSONObject =
     KeplerJobMetadata.read(jobDir)
 
 fun saveJobJson(jobDir: File, job: JSONObject) {
-    KeplerJobMetadata.requireRecoveryMutationAllowed(jobDir, JobRecoveryMutationIntent.METADATA_EDIT)
-    KeplerJobMetadata.write(jobDir, job)
+    val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+        jobDir,
+        JobRecoveryMutationIntent.METADATA_EDIT
+    )
+    try {
+        KeplerJobMetadata.write(jobDir, job)
+    } finally {
+        lease.release()
+    }
 }
 
 fun setFrameExcluded(jobDir: File, frameIndex: Int, excluded: Boolean) {
     // External mutation: acquire own operation lease, reject unresolved transactions
-    KeplerJobMetadata.requireRecoveryMutationAllowed(jobDir, JobRecoveryMutationIntent.FRAME_SELECTION)
-    val lease = KeplerJobMetadata.acquireOperation(jobDir)
-        ?: throw IllegalStateException("Job mutation is in progress.")
+    val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+        jobDir,
+        JobRecoveryMutationIntent.FRAME_SELECTION
+    )
     try {
         require(!isReprocessQuarantined(jobDir)) { "Cannot modify frames of a quarantined or unresolved reprocess job." }
         KeplerJobMetadata.update(jobDir) { job ->
@@ -232,8 +240,10 @@ fun summarizeKeplerGalleryStorage(jobs: List<KeplerGalleryJobSummary>): KeplerGa
 
 fun deleteKeplerGalleryJob(context: Context, jobDirectory: File): Result<KeplerJobCleanupResult> = runCatching {
     val target = requireCleanupSafeJobDirectory(context, jobDirectory)
-    KeplerJobMetadata.requireRecoveryMutationAllowed(target, JobRecoveryMutationIntent.JOB_DELETE)
-    val lease = KeplerJobMetadata.acquireOperation(target) ?: error("Job mutation is in progress.")
+    val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+        target,
+        JobRecoveryMutationIntent.JOB_DELETE
+    )
     try {
         require(target.isDirectory) { "Job directory no longer exists." }
         val (status, failedPaths) = deleteRecursivelySafe(target)
@@ -256,8 +266,10 @@ fun cleanupKeplerGalleryJob(
     cleanupType: KeplerJobCleanupType
 ): Result<KeplerJobCleanupResult> = runCatching {
     val target = requireCleanupSafeJobDirectory(context, jobDirectory)
-    KeplerJobMetadata.requireRecoveryMutationAllowed(target, JobRecoveryMutationIntent.JOB_CLEANUP)
-    val lease = KeplerJobMetadata.acquireOperation(target) ?: error("Job mutation is in progress.")
+    val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+        target,
+        JobRecoveryMutationIntent.JOB_CLEANUP
+    )
     try {
     val before = folderSizeBytes(target)
     val job = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
@@ -516,7 +528,11 @@ fun maybePersistStorageMetadata(
 ) {
     if (job == null) return
     if (isReprocessQuarantined(directory)) return
-    if (KeplerJobMetadata.isOperationActive(directory)) return
+    if (KeplerJobMetadata.inspectRecoveryMutationGate(
+            directory,
+            JobRecoveryMutationIntent.METADATA_EDIT
+        ) != JobRecoveryMutationGateOutcome.ALLOWED
+    ) return
     if (
         job.optLong("totalJobBytes", -1L) == storage.totalJobBytes &&
         job.optInt("fileCount", -1) == storage.fileCount

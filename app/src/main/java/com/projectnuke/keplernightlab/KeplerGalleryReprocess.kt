@@ -292,8 +292,10 @@ internal class ReprocessTransactionSession(val jobDir: File) {
     /** Maximum production late-finalization retries from UNRESOLVED. */
     private val LATE_RETRY_BOUND = 1
 
-    fun acquireLease(): JobOperationLease? {
-        val acquired = KeplerJobMetadata.acquireOperation(jobDir)
+    fun acquireLease(intent: JobRecoveryMutationIntent? = null): JobOperationLease? {
+        val acquired = intent?.let {
+            KeplerJobMetadata.acquireRecoveryCheckedOperation(jobDir, it)
+        } ?: KeplerJobMetadata.acquireOperation(jobDir)
         lease = acquired
         return acquired
     }
@@ -493,15 +495,14 @@ suspend fun reprocessKeplerGalleryJob(
     catch (ie: InternalError) { throw ie }
     catch (e: Error) { throw e }
     catch (sf: Exception) { return@withContext Result.failure(sf) }
-    try {
-        KeplerJobMetadata.requireRecoveryMutationAllowed(target, JobRecoveryMutationIntent.REPROCESS)
+    val session = ReprocessTransactionSession(target)
+    val operationLease = try {
+        session.acquireLease(JobRecoveryMutationIntent.REPROCESS)
     } catch (blocked: JobRecoveryMutationBlockedException) {
         return@withContext Result.failure(blocked)
     } catch (blocked: ProcessingCleanupRequiredException) {
         return@withContext Result.failure(blocked)
-    }
-    val session = ReprocessTransactionSession(target)
-    val operationLease = session.acquireLease() ?: run {
+    } ?: run {
         return@withContext Result.failure(IllegalStateException("A job mutation is already in progress."))
     }
 

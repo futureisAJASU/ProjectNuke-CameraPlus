@@ -95,6 +95,20 @@ fun captureProcessExportNightFusion(
                         .put("savedFrames", 1)
                 }
             }
+            val pipelineLease = try {
+                KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                    jobDir,
+                    JobRecoveryMutationIntent.PROCESSING_START,
+                    consumesProcessingHandoff = true
+                )
+            } catch (failure: Throwable) {
+                post("PIPELINE_FAILED: Capture processing ownership could not be reserved; cache kept.")
+                terminal.publish(
+                    CameraPipelineEvent.Terminal.Kind.FAILED,
+                    message = "Capture processing ownership could not be reserved."
+                )
+                return@captureYuvBurstColorWithMotion
+            }
             val workerThread = HandlerThread("KeplerCaptureProcessExportThread").apply { start() }
             val workerHandler = Handler(workerThread.looper)
             val workerPosted = runCatching { workerHandler.post {
@@ -114,6 +128,7 @@ fun captureProcessExportNightFusion(
                             jobDir = jobDir,
                             requestedParams = processingParams,
                             cancellation = cancellation,
+                            operationLease = pipelineLease,
                             onStatus = { post(it) }
                         )
                     } else {
@@ -121,7 +136,8 @@ fun captureProcessExportNightFusion(
                             jobDir,
                             onStatus = { post(it) },
                             requestedParams = processingParams,
-                            cancellation = cancellation
+                            cancellation = cancellation,
+                            operationLease = pipelineLease
                         )
                     }
                     cancellation.throwIfCancelled()
@@ -141,7 +157,8 @@ fun captureProcessExportNightFusion(
                             displayNameBase = displayNameBase,
                             requestedFormat = requestedOutputFormat,
                             cancellation = cancellation,
-                            jobDir = jobDir
+                            jobDir = jobDir,
+                            ownerLease = pipelineLease
                         )
                     } finally {
                         bitmap.recycle()
@@ -282,6 +299,7 @@ fun captureProcessExportNightFusion(
                         message = e.message
                     )
                 } finally {
+                    pipelineLease.release()
                     workerThread.quitSafely()
                 }
             } }.getOrElse { failure ->
@@ -289,6 +307,7 @@ fun captureProcessExportNightFusion(
                 false
             }
             if (!workerPosted) {
+                pipelineLease.release()
                 workerThread.quitSafely()
                 post("PIPELINE_FAILED: Capture processing worker could not start; cache kept.")
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = "Capture processing worker could not start.")
@@ -412,7 +431,8 @@ internal fun reprocessYuvJob(
                     }",
                     requestedFormat = requestedFormat,
                     cancellation = cancellation,
-                    jobDir = jobDir
+                    jobDir = jobDir,
+                    ownerLease = operationLease
                 )
             } finally {
                 bitmap.recycle()

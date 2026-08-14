@@ -657,11 +657,16 @@ fun captureProcessExportSuperResolutionFusion(
                 var requiredOutputCommitted = false
                 var publicExportCommitted = false
                 var verified = false
+                var outputLease: JobOperationLease? = null
                 try {
                     cancellation.throwIfCancelled()
                     val sourceFrames = readColorBurstFrameFiles(sourceJobDir)
                     cancellation.throwIfCancelled()
                     val outputDir = createSuperResolutionJobDirectory(context)
+                    outputLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                        outputDir,
+                        JobRecoveryMutationIntent.PROCESSING_START
+                    )
                     cancellation.throwIfCancelled()
                     val result = runSuperResolutionFusion(
                         SuperResolutionFusionRequest(
@@ -672,6 +677,7 @@ fun captureProcessExportSuperResolutionFusion(
                             maxFrames = captureFrames,
                             processingParams = processingParams,
                             cancellation = cancellation,
+                            operationLease = outputLease,
                             status = { post(it) }
                         )
                     )
@@ -699,7 +705,8 @@ fun captureProcessExportSuperResolutionFusion(
                             displayNameBase = displayName,
                             requestedFormat = requestedFormat,
                             cancellation = cancellation,
-                            jobDir = outputDir
+                            jobDir = outputDir,
+                            ownerLease = outputLease
                         )
                     } finally {
                         bitmap.recycle()
@@ -801,6 +808,7 @@ fun captureProcessExportSuperResolutionFusion(
                         message = error.message
                     )
                 } finally {
+                    outputLease?.release()
                     workerThread.quitSafely()
                 }
             } }.getOrElse { failure ->
@@ -808,6 +816,7 @@ fun captureProcessExportSuperResolutionFusion(
                 false
             }
             if (!workerPosted) {
+                // The worker never reached its finally block.
                 workerThread.quitSafely()
                 post("PIPELINE_FAILED: 24M Fusion worker could not start.")
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = "24M Fusion worker could not start.")

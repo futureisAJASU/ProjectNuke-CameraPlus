@@ -291,6 +291,7 @@ fun captureYuvBurstColorWithMotion(
     var yuvSession: YuvCaptureSession? = null
     var jobFileHolder: JobFileHolder? = null
     var durableCaptureOperationId: String? = null
+    var durableCaptureLease: JobOperationLease? = null
 
     fun logLateCameraCallback(callback: String) {
         val isFinished = yuvSession?.let { !it.terminalState.status().equals(CaptureTerminalStatus.ACTIVE) } ?: finished.get()
@@ -504,6 +505,12 @@ fun captureYuvBurstColorWithMotion(
 
         postStatus("Color Fusion 초기화 3/7: job.json 생성 중...")
 
+        val plannedCaptureOperationId = UUID.randomUUID().toString()
+        durableCaptureLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+            currentBurstDir,
+            JobRecoveryMutationIntent.PROCESSING_START
+        )
+        try {
         writeColorJobJson(
             jobFile = currentJobFile,
             status = "CAPTURING",
@@ -542,12 +549,20 @@ fun captureYuvBurstColorWithMotion(
             actualRoute = actualCaptureRoute?.name,
             requestedPhysicalCameraId = physicalCameraId,
             finalRequestZoom = finalRequestZoom,
-            requestedZoomRatio = zoomRatio
+            requestedZoomRatio = zoomRatio,
+            activeOperationId = plannedCaptureOperationId,
+            activeOperationKind = KeplerActiveOperationKind.CAPTURE_YUV
         )
         durableCaptureOperationId = KeplerJobMetadata.beginActiveOperation(
             currentBurstDir,
-            kind = KeplerActiveOperationKind.CAPTURE_YUV
+            operationId = plannedCaptureOperationId,
+            kind = KeplerActiveOperationKind.CAPTURE_YUV,
+            ownerLease = durableCaptureLease
         )
+        } catch (failure: Throwable) {
+            durableCaptureLease?.release()
+            throw failure
+        }
 
         metadataWriter = ProductionMetadataWriter(
             jobFileHolder = jobFileHolder!!,
@@ -626,6 +641,7 @@ fun captureYuvBurstColorWithMotion(
                             ) {
                                 KeplerJobMetadata.clearActiveOperation(currentBurstDir, operationId)
                             }
+                            durableCaptureLease?.release()
                         }
                         onComplete(currentBurstDir)
                     }
@@ -633,6 +649,7 @@ fun captureYuvBurstColorWithMotion(
                         durableCaptureOperationId?.let { operationId ->
                             KeplerJobMetadata.clearActiveOperation(currentBurstDir, operationId)
                         }
+                        durableCaptureLease?.release()
                         logYuvCaptureFailure(
                             stage = "terminal",
                             throwable = request.cause,
@@ -1516,7 +1533,7 @@ private fun updateYuvCaptureRequestTemplateMetadata(
     }
 }
 
-fun writeColorJobJson(
+internal fun writeColorJobJson(
     jobFile: File,
     status: String,
     cameraId: String,
@@ -1557,7 +1574,9 @@ fun writeColorJobJson(
     actualRoute: String? = null,
     requestedPhysicalCameraId: String? = physicalCameraId,
     finalRequestZoom: Float = zoomRatio,
-    requestedZoomRatio: Float = zoomRatio
+    requestedZoomRatio: Float = zoomRatio,
+    activeOperationId: String? = null,
+    activeOperationKind: KeplerActiveOperationKind? = null
 ) {
     val actualPhysicalCameraId =
         if (actualRoute == PhysicalCaptureRoute.PHYSICAL.name) physicalCameraId else null
@@ -1722,6 +1741,28 @@ fun writeColorJobJson(
         val oldCreatedAt = previousJob.optLong("createdAt", now)
 
         json.put("createdAt", oldCreatedAt)
+    }
+
+    if (activeOperationId != null && activeOperationKind != null) {
+        json.put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+            .put(ACTIVE_OPERATION_ID, activeOperationId)
+            .put(ACTIVE_OPERATION_KIND, activeOperationKind.name)
+            .put(ACTIVE_OPERATION_STARTED_AT, now)
+            .put(ACTIVE_OPERATION_UPDATED_AT, now)
+    } else {
+        listOf(
+            ACTIVE_RUNTIME_SESSION_ID,
+            ACTIVE_OPERATION_ID,
+            ACTIVE_OPERATION_KIND,
+            ACTIVE_OPERATION_STARTED_AT,
+            ACTIVE_OPERATION_UPDATED_AT,
+            PROCESSING_HANDOFF_RUNTIME_SESSION_ID,
+            PROCESSING_HANDOFF_OPERATION_ID,
+            PROCESSING_HANDOFF_KIND,
+            PROCESSING_HANDOFF_CREATED_AT
+        ).forEach { key ->
+            if (previousJob?.has(key) == true) json.put(key, previousJob.opt(key))
+        }
     }
 
     KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), json)

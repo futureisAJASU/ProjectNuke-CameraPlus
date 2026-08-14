@@ -75,6 +75,7 @@ object KeplerJobMetadata {
     // without a GC-sensitive weak table or an unbounded lock-map leak.
     private val _locks = Array(64) { Any() }
     private val operationLeases = ConcurrentHashMap<String, JobOperationLease>()
+    private val autoOperationLeases = ConcurrentHashMap.newKeySet<String>()
 
     /** Narrow lease/metadata test seam: incremented each time a job metadata write is durably
      *  persisted. Tests must save the prior value and restore it in `finally`. Production never reads it. */
@@ -106,7 +107,8 @@ object KeplerJobMetadata {
     internal fun inspectRecoveryMutationGate(
         jobDir: File,
         intent: JobRecoveryMutationIntent,
-        consumesProcessingHandoff: Boolean = false
+        consumesProcessingHandoff: Boolean = false,
+        ownerLease: JobOperationLease? = null
     ): JobRecoveryMutationGateOutcome = withJobLock(jobDir) {
         try {
             if (isReprocessQuarantined(jobDir)) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_REPROCESS_QUARANTINE
@@ -129,7 +131,11 @@ object KeplerJobMetadata {
             val activeRuntime = job.optString(ACTIVE_RUNTIME_SESSION_ID)
             val handoffId = job.optString(PROCESSING_HANDOFF_OPERATION_ID)
             val handoffRuntime = job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID)
-            if (activeId.isNotBlank()) {
+            val exactCurrentOwner = ownerLease != null &&
+                operationLeases[jobDir.toPath().toAbsolutePath().normalize().toString()] === ownerLease
+            if (activeId.isNotBlank() && exactCurrentOwner) {
+                // The exact current owner may reassert its durable phase.
+            } else if (activeId.isNotBlank()) {
                 val handoffConsumerAllowed = intent == JobRecoveryMutationIntent.PROCESSING_START &&
                     consumesProcessingHandoff &&
                     handoffId.isNotBlank() &&
@@ -148,7 +154,8 @@ object KeplerJobMetadata {
             }
             val settledAuthoritative = processingScan.validJournals.any {
                 it.second.state == ProcessingArtifactJournalState.SETTLED &&
-                    it.second.claimKey != null && it.second.processingAttemptId != null
+                    ((it.second.claimKey != null && it.second.processingAttemptId != null) ||
+                        it.second.adoptedResult == "NO_OUTPUT")
             }
             if (settledAuthoritative && !reconcileSettledAuthoritativeProcessingJournals(jobDir, job)) {
                 return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_SETTLED_JOURNAL
@@ -194,11 +201,39 @@ object KeplerJobMetadata {
         return if (operationLeases.putIfAbsent(key, lease) == null) lease else null
     }
 
+    /** Checks durable recovery authority and reserves the process-local owner under one lock. */
+    internal fun acquireRecoveryCheckedOperation(
+        jobDir: File,
+        intent: JobRecoveryMutationIntent,
+        consumesProcessingHandoff: Boolean = false
+    ): JobOperationLease = withJobLock(jobDir) {
+        val outcome = inspectRecoveryMutationGate(
+            jobDir,
+            intent,
+            consumesProcessingHandoff = consumesProcessingHandoff
+        )
+        if (outcome == JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP) {
+            throw ProcessingCleanupRequiredException()
+        }
+        if (outcome != JobRecoveryMutationGateOutcome.ALLOWED) {
+            throw JobRecoveryMutationBlockedException(outcome)
+        }
+        val key = jobDir.toPath().toAbsolutePath().normalize().toString()
+        val lease = JobOperationLease(key)
+        if (operationLeases.putIfAbsent(key, lease) != null) {
+            throw ProcessingAlreadyActiveException(jobDir)
+        }
+        lease
+    }
+
     internal fun hasProcessingCleanupBlocker(jobDir: File): Boolean = runCatching {
         val job = read(jobDir)
         job.optString("recoveryState") == PROCESSING_CLEANUP_REQUIRED ||
             ProcessingArtifactJournal.scan(jobDir).let { scan ->
-                scan.invalidFiles.isNotEmpty() || scan.validJournals.any { isUnresolvedAuthoritativeProcessingJournal(it.second) }
+                scan.invalidFiles.isNotEmpty() || scan.validJournals.any {
+                    isUnresolvedAuthoritativeProcessingJournal(it.second) ||
+                        (it.second.state == ProcessingArtifactJournalState.SETTLED && it.second.adoptedResult == "NO_OUTPUT")
+                }
             }
     }.getOrDefault(false)
 
@@ -254,7 +289,13 @@ object KeplerJobMetadata {
         operationLeases[jobDir.toPath().toAbsolutePath().normalize().toString()] === lease
 
     internal fun releaseOperation(lease: JobOperationLease) {
+        autoOperationLeases.remove(lease.key)
         operationLeases.remove(lease.key, lease)
+    }
+
+    private fun releaseAutoOperation(jobDir: File) {
+        val key = jobDir.toPath().toAbsolutePath().normalize().toString()
+        if (autoOperationLeases.remove(key)) operationLeases.remove(key)
     }
 
     /** Removes the lock entry for a permanently deleted job directory. Safe to call after successful deletion. */
@@ -324,17 +365,52 @@ object KeplerJobMetadata {
         jobDir: File,
         operationId: String = UUID.randomUUID().toString(),
         kind: KeplerActiveOperationKind,
-        startedAt: Long = System.currentTimeMillis()
-    ): String {
-        update(jobDir) { job ->
-            job.put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
-                .put(ACTIVE_OPERATION_ID, operationId)
-                .put(ACTIVE_OPERATION_KIND, kind.name)
-                .put(ACTIVE_OPERATION_STARTED_AT, startedAt)
-                .put(ACTIVE_OPERATION_UPDATED_AT, startedAt)
-            job.remove(TERMINAL_OPERATION_ID)
+        startedAt: Long = System.currentTimeMillis(),
+        ownerLease: JobOperationLease? = null
+    ): String = withJobLock(jobDir) {
+        val key = jobDir.toPath().toAbsolutePath().normalize().toString()
+        val lease = if (ownerLease != null) {
+            check(operationLeases[key] === ownerLease) {
+                "Durable operation reassertion requires the exact job owner lease"
+            }
+            ownerLease
+        } else {
+            check(operationLeases[key] == null) {
+                "A process-local job owner already exists"
+            }
+            JobOperationLease(key).also {
+                check(operationLeases.putIfAbsent(key, it) == null)
+                autoOperationLeases += key
+            }
         }
-        return operationId
+        try {
+            val outcome = inspectRecoveryMutationGate(
+                jobDir,
+                JobRecoveryMutationIntent.METADATA_EDIT,
+                ownerLease = lease
+            )
+            if (outcome == JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP) {
+                throw ProcessingCleanupRequiredException()
+            }
+            if (outcome != JobRecoveryMutationGateOutcome.ALLOWED) {
+                throw JobRecoveryMutationBlockedException(outcome)
+            }
+            update(jobDir) { job ->
+                job.put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                    .put(ACTIVE_OPERATION_ID, operationId)
+                    .put(ACTIVE_OPERATION_KIND, kind.name)
+                    .put(ACTIVE_OPERATION_STARTED_AT, startedAt)
+                    .put(ACTIVE_OPERATION_UPDATED_AT, startedAt)
+                job.remove(TERMINAL_OPERATION_ID)
+            }
+            operationId
+        } catch (failure: Throwable) {
+            if (ownerLease == null) {
+                autoOperationLeases.remove(key)
+                operationLeases.remove(key, lease)
+            }
+            throw failure
+        }
     }
 
     /** Records the durable capture-to-processing handoff before capture ownership is released. */
@@ -385,6 +461,7 @@ object KeplerJobMetadata {
             job.remove(ACTIVE_OPERATION_STARTED_AT)
             job.remove(ACTIVE_OPERATION_UPDATED_AT)
         }
+        if (matched) releaseAutoOperation(jobDir)
         matched
     }.getOrDefault(false)
 
@@ -402,6 +479,7 @@ object KeplerJobMetadata {
             job.remove(ACTIVE_OPERATION_STARTED_AT)
             job.remove(ACTIVE_OPERATION_UPDATED_AT)
         }
+        if (matched) releaseAutoOperation(jobDir)
         matched
     }.getOrDefault(false)
 

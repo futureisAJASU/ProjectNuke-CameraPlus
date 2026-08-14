@@ -4,11 +4,14 @@ import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 
 @RunWith(RobolectricTestRunner::class)
 class KeplerJobMetadataTest {
@@ -70,20 +73,62 @@ class KeplerJobMetadataTest {
     }
 
     @Test
-    fun newOperationReplacesOldDurableMarkerAndOldOwnerCannotClearIt() {
+    fun unrelatedOperationCannotReplaceAnExistingProcessLocalOwner() {
         val directory = Files.createTempDirectory("kepler-runtime-replacement-").toFile()
         try {
             KeplerJobMetadata.write(directory, JSONObject().put("status", "PROCESSING"))
             val first = KeplerJobMetadata.beginActiveOperation(directory, kind = KeplerActiveOperationKind.CAPTURE_RAW)
-            val second = KeplerJobMetadata.beginActiveOperation(directory, kind = KeplerActiveOperationKind.PUBLIC_EXPORT)
-            assertTrue(first != second)
+            assertThrows(IllegalStateException::class.java) {
+                KeplerJobMetadata.beginActiveOperation(directory, kind = KeplerActiveOperationKind.PUBLIC_EXPORT)
+            }
             val current = KeplerJobMetadata.read(directory)
-            assertEquals(second, current.getString(ACTIVE_OPERATION_ID))
-            assertEquals("PUBLIC_EXPORT", current.getString(ACTIVE_OPERATION_KIND))
-            assertFalse(KeplerJobMetadata.clearActiveOperation(directory, first))
-            assertEquals(second, KeplerJobMetadata.read(directory).getString(ACTIVE_OPERATION_ID))
-            assertTrue(KeplerJobMetadata.clearActiveOperation(directory, second))
+            assertEquals(first, current.getString(ACTIVE_OPERATION_ID))
+            assertEquals("CAPTURE_RAW", current.getString(ACTIVE_OPERATION_KIND))
+            assertTrue(KeplerJobMetadata.clearActiveOperation(directory, first))
+            assertFalse(KeplerJobMetadata.read(directory).has(ACTIVE_OPERATION_ID))
         } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun recoveryCheckedAcquisitionSerializesCompetingMutations() {
+        val directory = Files.createTempDirectory("kepler-atomic-owner-").toFile()
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            KeplerJobMetadata.write(directory, JSONObject().put("status", "COMPLETE"))
+            val ready = CountDownLatch(2)
+            val start = CountDownLatch(1)
+            val winnerHeld = CountDownLatch(1)
+            val bothAttempted = CountDownLatch(2)
+            val releaseWinner = CountDownLatch(1)
+            val futures = (0 until 2).map {
+                executor.submit<Boolean> {
+                    ready.countDown()
+                    start.await()
+                    val acquired = runCatching {
+                        KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                            directory,
+                            JobRecoveryMutationIntent.JOB_DELETE
+                        )
+                    }.getOrNull()
+                    bothAttempted.countDown()
+                    if (acquired != null) {
+                        winnerHeld.countDown()
+                        releaseWinner.await()
+                        acquired.release()
+                        true
+                    } else false
+                }
+            }
+            ready.await()
+            start.countDown()
+            winnerHeld.await()
+            bothAttempted.await()
+            releaseWinner.countDown()
+            assertEquals(1, futures.count { it.get() })
+        } finally {
+            executor.shutdownNow()
             directory.deleteRecursively()
         }
     }

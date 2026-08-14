@@ -113,10 +113,15 @@ fun exportNightFusionBitmapToGallery(
     relativeAlbumPath: String = "Pictures/Kepler",
     quality: Int = 92,
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation,
-    jobDir: File? = null
+    jobDir: File? = null,
+    ownerLease: JobOperationLease? = null
 ): GalleryExportResult {
     val exportOperationId = if (jobDir != null && NoFollowFileSystem.resolveDirectChild(jobDir, JOB_JSON_FILE_NAME, requireFile = true) != null) {
-        KeplerJobMetadata.beginActiveOperation(jobDir, kind = KeplerActiveOperationKind.PUBLIC_EXPORT)
+        KeplerJobMetadata.beginActiveOperation(
+            jobDir,
+            kind = KeplerActiveOperationKind.PUBLIC_EXPORT,
+            ownerLease = ownerLease
+        )
     } else null
     val attempts = when (requestedFormat) {
         OutputFormat.HEIF -> listOf(OutputFormat.HEIF, OutputFormat.JPEG, OutputFormat.PNG)

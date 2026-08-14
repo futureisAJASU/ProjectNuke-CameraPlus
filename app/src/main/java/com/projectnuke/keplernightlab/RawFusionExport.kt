@@ -37,7 +37,7 @@ internal class RawProcessingOperation internal constructor(
     /** Reclaims durable evidence after the nested ProcessingAttempt releases its sublease. */
     internal fun reassertActiveOperation(kind: KeplerActiveOperationKind) {
         activeOperationId?.let { operationId ->
-            KeplerJobMetadata.beginActiveOperation(jobDir, operationId, kind)
+            KeplerJobMetadata.beginActiveOperation(jobDir, operationId, kind, ownerLease = lease)
         }
     }
 }
@@ -47,13 +47,22 @@ internal fun acquireRawProcessingOperation(
     borrowedLease: JobOperationLease? = null
 ): RawProcessingOperation? {
     val ownsLease = borrowedLease == null
-    val lease = borrowedLease ?: KeplerJobMetadata.acquireOperation(jobDir) ?: return null
+    val lease = borrowedLease ?: runCatching {
+        KeplerJobMetadata.acquireRecoveryCheckedOperation(
+            jobDir,
+            JobRecoveryMutationIntent.PROCESSING_START
+        )
+    }.getOrNull() ?: return null
     if (!KeplerJobMetadata.isOperationOwner(jobDir, lease)) {
         if (ownsLease) lease.release()
         return null
     }
     val operationId = if (NoFollowFileSystem.resolveDirectChild(jobDir, JOB_JSON_FILE_NAME, requireFile = true) != null) {
-        KeplerJobMetadata.beginActiveOperation(jobDir, kind = KeplerActiveOperationKind.PROCESSING_RAW)
+        KeplerJobMetadata.beginActiveOperation(
+            jobDir,
+            kind = KeplerActiveOperationKind.PROCESSING_RAW,
+            ownerLease = lease
+        )
     } else null
     return RawProcessingOperation(lease, ownsLease, jobDir, operationId)
 }
@@ -856,7 +865,8 @@ fun captureProcessExportRawNightFusion(
                             }",
                             requestedFormat = requestedOutputFormat,
                             cancellation = cancellation,
-                            jobDir = jobDir
+                            jobDir = jobDir,
+                            ownerLease = processingOperation.lease
                         )
                     } finally {
                         exportBitmap?.takeUnless { it.isRecycled }?.recycle()
@@ -1606,7 +1616,8 @@ internal fun reprocessRawJob(
                     }",
                     requestedFormat = requestedFormat,
                     cancellation = cancellation,
-                    jobDir = jobDir
+                    jobDir = jobDir,
+                    ownerLease = processingOperation.lease
                 )
             } catch (exportError: Throwable) {
                 exportBitmap?.takeUnless { it.isRecycled }?.recycle()

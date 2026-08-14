@@ -50,15 +50,16 @@ internal fun beginProcessingAttempt(
     // An existing process-local owner is the explicit internal concurrency proof. Let the
     // lease/sublease checks below return the established ProcessingAlreadyActive outcome;
     // a durable owner with no local proof still goes through the restart mutation gate.
-    if (operationLease == null && !KeplerJobMetadata.isOperationActive(jobDir)) {
-        KeplerJobMetadata.requireRecoveryMutationAllowed(
+    val ownsLease = operationLease == null
+    val lease = operationLease ?: if (KeplerJobMetadata.isOperationActive(jobDir)) {
+        KeplerJobMetadata.acquireOperation(jobDir)
+    } else {
+        KeplerJobMetadata.acquireRecoveryCheckedOperation(
             jobDir,
             JobRecoveryMutationIntent.PROCESSING_START,
             consumesProcessingHandoff = true
         )
     }
-    val ownsLease = operationLease == null
-    val lease = operationLease ?: KeplerJobMetadata.acquireOperation(jobDir)
         ?: throw ProcessingAlreadyActiveException(jobDir)
     check(KeplerJobMetadata.isOperationOwner(jobDir, lease)) {
         "Processing operation lease is not owned by this attempt"
