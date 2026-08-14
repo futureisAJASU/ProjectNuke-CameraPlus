@@ -161,7 +161,7 @@ fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
             onDismiss = { confirmDeleteFailed = false },
             onConfirm = {
                 confirmDeleteFailed = false
-                val targets = jobs.filter { it.isFailedGalleryJob() }.map { it.directory }
+                val targets = selectFailedGalleryJobs(jobs).map { it.directory }
                 scope.launch {
                     val failed = withContext(Dispatchers.IO) {
                         targets.mapNotNull { dir ->
@@ -377,13 +377,45 @@ private fun GalleryInfoGrid(
 private fun Set<String>.toggleGalleryId(id: String): Set<String> =
     if (id in this) this - id else this + id
 
-private fun KeplerGalleryJobSummary.isFailedGalleryJob(): Boolean {
+internal fun selectFailedGalleryJobs(
+    jobs: List<KeplerGalleryJobSummary>
+): List<KeplerGalleryJobSummary> = jobs.filter { it.isFailedGalleryJob() }
+
+internal fun KeplerGalleryJobSummary.isFailedGalleryJob(): Boolean {
     if (recoveryState != "STABLE") return false
+    // A failed stage is diagnostic only when a current authoritative result is
+    // still usable.  Bulk deletion must never treat that result as failed
+    // garbage merely because a later export/post-processing step failed.
+    val metadata = metadata
+    val usableLocalResult = finalPreviewFile?.let {
+        NoFollowFileSystem.isRealFile(it.toPath()) &&
+            !metadata?.optBoolean("galleryDisplayUnavailable", false).orFalse()
+    } == true
+    val usablePublicResult = finalExportExists &&
+        metadata?.optBoolean("galleryExportCommitted", false) == true &&
+        metadata.optString("exportUri").isNotBlank()
+    if (usableLocalResult || usablePublicResult) return false
+
+    // Recovery-blocked or quarantined jobs require their evidence-preserving
+    // mutation policy, not the ordinary failed-job delete path.
+    if (isReprocessQuarantined(directory)) return false
+    val hasUnresolvedJournalEvidence = try {
+        ProcessingArtifactJournal.scan(directory).invalidFiles.isNotEmpty() ||
+            MediaStoreExportJournal.invalidFiles(directory).isNotEmpty()
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        true
+    }
+    if (hasUnresolvedJournalEvidence) return false
+
     val process = metadata?.optString("processStatus").orEmpty()
     val export = metadata?.optString("exportStatus").orEmpty()
     val combined = listOf(status, process, export).joinToString(" ").uppercase()
     return combined.contains("FAILED") || combined.contains("FAILURE") || combined.contains("ERROR")
 }
+
+private fun Boolean?.orFalse(): Boolean = this == true
 
 private fun KeplerGalleryJobSummary.isSourceOnlyGalleryJob(): Boolean =
     metadata?.optString("cleanupType") == "SOURCE_ONLY" ||
