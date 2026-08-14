@@ -17,8 +17,14 @@ internal data class ProcessingAttempt(
     private val released = AtomicBoolean(false)
 
     internal fun release() {
+        if (released.get()) return
+        val cleared = KeplerJobMetadata.clearActiveOperation(jobDir, id)
+        if (!cleared && KeplerJobMetadata.isCurrentActiveOperation(jobDir, id)) {
+            // A failed metadata write leaves the durable owner in place. Keep both
+            // the sublease and its top-level lease so another mutation cannot overlap it.
+            return
+        }
         if (!released.compareAndSet(false, true)) return
-        KeplerJobMetadata.clearActiveOperation(jobDir, id)
         operationLease?.releaseProcessingAttempt(id)
         if (ownsOperationLease) operationLease?.release()
     }
@@ -30,11 +36,61 @@ internal class ProcessingAlreadyActiveException(jobDir: File) :
 internal fun ProcessingAttempt.releaseOwnedLease() = release()
 
 /**
- * Processing entry points return only after their required artifact claim is
- * durable. Preserve that claim in a terminal event across an immediate
- * cancellation/failure boundary.
+ * Reads only the current processing attempt's durable required-output claim.
+ * A previous final pathname is not sufficient evidence for this predicate.
  */
-internal fun requiredOutputCommittedAfterProcessing(finalFile: File): Boolean = finalFile.isFile
+internal fun currentProcessingAttemptHasRequiredOutputClaim(
+    jobDir: File,
+    expectedAttemptId: String? = null
+): Boolean {
+    val job = try {
+        KeplerJobMetadata.read(jobDir)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        return false
+    }
+    val attemptId = job.optString("processingAttemptId").takeIf { it.isNotBlank() }
+        ?: return false
+    if (expectedAttemptId != null && attemptId != expectedAttemptId) return false
+    if (!job.optBoolean("processingOutputCommitted", false) ||
+        job.optString("processingArtifactClaimAttemptId") != attemptId
+    ) return false
+    val mode = job.optString("processingMode").uppercase()
+    val jobType = job.optString("jobType").uppercase()
+    val claimKey = when {
+        mode == "CLASSIC_RAW" || jobType == "RAW" || jobType == "RAW_NIGHT_FUSION" -> "mergedRawFile"
+        mode == "SUPER_RESOLUTION" || jobType.contains("SUPER") -> "superResolutionOutputFile"
+        mode == "CLASSIC_YUV" || mode == "SINGLE_FRAME" ||
+            jobType == "YUV_NIGHT_FUSION" || jobType == "YUV_SINGLE_FRAME" -> "finalFile"
+        else -> return false
+    }
+    val finalName = job.optString(claimKey).takeIf { it.isNotBlank() } ?: return false
+    return NoFollowFileSystem.resolveDirectChildResult(jobDir, finalName, requireFile = true) is
+        NoFollowInspection.Present
+}
+
+/**
+ * Processing callers use the lease's last exact attempt identity because the
+ * ProcessingAttempt sublease is released before an outer terminal callback sees
+ * an exceptional return. This prevents an old durable result from being counted
+ * when a new attempt failed before it published its own metadata.
+ */
+internal fun requiredOutputCommittedAfterProcessing(
+    jobDir: File,
+    operationLease: JobOperationLease? = null
+): Boolean {
+    if (operationLease == null) return currentProcessingAttemptHasRequiredOutputClaim(jobDir)
+    val attemptId = operationLease.lastProcessingAttemptId() ?: return false
+    return currentProcessingAttemptHasRequiredOutputClaim(jobDir, expectedAttemptId = attemptId)
+}
+
+internal fun currentProcessingAttemptHasRequiredOutputClaimForLease(
+    jobDir: File,
+    operationLease: JobOperationLease?
+): Boolean = operationLease?.lastProcessingAttemptId()?.let { attemptId ->
+    currentProcessingAttemptHasRequiredOutputClaim(jobDir, expectedAttemptId = attemptId)
+} == true
 
 private val COMMON_PROCESSING_ATTEMPT_KEYS = setOf(
     "pipelineFailed",

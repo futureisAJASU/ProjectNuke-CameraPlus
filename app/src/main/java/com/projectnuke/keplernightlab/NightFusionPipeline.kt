@@ -171,7 +171,7 @@ fun captureProcessExportNightFusion(
                             operationLease = pipelineLease
                         )
                     }
-                    requiredOutputCommitted = requiredOutputCommittedAfterProcessing(finalFile)
+                    requiredOutputCommitted = requiredOutputCommittedAfterProcessing(jobDir, pipelineLease)
                     cancellation.throwIfCancelled()
 
                     val requestedOutputFormat = requestedOutputFormatForSetting(finalOutputFormat)
@@ -207,7 +207,8 @@ fun captureProcessExportNightFusion(
                         post("PIPELINE_FAILED: Export failed; keeping cache. ${export.errorMessage}")
                         terminal.publish(
                             CameraPipelineEvent.Terminal.Kind.FAILED,
-                            requiredOutputCommitted = finalFile.isFile,
+                            requiredOutputCommitted = requiredOutputCommitted ||
+                                currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, pipelineLease),
                             publicExportCommitted = export.success && !export.uriString.isNullOrBlank(),
                             message = export.errorMessage
                         )
@@ -217,7 +218,8 @@ fun captureProcessExportNightFusion(
                     post("Verifying gallery output...")
                     verified = verifyCommittedGalleryExport(context, export) is GalleryExportVerification.Verified
                     publicExportCommitted = export.success && !export.uriString.isNullOrBlank()
-                    requiredOutputCommitted = finalFile.isFile
+                    requiredOutputCommitted = requiredOutputCommitted ||
+                        currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, pipelineLease)
                     updateExportMetadata(
                         jobDir = jobDir,
                         export = export,
@@ -312,6 +314,8 @@ fun captureProcessExportNightFusion(
                         )
                     }
                 } catch (_: CancellationException) {
+                    requiredOutputCommitted = requiredOutputCommitted ||
+                        currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, pipelineLease)
                     post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                     val evidence = settleInterruptedExportForTerminal(PublicExportInterruptionDisposition.CANCELLED)
                     terminal.publish(
@@ -326,6 +330,8 @@ fun captureProcessExportNightFusion(
                         message = "Pipeline cancellation settled."
                     )
                 } catch (e: Exception) {
+                    requiredOutputCommitted = requiredOutputCommitted ||
+                        currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, pipelineLease)
                     post("PIPELINE_FAILED: ${if (captureMode == CaptureMode.SINGLE_FRAME) "Single photo" else "Night Fusion"} pipeline failed; keeping cache.\n${e.stackTraceToString()}")
                     val evidence = settleInterruptedExportForTerminal(PublicExportInterruptionDisposition.FAILED)
                     terminal.publish(
@@ -358,7 +364,12 @@ fun captureProcessExportNightFusion(
                         }
                     }
                     if (exportSettlementSucceeded) {
-                        pipelineLease.release()
+                        if (!pipelineLease.releaseIfProcessingSettled()) {
+                            android.util.Log.e(
+                                "KeplerYuvPipeline",
+                                "retaining processing lease after durable attempt settlement failure"
+                            )
+                        }
                     } else {
                         android.util.Log.e("KeplerYuvPipeline", "retaining public export lease after settlement failure")
                     }
@@ -429,7 +440,7 @@ internal fun reprocessYuvJob(
     val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
     val workerThread = HandlerThread("KeplerYuvReprocessThread").apply { start() }
     val workerHandler = Handler(workerThread.looper)
-    val workerPosted = runCatching {
+    val workerPosted = try {
         (workerPostOperation ?: workerHandler::post).invoke(Runnable {
         val jobFile = NoFollowFileSystem.requireDirectChildFile(jobDir, JOB_JSON_FILE_NAME)
         var totalFrames = 0
@@ -557,7 +568,12 @@ internal fun reprocessYuvJob(
             )
         }
         })
-    }.getOrElse { false }
+    } catch (failure: Error) {
+        workerThread.quitSafely()
+        throw failure
+    } catch (_: Exception) {
+        false
+    }
     if (!workerPosted) {
         workerThread.quitSafely()
         terminal.complete(

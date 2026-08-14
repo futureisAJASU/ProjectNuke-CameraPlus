@@ -1967,8 +1967,14 @@ private fun persistClassicYuvFailure(
             if (job.has(key)) current.put(key, job.get(key))
             else current.remove(key)
         }
-        // On NORMAL failure, clear only stale final/gallery/output keys; KEEP failure diagnostics
-        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+        // A new attempt may fail after its required final was durably claimed.
+        // Preserve that exact current claim; only clear output paths for an
+        // attempt which never claimed its required artifact.
+        val currentAttemptClaimedOutput = attempt != null &&
+            current.optBoolean("processingOutputCommitted", false) &&
+            current.optString("processingArtifactClaimAttemptId") == attempt.id &&
+            current.optString("processingAttemptId") == attempt.id
+        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL && !currentAttemptClaimedOutput) {
             classicYuvStaleFinalOutputKeys.forEach { current.remove(it) }
         }
     }

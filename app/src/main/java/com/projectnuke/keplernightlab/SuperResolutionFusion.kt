@@ -716,12 +716,19 @@ fun captureProcessExportSuperResolutionFusion(
                     )
                     val outputFile = result.outputFile
                     if (outputFile == null || !outputFile.exists()) {
+                        requiredOutputCommitted = outputDirForSettlement?.let { dir ->
+                            currentProcessingAttemptHasRequiredOutputClaimForLease(dir, outputLease)
+                        } == true
                         post("PIPELINE_FAILED: 24M Fusion failed. ${result.message}")
-                        terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = result.message)
+                        terminal.publish(
+                            CameraPipelineEvent.Terminal.Kind.FAILED,
+                            requiredOutputCommitted = requiredOutputCommitted,
+                            message = result.message
+                        )
                         return@post
                     }
 
-                    requiredOutputCommitted = requiredOutputCommittedAfterProcessing(outputFile)
+                    requiredOutputCommitted = requiredOutputCommittedAfterProcessing(outputDirForSettlement ?: error("Super Resolution output directory missing"), outputLease)
                     cancellation.throwIfCancelled()
                     val bitmap = NoFollowFileSystem.decodeBitmapVerified(outputFile)
                         ?: error("Could not decode 24M Fusion output.")
@@ -755,7 +762,8 @@ fun captureProcessExportSuperResolutionFusion(
                         post("PIPELINE_FAILED: 24M Fusion export failed. ${export.errorMessage}")
                         terminal.publish(
                             CameraPipelineEvent.Terminal.Kind.FAILED,
-                            requiredOutputCommitted = outputFile.isFile,
+                            requiredOutputCommitted = requiredOutputCommitted ||
+                                currentProcessingAttemptHasRequiredOutputClaimForLease(outputDir, outputLease),
                             publicExportCommitted = export.success && !export.uriString.isNullOrBlank(),
                             message = export.errorMessage
                         )
@@ -763,7 +771,8 @@ fun captureProcessExportSuperResolutionFusion(
                     }
 
                     verified = verifyCommittedGalleryExport(context, export) is GalleryExportVerification.Verified
-                    requiredOutputCommitted = outputFile.isFile
+                    requiredOutputCommitted = requiredOutputCommitted ||
+                        currentProcessingAttemptHasRequiredOutputClaimForLease(outputDir, outputLease)
                     publicExportCommitted = export.success && !export.uriString.isNullOrBlank()
                     updateExportMetadata(
                         jobDir = outputDir,
@@ -820,6 +829,9 @@ fun captureProcessExportSuperResolutionFusion(
                         message = "24M Fusion export complete."
                     )
                 } catch (_: CancellationException) {
+                    requiredOutputCommitted = requiredOutputCommitted || outputDirForSettlement?.let { dir ->
+                        currentProcessingAttemptHasRequiredOutputClaimForLease(dir, outputLease)
+                    } == true
                     post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                     val evidence = outputLease?.let { lease ->
                         outputDirForSettlement?.let { dir ->
@@ -838,6 +850,9 @@ fun captureProcessExportSuperResolutionFusion(
                         message = "24M Fusion cancellation settled."
                     )
                 } catch (error: Exception) {
+                    requiredOutputCommitted = requiredOutputCommitted || outputDirForSettlement?.let { dir ->
+                        currentProcessingAttemptHasRequiredOutputClaimForLease(dir, outputLease)
+                    } == true
                     post(
                         "PIPELINE_FAILED: 24M Fusion failed. " +
                             "${error.javaClass.simpleName}: ${error.message}"
@@ -879,8 +894,16 @@ fun captureProcessExportSuperResolutionFusion(
                                 Log.e("KeplerSuperResolution", "public export owner settlement failed", settlementFailure)
                             }
                         }
-                        if (exportSettlementSucceeded) lease.release()
-                        else Log.e("KeplerSuperResolution", "retaining public export lease after settlement failure")
+                        if (exportSettlementSucceeded) {
+                            if (!lease.releaseIfProcessingSettled()) {
+                                Log.e(
+                                    "KeplerSuperResolution",
+                                    "retaining processing lease after durable attempt settlement failure"
+                                )
+                            }
+                        } else {
+                            Log.e("KeplerSuperResolution", "retaining public export lease after settlement failure")
+                        }
                     }
                     workerThread.quitSafely()
                 }

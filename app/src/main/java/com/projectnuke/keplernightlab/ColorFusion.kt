@@ -661,10 +661,23 @@ fun captureYuvBurstColorWithMotion(
                         } ?: onComplete(currentBurstDir)
                     }
                     TerminalCompletionKind.ERROR -> {
-                        durableCaptureOperationId?.let { operationId ->
-                            KeplerJobMetadata.clearActiveOperation(currentBurstDir, operationId)
+                        val ownerSettled = durableCaptureOperationId?.let { operationId ->
+                            durableCaptureLease?.let { lease ->
+                                KeplerJobMetadata.settleCaptureOwnerAfterHandoffFailure(
+                                    currentBurstDir,
+                                    operationId,
+                                    lease
+                                )
+                            } ?: KeplerJobMetadata.clearActiveOperation(currentBurstDir, operationId)
+                        } ?: true
+                        if (ownerSettled) {
+                            durableCaptureLease?.release()
+                        } else {
+                            android.util.Log.e(
+                                "KeplerYuvCapture",
+                                "retaining capture lease after terminal owner settlement failure"
+                            )
                         }
-                        durableCaptureLease?.release()
                         logYuvCaptureFailure(
                             stage = "terminal",
                             throwable = request.cause,

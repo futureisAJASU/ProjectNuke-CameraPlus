@@ -13,14 +13,86 @@ import org.robolectric.RobolectricTestRunner
 @RunWith(RobolectricTestRunner::class)
 class ProcessingAttemptTest {
     @Test
-    fun returnedClaimedFinalPreservesRequiredOutputTerminalFlag() {
+    fun durableCurrentClaimPreservesRequiredOutputAfterAttemptReturnsThroughFailureBoundary() {
         val dir = Files.createTempDirectory("processing-terminal-output").toFile()
         try {
+            KeplerJobMetadata.write(dir, JSONObject().put("jobType", "YUV_NIGHT_FUSION"))
+            val attempt = beginProcessingAttempt(dir, "CLASSIC_YUV")
             val output = dir.resolve("final.png")
-            assertFalse(requiredOutputCommittedAfterProcessing(output))
-            output.writeBytes(byteArrayOf(1, 2, 3))
-            assertTrue(requiredOutputCommittedAfterProcessing(output))
+            try {
+                commitProcessingArtifact(
+                    finalFile = output,
+                    writeTemp = { it.writeBytes(byteArrayOf(1, 2, 3)) },
+                    verifyFinal = { check(it.readBytes().contentEquals(byteArrayOf(1, 2, 3))) },
+                    processingAttemptId = attempt.id,
+                    claimKey = "finalFile"
+                )
+                markProcessingArtifactClaim(dir, attempt, "finalFile", output)
+
+                // Model the caller observing an exceptional return after the
+                // durable claim, before it receives a File result.
+                assertTrue(requiredOutputCommittedAfterProcessing(dir, attempt.operationLease))
+                attempt.releaseOwnedLease()
+                assertTrue(requiredOutputCommittedAfterProcessing(dir))
+            } finally {
+                attempt.releaseOwnedLease()
+            }
         } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun previousFinalIsNotCountedForAnewUncommittedAttempt() {
+        val dir = Files.createTempDirectory("processing-terminal-previous").toFile()
+        try {
+            KeplerJobMetadata.write(dir, JSONObject().put("jobType", "YUV_NIGHT_FUSION"))
+            val first = beginProcessingAttempt(dir, "CLASSIC_YUV")
+            val output = dir.resolve("final.png")
+            commitProcessingArtifact(
+                finalFile = output,
+                writeTemp = { it.writeBytes(byteArrayOf(7, 8, 9)) },
+                verifyFinal = { check(it.readBytes().contentEquals(byteArrayOf(7, 8, 9))) },
+                processingAttemptId = first.id,
+                claimKey = "finalFile"
+            )
+            markProcessingArtifactClaim(dir, first, "finalFile", output)
+            first.releaseOwnedLease()
+
+            val second = beginProcessingAttempt(dir, "CLASSIC_YUV")
+            try {
+                assertFalse(requiredOutputCommittedAfterProcessing(dir, second.operationLease))
+                assertTrue(output.exists())
+            } finally {
+                second.releaseOwnedLease()
+            }
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun previousClaimIsNotCountedBeforeTheNewAttemptClaimsAnOutput() {
+        val dir = Files.createTempDirectory("processing-terminal-pre-attempt").toFile()
+        var lease: JobOperationLease? = null
+        try {
+            KeplerJobMetadata.write(dir, JSONObject().put("jobType", "YUV_NIGHT_FUSION"))
+            val first = beginProcessingAttempt(dir, "CLASSIC_YUV")
+            val output = dir.resolve("final.png")
+            commitProcessingArtifact(
+                finalFile = output,
+                writeTemp = { it.writeBytes(byteArrayOf(4, 5, 6)) },
+                verifyFinal = { check(it.readBytes().contentEquals(byteArrayOf(4, 5, 6))) },
+                processingAttemptId = first.id,
+                claimKey = "finalFile"
+            )
+            markProcessingArtifactClaim(dir, first, "finalFile", output)
+            first.releaseOwnedLease()
+
+            lease = KeplerJobMetadata.acquireOperation(dir)
+            assertFalse(requiredOutputCommittedAfterProcessing(dir, lease))
+        } finally {
+            lease?.release()
             dir.deleteRecursively()
         }
     }

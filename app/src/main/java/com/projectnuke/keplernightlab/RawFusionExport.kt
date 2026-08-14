@@ -29,8 +29,14 @@ internal class RawProcessingOperation internal constructor(
     private val released = AtomicBoolean(false)
 
     fun release() {
+        if (released.get()) return
+        val operationId = activeOperationId
+        val cleared = operationId?.let { KeplerJobMetadata.clearActiveOperation(jobDir, it) } ?: true
+        if (!cleared && operationId?.let { KeplerJobMetadata.isCurrentActiveOperation(jobDir, it) } == true) {
+            Log.e("KeplerRawPipeline", "retaining RAW operation lease after durable owner clear failure")
+            return
+        }
         if (!released.compareAndSet(false, true)) return
-        activeOperationId?.let { KeplerJobMetadata.clearActiveOperation(jobDir, it) }
         if (ownsLease) lease.release()
     }
 
@@ -752,7 +758,7 @@ fun captureProcessExportRawNightFusion(
                 }
                 return@captureRawBurstForFusion
             }
-            val workerPosted = runCatching {
+            val workerPosted = try {
                 Handler(thread.looper).post {
                 var capturedProcess: RawFusionProcessResult? = null
                 var committedExport: GalleryExportResult? = null
@@ -1404,7 +1410,11 @@ fun captureProcessExportRawNightFusion(
                             cancellation.isCancelled -> CameraPipelineEvent.Terminal.Kind.CANCELLED
                             else -> CameraPipelineEvent.Terminal.Kind.FAILED
                         },
-                        requiredOutputCommitted = capturedProcess?.finalPngFile?.isFile == true,
+                        requiredOutputCommitted = capturedProcess?.outputCommitted == true ||
+                            currentProcessingAttemptHasRequiredOutputClaimForLease(
+                                jobDir,
+                                processingOperation.lease
+                            ),
                         publicExportCommitted = committedExport != null,
                         verified = exportVerified,
                         message = "RAW pipeline terminal settlement"
@@ -1413,7 +1423,11 @@ fun captureProcessExportRawNightFusion(
                     thread.quitSafely()
                 }
                 }
-            }.getOrElse { failure ->
+            } catch (failure: Error) {
+                processingOperation.release()
+                thread.quitSafely()
+                throw failure
+            } catch (failure: Exception) {
                 Log.e("KeplerRawPipeline", "RAW processing worker dispatch failed", failure)
                 false
             }
@@ -1522,7 +1536,7 @@ internal fun reprocessRawJob(
             cancel = { (cancellation as? KeplerPipelineCancellationToken)?.cancel() }
         )
     }
-    val workerPosted = runCatching {
+    val workerPosted = try {
         Handler(thread.looper).post {
         var terminalResult: Result<Unit> = Result.failure(IllegalStateException("RAW reprocess did not reach a terminal state."))
         var publicOutcome: RawFusionPublicExportOutcome? = null
@@ -1875,7 +1889,11 @@ internal fun reprocessRawJob(
             )
         }
     }
-    }.getOrElse { failure ->
+    } catch (failure: Error) {
+        processingOperation.release()
+        thread.quitSafely()
+        throw failure
+    } catch (failure: Exception) {
         Log.e("KeplerRawReprocess", "RAW reprocess worker dispatch failed", failure)
         false
     }

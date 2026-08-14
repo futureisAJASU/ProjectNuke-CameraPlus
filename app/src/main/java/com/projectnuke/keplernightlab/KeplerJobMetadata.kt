@@ -521,6 +521,25 @@ object KeplerJobMetadata {
         }
     }
 
+    /**
+     * Conservative post-clear inspection for exact local-owner release. A read
+     * failure is treated as still owned so a transient metadata fault cannot
+     * release a lease behind an uncleared durable marker.
+     */
+    internal fun isCurrentActiveOperation(jobDir: File, operationId: String): Boolean {
+        return try {
+            val job = read(jobDir)
+            job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id &&
+                job.optString(ACTIVE_OPERATION_ID) == operationId
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: KeplerJobMetadataMissing) {
+            false
+        } catch (_: Exception) {
+            true
+        }
+    }
+
     /** Clears a current-process marker when terminal metadata has already settled its owner. */
     internal fun clearActiveOperationKind(jobDir: File, kind: KeplerActiveOperationKind): Boolean = runCatching {
         var matched = false
@@ -734,15 +753,34 @@ object KeplerJobMetadata {
 class JobOperationLease internal constructor(internal val key: String) {
     private val released = AtomicBoolean(false)
     private val processingAttemptId = java.util.concurrent.atomic.AtomicReference<String?>(null)
+    private val lastProcessingAttemptId = java.util.concurrent.atomic.AtomicReference<String?>(null)
 
-    internal fun claimProcessingAttempt(attemptId: String): Boolean =
-        !released.get() && processingAttemptId.compareAndSet(null, attemptId)
+    internal fun claimProcessingAttempt(attemptId: String): Boolean {
+        if (released.get() || !processingAttemptId.compareAndSet(null, attemptId)) return false
+        lastProcessingAttemptId.set(attemptId)
+        return true
+    }
 
     internal fun releaseProcessingAttempt(attemptId: String): Boolean =
         processingAttemptId.compareAndSet(attemptId, null)
 
     internal fun isProcessingAttemptOwner(attemptId: String): Boolean =
         !released.get() && processingAttemptId.get() == attemptId
+
+    internal fun lastProcessingAttemptId(): String? = lastProcessingAttemptId.get()
+
+    /**
+     * Releases the top-level lease only when a borrowed processing sublease has
+     * already settled its durable owner. A failed ProcessingAttempt clear keeps
+     * the sublease attached so outer pipeline cleanup cannot create an ownerless
+     * current-runtime marker.
+     */
+    internal fun releaseIfProcessingSettled(): Boolean {
+        val attemptId = lastProcessingAttemptId.get()
+        if (attemptId != null && isProcessingAttemptOwner(attemptId)) return false
+        release()
+        return true
+    }
 
     fun release() {
         if (!released.compareAndSet(false, true)) return

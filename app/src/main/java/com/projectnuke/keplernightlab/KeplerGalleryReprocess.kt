@@ -1835,6 +1835,7 @@ private fun performTerminalCleanupDebt(
             }
         }
     } finally {
+        var ownerSettled = true
         try {
             val activeOperationId = KeplerJobMetadata.read(jobDir)
                 .optString(ACTIVE_OPERATION_ID)
@@ -1843,8 +1844,10 @@ private fun performTerminalCleanupDebt(
                 check(KeplerJobMetadata.isOperationOwner(jobDir, lease)) {
                     "Reprocess terminal cleanup lost the exact owner lease"
                 }
-                check(KeplerJobMetadata.clearActiveOperation(jobDir, activeOperationId)) {
-                    "Reprocess terminal cleanup could not clear durable active ownership"
+                val cleared = KeplerJobMetadata.clearActiveOperation(jobDir, activeOperationId)
+                ownerSettled = cleared || !KeplerJobMetadata.isCurrentActiveOperation(jobDir, activeOperationId)
+                if (!ownerSettled) {
+                    warnings += "Durable reprocess owner cleanup remains pending."
                 }
             }
         } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
@@ -1855,8 +1858,9 @@ private fun performTerminalCleanupDebt(
         catch (e: Error) { throw e }
         catch (failure: Exception) {
             warnings += "Durable reprocess owner cleanup failed: ${failure.message}"
+            ownerSettled = false
         }
-        try { lease.release() }
+        if (ownerSettled) try { lease.release() }
         catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
         catch (oom: OutOfMemoryError) { throw oom }
         catch (td: ThreadDeath) { throw td }

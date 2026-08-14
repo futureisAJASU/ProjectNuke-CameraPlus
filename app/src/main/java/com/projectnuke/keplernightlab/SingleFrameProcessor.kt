@@ -67,7 +67,7 @@ internal fun processSingleFrameJobSync(
     var sourceForCleanup: Bitmap? = null
     var processedForCleanup: Bitmap? = null
     var outputFile: File? = null
-    var committedFinalVerified = false
+    var committedFinalClaimed = false
     try {
         val frames = job.optJSONArray("frames")
             ?: error("Single-frame job has no frames array")
@@ -116,9 +116,11 @@ internal fun processSingleFrameJobSync(
                 verifyPngArtifact(candidate, processedBitmap.width, processedBitmap.height)
             }
         )
-        committedFinalVerified = true
         if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
             markProcessingArtifactClaim(jobDir, processingAttempt, "finalFile", outputFile)
+            committedFinalClaimed = true
+        } else {
+            committedFinalClaimed = true
         }
         cancellation.throwIfCancelled()
         val finishedAt = System.currentTimeMillis()
@@ -140,7 +142,7 @@ internal fun processSingleFrameJobSync(
         return completedOutput
     } catch (ce: CancellationException) {
         if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            val settlement = if (committedFinalVerified) SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
+            val settlement = if (committedFinalClaimed) SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
             else SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
             persistSingleFrameCancellation(
                 jobDir = jobDir,
@@ -153,7 +155,9 @@ internal fun processSingleFrameJobSync(
         }
         throw ce
     } catch (oom: OutOfMemoryError) {
-        val settlement = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
+        val settlement = if (committedFinalClaimed) {
+            SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
+        } else if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
             SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
         } else {
             SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT

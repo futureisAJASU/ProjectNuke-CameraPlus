@@ -7,6 +7,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -84,6 +85,58 @@ class RawProcessingOperationTest {
             scope.release()
             assertNotNull(KeplerJobMetadata.acquireOperation(dir)?.also { it.release() })
         } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun rawWrapperRetainsDurableOwnerWhenClearFailsAndRetries() {
+        val dir = Files.createTempDirectory("raw-processing-owner-clear-failure").toFile()
+        val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
+        try {
+            KeplerJobMetadata.write(dir, JSONObject().put("jobType", "RAW_CAPTURE"))
+            val scope = requireNotNull(acquireRawProcessingOperation(dir))
+            KeplerJobMetadata.atomicWriteFailureForTest = IllegalStateException("RAW owner clear failed")
+
+            scope.release()
+
+            assertTrue(KeplerJobMetadata.isOperationOwner(dir, scope.lease))
+            assertNotNull(KeplerJobMetadata.read(dir).optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() })
+            assertThrows(JobRecoveryMutationBlockedException::class.java) {
+                KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                    dir,
+                    JobRecoveryMutationIntent.REPROCESS
+                )
+            }
+
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            scope.release()
+            assertFalse(KeplerJobMetadata.isOperationOwner(dir, scope.lease))
+            assertFalse(KeplerJobMetadata.read(dir).has(ACTIVE_OPERATION_ID))
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun rawWrapperFatalOwnerClearFailurePropagatesAndRetainsOwner() {
+        val dir = Files.createTempDirectory("raw-processing-owner-clear-fatal").toFile()
+        val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
+        try {
+            KeplerJobMetadata.write(dir, JSONObject().put("jobType", "RAW_CAPTURE"))
+            val scope = requireNotNull(acquireRawProcessingOperation(dir))
+            KeplerJobMetadata.atomicWriteFailureForTest = AssertionError("fatal RAW owner clear failed")
+
+            assertThrows(AssertionError::class.java) { scope.release() }
+            assertTrue(KeplerJobMetadata.isOperationOwner(dir, scope.lease))
+            assertNotNull(KeplerJobMetadata.read(dir).optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() })
+
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            scope.release()
+            assertFalse(KeplerJobMetadata.isOperationOwner(dir, scope.lease))
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
             dir.deleteRecursively()
         }
     }
