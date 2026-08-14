@@ -195,8 +195,7 @@ internal object KeplerRecoveryCoordinator {
             val malformedExportBlocks = when {
                 processingRecoveryOwnsAuthority -> false
                 activeOperationKind == KeplerActiveOperationKind.PUBLIC_EXPORT.name ->
-                    invalidCurrentExportJournals.isNotEmpty() ||
-                        (invalidExportJournals.isNotEmpty() && currentExportJournals.isEmpty())
+                    invalidCurrentExportJournals.isNotEmpty()
                 else -> invalidExportJournals.isNotEmpty() && !terminalResultAlreadyProven
             }
             if (malformedExportBlocks) {
@@ -216,6 +215,13 @@ internal object KeplerRecoveryCoordinator {
                 exportAccess?.let { recoverMediaStoreExportJournals(jobDir, it) }.orEmpty()
             }
             val exportJournalsById = MediaStoreExportJournal.list(jobDir).associateBy { it.exportAttemptId }
+            val recoveredMainVerified = exportResults.any { result ->
+                val journal = exportJournalsById[result.attemptId]
+                val verified = result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
+                    result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED
+                verified && journal?.role == MediaStoreExportRole.MAIN_IMAGE &&
+                    (exportAuthorityOperation.isBlank() || journal.ownerOperationId == exportAuthorityOperation)
+            }
             val recoveredMainCommit = exportResults.any { result ->
                 val journal = exportJournalsById[result.attemptId]
                 val verified = result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
@@ -440,8 +446,16 @@ internal object KeplerRecoveryCoordinator {
                 } else {
                     KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL.name
                 }
-                val publicCommitted = job.optBoolean("galleryExportCommitted", false)
-                val publicVerified = job.optBoolean("exportVerified", false)
+                val publicCommitted = if (activeOperationKind == KeplerActiveOperationKind.PUBLIC_EXPORT.name) {
+                    recoveredMainCommit
+                } else {
+                    job.optBoolean("galleryExportCommitted", false)
+                }
+                val publicVerified = if (activeOperationKind == KeplerActiveOperationKind.PUBLIC_EXPORT.name) {
+                    recoveredMainVerified
+                } else {
+                    job.optBoolean("exportVerified", false)
+                }
                 val classification = when {
                     publicVerified -> KeplerJobRecoveryClassification.PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL
                     publicCommitted -> KeplerJobRecoveryClassification.PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION

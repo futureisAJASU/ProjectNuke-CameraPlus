@@ -253,4 +253,81 @@ class KeplerJobMetadataTest {
             directory.deleteRecursively()
         }
     }
+
+    @Test
+    fun historicalMalformedExportDoesNotPoisonZeroJournalPreCommitSettlement() {
+        val directory = Files.createTempDirectory("kepler-public-export-zero-journal-").toFile()
+        var lease: JobOperationLease? = null
+        try {
+            KeplerJobMetadata.write(directory, JSONObject()
+                .put("currentPipelineStage", "COMPLETE")
+                .put("galleryExportCommitted", true)
+                .put("exportVerified", true)
+                .put("exportUri", "content://media/old-uri"))
+            val historical = File(directory, ".export_tx_historical-corrupt.json").apply {
+                writeText("not-json")
+                setLastModified(1L)
+            }
+            lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                directory,
+                JobRecoveryMutationIntent.PROCESSING_START
+            )
+            KeplerJobMetadata.beginActiveOperation(
+                directory,
+                kind = KeplerActiveOperationKind.PUBLIC_EXPORT,
+                ownerLease = lease
+            )
+
+            assertTrue(settleOwnedPublicExportInterruption(directory, lease!!, "cancelled before insert"))
+            val settled = KeplerJobMetadata.read(directory)
+            assertEquals("content://media/old-uri", settled.getString("exportUri"))
+            assertTrue(settled.getBoolean("galleryExportCommitted"))
+            assertTrue(settled.getBoolean("exportVerified"))
+            assertFalse(settled.has(ACTIVE_OPERATION_ID))
+            assertTrue(historical.exists())
+        } finally {
+            lease?.release()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fatalPublicExportSettlementFailureRetainsExactLeaseAndDurableOwner() {
+        val directory = Files.createTempDirectory("kepler-public-export-fatal-").toFile()
+        var lease: JobOperationLease? = null
+        val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
+        try {
+            KeplerJobMetadata.write(directory, JSONObject().put("currentPipelineStage", "PROCESSING"))
+            lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                directory,
+                JobRecoveryMutationIntent.PROCESSING_START
+            )
+            val operationId = KeplerJobMetadata.beginActiveOperation(
+                directory,
+                kind = KeplerActiveOperationKind.PUBLIC_EXPORT,
+                ownerLease = lease
+            )
+            MediaStoreExportJournal.create(
+                directory,
+                MediaStoreExportRole.MAIN_IMAGE,
+                null,
+                "result.jpg",
+                "Pictures/Kepler",
+                "image/jpeg",
+                Uri.parse("content://media/external/images/media"),
+                ownerOperationId = operationId
+            )
+            KeplerJobMetadata.atomicWriteFailureForTest = AssertionError("fatal settlement failure")
+
+            assertThrows(AssertionError::class.java) {
+                settleOwnedPublicExportInterruption(directory, lease!!, "fatal")
+            }
+            assertTrue(KeplerJobMetadata.isOperationOwner(directory, lease!!))
+            assertEquals(operationId, KeplerJobMetadata.read(directory).getString(ACTIVE_OPERATION_ID))
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
+            lease?.release()
+            directory.deleteRecursively()
+        }
+    }
 }

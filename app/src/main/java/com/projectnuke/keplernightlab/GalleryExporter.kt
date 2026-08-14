@@ -175,6 +175,16 @@ internal data class OwnedPublicExportEvidence(
     val uri: String?
 )
 
+internal fun publicExportInterruptionTerminalKind(
+    evidence: OwnedPublicExportEvidence?,
+    cancellationRequested: Boolean,
+    committedFallback: Boolean = false
+): CameraPipelineEvent.Terminal.Kind = when {
+    evidence?.committed == true || committedFallback -> CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+    cancellationRequested -> CameraPipelineEvent.Terminal.Kind.CANCELLED
+    else -> CameraPipelineEvent.Terminal.Kind.FAILED
+}
+
 /** Reads only evidence owned by the exact current PUBLIC_EXPORT operation. */
 internal fun inspectOwnedPublicExportEvidence(
     jobDir: File,
@@ -235,9 +245,13 @@ internal fun settleOwnedPublicExportInterruption(
     val currentInvalid = invalid.filter { activeStartedAt <= 0L || it.lastModified() > activeStartedAt }
     val evidence = inspectOwnedPublicExportEvidence(jobDir, ownerLease)
         ?: return true
-    check(currentInvalid.isEmpty() && (invalid.isEmpty() || ownerJournals.any {
-        it.role == MediaStoreExportRole.MAIN_IMAGE
-    })) { "Invalid export evidence may belong to the current public export operation" }
+    // A malformed file created before this operation is historical forensic
+    // debt.  It must not turn the real zero-journal pre-commit cut into an
+    // ambiguous export.  Only malformed evidence correlated to this owner's
+    // lifetime remains fail-closed.
+    check(currentInvalid.isEmpty()) {
+        "Invalid export evidence may belong to the current public export operation"
+    }
 
     // Durable terminal metadata must be written before journal acknowledgement.
     // The active marker remains until both writes succeed, so the exact lease can
@@ -249,12 +263,17 @@ internal fun settleOwnedPublicExportInterruption(
         ) { "Public export owner changed during settlement" }
         finalOutputFormat?.let { job.put("finalOutputFormatSetting", it.name) }
         job.put(TERMINAL_OPERATION_ID, evidence.operationId)
-            .put("exportUri", evidence.uri ?: JSONObject.NULL)
-            .put("galleryPublicExportLinkage", evidence.uri ?: JSONObject.NULL)
-            .put("galleryExportCommitted", evidence.committed)
-            .put("exportVerified", evidence.verified)
             .put("exportError", failureMessage)
             .put("exportedAt", System.currentTimeMillis())
+        if (evidence.committed) {
+            // These fields belong to this exact operation only.  On a
+            // pre-commit interruption, preserve any previous terminal export
+            // linkage instead of replacing it with null/false.
+            job.put("exportUri", evidence.uri ?: JSONObject.NULL)
+                .put("galleryPublicExportLinkage", evidence.uri ?: JSONObject.NULL)
+                .put("galleryExportCommitted", true)
+                .put("exportVerified", evidence.verified)
+        }
         when {
             evidence.verified -> job.put("currentPipelineStage", "PARTIAL")
                 .put("processStatus", "EXPORT_VERIFIED_INTERRUPTED")

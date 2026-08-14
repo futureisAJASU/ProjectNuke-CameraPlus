@@ -660,7 +660,7 @@ fun captureProcessExportSuperResolutionFusion(
                 var outputLease: JobOperationLease? = null
                 var outputDirForSettlement: File? = null
                 var exportSettlementAttempted = false
-                var exportSettlementFailed = false
+                var exportSettlementSucceeded = false
                 fun settleInterruptedExportForTerminal(jobDir: File, lease: JobOperationLease): OwnedPublicExportEvidence? {
                     val evidence = try {
                         inspectOwnedPublicExportEvidence(jobDir, lease)
@@ -671,16 +671,16 @@ fun captureProcessExportSuperResolutionFusion(
                     }
                     try {
                         exportSettlementAttempted = true
-                        settleOwnedPublicExportInterruption(
+                        val settled = settleOwnedPublicExportInterruption(
                             jobDir = jobDir,
                             ownerLease = lease,
                             failureMessage = "Super Resolution public export ended before terminal metadata was settled.",
                             finalOutputFormat = finalOutputFormat
                         )
+                        if (settled) exportSettlementSucceeded = true
                     } catch (failure: Error) {
                         throw failure
                     } catch (settlementFailure: Exception) {
-                        exportSettlementFailed = true
                         Log.e("KeplerSuperResolution", "public export owner settlement failed", settlementFailure)
                     }
                     return evidence
@@ -819,8 +819,11 @@ fun captureProcessExportSuperResolutionFusion(
                         outputDirForSettlement?.let { dir -> settleInterruptedExportForTerminal(dir, lease) }
                     }
                     terminal.publish(
-                        if (evidence?.verified == true || (evidence == null && publicExportCommitted && verified)) CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
-                        else CameraPipelineEvent.Terminal.Kind.CANCELLED,
+                        publicExportInterruptionTerminalKind(
+                            evidence,
+                            cancellationRequested = true,
+                            committedFallback = publicExportCommitted
+                        ),
                         requiredOutputCommitted = requiredOutputCommitted,
                         publicExportCommitted = evidence?.committed ?: publicExportCommitted,
                         verified = evidence?.verified ?: verified,
@@ -835,7 +838,11 @@ fun captureProcessExportSuperResolutionFusion(
                         outputDirForSettlement?.let { dir -> settleInterruptedExportForTerminal(dir, lease) }
                     }
                     terminal.publish(
-                        CameraPipelineEvent.Terminal.Kind.FAILED,
+                        publicExportInterruptionTerminalKind(
+                            evidence,
+                            cancellationRequested = false,
+                            committedFallback = publicExportCommitted
+                        ),
                         requiredOutputCommitted = requiredOutputCommitted,
                         publicExportCommitted = evidence?.committed ?: publicExportCommitted,
                         verified = evidence?.verified ?: verified,
@@ -848,20 +855,20 @@ fun captureProcessExportSuperResolutionFusion(
                         if (!exportSettlementAttempted) {
                             try {
                                 exportSettlementAttempted = true
-                                settleOwnedPublicExportInterruption(
+                                val settled = settleOwnedPublicExportInterruption(
                                     jobDir = settlementDir,
                                     ownerLease = lease,
                                     failureMessage = "Super Resolution public export ended before terminal metadata was settled.",
                                     finalOutputFormat = finalOutputFormat
                                 )
+                                if (settled) exportSettlementSucceeded = true
                             } catch (failure: Error) {
                                 throw failure
                             } catch (settlementFailure: Exception) {
-                                exportSettlementFailed = true
                                 Log.e("KeplerSuperResolution", "public export owner settlement failed", settlementFailure)
                             }
                         }
-                        if (!exportSettlementFailed) lease.release()
+                        if (exportSettlementSucceeded) lease.release()
                         else Log.e("KeplerSuperResolution", "retaining public export lease after settlement failure")
                     }
                     workerThread.quitSafely()

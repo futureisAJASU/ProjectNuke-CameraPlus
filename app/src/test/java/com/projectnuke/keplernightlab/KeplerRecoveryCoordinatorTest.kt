@@ -4,6 +4,7 @@ import android.net.Uri
 import org.json.JSONObject
 import org.json.JSONArray
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -651,6 +652,42 @@ class KeplerRecoveryCoordinatorTest {
             assertEquals("content://media/external/images/media/new", recovered.getString("exportUri"))
             assertTrue(historical.exists())
         } finally { root.deleteRecursively() }
+    }
+
+    @Test
+    fun historicalMalformedExportDoesNotPoisonDeadZeroJournalPreCommitOperation() {
+        val root = File(Files.createTempDirectory("kepler-recovery-zero-journal-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_zero-journal").apply { mkdirs() }
+        try {
+            val startedAt = System.currentTimeMillis()
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("currentPipelineStage", "PROCESSING")
+                .put("galleryExportCommitted", true)
+                .put("exportVerified", true)
+                .put("exportUri", "content://media/old-uri")
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, "new-public-export")
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name)
+                .put(ACTIVE_OPERATION_STARTED_AT, startedAt))
+            val historical = File(job, ".export_tx_historical-corrupt.json").apply {
+                writeText("not-json")
+                setLastModified(1L)
+            }
+
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
+            val result = report.jobs.single()
+            val settled = KeplerJobMetadata.read(job)
+            assertEquals(KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT, result.classification)
+            assertEquals("STABLE", settled.getString("recoveryState"))
+            assertEquals("content://media/old-uri", settled.getString("exportUri"))
+            assertTrue(settled.getBoolean("galleryExportCommitted"))
+            assertTrue(settled.getBoolean("exportVerified"))
+            assertFalse(settled.has(ACTIVE_OPERATION_ID))
+            assertTrue(historical.exists())
+        } finally {
+            root.deleteRecursively()
+        }
     }
 
     @Test

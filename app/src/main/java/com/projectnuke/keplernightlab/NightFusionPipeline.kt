@@ -118,7 +118,7 @@ fun captureProcessExportNightFusion(
                 var publicExportCommitted = false
                 var verified = false
                 var exportSettlementAttempted = false
-                var exportSettlementFailed = false
+                var exportSettlementSucceeded = false
                 fun settleInterruptedExportForTerminal(): OwnedPublicExportEvidence? {
                     val evidence = try {
                         inspectOwnedPublicExportEvidence(jobDir, pipelineLease)
@@ -129,16 +129,16 @@ fun captureProcessExportNightFusion(
                     }
                     try {
                         exportSettlementAttempted = true
-                        settleOwnedPublicExportInterruption(
+                        val settled = settleOwnedPublicExportInterruption(
                             jobDir = jobDir,
                             ownerLease = pipelineLease,
                             failureMessage = "Night Fusion public export ended before terminal metadata was settled.",
                             finalOutputFormat = finalOutputFormat
                         )
+                        if (settled) exportSettlementSucceeded = true
                     } catch (failure: Error) {
                         throw failure
                     } catch (failure: Exception) {
-                        exportSettlementFailed = true
                         android.util.Log.e("KeplerYuvPipeline", "public export owner settlement failed", failure)
                     }
                     return evidence
@@ -311,8 +311,11 @@ fun captureProcessExportNightFusion(
                     post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                     val evidence = settleInterruptedExportForTerminal()
                     terminal.publish(
-                        if (evidence?.verified == true || (evidence == null && publicExportCommitted && verified)) CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
-                        else CameraPipelineEvent.Terminal.Kind.CANCELLED,
+                        publicExportInterruptionTerminalKind(
+                            evidence,
+                            cancellationRequested = true,
+                            committedFallback = publicExportCommitted
+                        ),
                         requiredOutputCommitted = requiredOutputCommitted,
                         publicExportCommitted = evidence?.committed ?: publicExportCommitted,
                         verified = evidence?.verified ?: verified,
@@ -322,7 +325,11 @@ fun captureProcessExportNightFusion(
                     post("PIPELINE_FAILED: ${if (captureMode == CaptureMode.SINGLE_FRAME) "Single photo" else "Night Fusion"} pipeline failed; keeping cache.\n${e.stackTraceToString()}")
                     val evidence = settleInterruptedExportForTerminal()
                     terminal.publish(
-                        CameraPipelineEvent.Terminal.Kind.FAILED,
+                        publicExportInterruptionTerminalKind(
+                            evidence,
+                            cancellationRequested = false,
+                            committedFallback = publicExportCommitted
+                        ),
                         requiredOutputCommitted = requiredOutputCommitted,
                         publicExportCommitted = evidence?.committed ?: publicExportCommitted,
                         verified = evidence?.verified ?: verified,
@@ -332,20 +339,20 @@ fun captureProcessExportNightFusion(
                     if (!exportSettlementAttempted) {
                         try {
                             exportSettlementAttempted = true
-                            settleOwnedPublicExportInterruption(
+                            val settled = settleOwnedPublicExportInterruption(
                                 jobDir = jobDir,
                                 ownerLease = pipelineLease,
                                 failureMessage = "Night Fusion public export ended before terminal metadata was settled.",
                                 finalOutputFormat = finalOutputFormat
                             )
+                            if (settled) exportSettlementSucceeded = true
                         } catch (failure: Error) {
                             throw failure
                         } catch (settlementFailure: Exception) {
-                            exportSettlementFailed = true
                             android.util.Log.e("KeplerYuvPipeline", "public export owner settlement failed", settlementFailure)
                         }
                     }
-                    if (!exportSettlementFailed) {
+                    if (exportSettlementSucceeded) {
                         pipelineLease.release()
                     } else {
                         android.util.Log.e("KeplerYuvPipeline", "retaining public export lease after settlement failure")
