@@ -91,9 +91,11 @@ internal object KeplerRecoveryCoordinator {
             keplerGalleryRoots(context),
             ContextMediaStoreExportRecoveryAccess(context)
         )
-        val cacheCleanup = runCatching {
+        val cacheCleanup = try {
             cleanStaleKeplerExportCacheFilesDetailed(context.cacheDir)
-        }.getOrElse { failure ->
+        } catch (failure: Error) {
+            throw failure
+        } catch (failure: Exception) {
             KeplerCacheCleanupResult(failures = listOf("Cache cleanup failed: ${failure.message}"))
         }
         return report.copy(cacheCleanupFailures = cacheCleanup.failures)
