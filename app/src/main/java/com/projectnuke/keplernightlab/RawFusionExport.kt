@@ -172,13 +172,15 @@ internal val RawFusionExportResult.processResult: RawFusionProcessResult get() =
 /** One terminal-kind mapping for every durable RAW public-export outcome. */
 internal fun rawFusionOutcomeTerminalKind(
     outcome: RawFusionPublicExportOutcome?,
-    cancellationRequested: Boolean
+    cancellationRequested: Boolean,
+    currentLocalOutput: File? = outcome?.currentLocalOutput
 ): CameraPipelineEvent.Terminal.Kind = when {
     outcome?.committed == true && outcome.verified &&
         !outcome.postExportCancellationRequested &&
         !outcome.postExportWorkSkipped &&
         outcome.currentWarning == null -> CameraPipelineEvent.Terminal.Kind.COMPLETE
-    outcome?.committed == true || outcome?.base?.outputCommitted == true ->
+    outcome?.committed == true ||
+        (outcome?.base?.outputCommitted == true && currentLocalOutput != null) ->
         CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
     cancellationRequested -> CameraPipelineEvent.Terminal.Kind.CANCELLED
     else -> CameraPipelineEvent.Terminal.Kind.FAILED
@@ -1463,7 +1465,11 @@ fun captureProcessExportRawNightFusion(
                     terminal.publish(
                         kind = rawFusionOutcomeTerminalKind(
                             publicOutcome,
-                            cancellationRequested = cancellation.isCancelled
+                            cancellationRequested = cancellation.isCancelled,
+                            currentLocalOutput = publicOutcome?.currentLocalOutput
+                                ?: capturedProcess?.finalPngFile?.takeIf {
+                                    it.isFile && it.length() > 0L
+                                }
                         ),
                         requiredOutputCommitted = publicOutcome?.base?.outputCommitted == true ||
                             capturedProcess?.outputCommitted == true ||

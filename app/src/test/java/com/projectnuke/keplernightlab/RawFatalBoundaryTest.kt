@@ -76,6 +76,30 @@ class RawFatalBoundaryTest {
     }
 
     @Test
+    fun missingCurrentLocalOutputDoesNotMapClaimFlagToPartial() {
+        val outcome = RawFusionPublicExportOutcome.UncommittedFailure(
+            base = RawFusionProcessResult(
+                success = false,
+                mergedRawFile = File("merged.raw16"),
+                mergedDngFile = null,
+                previewPngFile = null,
+                finalPngFile = File("missing-final.png"),
+                errorMessage = "local output disappeared",
+                outputCommitted = true
+            ),
+            finalOutputFormat = FinalOutputFormat.JPEG,
+            currentLocalPreview = null,
+            currentLocalOutput = null,
+            currentError = "local output disappeared"
+        )
+
+        assertEquals(
+            CameraPipelineEvent.Terminal.Kind.FAILED,
+            rawFusionOutcomeTerminalKind(outcome, cancellationRequested = false)
+        )
+    }
+
+    @Test
     fun verifiedPostExportCancellationDoesNotMapToComplete() {
         val export = GalleryExportResult(
             success = true,
