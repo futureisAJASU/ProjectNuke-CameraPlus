@@ -3,8 +3,10 @@ package com.projectnuke.keplernightlab
 import android.os.Environment
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -16,6 +18,137 @@ import java.util.UUID
 
 @RunWith(RobolectricTestRunner::class)
 class KeplerGalleryResultAuthorityTest {
+    @Test
+    fun sourceOnlyFinalDeleteFailurePreservesVisibleResultAndPartialState() {
+        val (root, directory) = createGalleryJobDirectory("source-only-final-failure")
+        try {
+            galleryCleanupDeleteFailurePathForTest = "final.png"
+
+            val result = cleanupKeplerGalleryJob(
+                RuntimeEnvironment.getApplication(),
+                directory,
+                KeplerJobCleanupType.SOURCE_ONLY
+            ).getOrThrow()
+
+            assertEquals(CleanupStatus.PARTIAL, result.cleanupStatus)
+            assertTrue(File(directory, "final.png").isFile)
+            val persisted = KeplerJobMetadata.read(directory)
+            assertTrue(persisted.getBoolean("finalOutputAvailable"))
+            assertFalse(persisted.getBoolean("galleryDisplayUnavailable"))
+            assertTrue(persisted.getBoolean("galleryVisible"))
+            assertEquals("SOURCE_ONLY_PARTIAL", persisted.getString("cleanupType"))
+            assertEquals("SOURCE_ONLY", persisted.getString("requestedCleanupType"))
+            assertEquals(File(directory, "final.png"), readKeplerGalleryJob(directory).finalPreviewFile)
+        } finally {
+            galleryCleanupDeleteFailurePathForTest = null
+            directory.deleteRecursively()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun sourceOnlyExactClaimedSuperResolutionFinalRemainsVisibleWhenDeleteFails() {
+        val (root, directory) = createGalleryJobDirectory("source-only-sr-final-failure")
+        try {
+            val attemptId = "sr-source-only-attempt"
+            KeplerJobMetadata.update(directory) {
+                it.put("jobType", "SUPER_RESOLUTION_FUSION")
+                    .put("processingMode", "SUPER_RESOLUTION")
+                    .put("processingAttemptId", attemptId)
+                    .put("processingArtifactClaimAttemptId", attemptId)
+                    .put("processingOutputCommitted", true)
+                    .put("superResolutionOutputFile", "final.png")
+            }
+            galleryCleanupDeleteFailurePathForTest = "final.png"
+
+            val result = cleanupKeplerGalleryJob(
+                RuntimeEnvironment.getApplication(),
+                directory,
+                KeplerJobCleanupType.SOURCE_ONLY
+            ).getOrThrow()
+
+            assertEquals(CleanupStatus.PARTIAL, result.cleanupStatus)
+            assertTrue(File(directory, "final.png").isFile)
+            assertTrue(KeplerJobMetadata.read(directory).getBoolean("finalOutputAvailable"))
+            assertEquals(File(directory, "final.png"), readKeplerGalleryJob(directory).finalPreviewFile)
+        } finally {
+            galleryCleanupDeleteFailurePathForTest = null
+            directory.deleteRecursively()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun sourceOnlySuccessfulCleanupRecordsActualFinalAbsence() {
+        val (root, directory) = createGalleryJobDirectory("source-only-success")
+        try {
+            val result = cleanupKeplerGalleryJob(
+                RuntimeEnvironment.getApplication(),
+                directory,
+                KeplerJobCleanupType.SOURCE_ONLY
+            ).getOrThrow()
+
+            assertEquals(CleanupStatus.COMPLETE, result.cleanupStatus)
+            val persisted = KeplerJobMetadata.read(directory)
+            assertFalse(persisted.getBoolean("finalOutputAvailable"))
+            assertTrue(persisted.getBoolean("galleryDisplayUnavailable"))
+            assertFalse(persisted.getBoolean("galleryVisible"))
+            assertEquals("SOURCE_ONLY", persisted.getString("cleanupType"))
+            assertTrue(readKeplerGalleryJob(directory).finalPreviewFile == null)
+        } finally {
+            directory.deleteRecursively()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun sourceOnlyAncillaryFailureCanBePartialAfterFinalRemoval() {
+        val (root, directory) = createGalleryJobDirectory("source-only-ancillary-failure")
+        try {
+            File(directory, "diagnostic.log").writeText("diagnostic")
+            galleryCleanupDeleteFailurePathForTest = "diagnostic.log"
+
+            val result = cleanupKeplerGalleryJob(
+                RuntimeEnvironment.getApplication(),
+                directory,
+                KeplerJobCleanupType.SOURCE_ONLY
+            ).getOrThrow()
+
+            assertEquals(CleanupStatus.PARTIAL, result.cleanupStatus)
+            assertFalse(File(directory, "final.png").isFile)
+            val persisted = KeplerJobMetadata.read(directory)
+            assertFalse(persisted.getBoolean("finalOutputAvailable"))
+            assertTrue(persisted.getBoolean("galleryDisplayUnavailable"))
+            assertEquals("SOURCE_ONLY", persisted.getString("cleanupType"))
+            assertTrue(result.failedPaths.any { it.endsWith("diagnostic.log") })
+        } finally {
+            galleryCleanupDeleteFailurePathForTest = null
+            directory.deleteRecursively()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun galleryLoaderUsesRecoverySummaryForOrdinaryReadFailureButPropagatesFatalError() {
+        val (root, directory) = createGalleryJobDirectory("loader-fatal-boundary")
+        try {
+            galleryReadFailureForTest = IOException("injected metadata read failure")
+            val recovered = loadKeplerGalleryJobs(RuntimeEnvironment.getApplication())
+                .single { it.directory == directory }
+            assertEquals("METADATA_CORRUPT", recovered.recoveryState)
+
+            galleryReadFailureForTest = AssertionError("fatal metadata read failure")
+            assertThrows(AssertionError::class.java) {
+                loadKeplerGalleryJobs(RuntimeEnvironment.getApplication())
+                    .single { it.directory == directory }
+            }
+        } finally {
+            galleryReadFailureForTest = null
+            directory.deleteRecursively()
+            root.deleteRecursively()
+        }
+    }
+
     @Test
     fun deleteGalleryJobReturnsOrdinaryFailureButPropagatesFatalError() {
         val (root, directory) = createGalleryJobDirectory("delete-contract")

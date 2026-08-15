@@ -10,8 +10,10 @@ import java.nio.file.Files
 /** Narrow deterministic seams for destructive Gallery API contract tests. */
 internal var galleryDeleteFailureForTest: Throwable? = null
 internal var galleryCleanupFileDeleteFailureForTest: Throwable? = null
+internal var galleryCleanupDeleteFailurePathForTest: String? = null
 internal var galleryCleanupDeleteReturnsFalseForTest: Boolean = false
 internal var galleryCleanupMetadataFailureForTest: Throwable? = null
+internal var galleryReadFailureForTest: Throwable? = null
 
 data class KeplerGalleryJobSummary(
     val id: String,
@@ -160,8 +162,13 @@ fun loadKeplerGalleryJobs(context: Context): List<KeplerGalleryJobSummary> {
         if (metadata is NoFollowInspection.Absent) {
             recoveryGallerySummary(directory, KeplerJobMetadataMissing(directory))
         } else {
-            runCatching { readKeplerGalleryJob(directory) }
-                .getOrElse { failure -> recoveryGallerySummary(directory, failure) }
+            try {
+                readKeplerGalleryJob(directory)
+            } catch (failure: Error) {
+                throw failure
+            } catch (failure: Exception) {
+                recoveryGallerySummary(directory, failure)
+            }
         }
     }.sortedByDescending { it.createdAt }
 }
@@ -175,7 +182,7 @@ internal fun recoveryGallerySummary(directory: File, failure: Throwable): Kepler
     } else {
         "이 작업의 메타데이터를 읽을 수 없어 복구가 필요합니다."
     }
-    val frames = runCatching {
+    val frames = try {
         listFilesNoFollow(directory)
             .filter { NoFollowFileSystem.isRealFile(it.toPath()) && isSourceFrame(it) }
             .sortedBy { it.name }
@@ -185,9 +192,18 @@ internal fun recoveryGallerySummary(directory: File, failure: Throwable): Kepler
                     null, null, null, null, null, null, null, null, null, false, null
                 )
             }
-    }.getOrDefault(emptyList())
-    val storage = runCatching { computeKeplerJobStorage(directory, null, null) }
-        .getOrElse { KeplerJobStorageInfo(0L, "0 B", 0L, "0 B", 0L, 0L, 0L, 0L, 0L, 0L, 0) }
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        emptyList()
+    }
+    val storage = try {
+        computeKeplerJobStorage(directory, null, null)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        KeplerJobStorageInfo(0L, "0 B", 0L, "0 B", 0L, 0L, 0L, 0L, 0L, 0L, 0)
+    }
     return KeplerGalleryJobSummary(
         id = directory.absolutePath,
         jobType = when {
@@ -330,7 +346,10 @@ fun cleanupKeplerGalleryJob(
                 galleryCleanupFileDeleteFailureForTest = null
                 throw injected
             }
-            if (galleryCleanupDeleteReturnsFalseForTest) {
+            if (galleryCleanupDeleteFailurePathForTest == item.name) {
+                galleryCleanupDeleteFailurePathForTest = null
+                false
+            } else if (galleryCleanupDeleteReturnsFalseForTest) {
                 galleryCleanupDeleteReturnsFalseForTest = false
                 false
             } else try {
@@ -351,10 +370,12 @@ fun cleanupKeplerGalleryJob(
     val remainingFiles = listFilesNoFollow(target).filter { NoFollowFileSystem.isRealFile(it.toPath()) }
     val sourceAvailable = remainingFiles.any { isSourceFrame(it) }
     val debugAvailable = remainingFiles.any { isDebugFile(it, finalFiles.map { f -> f.name }.toSet()) }
-    val finalOutputAvailable = if (cleanupType == KeplerJobCleanupType.SOURCE_ONLY) {
-        false
-    } else {
-        finalFiles.any { it.isFile }
+    val finalOutputAvailable = finalFiles.any { NoFollowFileSystem.isRealFile(it.toPath()) }
+    val effectiveSourceOnly = cleanupType == KeplerJobCleanupType.SOURCE_ONLY && !finalOutputAvailable
+    val effectiveCleanupType = when {
+        effectiveSourceOnly -> KeplerJobCleanupType.SOURCE_ONLY.name
+        cleanupType == KeplerJobCleanupType.SOURCE_ONLY -> "SOURCE_ONLY_PARTIAL"
+        else -> cleanupType.name
     }
     val metadataWarning = try {
         galleryCleanupMetadataFailureForTest?.let { injected ->
@@ -364,7 +385,8 @@ fun cleanupKeplerGalleryJob(
         KeplerJobMetadata.update(target) { j ->
             val updated = computeKeplerJobStorage(target, j, finalFiles.firstOrNull())
             j.put("cleanupApplied", failed.isEmpty())
-                .put("cleanupType", cleanupType.name)
+                .put("cleanupType", effectiveCleanupType)
+                .put("requestedCleanupType", cleanupType.name)
                 .put("cleanupAt", System.currentTimeMillis())
                 .put("bytesFreed", (before - after).coerceAtLeast(0L))
                 .put("remainingJobBytes", after)
@@ -372,8 +394,8 @@ fun cleanupKeplerGalleryJob(
                 .put("finalOutputAvailable", finalOutputAvailable)
                 .put("debugFilesAvailable", debugAvailable)
                 .put("canReprocess", sourceAvailable)
-                .put("galleryDisplayUnavailable", cleanupType == KeplerJobCleanupType.SOURCE_ONLY)
-                .put("galleryVisible", cleanupType != KeplerJobCleanupType.SOURCE_ONLY)
+                .put("galleryDisplayUnavailable", effectiveSourceOnly)
+                .put("galleryVisible", !effectiveSourceOnly)
             putStorageMetadata(j, updated)
         }
         null
@@ -442,6 +464,10 @@ internal fun matchesJobPrefix(root: File, name: String): Boolean = when (root.na
 }
 
 fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
+    galleryReadFailureForTest?.let { injected ->
+        galleryReadFailureForTest = null
+        throw injected
+    }
     val job = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
         directory, JOB_JSON_FILE_NAME, requireFile = true
     )) {
@@ -591,11 +617,15 @@ fun maybePersistStorageMetadata(
         job.optLong("totalJobBytes", -1L) == storage.totalJobBytes &&
         job.optInt("fileCount", -1) == storage.fileCount
     ) return
-    runCatching {
+    try {
         KeplerJobMetadata.update(directory) {
             putStorageMetadata(it, storage)
                 .put("storageScannedAt", System.currentTimeMillis())
         }
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        // Storage summaries are non-authoritative and best effort.
     }
 }
 
