@@ -7,6 +7,12 @@ import org.json.JSONObject
 import java.io.File
 import java.nio.file.Files
 
+/** Narrow deterministic seams for destructive Gallery API contract tests. */
+internal var galleryDeleteFailureForTest: Throwable? = null
+internal var galleryCleanupFileDeleteFailureForTest: Throwable? = null
+internal var galleryCleanupDeleteReturnsFalseForTest: Boolean = false
+internal var galleryCleanupMetadataFailureForTest: Throwable? = null
+
 data class KeplerGalleryJobSummary(
     val id: String,
     val jobType: String,
@@ -238,25 +244,35 @@ fun summarizeKeplerGalleryStorage(jobs: List<KeplerGalleryJobSummary>): KeplerGa
     )
 }
 
-fun deleteKeplerGalleryJob(context: Context, jobDirectory: File): Result<KeplerJobCleanupResult> = runCatching {
-    val target = requireCleanupSafeJobDirectory(context, jobDirectory)
-    val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
-        target,
-        JobRecoveryMutationIntent.JOB_DELETE
-    )
-    try {
-        require(target.isDirectory) { "Job directory no longer exists." }
-        val (status, failedPaths) = deleteRecursivelySafe(target)
-        if (status == CleanupStatus.COMPLETE) KeplerJobMetadata.removeLockEntry(target)
-        KeplerJobCleanupResult(
-            bytesFreed = 0L,
-            failedPaths = failedPaths,
-            metadataWarning = failedPaths.takeIf { it.isNotEmpty() }
-                ?.let { "Cleanup ${status.name}: ${it.size} path(s) failed" },
-            cleanupStatus = status
+fun deleteKeplerGalleryJob(context: Context, jobDirectory: File): Result<KeplerJobCleanupResult> {
+    return try {
+        val target = requireCleanupSafeJobDirectory(context, jobDirectory)
+        val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+            target,
+            JobRecoveryMutationIntent.JOB_DELETE
         )
-    } finally {
-        lease.release()
+        try {
+            galleryDeleteFailureForTest?.let { injected ->
+                galleryDeleteFailureForTest = null
+                throw injected
+            }
+            require(target.isDirectory) { "Job directory no longer exists." }
+            val (status, failedPaths) = deleteRecursivelySafe(target)
+            if (status == CleanupStatus.COMPLETE) KeplerJobMetadata.removeLockEntry(target)
+            Result.success(KeplerJobCleanupResult(
+                bytesFreed = 0L,
+                failedPaths = failedPaths,
+                metadataWarning = failedPaths.takeIf { it.isNotEmpty() }
+                    ?.let { "Cleanup ${status.name}: ${it.size} path(s) failed" },
+                cleanupStatus = status
+            ))
+        } finally {
+            lease.release()
+        }
+    } catch (failure: Error) {
+        throw failure
+    } catch (failure: Exception) {
+        Result.failure(failure)
     }
 }
 
@@ -264,19 +280,25 @@ fun cleanupKeplerGalleryJob(
     context: Context,
     jobDirectory: File,
     cleanupType: KeplerJobCleanupType
-): Result<KeplerJobCleanupResult> = runCatching {
-    val target = requireCleanupSafeJobDirectory(context, jobDirectory)
-    val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
-        target,
-        JobRecoveryMutationIntent.JOB_CLEANUP
-    )
-    try {
+): Result<KeplerJobCleanupResult> {
+    return try {
+        val target = requireCleanupSafeJobDirectory(context, jobDirectory)
+        val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+            target,
+            JobRecoveryMutationIntent.JOB_CLEANUP
+        )
+        try {
     val before = folderSizeBytes(target)
     val job = when (val resolved = NoFollowFileSystem.resolveDirectChildResult(
         target, JOB_JSON_FILE_NAME, requireFile = true
     )) {
-        is NoFollowInspection.Present -> runCatching { JSONObject(NoFollowFileSystem.readTextVerified(resolved.value)) }
-            .getOrElse { throw IllegalStateException("Cannot read job.json", it) }
+        is NoFollowInspection.Present -> try {
+            JSONObject(NoFollowFileSystem.readTextVerified(resolved.value))
+        } catch (failure: Error) {
+            throw failure
+        } catch (failure: Exception) {
+            throw IllegalStateException("Cannot read job.json", failure)
+        }
         NoFollowInspection.Absent -> JSONObject()
         is NoFollowInspection.InspectionFailed -> throw resolved.exception
     }
@@ -303,7 +325,25 @@ fun cleanupKeplerGalleryJob(
         .toList()
     val failed = mutableListOf<String>()
     filesToDelete.forEach { item ->
-        if (NoFollowFileSystem.isRealFile(item.toPath()) && !runCatching { java.nio.file.Files.deleteIfExists(item.toPath()) }.getOrDefault(false)) {
+        val deleted = if (NoFollowFileSystem.isRealFile(item.toPath())) {
+            galleryCleanupFileDeleteFailureForTest?.let { injected ->
+                galleryCleanupFileDeleteFailureForTest = null
+                throw injected
+            }
+            if (galleryCleanupDeleteReturnsFalseForTest) {
+                galleryCleanupDeleteReturnsFalseForTest = false
+                false
+            } else try {
+                java.nio.file.Files.deleteIfExists(item.toPath())
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                false
+            }
+        } else {
+            true
+        }
+        if (!deleted) {
             failed += item.absolutePath
         }
     }
@@ -316,7 +356,11 @@ fun cleanupKeplerGalleryJob(
     } else {
         finalFiles.any { it.isFile }
     }
-    val metadataWarning = runCatching {
+    val metadataWarning = try {
+        galleryCleanupMetadataFailureForTest?.let { injected ->
+            galleryCleanupMetadataFailureForTest = null
+            throw injected
+        }
         KeplerJobMetadata.update(target) { j ->
             val updated = computeKeplerJobStorage(target, j, finalFiles.firstOrNull())
             j.put("cleanupApplied", failed.isEmpty())
@@ -332,20 +376,30 @@ fun cleanupKeplerGalleryJob(
                 .put("galleryVisible", cleanupType != KeplerJobCleanupType.SOURCE_ONLY)
             putStorageMetadata(j, updated)
         }
-    }.exceptionOrNull()?.let { "${it.javaClass.simpleName}: ${it.message}" }
+        null
+    } catch (failure: Error) {
+        throw failure
+    } catch (failure: Exception) {
+        "${failure.javaClass.simpleName}: ${failure.message}"
+    }
     val cleanupStatus = when {
         metadataWarning != null && failed.isEmpty() -> CleanupStatus.FAILED
         failed.isNotEmpty() || metadataWarning != null -> CleanupStatus.PARTIAL
         else -> CleanupStatus.COMPLETE
     }
-    KeplerJobCleanupResult(
+    Result.success(KeplerJobCleanupResult(
         bytesFreed = (before - after).coerceAtLeast(0L),
         failedPaths = failed,
         metadataWarning = metadataWarning,
         cleanupStatus = cleanupStatus
-    )
-    } finally {
-        lease.release()
+    ))
+        } finally {
+            lease.release()
+        }
+    } catch (failure: Error) {
+        throw failure
+    } catch (failure: Exception) {
+        Result.failure(failure)
     }
 }
 
@@ -566,6 +620,7 @@ fun finalFilesForCleanup(directory: File, job: JSONObject?): Set<File> {
         job?.optString("finalNightFusionFile").orEmpty().ifBlank { null },
         job?.optString("finalFile").orEmpty().ifBlank { null },
         job?.optString("outputFile").orEmpty().ifBlank { null },
+        claimedSuperResolutionOutput(directory, job)?.name,
         resolveFinalPreview(directory, job)?.name
     )
     return names.mapNotNull { name -> NoFollowFileSystem.resolveDirectChild(directory, name, requireFile = true) }.toSet()
@@ -700,6 +755,7 @@ private fun JSONObject.optionalFloat(key: String): Float? {
 }
 
 private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
+    claimedSuperResolutionOutput(directory, job)?.let { return it }
     val currentNames = listOf(
         job?.optString("galleryDisplayFile").orEmpty(),
         job?.optString("galleryThumbnailFile").orEmpty(),
@@ -741,7 +797,7 @@ private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
         }
             ?.let { return it }
     }
-return NoFollowFileSystem.requireDirectChildren(directory)
+    return NoFollowFileSystem.requireDirectChildren(directory)
         .filter {
                 NoFollowFileSystem.isRealFile(it.toPath()) &&
                 isDisplayImageFile(it) &&
@@ -794,6 +850,22 @@ internal fun isSafeRelativeFilename(name: String): Boolean {
 
 internal fun deleteRecursivelySafe(root: File): Pair<CleanupStatus, List<String>> {
     return NoFollowFileSystem.deleteTree(root)
+}
+
+/** Exact current-attempt Super Resolution output authority; arbitrary image files are fallback only. */
+private fun claimedSuperResolutionOutput(directory: File, job: JSONObject?): File? {
+    if (job == null) return null
+    val mode = job.optString("processingMode").uppercase()
+    val jobType = job.optString("jobType").uppercase()
+    if (mode != "SUPER_RESOLUTION" && !jobType.contains("SUPER")) return null
+    val attemptId = job.optString("processingAttemptId").takeIf { it.isNotBlank() } ?: return null
+    if (!job.optBoolean("processingOutputCommitted", false) ||
+        job.optString("processingArtifactClaimAttemptId") != attemptId
+    ) return null
+    val name = job.optString("superResolutionOutputFile")
+        .takeIf { it.isNotBlank() && it != "null" } ?: return null
+    return NoFollowFileSystem.optionalDirectChildFile(directory, name)
+        ?.takeIf { it.isFile && isDisplayImageFile(it) }
 }
 
 internal fun listFilesNoFollow(root: File): List<File> {
