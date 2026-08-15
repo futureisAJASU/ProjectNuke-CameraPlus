@@ -31,4 +31,34 @@ class LegacyCaptureToolsTest {
             pictures.deleteRecursively()
         }
     }
+
+    @Test
+    fun burstMetadataCarryForwardPropagatesFatalPreviousRead() {
+        val root = kotlin.io.path.createTempDirectory("kepler-carry-forward-").toFile()
+        val job = File(root, "job").apply { mkdirs() }
+        val jobFile = File(job, "job.json").apply { writeText("{\"createdAt\":1}") }
+        val fatal = AssertionError("previous metadata read failed")
+        try {
+            var escaped: AssertionError? = null
+            try {
+                carryForwardJobCreatedAt(jobFile, 100L) { throw fatal }
+            } catch (failure: AssertionError) {
+                escaped = failure
+            }
+            assertTrue("fatal previous metadata read must escape", escaped === fatal)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun burstMetadataCarryForwardKeepsOrdinaryFallback() {
+        val root = kotlin.io.path.createTempDirectory("kepler-carry-forward-ordinary-").toFile()
+        val jobFile = File(root, "job.json")
+        try {
+            assertTrue(carryForwardJobCreatedAt(jobFile, 100L) { throw java.io.IOException("read") } == 100L)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
 }

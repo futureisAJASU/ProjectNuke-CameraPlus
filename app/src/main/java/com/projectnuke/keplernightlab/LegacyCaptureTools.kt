@@ -1883,11 +1883,7 @@ fun writeBurstJobJson(
     if (existingJobFile == null) {
         json.put("createdAt", now)
     } else {
-        val oldCreatedAt = runCatching {
-            JSONObject(NoFollowFileSystem.readTextVerified(existingJobFile)).optLong("createdAt", now)
-        }.getOrDefault(now)
-
-        json.put("createdAt", oldCreatedAt)
+        json.put("createdAt", carryForwardJobCreatedAt(existingJobFile, now))
     }
 
     KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), json)
@@ -1951,12 +1947,20 @@ fun writeYuvJobJson(
     if (existingJobFile == null) {
         json.put("createdAt", now)
     } else {
-        val oldCreatedAt = runCatching {
-            JSONObject(NoFollowFileSystem.readTextVerified(existingJobFile)).optLong("createdAt", now)
-        }.getOrDefault(now)
-
-        json.put("createdAt", oldCreatedAt)
+        json.put("createdAt", carryForwardJobCreatedAt(existingJobFile, now))
     }
 
     KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), json)
+}
+
+internal fun carryForwardJobCreatedAt(
+    existingJobFile: File,
+    now: Long,
+    readText: (File) -> String = { file -> NoFollowFileSystem.readTextVerified(file) }
+): Long = try {
+    JSONObject(readText(existingJobFile)).optLong("createdAt", now)
+} catch (failure: Error) {
+    throw failure
+} catch (_: Exception) {
+    now
 }

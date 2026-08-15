@@ -1,5 +1,7 @@
 package com.projectnuke.keplernightlab
 
+import java.util.concurrent.CancellationException
+
 internal interface CaptureOwnerEvent {
     fun execute()
     fun disposeWithoutMutation()
@@ -31,8 +33,23 @@ internal class CaptureStateOwner(
         override fun execute() {
             when (owner.startGate(this)) {
                 GateResult.STARTED -> {
-                    try { event.execute() } catch (t: Throwable) {
-                        ignore { owner.onEventFailure(event, t) }
+                    try {
+                        event.execute()
+                    } catch (failure: Throwable) {
+                        try {
+                            owner.onEventFailure(event, failure)
+                        } catch (hookFailure: Throwable) {
+                            if (hookFailure.isFatalOrCancellation()) {
+                                if (failure.isFatalOrCancellation()) {
+                                    failure.addSuppressedIfDistinct(hookFailure)
+                                    throw failure
+                                } else {
+                                    hookFailure.addSuppressedIfDistinct(failure)
+                                    throw hookFailure
+                                }
+                            }
+                        }
+                        if (failure.isFatalOrCancellation()) throw failure
                     }
                     finally { owner.complete(this) }
                 }
@@ -83,9 +100,29 @@ internal class CaptureStateOwner(
             return false
         }
 
-        val accepted = try { dispatch(env) } catch (_: Throwable) { false }
+        var dispatchFailure: Throwable? = null
+        val accepted = try {
+            dispatch(env)
+        } catch (failure: Throwable) {
+            dispatchFailure = failure
+            false
+        }
         val outcome = settleDispatchOutcome(env, accepted)
-        return finalizePost(outcome, event)
+        val result = try {
+            finalizePost(outcome, event)
+        } catch (settlementFailure: Throwable) {
+            dispatchFailure?.let { dispatchError ->
+                if (dispatchError.isFatalOrCancellation()) {
+                    dispatchError.addSuppressedIfDistinct(settlementFailure)
+                    throw dispatchError
+                }
+            }
+            throw settlementFailure
+        }
+        dispatchFailure?.let { failure ->
+            if (failure.isFatalOrCancellation()) throw failure
+        }
+        return result
     }
 
     private fun settleDispatchOutcome(env: Envelope, accepted: Boolean): PostDispatchOutcome =
@@ -148,8 +185,30 @@ internal class CaptureStateOwner(
             try {
                 onDisposalFailure(event, disposalError)
             } catch (hookError: Throwable) {
-                ignore { onOwnerInternalFailure("disposal", event, hookError) }
+                if (hookError.isFatalOrCancellation()) {
+                    if (disposalError.isFatalOrCancellation()) {
+                        disposalError.addSuppressedIfDistinct(hookError)
+                        throw disposalError
+                    } else {
+                        hookError.addSuppressedIfDistinct(disposalError)
+                        throw hookError
+                    }
+                }
+                try {
+                    onOwnerInternalFailure("disposal", event, hookError)
+                } catch (internalFailure: Throwable) {
+                    if (internalFailure.isFatalOrCancellation()) {
+                        if (disposalError.isFatalOrCancellation()) {
+                            disposalError.addSuppressedIfDistinct(internalFailure)
+                            throw disposalError
+                        } else {
+                            internalFailure.addSuppressedIfDistinct(hookError)
+                            throw internalFailure
+                        }
+                    }
+                }
             }
+            if (disposalError.isFatalOrCancellation()) throw disposalError
         }
     }
 
@@ -160,5 +219,21 @@ internal class CaptureStateOwner(
 }
 
 internal inline fun ignore(block: () -> Unit) {
-    try { block() } catch (_: Throwable) {}
+    try {
+        block()
+    } catch (failure: CancellationException) {
+        throw failure
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        // Diagnostic hook containment only; ordinary hook failures do not alter
+        // the owner state or replace the original operation outcome.
+    }
+}
+
+private fun Throwable.isFatalOrCancellation(): Boolean =
+    this is CancellationException || this is Error
+
+private fun Throwable.addSuppressedIfDistinct(other: Throwable) {
+    if (this !== other) addSuppressed(other)
 }

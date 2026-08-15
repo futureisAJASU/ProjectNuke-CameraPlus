@@ -51,6 +51,24 @@ class CaptureStateOwnerTest {
         }
     }
 
+    private class FatalTestEvent : CaptureOwnerEvent {
+        val executions = AtomicInteger(0)
+        override fun execute() {
+            executions.incrementAndGet()
+            throw AssertionError("fatal event")
+        }
+        override fun disposeWithoutMutation() = Unit
+    }
+
+    private class FatalDisposeEvent : CaptureOwnerEvent {
+        val disposals = AtomicInteger(0)
+        override fun execute() = Unit
+        override fun disposeWithoutMutation() {
+            disposals.incrementAndGet()
+            throw AssertionError("fatal disposal")
+        }
+    }
+
     // ============================ existing tests ============================
 
     @Test
@@ -176,6 +194,54 @@ class CaptureStateOwnerTest {
         assertEquals(1, event.executions.get())
         assertEquals(1, failures.size)
         assertEquals("forced failure", failures[0].second.message)
+    }
+
+    @Test
+    fun fatalEventFailureEscapesAfterEnvelopeSettles() {
+        val event = FatalTestEvent()
+        val owner = CaptureStateOwner(dispatch = { it.execute(); true })
+        var escaped: AssertionError? = null
+        try {
+            owner.post(event)
+        } catch (failure: AssertionError) {
+            escaped = failure
+        }
+        assertEquals("fatal event", escaped?.message)
+        assertEquals(1, event.executions.get())
+        assertEquals(0, owner.pendingCount())
+        assertEquals(0, owner.runningCount())
+        assertEquals(0, owner.trackingSize())
+    }
+
+    @Test
+    fun fatalDisposalFailureEscapesAndDoesNotBecomeRejectedPost() {
+        val event = FatalDisposeEvent()
+        val owner = CaptureStateOwner(dispatch = { false })
+        var escaped: AssertionError? = null
+        try {
+            owner.post(event)
+        } catch (failure: AssertionError) {
+            escaped = failure
+        }
+        assertEquals("fatal disposal", escaped?.message)
+        assertEquals(1, event.disposals.get())
+        assertEquals(0, owner.trackingSize())
+    }
+
+    @Test
+    fun fatalFailureHookEscapesInsteadOfReplacingEventFailureWithOrdinaryTruth() {
+        val owner = CaptureStateOwner(
+            dispatch = { it.execute(); true },
+            onEventFailure = { _, _ -> throw AssertionError("fatal failure hook") }
+        )
+        var escaped: AssertionError? = null
+        try {
+            owner.post(ThrowingTestEvent())
+        } catch (failure: AssertionError) {
+            escaped = failure
+        }
+        assertEquals("fatal failure hook", escaped?.message)
+        assertEquals(0, owner.trackingSize())
     }
 
     @Test
