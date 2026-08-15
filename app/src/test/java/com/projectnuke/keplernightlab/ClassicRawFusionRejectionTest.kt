@@ -37,6 +37,51 @@ class ClassicRawFusionRejectionTest {
     }
 
     @Test
+    fun fatalDescriptorCloseSupersedesOrdinaryMergeFailureAndSuppressesIt() {
+        val dir = Files.createTempDirectory("classic-raw-fatal-close-primary").toFile()
+        try {
+            val file = dir.resolve("frame.raw16").apply { writeBytes(ByteArray(32)) }
+            val cleanup = AssertionError("fatal close")
+            val primary = IllegalStateException("merge failed")
+            val handle = VerifiedRandomAccessHandle.openForTesting(file, 32L, cleanup)
+
+            try {
+                settleVerifiedRawInputHandles(listOf("frame" to handle), primaryFailure = primary)
+                fail("fatal descriptor close was not propagated")
+            } catch (failure: AssertionError) {
+                assertSame(cleanup, failure)
+                assertTrue(cleanup.suppressed.any { it === primary })
+            }
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fatalMergeFailureRemainsPrimaryWhenDescriptorCloseAlsoFails() {
+        val dir = Files.createTempDirectory("classic-raw-two-fatals").toFile()
+        try {
+            val file = dir.resolve("frame.raw16").apply { writeBytes(ByteArray(32)) }
+            val primary = AssertionError("fatal merge")
+            val cleanup = LinkageError("fatal close")
+            val handle = VerifiedRandomAccessHandle.openForTesting(file, 32L, cleanup)
+
+            try {
+                try {
+                    throw primary
+                } finally {
+                    settleVerifiedRawInputHandles(listOf("frame" to handle), primaryFailure = primary)
+                }
+            } catch (failure: Throwable) {
+                assertSame(primary, failure)
+                assertTrue(primary.suppressed.any { it === cleanup })
+            }
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
     fun rawOutputRangeNeverWraps() {
         assertEquals(0, clampRawOutputValue(-12f, 4095))
         assertEquals(4095, clampRawOutputValue(5000f, 4095))

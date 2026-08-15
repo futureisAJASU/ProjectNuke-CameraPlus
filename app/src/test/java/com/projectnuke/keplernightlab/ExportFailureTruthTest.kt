@@ -141,4 +141,73 @@ class ExportFailureTruthTest {
             directory.deleteRecursively()
         }
     }
+
+    @Test
+    fun verifiedOptionalInterruptionUsesCanonicalPartialStage() {
+        val directory = Files.createTempDirectory("export-verified-partial-").toFile()
+        try {
+            KeplerJobMetadata.write(directory, JSONObject()
+                .put(ACTIVE_OPERATION_ID, "operation-current")
+                .put("currentPipelineStage", "PROCESSING"))
+            val export = GalleryExportResult(
+                success = true,
+                uriString = "content://media/current",
+                displayName = "current.jpg",
+                mimeType = "image/jpeg",
+                fileSizeBytes = 4L,
+                formatUsed = OutputFormat.JPEG,
+                fallbackUsed = false,
+                errorMessage = null
+            )
+
+            updateExportMetadata(
+                jobDir = directory,
+                export = export,
+                verified = true,
+                finalOutputFormat = FinalOutputFormat.JPEG,
+                postExportCancellationRequested = true,
+                postExportWorkSkipped = true
+            )
+
+            val job = KeplerJobMetadata.read(directory)
+            assertEquals("PARTIAL", job.getString("currentPipelineStage"))
+            assertEquals("PIPELINE_COMPLETE_PARTIAL", job.getString("processStatus"))
+            assertEquals("operation-current", job.getString(TERMINAL_OPERATION_ID))
+            assertTrue(job.getBoolean("galleryExportCommitted"))
+            assertTrue(job.getBoolean("exportVerified"))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun verifiedCleanExportUsesCanonicalCompleteStage() {
+        val directory = Files.createTempDirectory("export-verified-complete-").toFile()
+        try {
+            KeplerJobMetadata.write(directory, JSONObject()
+                .put(ACTIVE_OPERATION_ID, "operation-current")
+                .put("currentPipelineStage", "PROCESSING"))
+            updateExportMetadata(
+                jobDir = directory,
+                export = GalleryExportResult(
+                    success = true,
+                    uriString = "content://media/current",
+                    displayName = "current.jpg",
+                    mimeType = "image/jpeg",
+                    fileSizeBytes = 4L,
+                    formatUsed = OutputFormat.JPEG,
+                    fallbackUsed = false,
+                    errorMessage = null
+                ),
+                verified = true,
+                finalOutputFormat = FinalOutputFormat.JPEG
+            )
+            val job = KeplerJobMetadata.read(directory)
+            assertEquals("COMPLETE", job.getString("currentPipelineStage"))
+            assertEquals("PIPELINE_COMPLETE", job.getString("processStatus"))
+            assertEquals("operation-current", job.getString(TERMINAL_OPERATION_ID))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
 }
