@@ -147,8 +147,35 @@ fun processLatestNightFusionV02(
             requiredOutputCommitted = requiredOutputCommitted || jobDir?.let {
                 currentProcessingAttemptHasRequiredOutputClaimForLease(it, operationLease)
             } == true
+            val targetDir = jobDir
+            if (targetDir != null) {
+                try {
+                    KeplerJobMetadata.update(targetDir) { job ->
+                        job.put("currentPipelineStage", if (requiredOutputCommitted) "PARTIAL" else "CANCELLED")
+                            .put(
+                                "processStatus",
+                                if (requiredOutputCommitted) {
+                                    "PIPELINE_CANCELLED_KEEPING_CACHE"
+                                } else {
+                                    "PIPELINE_CANCELLED"
+                                }
+                            )
+                            .put("processingCancellationType", CancellationException::class.java.name)
+                            .put("processingCancellationMessage", "YUV Night Fusion processing cancelled")
+                            .put("userCanMoveDevice", true)
+                    }
+                } catch (failure: Error) {
+                    throw failure
+                } catch (failure: Exception) {
+                    Log.e("KeplerYuvPipeline", "failed to persist processing cancellation metadata", failure)
+                }
+            }
             postTerminal(
-                CameraPipelineEvent.Terminal.Kind.CANCELLED,
+                if (requiredOutputCommitted) {
+                    CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+                } else {
+                    CameraPipelineEvent.Terminal.Kind.CANCELLED
+                },
                 "PIPELINE_CANCELLED: YUV Night Fusion processing cancelled; cache kept.",
                 requiredOutputCommitted = requiredOutputCommitted
             )
@@ -161,8 +188,15 @@ fun processLatestNightFusionV02(
                 val targetDir = jobDir ?: findLatestColorBurstJobDir(context)
                 if (targetDir != null) {
                     KeplerJobMetadata.update(targetDir) { job ->
-                        job.put("currentPipelineStage", "PIPELINE_FAILED")
-                            .put("processStatus", "PIPELINE_FAILED")
+                        job.put("currentPipelineStage", if (requiredOutputCommitted) "PARTIAL" else "PIPELINE_FAILED")
+                            .put(
+                                "processStatus",
+                                if (requiredOutputCommitted) {
+                                    "PIPELINE_FAILED_KEEPING_CACHE"
+                                } else {
+                                    "PIPELINE_FAILED"
+                                }
+                            )
                             .put("pipelineFailed", true)
                             .put("pipelineFailureSource", "processLatestNightFusionV02")
                             .put("pipelineFailureType", e.javaClass.name)
@@ -177,7 +211,11 @@ fun processLatestNightFusionV02(
                 Log.e("KeplerYuvPipeline", "failed to persist processing failure metadata", failure)
             }
             postTerminal(
-                CameraPipelineEvent.Terminal.Kind.FAILED,
+                if (requiredOutputCommitted) {
+                    CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+                } else {
+                    CameraPipelineEvent.Terminal.Kind.FAILED
+                },
                 "PIPELINE_FAILED: YUV Night Fusion failed: ${e.shortMessage()}; cache kept. See logcat/job.json for details.",
                 requiredOutputCommitted = requiredOutputCommitted
             )

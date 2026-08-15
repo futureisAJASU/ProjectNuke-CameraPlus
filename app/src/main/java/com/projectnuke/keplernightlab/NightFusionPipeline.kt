@@ -202,14 +202,21 @@ fun captureProcessExportNightFusion(
                             error = export.errorMessage ?: "Unknown export failure",
                             finalOutputFormat = finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
-                            export = export
+                            export = export,
+                            requiredOutputCommitted = requiredOutputCommitted
                         )
                         post("PIPELINE_FAILED: Export failed; keeping cache. ${export.errorMessage}")
+                        val currentPublicCommit = export.success && !export.uriString.isNullOrBlank()
+                        val currentRequiredOutputCommitted = requiredOutputCommitted ||
+                            currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, pipelineLease)
                         terminal.publish(
-                            CameraPipelineEvent.Terminal.Kind.FAILED,
-                            requiredOutputCommitted = requiredOutputCommitted ||
-                                currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, pipelineLease),
-                            publicExportCommitted = export.success && !export.uriString.isNullOrBlank(),
+                            exportOutcomeTerminalKind(
+                                requiredOutputCommitted = currentRequiredOutputCommitted,
+                                publicExportCommitted = currentPublicCommit,
+                                verified = false
+                            ),
+                            requiredOutputCommitted = currentRequiredOutputCommitted,
+                            publicExportCommitted = currentPublicCommit,
                             message = export.errorMessage
                         )
                         return@post
@@ -236,11 +243,16 @@ fun captureProcessExportNightFusion(
                             error = "Export verification failed",
                             finalOutputFormat = finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
-                            ,export = export
+                            ,export = export,
+                            requiredOutputCommitted = requiredOutputCommitted
                         )
                         post("PIPELINE_FAILED: Export verification failed; keeping source frames.")
                         terminal.publish(
-                            CameraPipelineEvent.Terminal.Kind.FAILED,
+                            exportOutcomeTerminalKind(
+                                requiredOutputCommitted = requiredOutputCommitted,
+                                publicExportCommitted = publicExportCommitted,
+                                verified = false
+                            ),
                             requiredOutputCommitted = requiredOutputCommitted,
                             publicExportCommitted = publicExportCommitted,
                             verified = false,

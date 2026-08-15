@@ -207,6 +207,18 @@ internal fun publicExportInterruptionTerminalKind(
     else -> CameraPipelineEvent.Terminal.Kind.FAILED
 }
 
+internal fun exportOutcomeTerminalKind(
+    requiredOutputCommitted: Boolean,
+    publicExportCommitted: Boolean,
+    verified: Boolean
+): CameraPipelineEvent.Terminal.Kind = if (
+    requiredOutputCommitted || publicExportCommitted
+) {
+    CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+} else {
+    CameraPipelineEvent.Terminal.Kind.FAILED
+}
+
 /** Reads only evidence owned by the exact current PUBLIC_EXPORT operation. */
 internal fun inspectOwnedPublicExportEvidence(
     jobDir: File,
@@ -837,29 +849,48 @@ fun updateExportFailure(
     error: String,
     finalOutputFormat: FinalOutputFormat,
     rawSidecarIgnored: Boolean = false,
-    export: GalleryExportResult? = null
+    export: GalleryExportResult? = null,
+    requiredOutputCommitted: Boolean = currentProcessingAttemptHasRequiredOutputClaim(jobDir)
 ) {
+    val currentPublicCommit = export?.success == true && !export.uriString.isNullOrBlank()
+    val currentLocalCommit = requiredOutputCommitted || currentProcessingAttemptHasRequiredOutputClaim(jobDir)
+    val usableCurrentResult = currentPublicCommit || currentLocalCommit
     KeplerJobMetadata.update(jobDir) { job ->
         job.optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }?.let { job.put(TERMINAL_OPERATION_ID, it) }
         job.put("finalOutputFormatSetting", finalOutputFormat.name)
-            .put("processStatus", "EXPORT_FAILED_KEEPING_CACHE")
-            .put("currentPipelineStage", "FAILED")
-            .put("exportStatus", "FAILED")
-            .put("exportVerified", false)
-            .put("galleryExportCommitted", export?.success == true && !export?.uriString.isNullOrBlank())
-            .put("exportUri", export?.uriString ?: JSONObject.NULL)
+            .put(
+                "processStatus",
+                if (currentPublicCommit) "EXPORT_COMMITTED_UNVERIFIED" else "EXPORT_FAILED_KEEPING_CACHE"
+            )
+            .put("currentPipelineStage", if (usableCurrentResult) "PARTIAL" else "FAILED")
+            .put("exportStatus", if (currentPublicCommit) "COMMITTED_UNVERIFIED" else "FAILED")
             .put("exportError", error)
             .put("rawSidecarRequested", finalOutputFormat.shouldExportRawSidecar)
             .put("rawSidecarExportStatus", if (rawSidecarIgnored) "UNAVAILABLE" else "SKIPPED")
             .put("rawSidecarError", if (rawSidecarIgnored) "RAW sidecar unavailable for YUV pipeline." else JSONObject.NULL)
             .put("cleanupStatus", "SKIPPED")
             .put("exportedAt", System.currentTimeMillis())
+        if (currentPublicCommit) {
+            // A committed-but-unverified result is still the current public
+            // result. Its exact URI belongs to this export attempt; never
+            // replace it with a previous job-level URI.
+            job.put("exportVerified", false)
+                .put("galleryExportCommitted", true)
+                .put("exportUri", export?.uriString ?: JSONObject.NULL)
+                .put("exportVerificationFailed", true)
+        }
     }
     markMediaStoreExportJournalsTerminalPersisted(jobDir)
 }
 
 internal fun markMediaStoreExportJournalsTerminalPersisted(jobDir: File) {
-    val metadata = runCatching { KeplerJobMetadata.read(jobDir) }.getOrNull()
+    val metadata = try {
+        KeplerJobMetadata.read(jobDir)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        null
+    }
     val ownerOperationId = metadata?.optString(TERMINAL_OPERATION_ID)?.takeIf { it.isNotBlank() }
         ?: return
     MediaStoreExportJournal.list(jobDir).forEach { journal ->
@@ -867,7 +898,13 @@ internal fun markMediaStoreExportJournalsTerminalPersisted(jobDir: File) {
             journal.markTerminalPersisted(jobDir, ownerOperationId)
         }
     }
-    val stage = runCatching { KeplerJobMetadata.read(jobDir).optString("currentPipelineStage") }.getOrNull()
+    val stage = try {
+        KeplerJobMetadata.read(jobDir).optString("currentPipelineStage")
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        null
+    }
     if (stage != null && stage != "PROCESSING") {
         KeplerJobMetadata.clearActiveOperationKind(jobDir, KeplerActiveOperationKind.PUBLIC_EXPORT)
     }

@@ -97,4 +97,32 @@ class PublicExportTerminalTruthTest {
             )
         )
     }
+
+    @Test
+    fun normalExportBranchesUsePartialForLocalOrPublicCommittedResults() {
+        assertEquals(
+            CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+            exportOutcomeTerminalKind(
+                requiredOutputCommitted = true,
+                publicExportCommitted = false,
+                verified = false
+            )
+        )
+        assertEquals(
+            CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+            exportOutcomeTerminalKind(
+                requiredOutputCommitted = false,
+                publicExportCommitted = true,
+                verified = false
+            )
+        )
+        assertEquals(
+            CameraPipelineEvent.Terminal.Kind.FAILED,
+            exportOutcomeTerminalKind(
+                requiredOutputCommitted = false,
+                publicExportCommitted = false,
+                verified = false
+            )
+        )
+    }
 }
