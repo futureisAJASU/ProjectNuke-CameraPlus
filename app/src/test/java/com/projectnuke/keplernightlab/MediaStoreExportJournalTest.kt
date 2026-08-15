@@ -1,10 +1,12 @@
 package com.projectnuke.keplernightlab
 
 import android.net.Uri
+import java.io.IOException
 import java.nio.file.Files
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -68,6 +70,57 @@ class MediaStoreExportJournalTest {
             assertEquals(1234L, freshProcessView.expectedSizeBytes)
             assertTrue(freshProcessView.runtimeSessionId.isNotBlank())
         } finally {
+            jobDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun ordinaryJournalReadFailureKeepsExistingInvalidEvidenceBehavior() {
+        val jobDir = Files.createTempDirectory("media-export-journal-read-failure-").toFile()
+        try {
+            MediaStoreExportJournal.create(
+                jobDir = jobDir,
+                role = MediaStoreExportRole.MAIN_IMAGE,
+                frameIndex = null,
+                displayName = "result.jpg",
+                relativePath = "Pictures/Kepler",
+                mimeType = "image/jpeg",
+                collectionUri = Uri.parse("content://media/external/images/media")
+            )
+            mediaStoreExportJournalReadFailureForTest = IOException("ordinary journal read")
+            assertTrue(MediaStoreExportJournal.list(jobDir).isEmpty())
+            mediaStoreExportJournalReadFailureForTest = IOException("ordinary invalid journal read")
+            assertEquals(1, MediaStoreExportJournal.invalidFiles(jobDir).size)
+        } finally {
+            mediaStoreExportJournalReadFailureForTest = null
+            assertTrue(jobDir.listFiles().orEmpty().isNotEmpty())
+            jobDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fatalJournalReadErrorPropagatesAndPreservesEvidence() {
+        val jobDir = Files.createTempDirectory("media-export-journal-read-fatal-").toFile()
+        try {
+            MediaStoreExportJournal.create(
+                jobDir = jobDir,
+                role = MediaStoreExportRole.MAIN_IMAGE,
+                frameIndex = null,
+                displayName = "result.jpg",
+                relativePath = "Pictures/Kepler",
+                mimeType = "image/jpeg",
+                collectionUri = Uri.parse("content://media/external/images/media")
+            )
+            val journalFile = jobDir.listFiles().orEmpty().single()
+            mediaStoreExportJournalReadFailureForTest = AssertionError("fatal journal read")
+            assertThrows(AssertionError::class.java) { MediaStoreExportJournal.list(jobDir) }
+            assertTrue(journalFile.exists())
+
+            mediaStoreExportJournalReadFailureForTest = AssertionError("fatal invalid-journal read")
+            assertThrows(AssertionError::class.java) { MediaStoreExportJournal.invalidFiles(jobDir) }
+            assertTrue(journalFile.exists())
+        } finally {
+            mediaStoreExportJournalReadFailureForTest = null
             jobDir.deleteRecursively()
         }
     }

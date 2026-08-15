@@ -26,6 +26,9 @@ internal class ProcessingArtifactClaimConflictException(message: String) : Illeg
 
 @Volatile
 internal var processingArtifactJournalDeleteFailureForTest: Boolean = false
+internal var processingArtifactJournalDeleteErrorForTest: Throwable? = null
+internal var processingArtifactJournalReadFailureForTest: Throwable? = null
+internal var processingArtifactJournalVerifyFailureForTest: Throwable? = null
 
 internal data class ProcessingArtifactJournalScan(
     val validJournals: List<Pair<File, ProcessingArtifactJournal>>,
@@ -95,7 +98,13 @@ internal fun reconcileSettledAuthoritativeProcessingJournals(
         if (!exactClaim) return false
         val final = NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true)
             ?: return false
-        if (runCatching { verifyProcessingArtifactRecovery(journal, final, prior = false) }.isFailure) return false
+        try {
+            verifyProcessingArtifactRecovery(journal, final, prior = false)
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            return false
+        }
         if (!journal.deleteIfOwned(jobDir)) return false
     }
     return true
@@ -164,9 +173,17 @@ internal data class ProcessingArtifactJournal(
         if (processingArtifactJournalDeleteFailureForTest) return false
         if (!Files.exists(file.toPath(), LinkOption.NOFOLLOW_LINKS)) return true
         if (!NoFollowFileSystem.isRealFile(file.toPath())) return false
-        return runCatching {
+        return try {
+            processingArtifactJournalDeleteErrorForTest?.let { failure ->
+                processingArtifactJournalDeleteErrorForTest = null
+                throw failure
+            }
             Files.deleteIfExists(file.toPath()) && !Files.exists(file.toPath(), LinkOption.NOFOLLOW_LINKS)
-        }.getOrDefault(false)
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun validateNames() {
@@ -239,7 +256,13 @@ internal data class ProcessingArtifactJournal(
                 )
             }
             if (claimKey != null) {
-                val job = runCatching { KeplerJobMetadata.read(jobDir) }.getOrNull()
+                val job = try {
+                    KeplerJobMetadata.read(jobDir)
+                } catch (failure: Error) {
+                    throw failure
+                } catch (_: Exception) {
+                    null
+                }
                 if (job == null || !isKnownProcessingArtifactClaimKey(job, claimKey)) {
                     throw ProcessingArtifactClaimConflictException(
                         "Claim key $claimKey is not valid for processing mode ${job?.optString("processingMode").orEmpty()}"
@@ -257,6 +280,10 @@ internal data class ProcessingArtifactJournal(
             File(jobDir, "$PREFIX${transactionId.also { require(it.matches(UUID_PATTERN)) }}$SUFFIX")
 
         fun read(file: File): ProcessingArtifactJournal {
+            processingArtifactJournalReadFailureForTest?.let { failure ->
+                processingArtifactJournalReadFailureForTest = null
+                throw failure
+            }
             require(NoFollowFileSystem.isRealFile(file.toPath()))
             val parent = file.parentFile ?: error("Processing journal parent missing")
             require(NoFollowFileSystem.isRealDirectory(parent.toPath()))
@@ -302,9 +329,13 @@ internal data class ProcessingArtifactJournal(
                 if (!NoFollowFileSystem.isRealFile(file.toPath())) {
                     invalid += file
                 } else {
-                    runCatching { read(file) }
-                        .onSuccess { valid += file to it }
-                        .onFailure { invalid += file }
+                    try {
+                        valid += file to read(file)
+                    } catch (failure: Error) {
+                        throw failure
+                    } catch (_: Exception) {
+                        invalid += file
+                    }
                 }
             }
             return ProcessingArtifactJournalScan(valid, invalid)
@@ -368,9 +399,17 @@ internal fun recoverProcessingArtifactJournals(
     val final = NoFollowFileSystem.resolveDirectChild(jobDir, journal.finalName, requireFile = true)
     val temp = NoFollowFileSystem.resolveDirectChild(jobDir, journal.tempName, requireFile = true)
     val prior = NoFollowFileSystem.resolveDirectChild(jobDir, journal.priorName, requireFile = true)
-    fun valid(file: File?, prior: Boolean = false): Boolean = file != null && runCatching {
-        verifyProcessingArtifactRecovery(journal, file, prior)
-    }.isSuccess
+    fun valid(file: File?, prior: Boolean = false): Boolean {
+        if (file == null) return false
+        return try {
+            verifyProcessingArtifactRecovery(journal, file, prior)
+            true
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            false
+        }
+    }
     fun deleteExact(file: File?): Boolean = file == null || settleProcessingArtifactPath(file).status != ProcessingArtifactSettlementStatus.DELETE_FAILED
     fun movePriorToFinal(source: File, destination: File) {
         require(NoFollowFileSystem.isRealFile(source.toPath()))
@@ -622,6 +661,10 @@ internal fun recoverProcessingArtifactJournals(
 }
 
 private fun verifyProcessingArtifactRecovery(journal: ProcessingArtifactJournal, file: File, prior: Boolean) {
+    processingArtifactJournalVerifyFailureForTest?.let { failure ->
+        processingArtifactJournalVerifyFailureForTest = null
+        throw failure
+    }
     val digest = NoFollowFileSystem.digestVerified(file)
     val expectedSize = if (prior) journal.priorExpectedSizeBytes else journal.expectedSizeBytes
     val expectedSha256 = if (prior) journal.priorExpectedSha256 else journal.expectedSha256

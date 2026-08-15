@@ -356,7 +356,7 @@ object KeplerJobMetadata {
         return true
     }
 
-    internal fun hasProcessingCleanupBlocker(jobDir: File): Boolean = runCatching {
+    internal fun hasProcessingCleanupBlocker(jobDir: File): Boolean = try {
         val job = read(jobDir)
         job.optString("recoveryState") == PROCESSING_CLEANUP_REQUIRED ||
             ProcessingArtifactJournal.scan(jobDir).let { scan ->
@@ -365,7 +365,11 @@ object KeplerJobMetadata {
                         (it.second.state == ProcessingArtifactJournalState.SETTLED && it.second.adoptedResult == "NO_OUTPUT")
                 }
             }
-    }.getOrDefault(false)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        false
+    }
 
     internal fun recordProcessingCleanupRequired(
         jobDir: File,

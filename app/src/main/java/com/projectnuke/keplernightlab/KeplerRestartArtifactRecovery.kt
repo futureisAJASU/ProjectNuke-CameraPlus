@@ -5,6 +5,12 @@ import java.io.File
 
 internal enum class KeplerMetadataTempClassification { NONE, STALE_CLEANED, PROMOTED_SINGLE_VALID, AMBIGUOUS }
 
+internal var metadataTempInspectionFailureForTest: Throwable? = null
+internal var metadataTempDeleteFailureForTest: Throwable? = null
+internal var metadataTempCandidateReadFailureForTest: Throwable? = null
+internal var metadataTempPromotionFailureForTest: Throwable? = null
+internal var cacheCleanupDeleteFailureForTest: Throwable? = null
+
 internal data class KeplerMetadataTempRecovery(
     val classification: KeplerMetadataTempClassification,
     val actions: List<String> = emptyList(),
@@ -12,8 +18,16 @@ internal data class KeplerMetadataTempRecovery(
 )
 
 internal fun reconcileJobMetadataWriteTemps(jobDir: File): KeplerMetadataTempRecovery {
-    val children = runCatching { NoFollowFileSystem.requireDirectChildren(jobDir) }.getOrElse {
-        return KeplerMetadataTempRecovery(KeplerMetadataTempClassification.AMBIGUOUS, failures = listOf("Metadata temp inspection failed: ${it.message}"))
+    val children = try {
+        metadataTempInspectionFailureForTest?.let { failure ->
+            metadataTempInspectionFailureForTest = null
+            throw failure
+        }
+        NoFollowFileSystem.requireDirectChildren(jobDir)
+    } catch (failure: Error) {
+        throw failure
+    } catch (failure: Exception) {
+        return KeplerMetadataTempRecovery(KeplerMetadataTempClassification.AMBIGUOUS, failures = listOf("Metadata temp inspection failed: ${failure.message}"))
     }
     val candidates = children.filter { file ->
         NoFollowFileSystem.isRealFile(file.toPath()) && file.name.matches(Regex("\\.job\\.json\\.\\d+\\.tmp"))
@@ -21,10 +35,18 @@ internal fun reconcileJobMetadataWriteTemps(jobDir: File): KeplerMetadataTempRec
     if (candidates.isEmpty()) return KeplerMetadataTempRecovery(KeplerMetadataTempClassification.NONE)
     if (NoFollowFileSystem.resolveDirectChild(jobDir, JOB_JSON_FILE_NAME, requireFile = true) != null) {
         val failures = candidates.mapNotNull { candidate ->
-            runCatching { candidate.delete() }.fold(
-                onSuccess = { deleted -> if (deleted || !candidate.exists()) null else "Could not delete stale metadata temp ${candidate.name}." },
-                onFailure = { "Could not delete stale metadata temp ${candidate.name}: ${it.message}" }
-            )
+            try {
+                metadataTempDeleteFailureForTest?.let { failure ->
+                    metadataTempDeleteFailureForTest = null
+                    throw failure
+                }
+                val deleted = candidate.delete()
+                if (deleted || !candidate.exists()) null else "Could not delete stale metadata temp ${candidate.name}."
+            } catch (failure: Error) {
+                throw failure
+            } catch (failure: Exception) {
+                "Could not delete stale metadata temp ${candidate.name}: ${failure.message}"
+            }
         }
         return KeplerMetadataTempRecovery(
             if (failures.isEmpty()) KeplerMetadataTempClassification.STALE_CLEANED else KeplerMetadataTempClassification.AMBIGUOUS,
@@ -33,19 +55,35 @@ internal fun reconcileJobMetadataWriteTemps(jobDir: File): KeplerMetadataTempRec
         )
     }
     val valid = candidates.mapNotNull { candidate ->
-        runCatching {
+        try {
+            metadataTempCandidateReadFailureForTest?.let { failure ->
+                metadataTempCandidateReadFailureForTest = null
+                throw failure
+            }
             val json = JSONObject(NoFollowFileSystem.readTextVerified(candidate))
             requireValidMetadataReplacement(jobDir, json)
             candidate
-        }.getOrNull()
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            null
+        }
     }
     if (valid.size != 1 || valid.size != candidates.size) {
         return KeplerMetadataTempRecovery(KeplerMetadataTempClassification.AMBIGUOUS, failures = listOf("Metadata replacement is ambiguous; candidates were preserved."))
     }
-    return runCatching {
+    return try {
+        metadataTempPromotionFailureForTest?.let { failure ->
+            metadataTempPromotionFailureForTest = null
+            throw failure
+        }
         KeplerJobMetadata.atomicReplace(valid.single(), File(jobDir, JOB_JSON_FILE_NAME))
         KeplerMetadataTempRecovery(KeplerMetadataTempClassification.PROMOTED_SINGLE_VALID, actions = listOf("PROMOTED_${valid.single().name}"))
-    }.getOrElse { KeplerMetadataTempRecovery(KeplerMetadataTempClassification.AMBIGUOUS, failures = listOf("Valid metadata replacement could not be promoted: ${it.message}")) }
+    } catch (failure: Error) {
+        throw failure
+    } catch (failure: Exception) {
+        KeplerMetadataTempRecovery(KeplerMetadataTempClassification.AMBIGUOUS, failures = listOf("Valid metadata replacement could not be promoted: ${failure.message}"))
+    }
 }
 
 private fun requireValidMetadataReplacement(jobDir: File, job: JSONObject) {
@@ -119,10 +157,16 @@ internal fun cleanStaleKeplerExportCacheFilesDetailed(cacheDir: File): KeplerCac
     NoFollowFileSystem.requireDirectChildren(cacheDir).filter { file ->
         NoFollowFileSystem.isRealFile(file.toPath()) && file.name.startsWith("kepler_export_") && file.name.endsWith(".heic")
     }.forEach { file ->
-        runCatching {
+        try {
+            cacheCleanupDeleteFailureForTest?.let { failure ->
+                cacheCleanupDeleteFailureForTest = null
+                throw failure
+            }
             if (file.delete() || !file.exists()) deleted += file.name
             else failures += "Could not delete cache export ${file.name}."
-        }.onFailure { failure ->
+        } catch (failure: Error) {
+            throw failure
+        } catch (failure: Exception) {
             failures += "Could not delete cache export ${file.name}: ${failure.message}"
         }
     }

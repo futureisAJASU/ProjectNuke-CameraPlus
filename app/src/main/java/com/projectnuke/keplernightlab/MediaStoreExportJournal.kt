@@ -23,6 +23,8 @@ internal enum class MediaStoreExportState {
     CLEANED
 }
 
+internal var mediaStoreExportJournalReadFailureForTest: Throwable? = null
+
 /** Direct-child, filename-only evidence for one MediaStore insert attempt. */
 internal data class MediaStoreExportJournal(
     val exportAttemptId: String,
@@ -156,6 +158,10 @@ internal data class MediaStoreExportJournal(
         }
 
         fun read(jobDir: File, file: File): MediaStoreExportJournal {
+            mediaStoreExportJournalReadFailureForTest?.let { failure ->
+                mediaStoreExportJournalReadFailureForTest = null
+                throw failure
+            }
             require(file.parentFile?.canonicalFile == jobDir.canonicalFile)
             val json = JSONObject(NoFollowFileSystem.readTextVerified(file))
             val attemptId = json.getString("exportAttemptId")
@@ -192,12 +198,29 @@ internal data class MediaStoreExportJournal(
         fun list(jobDir: File): List<MediaStoreExportJournal> =
             NoFollowFileSystem.requireDirectChildren(jobDir)
                 .filter { it.name.startsWith(PREFIX) && it.name.endsWith(SUFFIX) }
-                .mapNotNull { file -> runCatching { read(jobDir, file) }.getOrNull() }
+                .mapNotNull { file ->
+                    try {
+                        read(jobDir, file)
+                    } catch (failure: Error) {
+                        throw failure
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
 
         /** Invalid journals remain evidence and must not disappear from recovery accounting. */
         fun invalidFiles(jobDir: File): List<File> =
             NoFollowFileSystem.requireDirectChildren(jobDir)
                 .filter { it.name.startsWith(PREFIX) && it.name.endsWith(SUFFIX) }
-                .filter { file -> runCatching { read(jobDir, file) }.isFailure }
+                .filter { file ->
+                    try {
+                        read(jobDir, file)
+                        false
+                    } catch (failure: Error) {
+                        throw failure
+                    } catch (_: Exception) {
+                        true
+                    }
+                }
     }
 }

@@ -13,6 +13,7 @@ import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import org.json.JSONObject
+import org.junit.Assert.assertThrows
 
 @RunWith(RobolectricTestRunner::class)
 class ProcessingArtifactTransactionTest {
@@ -20,6 +21,176 @@ class ProcessingArtifactTransactionTest {
         override val isCancelled: Boolean get() = cancelled
         override fun throwIfCancelled() {
             if (cancelled) throw CancellationException("cancelled")
+        }
+    }
+
+    @Test
+    fun ordinaryProcessingJournalReadFailureRemainsInvalidEvidence() {
+        val dir = Files.createTempDirectory("processing-journal-read-failure-").toFile()
+        try {
+            val journal = ProcessingArtifactJournal(
+                transactionId = UUID.randomUUID().toString(),
+                processingAttemptId = null,
+                runtimeSessionId = "old-runtime",
+                artifactType = "BIN",
+                finalName = "result.bin",
+                tempName = ".result.tmp",
+                priorName = ".result.prior",
+                state = ProcessingArtifactJournalState.PREPARED,
+                createdAt = 1L,
+                updatedAt = 2L
+            )
+            journal.writeTo(dir)
+            processingArtifactJournalReadFailureForTest = java.io.IOException("ordinary processing journal read")
+            val scan = ProcessingArtifactJournal.scan(dir)
+            assertTrue(scan.validJournals.isEmpty())
+            assertEquals(1, scan.invalidFiles.size)
+            assertTrue(scan.invalidFiles.single().exists())
+        } finally {
+            processingArtifactJournalReadFailureForTest = null
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fatalProcessingJournalReadErrorPropagatesAndPreservesEvidence() {
+        val dir = Files.createTempDirectory("processing-journal-read-fatal-").toFile()
+        try {
+            val journal = ProcessingArtifactJournal(
+                transactionId = UUID.randomUUID().toString(),
+                processingAttemptId = null,
+                runtimeSessionId = "old-runtime",
+                artifactType = "BIN",
+                finalName = "result.bin",
+                tempName = ".result.tmp",
+                priorName = ".result.prior",
+                state = ProcessingArtifactJournalState.PREPARED,
+                createdAt = 1L,
+                updatedAt = 2L
+            )
+            journal.writeTo(dir)
+            val journalFile = ProcessingArtifactJournal.list(dir).single()
+            processingArtifactJournalReadFailureForTest = AssertionError("fatal processing journal read")
+            assertThrows(AssertionError::class.java) { ProcessingArtifactJournal.scan(dir) }
+            assertTrue(journalFile.exists())
+        } finally {
+            processingArtifactJournalReadFailureForTest = null
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fatalProcessingJournalScanErrorDoesNotBecomeMissingCleanupBlocker() {
+        val dir = Files.createTempDirectory("processing-journal-blocker-fatal-").toFile()
+        try {
+            KeplerJobMetadata.write(dir, JSONObject().put("jobType", "YUV_NIGHT_FUSION"))
+            val journal = ProcessingArtifactJournal(
+                transactionId = UUID.randomUUID().toString(),
+                processingAttemptId = null,
+                runtimeSessionId = "old-runtime",
+                artifactType = "BIN",
+                finalName = "result.bin",
+                tempName = ".result.tmp",
+                priorName = ".result.prior",
+                state = ProcessingArtifactJournalState.PREPARED,
+                createdAt = 1L,
+                updatedAt = 2L
+            )
+            journal.writeTo(dir)
+            processingArtifactJournalReadFailureForTest = AssertionError("fatal cleanup-blocker scan")
+            assertThrows(AssertionError::class.java) { KeplerJobMetadata.hasProcessingCleanupBlocker(dir) }
+            assertTrue(ProcessingArtifactJournal.list(dir).isNotEmpty())
+        } finally {
+            processingArtifactJournalReadFailureForTest = null
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun ordinaryProcessingArtifactVerificationFailureRemainsAmbiguous() {
+        val dir = Files.createTempDirectory("processing-verify-failure-").toFile()
+        try {
+            val final = File(dir, "result.bin").apply { writeText("current") }
+            val journal = ProcessingArtifactJournal(
+                transactionId = UUID.randomUUID().toString(),
+                processingAttemptId = null,
+                runtimeSessionId = "old-runtime",
+                artifactType = "BIN",
+                finalName = final.name,
+                tempName = ".result.tmp",
+                priorName = ".result.prior",
+                expectedSizeBytes = final.length(),
+                expectedSha256 = NoFollowFileSystem.digestVerified(final).sha256,
+                state = ProcessingArtifactJournalState.NEW_FINAL_MOVED,
+                createdAt = 1L,
+                updatedAt = 2L
+            )
+            journal.writeTo(dir)
+            processingArtifactJournalVerifyFailureForTest = java.io.IOException("ordinary verification failure")
+            val result = recoverProcessingArtifactJournals(dir).single()
+            assertEquals(ProcessingArtifactRecoveryClassification.AMBIGUOUS, result.classification)
+            assertTrue(final.exists())
+            assertTrue(ProcessingArtifactJournal.list(dir).isNotEmpty())
+        } finally {
+            processingArtifactJournalVerifyFailureForTest = null
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fatalProcessingArtifactVerificationErrorPropagatesAndPreservesEvidence() {
+        val dir = Files.createTempDirectory("processing-verify-fatal-").toFile()
+        try {
+            val final = File(dir, "result.bin").apply { writeText("current") }
+            val journal = ProcessingArtifactJournal(
+                transactionId = UUID.randomUUID().toString(),
+                processingAttemptId = null,
+                runtimeSessionId = "old-runtime",
+                artifactType = "BIN",
+                finalName = final.name,
+                tempName = ".result.tmp",
+                priorName = ".result.prior",
+                expectedSizeBytes = final.length(),
+                expectedSha256 = NoFollowFileSystem.digestVerified(final).sha256,
+                state = ProcessingArtifactJournalState.NEW_FINAL_MOVED,
+                createdAt = 1L,
+                updatedAt = 2L
+            )
+            journal.writeTo(dir)
+            processingArtifactJournalVerifyFailureForTest = AssertionError("fatal processing artifact verification")
+            assertThrows(AssertionError::class.java) { recoverProcessingArtifactJournals(dir) }
+            assertTrue(final.exists())
+            assertTrue(ProcessingArtifactJournal.list(dir).isNotEmpty())
+        } finally {
+            processingArtifactJournalVerifyFailureForTest = null
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fatalProcessingJournalDeleteErrorPropagatesAndPreservesJournalEvidence() {
+        val dir = Files.createTempDirectory("processing-journal-delete-fatal-").toFile()
+        try {
+            val journal = ProcessingArtifactJournal(
+                transactionId = UUID.randomUUID().toString(),
+                processingAttemptId = null,
+                runtimeSessionId = "old-runtime",
+                artifactType = "BIN",
+                finalName = "result.bin",
+                tempName = ".result.tmp",
+                priorName = ".result.prior",
+                state = ProcessingArtifactJournalState.SETTLED,
+                adoptedResult = "NO_OUTPUT",
+                createdAt = 1L,
+                updatedAt = 2L
+            )
+            journal.writeTo(dir)
+            processingArtifactJournalDeleteErrorForTest = AssertionError("fatal processing journal delete")
+            assertThrows(AssertionError::class.java) { journal.deleteIfOwned(dir) }
+            assertTrue(ProcessingArtifactJournal.list(dir).isNotEmpty())
+        } finally {
+            processingArtifactJournalDeleteErrorForTest = null
+            dir.deleteRecursively()
         }
     }
 
