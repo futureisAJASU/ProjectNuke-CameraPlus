@@ -525,8 +525,21 @@ fun exportRawSidecarsToPublicStorage(
                 )
             }
             if (verificationError != null) {
-                result.journal?.let { abandonMediaStoreAttempt(context, jobDir, it, result.uri) }
-                val failure = "${file.name}: $verificationError"
+                val verificationFailure = IllegalStateException(
+                    "${file.name}: $verificationError"
+                )
+                try {
+                    result.journal?.let { abandonMediaStoreAttempt(context, jobDir, it, result.uri) }
+                } catch (cleanupFailure: Throwable) {
+                    val combined = combineSettlementFailure(verificationFailure, cleanupFailure)
+                    if (combined is Error || combined is CancellationException) throw combined
+                    Log.e(
+                        "KeplerRawPipeline",
+                        "RAW sidecar abandonment failed after verification failure: ${cleanupFailure.message}",
+                        cleanupFailure
+                    )
+                }
+                val failure = verificationFailure.message ?: "${file.name}: $verificationError"
                 publicFailures += failure
                 publicFailureByFrame[frame.frameIndex] = failure
             } else {
@@ -772,11 +785,25 @@ fun updateExportMetadata(
     lateinit var nativePostprocessRgbaFileForLog: String
     lateinit var rawRenderDebugFileForLog: String
     KeplerJobMetadata.update(jobDir) { job ->
-        if (verified) {
+        val verifiedPartial = verified && (postExportCancellationRequested || postExportWorkSkipped)
+        val durableStage = when {
+            !verified -> "PROCESSING"
+            verifiedPartial -> "PARTIAL"
+            else -> "COMPLETE"
+        }
+        if (durableStage == "COMPLETE" || durableStage == "PARTIAL") {
             job.optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }?.let { job.put(TERMINAL_OPERATION_ID, it) }
         }
         job.put("finalOutputFormatSetting", finalOutputFormat.name)
-            .put("currentPipelineStage", if (verified) "COMPLETE" else "PROCESSING")
+            .put("currentPipelineStage", durableStage)
+            .put(
+                "processStatus",
+                when {
+                    verifiedPartial -> "PIPELINE_COMPLETE_PARTIAL"
+                    verified -> "PIPELINE_COMPLETE"
+                    else -> job.optString("processStatus", "PROCESSING")
+                }
+            )
             .put("exportStatus", when {
                 export == null -> "FAILED"
                 verified -> "EXPORTED"
@@ -872,10 +899,15 @@ fun updateExportFailure(
     finalOutputFormat: FinalOutputFormat,
     rawSidecarIgnored: Boolean = false,
     export: GalleryExportResult? = null,
-    requiredOutputCommitted: Boolean = currentProcessingAttemptHasRequiredOutputClaim(jobDir)
+    requiredOutputCommitted: Boolean = currentProcessingAttemptHasRequiredOutputClaim(jobDir),
+    operationLease: JobOperationLease? = null
 ) {
     val currentPublicCommit = export?.success == true && !export.uriString.isNullOrBlank()
-    val currentLocalCommit = requiredOutputCommitted || currentProcessingAttemptHasRequiredOutputClaim(jobDir)
+    val currentLocalCommit = requiredOutputCommitted || if (operationLease != null) {
+        currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, operationLease)
+    } else {
+        currentProcessingAttemptHasRequiredOutputClaim(jobDir)
+    }
     val usableCurrentResult = currentPublicCommit || currentLocalCommit
     KeplerJobMetadata.update(jobDir) { job ->
         job.optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }?.let { job.put(TERMINAL_OPERATION_ID, it) }
@@ -962,6 +994,11 @@ internal fun updateRawPublicExportOutcome(
     jobDir: File,
     outcome: RawFusionPublicExportOutcome
 ) {
+    val terminalPolicy = deriveRawFusionOutcomePolicy(
+        outcome = outcome,
+        cancellationRequested = outcome.postExportCancellationRequested,
+        currentLocalOutput = outcome.currentLocalOutput
+    )
     KeplerJobMetadata.update(jobDir) { job ->
         val requested = requestedOutputFormatForSetting(outcome.finalOutputFormat)
         job.put("finalOutputFormatSetting", outcome.finalOutputFormat.name)
@@ -1084,10 +1121,17 @@ internal fun updateRawPublicExportOutcome(
         when (outcome) {
             is RawFusionPublicExportOutcome.VerifiedSuccess,
             is RawFusionPublicExportOutcome.VerifiedWithPostExportCancellation -> {
-                job.put("currentPipelineStage", "COMPLETE")
-                    .put("processStatus", "NIGHT_FUSION_COMPLETE")
+                job.put("currentPipelineStage", terminalPolicy.durablePipelineStage)
+                    .put(
+                        "processStatus",
+                        if (terminalPolicy.durablePipelineStage == "COMPLETE") {
+                            "NIGHT_FUSION_COMPLETE"
+                        } else {
+                            "NIGHT_FUSION_COMPLETE_PARTIAL"
+                        }
+                    )
                     .put("userCanMoveDevice", true)
-                    .put("exportError", JSONObject.NULL)
+                    .put("exportError", outcome.currentWarning ?: JSONObject.NULL)
             }
             is RawFusionPublicExportOutcome.VerifiedPostWorkInterrupted -> {
                 job.put("currentPipelineStage", "PARTIAL")
@@ -1096,8 +1140,15 @@ internal fun updateRawPublicExportOutcome(
                     .put("exportError", outcome.currentError ?: JSONObject.NULL)
             }
             is RawFusionPublicExportOutcome.UncommittedFailure -> {
-                job.put("currentPipelineStage", "FAILED")
-                    .put("processStatus", "EXPORT_FAILED_KEEPING_CACHE")
+                job.put("currentPipelineStage", terminalPolicy.durablePipelineStage)
+                    .put(
+                        "processStatus",
+                        if (terminalPolicy.hasCurrentLocalResult) {
+                            "LOCAL_OUTPUT_COMMITTED_EXPORT_FAILED"
+                        } else {
+                            "EXPORT_FAILED_KEEPING_CACHE"
+                        }
+                    )
                     .put("userCanMoveDevice", true)
                     .put("exportError", outcome.currentError)
                 outcome.rawPublicExportAttemptError?.let {
@@ -1205,7 +1256,17 @@ private fun writeGalleryBitmap(
 
     if (verification !is GalleryExportVerification.Verified) {
         jobDir?.let { owner ->
-            inserted.journal?.let { abandonMediaStoreAttempt(context, owner, it, committedUri) }
+            inserted.journal?.let { journal ->
+                val verificationFailure = IllegalStateException(
+                    "Verification failed: ${(verification as? GalleryExportVerification.RetryableFailure)?.reason
+                        ?: (verification as? GalleryExportVerification.PermanentFailure)?.reason}"
+                )
+                try {
+                    abandonMediaStoreAttempt(context, owner, journal, committedUri)
+                } catch (cleanupFailure: Throwable) {
+                    throw requireNotNull(combineSettlementFailure(verificationFailure, cleanupFailure))
+                }
+            }
         }
         return GalleryExportResult(
             success = false,
@@ -1349,27 +1410,26 @@ private fun insertPublicFile(
         }
         InsertedPublicFile(uri, mediaSize, journal)
     } catch (ce: CancellationException) {
+        var cleanupFailure: Throwable? = null
         if (insertReturned && uri != null && journal != null) {
             try {
                 journal = abandonMediaStoreAttempt(context, jobDir!!, journal!!, uri!!)
-            } catch (failure: Error) {
-                throw failure
-            } catch (_: Exception) {
-                // Preserve cancellation as the primary ordinary control-flow outcome.
+            } catch (failure: Throwable) {
+                cleanupFailure = failure
             }
         }
-        throw ce
+        throw requireNotNull(combineSettlementFailure(ce, cleanupFailure))
     } catch (error: Throwable) {
+        var cleanupFailure: Throwable? = null
         if (insertReturned && uri != null && journal != null) {
             try {
                 journal = abandonMediaStoreAttempt(context, jobDir!!, journal!!, uri!!)
-            } catch (failure: Error) {
-                throw failure
-            } catch (_: Exception) {
-                // Preserve the original ordinary export failure; the journal remains debt.
+            } catch (failure: Throwable) {
+                cleanupFailure = failure
             }
         }
-        if (error is Error) throw error
+        val combined = combineSettlementFailure(error, cleanupFailure)
+        if (combined is Error || combined is CancellationException) throw requireNotNull(combined)
         null
     }
 }
@@ -1384,6 +1444,7 @@ private fun writeHeifViaTempFile(
     val tempFile = File.createTempFile("kepler_export_", ".heic", context.cacheDir)
     var writer: HeifWriter? = null
     val timeoutMs = heifStopTimeoutMs(bitmap.width, bitmap.height)
+    var primaryFailure: Throwable? = null
     return try {
         val createdWriter = HeifWriter.Builder(
             tempFile.absolutePath,
@@ -1403,10 +1464,13 @@ private fun writeHeifViaTempFile(
         check(digest.size > 0L) { "HEIF writer produced an empty temporary file" }
         true
     } catch (cancelled: CancellationException) {
+        primaryFailure = cancelled
         throw cancelled
     } catch (error: Error) {
+        primaryFailure = error
         throw error
     } catch (error: Exception) {
+        primaryFailure = error
         Log.w(
             "KeplerGalleryExporter",
             "HEIF encode failed pixels=${bitmap.width.toLong() * bitmap.height} timeoutMs=$timeoutMs: ${error.message}",
@@ -1414,15 +1478,28 @@ private fun writeHeifViaTempFile(
         )
         false
     } finally {
+        var cleanupFailure: Throwable? = null
         try {
             writer?.close()
-        } catch (failure: Error) {
-            throw failure
-        } catch (failure: Exception) {
-            Log.w("KeplerGalleryExporter", "Failed to close HEIF writer.", failure)
+        } catch (failure: Throwable) {
+            cleanupFailure = failure
+            if (failure !is Error && failure !is CancellationException) {
+                Log.w("KeplerGalleryExporter", "Failed to close HEIF writer.", failure)
+            }
         }
-        if (tempFile.exists() && !tempFile.delete()) {
-            Log.w("KeplerGalleryExporter", "Failed to delete temporary HEIF file: ${tempFile.absolutePath}")
+        try {
+            if (tempFile.exists() && !tempFile.delete()) {
+                Log.w("KeplerGalleryExporter", "Failed to delete temporary HEIF file: ${tempFile.absolutePath}")
+            }
+        } catch (failure: Throwable) {
+            cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+            if (failure !is Error && failure !is CancellationException) {
+                Log.w("KeplerGalleryExporter", "Failed to delete temporary HEIF file.", failure)
+            }
+        }
+        val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+        if (combined is Error || combined is CancellationException) {
+            throw requireNotNull(combined)
         }
     }
 }

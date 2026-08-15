@@ -59,6 +59,9 @@ internal inline fun wrapMetadataIntegrityFailure(
             if (originalFailure !== fatal) originalFailure.addSuppressed(fatal)
             throw originalFailure
         }
+        if (originalFailure != null && originalFailure !== fatal) {
+            fatal.addSuppressed(originalFailure)
+        }
         throw fatal
     }
 }

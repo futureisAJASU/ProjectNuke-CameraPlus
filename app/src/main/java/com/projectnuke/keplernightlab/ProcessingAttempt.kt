@@ -21,8 +21,13 @@ internal data class ProcessingAttempt(
         val cleared = try {
             KeplerJobMetadata.clearActiveOperation(jobDir, id, operationLease)
         } catch (failure: Error) {
-            operationLease?.markProcessingSettlementPending(id)
-            throw failure
+            var cleanupFailure: Throwable? = null
+            try {
+                operationLease?.markProcessingSettlementPending(id)
+            } catch (secondary: Throwable) {
+                cleanupFailure = secondary
+            }
+            throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
         }
         if (!cleared && KeplerJobMetadata.isCurrentActiveOperation(jobDir, id)) {
             // A failed metadata write leaves the durable owner in place. Keep both
@@ -98,6 +103,39 @@ internal fun currentProcessingAttemptHasRequiredOutputClaimForLease(
     currentProcessingAttemptHasRequiredOutputClaim(jobDir, expectedAttemptId = attemptId)
 } == true
 
+/** Returns the exact current-attempt required output only when the lease owns its claim. */
+internal fun currentProcessingAttemptRequiredOutputFileForLease(
+    jobDir: File,
+    operationLease: JobOperationLease?
+): File? {
+    val expectedAttemptId = operationLease?.lastProcessingAttemptId() ?: return null
+    val job = try {
+        KeplerJobMetadata.read(jobDir)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        return null
+    }
+    if (job.optString("processingAttemptId") != expectedAttemptId ||
+        !job.optBoolean("processingOutputCommitted", false) ||
+        job.optString("processingArtifactClaimAttemptId") != expectedAttemptId
+    ) return null
+    val mode = job.optString("processingMode").uppercase()
+    val jobType = job.optString("jobType").uppercase()
+    val claimKey = when {
+        mode == "CLASSIC_RAW" || jobType == "RAW" || jobType == "RAW_NIGHT_FUSION" -> "mergedRawFile"
+        mode == "SUPER_RESOLUTION" || jobType.contains("SUPER") -> "superResolutionOutputFile"
+        mode == "CLASSIC_YUV" || mode == "SINGLE_FRAME" ||
+            jobType == "YUV_NIGHT_FUSION" || jobType == "YUV_SINGLE_FRAME" -> "finalFile"
+        else -> return null
+    }
+    val name = job.optString(claimKey).takeIf { it.isNotBlank() } ?: return null
+    return when (val resolved = NoFollowFileSystem.resolveDirectChildResult(jobDir, name, requireFile = true)) {
+        is NoFollowInspection.Present -> resolved.value
+        else -> null
+    }
+}
+
 private val COMMON_PROCESSING_ATTEMPT_KEYS = setOf(
     "pipelineFailed",
     "pipelineFailureSource",
@@ -134,15 +172,28 @@ internal fun beginProcessingAttempt(
         ownsOperationLease = ownsLease
     )
     if (!lease.claimProcessingAttempt(attempt.id)) {
-        if (ownsLease) lease.release()
-        throw ProcessingAlreadyActiveException(jobDir)
+        val primaryFailure = ProcessingAlreadyActiveException(jobDir)
+        var cleanupFailure: Throwable? = null
+        if (ownsLease) {
+            try {
+                lease.release()
+            } catch (failure: Throwable) {
+                cleanupFailure = failure
+            }
+        }
+        throw requireNotNull(combineSettlementFailure(primaryFailure, cleanupFailure))
     }
     if (NoFollowFileSystem.resolveDirectChildResult(jobDir, JOB_JSON_FILE_NAME, requireFile = true) is NoFollowInspection.Absent) {
         try {
             KeplerJobMetadata.write(jobDir, org.json.JSONObject().put("jobType", mode).put("pipeline", mode))
         } catch (failure: Throwable) {
-            attempt.releaseOwnedLease()
-            throw failure
+            var cleanupFailure: Throwable? = null
+            try {
+                attempt.releaseOwnedLease()
+            } catch (secondary: Throwable) {
+                cleanupFailure = secondary
+            }
+            throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
         }
     }
     try {
@@ -168,8 +219,13 @@ internal fun beginProcessingAttempt(
                 .put(ACTIVE_OPERATION_UPDATED_AT, attempt.startedAt)
         }
     } catch (failure: Throwable) {
-        attempt.releaseOwnedLease()
-        throw failure
+        var cleanupFailure: Throwable? = null
+        try {
+            attempt.releaseOwnedLease()
+        } catch (secondary: Throwable) {
+            cleanupFailure = secondary
+        }
+        throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
     }
     return attempt
 }

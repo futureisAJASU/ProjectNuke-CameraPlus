@@ -714,8 +714,13 @@ fun captureRawBurstForFusion(
                 ownerLease = durableCaptureLease
             )
         } catch (failure: Throwable) {
-            durableCaptureLease.release()
-            throw failure
+            var cleanupFailure: Throwable? = null
+            try {
+                durableCaptureLease.release()
+            } catch (secondary: Throwable) {
+                cleanupFailure = secondary
+            }
+            throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
         }
         var durableCaptureTerminalPersisted = false
 
@@ -1799,8 +1804,27 @@ private object RawFusionExportCoordinator {
             current.put("rawLocalRenderFailureType", rendererFailureType)
             current.put("rawLocalRenderFailureMessage", errorMessage)
             if (context.metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-                current.put("currentPipelineStage", "FAILED")
-                current.put("processStatus", processStatus)
+                val currentClaimedOutput = current.optBoolean("processingOutputCommitted", false) &&
+                    current.optString("processingArtifactClaimAttemptId") == current.optString("processingAttemptId") &&
+                    current.optString("processingAttemptId").isNotBlank() &&
+                    current.optString("mergedRawFile").isNotBlank() &&
+                    NoFollowFileSystem.resolveDirectChildResult(
+                        context.files.jobDir,
+                        current.optString("mergedRawFile"),
+                        requireFile = true
+                    ) is NoFollowInspection.Present
+                current.put("currentPipelineStage", if (currentClaimedOutput) {
+                    "PIPELINE_COMPLETE_PARTIAL"
+                } else {
+                    "FAILED"
+                })
+                current.put("processStatus", if (currentClaimedOutput) {
+                    "LOCAL_OUTPUT_COMMITTED_EXPORT_FAILED"
+                } else {
+                    processStatus
+                })
+                    .put("finalOutputAvailable", currentClaimedOutput)
+                    .put("galleryDisplayUnavailable", !currentClaimedOutput)
                 current.put("userCanMoveDevice", true)
             }
         }
@@ -1916,10 +1940,11 @@ private object RawFusionExportCoordinator {
         }
         cancellation.throwIfCancelled()
         val expectedRgbaBytes = outputWidth.toLong() * outputHeight.toLong() * 4L
+        // The committed RGBA image is the required renderer result. Native metadata is
+        // diagnostic/carry-forward data and may be absent after a successful native render.
         val nativePostprocessUsed = postprocessStatus.startsWith("OK:") &&
             nativeRgbaFile.exists() &&
-            nativeRgbaFile.length() == expectedRgbaBytes &&
-            nativeMetadataFile.exists()
+            nativeRgbaFile.length() == expectedRgbaBytes
         cancellation.throwIfCancelled()
         val nativeIspRenderMs = System.currentTimeMillis() - nativeIspStartedAt
         Log.i(RAW_PIPELINE_LOG_TAG, "NATIVE_ISP_COMPLETE jobDirAbsolutePath=${context.files.jobDir.absolutePath} nativeIspRenderMs=$nativeIspRenderMs")
@@ -1998,7 +2023,8 @@ private object RawFusionExportCoordinator {
         var nativeMp24DebugPngWritten = false
         if (nativeMp24DebugPngRequested) {
             var nativeBitmap: Bitmap? = null
-            try {
+            withSettlementPrecedence(
+                block = {
                 context.onStatus("결과를 저장하는 중입니다.")
                 cancellation.throwIfCancelled()
                 nativeBitmap = loadRawRgbaBitmap(nativeRgbaFile, outputWidth, outputHeight)
@@ -2006,9 +2032,9 @@ private object RawFusionExportCoordinator {
                 saveRawFusionPng(nativeBitmap, finalFile)
                 cancellation.throwIfCancelled()
                 nativeMp24DebugPngWritten = true
-            } finally {
-                nativeBitmap?.takeUnless { it.isRecycled }?.recycle()
-            }
+                },
+                cleanup = { nativeBitmap?.takeUnless { it.isRecycled }?.recycle() }
+            )
         }
         val nativeMp24DebugPngSkipReason = if (nativeMp24DebugPngWritten) {
             null
@@ -2135,8 +2161,9 @@ private object RawFusionExportCoordinator {
         val expectedBytes = outputWidth.toLong() * outputHeight.toLong() * 4L
         val nativeOk = status.startsWith("OK:") &&
             nativeRgbaFile.exists() &&
-            nativeRgbaFile.length() == expectedBytes &&
-            renderDebugFile.exists()
+            nativeRgbaFile.length() == expectedBytes
+        // renderDebugFile and the reference/linear debug artifacts are optional diagnostics;
+        // they must not downgrade a valid native required image into renderer failure.
         val nativeIspRenderMs = System.currentTimeMillis() - nativeIspStartedAt
         Log.i(RAW_PIPELINE_LOG_TAG, "NATIVE_ISP_COMPLETE jobDirAbsolutePath=${context.files.jobDir.absolutePath} nativeIspRenderMs=$nativeIspRenderMs")
         Log.i(
@@ -2362,6 +2389,7 @@ fun processRawFusionJob(
         JobRecoveryMutationIntent.PROCESSING_START,
         consumesProcessingHandoff = true
     )
+    var primaryFailure: Throwable? = null
     return try {
         cancellation.throwIfCancelled()
         val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
@@ -2504,6 +2532,7 @@ fun processRawFusionJob(
             }
             val originalClassicFailure = classicMerge.originalFailure
                 ?: IllegalStateException("Classic RAW fusion: $failureMessage")
+            primaryFailure = originalClassicFailure
             wrapMetadataIntegrityFailure(originalFailure = originalClassicFailure) {
                 persistRawFusionFailureMetadata(
                     jobDir = jobDir,
@@ -2516,13 +2545,20 @@ fun processRawFusionJob(
                 )
             }
             onStatus("Classic RAW fusion failed. RAW cache kept.")
+            val currentClaimed = try {
+                classicMerge.outputCommitted &&
+                    currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, processingLease)
+            } catch (failure: Throwable) {
+                throw requireNotNull(combineSettlementFailure(originalClassicFailure, failure))
+            }
             return RawFusionProcessResult(
                 success = false,
-                mergedRawFile = null,
+                mergedRawFile = mergedRawFile.takeIf { currentClaimed },
                 mergedDngFile = null,
                 previewPngFile = null,
                 finalPngFile = null,
-                errorMessage = failureMessage
+                errorMessage = failureMessage,
+                outputCommitted = currentClaimed
             )
         }
         persistProcessingMetadata(job)
@@ -2559,7 +2595,23 @@ fun processRawFusionJob(
             ),
             cancellation
         )
-        val exportProcessResult = exportResult.processResult
+        val exportProcessResult = exportResult.processResult.let { result ->
+            // The renderer result is downstream of the committed Classic RAW artifact. Keep
+            // that exact current-attempt claim attached when rendering/export fails, rather
+            // than allowing a renderer-local failure object to masquerade as no local result.
+            val currentRequiredOutput = currentProcessingAttemptRequiredOutputFileForLease(
+                jobDir,
+                processingLease
+            )
+            if (currentRequiredOutput == null) {
+                result
+            } else {
+                result.copy(
+                    mergedRawFile = currentRequiredOutput,
+                    outputCommitted = true
+                )
+            }
+        }
         if (!exportProcessResult.success) cancellation.throwIfCancelled()
         // For NORMAL success, persist ONLY the post-export total pipeline timing + policy scalar
         // without clobbering the export coordinator's freshly-written terminal stage/status or
@@ -2586,10 +2638,12 @@ fun processRawFusionJob(
         }
         exportProcessResult
     } catch (ce: CancellationException) {
+        primaryFailure = ce
         // Cancellation propagates unchanged: never converted into a processor terminal failure
         // and never causes a metadata write from this processor.
         throw ce
     } catch (oom: OutOfMemoryError) {
+        primaryFailure = oom
         // OOM path: allocation-light. Use the current-run job if we have one, otherwise skip
         // owned-key cleanup (no current-run metadata to preserve). Do not re-read job.json.
         wrapMetadataIntegrityFailure(originalFailure = oom) {
@@ -2606,11 +2660,16 @@ fun processRawFusionJob(
         onStatus("RAW fusion stopped: insufficient memory. RAW cache kept.")
         throw oom
     } catch (mie: RawFusionMetadataIntegrityException) {
+        primaryFailure = mie
         // Metadata-integrity failure that already carries both the original processing failure
         // and the metadata persistence failure. Bypass ordinary processor-failure conversion so
         // it reaches the reprocess finalizer through terminalError with both failures intact.
         throw mie
+    } catch (fatal: Error) {
+        primaryFailure = fatal
+        throw fatal
     } catch (e: Exception) {
+        primaryFailure = e
         // Do not return failure without recording the current NORMAL/reprocess failure metadata.
         // Do not re-read job.json; use the current-run job assigned immediately after read.
         val failureMessage = "${e.javaClass.simpleName}: ${e.message}"
@@ -2625,11 +2684,33 @@ fun processRawFusionJob(
                 ownedKeys = ownedKeys
             )
         }
-        RawFusionProcessResult(false, null, null, null, null, failureMessage)
-    } finally {
-        if (ownsOperationLease && !processingLease.releaseIfProcessingSettled()) {
-            Log.e("KeplerRawFusion", "retaining processing lease after nested attempt settlement failure")
+        val currentOutput = try {
+            currentProcessingAttemptRequiredOutputFileForLease(jobDir, processingLease)
+        } catch (failure: Throwable) {
+            throw requireNotNull(combineSettlementFailure(e, failure))
         }
+        RawFusionProcessResult(
+            success = false,
+            mergedRawFile = currentOutput,
+            mergedDngFile = null,
+            previewPngFile = null,
+            finalPngFile = null,
+            errorMessage = failureMessage,
+            outputCommitted = currentOutput != null
+        )
+    } finally {
+        var cleanupFailure: Throwable? = null
+        if (ownsOperationLease) {
+            try {
+                if (!processingLease.releaseIfProcessingSettled()) {
+                    Log.e("KeplerRawFusion", "retaining processing lease after nested attempt settlement failure")
+                }
+            } catch (failure: Throwable) {
+                cleanupFailure = failure
+            }
+        }
+        val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+        if (combined !== primaryFailure) throw requireNotNull(combined)
     }
 }
 
@@ -3062,12 +3143,12 @@ internal fun loadRawRgbaBitmap(file: File, width: Int, height: Int): Bitmap {
         NoFollowFileSystem.copyVerified(file, NativeRgbaBitmapSink(bitmap, width, height))
         return bitmap
     } catch (failure: Throwable) {
+        var cleanupFailure: Throwable? = null
         try {
             bitmap.takeUnless { it.isRecycled }?.recycle()
         } catch (secondary: Throwable) {
-            try { failure.addSuppressed(secondary) } catch (_: Exception) { }
-            if (failure !is Error && secondary is Error) throw secondary
+            cleanupFailure = secondary
         }
-        throw failure
+        throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
     }
 }

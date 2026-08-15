@@ -119,6 +119,7 @@ fun captureProcessExportNightFusion(
                 var verified = false
                 var exportSettlementAttempted = false
                 var exportSettlementSucceeded = false
+                var primaryFailure: Throwable? = null
                 fun settleInterruptedExportForTerminal(
                     disposition: PublicExportInterruptionDisposition
                 ): OwnedPublicExportEvidence? {
@@ -181,20 +182,21 @@ fun captureProcessExportNightFusion(
                     val bitmap = NoFollowFileSystem.decodeBitmapVerified(finalFile)
                         ?: error("Could not decode final Night Fusion image.")
                     val displayNameBase = "Kepler_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}"
-                    val export = try {
-                        cancellation.throwIfCancelled()
-                        exportNightFusionBitmapToGallery(
-                            context = context,
-                            bitmap = bitmap,
-                            displayNameBase = displayNameBase,
-                            requestedFormat = requestedOutputFormat,
-                            cancellation = cancellation,
-                            jobDir = jobDir,
-                            ownerLease = pipelineLease
-                        )
-                    } finally {
-                        bitmap.recycle()
-                    }
+                    val export = withSettlementPrecedence(
+                        block = {
+                            cancellation.throwIfCancelled()
+                            exportNightFusionBitmapToGallery(
+                                context = context,
+                                bitmap = bitmap,
+                                displayNameBase = displayNameBase,
+                                requestedFormat = requestedOutputFormat,
+                                cancellation = cancellation,
+                                jobDir = jobDir,
+                                ownerLease = pipelineLease
+                            )
+                        },
+                        cleanup = { bitmap.recycle() }
+                    )
 
                     if (!export.success || export.uriString.isNullOrBlank()) {
                         updateExportFailure(
@@ -203,7 +205,8 @@ fun captureProcessExportNightFusion(
                             finalOutputFormat = finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
                             export = export,
-                            requiredOutputCommitted = requiredOutputCommitted
+                            requiredOutputCommitted = requiredOutputCommitted,
+                            operationLease = pipelineLease
                         )
                         post("PIPELINE_FAILED: Export failed; keeping cache. ${export.errorMessage}")
                         val currentPublicCommit = export.success && !export.uriString.isNullOrBlank()
@@ -244,7 +247,8 @@ fun captureProcessExportNightFusion(
                             finalOutputFormat = finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
                             ,export = export,
-                            requiredOutputCommitted = requiredOutputCommitted
+                            requiredOutputCommitted = requiredOutputCommitted,
+                            operationLease = pipelineLease
                         )
                         post("PIPELINE_FAILED: Export verification failed; keeping source frames.")
                         terminal.publish(
@@ -325,11 +329,23 @@ fun captureProcessExportNightFusion(
                             message = "Night Fusion export complete."
                         )
                     }
-                } catch (_: CancellationException) {
-                    requiredOutputCommitted = requiredOutputCommitted ||
-                        currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, pipelineLease)
+                } catch (cancelled: CancellationException) {
+                    primaryFailure = cancelled
+                    try {
+                        requiredOutputCommitted = requiredOutputCommitted ||
+                            currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, pipelineLease)
+                    } catch (failure: Throwable) {
+                        primaryFailure = combineSettlementFailure(primaryFailure, failure)
+                        if (primaryFailure is Error) throw primaryFailure!!
+                    }
                     post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
-                    val evidence = settleInterruptedExportForTerminal(PublicExportInterruptionDisposition.CANCELLED)
+                    val evidence = try {
+                        settleInterruptedExportForTerminal(PublicExportInterruptionDisposition.CANCELLED)
+                    } catch (failure: Throwable) {
+                        primaryFailure = combineSettlementFailure(primaryFailure, failure)
+                        if (primaryFailure is Error) throw primaryFailure!!
+                        null
+                    }
                     terminal.publish(
                         publicExportInterruptionTerminalKind(
                             evidence,
@@ -343,10 +359,26 @@ fun captureProcessExportNightFusion(
                         message = "Pipeline cancellation settled."
                     )
                 } catch (e: Exception) {
-                    requiredOutputCommitted = requiredOutputCommitted ||
-                        currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, pipelineLease)
+                    primaryFailure = e
+                    try {
+                        requiredOutputCommitted = requiredOutputCommitted ||
+                            currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, pipelineLease)
+                    } catch (failure: Throwable) {
+                        primaryFailure = combineSettlementFailure(primaryFailure, failure)
+                        if (primaryFailure is Error || primaryFailure is CancellationException) {
+                            throw primaryFailure!!
+                        }
+                    }
                     post("PIPELINE_FAILED: ${if (captureMode == CaptureMode.SINGLE_FRAME) "Single photo" else "Night Fusion"} pipeline failed; keeping cache.\n${e.stackTraceToString()}")
-                    val evidence = settleInterruptedExportForTerminal(PublicExportInterruptionDisposition.FAILED)
+                    val evidence = try {
+                        settleInterruptedExportForTerminal(PublicExportInterruptionDisposition.FAILED)
+                    } catch (failure: Throwable) {
+                        primaryFailure = combineSettlementFailure(primaryFailure, failure)
+                        if (primaryFailure is Error || primaryFailure is CancellationException) {
+                            throw primaryFailure!!
+                        }
+                        null
+                    }
                     terminal.publish(
                         publicExportInterruptionTerminalKind(
                             evidence,
@@ -359,7 +391,11 @@ fun captureProcessExportNightFusion(
                         verified = evidence?.verified ?: verified,
                         message = e.message
                     )
+                } catch (fatal: Error) {
+                    primaryFailure = fatal
+                    throw fatal
                 } finally {
+                    var cleanupFailure: Throwable? = null
                     if (!exportSettlementAttempted) {
                         try {
                             exportSettlementAttempted = true
@@ -371,23 +407,34 @@ fun captureProcessExportNightFusion(
                             disposition = PublicExportInterruptionDisposition.FAILED
                             )
                             if (settled) exportSettlementSucceeded = true
-                        } catch (failure: Error) {
-                            throw failure
-                        } catch (settlementFailure: Exception) {
+                        } catch (settlementFailure: Throwable) {
+                            cleanupFailure = combineSettlementFailure(cleanupFailure, settlementFailure)
                             android.util.Log.e("KeplerYuvPipeline", "public export owner settlement failed", settlementFailure)
                         }
                     }
-                    if (exportSettlementSucceeded) {
-                        if (!pipelineLease.releaseIfProcessingSettled()) {
-                            android.util.Log.e(
-                                "KeplerYuvPipeline",
-                                "retaining processing lease after durable attempt settlement failure"
-                            )
+                    try {
+                        if (exportSettlementSucceeded) {
+                            if (!pipelineLease.releaseIfProcessingSettled()) {
+                                android.util.Log.e(
+                                    "KeplerYuvPipeline",
+                                    "retaining processing lease after durable attempt settlement failure"
+                                )
+                            }
+                        } else {
+                            android.util.Log.e("KeplerYuvPipeline", "retaining public export lease after settlement failure")
                         }
-                    } else {
-                        android.util.Log.e("KeplerYuvPipeline", "retaining public export lease after settlement failure")
+                    } catch (failure: Throwable) {
+                        cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
                     }
-                    workerThread.quitSafely()
+                    try {
+                        workerThread.quitSafely()
+                    } catch (failure: Throwable) {
+                        cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+                    }
+                    val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+                    if (combined is Error && combined !== primaryFailure) {
+                        throw combined
+                    }
                 }
             } } catch (failure: Error) {
                 throw failure
@@ -466,6 +513,27 @@ internal fun reprocessYuvJob(
         var committedExport: GalleryExportResult? = null
         var terminalDisposition = ReprocessTerminalDisposition.UNCOMMITTED_FAILURE
         var finalOutputFile: File? = null
+        fun currentAttemptHasLocalResult(): Boolean {
+            return try {
+                if (operationLease != null) {
+                    currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, operationLease)
+                } else {
+                    // A returned file belongs to this invocation. Without the outer lease there
+                    // is no safe attempt identity to use for a post-throw metadata lookup, so an
+                    // older pathname is never treated as a new reprocess result.
+                    val file = finalOutputFile ?: return false
+                    file.isFile && file.length() > 0L
+                }
+            } catch (failure: Throwable) {
+                val combined = combineSettlementFailure(terminalResult.exceptionOrNull(), failure)
+                if (combined is Error) {
+                    fatalReprocessFailure = combined
+                } else if (combined is CancellationException) {
+                    terminalResult = Result.failure(combined)
+                }
+                false
+            }
+        }
         try {
             cancellation.throwIfCancelled()
             if (selectedFrameIndices != null) {
@@ -526,21 +594,22 @@ internal fun reprocessYuvJob(
             val bitmap = NoFollowFileSystem.decodeBitmapVerified(finalFile)
                 ?: error("Could not decode reprocessed YUV image.")
             val requestedFormat = requestedOutputFormatForSetting(finalOutputFormat)
-            val export = try {
-                exportNightFusionBitmapToGallery(
-                    context = context,
-                    bitmap = bitmap,
-                    displayNameBase = "Kepler_YUV_REPROCESS_${
-                        SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-                    }",
-                    requestedFormat = requestedFormat,
-                    cancellation = cancellation,
-                    jobDir = jobDir,
-                    ownerLease = operationLease
-                )
-            } finally {
-                bitmap.recycle()
-            }
+            val export = withSettlementPrecedence(
+                block = {
+                    exportNightFusionBitmapToGallery(
+                        context = context,
+                        bitmap = bitmap,
+                        displayNameBase = "Kepler_YUV_REPROCESS_${
+                            SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                        }",
+                        requestedFormat = requestedFormat,
+                        cancellation = cancellation,
+                        jobDir = jobDir,
+                        ownerLease = operationLease
+                    )
+                },
+                cleanup = { bitmap.recycle() }
+            )
             if (!export.success || export.uriString.isNullOrBlank()) {
                 error(export.errorMessage ?: "YUV export failed")
             }
@@ -561,7 +630,7 @@ internal fun reprocessYuvJob(
         } catch (ce: kotlinx.coroutines.CancellationException) {
             post("PIPELINE_CANCELLED: YUV reprocess cancelled; source frames kept.")
             terminalResult = Result.failure(ce)
-            terminalDisposition = if (finalOutputFile?.isFile == true && finalOutputFile.length() > 0L) {
+            terminalDisposition = if (currentAttemptHasLocalResult()) {
                 ReprocessTerminalDisposition.COMMITTED_PARTIAL
             } else {
                 ReprocessTerminalDisposition.CANCELLED
@@ -570,17 +639,27 @@ internal fun reprocessYuvJob(
             post("PIPELINE_FAILED: YUV reprocess failed; cache kept. out of memory")
             fatalReprocessFailure = oom
             terminalResult = Result.success(Unit)
-            if (finalOutputFile?.isFile == true && finalOutputFile.length() > 0L) {
+            if (currentAttemptHasLocalResult()) {
                 terminalDisposition = ReprocessTerminalDisposition.COMMITTED_PARTIAL
             }
         } catch (e: Exception) {
             post("PIPELINE_FAILED: YUV reprocess failed; cache kept. ${e.message}")
             terminalResult = Result.failure(e)
-            if (finalOutputFile?.isFile == true && finalOutputFile.length() > 0L) {
+            if (currentAttemptHasLocalResult()) {
                 terminalDisposition = ReprocessTerminalDisposition.COMMITTED_PARTIAL
             }
         } finally {
-            workerThread.quitSafely()
+            var cleanupFailure: Throwable? = null
+            try {
+                workerThread.quitSafely()
+            } catch (failure: Throwable) {
+                cleanupFailure = failure
+            }
+            val primaryFailure = fatalReprocessFailure ?: terminalResult.exceptionOrNull()
+            val combinedFailure = combineSettlementFailure(primaryFailure, cleanupFailure)
+            if (combinedFailure is Error) {
+                fatalReprocessFailure = combinedFailure
+            }
             terminal.complete(
                 ReprocessWorkerOutcome(
                     result = terminalResult,
@@ -598,20 +677,35 @@ internal fun reprocessYuvJob(
         fatalReprocessFailure?.let { throw it }
         })
     } catch (failure: Error) {
-        workerThread.quitSafely()
-        throw failure
+        var cleanupFailure: Throwable? = null
+        try {
+            workerThread.quitSafely()
+        } catch (secondary: Throwable) {
+            cleanupFailure = secondary
+        }
+        throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
     } catch (_: Exception) {
         false
     }
     if (!workerPosted) {
-        workerThread.quitSafely()
+        val failure = IllegalStateException("YUV reprocess worker could not start")
+        var cleanupFailure: Throwable? = null
+        try {
+            workerThread.quitSafely()
+        } catch (secondary: Throwable) {
+            cleanupFailure = secondary
+        }
+        val terminalFailure = combineSettlementFailure(failure, cleanupFailure)
+        if (terminalFailure is Error || terminalFailure is CancellationException) {
+            throw terminalFailure
+        }
         terminal.complete(
             ReprocessWorkerOutcome(
-                result = Result.failure(IllegalStateException("YUV reprocess worker could not start")),
+                result = Result.failure(terminalFailure ?: failure),
                 publicExportCommitted = false,
                 exportVerified = false,
                 disposition = ReprocessTerminalDisposition.UNCOMMITTED_FAILURE,
-                terminalError = IllegalStateException("YUV reprocess worker could not start")
+                terminalError = terminalFailure ?: failure
             )
         )
     }

@@ -581,6 +581,8 @@ selectionMode = resolveSelectionMode(job, frameSelection)
         job = job,
         jobKind = kind
     ).getOrElse { backupError ->
+        if (backupError is kotlinx.coroutines.CancellationException) throw backupError
+        if (backupError is Error) throw backupError
         writeReprocessFailure(target, "Required reprocess backup failed: ${backupError.message}")
         return@withContext Result.failure(backupError)
     }
@@ -815,7 +817,9 @@ private fun settleTerminalResult(
             acquisition.outcome?.let { Result.success(it) }
                 ?: Result.failure(
                     combineCause(
-                        IllegalStateException("Worker exited after cancellation with no outcome."),
+                        kotlinx.coroutines.CancellationException(
+                            "Worker exited after cancellation with no outcome."
+                        ),
                         acquisition.cancelFailure
                     )
                 )
@@ -1068,6 +1072,9 @@ internal suspend fun runLateFinalization(handoff: ReprocessLateFinalizationHando
         outcome = if (resolved != null) {
             resolved
         } else if (completionCause != null) {
+            if (completionCause is kotlinx.coroutines.CancellationException || completionCause is Error) {
+                throw completionCause
+            }
             Result.failure<ReprocessWorkerOutcome>(
                 combineCause(
                     IllegalStateException("Reprocess late finalization after completion cause."),
@@ -1564,15 +1571,37 @@ internal fun finalizeTransaction(
         Result.failure(IllegalStateException("Operation lease owner mismatch during finalization"))
     )
 
+    val currentAttemptLocalOutput = try {
+        currentProcessingAttemptRequiredOutputFileForLease(jobDir, ownedLease)
+    } catch (failure: Throwable) {
+        val priorFailure = outcome.terminalError ?: terminal.exceptionOrNull()
+        val combined = combineSettlementFailure(priorFailure, failure)
+        if (combined is Error || combined is CancellationException) throw combined
+        null
+    }
+    val currentAttemptHasLocalResult = currentAttemptLocalOutput != null
     val hasUsableOutput = outcome.publicExportCommitted || outcome.exportVerified ||
-        (outcome.finalOutputFile?.isFile == true && outcome.finalOutputFile.length() > 0L)
+        (outcome.finalOutputFile?.isFile == true && outcome.finalOutputFile.length() > 0L) ||
+        currentAttemptHasLocalResult
     val shouldCommit = (outcome.disposition == ReprocessTerminalDisposition.VERIFIED_SUCCESS ||
         outcome.disposition == ReprocessTerminalDisposition.COMMITTED_PARTIAL ||
-        outcome.publicExportCommitted) && hasUsableOutput
+        outcome.publicExportCommitted || currentAttemptHasLocalResult) && hasUsableOutput
 
     return if (shouldCommit) {
         val finalOutcome: Result<KeplerReprocessResult> = try {
-            Result.success(finalizeReprocessOutcome(jobDir, jobKind, outputSettings, selectionMode, includedFrameIndices, outcome, transaction))
+            Result.success(
+                finalizeReprocessOutcome(
+                    jobDir,
+                    jobKind,
+                    outputSettings,
+                    selectionMode,
+                    includedFrameIndices,
+                    outcome,
+                    transaction,
+                    currentAttemptLocalResult = currentAttemptHasLocalResult,
+                    currentAttemptLocalOutput = currentAttemptLocalOutput
+                )
+            )
         } catch (e: OutOfMemoryError) { throw e
         } catch (e: ThreadDeath) { throw e
         } catch (e: LinkageError) { throw e
@@ -2040,11 +2069,15 @@ private fun finalizeReprocessOutcome(
     selectionMode: FrameSelectionMode,
     includedFrameIndices: Set<Int>,
     outcome: ReprocessWorkerOutcome,
-    transaction: ReprocessTransaction
+    transaction: ReprocessTransaction,
+    currentAttemptLocalResult: Boolean = false,
+    currentAttemptLocalOutput: File? = null
 ): KeplerReprocessResult {
-    val finalFile = outcome.finalOutputFile?.takeIf { it.isFile && it.length() > 0L }
+    val finalFile = (outcome.finalOutputFile ?: currentAttemptLocalOutput)
+        ?.takeIf { it.isFile && it.length() > 0L }
     val previewFile = outcome.previewFile?.takeIf { it.isFile && it.length() > 0L } ?: finalFile
-    val uncommittedNoOutput = outcome.result.isSuccess && !outcome.publicExportCommitted && finalFile?.isFile != true
+    val uncommittedNoOutput = outcome.result.isSuccess && !outcome.publicExportCommitted &&
+        finalFile?.isFile != true && !currentAttemptLocalResult
     if (uncommittedNoOutput && (previewFile == null || previewFile == finalFile)) {
         throw IllegalStateException("Reprocess completed without a final output file.")
     }
@@ -2052,13 +2085,28 @@ private fun finalizeReprocessOutcome(
         ?: outcome.export?.fileSizeBytes?.takeIf { it > 0L }
         ?: finalFile?.length()
         ?: 0L
-    val verifiedSuccess = outcome.result.isSuccess && outcome.exportVerified
-    val publicOnlyWithoutPreview = verifiedSuccess && outcome.publicExportCommitted && finalFile == null && previewFile == null
     val displayFile = finalFile ?: previewFile
     val publicOutcome = outcome.publicOutcome
+    val rawPolicy = publicOutcome?.let {
+        deriveRawFusionOutcomePolicy(
+            outcome = it,
+            cancellationRequested = outcome.postExportCancellationRequested || it.postExportCancellationRequested,
+            currentLocalOutput = it.currentLocalOutput ?: finalFile,
+            currentAttemptLocalResult = currentAttemptLocalResult ||
+                (outcome.result.isSuccess && finalFile?.isFile == true && it.base.outputCommitted)
+        )
+    }
+    val verifiedSuccess = if (rawPolicy != null) {
+        rawPolicy.durablePipelineStage == "COMPLETE"
+    } else {
+        outcome.result.isSuccess && outcome.exportVerified
+    }
+    val publicOnlyWithoutPreview = verifiedSuccess && outcome.publicExportCommitted && finalFile == null && previewFile == null
     val sidecarResult = publicOutcome?.sidecar ?: outcome.sidecar
-    val postExportCancellation = outcome.postExportCancellationRequested
-    val postExportWorkSkipped = outcome.postExportWorkSkipped
+    val postExportCancellation = outcome.postExportCancellationRequested ||
+        (publicOutcome?.postExportCancellationRequested == true)
+    val postExportWorkSkipped = outcome.postExportWorkSkipped ||
+        (publicOutcome?.postExportWorkSkipped == true)
     val currentWarning = publicOutcome?.currentWarning
     if (verifiedSuccess && !publicOnlyWithoutPreview) {
         writeReprocessSuccess(
@@ -2125,32 +2173,35 @@ internal fun writeBoundedReprocessPreview(jobDir: File, source: Bitmap): File {
     } else source
     val preview = File(jobDir, "$REPROCESS_PREVIEW_PREFIX${System.currentTimeMillis()}.png")
     val temp = File(preview.parentFile, ".${preview.name}.${System.nanoTime()}.tmp")
+    var primaryFailure: Throwable? = null
     try {
         temp.write { output -> check(scaled.compress(Bitmap.CompressFormat.PNG, 92, output)) { "Reprocess preview compress failed." } }
         KeplerJobMetadata.atomicReplace(temp, preview)
-    } catch (compressFailure: Exception) {
-        if (temp.exists()) {
-            try {
-                temp.delete()
-            } catch (fatal: Error) {
-                fatal.addSuppressed(compressFailure)
-                throw fatal
-            } catch (cleanupFailure: Exception) {
-                compressFailure.addSuppressed(cleanupFailure)
-            }
-        }
-        throw compressFailure
+    } catch (failure: Throwable) {
+        primaryFailure = failure
+        throw failure
     } finally {
+        var cleanupFailure: Throwable? = null
         if (temp.exists()) {
             try {
                 temp.delete()
             } catch (fatal: Error) {
-                throw fatal
-            } catch (_: Exception) {
-                // The terminal result is already selected; ordinary temp cleanup remains best effort.
+                cleanupFailure = fatal
+            } catch (failure: Exception) {
+                cleanupFailure = failure
             }
         }
-        if (scaled !== source && !scaled.isRecycled) scaled.recycle()
+        try {
+            if (scaled !== source && !scaled.isRecycled) scaled.recycle()
+        } catch (failure: Throwable) {
+            cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+        }
+        val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+        if (combined !== primaryFailure &&
+            (primaryFailure != null || combined is Error || combined is CancellationException)
+        ) {
+            throw requireNotNull(combined)
+        }
     }
     return preview.takeIf { it.isFile && it.length() > 0L } ?: error("Reprocess preview write produced no file.")
 }
@@ -3401,25 +3452,28 @@ internal fun backupReprocessTransaction(
         // Pre-ACTIVE caller cancellation: do not write ordinary failure metadata, do not create
         // an ACTIVE transaction after cancellation, do not convert cancellation into rollback.
         // Partial backup artifacts are cleaned best-effort under a narrow non-fatal boundary.
+        var cleanupFailure: Throwable? = null
         try {
             root.listFiles()?.forEach { it.delete() }
             if (root.exists()) root.delete()
-        } catch (oom: OutOfMemoryError) { throw oom }
-        catch (td: ThreadDeath) { throw td }
-        catch (le: LinkageError) { throw le }
-        catch (ie: InternalError) { throw ie }
-        catch (fatal: Error) { throw fatal }
-        catch (_: Exception) { /* best-effort partial cleanup; cancellation is the caller's error */ }
-        throw e
+        } catch (failure: Throwable) {
+            cleanupFailure = failure
+        }
+        throw requireNotNull(combineSettlementFailure(e, cleanupFailure))
     } catch (e: OutOfMemoryError) { throw e
     } catch (e: ThreadDeath) { throw e
     } catch (e: LinkageError) { throw e
     } catch (e: InternalError) { throw e
     } catch (e: Error) { throw e
     } catch (e: Exception) {
-        root.listFiles()?.forEach { it.delete() }
-        if (root.exists()) root.delete()
-        Result.failure(e)
+        var cleanupFailure: Throwable? = null
+        try {
+            root.listFiles()?.forEach { it.delete() }
+            if (root.exists()) root.delete()
+        } catch (failure: Throwable) {
+            cleanupFailure = failure
+        }
+        Result.failure(requireNotNull(combineSettlementFailure(e, cleanupFailure)))
     }
 }
 
@@ -3432,6 +3486,7 @@ internal fun backupReprocessTransaction(
  * The durable manifest is authoritative; corrupt/missing evidence never falls back to the in-memory snapshot.
  */
 internal fun restoreBackups(jobDir: File, transaction: ReprocessTransaction): Result<Unit> {
+    var primaryFailure: Throwable? = null
     return try {
     val root = transaction.backupRoot.canonicalFile
     if (!root.isDirectory) throw IllegalStateException("Backup root missing for rollback")
@@ -3496,20 +3551,23 @@ internal fun restoreBackups(jobDir: File, transaction: ReprocessTransaction): Re
         jobJsonLast.forEach { stagedRestore ->
             KeplerJobMetadata.atomicReplace(stagedRestore.temp, stagedRestore.restore.target)
         }
+    } catch (failure: Throwable) {
+        primaryFailure = failure
+        throw failure
     } finally {
         // Clean up any remaining temp files best-effort. Cancellation/fatal Errors propagate unchanged.
+        var cleanupFailure: Throwable? = null
         staged.forEach {
             if (it.temp.exists()) {
-                try { it.temp.delete() }
-                catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-                catch (oom: OutOfMemoryError) { throw oom }
-                catch (td: ThreadDeath) { throw td }
-                catch (le: LinkageError) { throw le }
-                catch (ie: InternalError) { throw ie }
-                catch (e: Error) { throw e }
-                catch (_: Exception) { /* best-effort temp cleanup; rollback already validated */ }
+                try {
+                    it.temp.delete()
+                } catch (failure: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+                }
             }
         }
+        val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+        if (combined !== primaryFailure) throw requireNotNull(combined)
     }
     Result.success(Unit)
     } catch (e: OutOfMemoryError) { throw e

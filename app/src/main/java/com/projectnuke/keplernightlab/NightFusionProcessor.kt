@@ -27,14 +27,18 @@ private data class LoadedColorFrame(
     val timestampNs: Long?
 )
 
-private fun recycleLoadedColorFrames(frames: List<LoadedColorFrame>) {
+private fun recycleLoadedColorFrames(frames: List<LoadedColorFrame>): Throwable? {
+    var cleanupFailure: Throwable? = null
     frames.forEach { frame ->
-        runCatching {
+        try {
             if (!frame.bitmap.isRecycled) {
                 frame.bitmap.recycle()
             }
+        } catch (failure: Throwable) {
+            cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
         }
     }
+    return cleanupFailure
 }
 
 private inline fun <T> withLoadedColorFrames(
@@ -43,10 +47,16 @@ private inline fun <T> withLoadedColorFrames(
     block: (List<LoadedColorFrame>) -> T
 ): T {
     val frames = loadColorFrames(jobDir, job)
+    var primaryFailure: Throwable? = null
     return try {
         block(frames)
+    } catch (failure: Throwable) {
+        primaryFailure = failure
+        throw failure
     } finally {
-        recycleLoadedColorFrames(frames)
+        val cleanupFailure = recycleLoadedColorFrames(frames)
+        val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+        if (combined !== primaryFailure) throw requireNotNull(combined)
     }
 }
 
@@ -118,6 +128,7 @@ fun processLatestNightFusionV02(
         var jobDir: File? = null
         var operationLease: JobOperationLease? = null
         var requiredOutputCommitted = false
+        var primaryFailure: Throwable? = null
         try {
             cancellation.throwIfCancelled()
             jobDir = findLatestColorBurstJobDir(context)
@@ -138,17 +149,33 @@ fun processLatestNightFusionV02(
             )
             requiredOutputCommitted = requiredOutputCommittedAfterProcessing(jobDir!!, operationLease)
             cancellation.throwIfCancelled()
+            val exactOperationId = operationLease.currentDurableOperationId()
+            KeplerJobMetadata.update(jobDir!!) { job ->
+                job.put("currentPipelineStage", "COMPLETE")
+                    .put("processStatus", "PIPELINE_COMPLETE")
+                    .put("userCanMoveDevice", true)
+                exactOperationId?.takeIf { job.optString(ACTIVE_OPERATION_ID) == it }?.let {
+                    job.put(TERMINAL_OPERATION_ID, it)
+                }
+            }
             postTerminal(
                 CameraPipelineEvent.Terminal.Kind.COMPLETE,
                 "PIPELINE_COMPLETE: YUV Night Fusion processing complete.",
                 requiredOutputCommitted = requiredOutputCommitted
             )
-        } catch (_: CancellationException) {
-            requiredOutputCommitted = requiredOutputCommitted || jobDir?.let {
-                currentProcessingAttemptHasRequiredOutputClaimForLease(it, operationLease)
-            } == true
+        } catch (cancelled: CancellationException) {
+            primaryFailure = cancelled
+            try {
+                requiredOutputCommitted = requiredOutputCommitted || jobDir?.let {
+                    currentProcessingAttemptHasRequiredOutputClaimForLease(it, operationLease)
+                } == true
+            } catch (failure: Throwable) {
+                primaryFailure = combineSettlementFailure(primaryFailure, failure)
+                if (primaryFailure is Error) throw primaryFailure!!
+            }
             val targetDir = jobDir
             if (targetDir != null) {
+                val exactOperationId = operationLease?.currentDurableOperationId()
                 try {
                     KeplerJobMetadata.update(targetDir) { job ->
                         job.put("currentPipelineStage", if (requiredOutputCommitted) "PARTIAL" else "CANCELLED")
@@ -163,10 +190,15 @@ fun processLatestNightFusionV02(
                             .put("processingCancellationType", CancellationException::class.java.name)
                             .put("processingCancellationMessage", "YUV Night Fusion processing cancelled")
                             .put("userCanMoveDevice", true)
+                        exactOperationId?.takeIf { job.optString(ACTIVE_OPERATION_ID) == it }?.let {
+                            job.put(TERMINAL_OPERATION_ID, it)
+                        }
                     }
-                } catch (failure: Error) {
-                    throw failure
-                } catch (failure: Exception) {
+                } catch (failure: Throwable) {
+                    primaryFailure = combineSettlementFailure(primaryFailure, failure)
+                    if (primaryFailure is Error || primaryFailure is CancellationException) {
+                        throw primaryFailure!!
+                    }
                     Log.e("KeplerYuvPipeline", "failed to persist processing cancellation metadata", failure)
                 }
             }
@@ -180,15 +212,24 @@ fun processLatestNightFusionV02(
                 requiredOutputCommitted = requiredOutputCommitted
             )
         } catch (e: Exception) {
-            requiredOutputCommitted = requiredOutputCommitted || jobDir?.let {
-                currentProcessingAttemptHasRequiredOutputClaimForLease(it, operationLease)
-            } == true
+            primaryFailure = e
+            try {
+                requiredOutputCommitted = requiredOutputCommitted || jobDir?.let {
+                    currentProcessingAttemptHasRequiredOutputClaimForLease(it, operationLease)
+                } == true
+            } catch (failure: Throwable) {
+                primaryFailure = combineSettlementFailure(primaryFailure, failure)
+                if (primaryFailure is Error || primaryFailure is CancellationException) {
+                    throw primaryFailure!!
+                }
+            }
             Log.e("KeplerYuvPipeline", "PIPELINE_FAILED in processLatestNightFusionV02", e)
             try {
                 val targetDir = jobDir ?: findLatestColorBurstJobDir(context)
                 if (targetDir != null) {
+                    val exactOperationId = operationLease?.currentDurableOperationId()
                     KeplerJobMetadata.update(targetDir) { job ->
-                        job.put("currentPipelineStage", if (requiredOutputCommitted) "PARTIAL" else "PIPELINE_FAILED")
+                        job.put("currentPipelineStage", if (requiredOutputCommitted) "PARTIAL" else "FAILED")
                             .put(
                                 "processStatus",
                                 if (requiredOutputCommitted) {
@@ -203,11 +244,16 @@ fun processLatestNightFusionV02(
                             .put("pipelineFailureMessage", e.shortMessage())
                             .put("pipelineFailureStackTrace", e.stackTraceToString())
                             .put("updatedAt", System.currentTimeMillis())
+                        exactOperationId?.takeIf { job.optString(ACTIVE_OPERATION_ID) == it }?.let {
+                            job.put(TERMINAL_OPERATION_ID, it)
+                        }
                     }
                 }
-            } catch (failure: Error) {
-                throw failure
-            } catch (failure: Exception) {
+            } catch (failure: Throwable) {
+                primaryFailure = combineSettlementFailure(primaryFailure, failure)
+                if (primaryFailure is Error || primaryFailure is CancellationException) {
+                    throw primaryFailure!!
+                }
                 Log.e("KeplerYuvPipeline", "failed to persist processing failure metadata", failure)
             }
             postTerminal(
@@ -219,16 +265,35 @@ fun processLatestNightFusionV02(
                 "PIPELINE_FAILED: YUV Night Fusion failed: ${e.shortMessage()}; cache kept. See logcat/job.json for details.",
                 requiredOutputCommitted = requiredOutputCommitted
             )
+        } catch (fatal: Error) {
+            primaryFailure = fatal
+            throw fatal
         } finally {
-            if (operationLease?.releaseIfProcessingSettled() == false) {
-                Log.e("KeplerYuvPipeline", "retaining processing lease after durable attempt settlement failure")
+            var cleanupFailure: Throwable? = null
+            try {
+                if (operationLease?.releaseIfProcessingSettled() == false) {
+                    Log.e("KeplerYuvPipeline", "retaining processing lease after durable attempt settlement failure")
+                }
+            } catch (failure: Throwable) {
+                cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
             }
-            workerThread.quitSafely()
+            try {
+                workerThread.quitSafely()
+            } catch (failure: Throwable) {
+                cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+            }
+            val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+            if (combined !== primaryFailure) throw requireNotNull(combined)
         }
         })
     } catch (failure: Error) {
-        workerThread.quitSafely()
-        throw failure
+        var cleanupFailure: Throwable? = null
+        try {
+            workerThread.quitSafely()
+        } catch (secondary: Throwable) {
+            cleanupFailure = secondary
+        }
+        throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
     } catch (failure: Exception) {
         Log.e("KeplerYuvPipeline", "worker dispatch failed", failure)
         false
