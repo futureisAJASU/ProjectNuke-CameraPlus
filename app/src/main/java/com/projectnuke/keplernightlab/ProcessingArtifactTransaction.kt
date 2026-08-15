@@ -7,6 +7,7 @@ import java.nio.file.LinkOption
 import java.nio.file.StandardCopyOption
 import java.nio.file.AtomicMoveNotSupportedException
 import java.util.UUID
+import java.util.concurrent.CancellationException
 import org.json.JSONObject
 
 internal class ProcessingArtifactSimulatedCrashForTest : Error("simulated process death")
@@ -50,6 +51,9 @@ internal enum class ProcessingArtifactSettlementStatus {
 
 @Volatile
 internal var processingArtifactDeleteFailureForTest: Boolean = false
+
+@Volatile
+internal var processingArtifactDeleteErrorForTest: Error? = null
 
 internal data class ProcessingArtifactSettlementRecord(
     val path: File,
@@ -134,6 +138,7 @@ internal fun settleProcessingArtifactPath(
                 IllegalStateException("Injected processing artifact cleanup failure")
             )
         }
+        processingArtifactDeleteErrorForTest?.let { throw it }
         if (!Files.exists(file.toPath(), LinkOption.NOFOLLOW_LINKS)) {
             ProcessingArtifactSettlementRecord(file, role, ProcessingArtifactSettlementStatus.ABSENT)
         } else if (Files.isSymbolicLink(file.toPath())) {
@@ -149,7 +154,11 @@ internal fun settleProcessingArtifactPath(
                 IllegalStateException("Could not delete artifact ${file.absolutePath}")
             )
         }
-    } catch (failure: Throwable) {
+    } catch (failure: CancellationException) {
+        throw failure
+    } catch (failure: Error) {
+        throw failure
+    } catch (failure: Exception) {
         ProcessingArtifactSettlementRecord(file, role, ProcessingArtifactSettlementStatus.DELETE_FAILED, failure)
     }
 }
@@ -175,6 +184,7 @@ internal fun commitProcessingArtifact(
     var priorBackedUp = false
     var newFinalCommitted = false
     var priorRestored = false
+    var finalAdopted = false
     var journal = ProcessingArtifactJournal.create(
         jobDir = parent,
         transactionId = UUID.randomUUID().toString(),
@@ -235,10 +245,14 @@ internal fun commitProcessingArtifact(
 
         if (existingRegularArtifact(finalFile)) {
             val priorEvidence = NoFollowFileSystem.digestVerified(finalFile)
-            val priorSemanticEvidence = runCatching {
+            val priorSemanticEvidence = try {
                 verifyFinal(finalFile)
                 true
-            }.getOrDefault(false)
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                false
+            }
             journal = journal.transition(
                 parent,
                 ProcessingArtifactJournalState.PRIOR_BACKED_UP,
@@ -271,6 +285,7 @@ internal fun commitProcessingArtifact(
             ProcessingArtifactSettlementStatus.ADOPTED
         )
         state = ProcessingArtifactState.ADOPTED
+        finalAdopted = true
         journalTransition(ProcessingArtifactJournalState.ADOPTED, adoptedResult = "NEW_FINAL", claimKey = claimKey)
 
         if (priorBackedUp) {
@@ -309,10 +324,89 @@ internal fun commitProcessingArtifact(
         return result
     } catch (failure: Throwable) {
         if (failure is ProcessingArtifactSimulatedCrashForTest) throw failure
-        runCatching { journalTransition(ProcessingArtifactJournalState.ROLLBACK_STARTED) }
+        // ADOPTED is a durable ownership boundary.  Optional cleanup or
+        // settlement failures after it must retain the current final and the
+        // journal evidence; this is not a rollback cut.
+        if (finalAdopted) {
+            val adoptedCleanup = mutableListOf<ProcessingArtifactSettlementRecord>()
+            var fatalAdoptedCleanupFailure: Error? = null
+            var cancellationAdoptedCleanupFailure: CancellationException? = null
+            try {
+                adoptedCleanup += settleProcessingArtifactPath(temp, ProcessingArtifactResourceRole.TEMPORARY)
+            } catch (secondary: Throwable) {
+                if (secondary !== failure) {
+                    if (secondary is Error && failure !is Error) {
+                        secondary.addSuppressed(failure)
+                        fatalAdoptedCleanupFailure = secondary
+                    } else if (secondary is CancellationException && failure !is Error && failure !is CancellationException) {
+                        secondary.addSuppressed(failure)
+                        cancellationAdoptedCleanupFailure = secondary
+                    } else {
+                        failure.addSuppressed(secondary)
+                    }
+                }
+                adoptedCleanup += ProcessingArtifactSettlementRecord(
+                    temp,
+                    ProcessingArtifactResourceRole.TEMPORARY,
+                    ProcessingArtifactSettlementStatus.DELETE_FAILED,
+                    secondary
+                )
+            }
+            val adoptedSettlements = settlements + adoptedCleanup
+            val adoptedCleanupFailure = adoptedSettlements.firstOrNull { it.failure != null }?.failure
+            state = ProcessingArtifactState.CLEANUP_FAILED
+            notifySettlement(
+                ProcessingArtifactSettlementReport(
+                    state = state,
+                    settlements = adoptedSettlements,
+                    cleanupFailure = adoptedCleanupFailure,
+                    hadPriorFinal = priorBackedUp,
+                    priorFinalRestored = false
+                )
+            )
+            if (failure is Error || failure is java.util.concurrent.CancellationException) throw failure
+            fatalAdoptedCleanupFailure?.let { throw it }
+            cancellationAdoptedCleanupFailure?.let { throw it }
+            throw ProcessingArtifactException(
+                finalFile = finalFile,
+                tempFile = temp,
+                cleanupFailure = adoptedCleanupFailure,
+                cause = failure,
+                settlements = adoptedSettlements,
+                priorBackupFile = priorBackup.takeIf { priorBackedUp && it.exists() }
+            )
+        }
+        var fatalRollbackFailure: Error? = null
+        var cancellationRollbackFailure: CancellationException? = null
+        fun captureRollbackFailure(secondary: Throwable) {
+            if (secondary is Error && secondary !== failure) {
+                if (failure is Error) failure.addSuppressed(secondary)
+                else secondary.addSuppressed(failure)
+                if (fatalRollbackFailure == null) fatalRollbackFailure = secondary
+            } else if (secondary is CancellationException && secondary !== failure) {
+                if (failure is Error || failure is CancellationException) failure.addSuppressed(secondary)
+                else secondary.addSuppressed(failure)
+                if (cancellationRollbackFailure == null) cancellationRollbackFailure = secondary
+            }
+        }
+        try {
+            journalTransition(ProcessingArtifactJournalState.ROLLBACK_STARTED)
+        } catch (secondary: Throwable) {
+            captureRollbackFailure(secondary)
+        }
         val cleanupRecords = mutableListOf<ProcessingArtifactSettlementRecord>()
         if (newFinalCommitted) {
-            cleanupRecords += settleProcessingArtifactPath(finalFile, ProcessingArtifactResourceRole.NEW_FINAL)
+            try {
+                cleanupRecords += settleProcessingArtifactPath(finalFile, ProcessingArtifactResourceRole.NEW_FINAL)
+            } catch (secondary: Throwable) {
+                captureRollbackFailure(secondary)
+                cleanupRecords += ProcessingArtifactSettlementRecord(
+                    finalFile,
+                    ProcessingArtifactResourceRole.NEW_FINAL,
+                    ProcessingArtifactSettlementStatus.DELETE_FAILED,
+                    secondary
+                )
+            }
         } else {
             cleanupRecords += ProcessingArtifactSettlementRecord(
                 finalFile,
@@ -320,7 +414,17 @@ internal fun commitProcessingArtifact(
                 ProcessingArtifactSettlementStatus.NOT_ATTEMPTED
             )
         }
-        cleanupRecords += settleProcessingArtifactPath(temp, ProcessingArtifactResourceRole.TEMPORARY)
+        try {
+            cleanupRecords += settleProcessingArtifactPath(temp, ProcessingArtifactResourceRole.TEMPORARY)
+        } catch (secondary: Throwable) {
+            captureRollbackFailure(secondary)
+            cleanupRecords += ProcessingArtifactSettlementRecord(
+                temp,
+                ProcessingArtifactResourceRole.TEMPORARY,
+                ProcessingArtifactSettlementStatus.DELETE_FAILED,
+                secondary
+            )
+        }
 
         if (priorBackedUp) {
             var restoreMoveSucceeded = false
@@ -328,6 +432,7 @@ internal fun commitProcessingArtifact(
                 move(priorBackup, finalFile)
                 restoreMoveSucceeded = true
             } catch (restoreMoveFailure: Throwable) {
+                captureRollbackFailure(restoreMoveFailure)
                 cleanupRecords += ProcessingArtifactSettlementRecord(
                     priorBackup,
                     ProcessingArtifactResourceRole.PRIOR_BACKUP,
@@ -344,13 +449,14 @@ internal fun commitProcessingArtifact(
                         ProcessingArtifactResourceRole.PRIOR_BACKUP,
                         ProcessingArtifactSettlementStatus.ABSENT
                     )
-                    runCatching { journalTransition(ProcessingArtifactJournalState.PRIOR_RESTORED, adoptedResult = "PRIOR_FINAL") }
+                    journalTransition(ProcessingArtifactJournalState.PRIOR_RESTORED, adoptedResult = "PRIOR_FINAL")
                     cleanupRecords += ProcessingArtifactSettlementRecord(
                         finalFile,
                         ProcessingArtifactResourceRole.RESTORED_PRIOR,
                         ProcessingArtifactSettlementStatus.RESTORED
                     )
                 } catch (restoreVerificationFailure: Throwable) {
+                    captureRollbackFailure(restoreVerificationFailure)
                     cleanupRecords += ProcessingArtifactSettlementRecord(
                         finalFile,
                         ProcessingArtifactResourceRole.RESTORED_PRIOR,
@@ -364,12 +470,12 @@ internal fun commitProcessingArtifact(
         val allSettlements = settlements + cleanupRecords
         val cleanupFailure = allSettlements.firstOrNull { it.failure != null }?.failure
         if (cleanupFailure != null) {
-            failure.addSuppressed(cleanupFailure)
+            if (cleanupFailure !== failure) failure.addSuppressed(cleanupFailure)
             state = ProcessingArtifactState.CLEANUP_FAILED
         } else {
             state = ProcessingArtifactState.ROLLED_BACK
             if (priorRestored || !priorBackedUp) {
-                runCatching {
+                try {
                     journalTransition(
                         if (priorRestored) ProcessingArtifactJournalState.PRIOR_RESTORED else ProcessingArtifactJournalState.SETTLED,
                         adoptedResult = if (priorRestored) "PRIOR_FINAL" else "NO_OUTPUT",
@@ -380,6 +486,8 @@ internal fun commitProcessingArtifact(
                         }
                     )
                     journal.deleteIfOwned(parent)
+                } catch (secondary: Throwable) {
+                    captureRollbackFailure(secondary)
                 }
             }
         }
@@ -392,6 +500,14 @@ internal fun commitProcessingArtifact(
                 priorFinalRestored = priorRestored
             )
         )
+        fatalRollbackFailure?.let { fatal ->
+            if (failure is Error) throw failure
+            throw fatal
+        }
+        cancellationRollbackFailure?.let { cancelled ->
+            if (failure is Error || failure is CancellationException) throw failure
+            throw cancelled
+        }
         if (failure is Error || failure is java.util.concurrent.CancellationException) throw failure
         throw ProcessingArtifactException(
             finalFile = finalFile,

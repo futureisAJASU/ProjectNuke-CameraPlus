@@ -107,4 +107,42 @@ class VerifiedRandomAccessHandleTest {
             dir.deleteRecursively()
         }
     }
+
+    @Test
+    fun fatalDescriptorCloseFailureIsNotReducedToCleanupDebt() {
+        val dir = Files.createTempDirectory("verified-raw-fatal-close").toFile()
+        try {
+            val file = dir.resolve("frame.raw16").apply { writeBytes(ByteArray(32)) }
+            val fatal = AssertionError("fatal descriptor close")
+            val handle = VerifiedRandomAccessHandle.openForTesting(file, 32L, fatal)
+            try {
+                handle.use { assertNotNull(it.read()) }
+                fail("fatal close failure was not propagated")
+            } catch (failure: AssertionError) {
+                assertSame(fatal, failure)
+            }
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fatalCloseSupersedesOrdinaryPrimaryButRetainsItSuppressed() {
+        val dir = Files.createTempDirectory("verified-raw-fatal-close-primary").toFile()
+        try {
+            val file = dir.resolve("frame.raw16").apply { writeBytes(ByteArray(32)) }
+            val fatal = AssertionError("fatal descriptor close")
+            val primary = IllegalStateException("ordinary processing failure")
+            val handle = VerifiedRandomAccessHandle.openForTesting(file, 32L, fatal)
+            try {
+                handle.use { throw primary }
+                fail("fatal close failure was not propagated")
+            } catch (failure: AssertionError) {
+                assertSame(fatal, failure)
+                assertTrue(fatal.suppressed.any { it === primary })
+            }
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
 }

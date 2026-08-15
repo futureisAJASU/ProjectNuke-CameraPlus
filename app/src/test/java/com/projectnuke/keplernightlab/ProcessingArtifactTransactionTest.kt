@@ -4,6 +4,7 @@ import java.io.File
 import java.nio.file.Files
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -982,6 +983,79 @@ class ProcessingArtifactTransactionTest {
             assertEquals(1, reports.size)
             assertTrue(reports.single().settlements.isNotEmpty())
         } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fatalCleanupBeforeAdoptionPropagatesAndLeavesEvidence() {
+        val dir = Files.createTempDirectory("processing-artifact-fatal-delete-pre-adoption").toFile()
+        val fatal = AssertionError("fatal artifact delete")
+        try {
+            processingArtifactDeleteErrorForTest = fatal
+            val finalFile = File(dir, "result.bin")
+            assertThrows(AssertionError::class.java) {
+                commitProcessingArtifact(
+                    finalFile,
+                    writeTemp = { it.writeBytes("new".toByteArray()) },
+                    verifyFinal = { error("ordinary verification failure") }
+                )
+            }
+            assertFalse(finalFile.exists())
+            assertTrue(dir.listFiles().orEmpty().any { it.name.endsWith(".tmp") })
+            assertTrue(ProcessingArtifactJournal.list(dir).isNotEmpty())
+        } finally {
+            processingArtifactDeleteErrorForTest = null
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fatalCleanupAfterAdoptionPropagatesWithoutDeletingCurrentFinal() {
+        val dir = Files.createTempDirectory("processing-artifact-fatal-delete-adopted").toFile()
+        val fatal = AssertionError("fatal prior cleanup")
+        try {
+            val finalFile = File(dir, "result.bin").apply { writeBytes("prior".toByteArray()) }
+            processingArtifactDeleteErrorForTest = fatal
+            val result = try {
+                commitProcessingArtifact(
+                    finalFile,
+                    writeTemp = { it.writeBytes("new".toByteArray()) },
+                    verifyFinal = { file ->
+                        check(file.readText() == "new")
+                    }
+                )
+            } catch (failure: AssertionError) {
+                assertSame(fatal, failure)
+                null
+            }
+            assertTrue(result == null)
+            assertEquals("new", finalFile.readText())
+            assertTrue(ProcessingArtifactJournal.list(dir).isNotEmpty())
+        } finally {
+            processingArtifactDeleteErrorForTest = null
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fatalPriorSemanticVerificationPropagatesBeforePriorMove() {
+        val dir = Files.createTempDirectory("processing-artifact-fatal-prior-verify").toFile()
+        val fatal = AssertionError("fatal prior semantic verification")
+        try {
+            val finalFile = File(dir, "result.bin").apply { writeBytes("prior".toByteArray()) }
+            assertThrows(AssertionError::class.java) {
+                commitProcessingArtifact(
+                    finalFile,
+                    writeTemp = { it.writeBytes("new".toByteArray()) },
+                    verifyFinal = { file ->
+                        if (file == finalFile) throw fatal
+                    }
+                )
+            }
+            assertEquals("prior", finalFile.readText())
+        } finally {
+            processingArtifactDeleteErrorForTest = null
             dir.deleteRecursively()
         }
     }

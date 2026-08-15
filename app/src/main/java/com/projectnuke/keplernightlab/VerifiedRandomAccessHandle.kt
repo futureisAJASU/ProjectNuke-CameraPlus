@@ -38,7 +38,14 @@ internal class VerifiedRandomAccessHandle private constructor(
     internal fun close(): Throwable? {
         if (closed) return null
         closed = true
-        return runCatching { closeAction() }.exceptionOrNull()
+        return try {
+            closeAction()
+            null
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (failure: Exception) {
+            failure
+        }
     }
 
     /**
@@ -53,7 +60,21 @@ internal class VerifiedRandomAccessHandle private constructor(
             primaryFailure = failure
             throw failure
         } finally {
-            val closeFailure = close()
+            val closeFailure = try {
+                close()
+            } catch (closeFatal: Error) {
+                when {
+                    primaryFailure is Error -> {
+                        if (primaryFailure !== closeFatal) primaryFailure.addSuppressed(closeFatal)
+                        throw primaryFailure
+                    }
+                    primaryFailure != null -> {
+                        closeFatal.addSuppressed(primaryFailure)
+                        throw closeFatal
+                    }
+                    else -> throw closeFatal
+                }
+            }
             if (closeFailure != null) {
                 if (primaryFailure != null) {
                     primaryFailure.addSuppressed(closeFailure)
@@ -97,7 +118,20 @@ internal class VerifiedRandomAccessHandle private constructor(
                     closeAction = { randomAccess.close() }
                 )
             } catch (failure: Throwable) {
-                runCatching { randomAccess.close() }
+                try {
+                    randomAccess.close()
+                } catch (closeFailure: Throwable) {
+                    when {
+                        failure is Error -> {
+                            if (failure !== closeFailure) failure.addSuppressed(closeFailure)
+                        }
+                        closeFailure is Error -> {
+                            closeFailure.addSuppressed(failure)
+                            throw closeFailure
+                        }
+                        else -> failure.addSuppressed(closeFailure)
+                    }
+                }
                 throw failure
             }
         }
