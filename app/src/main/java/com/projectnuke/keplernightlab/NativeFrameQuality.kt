@@ -9,9 +9,14 @@ data class FrameQualityNativeMetrics(
 )
 
 object NativeFrameQuality {
-    private val loaded = runCatching {
+    private val loaded = try {
         System.loadLibrary("kepler_raw_engine")
-    }.isSuccess
+        true
+    } catch (_: UnsatisfiedLinkError) {
+        false
+    } catch (_: SecurityException) {
+        false
+    }
 
     fun isAvailable(): Boolean = loaded
 
@@ -22,9 +27,15 @@ object NativeFrameQuality {
         rowStride: Int
     ): FrameQualityNativeMetrics? {
         if (!loaded) return null
-        val result = runCatching {
+        val result = try {
             nativeScoreLumaFrame(luma, width, height, rowStride)
-        }.getOrNull() ?: return null
+        } catch (failure: java.util.concurrent.CancellationException) {
+            throw failure
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            return null
+        } ?: return null
         if (result.size != 5 || result.any { !it.isFinite() }) return null
         return FrameQualityNativeMetrics(
             sharpnessRaw = result[0],

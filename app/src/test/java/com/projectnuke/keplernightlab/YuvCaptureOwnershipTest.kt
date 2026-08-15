@@ -15,6 +15,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class YuvCaptureOwnershipTest {
@@ -1103,6 +1104,25 @@ class YuvCaptureOwnershipTest {
             assertFalse(RealYuvFinalFileVerifier.verify(empty, 0))
             assertFalse(RealYuvFinalFileVerifier.verify(root, 0))
         } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun realYuvFinalFileVerifierPropagatesFatalDigestFailure() {
+        val root = Files.createTempDirectory("kepler-yuv-verifier-fatal").toFile()
+        val previousFailure = noFollowDigestFailureForTest
+        try {
+            val png = root.resolve("frame.png").apply { writeBytes(PNG_1X1) }
+            val fatal = AssertionError("fatal digest failure")
+            noFollowDigestFailureForTest = fatal
+
+            val escaped = assertThrows(AssertionError::class.java) {
+                RealYuvFinalFileVerifier.verify(png, 0)
+            }
+            assertEquals(fatal, escaped)
+        } finally {
+            noFollowDigestFailureForTest = previousFailure
             root.deleteRecursively()
         }
     }

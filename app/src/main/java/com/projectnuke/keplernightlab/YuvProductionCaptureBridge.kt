@@ -22,7 +22,11 @@ internal class YuvProductionImageBridge(
     fun onImageAvailable(reader: ImageReader, useMemoryBuffer: Boolean) {
         val image = try {
             reader.acquireNextImage()
-        } catch (t: Throwable) {
+        } catch (cancelled: java.util.concurrent.CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             onAcquireFailure(t)
             return
         } ?: return
@@ -49,7 +53,11 @@ internal class YuvProductionImageBridge(
     private fun closeLateImage(image: Image) {
         try {
             image.close()
-        } catch (t: Throwable) {
+        } catch (cancelled: java.util.concurrent.CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             onReleaseFailure(t)
         }
     }

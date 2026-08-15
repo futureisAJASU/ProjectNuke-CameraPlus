@@ -260,24 +260,29 @@ private fun persistSingleFrameCancellation(
 ) {
     try {
         updateForProcessingAttempt(jobDir, attempt) { current ->
+            val currentClaimedFinal = current.optBoolean("processingOutputCommitted", false) &&
+                current.optString("processingArtifactClaimAttemptId") == attempt.id &&
+                current.optString("processingAttemptId") == attempt.id &&
+                current.optString("finalFile") == SINGLE_FRAME_OUTPUT_FILE_NAME &&
+                NoFollowFileSystem.isRealFile(File(jobDir, SINGLE_FRAME_OUTPUT_FILE_NAME).toPath())
+            val currentOutputRetained = currentClaimedFinal ||
+                settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED
             current.put("processingStartedAt", processingStartedAt)
                 .put("processingTimeMs", System.currentTimeMillis() - processingStartedAt)
                 .put("singleFrameProcessingPolicy", ReprocessMetadataPolicy.NORMAL.name)
                 .put("fusionPresetName", params.presetName)
                 .put("fusionParams", params.toJson())
-                .put("currentPipelineStage", "CANCELLED")
-                .put("processStatus", "PIPELINE_CANCELLED")
+                .put("currentPipelineStage", if (currentClaimedFinal) "PARTIAL" else "CANCELLED")
+                .put("processStatus", if (currentClaimedFinal) "PIPELINE_COMPLETE_PARTIAL" else "PIPELINE_CANCELLED")
                 .put("processingFailureType", cancellation.javaClass.simpleName)
                 .put("processingFailureMessage", cancellation.message ?: "Single-frame processing cancelled")
                 .put("singleFrameCleanupResult", settlement.name)
-                .put("singleFrameCancelledOutputRetained", settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED)
+                .put("singleFrameCancelledOutputRetained", currentOutputRetained)
                 .put("userCanMoveDevice", true)
-            if (settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED ||
-                settlement == SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
-            ) {
+            if (currentOutputRetained) {
                 current.put("galleryDisplayUnavailable", false)
                     .put("finalOutputAvailable", true)
-                    .put("singleFrameCancelledPriorOutputValid", settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED)
+                    .put("singleFrameCancelledPriorOutputValid", !currentClaimedFinal && settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED)
             } else {
                 current.put("galleryDisplayUnavailable", true)
                     .put("finalOutputAvailable", false)
@@ -398,29 +403,28 @@ private fun persistSingleFrameFailure(
     }
     try {
         updateForProcessingAttempt(jobDir, attempt) { current ->
+            val currentClaimedFinal = current.optBoolean("processingOutputCommitted", false) &&
+                current.optString("processingArtifactClaimAttemptId") == attempt.id &&
+                current.optString("processingAttemptId") == attempt.id &&
+                current.optString("finalFile") == SINGLE_FRAME_OUTPUT_FILE_NAME &&
+                NoFollowFileSystem.isRealFile(File(jobDir, SINGLE_FRAME_OUTPUT_FILE_NAME).toPath())
             current.put("processingStartedAt", processingStartedAt)
                 .put("processingTimeMs", System.currentTimeMillis() - processingStartedAt)
                 .put("singleFrameProcessingPolicy", metadataPolicy.name)
                 .put("fusionPresetName", params.presetName)
                 .put("fusionParams", params.toJson())
             if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-                current.put("currentPipelineStage", "FAILED")
-                    .put("processStatus", "SINGLE_FRAME_PROCESSING_FAILED")
+                current.put("currentPipelineStage", if (currentClaimedFinal) "PARTIAL" else "FAILED")
+                    .put("processStatus", if (currentClaimedFinal) "PIPELINE_COMPLETE_PARTIAL" else "SINGLE_FRAME_PROCESSING_FAILED")
                     .put("processingFailureType", failure.javaClass.simpleName)
                     .put(
                         "processingFailureMessage",
                         failure.message ?: "Single-frame processing failed"
                     )
                     .put("singleFrameCleanupResult", settlement.name)
-                    .put(
-                        "singleFrameFailedOutputRetained",
-                        settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED ||
-                            settlement == SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
-                    )
+                    .put("singleFrameFailedOutputRetained", currentClaimedFinal || settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED)
                     .put("userCanMoveDevice", true)
-                if (settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED ||
-                    settlement == SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
-                ) {
+                if (currentClaimedFinal || settlement == SingleFrameCleanupResult.PREVIOUS_OUTPUT_RESTORED) {
                     current.put("galleryDisplayUnavailable", false)
                         .put("finalOutputAvailable", true)
                 } else {

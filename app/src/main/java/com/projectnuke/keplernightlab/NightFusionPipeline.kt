@@ -460,7 +460,9 @@ internal fun reprocessYuvJob(
         var totalFrames = 0
         var enabledFrames = 0
         var terminalResult: Result<Unit> = Result.failure(IllegalStateException("YUV reprocess did not reach a terminal state."))
+        var fatalReprocessFailure: Error? = null
         var publicExportCommitted = false
+        var exportVerified = false
         var committedExport: GalleryExportResult? = null
         var terminalDisposition = ReprocessTerminalDisposition.UNCOMMITTED_FAILURE
         var finalOutputFile: File? = null
@@ -545,42 +547,55 @@ internal fun reprocessYuvJob(
             publicExportCommitted = true
             committedExport = export
             val verified = verifyCommittedGalleryExport(context, export) is GalleryExportVerification.Verified
+            exportVerified = verified
             if (!verified) {
                 terminalDisposition = ReprocessTerminalDisposition.COMMITTED_PARTIAL
                 error("YUV export verification failed")
             }
+            terminalDisposition = ReprocessTerminalDisposition.VERIFIED_SUCCESS
             post(
                 "PIPELINE_COMPLETE: ${if (singleFrame) "Single photo" else "YUV reprocess"} " +
                     "saved ${export.formatUsed.label}; used $enabledFrames/$totalFrames frames; cache kept."
             )
             terminalResult = Result.success(Unit)
-            terminalDisposition = ReprocessTerminalDisposition.VERIFIED_SUCCESS
-        } catch (_: kotlinx.coroutines.CancellationException) {
+        } catch (ce: kotlinx.coroutines.CancellationException) {
             post("PIPELINE_CANCELLED: YUV reprocess cancelled; source frames kept.")
-            terminalResult = Result.failure(IllegalStateException("YUV reprocess cancelled"))
-            terminalDisposition = ReprocessTerminalDisposition.CANCELLED
+            terminalResult = Result.failure(ce)
+            terminalDisposition = if (finalOutputFile?.isFile == true && finalOutputFile.length() > 0L) {
+                ReprocessTerminalDisposition.COMMITTED_PARTIAL
+            } else {
+                ReprocessTerminalDisposition.CANCELLED
+            }
         } catch (oom: OutOfMemoryError) {
             post("PIPELINE_FAILED: YUV reprocess failed; cache kept. out of memory")
-            terminalResult = Result.failure(oom)
+            fatalReprocessFailure = oom
+            terminalResult = Result.success(Unit)
+            if (finalOutputFile?.isFile == true && finalOutputFile.length() > 0L) {
+                terminalDisposition = ReprocessTerminalDisposition.COMMITTED_PARTIAL
+            }
         } catch (e: Exception) {
             post("PIPELINE_FAILED: YUV reprocess failed; cache kept. ${e.message}")
             terminalResult = Result.failure(e)
+            if (finalOutputFile?.isFile == true && finalOutputFile.length() > 0L) {
+                terminalDisposition = ReprocessTerminalDisposition.COMMITTED_PARTIAL
+            }
         } finally {
             workerThread.quitSafely()
             terminal.complete(
                 ReprocessWorkerOutcome(
                     result = terminalResult,
                     publicExportCommitted = publicExportCommitted,
-                    exportVerified = terminalDisposition == ReprocessTerminalDisposition.VERIFIED_SUCCESS,
+                    exportVerified = exportVerified,
                     export = committedExport,
                     finalOutputFile = finalOutputFile,
                     previewFile = finalOutputFile,
                     bytesWritten = finalOutputFile?.length() ?: 0L,
                     disposition = terminalDisposition,
-                    terminalError = terminalResult.exceptionOrNull()
+                    terminalError = fatalReprocessFailure ?: terminalResult.exceptionOrNull()
                 )
             )
         }
+        fatalReprocessFailure?.let { throw it }
         })
     } catch (failure: Error) {
         workerThread.quitSafely()

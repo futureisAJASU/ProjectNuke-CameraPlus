@@ -5,6 +5,7 @@ import java.io.File
 import java.lang.Runnable
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.CancellationException
 
 private inline fun ignoreErrors(label: String, block: () -> Unit) {
     try { block() } catch (_: Exception) { }
@@ -95,7 +96,11 @@ internal class BufferedEncodeTask(
     override fun run() {
         val completion = try {
             encode()
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             YuvWorkerCompletion.Failed(item.frameIndex, item.timestampNs, null, t)
         }
         try {
@@ -142,7 +147,11 @@ internal class BufferedEncodeTask(
             onSettlementIssue?.let { hook ->
                 try {
                     hook(item, outcome)
-                } catch (_: Throwable) {}
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (fatal: Error) {
+                    throw fatal
+                } catch (_: Exception) {}
             }
             val detail = listOfNotNull(outcome.failure, outcome.lifecycleReleaseFailure)
                 .joinToString("; ") { "${it::class.java.simpleName}: ${it.message}" }
@@ -390,7 +399,11 @@ internal class YuvCaptureOwner(
                                         YuvCandidateHandle(item.frameIndex, candidate),
                                         fileName, 0L
                                     )
-                                } catch (t: Throwable) {
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (fatal: Error) {
+                                    throw fatal
+                                } catch (t: Exception) {
                                     YuvWorkerCompletion.Failed(
                                         item.frameIndex, item.timestampNs,
                                         if (candidate.exists()) YuvCandidateHandle(item.frameIndex, candidate) else null,
@@ -500,7 +513,11 @@ internal class YuvCaptureOwner(
                         YuvCandidateHandle(frame.frameIndex, candidate),
                         fileName, 0L
                     )
-                } catch (t: Throwable) {
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (fatal: Error) {
+                    throw fatal
+                } catch (t: Exception) {
                     YuvWorkerCompletion.Failed(
                         frame.frameIndex, frame.timestampNs,
                         if (candidate.exists()) YuvCandidateHandle(frame.frameIndex, candidate) else null,
@@ -610,7 +627,11 @@ internal class YuvCaptureOwner(
         var verifierThrowable: Throwable? = null
         val candidateValid = try {
             candidateVerifier.verify(handle.file, completion.frameIndex)
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             verifierThrowable = t
             Log.e("KeplerYuvOwner", "Candidate verifier threw for frame ${completion.frameIndex}", t)
             false
@@ -663,7 +684,11 @@ internal class YuvCaptureOwner(
         val commitFailure = try {
             workProcessor.commit(handle.file, finalFile)
             null
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             t
         }
         val destinationCreatedByAttempt = finalFile.exists()
@@ -683,7 +708,11 @@ internal class YuvCaptureOwner(
         //    terminal operation; the owner requests it through the session gateway.
         val finalVerified = try {
             sessionTerminal.verifyTerminalFinalFile(finalFile, completion.frameIndex)
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             recordDiagnostic(DiagnosticStage.FINAL_VERIFY, DiagnosticSeverity.ERROR, completion.frameIndex, finalFile.path,
                 "final verifier threw frame=${completion.frameIndex} file=${finalFile}: " +
                     "${t::class.java.simpleName}: ${t.message}", t)
@@ -751,14 +780,22 @@ internal class YuvCaptureOwner(
     private fun removeOrQuarantineCreatedFinal(file: File) {
         val deleteResult = try {
             candidateFilesystem.delete(file)
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             CandidateFileOperationResult.DELETE_THREW(t)
         }
         if (deleteResult != CandidateFileOperationResult.DELETED &&
             deleteResult != CandidateFileOperationResult.FILE_ABSENT) {
             val quarantineResult = try {
                 candidateFilesystem.quarantine(file)
-            } catch (t: Throwable) {
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (fatal: Error) {
+                throw fatal
+            } catch (t: Exception) {
                 CandidateFileOperationResult.QUARANTINE_FAILED(t)
             }
             if (quarantineResult !is CandidateFileOperationResult.QUARANTINE_FAILED) return
@@ -965,7 +1002,37 @@ internal class YuvCaptureOwner(
     private fun settleTerminalByRequest(request: YuvTerminalRequest, emergency: Boolean = false) {
         try {
             settleTerminalByRequestInternal(request, emergency)
-        } catch (failure: Throwable) {
+        } catch (cancelled: CancellationException) {
+            try {
+                cleanupCoordinator.perform()
+            } catch (secondary: Error) {
+                secondary.addSuppressed(cancelled)
+                throw secondary
+            } catch (secondary: Throwable) {
+                if (secondary !== cancelled) cancelled.addSuppressed(secondary)
+            }
+            try {
+                productionResourceCoordinator.perform()
+            } catch (secondary: Error) {
+                secondary.addSuppressed(cancelled)
+                throw secondary
+            } catch (secondary: Throwable) {
+                if (secondary !== cancelled) cancelled.addSuppressed(secondary)
+            }
+            throw cancelled
+        } catch (fatal: Error) {
+            try {
+                cleanupCoordinator.perform()
+            } catch (secondary: Throwable) {
+                if (secondary !== fatal) fatal.addSuppressed(secondary)
+            }
+            try {
+                productionResourceCoordinator.perform()
+            } catch (secondary: Throwable) {
+                if (secondary !== fatal) fatal.addSuppressed(secondary)
+            }
+            throw fatal
+        } catch (failure: Exception) {
             recordDiagnostic(
                 DiagnosticStage.TERMINAL_PUBLICATION,
                 DiagnosticSeverity.ERROR,
@@ -974,11 +1041,17 @@ internal class YuvCaptureOwner(
                 "unexpected YUV terminal transaction failure",
                 failure
             )
-            try { cleanupCoordinator.perform() } catch (cleanupFailure: Throwable) {
+            try { cleanupCoordinator.perform() } catch (cleanupFailure: Error) {
+                cleanupFailure.addSuppressed(failure)
+                throw cleanupFailure
+            } catch (cleanupFailure: Exception) {
                 recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
                     "internal cleanup after terminal transaction failure failed", cleanupFailure)
             }
-            try { productionResourceCoordinator.perform() } catch (cleanupFailure: Throwable) {
+            try { productionResourceCoordinator.perform() } catch (cleanupFailure: Error) {
+                cleanupFailure.addSuppressed(failure)
+                throw cleanupFailure
+            } catch (cleanupFailure: Exception) {
                 recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
                     "production cleanup after terminal transaction failure failed", cleanupFailure)
             }
@@ -1001,34 +1074,38 @@ internal class YuvCaptureOwner(
             // off the capture handler, but it must still attempt the public terminal
             // contract rather than falsely reporting NotRequested.
             val motionOutcome: TerminalOperationOutcome = if (request.saveMotion) {
-                runCatching { saveMotionOnce(outputDir) }
-                    .fold(
-                        onSuccess = { TerminalOperationOutcome.Succeeded },
-                        onFailure = { t ->
-                            recordDiagnostic(DiagnosticStage.TERMINAL_MOTION, DiagnosticSeverity.ERROR, null, outputDir.path,
-                                "terminal motion save failed", t)
-                            TerminalOperationOutcome.Failed(t)
-                        }
-                    )
+                try {
+                    saveMotionOnce(outputDir)
+                    TerminalOperationOutcome.Succeeded
+                } catch (failure: java.util.concurrent.CancellationException) {
+                    throw failure
+                } catch (failure: Error) {
+                    throw failure
+                } catch (failure: Exception) {
+                    recordDiagnostic(DiagnosticStage.TERMINAL_MOTION, DiagnosticSeverity.ERROR, null, outputDir.path,
+                        "terminal motion save failed", failure)
+                    TerminalOperationOutcome.Failed(failure)
+                }
             } else {
                 TerminalOperationOutcome.NotRequested
             }
             motionSaveOutcomeRef.set(motionOutcome)
 
             val snap = accounting.snapshot()
-            val metadataOutcome = runCatching {
+            val metadataOutcome = try {
                 sessionTerminal.requestTerminalMetadataWrite(
                     YuvTerminalMetadataRequest(request.jobStatus, snap.persistedFrames, snap.manifest)
                 )
+                TerminalOperationOutcome.Succeeded
+            } catch (failure: java.util.concurrent.CancellationException) {
+                throw failure
+            } catch (failure: Error) {
+                throw failure
+            } catch (failure: Exception) {
+                recordDiagnostic(DiagnosticStage.TERMINAL_METADATA, DiagnosticSeverity.ERROR, null, null,
+                    "terminal metadata write failed", failure)
+                TerminalOperationOutcome.Failed(failure)
             }
-                .fold(
-                    onSuccess = { TerminalOperationOutcome.Succeeded },
-                    onFailure = { t ->
-                        recordDiagnostic(DiagnosticStage.TERMINAL_METADATA, DiagnosticSeverity.ERROR, null, null,
-                            "terminal metadata write failed", t)
-                        TerminalOperationOutcome.Failed(t)
-                    }
-                )
             metadataWriteOutcomeRef.set(metadataOutcome)
 
             val statusMessage = when (request.status) {
@@ -1046,7 +1123,11 @@ internal class YuvCaptureOwner(
                         "terminal status dispatch rejected by handler")
                     TerminalOperationOutcome.Failed(IllegalStateException("terminal status dispatch rejected"))
                 }
-            } catch (t: Throwable) {
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (fatal: Error) {
+                throw fatal
+            } catch (t: Exception) {
                 recordDiagnostic(DiagnosticStage.TERMINAL_STATUS_DISPATCH, DiagnosticSeverity.ERROR, null, null,
                     "terminal status dispatch failed", t)
                 TerminalOperationOutcome.Failed(t)
@@ -1064,13 +1145,21 @@ internal class YuvCaptureOwner(
             // must run exactly once, regardless of callback dispatch outcome.
             try {
                 cleanupCoordinator.perform()
-            } catch (t: Throwable) {
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (fatal: Error) {
+                throw fatal
+            } catch (t: Exception) {
                 recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
                     "internal terminal cleanup failed", t)
             }
             try {
                 productionResourceCoordinator.perform()
-            } catch (t: Throwable) {
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (fatal: Error) {
+                throw fatal
+            } catch (t: Exception) {
                 recordDiagnostic(DiagnosticStage.CLEANUP, DiagnosticSeverity.ERROR, null, null,
                     "production terminal cleanup failed", t)
             }
@@ -1084,7 +1173,11 @@ internal class YuvCaptureOwner(
         // can choose the user callback.
         val published = try {
             sessionTerminal.publishTerminal(request)
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             recordDiagnostic(DiagnosticStage.TERMINAL_PUBLICATION, DiagnosticSeverity.ERROR, null, null,
                 "terminal request publication threw; publishing settlement failure", t)
             sessionTerminal.publishSettlementFailure(t)
@@ -1164,7 +1257,11 @@ internal class YuvCaptureOwner(
                 callback.invoke()
                 callbackStateRef.set(CallbackState.EXECUTED)
                 callbackExecutionOutcomeRef.set(TerminalOperationOutcome.Succeeded)
-            } catch (t: Throwable) {
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (fatal: Error) {
+                throw fatal
+            } catch (t: Exception) {
                 callbackStateRef.set(CallbackState.EXECUTION_FAILED)
                 callbackExecutionOutcomeRef.set(TerminalOperationOutcome.Failed(t))
                 recordDiagnostic(DiagnosticStage.TERMINAL_CALLBACK_EXECUTION, DiagnosticSeverity.ERROR, null, null,
@@ -1178,7 +1275,11 @@ internal class YuvCaptureOwner(
         publishSnapshot()
         val dispatched = try {
             dispatchCallback.dispatch(wrapped)
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             callbackStateRef.set(CallbackState.DISPATCH_REJECTED)
             callbackDispatchOutcomeRef.set(TerminalOperationOutcome.Failed(t))
             recordDiagnostic(DiagnosticStage.TERMINAL_CALLBACK_DISPATCH, DiagnosticSeverity.ERROR, null, null,

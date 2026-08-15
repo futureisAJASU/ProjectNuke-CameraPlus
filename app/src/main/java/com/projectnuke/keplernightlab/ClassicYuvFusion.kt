@@ -446,7 +446,7 @@ internal fun processClassicYuvFusionJob(
         job.put("yuvExternalFrameWeightsUsed", false)
         job.remove("yuvExternalFrameWeightsTarget")
     }
-        val debugMetadataFailure = runCatching {
+        val debugMetadataFailure = try {
             if (!postCommitCancellation) cancellation.throwIfCancelled()
             writeFusionDebugMetadata(
                 jobDir = jobDir,
@@ -462,7 +462,14 @@ internal fun processClassicYuvFusionJob(
                 fallbackAlignmentCount = fallbackAlignmentCount,
                 lowConfidenceAlignmentCount = lowConfidenceAlignmentCount
             )
-        }.exceptionOrNull()
+            null
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (failure: Exception) {
+            failure
+        }
         if (!postCommitCancellation) {
             generateFusionDebugArtifacts(
                 jobDir = jobDir,
@@ -557,9 +564,79 @@ internal fun processClassicYuvFusionJob(
             yuvHeight = dimensions?.second,
             attempt = processingAttempt
         )
-        throw IllegalStateException("Classic YUV fusion failed: OutOfMemoryError; cache kept", oom)
-    } catch (ce: CancellationException) {
+        throw oom
+} catch (ce: CancellationException) {
+        val failurePreflight = preflight ?: buildClassicYuvProcessingPreflight(jobDir, job)
+        recordClassicFailure(
+            jobFile = jobFile,
+            job = job,
+            status = "PIPELINE_CANCELLED",
+            reason = ce.message?.takeIf { it.isNotBlank() } ?: "Classic YUV fusion cancelled",
+            throwable = ce,
+            failureCounts = resolveClassicFailureCounts(
+                preflight = failurePreflight,
+                decodedUsableFrameCount = decodedUsableFrameCount,
+                sameSizeFrameCount = sameSizeFrameCount,
+                compatibleFrameCount = compatibleFrameCount,
+                sameSizeFrameCountKnown = sameSizeFrameCountKnown,
+                compatibleFrameCountKnown = compatibleFrameCountKnown
+            ),
+            preflight = failurePreflight,
+            params = params,
+            processingStartedAt = processingStartedAt,
+            metadataPolicy = metadataPolicy,
+            nativeAlignmentUsed = nativeAlignmentUsed,
+            fallbackAlignmentCount = fallbackAlignmentCount,
+            lowConfidenceAlignmentCount = lowConfidenceAlignmentCount,
+            externalFrameWeights = externalFrameWeights,
+            referenceFrameIndex = activeReferenceIndex ?: referenceIndex,
+            usedFrameCount = if (compatibleFrameCountKnown) compatibleFrameCount else null,
+            acceptedFrameCount = if (compatibleFrameCountKnown) compatibleFrameCount else null,
+            rejectedFrameCount = if (sameSizeFrameCountKnown && compatibleFrameCountKnown) {
+                (sameSizeFrameCount - compatibleFrameCount).coerceAtLeast(0)
+            } else null,
+            excludedFrameCount = countExcludedFrames(job),
+            skippedFrameCount = if (compatibleFrameCountKnown) {
+                (failurePreflight.enabledFrames - compatibleFrameCount).coerceAtLeast(0)
+            } else null,
+            ghostRejectedPixelRatio = mergeResult?.let {
+                if (it.comparedPixels > 0L) it.rejectedPixels.toDouble() / it.comparedPixels else 0.0
+            },
+            outputWidth = dimensions?.first,
+            outputHeight = dimensions?.second,
+            yuvWidth = dimensions?.first,
+            yuvHeight = dimensions?.second,
+            attempt = processingAttempt
+        )
         throw ce
+    } catch (fatal: Error) {
+        val failurePreflight = preflight ?: buildClassicYuvProcessingPreflight(jobDir, job)
+        recordClassicFailure(
+            jobFile = jobFile,
+            job = job,
+            status = "FATAL_FAILED_KEEPING_CACHE",
+            reason = fatal.message?.takeIf { it.isNotBlank() } ?: fatal.javaClass.simpleName,
+            throwable = fatal,
+            failureCounts = resolveClassicFailureCounts(
+                preflight = failurePreflight,
+                decodedUsableFrameCount = decodedUsableFrameCount,
+                sameSizeFrameCount = sameSizeFrameCount,
+                compatibleFrameCount = compatibleFrameCount,
+                sameSizeFrameCountKnown = sameSizeFrameCountKnown,
+                compatibleFrameCountKnown = compatibleFrameCountKnown
+            ),
+            preflight = failurePreflight,
+            params = params,
+            processingStartedAt = processingStartedAt,
+            metadataPolicy = metadataPolicy,
+            nativeAlignmentUsed = nativeAlignmentUsed,
+            fallbackAlignmentCount = fallbackAlignmentCount,
+            lowConfidenceAlignmentCount = lowConfidenceAlignmentCount,
+            externalFrameWeights = externalFrameWeights,
+            referenceFrameIndex = activeReferenceIndex ?: referenceIndex,
+            attempt = processingAttempt
+        )
+        throw fatal
     } catch (e: Exception) {
         val failurePreflight = preflight ?: buildClassicYuvProcessingPreflight(jobDir, job)
         val excludedFrameCount = countExcludedFrames(job)
@@ -1509,9 +1586,8 @@ private fun generateFusionDebugArtifacts(
             .put("yuvCompareReferenceVsFinalFile", "yuv_compare_reference_vs_final.png")
             .put("debugArtifactStatus", "COMPLETE")
             .remove("debugArtifactError")
-    } catch (oom: OutOfMemoryError) {
-        job.put("debugArtifactStatus", "FAILED")
-            .put("debugArtifactError", "OutOfMemoryError")
+    } catch (fatal: Error) {
+        throw fatal
     } catch (e: Exception) {
         job.put("debugArtifactStatus", "FAILED")
             .put("debugArtifactError", "${e.javaClass.simpleName}: ${e.message}".take(240))
@@ -1683,7 +1759,7 @@ private fun recordClassicFailure(
     yuvHeight: Int? = null,
     attempt: ProcessingAttempt? = null
 ) {
-    runCatching {
+    try {
         val now = System.currentTimeMillis()
         job.put("currentPipelineStage", "PIPELINE_FAILED")
             .put("processStatus", "PIPELINE_FAILED")
@@ -1779,6 +1855,19 @@ private fun recordClassicFailure(
             metadataPolicy = metadataPolicy,
             attempt = attempt
         )
+    } catch (metadataFailure: Error) {
+        when {
+            throwable is Error -> {
+                if (throwable !== metadataFailure) throwable.addSuppressed(metadataFailure)
+                throw throwable
+            }
+            else -> {
+                metadataFailure.addSuppressed(throwable ?: IllegalStateException(reason))
+                throw metadataFailure
+            }
+        }
+    } catch (metadataFailure: Exception) {
+        Log.e("KeplerYuvPipeline", "failure metadata persistence failed", metadataFailure)
     }
 }
 
@@ -1962,18 +2051,30 @@ private fun persistClassicYuvFailure(
         else KeplerJobMetadata.update(jobDir, mutate)
     }
     update { current ->
+        val currentAttemptClaimedOutput = attempt != null &&
+            current.optBoolean("processingOutputCommitted", false) &&
+            current.optString("processingArtifactClaimAttemptId") == attempt.id &&
+            current.optString("processingAttemptId") == attempt.id &&
+            current.optString("finalFile").isNotBlank() &&
+            NoFollowFileSystem.resolveDirectChildResult(
+                jobDir,
+                current.optString("finalFile"),
+                requireFile = true
+            ) is NoFollowInspection.Present
         // Write owned keys that are present in job; remove absent owned keys
         keysToWrite.forEach { key ->
             if (job.has(key)) current.put(key, job.get(key))
             else current.remove(key)
         }
+        if (metadataPolicy == ReprocessMetadataPolicy.NORMAL && currentAttemptClaimedOutput) {
+            current.put("currentPipelineStage", "PIPELINE_COMPLETE_PARTIAL")
+                .put("processStatus", "PIPELINE_COMPLETE_PARTIAL")
+                .put("finalOutputAvailable", true)
+                .put("galleryDisplayUnavailable", false)
+        }
         // A new attempt may fail after its required final was durably claimed.
         // Preserve that exact current claim; only clear output paths for an
         // attempt which never claimed its required artifact.
-        val currentAttemptClaimedOutput = attempt != null &&
-            current.optBoolean("processingOutputCommitted", false) &&
-            current.optString("processingArtifactClaimAttemptId") == attempt.id &&
-            current.optString("processingAttemptId") == attempt.id
         if (metadataPolicy == ReprocessMetadataPolicy.NORMAL && !currentAttemptClaimedOutput) {
             classicYuvStaleFinalOutputKeys.forEach { current.remove(it) }
         }

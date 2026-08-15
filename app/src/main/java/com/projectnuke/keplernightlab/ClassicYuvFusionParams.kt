@@ -115,7 +115,7 @@ fun loadClassicYuvFusionParams(job: JSONObject): ClassicYuvFusionParams {
         ?: return ClassicYuvFusionPreset.fromName(
             job.optString("fusionPresetName", job.optString("processingPresetName", "NATURAL"))
         ).params
-    return runCatching {
+    return try {
         val preset = ClassicYuvFusionPreset.fromName(
             json.optString("presetName", job.optString("fusionPresetName", "NATURAL"))
         )
@@ -131,17 +131,39 @@ fun loadClassicYuvFusionParams(job: JSONObject): ClassicYuvFusionParams {
             saturationBoost = json.requireFiniteFloat("saturationBoost"),
             shadowLift = json.requireFiniteFloat("shadowLift"),
             highlightRollOff = json.requireFiniteFloat("highlightRollOff"),
-            denoiseAlgorithm = runCatching {
-                    DenoiseAlgorithm.valueOf(json.optString("denoiseAlgorithm", DenoiseAlgorithm.GUIDED.name))
-                }.getOrDefault(DenoiseAlgorithm.GUIDED),
-            fusionAlgorithm = runCatching {
-                FusionAlgorithm.valueOf(json.optString("fusionAlgorithm", FusionAlgorithm.ROBUST_REFERENCE.name))
-            }.getOrDefault(FusionAlgorithm.ROBUST_REFERENCE),
-            toneAlgorithm = runCatching {
-                NativeToneAlgorithm.valueOf(json.optString("toneAlgorithm", NativeToneAlgorithm.NATURAL.name))
-            }.getOrDefault(NativeToneAlgorithm.NATURAL)
+            denoiseAlgorithm = parseDenoiseAlgorithm(json.optString("denoiseAlgorithm", DenoiseAlgorithm.GUIDED.name)),
+            fusionAlgorithm = parseFusionAlgorithm(json.optString("fusionAlgorithm", FusionAlgorithm.ROBUST_REFERENCE.name)),
+            toneAlgorithm = parseNativeToneAlgorithm(json.optString("toneAlgorithm", NativeToneAlgorithm.NATURAL.name))
         ).clamped()
-    }.getOrElse { ClassicYuvFusionPreset.NATURAL.params }
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        ClassicYuvFusionPreset.NATURAL.params
+    }
+}
+
+private fun parseDenoiseAlgorithm(value: String): DenoiseAlgorithm = try {
+    DenoiseAlgorithm.valueOf(value)
+} catch (failure: Error) {
+    throw failure
+} catch (_: Exception) {
+    DenoiseAlgorithm.GUIDED
+}
+
+private fun parseFusionAlgorithm(value: String): FusionAlgorithm = try {
+    FusionAlgorithm.valueOf(value)
+} catch (failure: Error) {
+    throw failure
+} catch (_: Exception) {
+    FusionAlgorithm.ROBUST_REFERENCE
+}
+
+private fun parseNativeToneAlgorithm(value: String): NativeToneAlgorithm = try {
+    NativeToneAlgorithm.valueOf(value)
+} catch (failure: Error) {
+    throw failure
+} catch (_: Exception) {
+    NativeToneAlgorithm.NATURAL
 }
 
 private fun JSONObject.requireFiniteFloat(key: String): Float {

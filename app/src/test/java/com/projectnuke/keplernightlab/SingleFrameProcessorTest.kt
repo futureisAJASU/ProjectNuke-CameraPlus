@@ -196,7 +196,7 @@ class SingleFrameProcessorTest {
             assertTrue(cancelled)
             assertTrue(outputFile.exists())
             val job = KeplerJobMetadata.read(jobDir)
-            assertEquals("PIPELINE_CANCELLED", job.getString("processStatus"))
+            assertEquals("PIPELINE_COMPLETE_PARTIAL", job.getString("processStatus"))
             assertFalse(job.getBoolean("galleryDisplayUnavailable"))
             assertTrue(job.getBoolean("finalOutputAvailable"))
             assertTrue(job.getBoolean("processingOutputCommitted"))

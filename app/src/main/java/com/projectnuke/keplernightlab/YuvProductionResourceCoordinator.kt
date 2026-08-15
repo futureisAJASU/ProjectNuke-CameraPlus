@@ -309,7 +309,11 @@ internal class YuvProductionResourceCoordinator(
         val failure: Throwable? = try {
             releaseInterceptor?.invoke(resourceType, action, block) ?: block()
             null
-        } catch (t: Throwable) {
+        } catch (cancelled: java.util.concurrent.CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             Log.w("KeplerYuvCleanup", "release $resourceType.$action failed", t)
             t
         }

@@ -14,9 +14,14 @@ data class NativeAlignmentResult(
 )
 
 object NativeFusionAlignment {
-    private val loaded = runCatching {
+    private val loaded = try {
         System.loadLibrary("kepler_raw_engine")
-    }.isSuccess
+        true
+    } catch (_: UnsatisfiedLinkError) {
+        false
+    } catch (_: SecurityException) {
+        false
+    }
 
     fun isAvailable(): Boolean = loaded
 
@@ -29,9 +34,15 @@ object NativeFusionAlignment {
         searchRadius: Int
     ): NativeAlignmentResult? {
         if (!loaded) return null
-        val result = runCatching {
+        val result = try {
             nativeAlignLumaFrames(reference, candidate, width, height, rowStride, searchRadius)
-        }.getOrNull() ?: return null
+        } catch (failure: java.util.concurrent.CancellationException) {
+            throw failure
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            return null
+        } ?: return null
         if (result.size != 9 || result.any { !it.isFinite() }) return null
         return NativeAlignmentResult(
             dx = result[0],

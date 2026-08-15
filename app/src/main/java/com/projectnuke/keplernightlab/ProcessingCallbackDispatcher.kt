@@ -3,6 +3,7 @@ package com.projectnuke.keplernightlab
 import android.os.Handler
 import android.util.Log
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.CancellationException
 
 internal enum class ProcessingCallbackDispatchResult {
     ACCEPTED,
@@ -49,10 +50,20 @@ internal class ProcessingCallbackDispatcher(
                     try {
                         callback()
                         executionObserver(ProcessingCallbackExecutionResult.EXECUTED, null)
-                    } catch (failure: Throwable) {
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (fatal: Error) {
+                        throw fatal
+                    } catch (failure: Exception) {
                         Log.e(tag, "processing callback execution failed", failure)
-                        runCatching {
+                        try {
                             executionObserver(ProcessingCallbackExecutionResult.EXECUTION_FAILED, failure)
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (fatal: Error) {
+                            throw fatal
+                        } catch (observerFailure: Exception) {
+                            Log.e(tag, "processing callback execution observer failed", observerFailure)
                         }
                     }
                 })) {
@@ -60,7 +71,11 @@ internal class ProcessingCallbackDispatcher(
             } else {
                 ProcessingCallbackDispatchResult.ACCEPTED.also(dispatchObserver)
             }
-        } catch (failure: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (failure: Exception) {
             Log.e(tag, "processing callback dispatch failed", failure)
             ProcessingCallbackDispatchResult.DISPATCH_THREW.also(dispatchObserver)
         }

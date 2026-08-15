@@ -7,6 +7,14 @@ import java.nio.file.LinkOption
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.CancellationException
+
+private fun throwIfYuvFatal(failure: Throwable) {
+    when (failure) {
+        is CancellationException -> throw failure
+        is Error -> throw failure
+    }
+}
 
 // ── Serializable manifest entry ────────────────────────────────────
 data class YuvFrameManifestEntry(
@@ -97,7 +105,11 @@ internal object RealYuvCandidateFilesystem : YuvCandidateFilesystem {
         return try {
             if (candidate.delete()) CandidateFileOperationResult.DELETED
             else CandidateFileOperationResult.DELETE_RETURNED_FALSE
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             CandidateFileOperationResult.DELETE_THREW(t)
         }
     }
@@ -110,7 +122,11 @@ internal object RealYuvCandidateFilesystem : YuvCandidateFilesystem {
             } else {
                 CandidateFileOperationResult.QUARANTINE_FAILED()
             }
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             CandidateFileOperationResult.QUARANTINE_FAILED(t)
         }
     }
@@ -144,7 +160,11 @@ internal object RealYuvFinalFileVerifier : YuvFinalFileVerifier {
     override fun verify(finalFile: File, frameIndex: Int): Boolean {
         val digest = try {
             NoFollowFileSystem.digestVerified(finalFile)
-        } catch (_: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (_: Exception) {
             return false
         }
         return digest.prefix.size >= PNG_SIGNATURE.size &&
@@ -424,7 +444,11 @@ internal class YuvCandidateHandle(
     private fun containedDelete(filesystem: YuvCandidateFilesystem): CandidateFileOperationResult =
         try {
             filesystem.delete(file)
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             CandidateFileOperationResult.DELETE_THREW(t)
         }
 
@@ -432,7 +456,11 @@ internal class YuvCandidateHandle(
     private fun containedQuarantine(filesystem: YuvCandidateFilesystem): CandidateFileOperationResult =
         try {
             filesystem.quarantine(file)
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             CandidateFileOperationResult.QUARANTINE_FAILED(t)
         }
 }
@@ -507,7 +535,11 @@ internal class AdoptionToken internal constructor(
         if (!state.compareAndSet(AdoptionTokenState.RESERVED, AdoptionTokenState.COMMITTING)) return false
         val ok = try {
             accounting.commitAdoption(this)
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             failure = t
             false
         }
@@ -533,7 +565,11 @@ internal class AdoptionToken internal constructor(
         if (!state.compareAndSet(AdoptionTokenState.RESERVED, AdoptionTokenState.ROLLING_BACK)) return false
         val ok = try {
             accounting.rollbackAdoption(this)
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             failure = t
             false
         }
@@ -597,7 +633,11 @@ internal class AdoptionToken internal constructor(
             } else {
                 returnedSuccess = true
             }
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             recoveryFailure = t
         }
         val status = accounting.reservationStatus(entry)
@@ -933,14 +973,32 @@ internal fun createDirectYuvWork(
 ): DirectYuvWorkCreation {
     val timestampNs = try {
         access.timestampNs()
-    } catch (t: Throwable) {
+    } catch (cancelled: CancellationException) {
+        val releaseFailure = containedRelease { access.release() }
+        if (releaseFailure != null) cancelled.addSuppressed(releaseFailure)
+        throw cancelled
+    } catch (fatal: Error) {
+        val releaseFailure = containedRelease { access.release() }
+        if (releaseFailure != null) {
+            if (releaseFailure is Error) fatal.addSuppressed(releaseFailure) else fatal.addSuppressed(releaseFailure)
+        }
+        throw fatal
+    } catch (t: Exception) {
         val releaseFailure = containedRelease { access.release() }
         account.failedFrame()
         return DirectYuvWorkCreation.Failed(t, releaseFailure)
     }
     val image = try {
         access.takeImage()
-    } catch (t: Throwable) {
+    } catch (cancelled: CancellationException) {
+        val releaseFailure = containedRelease { access.release() }
+        if (releaseFailure != null) cancelled.addSuppressed(releaseFailure)
+        throw cancelled
+    } catch (fatal: Error) {
+        val releaseFailure = containedRelease { access.release() }
+        if (releaseFailure != null) fatal.addSuppressed(releaseFailure)
+        throw fatal
+    } catch (t: Exception) {
         val releaseFailure = containedRelease { access.release() }
         account.failedFrame()
         return DirectYuvWorkCreation.Failed(t, releaseFailure)
@@ -956,7 +1014,15 @@ internal fun createDirectYuvWork(
     }
     val source = try {
         sourceFactory(image, timestampNs)
-    } catch (t: Throwable) {
+    } catch (cancelled: CancellationException) {
+        val releaseFailure = containedRelease { image.close() }
+        if (releaseFailure != null) cancelled.addSuppressed(releaseFailure)
+        throw cancelled
+    } catch (fatal: Error) {
+        val releaseFailure = containedRelease { image.close() }
+        if (releaseFailure != null) fatal.addSuppressed(releaseFailure)
+        throw fatal
+    } catch (t: Exception) {
         // The access was consumed by takeImage: the raw Image is released exactly once.
         val releaseFailure = containedRelease { image.close() }
         account.failedFrame()
@@ -964,7 +1030,15 @@ internal fun createDirectYuvWork(
     }
     val item = try {
         itemFactory(frameIndex, timestampNs, source, onRelease)
-    } catch (t: Throwable) {
+    } catch (cancelled: CancellationException) {
+        val releaseFailure = containedRelease { source.release() }
+        if (releaseFailure != null) cancelled.addSuppressed(releaseFailure)
+        throw cancelled
+    } catch (fatal: Error) {
+        val releaseFailure = containedRelease { source.release() }
+        if (releaseFailure != null) fatal.addSuppressed(releaseFailure)
+        throw fatal
+    } catch (t: Exception) {
         val releaseFailure = containedRelease { source.release() }
         account.failedFrame()
         return DirectYuvWorkCreation.Failed(t, releaseFailure)
@@ -976,7 +1050,11 @@ internal fun createDirectYuvWork(
 private inline fun containedRelease(release: () -> Unit): Throwable? = try {
     release()
     null
-} catch (t: Throwable) {
+} catch (cancelled: CancellationException) {
+    throw cancelled
+} catch (fatal: Error) {
+    throw fatal
+} catch (t: Exception) {
     t
 }
 
@@ -1004,7 +1082,11 @@ internal class YuvImageReleaseGuard(
         val outcome = try {
             access.release()
             YuvImageReleaseOutcome(attempted = true, succeeded = true)
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             YuvImageReleaseOutcome(attempted = true, succeeded = false, failure = t)
         }
         onReleaseOutcome(outcome)
@@ -1037,9 +1119,11 @@ internal fun createBufferedYuvWork(
         val item = YuvPngWorkItem.buffered(frameIndex, timestampNs, frame, bytes, reservations, accounting, onRelease)
         itemOwner = true
         return BufferedYuvWorkCreation.Accepted(item)
-    } catch (oom: OutOfMemoryError) {
-        throw oom
-    } catch (t: Throwable) {
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (fatal: Error) {
+        throw fatal
+    } catch (t: Exception) {
         accounting.failedFrame()
         return BufferedYuvWorkCreation.Failed(t)
     } finally {
@@ -1270,6 +1354,7 @@ internal class YuvPngWorkItem private constructor(
                 source.source.release()
                 sourceReleased = true
             } catch (t: Throwable) {
+                throwIfYuvFatal(t)
                 sourceReleaseFailure = t
             }
         }
@@ -1290,6 +1375,7 @@ internal class YuvPngWorkItem private constructor(
                 reservations?.release(retainedBytes)
                 reservationReleased = true
             } catch (t: Throwable) {
+                throwIfYuvFatal(t)
                 reservationReleaseFailure = t
             }
             bufferedAccountingReleaseAttempted = true
@@ -1297,6 +1383,7 @@ internal class YuvPngWorkItem private constructor(
                 accounting.releasedBufferedFrame()
                 bufferedAccountingReleased = true
             } catch (t: Throwable) {
+                throwIfYuvFatal(t)
                 bufferedAccountingFailure = t
             }
         }
@@ -1311,6 +1398,7 @@ internal class YuvPngWorkItem private constructor(
                 observer.invoke()
                 releaseObserverCompleted = true
             } catch (t: Throwable) {
+                throwIfYuvFatal(t)
                 releaseObserverFailure = t
             }
         }
@@ -1610,6 +1698,7 @@ internal class YuvCleanupCoordinator(
             captureStateOwner.close()
             stateRef.getAndUpdate { it.copy(ownerCloseRequested = true) }
         } catch (t: Throwable) {
+            throwIfYuvFatal(t)
             mutableFailures.add("ownerClose: ${t.message}")
         }
 
@@ -1619,6 +1708,7 @@ internal class YuvCleanupCoordinator(
         val claims = try {
             lifecycle.claimRetainedForDrain()
         } catch (t: Throwable) {
+            throwIfYuvFatal(t)
             mutableFailures.add("claimRetainedForDrain: ${t.message}")
             emptyList()
         }
@@ -1631,6 +1721,7 @@ internal class YuvCleanupCoordinator(
             val outcome = try {
                 claim.disposeAndFinish(accounting)
             } catch (t: Throwable) {
+                throwIfYuvFatal(t)
                 mutableFailures.add("drainDisposeAndFinish[${claim.frameIndex}]: ${t.message}")
                 continue
             }
@@ -1662,6 +1753,7 @@ internal class YuvCleanupCoordinator(
         try {
             workerReport = boundedWorker.shutdownNow()
         } catch (t: Throwable) {
+            throwIfYuvFatal(t)
             mutableFailures.add("workerShutdown: ${t.message}")
         }
 

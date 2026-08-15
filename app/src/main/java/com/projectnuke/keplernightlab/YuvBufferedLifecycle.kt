@@ -220,7 +220,11 @@ internal open class YuvBufferedLifecycle {
                 )
                 false
             }
-        } catch (t: Throwable) {
+        } catch (cancelled: java.util.concurrent.CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             releaseFailure = t
             false
         }
@@ -360,7 +364,11 @@ internal class YuvDrainClaim(
         }
         val released = try {
             lifecycle.finishDrain(item)
-        } catch (t: Throwable) {
+        } catch (cancelled: java.util.concurrent.CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             state.set(State.FAILED)
             return DrainSettlementOutcome(
                 DrainSettlementStatus.FAILED, disposal, lifecycleReleased = false, lifecycleReleaseFailure = t

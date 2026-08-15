@@ -65,7 +65,8 @@ fun analyzeKeplerFrameQuality(
         }
     }
     val thread = HandlerThread("KeplerFrameQualityThread").apply { start() }
-    val workerPosted = runCatching { Handler(thread.looper).post {
+    val workerPosted = try { Handler(thread.looper).post {
+        var primaryFailure: Throwable? = null
         try {
             val job = loadJobJson(jobDir)
             val frames = job.optJSONArray("frames") ?: JSONArray()
@@ -86,7 +87,16 @@ fun analyzeKeplerFrameQuality(
                 val metrics = try {
                     analyzeFrame(jobDir, job, frame, gyro)
                 } catch (oom: OutOfMemoryError) {
-                    suspectMetrics(scoringBackend, "OutOfMemoryError while analyzing frame")
+                    primaryFailure = oom
+                    try {
+                        post("Frame quality analysis stopped: OutOfMemoryError; job cache kept.")
+                    } catch (secondary: Throwable) {
+                        if (secondary !== oom) oom.addSuppressed(secondary)
+                    }
+                    throw oom
+                } catch (cancelled: java.util.concurrent.CancellationException) {
+                    primaryFailure = cancelled
+                    throw cancelled
                 } catch (e: Exception) {
                     suspectMetrics(scoringBackend, "${e.javaClass.simpleName}: ${e.message}")
                 }
@@ -124,17 +134,49 @@ fun analyzeKeplerFrameQuality(
             }
             post("Frame quality analysis complete: $total frames, $recommendedCount recommended exclude.")
         } catch (oom: OutOfMemoryError) {
-            post("Frame quality analysis failed: OutOfMemoryError; job cache kept.")
+            primaryFailure = oom
+            try {
+                post("Frame quality analysis stopped: OutOfMemoryError; job cache kept.")
+            } catch (secondary: Throwable) {
+                if (secondary !== oom) oom.addSuppressed(secondary)
+            }
+            throw oom
+        } catch (cancelled: java.util.concurrent.CancellationException) {
+            primaryFailure = cancelled
+            throw cancelled
+        } catch (fatal: Error) {
+            primaryFailure = fatal
+            throw fatal
         } catch (e: Exception) {
-            post("Frame quality analysis failed: ${e.javaClass.simpleName}: ${e.message}")
+            primaryFailure = e
+            try {
+                post("Frame quality analysis failed: ${e.javaClass.simpleName}: ${e.message}")
+            } catch (secondary: Throwable) {
+                if (secondary is Error || secondary is java.util.concurrent.CancellationException) {
+                    if (secondary !== e) secondary.addSuppressed(e)
+                    throw secondary
+                }
+                if (secondary !== e) e.addSuppressed(secondary)
+            }
         } finally {
-            val result = callbackDispatcher.dispatch(onComplete)
-            if (result != ProcessingCallbackDispatchResult.ACCEPTED) {
-                android.util.Log.w("KeplerFrameQuality", "completion dispatch $result")
+            try {
+                val result = callbackDispatcher.dispatch(onComplete)
+                if (result != ProcessingCallbackDispatchResult.ACCEPTED) {
+                    android.util.Log.w("KeplerFrameQuality", "completion dispatch $result")
+                }
+            } catch (secondary: Throwable) {
+                val primary = primaryFailure
+                if (primary != null) {
+                    if (secondary !== primary) primary.addSuppressed(secondary)
+                } else {
+                    throw secondary
+                }
             }
             thread.quitSafely()
         }
-    } }.getOrElse { failure ->
+    } } catch (failure: Error) {
+        throw failure
+    } catch (failure: Exception) {
         android.util.Log.e("KeplerFrameQuality", "worker dispatch failed", failure)
         false
     }

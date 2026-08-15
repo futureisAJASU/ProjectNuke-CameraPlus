@@ -1,6 +1,7 @@
 package com.projectnuke.keplernightlab
 
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.CancellationException
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -153,12 +154,14 @@ internal open class BoundedCaptureWorker(
                                 _ledger.add(WorkerFailure(task, exc, "shutdown", "disposeUnclean", outcome))
                             }
                             is CaptureTaskDisposalOutcome.Failed -> {
+                                throwIfCaptureFatal(outcome.failure)
                                 taskFailures.add("taskDispose: ${outcome.failure.message}")
                                 ignore { onTaskDisposalFailure(task, outcome.failure) }
                                 _ledger.add(WorkerFailure(task, outcome.failure, "shutdown", "disposeFailed"))
                             }
                         }
                     } catch (t: Throwable) {
+                        throwIfCaptureFatal(t)
                         taskFailures.add("taskDispose: ${t.message}")
                         ignore { onTaskDisposalFailure(task, t) }
                         _ledger.add(WorkerFailure(task, t, "shutdown", "disposeThrew"))
@@ -170,6 +173,7 @@ internal open class BoundedCaptureWorker(
                         task.dispose()
                         disposableSucceeded++
                     } catch (t: Throwable) {
+                        throwIfCaptureFatal(t)
                         taskFailures.add("taskDispose: ${t.message}")
                         ignore { onTaskDisposalFailure(task, t) }
                         _ledger.add(WorkerFailure(task, t, "shutdown", "dispose"))
@@ -183,6 +187,7 @@ internal open class BoundedCaptureWorker(
             try {
                 notificationHook(task)
             } catch (t: Throwable) {
+                throwIfCaptureFatal(t)
                 rejectionFailures.add("rejectionNotification: ${t.message}")
                 ignore { onRejectionNotificationFailure(task, t) }
                 _ledger.add(WorkerFailure(task, t, "shutdown", "notificationFailure"))
@@ -213,17 +218,20 @@ internal open class BoundedCaptureWorker(
                             _ledger.add(WorkerFailure(task, exc, "rejection", "disposeUnclean", outcome))
                         }
                         is CaptureTaskDisposalOutcome.Failed -> {
+                            throwIfCaptureFatal(outcome.failure)
                             ignore { onTaskDisposalFailure(task, outcome.failure) }
                             _ledger.add(WorkerFailure(task, outcome.failure, "rejection", "disposeFailed"))
                         }
                     }
                 } catch (t: Throwable) {
+                    throwIfCaptureFatal(t)
                     ignore { onTaskDisposalFailure(task, t) }
                     _ledger.add(WorkerFailure(task, t, "rejection", "disposeThrew"))
                 }
             }
             is DisposableCaptureTask -> {
                 try { task.dispose() } catch (t: Throwable) {
+                    throwIfCaptureFatal(t)
                     ignore { onTaskDisposalFailure(task, t) }
                     _ledger.add(WorkerFailure(task, t, "rejection", "dispose"))
                 }
@@ -233,6 +241,7 @@ internal open class BoundedCaptureWorker(
         try {
             notificationHook(task)
         } catch (t: Throwable) {
+            throwIfCaptureFatal(t)
             ignore { onRejectionNotificationFailure(task, t) }
             _ledger.add(WorkerFailure(task, t, "rejection", "notificationFailure"))
         }
@@ -262,4 +271,11 @@ internal open class BoundedCaptureWorker(
         val failureType: String,
         val disposalOutcome: CaptureTaskDisposalOutcome? = null
     )
+}
+
+private fun throwIfCaptureFatal(failure: Throwable) {
+    when (failure) {
+        is CancellationException -> throw failure
+        is Error -> throw failure
+    }
 }
