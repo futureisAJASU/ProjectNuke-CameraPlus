@@ -1402,8 +1402,11 @@ private fun writeHeifViaTempFile(
         val digest = NoFollowFileSystem.copyVerified(tempFile, output)
         check(digest.size > 0L) { "HEIF writer produced an empty temporary file" }
         true
-    } catch (error: Throwable) {
-        if (error is Error) throw error
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Error) {
+        throw error
+    } catch (error: Exception) {
         Log.w(
             "KeplerGalleryExporter",
             "HEIF encode failed pixels=${bitmap.width.toLong() * bitmap.height} timeoutMs=$timeoutMs: ${error.message}",

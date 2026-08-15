@@ -36,8 +36,7 @@ internal class RawFusionMetadataIntegrityException(
  * - [CancellationException] propagates unchanged.
  * - [ThreadDeath] propagates unchanged.
  * - ordinary [Exception] is wrapped with [originalFailure] as suppressed.
- * - [OutOfMemoryError] is wrapped with [originalFailure] as suppressed.
- * - Every other [Error] (fatal, unrelated) propagates unchanged.
+ * - Every [Error], including [OutOfMemoryError], propagates unchanged.
  */
 internal inline fun wrapMetadataIntegrityFailure(
     originalFailure: Throwable? = null,
@@ -50,9 +49,17 @@ internal inline fun wrapMetadataIntegrityFailure(
     } catch (td: ThreadDeath) {
         throw td
     } catch (e: Exception) {
+        if (originalFailure is Error) {
+            if (originalFailure !== e) originalFailure.addSuppressed(e)
+            throw originalFailure
+        }
         throw RawFusionMetadataIntegrityException(e, originalFailure)
-    } catch (oom: OutOfMemoryError) {
-        throw RawFusionMetadataIntegrityException(oom, originalFailure)
+    } catch (fatal: Error) {
+        if (originalFailure is Error) {
+            if (originalFailure !== fatal) originalFailure.addSuppressed(fatal)
+            throw originalFailure
+        }
+        throw fatal
     }
 }
 
@@ -458,8 +465,19 @@ internal fun persistRawFusionFailureMetadata(
             }
         }
         if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
-            current.put("currentPipelineStage", "FAILED")
-            current.put("processStatus", processStatus)
+            val currentClaimedOutput = current.optBoolean("processingOutputCommitted", false) &&
+                current.optString("processingArtifactClaimAttemptId") == current.optString("processingAttemptId") &&
+                current.optString("processingAttemptId").isNotBlank() &&
+                current.optString("mergedRawFile").isNotBlank() &&
+                NoFollowFileSystem.resolveDirectChildResult(
+                    jobDir,
+                    current.optString("mergedRawFile"),
+                    requireFile = true
+                ) is NoFollowInspection.Present
+            current.put("currentPipelineStage", if (currentClaimedOutput) "PIPELINE_COMPLETE_PARTIAL" else "FAILED")
+            current.put("processStatus", if (currentClaimedOutput) "PIPELINE_COMPLETE_PARTIAL" else processStatus)
+                .put("finalOutputAvailable", currentClaimedOutput)
+                .put("galleryDisplayUnavailable", !currentClaimedOutput)
             current.put("userCanMoveDevice", true)
         }
         current.put("rawProcessorFailureType", failureType)

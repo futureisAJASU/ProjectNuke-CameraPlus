@@ -118,6 +118,34 @@ internal fun runClassicRawFusionMerge(
         operationLease = operationLease
     )
     job.put("processingAttemptId", processingAttempt.id)
+    fun persistPostFailure(failure: Throwable, status: String) {
+        val currentClaimed = currentProcessingAttemptHasRequiredOutputClaim(
+            jobDir,
+            expectedAttemptId = processingAttempt.id
+        )
+        try {
+            updateForProcessingAttempt(jobDir, processingAttempt) { current ->
+                current.put("processStatus", if (currentClaimed) "PIPELINE_COMPLETE_PARTIAL" else status)
+                    .put("currentPipelineStage", if (currentClaimed) "PIPELINE_COMPLETE_PARTIAL" else "FAILED")
+                    .put("processError", "${failure.javaClass.simpleName}: ${failure.message}")
+                    .put("processingFailureType", failure.javaClass.simpleName)
+                    .put("processingFailureMessage", failure.message ?: status)
+                    .put("finalOutputAvailable", currentClaimed)
+                    .put("galleryDisplayUnavailable", !currentClaimed)
+            }
+        } catch (metadataFailure: Error) {
+            if (failure is Error) {
+                if (failure !== metadataFailure) failure.addSuppressed(metadataFailure)
+                throw failure
+            }
+            metadataFailure.addSuppressed(failure)
+            throw metadataFailure
+        } catch (metadataFailure: Exception) {
+            if (failure is Error) failure.addSuppressed(metadataFailure)
+            else Log.e("KeplerRawPipeline", "RAW failure metadata persistence failed", metadataFailure)
+            if (failure is Error) throw failure
+        }
+    }
     return try {
         cancellation.throwIfCancelled()
         onStatus("Classic RAW fusion: loading frames...")
@@ -380,28 +408,35 @@ internal fun runClassicRawFusionMerge(
             ,outputCommitted = true
         )
     } catch (ce: CancellationException) {
+        persistPostFailure(ce, "CANCELLED")
         throw ce
     } catch (oom: OutOfMemoryError) {
-        job.put("processStatus", "OOM_FAILED_KEEPING_CACHE")
-            .put("rawFusionEngine", "classic_raw_v1")
-            .put("processError", "OutOfMemoryError")
-            .put("processedAt", System.currentTimeMillis())
-        ClassicRawFusionResult(false, null, null, 0, "failed", "OOM_FAILED", null, "OutOfMemoryError", originalFailure = oom)
+        persistPostFailure(oom, "OOM_FAILED_KEEPING_CACHE")
+        throw oom
+    } catch (fatal: Error) {
+        persistPostFailure(fatal, "FATAL_FAILED_KEEPING_CACHE")
+        throw fatal
     } catch (e: Exception) {
-        job.put("processStatus", "CLASSIC_RAW_FUSION_FAILED_KEEPING_CACHE")
+        persistPostFailure(e, "CLASSIC_RAW_FUSION_FAILED_KEEPING_CACHE")
+        val currentClaimed = currentProcessingAttemptHasRequiredOutputClaim(
+            jobDir,
+            expectedAttemptId = processingAttempt.id
+        )
+        job.put("processStatus", if (currentClaimed) "PIPELINE_COMPLETE_PARTIAL" else "CLASSIC_RAW_FUSION_FAILED_KEEPING_CACHE")
             .put("rawFusionEngine", "classic_raw_v1")
             .put("processError", "${e.javaClass.simpleName}: ${e.message}")
             .put("processedAt", System.currentTimeMillis())
         ClassicRawFusionResult(
-            false,
-            null,
-            null,
+            currentClaimed,
+            mergedRawFile.takeIf { currentClaimed },
+            alignmentFile.takeIf { it.isFile },
             0,
             "failed",
-            "CLASSIC_RAW_FUSION_FAILED",
+            if (currentClaimed) "CLASSIC_RAW_MERGE_COMMITTED_PARTIAL" else "CLASSIC_RAW_FUSION_FAILED",
             null,
             "${e.javaClass.simpleName}: ${e.message}",
-            originalFailure = e
+            originalFailure = e,
+            outputCommitted = currentClaimed
         )
     } finally {
         processingAttempt.releaseOwnedLease()

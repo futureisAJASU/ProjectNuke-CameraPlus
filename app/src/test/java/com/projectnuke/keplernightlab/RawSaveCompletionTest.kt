@@ -2,6 +2,7 @@ package com.projectnuke.keplernightlab
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertThrows
 import org.junit.Test
@@ -302,6 +303,66 @@ class RawSaveCompletionTest {
         task.run()
 
         assertEquals(1, disposed)
+    }
+
+    @Test
+    fun fatalProducerFailureEscapesAfterOwnerReceivesExactFailureCompletion() {
+        val fatal = AssertionError("native save invariant")
+        var received: RawSaveCompletion? = null
+        var disposed = 0
+        val task = RawSaveTask(
+            produceCompletion = { throw fatal },
+            unexpectedFailure = { throwable ->
+                RawSaveCompletion.Failed(9, 99L, throwable.javaClass.simpleName, throwable.message.orEmpty(), throwable)
+            },
+            postCompletion = { completion ->
+                received = completion
+                RawCompletionPostOutcome.ACCEPTED
+            },
+            disposeCompletion = {
+                disposed++
+                CaptureTaskDisposalOutcome.Clean
+            },
+            disposeQueuedInput = { error("accepted task must not dispose queued input") }
+        )
+
+        assertThrows(AssertionError::class.java) { task.run() }
+        assertSame(fatal, (received as RawSaveCompletion.Failed).throwable)
+        assertEquals(0, disposed)
+    }
+
+    @Test
+    fun fatalOwnerHandoffFailureIsNotHiddenByOrdinaryProducerFailure() {
+        val producerFailure = IllegalStateException("ordinary producer failure")
+        val handoffFailure = AssertionError("fatal owner handoff")
+        val task = RawSaveTask(
+            produceCompletion = { throw producerFailure },
+            unexpectedFailure = { throwable ->
+                RawSaveCompletion.Failed(10, 100L, throwable.javaClass.simpleName, throwable.message.orEmpty(), throwable)
+            },
+            postCompletion = { throw handoffFailure },
+            disposeCompletion = { CaptureTaskDisposalOutcome.Clean },
+            disposeQueuedInput = { error("accepted task must not dispose queued input") }
+        )
+
+        val escaped = assertThrows(AssertionError::class.java) { task.run() }
+        assertSame(handoffFailure, escaped)
+        assertTrue(handoffFailure.suppressed.any { it === producerFailure })
+    }
+
+    @Test
+    fun fatalOutputCleanupFailureEscapesInsteadOfBecomingCleanupDebt() {
+        val root = createTempDirectory("raw-fatal-cleanup").toFile()
+        try {
+            val output = root.resolve("frame.raw16").apply { writeBytes(byteArrayOf(1)) }
+            val fatal = AssertionError("cleanup invariant")
+            assertThrows(AssertionError::class.java) {
+                settleRawOutputFiles(listOf(output), deleteFile = { throw fatal })
+            }
+            assertTrue(output.exists())
+        } finally {
+            root.deleteRecursively()
+        }
     }
 
     @Test

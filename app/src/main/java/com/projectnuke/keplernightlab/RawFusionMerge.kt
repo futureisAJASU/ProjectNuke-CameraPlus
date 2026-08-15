@@ -2,9 +2,23 @@ package com.projectnuke.keplernightlab
 
 import org.json.JSONObject
 
+@Volatile
+internal var rawFusionNativeMergeForTest: ((NativeMergeRequest) -> String)? = null
+
 internal fun runNativeRawMerge(request: NativeMergeRequest): String {
+    rawFusionNativeMergeForTest?.let { invoke ->
+        return try {
+            invoke(request)
+        } catch (cancelled: java.util.concurrent.CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (failure: Exception) {
+            "ERROR: ${failure.javaClass.simpleName}: ${failure.message}"
+        }
+    }
     if (!isNativeRawEngineAvailable()) return "ERROR: native library unavailable"
-    return runCatching {
+    return try {
         NativeRawEngine.alignAndMergeRaw16(
             framePaths = request.frameInputs.map { it.file.absolutePath }.toTypedArray(),
             exposureScales = request.exposureScales,
@@ -20,7 +34,13 @@ internal fun runNativeRawMerge(request: NativeMergeRequest): String {
             outputMergedRawPath = request.mergedRawFile.absolutePath,
             outputAlignmentJsonPath = request.alignmentFile.absolutePath
         )
-    }.getOrElse { "ERROR: ${it.javaClass.simpleName}: ${it.message}" }
+    } catch (cancelled: java.util.concurrent.CancellationException) {
+        throw cancelled
+    } catch (fatal: Error) {
+        throw fatal
+    } catch (failure: Exception) {
+        "ERROR: ${failure.javaClass.simpleName}: ${failure.message}"
+    }
 }
 
 internal fun resolveNativeAlignmentStatus(

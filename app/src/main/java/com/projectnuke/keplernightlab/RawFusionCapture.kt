@@ -83,12 +83,16 @@ private fun resolveRawUserProcessingParams(job: JSONObject): RawUserProcessingPa
     val localContrast = value("localContrastAmount", preset.params.localContrastAmount, 0f, 0.18f)
     val shadowLift = value("shadowLift", preset.params.shadowLift, 0f, 0.06f)
     val highlightRolloff = value("highlightRollOff", preset.params.highlightRollOff, 0.02f, 0.35f)
-    val fusionAlgorithm = runCatching {
+    val fusionAlgorithm = try {
         FusionAlgorithm.valueOf(
             json?.optString("fusionAlgorithm", FusionAlgorithm.ROBUST_REFERENCE.name)
                 ?: FusionAlgorithm.ROBUST_REFERENCE.name
         )
-    }.getOrDefault(FusionAlgorithm.ROBUST_REFERENCE)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        FusionAlgorithm.ROBUST_REFERENCE
+    }
     return RawUserProcessingParams(
         presetName = preset.name,
         fusionAlgorithm = fusionAlgorithm,
@@ -151,7 +155,11 @@ fun captureRawBurstForFusion(
         mainHandler.post {
             try {
                 onStatus(message)
-            } catch (callbackFailure: Throwable) {
+            } catch (cancelled: java.util.concurrent.CancellationException) {
+                throw cancelled
+            } catch (fatal: Error) {
+                throw fatal
+            } catch (callbackFailure: Exception) {
                 Log.e(RAW_PIPELINE_LOG_TAG, "RAW status callback failed", callbackFailure)
             }
         }
@@ -166,6 +174,9 @@ fun captureRawBurstForFusion(
             } catch (callbackFailure: Throwable) {
                 Log.e(RAW_PIPELINE_LOG_TAG, "RAW terminal callback failed", callbackFailure)
                 rawCallbackExecutionOutcome.set(RawTerminalOperationOutcome.Failed(callbackFailure))
+                if (callbackFailure is java.util.concurrent.CancellationException || callbackFailure is Error) {
+                    throw callbackFailure
+                }
             }
             republishRawTerminalSnapshot.get()?.invoke()
         }
@@ -396,7 +407,11 @@ fun captureRawBurstForFusion(
             if (error != null) job.put("failureReason", error)
             KeplerJobMetadata.write(jobFile.parentFile ?: error("Job directory missing"), job)
             RawTerminalOperationOutcome.Succeeded
-        } catch (failure: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Error) {
+            throw failure
+        } catch (failure: Exception) {
             RawTerminalOperationOutcome.Failed(failure)
         }
     }
@@ -778,7 +793,15 @@ fun captureRawBurstForFusion(
             RawAttachmentDisposition.SETTLED_LATE -> return
         }
 
-        motionLogger = runCatching { MotionLogger(context).also { it.start() } }.getOrNull()
+        motionLogger = try {
+            MotionLogger(context).also { it.start() }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            null
+        }
         when (productionResourceCoordinator.attachMotionLogger(motionLogger)) {
             RawAttachmentDisposition.ACCEPTED,
             RawAttachmentDisposition.ALREADY_OWNED,
@@ -815,7 +838,10 @@ fun captureRawBurstForFusion(
                                 val files = motionLogger?.saveToDirectory(jobDir)
                                 motionOutcome = RawTerminalOperationOutcome.Succeeded
                                 files
-                            } catch (failure: Throwable) {
+                            } catch (failure: Error) {
+                                motionOutcome = RawTerminalOperationOutcome.Failed(failure)
+                                throw failure
+                            } catch (failure: Exception) {
                                 motionOutcome = RawTerminalOperationOutcome.Failed(failure)
                                 null
                             }
@@ -860,7 +886,10 @@ fun captureRawBurstForFusion(
                                 KeplerJobMetadata.write(jobDir, terminalJob)
                                 metadataOutcome = RawTerminalOperationOutcome.Succeeded
                                 durableCaptureTerminalPersisted = true
-                            } catch (failure: Throwable) {
+                            } catch (failure: Error) {
+                                metadataOutcome = RawTerminalOperationOutcome.Failed(failure)
+                                throw failure
+                            } catch (failure: Exception) {
                                 metadataOutcome = RawTerminalOperationOutcome.Failed(failure)
                             }
                         } else {
@@ -884,6 +913,9 @@ fun captureRawBurstForFusion(
                             metadata = metadataOutcome,
                             status = statusOutcome
                         )
+                        if (failure is java.util.concurrent.CancellationException || failure is Error) {
+                            throw failure
+                        }
                     } finally {
                         if (durableCaptureTerminalPersisted) {
                             val handoffPublished = KeplerJobMetadata.publishProcessingHandoff(
@@ -1021,7 +1053,9 @@ fun captureRawBurstForFusion(
                 return try {
                     if (file.delete()) RawOutputCleanupStatus.DELETED
                     else RawOutputCleanupStatus.DELETE_RETURNED_FALSE
-                } catch (t: Throwable) {
+                } catch (t: Error) {
+                    throw t
+                } catch (t: Exception) {
                     RawOutputCleanupStatus.DELETE_THREW
                 }
             }
@@ -1066,8 +1100,12 @@ fun captureRawBurstForFusion(
                         check(finalDigest.size > 0L && isDngTiffHeader(finalDigest.prefix)) { "DNG final verification failed" }
                         // Some providers do not allow opening a directory channel. That is a
                         // best-effort durability fence after the atomic replacement.
-                        runCatching {
+                        try {
                             java.nio.channels.FileChannel.open(jobDir.toPath()).use { it.force(true) }
+                        } catch (failure: Error) {
+                            throw failure
+                        } catch (_: Exception) {
+                            // Provider directory-force is an optional durability fence.
                         }
                         dngSaved = true
                     } catch (e: Exception) {
@@ -1307,7 +1345,9 @@ fun captureRawBurstForFusion(
                     try {
                         request.image.close()
                         CaptureTaskDisposalOutcome.Clean
-                    } catch (t: Throwable) {
+                    } catch (t: Error) {
+                        throw t
+                    } catch (t: Exception) {
                         recordImageReleaseFailure(request.frameIndex, request.timestampNs, "queued-task-disposal", t)
                         CaptureTaskDisposalOutcome.Failed(t)
                     }
@@ -1379,7 +1419,9 @@ fun captureRawBurstForFusion(
             fun release(reason: String) {
                 try {
                     image.close()
-                } catch (failure: Throwable) {
+                } catch (failure: Error) {
+                    throw failure
+                } catch (failure: Exception) {
                     recordImageReleaseFailure(null, timestampNs, reason, failure)
                 }
             }
@@ -1502,7 +1544,9 @@ fun captureRawBurstForFusion(
             if (finished.get()) {
                 try {
                     image.close()
-                } catch (failure: Throwable) {
+                } catch (failure: Error) {
+                    throw failure
+                } catch (failure: Exception) {
                     recordImageReleaseFailure(null, image.timestamp, "late-image", failure)
                 }
                 return@setOnImageAvailableListener
@@ -1844,7 +1888,7 @@ private object RawFusionExportCoordinator {
         context.onStatus("Native RAW ISP 렌더링 중입니다.")
         // Native ISP cannot stop mid-call; cancellation is checked at call boundaries.
         cancellation.throwIfCancelled()
-        val postprocessStatus = runCatching {
+        val postprocessStatus = try {
             NativeRawEngine.processRaw16ToRgbOutput(
                 mergedRawPath = context.files.mergedRawFile.absolutePath,
                 width = context.sensor.width,
@@ -1858,7 +1902,13 @@ private object RawFusionExportCoordinator {
                 outputPath = nativeRgbaFile.absolutePath,
                 outputMetadataJsonPath = nativeMetadataFile.absolutePath
             )
-        }.getOrElse { "ERROR: ${it.javaClass.simpleName}: ${it.message}" }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Error) {
+            throw failure
+        } catch (failure: Exception) {
+            "ERROR: ${failure.javaClass.simpleName}: ${failure.message}"
+        }
         cancellation.throwIfCancelled()
         val expectedRgbaBytes = outputWidth.toLong() * outputHeight.toLong() * 4L
         val nativePostprocessUsed = postprocessStatus.startsWith("OK:") &&
@@ -1875,7 +1925,13 @@ private object RawFusionExportCoordinator {
         )
         val nativePostprocessMetadata = if (nativePostprocessUsed) {
             cancellation.throwIfCancelled()
-            runCatching { JSONObject(NoFollowFileSystem.readTextVerified(nativeMetadataFile)) }.getOrNull()
+            try {
+                JSONObject(NoFollowFileSystem.readTextVerified(nativeMetadataFile))
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                null
+            }
         } else {
             null
         }
@@ -2046,7 +2102,7 @@ private object RawFusionExportCoordinator {
         context.onStatus("Native RAW ISP 렌더링 중입니다.")
         // Native ISP cannot stop mid-call; cancellation is checked at call boundaries.
         cancellation.throwIfCancelled()
-        val status = runCatching {
+        val status = try {
             NativeRawEngine.processRaw16ToRgbOutputV2(
                 mergedRawPath = context.files.mergedRawFile.absolutePath,
                 referenceRawPath = referencePath,
@@ -2063,7 +2119,13 @@ private object RawFusionExportCoordinator {
                 outputReferenceDebugRgbaPath = referenceDebugRgbaFile.absolutePath,
                 outputMergedLinearDebugRgbaPath = mergedLinearDebugRgbaFile.absolutePath
             )
-        }.getOrElse { "ERROR: ${it.javaClass.simpleName}: ${it.message}" }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Error) {
+            throw failure
+        } catch (failure: Exception) {
+            "ERROR: ${failure.javaClass.simpleName}: ${failure.message}"
+        }
         cancellation.throwIfCancelled()
         val expectedBytes = outputWidth.toLong() * outputHeight.toLong() * 4L
         val nativeOk = status.startsWith("OK:") &&
@@ -2130,7 +2192,13 @@ private object RawFusionExportCoordinator {
             )
         }
         cancellation.throwIfCancelled()
-        val debug = runCatching { JSONObject(NoFollowFileSystem.readTextVerified(renderDebugFile)) }.getOrNull()
+        val debug = try {
+            JSONObject(NoFollowFileSystem.readTextVerified(renderDebugFile))
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            null
+        }
         val nativeWarnings = debug?.optJSONArray("renderWarnings") ?: JSONArray()
         Log.i(
             RAW_PIPELINE_LOG_TAG,
@@ -2409,14 +2477,19 @@ fun processRawFusionJob(
             )
         }
         cancellation.throwIfCancelled()
-        val mergedRawDigest = if (classicMerge.success) {
-            runCatching { NoFollowFileSystem.digestVerified(mergedRawFile) }.getOrNull()
+        val mergedRawDigest = if (classicMerge.outputCommitted) {
+            try {
+                NoFollowFileSystem.digestVerified(mergedRawFile)
+            } catch (fatal: Error) {
+                throw fatal
+            } catch (_: Exception) {
+                null
+            }
         } else {
             null
         }
-        val classicMergedOk = classicMerge.success &&
-            mergedRawDigest?.size == pixelCount * 2L &&
-            alignmentFile.exists()
+        val classicMergedOk = classicMerge.outputCommitted &&
+            mergedRawDigest?.size == pixelCount * 2L
         if (!classicMergedOk) {
             val failureMessage = classicMerge.errorMessage ?: "Classic RAW fusion failed"
             val classicFailureType = if (classicMerge.alignmentStatus == "OOM_FAILED") {
@@ -2491,7 +2564,7 @@ fun processRawFusionJob(
         // competing terminal metadata at all.
         if (!exportProcessResult.success) return exportProcessResult
         if (metadataPolicy != ReprocessMetadataPolicy.REPROCESS_PROGRESS_ONLY) {
-            runCatching {
+            try {
                 val pipelineStartedAt = job.optLong("rawCaptureStartedAt", 0L)
                     .takeIf { it > 0L }
                     ?: job.optLong("createdAt", System.currentTimeMillis())
@@ -2500,6 +2573,10 @@ fun processRawFusionJob(
                     current.put("totalPipelineMs", totalPipelineMs)
                     current.put("rawFusionProcessingPolicy", metadataPolicy.name)
                 }
+            } catch (failure: Error) {
+                throw failure
+            } catch (failure: Exception) {
+                Log.e("KeplerRawPipeline", "Failed to persist RAW pipeline timing metadata", failure)
             }
         }
         exportProcessResult
@@ -2522,7 +2599,7 @@ fun processRawFusionJob(
             )
         }
         onStatus("RAW fusion stopped: insufficient memory. RAW cache kept.")
-        RawFusionProcessResult(false, null, null, null, null, "OutOfMemoryError: RAW cache kept")
+        throw oom
     } catch (mie: RawFusionMetadataIntegrityException) {
         // Metadata-integrity failure that already carries both the original processing failure
         // and the metadata persistence failure. Bypass ordinary processor-failure conversion so
@@ -2567,9 +2644,13 @@ fun chooseRawFusionSizeV2(
     } else {
         emptyList()
     }
-    val highRaw = runCatching {
+    val highRaw = try {
         normalMap.getHighResolutionOutputSizes(ImageFormat.RAW_SENSOR)?.toList().orEmpty()
-    }.getOrDefault(emptyList())
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        emptyList()
+    }
     if (normalRaw.isEmpty() && maxRaw.isEmpty() && highRaw.isEmpty()) {
         error("RAW_SENSOR not exposed in normal, maximum-resolution, or high-resolution maps")
     }
@@ -2975,8 +3056,13 @@ internal fun loadRawRgbaBitmap(file: File, width: Int, height: Int): Bitmap {
     try {
         NoFollowFileSystem.copyVerified(file, NativeRgbaBitmapSink(bitmap, width, height))
         return bitmap
-    } catch (t: Throwable) {
-        bitmap.takeUnless { it.isRecycled }?.recycle()
-        throw t
+    } catch (failure: Throwable) {
+        try {
+            bitmap.takeUnless { it.isRecycled }?.recycle()
+        } catch (secondary: Throwable) {
+            try { failure.addSuppressed(secondary) } catch (_: Exception) { }
+            if (failure !is Error && secondary is Error) throw secondary
+        }
+        throw failure
     }
 }

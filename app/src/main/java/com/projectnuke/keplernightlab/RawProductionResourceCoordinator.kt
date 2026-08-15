@@ -57,7 +57,31 @@ internal class RawProductionResourceCoordinator(
     private fun releaseSession(session: CameraCaptureSession) {
         var first: Throwable? = null
         fun attempt(action: () -> Unit) {
-            try { action() } catch (t: Throwable) { if (first == null) first = t }
+            try {
+                action()
+            } catch (cancelled: java.util.concurrent.CancellationException) {
+                if (first == null) {
+                    first = cancelled
+                } else {
+                    val existing = first ?: return@attempt
+                    existing.addSuppressed(cancelled)
+                }
+            } catch (fatal: Error) {
+                if (first == null) {
+                    first = fatal
+                } else {
+                    val existing = first ?: return@attempt
+                    fatal.addSuppressed(existing)
+                    first = fatal
+                }
+            } catch (failure: Exception) {
+                if (first == null) {
+                    first = failure
+                } else {
+                    val existing = first ?: return@attempt
+                    existing.addSuppressed(failure)
+                }
+            }
         }
         attempt { session.abortCaptures() }
         attempt { session.stopRepeating() }
@@ -153,7 +177,11 @@ internal class RawProductionResourceCoordinator(
         try {
             releaseInterceptor?.invoke(tag, release) ?: release()
             synchronized(lock) { records += RawProductionReleaseRecord(tag, true, true) }
-        } catch (t: Throwable) {
+        } catch (cancelled: java.util.concurrent.CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (t: Exception) {
             synchronized(lock) { records += RawProductionReleaseRecord(tag, true, false, t) }
         }
     }

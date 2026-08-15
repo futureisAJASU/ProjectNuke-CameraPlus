@@ -1,6 +1,7 @@
 package com.projectnuke.keplernightlab
 
 import java.io.File
+import java.util.concurrent.CancellationException
 
 internal enum class RawOutputState {
     TEMP,
@@ -184,7 +185,11 @@ internal fun settleRawSaveImage(
     val releaseFailure = try {
         closeImage()
         null
-    } catch (failure: Throwable) {
+    } catch (failure: Error) {
+        // The task boundary rethrows this after the owner receives the exact
+        // completion, so resource settlement cannot replace fatal identity.
+        failure
+    } catch (failure: Exception) {
         failure
     }
     return when (completion) {
@@ -234,7 +239,9 @@ internal fun settleRawOutputFiles(
             } else {
                 records += RawOutputCleanupRecord(file.absolutePath, kind, role, RawOutputCleanupStatus.DELETED)
             }
-        } catch (failure: Throwable) {
+        } catch (failure: Error) {
+            throw failure
+        } catch (failure: Exception) {
             records += RawOutputCleanupRecord(file.absolutePath, kind, role, RawOutputCleanupStatus.DELETE_THREW, failure)
             if (firstFailure == null) firstFailure = failure
         }
@@ -283,13 +290,56 @@ internal class RawSaveTask(
         val completion = try {
             produceCompletion()
         } catch (t: Throwable) {
-            // The task boundary is the last ownership point for fatal worker
-            // failures.  Convert them into an immutable completion so the
-            // serialized owner can reject/adopt and settle outputs normally.
-            unexpectedFailure(t)
+            // Publish the exact failure completion while the task still owns the
+            // transferred input/output, then preserve fatal/cancellation identity.
+            val failed = unexpectedFailure(t)
+            var secondaryFailure: Throwable? = null
+            try {
+                if (postCompletion(failed) == RawCompletionPostOutcome.REJECTED_UNSETTLED) {
+                    when (val disposal = disposeCompletion(failed)) {
+                        is CaptureTaskDisposalOutcome.Failed -> {
+                            secondaryFailure = disposal.failure
+                        }
+                        else -> Unit
+                    }
+                }
+            } catch (secondary: Throwable) {
+                secondaryFailure = secondary
+            }
+            secondaryFailure?.let { secondary ->
+                when {
+                    secondary is Error || secondary is CancellationException -> {
+                        if (t is Error || t is CancellationException) {
+                            if (t !== secondary) t.addSuppressed(secondary)
+                        } else {
+                            secondary.addSuppressed(t)
+                        }
+                    }
+                    else -> t.addSuppressed(secondary)
+                }
+            }
+            if (t is java.util.concurrent.CancellationException || t is Error) throw t
+            if (secondaryFailure is CancellationException || secondaryFailure is Error) {
+                throw secondaryFailure!!
+            }
+            return
         }
         if (postCompletion(completion) == RawCompletionPostOutcome.REJECTED_UNSETTLED) {
-            disposeCompletion(completion)
+            when (val disposal = disposeCompletion(completion)) {
+                is CaptureTaskDisposalOutcome.Failed -> {
+                    if (disposal.failure is CancellationException || disposal.failure is Error) {
+                        throw disposal.failure
+                    }
+                }
+                else -> Unit
+            }
+        }
+        val completionFailure = when (completion) {
+            is RawSaveCompletion.Failed -> completion.throwable
+            else -> completion.imageReleaseFailure
+        }
+        if (completionFailure is java.util.concurrent.CancellationException || completionFailure is Error) {
+            throw completionFailure
         }
     }
 

@@ -169,6 +169,21 @@ internal sealed class RawFusionExportResult {
 
 internal val RawFusionExportResult.processResult: RawFusionProcessResult get() = base
 
+/** One terminal-kind mapping for every durable RAW public-export outcome. */
+internal fun rawFusionOutcomeTerminalKind(
+    outcome: RawFusionPublicExportOutcome?,
+    cancellationRequested: Boolean
+): CameraPipelineEvent.Terminal.Kind = when {
+    outcome?.committed == true && outcome.verified &&
+        !outcome.postExportCancellationRequested &&
+        !outcome.postExportWorkSkipped &&
+        outcome.currentWarning == null -> CameraPipelineEvent.Terminal.Kind.COMPLETE
+    outcome?.committed == true || outcome?.base?.outputCommitted == true ->
+        CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+    cancellationRequested -> CameraPipelineEvent.Terminal.Kind.CANCELLED
+    else -> CameraPipelineEvent.Terminal.Kind.FAILED
+}
+
 /**
  * Explicit RAW public-export outcome model. Captures precisely what happened during the
  * public MediaStore commit, verification, sidecar pass, and any post-commit cancellation —
@@ -216,8 +231,9 @@ internal sealed class RawFusionPublicExportOutcome {
      * Failure that occurred before any public MediaStore commit — local render failure, bitmap
      * preparation failure, or MediaStore insert failure with no Media commit.
      *
-     * `current=false`, `verified=false`. No sidecar is meaningful here because the image
-     * itself never reached the public store.
+     * `committed=false`, `verified=false`. A current local output may still be committed by the
+     * outer reprocess transaction as a usable local-only partial result; public-store failure
+     * never makes that current local claim disappear.
      */
     internal data class UncommittedFailure(
         override val base: RawFusionProcessResult,
@@ -236,7 +252,12 @@ internal sealed class RawFusionPublicExportOutcome {
         override val verified: Boolean = false
         override val postExportCancellationRequested: Boolean = false
         override val postExportWorkSkipped: Boolean = false
-        override val disposition: ReprocessTerminalDisposition = ReprocessTerminalDisposition.UNCOMMITTED_FAILURE
+        override val disposition: ReprocessTerminalDisposition =
+            if (base.outputCommitted && (currentLocalOutput?.isFile == true || currentLocalPreview?.isFile == true)) {
+                ReprocessTerminalDisposition.COMMITTED_PARTIAL
+            } else {
+                ReprocessTerminalDisposition.UNCOMMITTED_FAILURE
+            }
     }
 
     /**
@@ -476,14 +497,26 @@ private fun RawFusionProcessResult.validNativeRgbaFile(): File? {
     val file = nativeRgbaFile ?: return null
     if (nativeRgbaWidth <= 0 || nativeRgbaHeight <= 0 || !NoFollowFileSystem.isRealFile(file.toPath())) return null
     val expectedBytes = nativeRgbaWidth.toLong() * nativeRgbaHeight.toLong() * 4L
-    return file.takeIf { runCatching { NoFollowFileSystem.requireSize(it) }.getOrNull() == expectedBytes }
+    val actualBytes = try {
+        NoFollowFileSystem.requireSize(file)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        return null
+    }
+    return file.takeIf { actualBytes == expectedBytes }
 }
 
 private fun RawFusionProcessResult.hasExportableBitmapSource(): Boolean {
+    fun File.hasPositiveVerifiedSize(): Boolean = try {
+        NoFollowFileSystem.isRealFile(toPath()) && NoFollowFileSystem.requireSize(this) > 0L
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        false
+    }
     return validNativeRgbaFile() != null ||
-        finalPngFile?.let { file ->
-            NoFollowFileSystem.isRealFile(file.toPath()) && runCatching { NoFollowFileSystem.requireSize(file) > 0L }.getOrDefault(false)
-        } == true
+        finalPngFile?.hasPositiveVerifiedSize() == true
 }
 
 private fun RawFusionProcessResult.loadExportBitmap(jobDir: File): RawFusionExportBitmap {
@@ -504,8 +537,13 @@ private fun RawFusionProcessResult.loadExportBitmap(jobDir: File): RawFusionExpo
             throw oom
         } catch (nativeError: Exception) {
             val png = finalPngFile?.takeIf { file ->
-                NoFollowFileSystem.isRealFile(file.toPath()) &&
-                    runCatching { NoFollowFileSystem.requireSize(file) > 0L }.getOrDefault(false)
+                try {
+                    NoFollowFileSystem.isRealFile(file.toPath()) && NoFollowFileSystem.requireSize(file) > 0L
+                } catch (failure: Error) {
+                    throw failure
+                } catch (_: Exception) {
+                    false
+                }
             }
                 ?: throw IllegalStateException(
                     "Native RGBA bitmap load failed and no final PNG fallback exists",
@@ -520,8 +558,13 @@ private fun RawFusionProcessResult.loadExportBitmap(jobDir: File): RawFusionExpo
         }
     }
     val png = finalPngFile?.takeIf { file ->
-        NoFollowFileSystem.isRealFile(file.toPath()) &&
-            runCatching { NoFollowFileSystem.requireSize(file) > 0L }.getOrDefault(false)
+        try {
+            NoFollowFileSystem.isRealFile(file.toPath()) && NoFollowFileSystem.requireSize(file) > 0L
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            false
+        }
     }
         ?: error("No exportable RAW fusion bitmap source")
     val bitmap = NoFollowFileSystem.decodeBitmapVerified(png)
@@ -530,9 +573,13 @@ private fun RawFusionProcessResult.loadExportBitmap(jobDir: File): RawFusionExpo
 }
 
 internal fun resolveRawExportRotation(jobDir: File): ExportOrientationResolution {
-    val job = runCatching {
+    val job = try {
         JSONObject(NoFollowFileSystem.readTextVerified(NoFollowFileSystem.requireDirectChildFile(jobDir, JOB_JSON_FILE_NAME)))
-    }.getOrElse { return ExportOrientationResolution.Unsupported("Cannot read RAW orientation metadata: ${it.message}") }
+    } catch (failure: Error) {
+        throw failure
+    } catch (failure: Exception) {
+        return ExportOrientationResolution.Unsupported("Cannot read RAW orientation metadata: ${failure.message}")
+    }
     val sourceState = when (val value = job.strictOrientationString("sourceOrientationState")) {
         OrientationJsonValue.Missing -> {
         // Explicit legacy fallback: older jobs did not capture UI rotation. Keep their historical
@@ -720,6 +767,9 @@ fun captureProcessExportRawNightFusion(
                         .put("processingPresetName", processingParams.presetName)
                         .put("processingParams", processingParams.clamped().toJson())
                 }
+            } catch (cancelled: CancellationException) {
+                processingOperation.release()
+                throw cancelled
             } catch (failure: Throwable) {
                 if (failure is Error) {
                     processingOperation.release()
@@ -743,6 +793,9 @@ fun captureProcessExportRawNightFusion(
             post("PROCESSING_STARTED: RAW capture complete; processing started.")
             val thread = try {
                 HandlerThread("KeplerRawFusionPipelineThread").apply { start() }
+            } catch (cancelled: CancellationException) {
+                processingOperation.release()
+                throw cancelled
             } catch (failure: Throwable) {
                 if (failure is Error) {
                     processingOperation.release()
@@ -768,6 +821,7 @@ fun captureProcessExportRawNightFusion(
                 var committedExport: GalleryExportResult? = null
                 var exportVerified = false
                 var sidecarResult: RawSidecarExportResult? = null
+                var publicOutcome: RawFusionPublicExportOutcome? = null
                 var postExportCancellationRequested = false
                 try {
                     cancellation.throwIfCancelled()
@@ -782,13 +836,21 @@ fun captureProcessExportRawNightFusion(
                     processingOperation.reassertActiveOperation(KeplerActiveOperationKind.PUBLIC_EXPORT)
                     if (!process.success || !process.hasExportableBitmapSource()) {
                         val reason = process.errorMessage ?: "RAW fusion process failed"
+                        publicOutcome = RawFusionPublicExportOutcome.UncommittedFailure(
+                            base = process,
+                            finalOutputFormat = finalOutputFormat,
+                            currentLocalPreview = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L },
+                            currentLocalOutput = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L },
+                            currentError = reason
+                        )
                         try {
                             recordNormalPreCommitTerminal(
                                 jobDir,
                                 attemptStatus = "FAILED",
                                 pipelineStage = "FAILED",
                                 processStatus = "EXPORT_FAILED_KEEPING_CACHE",
-                                reason = reason
+                                reason = reason,
+                                localOutputCommitted = process.outputCommitted
                             )
                         } catch (metadataError: Exception) {
                             Log.e(
@@ -894,6 +956,7 @@ fun captureProcessExportRawNightFusion(
                                 currentLocalOutput = process.finalPngFile
                                     ?.takeIf { it.isFile && it.length() > 0L }
                             )
+                        publicOutcome = committedOutcome
                         try {
                             updateRawPublicExportOutcome(jobDir, committedOutcome)
                         } catch (metadataError: Exception) {
@@ -928,14 +991,25 @@ fun captureProcessExportRawNightFusion(
                         }
                     }
                     if (committedExport == null) {
+                        val currentProcess = capturedProcess
+                        val currentLocalPreview = currentProcess?.previewPngFile?.takeIf { it.isFile && it.length() > 0L }
+                        val currentLocalOutput = currentProcess?.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
                         if (cancellation.isCancelled) {
+                            publicOutcome = RawFusionPublicExportOutcome.UncommittedFailure(
+                                base = currentProcess ?: RawFusionProcessResult(success = false, null, null, null, null, "Export cancelled before commit"),
+                                finalOutputFormat = finalOutputFormat,
+                                currentLocalPreview = currentLocalPreview,
+                                currentLocalOutput = currentLocalOutput,
+                                currentError = "Export cancelled before MediaStore commit"
+                            )
                             try {
                                 recordNormalPreCommitTerminal(
                                     jobDir,
                                     attemptStatus = "CANCELLED",
                                     pipelineStage = "CANCELLED",
                                     processStatus = "EXPORT_CANCELLED_BEFORE_COMMIT",
-                                    reason = "Export cancelled before MediaStore commit."
+                                    reason = "Export cancelled before MediaStore commit.",
+                                    localOutputCommitted = currentProcess?.outputCommitted == true
                                 )
                             } catch (metadataError: Exception) {
                                 Log.e(
@@ -948,13 +1022,21 @@ fun captureProcessExportRawNightFusion(
                             return@post
                         }
                         val error = result.errorMessage ?: "Export failed"
+                        publicOutcome = RawFusionPublicExportOutcome.UncommittedFailure(
+                            base = currentProcess ?: RawFusionProcessResult(success = false, null, null, null, null, error),
+                            finalOutputFormat = finalOutputFormat,
+                            currentLocalPreview = currentLocalPreview,
+                            currentLocalOutput = currentLocalOutput,
+                            currentError = error
+                        )
                         try {
                             recordNormalPreCommitTerminal(
                                 jobDir,
                                 attemptStatus = "FAILED",
                                 pipelineStage = "FAILED",
                                 processStatus = "EXPORT_FAILED_KEEPING_CACHE",
-                                reason = error
+                                reason = error,
+                                localOutputCommitted = currentProcess?.outputCommitted == true
                             )
                         } catch (metadataError: Exception) {
                             Log.e(
@@ -980,6 +1062,7 @@ fun captureProcessExportRawNightFusion(
                             currentLocalPreview = cancelPrevFile,
                             currentLocalOutput = cancelLocalOutput
                         )
+                        publicOutcome = partial
                         updateRawPublicExportOutcome(jobDir, partial)
                         post("PIPELINE_CANCELLED: Export cancelled after MediaStore commit, before verification. RAW cache kept.")
                         return@post
@@ -997,6 +1080,7 @@ fun captureProcessExportRawNightFusion(
                             currentLocalOutput = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L },
                             currentError = "Export verification failed"
                         )
+                        publicOutcome = outcome
                         updateRawPublicExportOutcome(jobDir, outcome)
                         post("PIPELINE_FAILED: RAW export verification failed; keeping RAW cache.")
                         return@post
@@ -1009,6 +1093,7 @@ fun captureProcessExportRawNightFusion(
                         currentLocalPreview = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L },
                         currentLocalOutput = process.finalPngFile?.takeIf { it.isFile && it.length() > 0L }
                     )
+                    publicOutcome = verifiedPendingOutcome
                     try {
                         updateRawPublicExportOutcome(jobDir, verifiedPendingOutcome)
                     } catch (checkpointError: Exception) {
@@ -1035,18 +1120,12 @@ fun captureProcessExportRawNightFusion(
                             currentWarning = "Verified-pending checkpoint persistence failed; committed image preserved.",
                             currentError = "Verified-pending checkpoint persistence failed: ${checkpointError.message}"
                         )
+                        publicOutcome = interruptedOutcome
                         try {
                             updateRawPublicExportOutcome(jobDir, interruptedOutcome)
                         } catch (secondaryOom: OutOfMemoryError) {
-                            Log.e(
-                                "KeplerRawPipeline",
-                                "Secondary verified-partial metadata write ran out of memory; " +
-                                    "committed=${committedExport != null}, verified=true, " +
-                                    "uri=${committedExport?.uriString.orEmpty()}, " +
-                                    "original=${checkpointError.message}, " +
-                                    "metadataError=OutOfMemoryError",
-                                secondaryOom
-                            )
+                            secondaryOom.addSuppressed(checkpointError)
+                            throw secondaryOom
                         } catch (secondaryError: Exception) {
                             Log.e(
                                 "KeplerRawPipeline",
@@ -1130,6 +1209,7 @@ fun captureProcessExportRawNightFusion(
                         currentLocalOutput = localOutput,
                         currentWarning = warning
                     )
+                    publicOutcome = outcome
                     updateRawPublicExportOutcome(jobDir, outcome)
                     val rawSuffix = if (sidecarResult?.kind == RawSidecarOutcomeKind.COMPLETE) " + RAW" else ""
                     val rawSidecarCount = sidecarResult?.exportedFiles?.size ?: 0
@@ -1165,6 +1245,7 @@ fun captureProcessExportRawNightFusion(
                                 currentLocalPreview = cancelPrevFile,
                                 currentLocalOutput = cancelLocalOutput
                             )
+                            publicOutcome = outcome
                             updateRawPublicExportOutcome(jobDir, outcome)
                             post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. RAW cache kept.")
                         } else {
@@ -1176,6 +1257,7 @@ fun captureProcessExportRawNightFusion(
                                 currentLocalPreview = cancelPrevFile,
                                 currentLocalOutput = cancelLocalOutput
                             )
+                            publicOutcome = partial
                             updateRawPublicExportOutcome(jobDir, partial)
                             post("PIPELINE_CANCELLED: Export cancelled after MediaStore commit, before verification. RAW cache kept.")
                         }
@@ -1209,10 +1291,7 @@ fun captureProcessExportRawNightFusion(
                                 finalOutputFormat,
                                 oomReason
                             )
-                            try {
-                                updateRawPublicExportOutcome(
-                                    jobDir,
-                                    RawFusionPublicExportOutcome.VerifiedPostWorkInterrupted(
+                        val interruptedOutcome = RawFusionPublicExportOutcome.VerifiedPostWorkInterrupted(
                                         base = proc ?: RawFusionProcessResult(success = false, null, null, null, null, "OOM after verified export"),
                                         finalOutputFormat = finalOutputFormat,
                                         export = committedExport!!,
@@ -1222,17 +1301,12 @@ fun captureProcessExportRawNightFusion(
                                         currentWarning = "OOM after export; committed image preserved.",
                                         currentError = oomReason
                                     )
-                                )
+                            publicOutcome = interruptedOutcome
+                            try {
+                                updateRawPublicExportOutcome(jobDir, interruptedOutcome)
                             } catch (metadataOom: OutOfMemoryError) {
-                                Log.e(
-                                    "KeplerRawPipeline",
-                                    "Post-commit OOM metadata persistence ran out of memory; " +
-                                        "committed=true, verified=true, " +
-                                        "uri=${committedExport?.uriString.orEmpty()}, " +
-                                        "original=${oom.message}, " +
-                                        "metadataError=OutOfMemoryError",
-                                    metadataOom
-                                )
+                                metadataOom.addSuppressed(oom)
+                                throw oom
                             } catch (metadataError: Exception) {
                                 Log.e(
                                     "KeplerRawPipeline",
@@ -1246,10 +1320,7 @@ fun captureProcessExportRawNightFusion(
                             }
                             post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but post-export work was interrupted by OOM. RAW cache kept.")
                         } else {
-                            try {
-                                updateRawPublicExportOutcome(
-                                    jobDir,
-                                    RawFusionPublicExportOutcome.CommittedInterruptedBeforeVerification(
+                            val interruptedOutcome = RawFusionPublicExportOutcome.CommittedInterruptedBeforeVerification(
                                         base = proc ?: RawFusionProcessResult(success = false, null, null, null, null, "OOM after commit"),
                                         finalOutputFormat = finalOutputFormat,
                                         export = committedExport!!,
@@ -1258,17 +1329,12 @@ fun captureProcessExportRawNightFusion(
                                         currentLocalOutput = oomLocalOutput,
                                         currentError = oomReason
                                     )
-                                )
+                            publicOutcome = interruptedOutcome
+                            try {
+                                updateRawPublicExportOutcome(jobDir, interruptedOutcome)
                             } catch (metadataOom: OutOfMemoryError) {
-                                Log.e(
-                                    "KeplerRawPipeline",
-                                    "Post-commit OOM metadata persistence ran out of memory; " +
-                                        "committed=true, verified=false, " +
-                                        "uri=${committedExport?.uriString.orEmpty()}, " +
-                                        "original=${oom.message}, " +
-                                        "metadataError=OutOfMemoryError",
-                                    metadataOom
-                                )
+                                metadataOom.addSuppressed(oom)
+                                throw oom
                             } catch (metadataError: Exception) {
                                 Log.e(
                                     "KeplerRawPipeline",
@@ -1289,7 +1355,8 @@ fun captureProcessExportRawNightFusion(
                                 attemptStatus = "FAILED",
                                 pipelineStage = "FAILED",
                                 processStatus = "EXPORT_FAILED_KEEPING_CACHE",
-                                reason = "OutOfMemoryError during RAW export; cache kept"
+                                reason = "OutOfMemoryError during RAW export; cache kept",
+                                localOutputCommitted = capturedProcess?.outputCommitted == true
                             )
                         } catch (metadataError: Exception) {
                             Log.e(
@@ -1300,6 +1367,7 @@ fun captureProcessExportRawNightFusion(
                         }
                         post("PIPELINE_FAILED: RAW export ran out of memory; keeping RAW cache.")
                     }
+                    throw oom
                 } catch (e: Exception) {
                     if (committedExport != null) {
                         val proc = capturedProcess
@@ -1312,10 +1380,7 @@ fun captureProcessExportRawNightFusion(
                                 finalOutputFormat,
                                 excReason
                             )
-                            try {
-                                updateRawPublicExportOutcome(
-                                    jobDir,
-                                    RawFusionPublicExportOutcome.VerifiedPostWorkInterrupted(
+                            val interruptedOutcome = RawFusionPublicExportOutcome.VerifiedPostWorkInterrupted(
                                         base = proc ?: RawFusionProcessResult(success = false, null, null, null, null, "Exception after verified export"),
                                         finalOutputFormat = finalOutputFormat,
                                         export = committedExport!!,
@@ -1325,17 +1390,12 @@ fun captureProcessExportRawNightFusion(
                                         currentWarning = excReason,
                                         currentError = excReason
                                     )
-                                )
+                            publicOutcome = interruptedOutcome
+                            try {
+                                updateRawPublicExportOutcome(jobDir, interruptedOutcome)
                             } catch (metadataOom: OutOfMemoryError) {
-                                Log.e(
-                                    "KeplerRawPipeline",
-                                    "Post-commit exception metadata persistence ran out of memory; " +
-                                        "committed=true, verified=true, " +
-                                        "uri=${committedExport?.uriString.orEmpty()}, " +
-                                        "original=$excReason, " +
-                                        "metadataError=OutOfMemoryError",
-                                    metadataOom
-                                )
+                                metadataOom.addSuppressed(e)
+                                throw metadataOom
                             } catch (metadataError: Exception) {
                                 Log.e(
                                     "KeplerRawPipeline",
@@ -1349,10 +1409,7 @@ fun captureProcessExportRawNightFusion(
                             }
                             post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but post-export work was interrupted by ${e.javaClass.simpleName}. RAW cache kept.")
                         } else {
-                            try {
-                                updateRawPublicExportOutcome(
-                                    jobDir,
-                                    RawFusionPublicExportOutcome.CommittedInterruptedBeforeVerification(
+                            val interruptedOutcome = RawFusionPublicExportOutcome.CommittedInterruptedBeforeVerification(
                                         base = proc ?: RawFusionProcessResult(success = false, null, null, null, null, "Exception after commit"),
                                         finalOutputFormat = finalOutputFormat,
                                         export = committedExport!!,
@@ -1361,17 +1418,12 @@ fun captureProcessExportRawNightFusion(
                                         currentLocalOutput = excLocalOutput,
                                         currentError = excReason
                                     )
-                                )
+                            publicOutcome = interruptedOutcome
+                            try {
+                                updateRawPublicExportOutcome(jobDir, interruptedOutcome)
                             } catch (metadataOom: OutOfMemoryError) {
-                                Log.e(
-                                    "KeplerRawPipeline",
-                                    "Post-commit exception metadata persistence ran out of memory; " +
-                                        "committed=true, verified=false, " +
-                                        "uri=${committedExport?.uriString.orEmpty()}, " +
-                                        "original=$excReason, " +
-                                        "metadataError=OutOfMemoryError",
-                                    metadataOom
-                                )
+                                metadataOom.addSuppressed(e)
+                                throw metadataOom
                             } catch (metadataError: Exception) {
                                 Log.e(
                                     "KeplerRawPipeline",
@@ -1392,7 +1444,8 @@ fun captureProcessExportRawNightFusion(
                                 attemptStatus = "FAILED",
                                 pipelineStage = "FAILED",
                                 processStatus = "EXPORT_FAILED_KEEPING_CACHE",
-                                reason = "${e.javaClass.simpleName}: ${e.message}"
+                                reason = "${e.javaClass.simpleName}: ${e.message}",
+                                localOutputCommitted = capturedProcess?.outputCommitted == true
                             )
                         } catch (metadataError: Exception) {
                             Log.e(
@@ -1408,19 +1461,18 @@ fun captureProcessExportRawNightFusion(
                     }
                 } finally {
                     terminal.publish(
-                        kind = when {
-                            committedExport != null && exportVerified -> CameraPipelineEvent.Terminal.Kind.COMPLETE
-                            committedExport != null -> CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
-                            cancellation.isCancelled -> CameraPipelineEvent.Terminal.Kind.CANCELLED
-                            else -> CameraPipelineEvent.Terminal.Kind.FAILED
-                        },
-                        requiredOutputCommitted = capturedProcess?.outputCommitted == true ||
+                        kind = rawFusionOutcomeTerminalKind(
+                            publicOutcome,
+                            cancellationRequested = cancellation.isCancelled
+                        ),
+                        requiredOutputCommitted = publicOutcome?.base?.outputCommitted == true ||
+                            capturedProcess?.outputCommitted == true ||
                             currentProcessingAttemptHasRequiredOutputClaimForLease(
                                 jobDir,
                                 processingOperation.lease
                             ),
-                        publicExportCommitted = committedExport != null,
-                        verified = exportVerified,
+                        publicExportCommitted = publicOutcome?.committed == true || committedExport != null,
+                        verified = publicOutcome?.verified == true || exportVerified,
                         message = "RAW pipeline terminal settlement"
                     )
                     processingOperation.release()
@@ -1517,6 +1569,9 @@ internal fun reprocessRawJob(
     }
     val thread = try {
         HandlerThread("KeplerRawReprocessThread").apply { start() }
+    } catch (cancelled: CancellationException) {
+        processingOperation.release()
+        throw cancelled
     } catch (failure: Throwable) {
         processingOperation.release()
         if (failure is Error) throw failure
@@ -1543,6 +1598,7 @@ internal fun reprocessRawJob(
     val workerPosted = try {
         Handler(thread.looper).post {
         var terminalResult: Result<Unit> = Result.failure(IllegalStateException("RAW reprocess did not reach a terminal state."))
+        var fatalReprocessFailure: Error? = null
         var publicOutcome: RawFusionPublicExportOutcome? = null
         var currentOutputFile: File? = null
         var currentPreviewFile: File? = null
@@ -1554,10 +1610,20 @@ internal fun reprocessRawJob(
             if (selectedFrameIndices != null) {
                 applyExplicitFrameSelection(jobDir, selectedFrameIndices)
             }
-            enabledCount = runCatching { getEnabledRawFrames(jobDir).size }.getOrDefault(0)
-            totalCount = runCatching {
+            enabledCount = try {
+                getEnabledRawFrames(jobDir).size
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                0
+            }
+            totalCount = try {
                 loadJobJson(jobDir).optJSONArray("frames")?.length() ?: 0
-            }.getOrDefault(0)
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                0
+            }
             if (enabledCount < MIN_RAW_FUSION_FRAMES) {
                 post("Not enough enabled frames to reprocess")
                 publicOutcome = RawFusionPublicExportOutcome.UncommittedFailure(
@@ -1637,7 +1703,15 @@ internal fun reprocessRawJob(
                     jobDir = jobDir,
                     ownerLease = processingOperation.lease
                 )
-            } catch (exportError: Throwable) {
+            } catch (ce: CancellationException) {
+                exportBitmap?.takeUnless { it.isRecycled }?.recycle()
+                exportBitmap = null
+                throw ce
+            } catch (fatal: Error) {
+                exportBitmap?.takeUnless { it.isRecycled }?.recycle()
+                exportBitmap = null
+                throw fatal
+            } catch (exportError: Exception) {
                 exportBitmap?.takeUnless { it.isRecycled }?.recycle()
                 exportBitmap = null
                 GalleryExportResult(
@@ -1816,7 +1890,7 @@ internal fun reprocessRawJob(
             } finally {
                 exportBitmap?.takeUnless { it.isRecycled }?.recycle()
             }
-        } catch (_: kotlinx.coroutines.CancellationException) {
+        } catch (ce: kotlinx.coroutines.CancellationException) {
             if (publicOutcome == null || !publicOutcome!!.committed) {
                 post("PIPELINE_CANCELLED: RAW reprocess cancelled; source frames kept.")
                 publicOutcome = publicOutcome ?: RawFusionPublicExportOutcome.UncommittedFailure(
@@ -1826,7 +1900,7 @@ internal fun reprocessRawJob(
                     currentLocalOutput = currentOutputFile,
                     currentError = "RAW reprocess cancelled"
                 )
-                terminalResult = Result.failure(IllegalStateException("RAW reprocess cancelled"))
+                terminalResult = Result.failure(ce)
             } else if (publicOutcome!!.verified) {
                 // Already reached verified-with-cancellation inside the try; outcome is already set.
                 terminalResult = Result.success(Unit)
@@ -1839,7 +1913,7 @@ internal fun reprocessRawJob(
                     currentLocalPreview = currentPreviewFile,
                     currentLocalOutput = currentOutputFile
                 )
-                terminalResult = Result.failure(IllegalStateException("RAW reprocess cancelled after commit"))
+                terminalResult = Result.failure(ce)
             }
         } catch (oom: OutOfMemoryError) {
             publicOutcome = publicOutcome ?: RawFusionPublicExportOutcome.UncommittedFailure(
@@ -1850,7 +1924,8 @@ internal fun reprocessRawJob(
                 currentError = "OutOfMemoryError during RAW reprocess"
             )
             post("RAW reprocess failed: out of memory; source frames kept.")
-            terminalResult = Result.failure(oom)
+            fatalReprocessFailure = oom
+            terminalResult = Result.success(Unit)
         } catch (e: Exception) {
             publicOutcome = publicOutcome ?: RawFusionPublicExportOutcome.UncommittedFailure(
                 base = capturedProcess ?: RawFusionProcessResult(success = false, null, null, null, null, "Exception during reprocess"),
@@ -1882,7 +1957,7 @@ internal fun reprocessRawJob(
                     previewFile = currentPreviewFile ?: currentOutputFile,
                     bytesWritten = currentOutputFile?.length() ?: resolved.export?.fileSizeBytes ?: 0L,
                     disposition = resolved.disposition,
-                    terminalError = terminalResult.exceptionOrNull(),
+                    terminalError = fatalReprocessFailure ?: terminalResult.exceptionOrNull(),
                     sidecar = resolved.sidecar,
                     postExportCancellationRequested = resolved.postExportCancellationRequested,
                     postExportWorkSkipped = resolved.postExportWorkSkipped,
@@ -1892,6 +1967,7 @@ internal fun reprocessRawJob(
                 )
             )
         }
+        fatalReprocessFailure?.let { throw it }
     }
     } catch (failure: Error) {
         processingOperation.release()
@@ -1935,13 +2011,15 @@ internal fun reprocessRawJob(
  * [CommittedPendingVerification] and subsequent committed outcomes.
  */
 private fun recordRawPublicExportAttempt(jobDir: File, status: String, error: String) {
-    runCatching {
+    try {
         KeplerJobMetadata.update(jobDir) { job ->
             job.put("rawPublicExportAttemptStatus", status)
                 .put("rawPublicExportAttemptError", error)
                 .put("rawPublicExportAttemptAt", System.currentTimeMillis())
         }
-    }.onFailure { metadataError ->
+    } catch (metadataError: Error) {
+        throw metadataError
+    } catch (metadataError: Exception) {
         Log.e(
             "KeplerRawPipeline",
             "Failed to persist RAW export attempt failure: ${metadataError.message}",
@@ -1972,14 +2050,16 @@ private fun recordNormalPreCommitTerminal(
     attemptStatus: String,
     pipelineStage: String,
     processStatus: String,
-    reason: String
+    reason: String,
+    localOutputCommitted: Boolean = false
 ) {
     KeplerJobMetadata.update(jobDir) { job ->
-        job.put("rawPublicExportAttemptStatus", attemptStatus)
+        val effectivePartial = localOutputCommitted
+        job.put("rawPublicExportAttemptStatus", if (effectivePartial) "PARTIAL" else attemptStatus)
             .put("rawPublicExportAttemptError", reason)
             .put("rawPublicExportAttemptAt", System.currentTimeMillis())
-            .put("currentPipelineStage", pipelineStage)
-            .put("processStatus", processStatus)
+            .put("currentPipelineStage", if (effectivePartial) "PIPELINE_COMPLETE_PARTIAL" else pipelineStage)
+            .put("processStatus", if (effectivePartial) "LOCAL_OUTPUT_COMMITTED_EXPORT_FAILED" else processStatus)
             .put("userCanMoveDevice", true)
     }
 }
@@ -2111,30 +2191,10 @@ private fun updateRawNativeQualityDiagnostics(jobDir: File, bitmap: Bitmap) {
     } catch (oom: OutOfMemoryError) {
         Log.e(
             "KeplerRawPipeline",
-            "OOM during pre-commit optional RAW quality diagnostics; recording failure",
+            "OOM during pre-commit optional RAW quality diagnostics; propagating fatal error",
             oom
         )
-        try {
-            KeplerJobMetadata.update(jobDir) { job ->
-                job.put("rawQualityDiagnosticStatus", "FAILED")
-                    .put("rawQualityDiagnosticError", "OutOfMemoryError: ${oom.message}")
-                    .put("rawQualityDiagnosticAt", System.currentTimeMillis())
-            }
-        } catch (metadataOom: OutOfMemoryError) {
-            Log.e(
-                "KeplerRawPipeline",
-                "Secondary OOM while persisting diagnostic failure status during pre-commit quality diagnostics; " +
-                    "metadataError=OutOfMemoryError",
-                metadataOom
-            )
-        } catch (metadataError: Exception) {
-            Log.e(
-                "KeplerRawPipeline",
-                "Secondary failure while persisting diagnostic failure status during pre-commit quality diagnostics; " +
-                    "metadataError=${metadataError.message}",
-                metadataError
-            )
-        }
+        throw oom
     } catch (e: Exception) {
         Log.e(
             "KeplerRawPipeline",
@@ -2148,12 +2208,8 @@ private fun updateRawNativeQualityDiagnostics(jobDir: File, bitmap: Bitmap) {
                     .put("rawQualityDiagnosticAt", System.currentTimeMillis())
             }
         } catch (metadataOom: OutOfMemoryError) {
-            Log.e(
-                "KeplerRawPipeline",
-                "Secondary OOM while persisting diagnostic failure status during pre-commit quality diagnostics; " +
-                    "metadataError=OutOfMemoryError",
-                metadataOom
-            )
+            metadataOom.addSuppressed(e)
+            throw metadataOom
         } catch (metadataError: Exception) {
             Log.e(
                 "KeplerRawPipeline",

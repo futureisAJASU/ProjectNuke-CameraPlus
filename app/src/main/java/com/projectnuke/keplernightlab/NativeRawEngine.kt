@@ -1,9 +1,14 @@
 package com.projectnuke.keplernightlab
 
 object NativeRawEngine {
-    private val loaded = runCatching {
+    private val loaded = try {
         System.loadLibrary("kepler_raw_engine")
-    }.isSuccess
+        true
+    } catch (_: UnsatisfiedLinkError) {
+        false
+    } catch (_: SecurityException) {
+        false
+    }
 
     fun isAvailable(): Boolean = loaded
 
