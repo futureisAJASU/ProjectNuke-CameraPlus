@@ -66,6 +66,31 @@ class GalleryExportVerificationTest {
     )
 
     @Test fun validJpeg_isVerified() = assertTrue(verify(jpeg, OutputFormat.JPEG) is GalleryExportVerification.Verified)
+    @Test
+    fun ordinaryUriParseFailureRemainsPermanentVerificationFailure() {
+        galleryExportUriParseFailureForTest = IllegalArgumentException("bad URI")
+        try {
+            assertTrue(verify(jpeg, OutputFormat.JPEG) is GalleryExportVerification.PermanentFailure)
+        } finally {
+            galleryExportUriParseFailureForTest = null
+        }
+    }
+
+    @Test
+    fun fatalUriParseFailurePropagatesInsteadOfPermanentFailure() {
+        val fatal = AssertionError("fatal URI parser")
+        galleryExportUriParseFailureForTest = fatal
+        try {
+            try {
+                verify(jpeg, OutputFormat.JPEG)
+                throw AssertionError("fatal URI parser was swallowed")
+            } catch (failure: AssertionError) {
+                assertEquals(fatal, failure)
+            }
+        } finally {
+            galleryExportUriParseFailureForTest = null
+        }
+    }
     @Test fun validPng_isVerified() = assertTrue(verify(png, OutputFormat.PNG) is GalleryExportVerification.Verified)
     @Test fun validHeif_usesInjectableDecoderAndVerifier() = assertTrue(verify(heif, OutputFormat.HEIF, usePlatformDecode = false) is GalleryExportVerification.Verified)
     @Test fun truncatedJpeg_isRejected() = assertTrue(verify(jpeg.dropLast(2).toByteArray(), OutputFormat.JPEG) is GalleryExportVerification.PermanentFailure)

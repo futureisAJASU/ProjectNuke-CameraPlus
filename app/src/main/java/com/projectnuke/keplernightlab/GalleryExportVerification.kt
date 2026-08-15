@@ -6,6 +6,7 @@ import android.net.Uri
 import android.provider.MediaStore
 import java.io.InputStream
 import java.util.Locale
+import java.util.concurrent.CancellationException
 
 /** The only verification decision used for a committed final-image export. */
 sealed interface GalleryExportVerification {
@@ -21,6 +22,9 @@ sealed interface GalleryExportVerification {
     data class RetryableFailure(val reason: String) : GalleryExportVerification
     data class PermanentFailure(val reason: String) : GalleryExportVerification
 }
+
+@Volatile
+internal var galleryExportUriParseFailureForTest: Throwable? = null
 
 internal data class GalleryExportExpectation(
     val format: OutputFormat? = null,
@@ -110,8 +114,18 @@ internal fun verifyGalleryExportResult(
     }
 ): GalleryExportVerification {
     if (uriString.isBlank()) return GalleryExportVerification.PermanentFailure("Committed URI is blank")
-    val uri = runCatching { Uri.parse(uriString) }.getOrElse {
-        return GalleryExportVerification.PermanentFailure("Committed URI is invalid: ${it.message}")
+    val uri = try {
+        galleryExportUriParseFailureForTest?.let { failure ->
+            galleryExportUriParseFailureForTest = null
+            throw failure
+        }
+        Uri.parse(uriString)
+    } catch (fatal: Error) {
+        throw fatal
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (failure: Exception) {
+        return GalleryExportVerification.PermanentFailure("Committed URI is invalid: ${failure.message}")
     }
     var firstRetryableReason: String? = null
     repeat(retries.coerceAtLeast(1)) { index ->
@@ -135,12 +149,16 @@ private fun verifyOnce(
 ): GalleryExportVerification {
     val columns = try {
         source.query(uri)
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (error: Exception) {
         return GalleryExportVerification.RetryableFailure("MediaStore query failed: ${error.javaClass.simpleName}: ${error.message}")
     } ?: return GalleryExportVerification.RetryableFailure("MediaStore row is unavailable")
 
     val probe = try {
         source.open(uri)?.use(::probeImageStream)
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (error: Exception) {
         return GalleryExportVerification.RetryableFailure("Committed content is unreadable: ${error.javaClass.simpleName}: ${error.message}")
     } ?: return GalleryExportVerification.RetryableFailure("Committed content stream is unavailable")
@@ -156,6 +174,8 @@ private fun verifyOnce(
 
     val (width, height) = try {
         source.decodeBounds(uri)
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (error: Exception) {
         return GalleryExportVerification.RetryableFailure("Bounds decode failed: ${error.javaClass.simpleName}: ${error.message}")
     }
@@ -163,6 +183,8 @@ private fun verifyOnce(
     val sample = sampledProbeSize(width, height)
     val pixelsDecoded = try {
         source.decodeProbe(uri, sample)
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (error: Exception) {
         return GalleryExportVerification.RetryableFailure("Pixel decode probe failed: ${error.javaClass.simpleName}: ${error.message}")
     }

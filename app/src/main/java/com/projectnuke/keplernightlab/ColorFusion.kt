@@ -1079,14 +1079,18 @@ private fun ensureSufficientSpaceForYuvBurstPngs(
     outputWidth: Int,
     outputHeight: Int
 ): Boolean {
-    return runCatching {
+    return try {
         val statFs = StatFs(burstDir.absolutePath)
         val availableBytes = statFs.availableBytes
         val estimatedBytes =
             outputWidth.toLong() * outputHeight.toLong() *
                 YUV_RGB_STORAGE_BYTES_PER_PIXEL_ESTIMATE * frameCount
         availableBytes >= estimatedBytes
-    }.getOrDefault(false)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        false
+    }
 }
 
 private fun writeBitmapToTempPng(bitmap: Bitmap, finalFile: File) {
@@ -1509,21 +1513,30 @@ private fun createYuvBurstCaptureRequestBuilder(
             ?.toSet()
             .orEmpty()
         if (CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE in afModes) {
-            runCatching {
+            try {
                 builder.set(
                     CaptureRequest.CONTROL_AF_MODE,
                     CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
                 )
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
             }
         }
-        runCatching {
+        try {
             builder.set(
                 CaptureRequest.NOISE_REDUCTION_MODE,
                 CaptureRequest.NOISE_REDUCTION_MODE_FAST
             )
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
         }
-        runCatching {
+        try {
             builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_FAST)
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
         }
         builder.applyZoomAndFocusAe(
             characteristics = characteristics,
@@ -1559,13 +1572,16 @@ private fun updateYuvCaptureRequestTemplateMetadata(
     fallbackUsed: Boolean,
     failures: List<String>
 ) {
-    runCatching {
+    try {
         KeplerJobMetadata.update(jobFile.parentFile ?: error("Job directory missing")) { current ->
             current.put("yuvCaptureRequestTemplate", template)
                 .put("yuvCaptureRequestTemplateFallbackUsed", fallbackUsed)
                 .put("yuvCaptureRequestTemplateFailures", JSONArray(failures.take(6)))
                 .put("updatedAt", System.currentTimeMillis())
         }
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
     }
 }
 
@@ -1617,7 +1633,13 @@ internal fun writeColorJobJson(
     val actualPhysicalCameraId =
         if (actualRoute == PhysicalCaptureRoute.PHYSICAL.name) physicalCameraId else null
     val previousJob = if (jobFile.exists()) {
-        runCatching { JSONObject(NoFollowFileSystem.readTextVerified(jobFile)) }.getOrNull()
+        try {
+            JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            null
+        }
     } else {
         null
     }

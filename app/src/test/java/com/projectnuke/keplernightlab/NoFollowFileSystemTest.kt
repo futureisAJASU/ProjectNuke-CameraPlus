@@ -198,6 +198,40 @@ class NoFollowFileSystemTest {
     }
 
     @Test
+    fun ordinaryFinalDigestFailureRemainsFailClosed() {
+        val root = createTempDirectory("kepler-nofollow-digest-ordinary")
+        try {
+            val file = root.resolve("payload").toFile().apply { writeText("payload") }
+            noFollowDigestFailureForTest = IllegalStateException("digest unavailable")
+            assertThrows(IllegalArgumentException::class.java) {
+                NoFollowFileSystem.readTextVerified(file)
+            }
+        } finally {
+            noFollowDigestFailureForTest = null
+            root.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fatalFinalDigestFailurePropagatesInsteadOfBecomingIdentityCorruption() {
+        val root = createTempDirectory("kepler-nofollow-digest-fatal")
+        try {
+            val file = root.resolve("payload").toFile().apply { writeText("payload") }
+            val fatal = AssertionError("fatal digest read")
+            noFollowDigestFailureForTest = fatal
+            try {
+                NoFollowFileSystem.readTextVerified(file)
+                throw AssertionError("fatal digest failure was swallowed")
+            } catch (failure: AssertionError) {
+                assertEquals(fatal, failure)
+            }
+        } finally {
+            noFollowDigestFailureForTest = null
+            root.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
     fun readLinesVerifiedMatchesFileReadLinesSemantics() {
         val root = createTempDirectory("kepler-nofollow-lines").toFile()
         try {

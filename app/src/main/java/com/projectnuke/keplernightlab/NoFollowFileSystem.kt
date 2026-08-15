@@ -73,6 +73,9 @@ internal sealed interface NoFollowInspection<out T> {
     data class InspectionFailed(val exception: Exception) : NoFollowInspection<Nothing>
 }
 
+@Volatile
+internal var noFollowDigestFailureForTest: Throwable? = null
+
 internal object NoFollowFileSystem {
     enum class StableIdentityStrength { OBJECT_IDENTITY, CONTENT_IDENTITY }
     data class StreamDigest(val size: Long, val sha256: String, val prefix: ByteArray)
@@ -171,7 +174,11 @@ internal object NoFollowFileSystem {
         error("Input stream closed before verified read completed")
     }
 
-    private fun digestAtPath(path: Path): String? = runCatching {
+    private fun digestAtPath(path: Path): String? = try {
+        noFollowDigestFailureForTest?.let { failure ->
+            noFollowDigestFailureForTest = null
+            throw failure
+        }
         val digest = MessageDigest.getInstance("SHA-256")
         Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS).use { input ->
             val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
@@ -182,7 +189,11 @@ internal object NoFollowFileSystem {
             }
         }
         digest.digest().joinToString("") { "%02x".format(it) }
-    }.getOrNull()
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        null
+    }
 
     /** Streams a stable regular file without following links; never loads a RAW/DNG into memory. */
     fun copyVerified(file: File, output: OutputStream): StreamDigest = streamVerified(file, output).digest
@@ -215,9 +226,13 @@ internal object NoFollowFileSystem {
     }
 
     @Deprecated("Use inspect() and handle InspectionFailed explicitly")
-    fun attributes(path: Path): BasicFileAttributes? = runCatching {
+    fun attributes(path: Path): BasicFileAttributes? = try {
         Files.readAttributes(path, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
-    }.getOrNull()
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        null
+    }
 
     fun inspect(path: Path): NoFollowInspection<BasicFileAttributes> = try {
         NoFollowInspection.Present(
