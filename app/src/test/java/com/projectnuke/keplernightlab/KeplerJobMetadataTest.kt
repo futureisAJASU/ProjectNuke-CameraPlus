@@ -1004,4 +1004,26 @@ class KeplerJobMetadataTest {
             directory.deleteRecursively()
         }
     }
+
+    @Test
+    fun fatalPublicExportActiveKindClearPropagatesAndRetainsOwner() {
+        val directory = Files.createTempDirectory("kepler-public-export-clear-kind-fatal-").toFile()
+        val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
+        try {
+            KeplerJobMetadata.write(directory, JSONObject()
+                .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, "public-export-clear-kind-fatal")
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name))
+            KeplerJobMetadata.atomicWriteFailureForTest = AssertionError("fatal public export active-kind clear")
+            assertThrows(AssertionError::class.java) {
+                KeplerJobMetadata.clearActiveOperationKind(directory, KeplerActiveOperationKind.PUBLIC_EXPORT)
+            }
+            val retained = KeplerJobMetadata.read(directory)
+            assertEquals(KeplerActiveOperationKind.PUBLIC_EXPORT.name, retained.getString(ACTIVE_OPERATION_KIND))
+            assertEquals("public-export-clear-kind-fatal", retained.getString(ACTIVE_OPERATION_ID))
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
+            directory.deleteRecursively()
+        }
+    }
 }

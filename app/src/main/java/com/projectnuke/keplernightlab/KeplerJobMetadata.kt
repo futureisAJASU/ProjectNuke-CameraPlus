@@ -671,7 +671,7 @@ object KeplerJobMetadata {
     }
 
     /** Clears a current-process marker when terminal metadata has already settled its owner. */
-    internal fun clearActiveOperationKind(jobDir: File, kind: KeplerActiveOperationKind): Boolean = runCatching {
+    internal fun clearActiveOperationKind(jobDir: File, kind: KeplerActiveOperationKind): Boolean = try {
         var matched = false
         update(jobDir) { job ->
             if (job.optString(ACTIVE_RUNTIME_SESSION_ID) != KeplerRuntimeSession.id ||
@@ -686,7 +686,11 @@ object KeplerJobMetadata {
         }
         if (matched) releaseAutoOperation(jobDir)
         matched
-    }.getOrDefault(false)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        false
+    }
 
     /** Clears a dead-process marker only after recovery has matched its exact operation. */
     internal fun clearRecoveredActiveOperation(jobDir: File, operationId: String): Boolean = runCatching {
@@ -710,7 +714,7 @@ object KeplerJobMetadata {
         jobDir: File,
         operationId: String,
         recoveryLease: JobOperationLease? = null
-    ): Boolean = runCatching {
+    ): Boolean = try {
         var matched = false
         update(jobDir) { job ->
             if (job.optString(ACTIVE_OPERATION_ID) != operationId ||
@@ -732,7 +736,11 @@ object KeplerJobMetadata {
             job.remove(ACTIVE_OPERATION_UPDATED_AT)
         }
         matched
-    }.getOrDefault(false)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        false
+    }
 
     /** Atomically records a successful recovery classification before releasing a dead owner. */
     internal fun finalizeRecoveredInterruptedOperation(
@@ -741,7 +749,7 @@ object KeplerJobMetadata {
         classification: KeplerJobRecoveryClassification,
         recoveryMessage: String,
         recoveryLease: JobOperationLease? = null
-    ): Boolean = runCatching {
+    ): Boolean = try {
         var matched = false
         update(jobDir) { job ->
             if (job.optString(ACTIVE_OPERATION_ID) != operationId ||
@@ -767,7 +775,11 @@ object KeplerJobMetadata {
             job.remove(ACTIVE_OPERATION_UPDATED_AT)
         }
         matched
-    }.getOrDefault(false)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        false
+    }
 
     internal fun finalizeRecoveredProcessingHandoff(
         jobDir: File,

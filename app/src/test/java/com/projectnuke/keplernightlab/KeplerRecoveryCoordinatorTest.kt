@@ -6,6 +6,7 @@ import org.json.JSONArray
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -421,6 +422,86 @@ class KeplerRecoveryCoordinatorTest {
             val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root))
             assertEquals(KeplerJobRecoveryClassification.RECOVERY_FAILED, report.jobs.single().classification)
             assertEquals(operationId, KeplerJobMetadata.read(job).optString(ACTIVE_OPERATION_ID))
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fatalInterruptedFinalizationErrorEscapesCoordinatorAndPreservesOwner() {
+        val root = File(Files.createTempDirectory("kepler-recovery-finalize-fatal-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_finalize-fatal").apply { mkdirs() }
+        try {
+            val operationId = "dead-processing-finalize-fatal"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("status", "PROCESSING")
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, operationId)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PROCESSING_YUV.name))
+            KeplerJobMetadata.atomicWriteFailureForTest = AssertionError("fatal interrupted finalization")
+            assertThrows(AssertionError::class.java) {
+                KeplerRecoveryCoordinator.recoverRoots(listOf(root))
+            }
+            val retained = KeplerJobMetadata.read(job)
+            assertEquals(operationId, retained.optString(ACTIVE_OPERATION_ID))
+            assertFalse(retained.optString("recoveryState") == "STABLE")
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun ordinaryTerminalFinalizationFailureRemainsRecoveryFailedAndPreservesOwner() {
+        val root = File(Files.createTempDirectory("kepler-recovery-terminal-finalize-failure-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_terminal-finalize-failure").apply { mkdirs() }
+        try {
+            val operationId = "terminal-finalize-failure"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("currentPipelineStage", "COMPLETE")
+                .put("galleryExportCommitted", true)
+                .put("exportVerified", true)
+                .put("exportUri", "content://media/external/images/media/101")
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, operationId)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name)
+                .put(TERMINAL_OPERATION_ID, operationId))
+            KeplerJobMetadata.atomicWriteFailureForTest = IllegalStateException("ordinary terminal finalization")
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
+            assertEquals(KeplerJobRecoveryClassification.RECOVERY_FAILED, report.jobs.single().classification)
+            assertEquals(operationId, KeplerJobMetadata.read(job).optString(ACTIVE_OPERATION_ID))
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fatalTerminalFinalizationErrorEscapesCoordinatorAndPreservesOwner() {
+        val root = File(Files.createTempDirectory("kepler-recovery-terminal-finalize-fatal-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_terminal-finalize-fatal").apply { mkdirs() }
+        try {
+            val operationId = "terminal-finalize-fatal"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("currentPipelineStage", "COMPLETE")
+                .put("galleryExportCommitted", true)
+                .put("exportVerified", true)
+                .put("exportUri", "content://media/external/images/media/102")
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, operationId)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name)
+                .put(TERMINAL_OPERATION_ID, operationId))
+            KeplerJobMetadata.atomicWriteFailureForTest = AssertionError("fatal terminal finalization")
+            assertThrows(AssertionError::class.java) {
+                KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
+            }
+            val retained = KeplerJobMetadata.read(job)
+            assertEquals(operationId, retained.optString(ACTIVE_OPERATION_ID))
+            assertFalse(retained.optString("recoveryState") == "STABLE")
         } finally {
             KeplerJobMetadata.atomicWriteFailureForTest = null
             root.deleteRecursively()
