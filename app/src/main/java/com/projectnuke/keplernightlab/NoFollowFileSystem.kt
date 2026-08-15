@@ -553,9 +553,16 @@ internal object NoFollowFileSystem {
                     }
                 }
             }
-            if (!revalidateTraversal(path, attrs) ||
-                !runCatching { Files.deleteIfExists(path) }.getOrDefault(false)
-            ) failures += path.toString()
+            val deleted = if (!revalidateTraversal(path, attrs)) {
+                false
+            } else try {
+                Files.deleteIfExists(path)
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                false
+            }
+            if (!deleted) failures += path.toString()
         }
         remove(rootPath)
         val status = when {
