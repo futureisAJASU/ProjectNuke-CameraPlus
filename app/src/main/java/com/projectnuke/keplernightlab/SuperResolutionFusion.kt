@@ -42,6 +42,9 @@ private const val ALIGNMENT_SCORE_LIMIT = 0.16f
 private const val MIN_FUSION_FRAMES = 2
 private const val JPEG_QUALITY = 95
 
+/** Narrow deterministic seam for a post-claim job-write failure. */
+internal var superResolutionJobWriteFailureForTest: Throwable? = null
+
 enum class SuperResolutionSourceMode {
     BINNED_12MP_YUV,
     BINNED_12MP_RGB,
@@ -285,9 +288,14 @@ internal class StreamingPngTileSink(
         } catch (failure: Throwable) {
             cleanupRecords += listOfNotNull(settleTemporary())
             settleStreams()
-            runCatching { encoder.end() }
-                .onSuccess { resourceSettlementRecords += ProcessingResourceSettlementRecord("DEFLATER", "ENDED") }
-                .onFailure { resourceSettlementRecords += ProcessingResourceSettlementRecord("DEFLATER", "END_FAILED", it) }
+            try {
+                encoder.end()
+                resourceSettlementRecords += ProcessingResourceSettlementRecord("DEFLATER", "ENDED")
+            } catch (failure: Error) {
+                throw failure
+            } catch (failure: Exception) {
+                resourceSettlementRecords += ProcessingResourceSettlementRecord("DEFLATER", "END_FAILED", failure)
+            }
             deflater = null
             temporary = null
             state = State.FAILED
@@ -300,7 +308,14 @@ internal class StreamingPngTileSink(
         check(state == State.WRITING || state == State.FAILED) { "PNG sink abort in state=$state" }
         state = State.ABORTING
         settleStreams()
-        val deflaterFailure = runCatching { deflater?.end() }.exceptionOrNull()
+        val deflaterFailure = try {
+            deflater?.end()
+            null
+        } catch (failure: Error) {
+            throw failure
+        } catch (failure: Exception) {
+            failure
+        }
         resourceSettlementRecords += if (deflaterFailure == null) {
             ProcessingResourceSettlementRecord("DEFLATER", "ENDED")
         } else {
@@ -323,7 +338,14 @@ internal class StreamingPngTileSink(
 
     private fun settleStreams() {
         val currentStream = stream
-        val streamFailure = runCatching { currentStream?.close() }.exceptionOrNull()
+        val streamFailure = try {
+            currentStream?.close()
+            null
+        } catch (failure: Error) {
+            throw failure
+        } catch (failure: Exception) {
+            failure
+        }
         resourceSettlementRecords += if (streamFailure == null) {
             ProcessingResourceSettlementRecord("STREAM", "CLOSED")
         } else {
@@ -332,7 +354,14 @@ internal class StreamingPngTileSink(
         if (streamFailure != null) {
             val currentRaw = rawOutput
             if (currentRaw != null) {
-                val rawFailure = runCatching { currentRaw.close() }.exceptionOrNull()
+                val rawFailure = try {
+                    currentRaw.close()
+                    null
+                } catch (failure: Error) {
+                    throw failure
+                } catch (failure: Exception) {
+                    failure
+                }
                 resourceSettlementRecords += if (rawFailure == null) {
                     ProcessingResourceSettlementRecord("RAW_FD_FALLBACK", "CLOSED")
                 } else {
@@ -564,14 +593,11 @@ fun runSuperResolutionFusion(
         result
     } catch (ce: CancellationException) {
         throw ce
-    } catch (oom: OutOfMemoryError) {
-        failedSuperResolutionResult(
-            request = request,
-            inputFrameCount = inputFiles.size,
-            message = "Out of memory; fusion stopped without attempting recovery.",
-            shifts = shifts,
-            processingAttempt = processingAttempt
-        )
+    } catch (failure: Error) {
+        // Fatal VM/runtime errors are not a normal fusion result. The durable
+        // claim, if already written, remains the authority while the error
+        // propagates through the established fatal policy.
+        throw failure
     } catch (error: Exception) {
         failedSuperResolutionResult(
             request = request,
@@ -721,7 +747,11 @@ fun captureProcessExportSuperResolutionFusion(
                         } == true
                         post("PIPELINE_FAILED: 24M Fusion failed. ${result.message}")
                         terminal.publish(
-                            CameraPipelineEvent.Terminal.Kind.FAILED,
+                            exportOutcomeTerminalKind(
+                                requiredOutputCommitted = requiredOutputCommitted,
+                                publicExportCommitted = false,
+                                verified = false
+                            ),
                             requiredOutputCommitted = requiredOutputCommitted,
                             message = result.message
                         )
@@ -757,14 +787,22 @@ fun captureProcessExportSuperResolutionFusion(
                             jobDir = outputDir,
                             error = export.errorMessage ?: "Unknown export failure",
                             finalOutputFormat = finalOutputFormat,
-                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
+                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
+                            export = export,
+                            requiredOutputCommitted = requiredOutputCommitted
                         )
                         post("PIPELINE_FAILED: 24M Fusion export failed. ${export.errorMessage}")
+                        val currentPublicCommit = export.success && !export.uriString.isNullOrBlank()
+                        val currentRequiredOutputCommitted = requiredOutputCommitted ||
+                            currentProcessingAttemptHasRequiredOutputClaimForLease(outputDir, outputLease)
                         terminal.publish(
-                            CameraPipelineEvent.Terminal.Kind.FAILED,
-                            requiredOutputCommitted = requiredOutputCommitted ||
-                                currentProcessingAttemptHasRequiredOutputClaimForLease(outputDir, outputLease),
-                            publicExportCommitted = export.success && !export.uriString.isNullOrBlank(),
+                            exportOutcomeTerminalKind(
+                                requiredOutputCommitted = currentRequiredOutputCommitted,
+                                publicExportCommitted = currentPublicCommit,
+                                verified = false
+                            ),
+                            requiredOutputCommitted = currentRequiredOutputCommitted,
+                            publicExportCommitted = currentPublicCommit,
                             message = export.errorMessage
                         )
                         return@post
@@ -789,13 +827,19 @@ fun captureProcessExportSuperResolutionFusion(
                             error = "Export verification failed",
                             finalOutputFormat = finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
-                            ,export = export
+                            ,export = export,
+                            requiredOutputCommitted = requiredOutputCommitted
                         )
                         post("PIPELINE_FAILED: 24M Fusion export verification failed.")
                         terminal.publish(
-                            CameraPipelineEvent.Terminal.Kind.FAILED,
+                            exportOutcomeTerminalKind(
+                                requiredOutputCommitted = requiredOutputCommitted,
+                                publicExportCommitted = publicExportCommitted,
+                                verified = false
+                            ),
                             requiredOutputCommitted = requiredOutputCommitted,
                             publicExportCommitted = publicExportCommitted,
+                            verified = false,
                             message = "24M Fusion export verification failed."
                         )
                         return@post
@@ -1315,7 +1359,15 @@ private fun fuseFramesTiled(
         cancellation.throwIfCancelled()
         return sink.finish().also { finished = true }
     } finally {
-        decoders.values.forEach { decoder -> runCatching { decoder.recycle() } }
+        decoders.values.forEach { decoder ->
+            try {
+                decoder.recycle()
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                // Decoder cleanup is best effort for ordinary exceptions.
+            }
+        }
         if (!finished) sink.abort()
     }
 }
@@ -1917,7 +1969,22 @@ private fun failedSuperResolutionResult(
         rawInputUsed = request.sourceMode == SuperResolutionSourceMode.FULLRES_50MP_RAW,
         message = message
     )
-    runCatching { writeSuperResolutionJob(request, result, "FAILED", message, processingAttempt) }
+    val currentAttemptClaimedOutput = processingAttempt?.let { attempt ->
+        currentProcessingAttemptHasRequiredOutputClaim(request.outputDir, attempt.id)
+    } == true
+    try {
+        writeSuperResolutionJob(
+            request,
+            result,
+            if (currentAttemptClaimedOutput) "PARTIAL" else "FAILED",
+            message,
+            processingAttempt
+        )
+    } catch (failure: Error) {
+        throw failure
+    } catch (failure: Exception) {
+        Log.e("KeplerSuperResolution", "failed to persist fusion terminal metadata", failure)
+    }
     return result
 }
 
@@ -1928,14 +1995,22 @@ private fun writeSuperResolutionJob(
     reason: String?,
     processingAttempt: ProcessingAttempt? = null
 ) {
-    val priorAttempt = runCatching {
+    superResolutionJobWriteFailureForTest?.let { injected ->
+        superResolutionJobWriteFailureForTest = null
+        throw injected
+    }
+    val priorAttempt = try {
         NoFollowFileSystem.resolveDirectChildResult(request.outputDir, SUPER_RES_JOB_FILE, requireFile = true)
             .let { result ->
                 if (result is NoFollowInspection.Present) {
                     JSONObject(NoFollowFileSystem.readTextVerified(result.value))
                 } else null
             }
-    }.getOrNull()
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        null
+    }
     val shiftArray = JSONArray()
     result.estimatedShifts.forEach { shift ->
         shiftArray.put(
@@ -1988,7 +2063,7 @@ private fun writeSuperResolutionJob(
         .put("sourceFrameFiles", sources)
         .put("finalFile", result.outputFile?.name ?: JSONObject.NULL)
         .put("reason", reason ?: JSONObject.NULL)
-        .put("failureMessage", if (status == "FAILED") result.message else JSONObject.NULL)
+        .put("failureMessage", if (status != "COMPLETE") result.message else JSONObject.NULL)
         .put("message", result.message)
     priorAttempt?.optString("processingAttemptId")?.takeIf { it.isNotBlank() }?.let {
         job.put("processingAttemptId", it)
@@ -2066,7 +2141,7 @@ private fun estimateFusionWorkingBytes(
     outputHeight: Int,
     includesOutputBitmap: Boolean
 ): Long {
-    return runCatching {
+    return try {
         val outputBytes = if (includesOutputBitmap) {
             checkedBitmapBytes(outputWidth, outputHeight)
         } else 0L
@@ -2076,7 +2151,11 @@ private fun estimateFusionWorkingBytes(
         ).toLong()
         val tileBytes = Math.multiplyExact(tilePixels, 29L)
         Math.addExact(Math.addExact(outputBytes, tileBytes), 64L * 1024L * 1024L)
-    }.getOrElse { Long.MAX_VALUE }
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        Long.MAX_VALUE
+    }
 }
 
 private fun availableHeapBytes(): Long {
@@ -2118,10 +2197,20 @@ private fun detectSourceMegapixels(file: File?): Double {
 }
 
 private fun canAllocateOutputBitmap(outputWidth: Int, outputHeight: Int): Boolean {
-    val outputBytes = runCatching { checkedBitmapBytes(outputWidth, outputHeight) }
-        .getOrElse { return false }
-    val required = runCatching { Math.addExact(outputBytes, 64L * 1024L * 1024L) }
-        .getOrElse { return false }
+    val outputBytes = try {
+        checkedBitmapBytes(outputWidth, outputHeight)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        return false
+    }
+    val required = try {
+        Math.addExact(outputBytes, 64L * 1024L * 1024L)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        return false
+    }
     return availableHeapBytes() >= required
 }
 
