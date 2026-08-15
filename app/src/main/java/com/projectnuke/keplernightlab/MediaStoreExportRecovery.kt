@@ -51,7 +51,13 @@ internal fun reconstructRawSidecarJournalEvidence(
     journals: List<MediaStoreExportJournal> = MediaStoreExportJournal.list(jobDir),
     verifiedAttemptIds: Set<String>? = null
 ): Int {
-    val manifest = runCatching { loadRawSidecarManifest(jobDir) }.getOrNull()
+    val manifest = try {
+        loadRawSidecarManifest(jobDir)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        null
+    }
         ?: return 0
     val candidates = journals.filter {
         it.role == MediaStoreExportRole.RAW_DNG_SIDECAR &&
@@ -67,7 +73,15 @@ internal fun reconstructRawSidecarJournalEvidence(
         val frameIndex = frame.optInt("frameIndex", frame.optInt("index", index))
         val manifestFrame = manifest.frames.firstOrNull { it.frameIndex == frameIndex }
         val localFile = manifestFrame?.localFile
-        val digest = localFile?.let { runCatching { NoFollowFileSystem.digestVerified(it) }.getOrNull() }
+        val digest = localFile?.let {
+            try {
+                NoFollowFileSystem.digestVerified(it)
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                null
+            }
+        }
         val journal = candidates.asSequence()
             .filter { candidate ->
                 candidate.frameIndex == frameIndex &&
@@ -157,7 +171,15 @@ private fun recoverMediaStoreExportJournal(
         )
     }
     if (journal.state == MediaStoreExportState.CLEANUP_REQUIRED) {
-        val abandonedUri = journal.uri?.let { runCatching { Uri.parse(it) }.getOrNull() }
+        val abandonedUri = journal.uri?.let {
+            try {
+                Uri.parse(it)
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                null
+            }
+        }
             ?: run {
                 journal.transition(jobDir, MediaStoreExportState.CLEANED)
                 return MediaStoreExportRecoveryResult(
@@ -182,7 +204,13 @@ private fun recoverMediaStoreExportJournal(
                 "Abandoned MediaStore row was already absent."
             )
         }
-        val deleted = runCatching { access.delete(abandonedUri) }.getOrDefault(false)
+        val deleted = try {
+            access.delete(abandonedUri)
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            false
+        }
         if (!deleted) {
             return MediaStoreExportRecoveryResult(
                 journal.exportAttemptId,
@@ -205,7 +233,13 @@ private fun recoverMediaStoreExportJournal(
             "MediaStore insert result is unknown because no exact URI was durably recorded."
         )
     }
-    val uri = runCatching { Uri.parse(uriString) }.getOrNull()
+    val uri = try {
+        Uri.parse(uriString)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        null
+    }
         ?: return MediaStoreExportRecoveryResult(
             journal.exportAttemptId,
             MediaStoreExportRecoveryClassification.AMBIGUOUS,
@@ -231,7 +265,13 @@ private fun recoverMediaStoreExportJournal(
     }
     if (inspection.pending) {
         if (!inspection.verified) {
-            val deleted = runCatching { access.delete(uri) }.getOrDefault(false)
+            val deleted = try {
+                access.delete(uri)
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                false
+            }
             if (!deleted) {
                 return MediaStoreExportRecoveryResult(
                     journal.exportAttemptId,
@@ -246,7 +286,13 @@ private fun recoverMediaStoreExportJournal(
                 inspection.message ?: "Pending MediaStore content was not verifiable."
             )
         }
-        val committed = runCatching { access.setPending(uri, false) }.getOrDefault(false)
+        val committed = try {
+            access.setPending(uri, false)
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            false
+        }
         if (!committed) {
             return MediaStoreExportRecoveryResult(
                 journal.exportAttemptId,

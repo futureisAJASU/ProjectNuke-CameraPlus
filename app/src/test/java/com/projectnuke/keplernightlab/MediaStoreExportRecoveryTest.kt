@@ -5,9 +5,12 @@ import java.nio.file.Files
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import java.io.IOException
 
 @RunWith(RobolectricTestRunner::class)
 class MediaStoreExportRecoveryTest {
@@ -22,15 +25,19 @@ class MediaStoreExportRecoveryTest {
         var inspectionFailed = false
         var returnNullCursor = false
         var committed = false
+        var deleteFailure: Throwable? = null
+        var setPendingFailure: Throwable? = null
         override fun inspect(uri: Uri, journal: MediaStoreExportJournal) =
             MediaStoreExportInspection(exists, pending, verified, inspectionFailed = inspectionFailed)
         override fun setPending(uri: Uri, pending: Boolean): Boolean {
+            setPendingFailure?.let { throw it }
             if (!commitSucceeds) return false
             this.pending = pending
             committed = true
             return true
         }
         override fun delete(uri: Uri): Boolean {
+            deleteFailure?.let { throw it }
             deleted = true
             if (!deleteResult) return false
             exists = false
@@ -133,6 +140,31 @@ class MediaStoreExportRecoveryTest {
     }
 
     @Test
+    fun ordinaryAbandonedRowDeleteExceptionRemainsRetryableDebt() {
+        val dir = Files.createTempDirectory("media-recovery-abandoned-exception-").toFile()
+        try {
+            journal(dir, MediaStoreExportState.CLEANUP_REQUIRED)
+            val access = FakeAccess(true, true).apply { deleteFailure = IOException("delete failed") }
+            val result = recoverMediaStoreExportJournals(dir, access).single()
+            assertEquals(MediaStoreExportRecoveryClassification.DELETE_FAILED, result.classification)
+            assertEquals(MediaStoreExportState.CLEANUP_REQUIRED, MediaStoreExportJournal.list(dir).single().state)
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
+    fun fatalAbandonedRowDeleteErrorPropagatesWithoutChangingJournal() {
+        val dir = Files.createTempDirectory("media-recovery-abandoned-fatal-").toFile()
+        try {
+            journal(dir, MediaStoreExportState.CLEANUP_REQUIRED)
+            val access = FakeAccess(true, true).apply { deleteFailure = AssertionError("fatal delete") }
+            assertThrows(AssertionError::class.java) {
+                recoverMediaStoreExportJournals(dir, access)
+            }
+            assertEquals(MediaStoreExportState.CLEANUP_REQUIRED, MediaStoreExportJournal.list(dir).single().state)
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
     fun cleanupDebtDoesNotBecomePublicAfterRestart() {
         val dir = Files.createTempDirectory("media-recovery-abandoned-restart-").toFile()
         try {
@@ -207,6 +239,77 @@ class MediaStoreExportRecoveryTest {
             assertEquals(MediaStoreExportRecoveryClassification.DELETE_FAILED, recoverMediaStoreExportJournals(dir, access).single().classification)
             assertEquals(MediaStoreExportState.ROW_INSERTED, MediaStoreExportJournal.list(dir).single().state)
         } finally { dir.deleteRecursively() }
+    }
+
+    @Test
+    fun ordinaryPendingDeleteExceptionRemainsExistingRecoveryDebt() {
+        val dir = Files.createTempDirectory("media-recovery-delete-exception-").toFile()
+        try {
+            journal(dir)
+            val access = FakeAccess(true, false).apply { deleteFailure = IOException("delete failed") }
+            assertEquals(
+                MediaStoreExportRecoveryClassification.DELETE_FAILED,
+                recoverMediaStoreExportJournals(dir, access).single().classification
+            )
+            assertEquals(MediaStoreExportState.ROW_INSERTED, MediaStoreExportJournal.list(dir).single().state)
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
+    fun fatalPendingDeleteErrorPropagatesWithoutClassifyingRecovery() {
+        val dir = Files.createTempDirectory("media-recovery-delete-fatal-").toFile()
+        try {
+            journal(dir)
+            val access = FakeAccess(true, false).apply { deleteFailure = AssertionError("fatal pending delete") }
+            assertThrows(AssertionError::class.java) {
+                recoverMediaStoreExportJournals(dir, access)
+            }
+            assertEquals(MediaStoreExportState.ROW_INSERTED, MediaStoreExportJournal.list(dir).single().state)
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
+    fun ordinaryPendingCommitExceptionRemainsAmbiguous() {
+        val dir = Files.createTempDirectory("media-recovery-commit-exception-").toFile()
+        try {
+            journal(dir)
+            val access = FakeAccess(true, true).apply { setPendingFailure = IOException("commit failed") }
+            assertEquals(
+                MediaStoreExportRecoveryClassification.AMBIGUOUS,
+                recoverMediaStoreExportJournals(dir, access).single().classification
+            )
+            assertEquals(MediaStoreExportState.ROW_INSERTED, MediaStoreExportJournal.list(dir).single().state)
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
+    fun fatalPendingCommitErrorPropagatesWithoutClassifyingRecovery() {
+        val dir = Files.createTempDirectory("media-recovery-commit-fatal-").toFile()
+        try {
+            journal(dir)
+            val access = FakeAccess(true, true).apply { setPendingFailure = AssertionError("fatal commit") }
+            assertThrows(AssertionError::class.java) {
+                recoverMediaStoreExportJournals(dir, access)
+            }
+            assertEquals(MediaStoreExportState.ROW_INSERTED, MediaStoreExportJournal.list(dir).single().state)
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
+    fun abandonedRowDeleteHelperReturnsOrdinaryFailureButPropagatesFatalError() {
+        val app = RuntimeEnvironment.getApplication()
+        val uri = Uri.parse("content://media/external/images/media/99")
+        mediaStoreAbandonDeleteFailureForTest = IOException("ordinary abandoned delete")
+        assertFalse(deleteMediaStoreRowForAbandon(app, uri))
+
+        mediaStoreAbandonDeleteFailureForTest = AssertionError("fatal abandoned delete")
+        try {
+            assertThrows(AssertionError::class.java) {
+                deleteMediaStoreRowForAbandon(app, uri)
+            }
+        } finally {
+            mediaStoreAbandonDeleteFailureForTest = null
+        }
     }
 
     @Test

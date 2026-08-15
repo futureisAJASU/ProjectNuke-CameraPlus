@@ -14,6 +14,8 @@ import java.io.OutputStream
 import java.security.MessageDigest
 import java.util.concurrent.CancellationException
 
+internal var mediaStoreAbandonDeleteFailureForTest: Throwable? = null
+
 data class GalleryExportResult(
     val success: Boolean,
     val uriString: String?,
@@ -420,8 +422,12 @@ fun exportRawSidecarsToPublicStorage(
     cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
 ): RawSidecarExportResult {
     val ownerOperationId = KeplerJobMetadata.read(jobDir).optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }
-    val manifest = runCatching { loadRawSidecarManifest(jobDir) }.getOrElse {
-        return RawSidecarExportResult.failed("Invalid RAW sidecar manifest: ${it.message}")
+    val manifest = try {
+        loadRawSidecarManifest(jobDir)
+    } catch (failure: Error) {
+        throw failure
+    } catch (failure: Exception) {
+        return RawSidecarExportResult.failed("Invalid RAW sidecar manifest: ${failure.message}")
     }
     if (manifest.frames.none { it.requested }) {
         return RawSidecarExportResult.failed("No DNG sidecars were requested in job.json")
@@ -436,10 +442,14 @@ fun exportRawSidecarsToPublicStorage(
             val file = frame.localFile ?: return@forEach
             cancellation.throwIfCancelled()
             val exportName = "${displayNameBase}_${frame.frameIndex.toString().padStart(2, '0')}.dng"
-            val sourceDigest = runCatching { NoFollowFileSystem.digestVerified(file) }.getOrElse {
-                val failure = "${file.name}: source DNG could not be hashed: ${it.message}"
-                publicFailures += failure
-                publicFailureByFrame[frame.frameIndex] = failure
+            val sourceDigest = try {
+                NoFollowFileSystem.digestVerified(file)
+            } catch (failure: Error) {
+                throw failure
+            } catch (failure: Exception) {
+                val message = "${file.name}: source DNG could not be hashed: ${failure.message}"
+                publicFailures += message
+                publicFailureByFrame[frame.frameIndex] = message
                 return@forEach
             }
             val reusable = findReusableRawSidecarJournal(
@@ -712,7 +722,7 @@ private fun rawSidecarOutcome(
 }
 
 fun queryMediaSize(context: Context, uri: Uri): Long {
-    val mediaSize = runCatching {
+    val mediaSize = try {
         context.contentResolver.query(
             uri,
             arrayOf(MediaStore.MediaColumns.SIZE),
@@ -722,17 +732,29 @@ fun queryMediaSize(context: Context, uri: Uri): Long {
         )?.use { cursor ->
             if (cursor.moveToFirst()) cursor.getLong(0) else 0L
         } ?: 0L
-    }.getOrDefault(0L)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        0L
+    }
     if (mediaSize > 0L) return mediaSize
-    return runCatching {
+    val descriptorSize = try {
         context.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: 0L
-    }.getOrDefault(0L).coerceAtLeast(0L)
-        .takeIf { it > 0L }
-        ?: runCatching {
-            if (uri.scheme == "file") {
-                uri.path?.let { java.io.File(it).length() } ?: 0L
-            } else 0L
-        }.getOrDefault(0L)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        0L
+    }
+    if (descriptorSize > 0L) return descriptorSize
+    return try {
+        if (uri.scheme == "file") {
+            uri.path?.let { java.io.File(it).length() } ?: 0L
+        } else 0L
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        0L
+    }
 }
 
 fun updateExportMetadata(
@@ -1225,8 +1247,22 @@ private fun abandonMediaStoreAttempt(
     uri: Uri
 ): MediaStoreExportJournal {
     val abandoned = journal.transition(jobDir, MediaStoreExportState.CLEANUP_REQUIRED, uri.toString())
-    val deleted = runCatching { context.contentResolver.delete(uri, null, null) == 1 }.getOrDefault(false)
+    val deleted = deleteMediaStoreRowForAbandon(context, uri)
     return if (deleted) abandoned.transition(jobDir, MediaStoreExportState.CLEANED) else abandoned
+}
+
+internal fun deleteMediaStoreRowForAbandon(context: Context, uri: Uri): Boolean {
+    return try {
+        mediaStoreAbandonDeleteFailureForTest?.let { failure ->
+            mediaStoreAbandonDeleteFailureForTest = null
+            throw failure
+        }
+        context.contentResolver.delete(uri, null, null) == 1
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        false
+    }
 }
 
 private data class InsertedPublicFile(
@@ -1304,15 +1340,34 @@ private fun insertPublicFile(
             return null
         }
         journal = journal?.transition(jobDir!!, MediaStoreExportState.PUBLIC_COMMITTED)
-        InsertedPublicFile(uri, runCatching { queryMediaSize(context, uri) }.getOrDefault(0L), journal)
+        val mediaSize = try {
+            queryMediaSize(context, uri)
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            0L
+        }
+        InsertedPublicFile(uri, mediaSize, journal)
     } catch (ce: CancellationException) {
         if (insertReturned && uri != null && journal != null) {
-            runCatching { journal = abandonMediaStoreAttempt(context, jobDir!!, journal!!, uri!!) }
+            try {
+                journal = abandonMediaStoreAttempt(context, jobDir!!, journal!!, uri!!)
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                // Preserve cancellation as the primary ordinary control-flow outcome.
+            }
         }
         throw ce
     } catch (error: Throwable) {
         if (insertReturned && uri != null && journal != null) {
-            runCatching { journal = abandonMediaStoreAttempt(context, jobDir!!, journal!!, uri!!) }
+            try {
+                journal = abandonMediaStoreAttempt(context, jobDir!!, journal!!, uri!!)
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                // Preserve the original ordinary export failure; the journal remains debt.
+            }
         }
         if (error is Error) throw error
         null
@@ -1356,8 +1411,13 @@ private fun writeHeifViaTempFile(
         )
         false
     } finally {
-        runCatching { writer?.close() }
-            .onFailure { Log.w("KeplerGalleryExporter", "Failed to close HEIF writer.", it) }
+        try {
+            writer?.close()
+        } catch (failure: Error) {
+            throw failure
+        } catch (failure: Exception) {
+            Log.w("KeplerGalleryExporter", "Failed to close HEIF writer.", failure)
+        }
         if (tempFile.exists() && !tempFile.delete()) {
             Log.w("KeplerGalleryExporter", "Failed to delete temporary HEIF file: ${tempFile.absolutePath}")
         }
