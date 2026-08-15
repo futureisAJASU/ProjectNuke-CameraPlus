@@ -26,6 +26,7 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.CancellationException
 import kotlin.coroutines.resume
 
 typealias OutputSettings = FinalOutputFormat
@@ -448,7 +449,7 @@ private suspend fun resolveWorkerTerminal(
         if (currentCoroutineContext().isActive) {
             // Worker Deferred was cancelled, but this coroutine is still active.
             // Confirmed worker failure, not callback cancellation.
-            Result.failure(ce)
+            Result.failure(IllegalStateException("Reprocess worker deferred was cancelled.", ce))
         } else {
             // This coroutine is cancelled → callback/retry cancellation, propagate.
             throw ce
@@ -556,11 +557,13 @@ suspend fun reprocessKeplerGalleryJob(
         kind = detectJobKind(target, job)
         reviewItems = loadFrameReviewItems(context, target).getOrElse {
             if (it is kotlinx.coroutines.CancellationException) throw it
+            if (it is Error) throw it
             writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
             return@withContext Result.failure(it)
         }
         resolvedSelection = resolveFrameSelection(target, kind, job, reviewItems, frameSelection).getOrElse {
             if (it is kotlinx.coroutines.CancellationException) throw it
+            if (it is Error) throw it
             writeReprocessFailure(target, "${it.javaClass.simpleName}: ${it.message}")
             return@withContext Result.failure(it)
         }
@@ -603,6 +606,8 @@ selectionMode = resolveSelectionMode(job, frameSelection)
             frames = applyFrameSelectionToItems(reviewItems, resolvedSelection, selectionMode),
             operationLease = operationLease
         ).getOrElse {
+            if (it is kotlinx.coroutines.CancellationException) throw it
+            if (it is Error) throw it
             return@withContext finalizeTransaction(
                 session, transaction, target, capability.jobKind, outputSettings, selectionMode,
                 resolvedSelection, Result.failure(it)
@@ -790,18 +795,24 @@ private fun settleTerminalResult(
             Result.failure(IllegalStateException("No transaction available to settle terminal result."))
         )
     }
+    fun finalizeAndPropagate(terminal: Result<ReprocessWorkerOutcome>): ReprocessFinalizationResult {
+        val settled = finalizeTransaction(
+            session, transaction, target, jobKind, outputSettings, selectionMode,
+            resolvedSelection, terminal
+        )
+        settled.result.exceptionOrNull()?.let { failure ->
+            if (failure is CancellationException || failure is Error) throw failure
+        }
+        terminal.getOrNull()?.terminalError?.let { failure ->
+            if (failure is CancellationException || failure is Error) throw failure
+        }
+        return settled
+    }
     return when (acquisition) {
-        is WorkerTerminalResult.TerminalReceived -> finalizeTransaction(
-            session, transaction, target, jobKind, outputSettings, selectionMode,
-            resolvedSelection, Result.success(acquisition.outcome)
-        )
-        is WorkerTerminalResult.DeferredExceptionalCompletion -> finalizeTransaction(
-            session, transaction, target, jobKind, outputSettings, selectionMode,
-            resolvedSelection, Result.failure(acquisition.cause)
-        )
-        is WorkerTerminalResult.WorkerExitedAfterCancellation -> finalizeTransaction(
-            session, transaction, target, jobKind, outputSettings, selectionMode,
-            resolvedSelection, acquisition.outcome?.let { Result.success(it) }
+        is WorkerTerminalResult.TerminalReceived -> finalizeAndPropagate(Result.success(acquisition.outcome))
+        is WorkerTerminalResult.DeferredExceptionalCompletion -> finalizeAndPropagate(Result.failure(acquisition.cause))
+        is WorkerTerminalResult.WorkerExitedAfterCancellation -> finalizeAndPropagate(
+            acquisition.outcome?.let { Result.success(it) }
                 ?: Result.failure(
                     combineCause(
                         IllegalStateException("Worker exited after cancellation with no outcome."),
@@ -809,10 +820,7 @@ private fun settleTerminalResult(
                     )
                 )
         )
-        is WorkerTerminalResult.CallerCancelledWhileWorkerExited -> finalizeTransaction(
-            session, transaction, target, jobKind, outputSettings, selectionMode,
-            resolvedSelection, Result.success(acquisition.outcome)
-        )
+        is WorkerTerminalResult.CallerCancelledWhileWorkerExited -> finalizeAndPropagate(Result.success(acquisition.outcome))
         is WorkerTerminalResult.WorkerDidNotExitBeforeTimeout -> {
             val persistence = persistUnresolvedQuarantine(session, transaction, acquisition.cancelFailure)
             registerLateFinalization(session, worker, target, jobKind, outputSettings, selectionMode, resolvedSelection)
@@ -1503,6 +1511,7 @@ internal fun finalizeTransaction(
     }
     val currentManifest = loadStrictManifest(File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE))
     val outcome = terminal.getOrElse { terminalError ->
+        if (terminalError is CancellationException || terminalError is Error) throw terminalError
         // Exceptional Deferred completion is a confirmed worker exit, not an unresolved timeout.
         // It therefore follows the ordinary uncommitted rollback settlement path.
         ReprocessWorkerOutcome(
@@ -1516,7 +1525,11 @@ internal fun finalizeTransaction(
     when (currentManifest.state) {
         ReprocessTransactionState.COMMITTED -> {
             if (operationLease != null && KeplerJobMetadata.isOperationOwner(jobDir, operationLease)) {
-                try { operationLease.releaseIfProcessingSettled() } catch (_: Exception) {}
+                try {
+                    operationLease.releaseIfProcessingSettled()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {}
             }
             val saved = ReprocessFinalizationResult(
                 ReprocessFinalizationState.COMMITTED, Result.success(
@@ -1528,7 +1541,11 @@ internal fun finalizeTransaction(
         }
         ReprocessTransactionState.ROLLED_BACK -> {
             if (operationLease != null && KeplerJobMetadata.isOperationOwner(jobDir, operationLease)) {
-                try { operationLease.releaseIfProcessingSettled() } catch (_: Exception) {}
+                try {
+                    operationLease.releaseIfProcessingSettled()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {}
             }
             val saved = ReprocessFinalizationResult(
                 ReprocessFinalizationState.ROLLED_BACK, Result.failure(IllegalStateException("Already finalized: ROLLED_BACK"))
@@ -2085,7 +2102,10 @@ internal suspend fun cancelWorkerAndAwaitTerminal(
         is WorkerTerminalResult.WorkerExitedAfterCancellation ->
             result.outcome?.let { Result.success(it) }
                 ?: Result.failure(IllegalStateException("Worker exited with no outcome."))
-        is WorkerTerminalResult.DeferredExceptionalCompletion -> Result.failure(result.cause)
+        is WorkerTerminalResult.DeferredExceptionalCompletion -> {
+            if (result.cause is CancellationException || result.cause is Error) throw result.cause
+            Result.failure(result.cause)
+        }
         is WorkerTerminalResult.WorkerDidNotExitBeforeTimeout ->
             Result.failure(ReprocessWorkerDidNotExitException("Reprocess worker did not exit before rollback timeout."))
         is WorkerTerminalResult.CallerCancelledWhileWorkerExited -> Result.success(result.outcome)
@@ -2109,10 +2129,27 @@ internal fun writeBoundedReprocessPreview(jobDir: File, source: Bitmap): File {
         temp.write { output -> check(scaled.compress(Bitmap.CompressFormat.PNG, 92, output)) { "Reprocess preview compress failed." } }
         KeplerJobMetadata.atomicReplace(temp, preview)
     } catch (compressFailure: Exception) {
-        if (temp.exists()) runCatching { temp.delete() }
+        if (temp.exists()) {
+            try {
+                temp.delete()
+            } catch (fatal: Error) {
+                fatal.addSuppressed(compressFailure)
+                throw fatal
+            } catch (cleanupFailure: Exception) {
+                compressFailure.addSuppressed(cleanupFailure)
+            }
+        }
         throw compressFailure
     } finally {
-        if (temp.exists()) runCatching { temp.delete() }
+        if (temp.exists()) {
+            try {
+                temp.delete()
+            } catch (fatal: Error) {
+                throw fatal
+            } catch (_: Exception) {
+                // The terminal result is already selected; ordinary temp cleanup remains best effort.
+            }
+        }
         if (scaled !== source && !scaled.isRecycled) scaled.recycle()
     }
     return preview.takeIf { it.isFile && it.length() > 0L } ?: error("Reprocess preview write produced no file.")
@@ -3044,8 +3081,13 @@ internal data class ReprocessTransactionManifest(
             val newlyCreated = json.optJSONArray("newlyCreatedPaths")?.toStringSetStrict().orEmpty()
             val state = if (json.has("state") && !json.isNull("state")) {
                 val name = json.optString("state")
-                runCatching { ReprocessTransactionState.valueOf(name) }.getOrNull()
-                    ?: throw IllegalArgumentException("Unknown transaction state: $name")
+                try {
+                    ReprocessTransactionState.valueOf(name)
+                } catch (failure: Error) {
+                    throw failure
+                } catch (_: Exception) {
+                    throw IllegalArgumentException("Unknown transaction state: $name")
+                }
             } else {
                 // Legacy structurally valid manifest missing only `state` remains ACTIVE.
                 ReprocessTransactionState.ACTIVE
@@ -4092,30 +4134,40 @@ private suspend fun resolveFrameSelection(
     job: JSONObject,
     frames: List<KeplerFrameReviewItem>,
     explicitSelection: Set<Int>?
-): Result<Set<Int>> = runCatching {
-    if (explicitSelection != null) {
-        return@runCatching explicitSelection
+): Result<Set<Int>> {
+    return try {
+        if (explicitSelection != null) {
+            Result.success(explicitSelection
             .filter { index -> frames.any { it.index == index && it.file.isFile && it.file.length() > 0L } }
-            .toSet()
-    }
-
-    val persisted = persistedIncludedFrameIndices(job)
-        .filter { index -> frames.any { it.index == index && it.file.isFile && it.file.length() > 0L } }
-        .toSet()
-    if (persisted.isNotEmpty()) return@runCatching persisted
-
-    val recommendation = RuleBasedFrameSelectionAdvisor().recommend(null, frames)
-    val recommended = recommendation.includedFrameIndices
-        .filter { index -> frames.any { it.index == index && it.file.isFile && it.file.length() > 0L } }
-        .toSet()
-    if (recommended.size >= requiredSelectedFrameCount(kind, job)) {
-        recommended
-    } else {
-        frames.filter { it.file.isFile && it.file.length() > 0L }
-            .sortedByDescending { it.quality?.overallScore ?: 0.5f }
-            .take(requiredSelectedFrameCount(kind, job))
-            .map { it.index }
-            .toSet()
+            .toSet())
+        } else {
+            val persisted = persistedIncludedFrameIndices(job)
+                .filter { index -> frames.any { it.index == index && it.file.isFile && it.file.length() > 0L } }
+                .toSet()
+            if (persisted.isNotEmpty()) {
+                Result.success(persisted)
+            } else {
+                val recommendation = RuleBasedFrameSelectionAdvisor().recommend(null, frames)
+                val recommended = recommendation.includedFrameIndices
+                    .filter { index -> frames.any { it.index == index && it.file.isFile && it.file.length() > 0L } }
+                    .toSet()
+                if (recommended.size >= requiredSelectedFrameCount(kind, job)) {
+                    Result.success(recommended)
+                } else {
+                    Result.success(frames.filter { it.file.isFile && it.file.length() > 0L }
+                        .sortedByDescending { it.quality?.overallScore ?: 0.5f }
+                        .take(requiredSelectedFrameCount(kind, job))
+                        .map { it.index }
+                        .toSet())
+                }
+            }
+        }
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (fatal: Error) {
+        throw fatal
+    } catch (failure: Exception) {
+        Result.failure(failure)
     }
 }
 

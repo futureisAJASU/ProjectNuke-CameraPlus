@@ -7,6 +7,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CancellationException
 
 data class KeplerFrameReviewItem(
     val index: Int,
@@ -143,7 +144,7 @@ class AiFrameSelectionAdvisor(
 fun loadFrameReviewItems(
     context: Context,
     jobDir: File
-): Result<List<KeplerFrameReviewItem>> = runCatching {
+): Result<List<KeplerFrameReviewItem>> = try {
     val target = requireReprocessSafeJobDirectory(context, jobDir)
     val job = loadJobJsonSafe(target)
     val kind = detectJobKind(target, job)
@@ -159,14 +160,20 @@ fun loadFrameReviewItems(
     } else {
         reviewItemsFromFiles(target, kind, persistedIncluded, savedSelectionFrames, persistedMode)
     }
-    items.sortedBy { it.index }
+    Result.success(items.sortedBy { it.index })
+} catch (ce: CancellationException) {
+    throw ce
+} catch (fatal: Error) {
+    throw fatal
+} catch (failure: Exception) {
+    Result.failure(failure)
 }
 
 fun saveFrameSelection(
     jobDir: File,
     mode: FrameSelectionMode,
     frames: List<KeplerFrameReviewItem>
-): Result<Unit> = runCatching {
+): Result<Unit> = try {
     // External mutation: acquire own operation lease, reject unresolved transactions
     val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
         jobDir,
@@ -177,6 +184,13 @@ fun saveFrameSelection(
     } finally {
         lease.release()
     }
+    Result.success(Unit)
+} catch (ce: CancellationException) {
+    throw ce
+} catch (fatal: Error) {
+    throw fatal
+} catch (failure: Exception) {
+    Result.failure(failure)
 }
 
 /** Internal mutation path for reprocess transaction owner. Does NOT check quarantine;
@@ -186,11 +200,18 @@ internal fun saveFrameSelectionInternal(
     mode: FrameSelectionMode,
     frames: List<KeplerFrameReviewItem>,
     operationLease: JobOperationLease
-): Result<Unit> = runCatching {
+): Result<Unit> = try {
     check(KeplerJobMetadata.isOperationOwner(jobDir, operationLease)) {
         "Reprocess operation lease is not the current owner."
     }
     writeFrameSelection(jobDir, mode, frames)
+    Result.success(Unit)
+} catch (ce: CancellationException) {
+    throw ce
+} catch (fatal: Error) {
+    throw fatal
+} catch (failure: Exception) {
+    Result.failure(failure)
 }
 
 /**
@@ -251,8 +272,13 @@ internal fun persistedIncludedFrameIndices(job: JSONObject): Set<Int> =
         repeat(array.length()) { index -> add(array.optInt(index, Int.MIN_VALUE)) }
     }.filter { it != Int.MIN_VALUE }.toSet()
 
-internal fun persistedFrameSelectionMode(job: JSONObject): FrameSelectionMode? =
-    runCatching { FrameSelectionMode.valueOf(job.optString("frameSelectionMode")) }.getOrNull()
+internal fun persistedFrameSelectionMode(job: JSONObject): FrameSelectionMode? = try {
+    FrameSelectionMode.valueOf(job.optString("frameSelectionMode"))
+} catch (failure: Error) {
+    throw failure
+} catch (_: Exception) {
+    null
+}
 
 internal fun applyFrameSelectionToItems(
     frames: List<KeplerFrameReviewItem>,
@@ -400,7 +426,13 @@ private fun parseUserDecision(
     mode: FrameSelectionMode?,
     included: Boolean
 ): FrameUserDecision {
-    val parsed = runCatching { FrameUserDecision.valueOf(raw.orEmpty()) }.getOrNull()
+    val parsed = try {
+        FrameUserDecision.valueOf(raw.orEmpty())
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        null
+    }
     if (parsed != null) return parsed
     return when {
         mode == FrameSelectionMode.MANUAL && included -> FrameUserDecision.INCLUDE
