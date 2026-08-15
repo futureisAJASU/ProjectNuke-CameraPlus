@@ -73,6 +73,7 @@ internal fun processSingleFrameJobSync(
     var processedForCleanup: Bitmap? = null
     var outputFile: File? = null
     var committedFinalClaimed = false
+    var primaryFailure: Throwable? = null
     try {
         val frames = job.optJSONArray("frames")
             ?: error("Single-frame job has no frames array")
@@ -146,20 +147,26 @@ internal fun processSingleFrameJobSync(
         onStatus("일반 사진 후처리가 완료되었습니다.")
         return completedOutput
     } catch (ce: CancellationException) {
+        primaryFailure = ce
         if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
             val settlement = if (committedFinalClaimed) SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
             else SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
-            persistSingleFrameCancellation(
-                jobDir = jobDir,
-                params = params,
-                processingStartedAt = processingStartedAt,
-                settlement = settlement,
-                cancellation = ce,
-                attempt = processingAttempt
-            )
+            try {
+                persistSingleFrameCancellation(
+                    jobDir = jobDir,
+                    params = params,
+                    processingStartedAt = processingStartedAt,
+                    settlement = settlement,
+                    cancellation = ce,
+                    attempt = processingAttempt
+                )
+            } catch (metadataFailure: Throwable) {
+                throw requireNotNull(combineSettlementFailure(ce, metadataFailure))
+            }
         }
         throw ce
     } catch (oom: OutOfMemoryError) {
+        primaryFailure = oom
         val settlement = if (committedFinalClaimed) {
             SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
         } else if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
@@ -167,55 +174,84 @@ internal fun processSingleFrameJobSync(
         } else {
             SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
         }
-        persistSingleFrameFailure(
-            jobDir,
-            params,
-            processingStartedAt,
-            metadataPolicy,
-            oom,
-            settlement,
-            processingAttempt
-        )
+        try {
+            persistSingleFrameFailure(
+                jobDir,
+                params,
+                processingStartedAt,
+                metadataPolicy,
+                oom,
+                settlement,
+                processingAttempt
+            )
+        } catch (metadataFailure: Throwable) {
+            throw requireNotNull(combineSettlementFailure(oom, metadataFailure))
+        }
         throw oom
     } catch (fatal: Error) {
+        primaryFailure = fatal
         val settlement = if (committedFinalClaimed) {
             SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
         } else {
             SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
         }
-        persistSingleFrameFailure(
-            jobDir,
-            params,
-            processingStartedAt,
-            metadataPolicy,
-            fatal,
-            settlement,
-            processingAttempt
-        )
+        try {
+            persistSingleFrameFailure(
+                jobDir,
+                params,
+                processingStartedAt,
+                metadataPolicy,
+                fatal,
+                settlement,
+                processingAttempt
+            )
+        } catch (metadataFailure: Throwable) {
+            throw requireNotNull(combineSettlementFailure(fatal, metadataFailure))
+        }
         throw fatal
     } catch (e: Exception) {
+        primaryFailure = e
         val settlement = if (metadataPolicy == ReprocessMetadataPolicy.NORMAL) {
             if (committedFinalClaimed) SingleFrameCleanupResult.COMMITTED_FINAL_RETAINED
             else SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
         } else {
             SingleFrameCleanupResult.NO_PREVIOUS_OUTPUT
         }
-        persistSingleFrameFailure(
-            jobDir,
-            params,
-            processingStartedAt,
-            metadataPolicy,
-            e,
-            settlement,
-            processingAttempt
-        )
+        try {
+            persistSingleFrameFailure(
+                jobDir,
+                params,
+                processingStartedAt,
+                metadataPolicy,
+                e,
+                settlement,
+                processingAttempt
+            )
+        } catch (metadataFailure: Throwable) {
+            throw requireNotNull(combineSettlementFailure(e, metadataFailure))
+        }
         throw e
     } finally {
-        processedForCleanup?.takeIf { !it.isRecycled }?.recycle()
-        sourceForCleanup
-            ?.takeIf { it !== processedForCleanup && !it.isRecycled }
-            ?.recycle()
-        processingAttempt.releaseOwnedLease()
+        var cleanupFailure: Throwable? = null
+        try {
+            processedForCleanup?.takeIf { !it.isRecycled }?.recycle()
+        } catch (failure: Throwable) {
+            cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+        }
+        try {
+            sourceForCleanup
+                ?.takeIf { it !== processedForCleanup && !it.isRecycled }
+                ?.recycle()
+        } catch (failure: Throwable) {
+            cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+        }
+        try {
+            processingAttempt.releaseOwnedLease()
+        } catch (failure: Throwable) {
+            cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+        }
+        val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+        if (combined !== primaryFailure) throw requireNotNull(combined)
     }
 }
 private fun resolveSingleFrameSourceFile(jobDir: File, rawName: String): File {

@@ -179,10 +179,21 @@ fun saveFrameSelection(
         jobDir,
         JobRecoveryMutationIntent.FRAME_SELECTION
     )
+    var primaryFailure: Throwable? = null
     try {
         writeFrameSelection(jobDir, mode, frames)
+    } catch (failure: Throwable) {
+        primaryFailure = failure
+        throw failure
     } finally {
-        lease.release()
+        var cleanupFailure: Throwable? = null
+        try {
+            lease.release()
+        } catch (failure: Throwable) {
+            cleanupFailure = failure
+        }
+        val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+        if (combined !== primaryFailure) throw requireNotNull(combined)
     }
     Result.success(Unit)
 } catch (ce: CancellationException) {

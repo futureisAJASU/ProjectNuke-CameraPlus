@@ -153,19 +153,38 @@ class BitmapTileSink(
 
     override fun finish(): File {
         val output = bitmap ?: error("Tile sink not started.")
-        return try {
+        var primaryFailure: Throwable? = null
+        try {
             saveJpeg(output, outputFile, quality, processingAttempt = processingAttempt, claimKey = "superResolutionOutputFile")
-            outputFile
-        } finally {
-            output.recycle()
-            bitmap = null
+        } catch (failure: Throwable) {
+            primaryFailure = failure
         }
+        var cleanupFailure: Throwable? = null
+        try {
+            output.recycle()
+        } catch (failure: Throwable) {
+            cleanupFailure = failure
+        }
+        bitmap = null
+        throwIfFailure(combineSettlementFailure(primaryFailure, cleanupFailure))
+        return outputFile
     }
 
     override fun abort() {
-        bitmap?.recycle()
+        val current = bitmap ?: return
+        var cleanupFailure: Throwable? = null
+        try {
+            current.recycle()
+        } catch (failure: Throwable) {
+            cleanupFailure = failure
+        }
         bitmap = null
+        throwIfFailure(cleanupFailure)
     }
+}
+
+private fun throwIfFailure(failure: Throwable?) {
+    if (failure != null) throw failure
 }
 
 /** Scanline PNG sink used when a full-resolution Bitmap would exceed the heap plan. */
@@ -286,20 +305,30 @@ internal class StreamingPngTileSink(
             state = State.COMMITTED
             outputFile
         } catch (failure: Throwable) {
-            cleanupRecords += listOfNotNull(settleTemporary())
-            settleStreams()
+            var cleanupFailure: Throwable? = null
+            try {
+                cleanupRecords += listOfNotNull(settleTemporary())
+            } catch (secondary: Throwable) {
+                cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
+            }
+            try {
+                settleStreams()
+            } catch (secondary: Throwable) {
+                cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
+            }
             try {
                 encoder.end()
                 resourceSettlementRecords += ProcessingResourceSettlementRecord("DEFLATER", "ENDED")
-            } catch (failure: Error) {
-                throw failure
-            } catch (failure: Exception) {
-                resourceSettlementRecords += ProcessingResourceSettlementRecord("DEFLATER", "END_FAILED", failure)
+            } catch (secondary: Throwable) {
+                cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
+                if (secondary !is Error) {
+                    resourceSettlementRecords += ProcessingResourceSettlementRecord("DEFLATER", "END_FAILED", secondary)
+                }
             }
             deflater = null
-            temporary = null
+            if (cleanupFailure == null) temporary = null
             state = State.FAILED
-            throw failure
+            throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
         }
     }
 
@@ -307,26 +336,32 @@ internal class StreamingPngTileSink(
         if (state == State.COMMITTED || state == State.ABORTED) return
         check(state == State.WRITING || state == State.FAILED) { "PNG sink abort in state=$state" }
         state = State.ABORTING
-        settleStreams()
-        val deflaterFailure = try {
+        var cleanupFailure: Throwable? = null
+        try {
+            settleStreams()
+        } catch (failure: Throwable) {
+            cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+        }
+        try {
             deflater?.end()
-            null
-        } catch (failure: Error) {
-            throw failure
-        } catch (failure: Exception) {
-            failure
+            resourceSettlementRecords += ProcessingResourceSettlementRecord("DEFLATER", "ENDED")
+        } catch (failure: Throwable) {
+            cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+            if (failure !is Error) {
+                resourceSettlementRecords += ProcessingResourceSettlementRecord("DEFLATER", "END_FAILED", failure)
+            }
         }
-        resourceSettlementRecords += if (deflaterFailure == null) {
-            ProcessingResourceSettlementRecord("DEFLATER", "ENDED")
-        } else {
-            ProcessingResourceSettlementRecord("DEFLATER", "END_FAILED", deflaterFailure)
+        try {
+            cleanupRecords += listOfNotNull(settleTemporary())
+        } catch (failure: Throwable) {
+            cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
         }
-        cleanupRecords += listOfNotNull(settleTemporary())
         stream = null
         rawOutput = null
         deflater = null
-        temporary = null
+        if (cleanupFailure == null) temporary = null
         state = State.ABORTED
+        cleanupFailure?.let { throw it }
     }
 
     internal fun settlementRecords(): List<ProcessingArtifactSettlementRecord> = cleanupRecords.toList()
@@ -692,6 +727,7 @@ fun captureProcessExportSuperResolutionFusion(
                 var outputDirForSettlement: File? = null
                 var exportSettlementAttempted = false
                 var exportSettlementSucceeded = false
+                var primaryFailure: Throwable? = null
                 fun settleInterruptedExportForTerminal(
                     jobDir: File,
                     lease: JobOperationLease,
@@ -773,20 +809,21 @@ fun captureProcessExportSuperResolutionFusion(
                     }MP_${
                         SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                     }"
-                    val export = try {
-                        cancellation.throwIfCancelled()
-                        exportNightFusionBitmapToGallery(
-                            context = context,
-                            bitmap = bitmap,
-                            displayNameBase = displayName,
-                            requestedFormat = requestedFormat,
-                            cancellation = cancellation,
-                            jobDir = outputDir,
-                            ownerLease = outputLease
-                        )
-                    } finally {
-                        bitmap.recycle()
-                    }
+                    val export = withSettlementPrecedence(
+                        block = {
+                            cancellation.throwIfCancelled()
+                            exportNightFusionBitmapToGallery(
+                                context = context,
+                                bitmap = bitmap,
+                                displayNameBase = displayName,
+                                requestedFormat = requestedFormat,
+                                cancellation = cancellation,
+                                jobDir = outputDir,
+                                ownerLease = outputLease
+                            )
+                        },
+                        cleanup = { bitmap.recycle() }
+                    )
                     if (!export.success || export.uriString.isNullOrBlank()) {
                         updateExportFailure(
                             jobDir = outputDir,
@@ -794,7 +831,8 @@ fun captureProcessExportSuperResolutionFusion(
                             finalOutputFormat = finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
                             export = export,
-                            requiredOutputCommitted = requiredOutputCommitted
+                            requiredOutputCommitted = requiredOutputCommitted,
+                            operationLease = outputLease
                         )
                         post("PIPELINE_FAILED: 24M Fusion export failed. ${export.errorMessage}")
                         val currentPublicCommit = export.success && !export.uriString.isNullOrBlank()
@@ -833,7 +871,8 @@ fun captureProcessExportSuperResolutionFusion(
                             finalOutputFormat = finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
                             ,export = export,
-                            requiredOutputCommitted = requiredOutputCommitted
+                            requiredOutputCommitted = requiredOutputCommitted,
+                            operationLease = outputLease
                         )
                         post("PIPELINE_FAILED: 24M Fusion export verification failed.")
                         terminal.publish(
@@ -877,15 +916,27 @@ fun captureProcessExportSuperResolutionFusion(
                         verified = true,
                         message = "24M Fusion export complete."
                     )
-                } catch (_: CancellationException) {
-                    requiredOutputCommitted = requiredOutputCommitted || outputDirForSettlement?.let { dir ->
-                        currentProcessingAttemptHasRequiredOutputClaimForLease(dir, outputLease)
-                    } == true
+                } catch (cancelled: CancellationException) {
+                    primaryFailure = cancelled
+                    try {
+                        requiredOutputCommitted = requiredOutputCommitted || outputDirForSettlement?.let { dir ->
+                            currentProcessingAttemptHasRequiredOutputClaimForLease(dir, outputLease)
+                        } == true
+                    } catch (failure: Throwable) {
+                        primaryFailure = combineSettlementFailure(primaryFailure, failure)
+                        if (primaryFailure is Error) throw primaryFailure!!
+                    }
                     post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
-                    val evidence = outputLease?.let { lease ->
-                        outputDirForSettlement?.let { dir ->
-                            settleInterruptedExportForTerminal(dir, lease, PublicExportInterruptionDisposition.CANCELLED)
+                    val evidence = try {
+                        outputLease?.let { lease ->
+                            outputDirForSettlement?.let { dir ->
+                                settleInterruptedExportForTerminal(dir, lease, PublicExportInterruptionDisposition.CANCELLED)
+                            }
                         }
+                    } catch (failure: Throwable) {
+                        primaryFailure = combineSettlementFailure(primaryFailure, failure)
+                        if (primaryFailure is Error) throw primaryFailure!!
+                        null
                     }
                     terminal.publish(
                         publicExportInterruptionTerminalKind(
@@ -900,17 +951,33 @@ fun captureProcessExportSuperResolutionFusion(
                         message = "24M Fusion cancellation settled."
                     )
                 } catch (error: Exception) {
-                    requiredOutputCommitted = requiredOutputCommitted || outputDirForSettlement?.let { dir ->
-                        currentProcessingAttemptHasRequiredOutputClaimForLease(dir, outputLease)
-                    } == true
+                    primaryFailure = error
+                    try {
+                        requiredOutputCommitted = requiredOutputCommitted || outputDirForSettlement?.let { dir ->
+                            currentProcessingAttemptHasRequiredOutputClaimForLease(dir, outputLease)
+                        } == true
+                    } catch (failure: Throwable) {
+                        primaryFailure = combineSettlementFailure(primaryFailure, failure)
+                        if (primaryFailure is Error || primaryFailure is CancellationException) {
+                            throw primaryFailure!!
+                        }
+                    }
                     post(
                         "PIPELINE_FAILED: 24M Fusion failed. " +
                             "${error.javaClass.simpleName}: ${error.message}"
                     )
-                    val evidence = outputLease?.let { lease ->
-                        outputDirForSettlement?.let { dir ->
-                            settleInterruptedExportForTerminal(dir, lease, PublicExportInterruptionDisposition.FAILED)
+                    val evidence = try {
+                        outputLease?.let { lease ->
+                            outputDirForSettlement?.let { dir ->
+                                settleInterruptedExportForTerminal(dir, lease, PublicExportInterruptionDisposition.FAILED)
+                            }
                         }
+                    } catch (failure: Throwable) {
+                        primaryFailure = combineSettlementFailure(primaryFailure, failure)
+                        if (primaryFailure is Error || primaryFailure is CancellationException) {
+                            throw primaryFailure!!
+                        }
+                        null
                     }
                     terminal.publish(
                         publicExportInterruptionTerminalKind(
@@ -924,7 +991,11 @@ fun captureProcessExportSuperResolutionFusion(
                         verified = evidence?.verified ?: verified,
                         message = error.message
                     )
+                } catch (fatal: Error) {
+                    primaryFailure = fatal
+                    throw fatal
                 } finally {
+                    var cleanupFailure: Throwable? = null
                     outputLease?.let { lease ->
                         val settlementDir = outputDirForSettlement
                         if (settlementDir == null) return@let
@@ -939,24 +1010,33 @@ fun captureProcessExportSuperResolutionFusion(
                                     disposition = PublicExportInterruptionDisposition.FAILED
                                 )
                                 if (settled) exportSettlementSucceeded = true
-                            } catch (failure: Error) {
-                                throw failure
-                            } catch (settlementFailure: Exception) {
+                            } catch (settlementFailure: Throwable) {
+                                cleanupFailure = combineSettlementFailure(cleanupFailure, settlementFailure)
                                 Log.e("KeplerSuperResolution", "public export owner settlement failed", settlementFailure)
                             }
                         }
-                        if (exportSettlementSucceeded) {
-                            if (!lease.releaseIfProcessingSettled()) {
-                                Log.e(
-                                    "KeplerSuperResolution",
-                                    "retaining processing lease after durable attempt settlement failure"
-                                )
+                        try {
+                            if (exportSettlementSucceeded) {
+                                if (!lease.releaseIfProcessingSettled()) {
+                                    Log.e(
+                                        "KeplerSuperResolution",
+                                        "retaining processing lease after durable attempt settlement failure"
+                                    )
+                                }
+                            } else {
+                                Log.e("KeplerSuperResolution", "retaining public export lease after settlement failure")
                             }
-                        } else {
-                            Log.e("KeplerSuperResolution", "retaining public export lease after settlement failure")
+                        } catch (failure: Throwable) {
+                            cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
                         }
                     }
-                    workerThread.quitSafely()
+                    try {
+                        workerThread.quitSafely()
+                    } catch (failure: Throwable) {
+                        cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+                    }
+                    val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+                    if (combined !== primaryFailure) throw requireNotNull(combined)
                 }
             } } catch (failure: Error) {
                 throw failure

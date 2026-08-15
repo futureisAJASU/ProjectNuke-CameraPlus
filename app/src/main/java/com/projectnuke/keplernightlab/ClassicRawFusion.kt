@@ -119,10 +119,14 @@ internal fun runClassicRawFusionMerge(
     )
     job.put("processingAttemptId", processingAttempt.id)
     fun persistPostFailure(failure: Throwable, status: String) {
-        val currentClaimed = currentProcessingAttemptHasRequiredOutputClaim(
-            jobDir,
-            expectedAttemptId = processingAttempt.id
-        )
+        val currentClaimed = try {
+            currentProcessingAttemptHasRequiredOutputClaim(
+                jobDir,
+                expectedAttemptId = processingAttempt.id
+            )
+        } catch (claimFailure: Throwable) {
+            throw requireNotNull(combineSettlementFailure(failure, claimFailure))
+        }
         try {
             updateForProcessingAttempt(jobDir, processingAttempt) { current ->
                 current.put("processStatus", if (currentClaimed) "PIPELINE_COMPLETE_PARTIAL" else status)
@@ -146,6 +150,7 @@ internal fun runClassicRawFusionMerge(
             if (failure is Error) throw failure
         }
     }
+    var primaryFailure: Throwable? = null
     return try {
         cancellation.throwIfCancelled()
         onStatus("Classic RAW fusion: loading frames...")
@@ -408,20 +413,48 @@ internal fun runClassicRawFusionMerge(
             ,outputCommitted = true
         )
     } catch (ce: CancellationException) {
-        persistPostFailure(ce, "CANCELLED")
+        primaryFailure = ce
+        try {
+            persistPostFailure(ce, "CANCELLED")
+        } catch (secondary: Throwable) {
+            primaryFailure = requireNotNull(combineSettlementFailure(ce, secondary))
+            throw primaryFailure!!
+        }
         throw ce
     } catch (oom: OutOfMemoryError) {
-        persistPostFailure(oom, "OOM_FAILED_KEEPING_CACHE")
+        primaryFailure = oom
+        try {
+            persistPostFailure(oom, "OOM_FAILED_KEEPING_CACHE")
+        } catch (secondary: Throwable) {
+            primaryFailure = requireNotNull(combineSettlementFailure(oom, secondary))
+            throw primaryFailure!!
+        }
         throw oom
     } catch (fatal: Error) {
-        persistPostFailure(fatal, "FATAL_FAILED_KEEPING_CACHE")
+        primaryFailure = fatal
+        try {
+            persistPostFailure(fatal, "FATAL_FAILED_KEEPING_CACHE")
+        } catch (secondary: Throwable) {
+            primaryFailure = requireNotNull(combineSettlementFailure(fatal, secondary))
+            throw primaryFailure!!
+        }
         throw fatal
     } catch (e: Exception) {
-        persistPostFailure(e, "CLASSIC_RAW_FUSION_FAILED_KEEPING_CACHE")
-        val currentClaimed = currentProcessingAttemptHasRequiredOutputClaim(
-            jobDir,
-            expectedAttemptId = processingAttempt.id
-        )
+        primaryFailure = e
+        try {
+            persistPostFailure(e, "CLASSIC_RAW_FUSION_FAILED_KEEPING_CACHE")
+        } catch (secondary: Throwable) {
+            primaryFailure = requireNotNull(combineSettlementFailure(e, secondary))
+            throw primaryFailure!!
+        }
+        val currentClaimed = try {
+            currentProcessingAttemptHasRequiredOutputClaim(
+                jobDir,
+                expectedAttemptId = processingAttempt.id
+            )
+        } catch (failure: Throwable) {
+            throw requireNotNull(combineSettlementFailure(e, failure))
+        }
         job.put("processStatus", if (currentClaimed) "PIPELINE_COMPLETE_PARTIAL" else "CLASSIC_RAW_FUSION_FAILED_KEEPING_CACHE")
             .put("rawFusionEngine", "classic_raw_v1")
             .put("processError", "${e.javaClass.simpleName}: ${e.message}")
@@ -439,7 +472,14 @@ internal fun runClassicRawFusionMerge(
             outputCommitted = currentClaimed
         )
     } finally {
-        processingAttempt.releaseOwnedLease()
+        var cleanupFailure: Throwable? = null
+        try {
+            processingAttempt.releaseOwnedLease()
+        } catch (failure: Throwable) {
+            cleanupFailure = failure
+        }
+        val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+        if (combined !== primaryFailure) throw requireNotNull(combined)
     }
 }
 
@@ -769,7 +809,8 @@ private fun mergeClassicRawTiles(
         descriptorCleanupFailures = settleVerifiedRawInputHandles(
             frameInputs.entries.map { entry ->
                 "frameIndex=${entry.key.position},file=${entry.key.input.file.name}" to entry.value
-            }
+            },
+            primaryFailure = primaryFailure
         )
         if (descriptorCleanupFailures.isNotEmpty()) {
             onStatus("Classic RAW input descriptor cleanup failed: ${descriptorCleanupFailures.size} handle(s)")
@@ -784,17 +825,29 @@ private fun mergeClassicRawTiles(
 }
 
 internal fun settleVerifiedRawInputHandles(
-    handles: Iterable<Pair<String, VerifiedRandomAccessHandle>>
-): List<ProcessingResourceSettlementRecord> = handles.mapNotNull { (identity, handle) ->
-    handle.close()?.let { failure ->
-        ProcessingResourceSettlementRecord(
-            resource = "VERIFIED_RAW_INPUT_HANDLE",
-            status = "CLOSE_FAILED",
-            failure = failure,
-            identity = identity,
-            operation = "CLOSE"
-        )
+    handles: Iterable<Pair<String, VerifiedRandomAccessHandle>>,
+    primaryFailure: Throwable? = null
+): List<ProcessingResourceSettlementRecord> {
+    val records = ArrayList<ProcessingResourceSettlementRecord>()
+    var cleanupFailure: Throwable? = null
+    handles.forEach { (identity, handle) ->
+        try {
+            handle.close()?.let { failure ->
+                records += ProcessingResourceSettlementRecord(
+                    resource = "VERIFIED_RAW_INPUT_HANDLE",
+                    status = "CLOSE_FAILED",
+                    failure = failure,
+                    identity = identity,
+                    operation = "CLOSE"
+                )
+            }
+        } catch (failure: Throwable) {
+            cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+        }
     }
+    val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+    if (combined !== primaryFailure) throw requireNotNull(combined)
+    return records
 }
 
 private fun recordRawDescriptorCleanupFailures(

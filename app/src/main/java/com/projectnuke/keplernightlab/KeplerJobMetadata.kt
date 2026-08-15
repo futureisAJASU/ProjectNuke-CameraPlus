@@ -639,13 +639,27 @@ object KeplerJobMetadata {
             if (matched) ownerLease?.clearDurableOperation(operationId)
             matched
         } catch (failure: Error) {
-            ownerLease?.markDurableSettlementPending(operationId)
-            throw failure
-        } catch (_: Exception) {
-            if (ownerLease != null && isOperationOwner(jobDir, ownerLease) &&
-                isCurrentActiveOperation(jobDir, operationId)
-            ) {
-                ownerLease.markDurableSettlementPending(operationId)
+            var cleanupFailure: Throwable? = null
+            try {
+                ownerLease?.markDurableSettlementPending(operationId)
+            } catch (secondary: Throwable) {
+                cleanupFailure = secondary
+            }
+            throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
+        } catch (failure: Exception) {
+            var cleanupFailure: Throwable? = null
+            try {
+                if (ownerLease != null && isOperationOwner(jobDir, ownerLease) &&
+                    isCurrentActiveOperation(jobDir, operationId)
+                ) {
+                    ownerLease.markDurableSettlementPending(operationId)
+                }
+            } catch (secondary: Throwable) {
+                cleanupFailure = secondary
+            }
+            val combined = combineSettlementFailure(failure, cleanupFailure)
+            if (combined is Error || combined is java.util.concurrent.CancellationException) {
+                throw combined
             }
             false
         }

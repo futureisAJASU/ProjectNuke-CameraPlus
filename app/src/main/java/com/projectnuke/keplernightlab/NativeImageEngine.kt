@@ -115,8 +115,13 @@ object NativeImageEngine {
             }
             return result
         } catch (t: Throwable) {
-            result?.recycle()
-            throw t
+            var cleanupFailure: Throwable? = null
+            try {
+                result?.recycle()
+            } catch (secondary: Throwable) {
+                cleanupFailure = secondary
+            }
+            throw requireNotNull(combineSettlementFailure(t, cleanupFailure))
         }
     }
 

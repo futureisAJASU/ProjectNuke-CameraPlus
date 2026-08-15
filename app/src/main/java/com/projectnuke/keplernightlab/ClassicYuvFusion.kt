@@ -154,6 +154,7 @@ internal fun processClassicYuvFusionJob(
     var fallbackAlignmentCount = 0
     var lowConfidenceAlignmentCount = 0
     var excludedFrameCount = 0
+    var primaryFailure: Throwable? = null
     try {
         fun markStage(stage: String, status: String) {
             job.put("currentPipelineStage", stage)
@@ -512,6 +513,8 @@ internal fun processClassicYuvFusionJob(
         onStatus("처리가 완료되었습니다.")
         return finalFile
 } catch (oom: OutOfMemoryError) {
+        primaryFailure = oom
+        try {
         val failurePreflight = preflight ?: buildClassicYuvProcessingPreflight(jobDir, job)
         val excludedFrameCount = countExcludedFrames(job)
         val usedFrameCount = if (compatibleFrameCountKnown) compatibleFrameCount else null
@@ -564,8 +567,13 @@ internal fun processClassicYuvFusionJob(
             yuvHeight = dimensions?.second,
             attempt = processingAttempt
         )
+        } catch (secondary: Throwable) {
+            throw requireNotNull(combineSettlementFailure(oom, secondary))
+        }
         throw oom
 } catch (ce: CancellationException) {
+        primaryFailure = ce
+        try {
         val failurePreflight = preflight ?: buildClassicYuvProcessingPreflight(jobDir, job)
         recordClassicFailure(
             jobFile = jobFile,
@@ -608,8 +616,13 @@ internal fun processClassicYuvFusionJob(
             yuvHeight = dimensions?.second,
             attempt = processingAttempt
         )
+        } catch (secondary: Throwable) {
+            throw requireNotNull(combineSettlementFailure(ce, secondary))
+        }
         throw ce
-    } catch (fatal: Error) {
+} catch (fatal: Error) {
+        primaryFailure = fatal
+        try {
         val failurePreflight = preflight ?: buildClassicYuvProcessingPreflight(jobDir, job)
         recordClassicFailure(
             jobFile = jobFile,
@@ -636,8 +649,13 @@ internal fun processClassicYuvFusionJob(
             referenceFrameIndex = activeReferenceIndex ?: referenceIndex,
             attempt = processingAttempt
         )
+        } catch (secondary: Throwable) {
+            throw requireNotNull(combineSettlementFailure(fatal, secondary))
+        }
         throw fatal
-    } catch (e: Exception) {
+} catch (e: Exception) {
+        primaryFailure = e
+        try {
         val failurePreflight = preflight ?: buildClassicYuvProcessingPreflight(jobDir, job)
         val excludedFrameCount = countExcludedFrames(job)
         val usedFrameCount = if (compatibleFrameCountKnown) compatibleFrameCount else null
@@ -690,11 +708,29 @@ internal fun processClassicYuvFusionJob(
             yuvHeight = dimensions?.second,
             attempt = processingAttempt
         )
+        } catch (secondary: Throwable) {
+            throw requireNotNull(combineSettlementFailure(e, secondary))
+        }
         throw e
     } finally {
-        finalBitmap?.recycle()
-        merged?.recycle()
-        processingAttempt.releaseOwnedLease()
+        var cleanupFailure: Throwable? = null
+        try {
+            finalBitmap?.recycle()
+        } catch (failure: Throwable) {
+            cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+        }
+        try {
+            merged?.recycle()
+        } catch (failure: Throwable) {
+            cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+        }
+        try {
+            processingAttempt.releaseOwnedLease()
+        } catch (failure: Throwable) {
+            cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+        }
+        val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+        if (combined !== primaryFailure) throw requireNotNull(combined)
     }
 }
 
@@ -897,6 +933,7 @@ private fun mergeClassicFrames(
     var rejectedPixels = 0L
     var comparedPixels = 0L
     val reportedMergeFrames = mutableSetOf<Int>()
+    var primaryFailure: Throwable? = null
     try {
         val memoryPlan = planFusionMemory(
             FusionMemoryPlanRequest(
@@ -1054,9 +1091,27 @@ private fun mergeClassicFrames(
         }
         outputReturned = true
         return MergeResult(requireNotNull(output), rejectedPixels, comparedPixels, memoryPlan)
+    } catch (failure: Throwable) {
+        primaryFailure = failure
+        throw failure
     } finally {
-        decoders.values.forEach { it.recycle() }
-        if (!outputReturned) output?.recycle()
+        var cleanupFailure: Throwable? = null
+        decoders.values.forEach { decoder ->
+            try {
+                decoder.recycle()
+            } catch (failure: Throwable) {
+                cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+            }
+        }
+        if (!outputReturned) {
+            try {
+                output?.recycle()
+            } catch (failure: Throwable) {
+                cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+            }
+        }
+        val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+        if (combined !== primaryFailure) throw requireNotNull(combined)
     }
 }
 
@@ -1207,11 +1262,16 @@ internal fun applyClassicYuvPostProcessing(
         )
         tileTop = tileBottom
     }
-    return outputBitmap
     } catch (t: Throwable) {
-        outputBitmap.recycle()
-        throw t
+        var cleanupFailure: Throwable? = null
+        try {
+            outputBitmap.recycle()
+        } catch (secondary: Throwable) {
+            cleanupFailure = secondary
+        }
+        throw requireNotNull(combineSettlementFailure(t, cleanupFailure))
     }
+    return outputBitmap
 }
 
 internal fun isIdentityProcessing(params: ClassicYuvFusionParams): Boolean =
@@ -1866,6 +1926,8 @@ private fun recordClassicFailure(
                 throw metadataFailure
             }
         }
+    } catch (metadataFailure: CancellationException) {
+        throw requireNotNull(combineSettlementFailure(throwable, metadataFailure))
     } catch (metadataFailure: Exception) {
         Log.e("KeplerYuvPipeline", "failure metadata persistence failed", metadataFailure)
     }

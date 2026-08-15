@@ -364,8 +364,8 @@ internal fun commitProcessingArtifact(
                     priorFinalRestored = false
                 )
             )
-            if (failure is Error || failure is java.util.concurrent.CancellationException) throw failure
             fatalAdoptedCleanupFailure?.let { throw it }
+            if (failure is Error || failure is java.util.concurrent.CancellationException) throw failure
             cancellationAdoptedCleanupFailure?.let { throw it }
             throw ProcessingArtifactException(
                 finalFile = finalFile,
@@ -376,18 +376,10 @@ internal fun commitProcessingArtifact(
                 priorBackupFile = priorBackup.takeIf { priorBackedUp && it.exists() }
             )
         }
-        var fatalRollbackFailure: Error? = null
-        var cancellationRollbackFailure: CancellationException? = null
+        var rollbackSecondaryFailure: Throwable? = null
         fun captureRollbackFailure(secondary: Throwable) {
-            if (secondary is Error && secondary !== failure) {
-                if (failure is Error) failure.addSuppressed(secondary)
-                else secondary.addSuppressed(failure)
-                if (fatalRollbackFailure == null) fatalRollbackFailure = secondary
-            } else if (secondary is CancellationException && secondary !== failure) {
-                if (failure is Error || failure is CancellationException) failure.addSuppressed(secondary)
-                else secondary.addSuppressed(failure)
-                if (cancellationRollbackFailure == null) cancellationRollbackFailure = secondary
-            }
+            if (secondary === failure) return
+            rollbackSecondaryFailure = combineSettlementFailure(rollbackSecondaryFailure, secondary)
         }
         try {
             journalTransition(ProcessingArtifactJournalState.ROLLBACK_STARTED)
@@ -500,19 +492,13 @@ internal fun commitProcessingArtifact(
                 priorFinalRestored = priorRestored
             )
         )
-        fatalRollbackFailure?.let { fatal ->
-            if (failure is Error) throw failure
-            throw fatal
-        }
-        cancellationRollbackFailure?.let { cancelled ->
-            if (failure is Error || failure is CancellationException) throw failure
-            throw cancelled
-        }
-        if (failure is Error || failure is java.util.concurrent.CancellationException) throw failure
+        val rollbackFailure = combineSettlementFailure(rollbackSecondaryFailure, cleanupFailure)
+        val combinedFailure = combineSettlementFailure(failure, rollbackFailure)
+        if (combinedFailure is Error || combinedFailure is CancellationException) throw combinedFailure
         throw ProcessingArtifactException(
             finalFile = finalFile,
             tempFile = temp,
-            cleanupFailure = cleanupFailure,
+            cleanupFailure = rollbackFailure,
             cause = failure,
             settlements = allSettlements,
             priorBackupFile = priorBackup.takeIf { priorBackedUp && it.exists() }
