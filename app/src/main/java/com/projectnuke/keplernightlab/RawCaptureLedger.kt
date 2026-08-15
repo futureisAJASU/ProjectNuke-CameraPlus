@@ -2,6 +2,7 @@ package com.projectnuke.keplernightlab
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.CancellationException
 
 /**
  * Immutable snapshot of RAW capture progress, published by the owner after every
@@ -181,6 +182,7 @@ internal class RawCaptureLedger<IMAGE, RESULT>(
             closeImage(image)
             RawImageReleaseOutcome(reason, attempted = true, succeeded = true)
         } catch (t: Throwable) {
+            if (t is CancellationException || t is Error) throw t
             RawImageReleaseOutcome(reason, attempted = true, succeeded = false, failure = t)
         }
         synchronized(lock) { imageReleaseOutcomes += outcome }

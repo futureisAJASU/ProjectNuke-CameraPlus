@@ -236,6 +236,21 @@ class RawCaptureLedgerTest {
     }
 
     @Test
+    fun fatalReleaseFailureEscapesInsteadOfBecomingLedgerCleanupDebt() {
+        val fatal = AssertionError("fatal close failed")
+        val owner = ledger(onClose = { throw fatal })
+        owner.recordImage(1L, "img-1", 10L)
+        var escaped: AssertionError? = null
+        try {
+            owner.releaseAllImages()
+        } catch (failure: AssertionError) {
+            escaped = failure
+        }
+        assertEquals(fatal, escaped)
+        assertTrue(owner.imageReleaseOutcomes().isEmpty())
+    }
+
+    @Test
     fun duplicateTimestampReplacesAndClosesPriorImage() {
         val closed = mutableListOf<String>()
         val owner = ledger(onClose = { closed += it })

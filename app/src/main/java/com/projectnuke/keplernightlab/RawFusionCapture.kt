@@ -1319,6 +1319,11 @@ fun captureRawBurstForFusion(
                                 }
                                 is RawSaveCompletion.Failed -> {
                                     disposeUnadoptedCompletion(completion)
+                                    if (completion.throwable is java.util.concurrent.CancellationException ||
+                                        completion.throwable is Error
+                                    ) {
+                                        throw completion.throwable
+                                    }
                                     ledger.value.adoptFailure(completion)
                                     finishError("CAPTURE_FAILED", completion.failureMessage)
                                 }
