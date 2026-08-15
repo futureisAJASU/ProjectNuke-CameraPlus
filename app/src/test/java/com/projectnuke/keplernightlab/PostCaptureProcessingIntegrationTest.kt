@@ -4,7 +4,6 @@ import android.graphics.Bitmap
 import java.io.File
 import java.nio.file.Files
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertThrows
@@ -87,13 +86,24 @@ class PostCaptureProcessingIntegrationTest {
                 )
             )
             val persisted = KeplerJobMetadata.read(outputDir)
-            assertFalse(result.outputFile?.isFile == true)
+            val claimedOutput = requireNotNull(result.outputFile)
+            assertTrue(claimedOutput.isFile)
+            assertEquals(
+                claimedOutput.name,
+                persisted.getString("superResolutionOutputFile")
+            )
+            assertTrue(result.outputWidth > 0)
+            assertTrue(result.outputHeight > 0)
+            assertTrue(result.actualOutputMegapixels > 0.0)
             assertEquals("PARTIAL", persisted.getString("status"))
             assertTrue(persisted.getBoolean("processingOutputCommitted"))
             assertEquals(
                 persisted.getString("processingAttemptId"),
                 persisted.getString("processingArtifactClaimAttemptId")
             )
+            val gallery = readKeplerGalleryJob(outputDir)
+            assertEquals(claimedOutput, gallery.finalPreviewFile)
+            assertTrue(finalFilesForCleanup(outputDir, persisted).contains(claimedOutput))
         } finally {
             superResolutionJobWriteFailureForTest = null
             source.recycle()

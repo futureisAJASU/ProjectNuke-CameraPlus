@@ -469,6 +469,7 @@ fun runSuperResolutionFusion(
     }
 
     var shifts = emptyList<FrameShift>()
+    var committedResult: SuperResolutionFusionResult? = null
     return try {
         val statusLabel = superResolutionStatusLabel(request)
         request.status("$statusLabel: aligning frames...")
@@ -513,7 +514,8 @@ fun runSuperResolutionFusion(
                 sourceMegapixels = sourceMegapixels,
                 targetMegapixels = resolvedTargetMegapixels,
                 reason = "Fewer than two frames passed alignment.",
-                processingAttempt = processingAttempt
+                processingAttempt = processingAttempt,
+                onClaimedResult = { committedResult = it }
             )
         }
 
@@ -532,7 +534,8 @@ fun runSuperResolutionFusion(
                 sourceMegapixels = sourceMegapixels,
                 targetMegapixels = resolvedTargetMegapixels,
                 reason = "Memory guard selected single-frame fallback.",
-                processingAttempt = processingAttempt
+                processingAttempt = processingAttempt,
+                onClaimedResult = { committedResult = it }
             )
         }
 
@@ -586,6 +589,7 @@ fun runSuperResolutionFusion(
             message = "Multi-frame tiled super-resolution completed."
         )
         markProcessingArtifactClaim(request.outputDir, processingAttempt, "superResolutionOutputFile", requireNotNull(result.outputFile))
+        committedResult = result
         writeSuperResolutionJob(request, result, "COMPLETE", null, processingAttempt)
         if (request.cancellation.isCancelled) {
             markProcessingPostCommitCancellation(request.outputDir, processingAttempt)
@@ -604,7 +608,8 @@ fun runSuperResolutionFusion(
             inputFrameCount = inputFiles.size,
             message = "${error.javaClass.simpleName}: ${error.message}",
             shifts = shifts,
-            processingAttempt = processingAttempt
+            processingAttempt = processingAttempt,
+            claimedResult = committedResult
         )
     } finally {
         processingAttempt.releaseOwnedLease()
@@ -1859,7 +1864,8 @@ private fun runSingleFrameFallback(
     sourceMegapixels: Double,
     targetMegapixels: Double,
     reason: String,
-    processingAttempt: ProcessingAttempt
+    processingAttempt: ProcessingAttempt,
+    onClaimedResult: (SuperResolutionFusionResult) -> Unit = {}
 ): SuperResolutionFusionResult {
     if (targetMegapixels > request.targetPolicy.maxSafeTargetMegapixels) {
         return failedSuperResolutionResult(
@@ -1926,6 +1932,7 @@ private fun runSingleFrameFallback(
             message = reason
         )
         markProcessingArtifactClaim(request.outputDir, processingAttempt, "superResolutionOutputFile", requireNotNull(result.outputFile))
+        onClaimedResult(result)
         val postCommitCancellation = request.cancellation.isCancelled
         writeSuperResolutionJob(request, result, "COMPLETE", reason, processingAttempt)
         if (postCommitCancellation) {
@@ -1943,7 +1950,8 @@ private fun failedSuperResolutionResult(
     inputFrameCount: Int,
     message: String,
     shifts: List<FrameShift> = emptyList(),
-    processingAttempt: ProcessingAttempt? = null
+    processingAttempt: ProcessingAttempt? = null,
+    claimedResult: SuperResolutionFusionResult? = null
 ): SuperResolutionFusionResult {
     val sourceMegapixels = detectSourceMegapixels(request.inputFrameFiles.firstOrNull())
     val targetMegapixels = if (sourceMegapixels > 0.0) {
@@ -1953,7 +1961,7 @@ private fun failedSuperResolutionResult(
             request.targetPolicy.maxExperimentalTargetMegapixels
         )
     }
-    val result = SuperResolutionFusionResult(
+    val emptyResult = SuperResolutionFusionResult(
         outputFile = null,
         outputWidth = 0,
         outputHeight = 0,
@@ -1972,6 +1980,20 @@ private fun failedSuperResolutionResult(
     val currentAttemptClaimedOutput = processingAttempt?.let { attempt ->
         currentProcessingAttemptHasRequiredOutputClaim(request.outputDir, attempt.id)
     } == true
+    val preservedResult = if (currentAttemptClaimedOutput) {
+        claimedResult ?: recoverClaimedSuperResolutionResult(
+            request = request,
+            processingAttempt = processingAttempt,
+            inputFrameCount = inputFrameCount,
+            shifts = shifts,
+            message = message,
+            sourceMegapixels = sourceMegapixels,
+            targetMegapixels = targetMegapixels
+        )
+    } else {
+        null
+    }
+    val result = preservedResult ?: emptyResult
     try {
         writeSuperResolutionJob(
             request,
@@ -1986,6 +2008,67 @@ private fun failedSuperResolutionResult(
         Log.e("KeplerSuperResolution", "failed to persist fusion terminal metadata", failure)
     }
     return result
+}
+
+/**
+ * Reconstructs only the exact current Super Resolution claim when a post-claim
+ * failure occurred before the successful in-memory result could be returned.
+ * A previous image pathname is never sufficient evidence for this fallback.
+ */
+private fun recoverClaimedSuperResolutionResult(
+    request: SuperResolutionFusionRequest,
+    processingAttempt: ProcessingAttempt?,
+    inputFrameCount: Int,
+    shifts: List<FrameShift>,
+    message: String,
+    sourceMegapixels: Double,
+    targetMegapixels: Double
+): SuperResolutionFusionResult? {
+    val attemptId = processingAttempt?.id ?: return null
+    val job = try {
+        KeplerJobMetadata.read(request.outputDir)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        return null
+    }
+    if (job.optString("processingAttemptId") != attemptId ||
+        !job.optBoolean("processingOutputCommitted", false) ||
+        job.optString("processingArtifactClaimAttemptId") != attemptId ||
+        job.optString("processingMode").uppercase() != "SUPER_RESOLUTION"
+    ) return null
+    val outputName = job.optString("superResolutionOutputFile")
+        .takeIf { it.isNotBlank() && it != "null" } ?: return null
+    val outputFile = NoFollowFileSystem.optionalDirectChildFile(request.outputDir, outputName)
+        ?.takeIf { it.isFile && it.length() > 0L } ?: return null
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(outputFile.absolutePath, bounds)
+    val outputWidth = bounds.outWidth.takeIf { it > 0 }
+        ?: job.optInt("outputWidth", 0).takeIf { it > 0 }
+        ?: 0
+    val outputHeight = bounds.outHeight.takeIf { it > 0 }
+        ?: job.optInt("outputHeight", 0).takeIf { it > 0 }
+        ?: 0
+    val actualMegapixels = if (outputWidth > 0 && outputHeight > 0) {
+        megapixels(outputWidth, outputHeight)
+    } else {
+        job.optDouble("actualOutputMegapixels", 0.0).coerceAtLeast(0.0)
+    }
+    return SuperResolutionFusionResult(
+        outputFile = outputFile,
+        outputWidth = outputWidth,
+        outputHeight = outputHeight,
+        inputFrameCount = inputFrameCount,
+        usedFrameCount = job.optInt("usedFrameCount", 0),
+        fallbackUsed = job.optBoolean("fallbackUsed", false),
+        estimatedShifts = shifts,
+        sourceMegapixels = sourceMegapixels,
+        targetMegapixels = targetMegapixels,
+        actualOutputMegapixels = actualMegapixels,
+        experimentalTarget = targetMegapixels > request.targetPolicy.maxSafeTargetMegapixels,
+        rawInputUsed = request.sourceMode == SuperResolutionSourceMode.FULLRES_50MP_RAW,
+        message = message
+    )
 }
 
 private fun writeSuperResolutionJob(
