@@ -47,6 +47,14 @@ internal data class PendingPublicExportSettlement(
     val disposition: PublicExportInterruptionDisposition
 )
 
+internal data class PendingTerminalSettlement(
+    val operationId: String,
+    val attemptStatus: String,
+    val pipelineStage: String,
+    val processStatus: String,
+    val reason: String
+)
+
 internal enum class JobRecoveryMutationGateOutcome {
     ALLOWED,
     BLOCKED_DEAD_OPERATION,
@@ -279,6 +287,33 @@ object KeplerJobMetadata {
         jobDir: File,
         lease: JobOperationLease
     ): Boolean {
+        val pendingTerminal = lease.pendingTerminalSettlement()
+        if (pendingTerminal != null) {
+            val persisted = try {
+                recordNormalPreCommitTerminal(
+                    jobDir = jobDir,
+                    attemptStatus = pendingTerminal.attemptStatus,
+                    pipelineStage = pendingTerminal.pipelineStage,
+                    processStatus = pendingTerminal.processStatus,
+                    reason = pendingTerminal.reason,
+                    operationId = pendingTerminal.operationId,
+                    operationLease = lease
+                )
+                true
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                false
+            }
+            if (!persisted) return false
+            lease.completeTerminalSettlement(pendingTerminal.operationId)
+            val cleared = clearActiveOperation(jobDir, pendingTerminal.operationId, lease)
+            if (!cleared && isCurrentActiveOperation(jobDir, pendingTerminal.operationId)) return false
+            lease.clearDurableOperation(pendingTerminal.operationId)
+            lease.completeDurableSettlement(pendingTerminal.operationId)
+            lease.release()
+            return true
+        }
         val pendingPublicExport = lease.pendingPublicExportSettlement()
         if (pendingPublicExport != null) {
             val settled = try {
@@ -636,7 +671,10 @@ object KeplerJobMetadata {
                 job.remove(ACTIVE_OPERATION_UPDATED_AT)
             }
             if (matched) releaseAutoOperation(jobDir)
-            if (matched) ownerLease?.clearDurableOperation(operationId)
+            if (matched) {
+                ownerLease?.clearDurableOperation(operationId)
+                ownerLease?.completeDurableSettlement(operationId)
+            }
             matched
         } catch (failure: Error) {
             var cleanupFailure: Throwable? = null
@@ -685,13 +723,19 @@ object KeplerJobMetadata {
     }
 
     /** Clears a current-process marker when terminal metadata has already settled its owner. */
-    internal fun clearActiveOperationKind(jobDir: File, kind: KeplerActiveOperationKind): Boolean = try {
+    internal fun clearActiveOperationKind(
+        jobDir: File,
+        kind: KeplerActiveOperationKind,
+        ownerLease: JobOperationLease? = null
+    ): Boolean = try {
         var matched = false
+        var matchedOperationId: String? = null
         update(jobDir) { job ->
             if (job.optString(ACTIVE_RUNTIME_SESSION_ID) != KeplerRuntimeSession.id ||
                 job.optString(ACTIVE_OPERATION_KIND) != kind.name
             ) return@update
             matched = true
+            matchedOperationId = job.optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }
             job.remove(ACTIVE_RUNTIME_SESSION_ID)
             job.remove(ACTIVE_OPERATION_ID)
             job.remove(ACTIVE_OPERATION_KIND)
@@ -699,10 +743,20 @@ object KeplerJobMetadata {
             job.remove(ACTIVE_OPERATION_UPDATED_AT)
         }
         if (matched) releaseAutoOperation(jobDir)
+        val exactLease = ownerLease ?: operationLeases[jobDir.toPath().toAbsolutePath().normalize().toString()]
+        matchedOperationId?.let {
+            exactLease?.clearDurableOperation(it)
+            exactLease?.completeDurableSettlement(it)
+        }
         matched
     } catch (failure: Error) {
+        ownerLease?.currentDurableOperationId()?.let { ownerLease.markDurableSettlementPending(it) }
         throw failure
     } catch (_: Exception) {
+        // This helper is used after terminal metadata/journal persistence. Keep the exact
+        // operation reachable for the next production acquisition instead of leaving a lease
+        // with no retry marker after an ordinary atomic-write failure.
+        ownerLease?.currentDurableOperationId()?.let { ownerLease.markDurableSettlementPending(it) }
         false
     }
 
@@ -947,6 +1001,8 @@ class JobOperationLease internal constructor(internal val key: String) {
     private val pendingProcessingHandoffSettlement = AtomicBoolean(false)
     private val pendingPublicExportSettlement =
         java.util.concurrent.atomic.AtomicReference<PendingPublicExportSettlement?>(null)
+    private val pendingTerminalSettlement =
+        java.util.concurrent.atomic.AtomicReference<PendingTerminalSettlement?>(null)
     private val currentDurableOperationId =
         java.util.concurrent.atomic.AtomicReference<String?>(null)
     private val currentDurableOperationKind =
@@ -959,7 +1015,7 @@ class JobOperationLease internal constructor(internal val key: String) {
     }
 
     internal fun releaseProcessingAttempt(attemptId: String): Boolean =
-        processingAttemptId.compareAndSet(attemptId, null)
+        compareAndClear(processingAttemptId, attemptId)
 
     internal fun isProcessingAttemptOwner(attemptId: String): Boolean =
         !released.get() && processingAttemptId.get() == attemptId
@@ -970,13 +1026,33 @@ class JobOperationLease internal constructor(internal val key: String) {
         pendingDurableSettlementId.compareAndSet(null, operationId)
     }
 
+    internal fun markTerminalSettlementPending(settlement: PendingTerminalSettlement) {
+        val existing = pendingTerminalSettlement.get()
+        if (existing != null) {
+            check(existing.operationId == settlement.operationId) {
+                "A different terminal settlement already owns this lease"
+            }
+            return
+        }
+        pendingTerminalSettlement.compareAndSet(null, settlement)
+        markDurableSettlementPending(settlement.operationId)
+    }
+
+    internal fun pendingTerminalSettlement(): PendingTerminalSettlement? = pendingTerminalSettlement.get()
+
+    internal fun completeTerminalSettlement(operationId: String): Boolean =
+        pendingTerminalSettlement.get()?.let { pending ->
+            if (pending.operationId != operationId) return false
+            pendingTerminalSettlement.compareAndSet(pending, null)
+        } ?: true
+
     internal fun markDurableOperation(operationId: String, kind: KeplerActiveOperationKind) {
         currentDurableOperationId.set(operationId)
         currentDurableOperationKind.set(kind)
     }
 
     internal fun clearDurableOperation(operationId: String) {
-        if (currentDurableOperationId.compareAndSet(operationId, null)) {
+        if (compareAndClear(currentDurableOperationId, operationId)) {
             currentDurableOperationKind.set(null)
         }
     }
@@ -1026,9 +1102,18 @@ class JobOperationLease internal constructor(internal val key: String) {
     internal fun pendingDurableSettlementId(): String? = pendingDurableSettlementId.get()
 
     internal fun completeDurableSettlement(operationId: String): Boolean {
-        if (!pendingDurableSettlementId.compareAndSet(operationId, null)) return false
-        processingAttemptId.compareAndSet(operationId, null)
+        if (!compareAndClear(pendingDurableSettlementId, operationId)) return false
+        compareAndClear(processingAttemptId, operationId)
         return true
+    }
+
+    /** AtomicReference CAS compares object identity; operation IDs are durable value identities. */
+    private fun compareAndClear(reference: java.util.concurrent.atomic.AtomicReference<String?>, expected: String): Boolean {
+        while (true) {
+            val current = reference.get() ?: return false
+            if (current != expected) return false
+            if (reference.compareAndSet(current, null)) return true
+        }
     }
 
     /**
@@ -1039,6 +1124,16 @@ class JobOperationLease internal constructor(internal val key: String) {
      */
     internal fun releaseIfProcessingSettled(): Boolean {
         if (pendingPublicExportSettlement.get() != null) return false
+        if (pendingTerminalSettlement.get() != null || pendingDurableSettlementId.get() != null) return false
+        // A nested PUBLIC_EXPORT (or any newer durable operation) is still owned by this lease.
+        // The wrapper must settle/clear that exact operation before releasing the top-level lease.
+        currentDurableOperationId.get()?.let {
+            // A terminal writer which could not install a more specific retry record must still
+            // leave a reachable debt marker.  Otherwise the retained lease would block the next
+            // production acquisition forever with no convergence path.
+            markDurableSettlementPending(it)
+            return false
+        }
         val attemptId = lastProcessingAttemptId.get()
         if (attemptId != null && isProcessingAttemptOwner(attemptId)) return false
         release()

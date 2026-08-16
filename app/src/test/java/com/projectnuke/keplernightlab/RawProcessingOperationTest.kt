@@ -63,14 +63,43 @@ class RawProcessingOperationTest {
             KeplerJobMetadata.write(dir, JSONObject().put("jobType", "RAW_REPROCESS"))
             val nested = acquireRawProcessingOperation(dir, outer)
             assertNotNull(nested)
+            val processingId = KeplerJobMetadata.read(dir).getString(ACTIVE_OPERATION_ID)
+            assertEquals(KeplerActiveOperationKind.PROCESSING_RAW.name,
+                KeplerJobMetadata.read(dir).getString(ACTIVE_OPERATION_KIND))
             nested!!.release()
 
             assertTrue(KeplerJobMetadata.isOperationOwner(dir, outer!!))
+            assertEquals(processingId, KeplerJobMetadata.read(dir).getString(ACTIVE_OPERATION_ID))
             val competing = KeplerJobMetadata.acquireOperation(dir)
             assertFalse("outer RAW reprocess operation was released too early", competing != null)
             competing?.release()
         } finally {
             outer!!.release()
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun rawPublicExportReassertsTheSameDurableOperationId() {
+        val dir = Files.createTempDirectory("raw-processing-public-export-id").toFile()
+        try {
+            KeplerJobMetadata.write(dir, JSONObject().put("jobType", "RAW_CAPTURE"))
+            val operation = requireNotNull(acquireRawProcessingOperation(dir))
+            val processingId = KeplerJobMetadata.read(dir).getString(ACTIVE_OPERATION_ID)
+            assertEquals(processingId, operation.lease.currentDurableOperationId())
+
+            operation.reassertActiveOperation(KeplerActiveOperationKind.PUBLIC_EXPORT)
+
+            val publicExportMetadata = KeplerJobMetadata.read(dir)
+            assertEquals(processingId, publicExportMetadata.getString(ACTIVE_OPERATION_ID))
+            assertEquals(
+                KeplerActiveOperationKind.PUBLIC_EXPORT.name,
+                publicExportMetadata.getString(ACTIVE_OPERATION_KIND)
+            )
+            assertEquals(processingId, operation.lease.currentDurableOperationId())
+            operation.release()
+            assertFalse(KeplerJobMetadata.read(dir).has(ACTIVE_OPERATION_ID))
+        } finally {
             dir.deleteRecursively()
         }
     }

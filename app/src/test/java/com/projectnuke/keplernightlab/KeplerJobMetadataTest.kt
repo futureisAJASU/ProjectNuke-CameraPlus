@@ -502,6 +502,54 @@ class KeplerJobMetadataTest {
     }
 
     @Test
+    fun leaseCannotReleaseWhileExactPublicExportOperationRemainsActive() {
+        val directory = Files.createTempDirectory("kepler-exact-public-owner-").toFile()
+        var lease: JobOperationLease? = null
+        try {
+            KeplerJobMetadata.write(directory, JSONObject().put("currentPipelineStage", "PROCESSING"))
+            lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                directory,
+                JobRecoveryMutationIntent.PROCESSING_START
+            )
+            val operationId = KeplerJobMetadata.beginActiveOperation(
+                directory,
+                operationId = "public-export-E",
+                kind = KeplerActiveOperationKind.PUBLIC_EXPORT,
+                ownerLease = lease
+            )
+
+            assertEquals("public-export-E", operationId)
+            assertEquals(operationId, lease.currentDurableOperationId())
+            assertTrue(KeplerJobMetadata.isOperationOwner(directory, lease))
+            assertFalse(lease.releaseIfProcessingSettled())
+            assertTrue(KeplerJobMetadata.isOperationOwner(directory, lease))
+
+            recordNormalPreCommitTerminal(
+                jobDir = directory,
+                attemptStatus = "FAILED",
+                pipelineStage = "FAILED",
+                processStatus = "EXPORT_FAILED_KEEPING_CACHE",
+                reason = "test terminal",
+                operationId = "processing-P",
+                operationLease = lease
+            )
+            assertEquals("public-export-E", KeplerJobMetadata.read(directory).getString(TERMINAL_OPERATION_ID))
+
+            assertTrue(KeplerJobMetadata.clearActiveOperationKind(
+                directory,
+                KeplerActiveOperationKind.PUBLIC_EXPORT,
+                lease
+            ))
+            assertEquals(null, lease.currentDurableOperationId())
+            assertTrue(lease.releaseIfProcessingSettled())
+            assertFalse(KeplerJobMetadata.isOperationActive(directory))
+        } finally {
+            lease?.release()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun ownedPublicExportSettlementPreservesVerifiedJournalBeforeLeaseRelease() {
         val directory = Files.createTempDirectory("kepler-public-export-settlement-").toFile()
         var lease: JobOperationLease? = null

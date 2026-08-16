@@ -893,7 +893,7 @@ class KeplerRecoveryCoordinatorTest {
                     priorExpectedSha256Override = expected.sha256,
                     priorSemanticVerifiedOverride = true)
             val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
-            assertEquals(KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL, report.jobs.single().classification)
+            assertEquals(KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT, report.jobs.single().classification)
             assertTrue(File(job, "result.bin").exists())
             assertEquals("", KeplerJobMetadata.read(job).optString(ACTIVE_OPERATION_ID))
         } finally { root.deleteRecursively() }

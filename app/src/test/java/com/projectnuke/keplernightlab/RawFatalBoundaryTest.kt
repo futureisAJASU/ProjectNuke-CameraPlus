@@ -147,6 +147,32 @@ class RawFatalBoundaryTest {
     }
 
     @Test
+    fun staleCommittedFlagWithoutCurrentClaimDoesNotBecomePartialCancellation() {
+        val outcome = RawFusionPublicExportOutcome.UncommittedFailure(
+            base = RawFusionProcessResult(
+                success = false,
+                mergedRawFile = File("old-merged.raw16"),
+                mergedDngFile = null,
+                previewPngFile = null,
+                finalPngFile = File("old-final.png"),
+                errorMessage = "new attempt cancelled",
+                outputCommitted = true
+            ),
+            finalOutputFormat = FinalOutputFormat.JPEG,
+            currentLocalPreview = null,
+            currentLocalOutput = null,
+            currentError = "new attempt cancelled",
+            cancellationRequested = true
+        )
+
+        assertEquals(ReprocessTerminalDisposition.CANCELLED, outcome.disposition)
+        assertEquals(
+            CameraPipelineEvent.Terminal.Kind.CANCELLED,
+            rawFusionOutcomeTerminalKind(outcome, cancellationRequested = true)
+        )
+    }
+
+    @Test
     fun verifiedWarningMapsToPartialWhileKeepingPublicResult() {
         val export = GalleryExportResult(
             success = true,
@@ -314,6 +340,67 @@ class RawFatalBoundaryTest {
             rawFusionOutcomeTerminalKind(outcome, cancellationRequested = true)
         )
         assertEquals(ReprocessTerminalDisposition.COMMITTED_PARTIAL, outcome.disposition)
+    }
+
+    @Test
+    fun committedButUnverifiedExportEvidenceIsStillAUsablePartialResult() {
+        val export = GalleryExportResult(
+            success = false,
+            uriString = "content://media/committed-unverified",
+            displayName = "committed-unverified.jpg",
+            mimeType = "image/jpeg",
+            fileSizeBytes = 1L,
+            formatUsed = OutputFormat.JPEG,
+            fallbackUsed = false,
+            errorMessage = "verification unavailable",
+            verification = GalleryExportVerification.RetryableFailure("provider unavailable"),
+            publicCommitState = GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED
+        )
+        val outcome = RawFusionPublicExportOutcome.UncommittedFailure(
+            base = RawFusionProcessResult(false, null, null, null, null, "export verification unavailable"),
+            finalOutputFormat = FinalOutputFormat.JPEG,
+            currentLocalPreview = null,
+            currentLocalOutput = null,
+            currentError = "export verification unavailable",
+            exportEvidence = export
+        )
+
+        assertTrue(outcome.committed)
+        assertEquals(ReprocessTerminalDisposition.COMMITTED_PARTIAL, outcome.disposition)
+        val policy = deriveRawFusionOutcomePolicy(outcome, cancellationRequested = false)
+        assertTrue(policy.publicCommitted)
+        assertEquals("PARTIAL", policy.durablePipelineStage)
+        assertEquals(CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL, policy.cameraTerminalKind)
+    }
+
+    @Test
+    fun verifiedPublicOnlyResultUsesTheSamePartialPolicyAsReprocess() {
+        val export = GalleryExportResult(
+            success = true,
+            uriString = "content://media/public-only",
+            displayName = "public-only.jpg",
+            mimeType = "image/jpeg",
+            fileSizeBytes = 1L,
+            formatUsed = OutputFormat.JPEG,
+            fallbackUsed = false,
+            errorMessage = null
+        )
+        val outcome = RawFusionPublicExportOutcome.VerifiedSuccess(
+            base = RawFusionProcessResult(true, null, null, null, null, null),
+            finalOutputFormat = FinalOutputFormat.JPEG,
+            export = export,
+            sidecar = null,
+            currentLocalPreview = null,
+            currentLocalOutput = null
+        )
+
+        val policy = deriveRawFusionOutcomePolicy(
+            outcome = outcome,
+            cancellationRequested = false,
+            publicOnlyWithoutPreview = true
+        )
+        assertEquals("PARTIAL", policy.durablePipelineStage)
+        assertEquals(CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL, policy.cameraTerminalKind)
     }
 
     @Test

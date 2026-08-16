@@ -14,6 +14,7 @@ import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 
 /**
  * Owns the outer RAW processing operation for the whole export/reprocess wrapper.  Nested
@@ -31,12 +32,41 @@ internal class RawProcessingOperation internal constructor(
 
     fun release() {
         if (released.get()) return
-        val operationId = activeOperationId
+        if (!ownsLease) {
+            // A reprocess worker borrows the transaction's outer lease.  Its wrapper must not
+            // clear PROCESSING_RAW/PUBLIC_EXPORT here: the transaction finalizer still owns the
+            // exact durable operation and must write terminal metadata before clearing it.
+            released.compareAndSet(false, true)
+            return
+        }
+        if (lease.pendingTerminalSettlement() != null || lease.pendingPublicExportSettlement() != null) {
+            Log.e("KeplerRawPipeline", "retaining RAW lease until durable terminal settlement is retried")
+            return
+        }
+        // The durable lease is authoritative if a nested PUBLIC_EXPORT transition occurred.
+        // Never settle the stale wrapper id while a newer durable operation owns the job.
+        val operationId = lease.currentDurableOperationId() ?: activeOperationId
         val cleared = operationId?.let { KeplerJobMetadata.clearActiveOperation(jobDir, it, lease) } ?: true
+        if (!cleared) {
+            val currentActiveId = try {
+                KeplerJobMetadata.read(jobDir).optString(ACTIVE_OPERATION_ID)
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                lease.markDurableSettlementPending(operationId)
+                return
+            }
+            if (currentActiveId.isNotBlank() && currentActiveId != operationId) {
+                lease.markDurableSettlementPending(currentActiveId)
+                Log.e("KeplerRawPipeline", "retaining RAW lease for newer durable operation $currentActiveId")
+                return
+            }
+        }
         if (!cleared && operationId?.let { KeplerJobMetadata.isCurrentActiveOperation(jobDir, it) } == true) {
             Log.e("KeplerRawPipeline", "retaining RAW operation lease after durable owner clear failure")
             return
         }
+        operationId?.let { lease.clearDurableOperation(it) }
         if (!released.compareAndSet(false, true)) return
         if (ownsLease) lease.release()
     }
@@ -54,26 +84,70 @@ internal fun acquireRawProcessingOperation(
     borrowedLease: JobOperationLease? = null
 ): RawProcessingOperation? {
     val ownsLease = borrowedLease == null
-    val lease = borrowedLease ?: try {
-        KeplerJobMetadata.acquireRecoveryCheckedOperation(
-            jobDir,
-            JobRecoveryMutationIntent.PROCESSING_START
-        )
-    } catch (failure: Error) {
-        throw failure
-    } catch (_: Exception) {
-        null
-    } ?: return null
+    val lease = borrowedLease ?: KeplerJobMetadata.acquireRecoveryCheckedOperation(
+        jobDir,
+        JobRecoveryMutationIntent.PROCESSING_START
+    )
     if (!KeplerJobMetadata.isOperationOwner(jobDir, lease)) {
         if (ownsLease) lease.release()
         return null
     }
-    val operationId = if (NoFollowFileSystem.resolveDirectChild(jobDir, JOB_JSON_FILE_NAME, requireFile = true) != null) {
-        KeplerJobMetadata.beginActiveOperation(
-            jobDir,
-            kind = KeplerActiveOperationKind.PROCESSING_RAW,
-            ownerLease = lease
-        )
+    val hasJobMetadata = try {
+        NoFollowFileSystem.resolveDirectChild(jobDir, JOB_JSON_FILE_NAME, requireFile = true) != null
+    } catch (failure: Throwable) {
+        var cleanupFailure: Throwable? = null
+        if (ownsLease) {
+            try {
+                lease.release()
+            } catch (secondary: Throwable) {
+                cleanupFailure = secondary
+            }
+        }
+        throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
+    }
+    val operationId = if (hasJobMetadata) {
+        val requestedOperationId = UUID.randomUUID().toString()
+        try {
+            KeplerJobMetadata.beginActiveOperation(
+                jobDir,
+                operationId = requestedOperationId,
+                kind = KeplerActiveOperationKind.PROCESSING_RAW,
+                ownerLease = lease
+            )
+        } catch (failure: Throwable) {
+            var cleanupFailure: Throwable? = null
+            val durableOwnerMayRemain = try {
+                KeplerJobMetadata.read(jobDir).optString(ACTIVE_OPERATION_ID) == requestedOperationId
+            } catch (secondary: Error) {
+                cleanupFailure = secondary
+                true
+            } catch (_: Exception) {
+                // A failed read cannot prove that the attempted durable write did not land.
+                true
+            }
+            if (durableOwnerMayRemain) {
+                try {
+                    lease.markTerminalSettlementPending(
+                        PendingTerminalSettlement(
+                            operationId = requestedOperationId,
+                            attemptStatus = "FAILED",
+                            pipelineStage = "FAILED",
+                            processStatus = "PIPELINE_FAILED",
+                            reason = "RAW processing operation setup failed: ${failure.message}"
+                        )
+                    )
+                } catch (secondary: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
+                }
+            } else if (ownsLease) {
+                try {
+                    lease.release()
+                } catch (secondary: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
+                }
+            }
+            throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
+        }
     } else null
     return RawProcessingOperation(lease, ownsLease, jobDir, operationId)
 }
@@ -94,8 +168,7 @@ internal fun recordRawOuterTerminalFailureWhileOwned(
         "RAW terminal failure settlement requires the owning operation"
     }
     beforeMetadata()
-    try {
-        recordNormalPreCommitTerminal(
+    recordNormalPreCommitTerminal(
             jobDir,
             attemptStatus = "FAILED",
             pipelineStage = "FAILED",
@@ -103,14 +176,7 @@ internal fun recordRawOuterTerminalFailureWhileOwned(
             reason = reason,
             operationId = operation.operationId,
             operationLease = operation.lease
-        )
-    } catch (metadataError: Exception) {
-        Log.e(
-            "KeplerRawPipeline",
-            "Failed to persist RAW terminal failure metadata: ${metadataError.message}",
-            metadataError
-        )
-    }
+    )
     onStatus()
 }
 
@@ -187,26 +253,31 @@ internal fun deriveRawFusionOutcomePolicy(
     outcome: RawFusionPublicExportOutcome?,
     cancellationRequested: Boolean,
     currentLocalOutput: File? = outcome?.currentLocalOutput,
-    currentAttemptLocalResult: Boolean = false
+    currentAttemptLocalResult: Boolean = false,
+    publicOnlyWithoutPreview: Boolean = false
 ): RawFusionOutcomePolicy {
     fun File.isCurrentResultFile(): Boolean = try {
         NoFollowFileSystem.isRealFile(toPath()) && length() > 0L
     } catch (failure: Error) {
         throw failure
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (_: Exception) {
         false
     }
     val currentLocalResult = currentAttemptLocalResult ||
         (outcome?.base?.outputCommitted == true && currentLocalOutput?.isCurrentResultFile() == true)
     val publicCommitted = outcome?.committed == true
-    val publicVerified = outcome?.verified == true
+    val publicVerified = outcome?.verified == true &&
+        outcome.export?.publicCommitState == GalleryExportCommitState.VERIFIED
     val hasPostExportPartiality = outcome != null && (
         !publicVerified ||
             cancellationRequested ||
             outcome.postExportCancellationRequested ||
             outcome.postExportWorkSkipped ||
             outcome.currentWarning != null ||
-            outcome is RawFusionPublicExportOutcome.VerifiedPendingPostWork
+            outcome is RawFusionPublicExportOutcome.VerifiedPendingPostWork ||
+            publicOnlyWithoutPreview
         )
     val usableResult = publicCommitted || currentLocalResult
     val fullSuccess = publicCommitted && publicVerified && !hasPostExportPartiality
@@ -302,20 +373,27 @@ internal sealed class RawFusionPublicExportOutcome {
         override val currentLocalPreview: File?,
         override val currentLocalOutput: File?,
         override val currentError: String,
+        val exportEvidence: GalleryExportResult? = null,
+        val cancellationRequested: Boolean = false,
         override val currentWarning: String? = null,
         override val rawPublicExportAttemptStatus: String = "FAILED",
         override val rawPublicExportAttemptError: String? = currentError,
         override val rawPublicExportAttemptAt: Long = System.currentTimeMillis()
     ) : RawFusionPublicExportOutcome() {
-        override val export: GalleryExportResult? = null
+        override val export: GalleryExportResult? = exportEvidence
         override val sidecar: RawSidecarExportResult? = null
-        override val committed: Boolean = false
+        // The public export call can return this variant after the public row committed but
+        // before verification/journal settlement.  The class name describes the export failure,
+        // not the absence of a public commit.
+        override val committed: Boolean = exportEvidence?.publicCommitted == true
         override val verified: Boolean = false
-        override val postExportCancellationRequested: Boolean = false
-        override val postExportWorkSkipped: Boolean = false
+        override val postExportCancellationRequested: Boolean = cancellationRequested
+        override val postExportWorkSkipped: Boolean = cancellationRequested
         override val disposition: ReprocessTerminalDisposition =
-            if (base.outputCommitted) {
+            if (currentLocalOutput != null || export?.publicCommitted == true) {
                 ReprocessTerminalDisposition.COMMITTED_PARTIAL
+            } else if (cancellationRequested) {
+                ReprocessTerminalDisposition.CANCELLED
             } else {
                 ReprocessTerminalDisposition.UNCOMMITTED_FAILURE
             }
@@ -567,6 +645,8 @@ private fun RawFusionProcessResult.validNativeRgbaFile(): File? {
         NoFollowFileSystem.requireSize(file)
     } catch (failure: Error) {
         throw failure
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (_: Exception) {
         return null
     }
@@ -578,6 +658,8 @@ private fun RawFusionProcessResult.hasExportableBitmapSource(): Boolean {
         NoFollowFileSystem.isRealFile(toPath()) && NoFollowFileSystem.requireSize(this) > 0L
     } catch (failure: Error) {
         throw failure
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (_: Exception) {
         false
     }
@@ -616,6 +698,8 @@ private fun RawFusionProcessResult.loadExportBitmap(jobDir: File): RawFusionExpo
                     NoFollowFileSystem.isRealFile(file.toPath()) && NoFollowFileSystem.requireSize(file) > 0L
                 } catch (failure: Error) {
                     throw failure
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (_: Exception) {
                     false
                 }
@@ -637,6 +721,8 @@ private fun RawFusionProcessResult.loadExportBitmap(jobDir: File): RawFusionExpo
             NoFollowFileSystem.isRealFile(file.toPath()) && NoFollowFileSystem.requireSize(file) > 0L
         } catch (failure: Error) {
             throw failure
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
             false
         }
@@ -652,6 +738,8 @@ internal fun resolveRawExportRotation(jobDir: File): ExportOrientationResolution
         JSONObject(NoFollowFileSystem.readTextVerified(NoFollowFileSystem.requireDirectChildFile(jobDir, JOB_JSON_FILE_NAME)))
     } catch (failure: Error) {
         throw failure
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (failure: Exception) {
         return ExportOrientationResolution.Unsupported("Cannot read RAW orientation metadata: ${failure.message}")
     }
@@ -812,6 +900,8 @@ fun captureProcessExportRawNightFusion(
                         processStatus = "EXPORT_CANCELLED_BEFORE_COMMIT",
                         reason = "Capture cancelled before processing started."
                     )
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (metadataError: Exception) {
                     Log.e(
                         "KeplerRawPipeline",
@@ -826,7 +916,53 @@ fun captureProcessExportRawNightFusion(
                 )
                 return@captureRawBurstForFusion
             }
-            val processingOperation = acquireRawProcessingOperation(jobDir)
+            val processingOperation = try {
+                acquireRawProcessingOperation(jobDir)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Error) {
+                throw failure
+            } catch (failure: Exception) {
+                if (failure is ProcessingAlreadyActiveException ||
+                    failure is ProcessingCleanupRequiredException ||
+                    failure is JobRecoveryMutationBlockedException
+                ) {
+                    // This invocation did not acquire the exact durable owner.  Never rewrite
+                    // another operation's terminal metadata; publish the typed outcome while
+                    // leaving the existing owner/recovery evidence untouched.
+                    post("PIPELINE_FAILED: RAW processing setup is blocked; existing operation kept.")
+                    terminal.publish(
+                        CameraPipelineEvent.Terminal.Kind.FAILED,
+                        message = "RAW processing setup is blocked; existing operation kept."
+                    )
+                    return@captureRawBurstForFusion
+                }
+                var terminalFailure: Throwable? = failure
+                try {
+                    val activeId = KeplerJobMetadata.read(jobDir)
+                        .optString(ACTIVE_OPERATION_ID)
+                        .takeIf { it.isNotBlank() }
+                    recordNormalPreCommitTerminal(
+                        jobDir = jobDir,
+                        attemptStatus = "FAILED",
+                        pipelineStage = "FAILED",
+                        processStatus = "PIPELINE_FAILED",
+                        reason = "RAW processing operation setup failed: ${failure.message}",
+                        operationId = activeId
+                    )
+                } catch (secondary: Throwable) {
+                    terminalFailure = combineSettlementFailure(terminalFailure, secondary)
+                }
+                if (terminalFailure is Error || terminalFailure is CancellationException) {
+                    throw terminalFailure!!
+                }
+                post("PIPELINE_FAILED: RAW processing setup failed; cache kept.")
+                terminal.publish(
+                    CameraPipelineEvent.Terminal.Kind.FAILED,
+                    message = "RAW processing setup failed; cache kept."
+                )
+                return@captureRawBurstForFusion
+            }
             if (processingOperation == null) {
                 Log.w("KeplerRawPipeline", "RAW processing operation is already owned; preserving the existing owner.")
                 post("PIPELINE_FAILED: RAW processing is already active; existing operation kept.")
@@ -972,10 +1108,12 @@ fun captureProcessExportRawNightFusion(
                                 operationId = processingOperation.operationId,
                                 operationLease = processingOperation.lease
                             )
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
                         } catch (metadataError: Exception) {
-                            Log.e(
-                                "KeplerRawPipeline",
-                                "Failed to persist RAW pre-commit failure metadata: ${metadataError.message}",
+                                Log.e(
+                                    "KeplerRawPipeline",
+                                    "Failed to persist RAW pre-commit failure metadata: ${metadataError.message}",
                                 metadataError
                             )
                         }
@@ -1000,6 +1138,8 @@ fun captureProcessExportRawNightFusion(
                     val previewPrepareStartedAt = System.currentTimeMillis()
                     try {
                         resetRawExportAttemptDiagnostics(jobDir)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
                     } catch (resetError: Exception) {
                         primaryWorkerFailure = resetError
                         Log.e(
@@ -1017,6 +1157,8 @@ fun captureProcessExportRawNightFusion(
                                 operationId = processingOperation.operationId,
                                 operationLease = processingOperation.lease
                             )
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
                         } catch (metadataError: Exception) {
                             Log.e(
                                 "KeplerRawPipeline",
@@ -1069,7 +1211,7 @@ fun captureProcessExportRawNightFusion(
                             exportBitmap?.takeUnless { it.isRecycled }?.recycle()
                         }
                     )
-                    if (result.success && !result.uriString.isNullOrBlank()) {
+                    if (result.publicCommitted && !result.uriString.isNullOrBlank()) {
                         committedExport = result
                         post("Verifying gallery export...")
                         val committedOutcome =
@@ -1083,7 +1225,9 @@ fun captureProcessExportRawNightFusion(
                             )
                         publicOutcome = committedOutcome
                         try {
-                            updateRawPublicExportOutcome(jobDir, committedOutcome)
+                            updateRawPublicExportOutcome(jobDir, committedOutcome, processingOperation.lease)
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
                         } catch (metadataError: Exception) {
                             primaryWorkerFailure = metadataError
                             Log.e(
@@ -1103,7 +1247,7 @@ fun captureProcessExportRawNightFusion(
                                         currentLocalOutput = process.currentLocalResultForOutcome(),
                                         currentError = "Commit-checkpoint persistence failed: ${metadataError.message}"
                                     )
-                                updateRawPublicExportOutcome(jobDir, interruptedOutcome)
+                                updateRawPublicExportOutcome(jobDir, interruptedOutcome, processingOperation.lease)
                             } catch (secondMetadataError: Exception) {
                                 Log.e(
                                     "KeplerRawPipeline",
@@ -1126,7 +1270,8 @@ fun captureProcessExportRawNightFusion(
                                 finalOutputFormat = finalOutputFormat,
                                 currentLocalPreview = currentLocalPreview,
                                 currentLocalOutput = currentLocalOutput,
-                                currentError = "Export cancelled before MediaStore commit"
+                                currentError = "Export cancelled before MediaStore commit",
+                                cancellationRequested = true
                             )
                             try {
                                 recordNormalPreCommitTerminal(
@@ -1138,6 +1283,8 @@ fun captureProcessExportRawNightFusion(
                                     operationId = processingOperation.operationId,
                                     operationLease = processingOperation.lease
                                 )
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
                             } catch (metadataError: Exception) {
                                 Log.e(
                                     "KeplerRawPipeline",
@@ -1155,7 +1302,10 @@ fun captureProcessExportRawNightFusion(
                             finalOutputFormat = finalOutputFormat,
                             currentLocalPreview = currentLocalPreview,
                             currentLocalOutput = currentLocalOutput,
-                            currentError = error
+                            currentError = error,
+                            exportEvidence = result.takeIf {
+                                it.publicCommitState != GalleryExportCommitState.NOT_COMMITTED
+                            }
                         )
                         try {
                             recordNormalPreCommitTerminal(
@@ -1167,6 +1317,8 @@ fun captureProcessExportRawNightFusion(
                                 operationId = processingOperation.operationId,
                                 operationLease = processingOperation.lease
                             )
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
                         } catch (metadataError: Exception) {
                             Log.e(
                                 "KeplerRawPipeline",
@@ -1192,7 +1344,7 @@ fun captureProcessExportRawNightFusion(
                             currentLocalOutput = cancelLocalOutput
                         )
                         publicOutcome = partial
-                        updateRawPublicExportOutcome(jobDir, partial)
+                        updateRawPublicExportOutcome(jobDir, partial, processingOperation.lease)
                         post("PIPELINE_CANCELLED: Export cancelled after MediaStore commit, before verification. RAW cache kept.")
                         return@post
                     }
@@ -1210,7 +1362,7 @@ fun captureProcessExportRawNightFusion(
                             currentError = "Export verification failed"
                         )
                         publicOutcome = outcome
-                        updateRawPublicExportOutcome(jobDir, outcome)
+                        updateRawPublicExportOutcome(jobDir, outcome, processingOperation.lease)
                         post("PIPELINE_FAILED: RAW export verification failed; keeping RAW cache.")
                         return@post
                     }
@@ -1224,7 +1376,9 @@ fun captureProcessExportRawNightFusion(
                     )
                     publicOutcome = verifiedPendingOutcome
                     try {
-                        updateRawPublicExportOutcome(jobDir, verifiedPendingOutcome)
+                        updateRawPublicExportOutcome(jobDir, verifiedPendingOutcome, processingOperation.lease)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
                     } catch (checkpointError: Exception) {
                         primaryWorkerFailure = checkpointError
                         Log.e(
@@ -1252,7 +1406,7 @@ fun captureProcessExportRawNightFusion(
                         )
                         publicOutcome = interruptedOutcome
                         try {
-                            updateRawPublicExportOutcome(jobDir, interruptedOutcome)
+                            updateRawPublicExportOutcome(jobDir, interruptedOutcome, processingOperation.lease)
                         } catch (secondaryOom: OutOfMemoryError) {
                             secondaryOom.addSuppressed(checkpointError)
                             throw secondaryOom
@@ -1287,7 +1441,7 @@ fun captureProcessExportRawNightFusion(
                             currentLocalPreview = process.previewPngFile?.takeIf { it.isFile && it.length() > 0L },
                             currentLocalOutput = process.currentLocalResultForOutcome()
                         )
-                        updateRawPublicExportOutcome(jobDir, outcome)
+                        updateRawPublicExportOutcome(jobDir, outcome, processingOperation.lease)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. RAW cache kept.")
                         return@post
                     }
@@ -1321,7 +1475,7 @@ fun captureProcessExportRawNightFusion(
                             currentLocalPreview = previewFile,
                             currentLocalOutput = localOutput
                         )
-                        updateRawPublicExportOutcome(jobDir, outcome)
+                        updateRawPublicExportOutcome(jobDir, outcome, processingOperation.lease)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. RAW cache kept.")
                         return@post
                     }
@@ -1342,7 +1496,7 @@ fun captureProcessExportRawNightFusion(
                         currentWarning = warning
                     )
                     publicOutcome = outcome
-                    updateRawPublicExportOutcome(jobDir, outcome)
+                    updateRawPublicExportOutcome(jobDir, outcome, processingOperation.lease)
                     val rawSuffix = if (sidecarResult?.kind == RawSidecarOutcomeKind.COMPLETE) " + RAW" else ""
                     val rawSidecarCount = sidecarResult?.exportedFiles?.size ?: 0
                     val rawSidecarError = sidecarResult?.errorMessage?.takeIf { it.isNotBlank() }
@@ -1379,7 +1533,7 @@ fun captureProcessExportRawNightFusion(
                                 currentLocalOutput = cancelLocalOutput
                             )
                             publicOutcome = outcome
-                            updateRawPublicExportOutcome(jobDir, outcome)
+                    updateRawPublicExportOutcome(jobDir, outcome, processingOperation.lease)
                             post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. RAW cache kept.")
                         } else {
                             val partial = RawFusionPublicExportOutcome.CommittedCancelledBeforeVerification(
@@ -1391,7 +1545,7 @@ fun captureProcessExportRawNightFusion(
                                 currentLocalOutput = cancelLocalOutput
                             )
                             publicOutcome = partial
-                            updateRawPublicExportOutcome(jobDir, partial)
+                            updateRawPublicExportOutcome(jobDir, partial, processingOperation.lease)
                             post("PIPELINE_CANCELLED: Export cancelled after MediaStore commit, before verification. RAW cache kept.")
                         }
                     } else {
@@ -1439,12 +1593,14 @@ fun captureProcessExportRawNightFusion(
                                     )
                             publicOutcome = interruptedOutcome
                             try {
-                                updateRawPublicExportOutcome(jobDir, interruptedOutcome)
+                                updateRawPublicExportOutcome(jobDir, interruptedOutcome, processingOperation.lease)
                             } catch (metadataOom: OutOfMemoryError) {
                                 oom.addSuppressed(metadataOom)
                                 throw oom
                             } catch (metadataFatal: Error) {
                                 throw requireNotNull(combineSettlementFailure(oom, metadataFatal))
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
                             } catch (metadataError: Exception) {
                                 Log.e(
                                     "KeplerRawPipeline",
@@ -1469,12 +1625,14 @@ fun captureProcessExportRawNightFusion(
                                     )
                             publicOutcome = interruptedOutcome
                             try {
-                                updateRawPublicExportOutcome(jobDir, interruptedOutcome)
+                                updateRawPublicExportOutcome(jobDir, interruptedOutcome, processingOperation.lease)
                             } catch (metadataOom: OutOfMemoryError) {
                                 oom.addSuppressed(metadataOom)
                                 throw oom
                             } catch (metadataFatal: Error) {
                                 throw requireNotNull(combineSettlementFailure(oom, metadataFatal))
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
                             } catch (metadataError: Exception) {
                                 Log.e(
                                     "KeplerRawPipeline",
@@ -1534,12 +1692,14 @@ fun captureProcessExportRawNightFusion(
                                     )
                             publicOutcome = interruptedOutcome
                             try {
-                                updateRawPublicExportOutcome(jobDir, interruptedOutcome)
+                                updateRawPublicExportOutcome(jobDir, interruptedOutcome, processingOperation.lease)
                             } catch (metadataOom: OutOfMemoryError) {
                                 metadataOom.addSuppressed(e)
                                 throw metadataOom
                             } catch (metadataFatal: Error) {
                                 throw requireNotNull(combineSettlementFailure(e, metadataFatal))
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
                             } catch (metadataError: Exception) {
                                 Log.e(
                                     "KeplerRawPipeline",
@@ -1564,12 +1724,14 @@ fun captureProcessExportRawNightFusion(
                                     )
                             publicOutcome = interruptedOutcome
                             try {
-                                updateRawPublicExportOutcome(jobDir, interruptedOutcome)
+                                updateRawPublicExportOutcome(jobDir, interruptedOutcome, processingOperation.lease)
                             } catch (metadataOom: OutOfMemoryError) {
                                 metadataOom.addSuppressed(e)
                                 throw metadataOom
                             } catch (metadataFatal: Error) {
                                 throw requireNotNull(combineSettlementFailure(e, metadataFatal))
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
                             } catch (metadataError: Exception) {
                                 Log.e(
                                     "KeplerRawPipeline",
@@ -1594,6 +1756,8 @@ fun captureProcessExportRawNightFusion(
                                 operationId = processingOperation.operationId,
                                 operationLease = processingOperation.lease
                             )
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
                         } catch (metadataError: Exception) {
                             Log.e(
                                 "KeplerRawPipeline",
@@ -1659,15 +1823,49 @@ fun captureProcessExportRawNightFusion(
                             kind = terminalPolicy.cameraTerminalKind,
                             requiredOutputCommitted = terminalPolicy.hasCurrentLocalResult,
                             publicExportCommitted = publicOutcome?.committed == true || committedExport != null,
-                            verified = publicOutcome?.verified == true || exportVerified,
+                            verified = terminalPolicy.publicVerified,
                             message = "RAW pipeline terminal settlement"
                         )
                     }
                     var cleanupFailure: Throwable? = null
+                    val rawPublicOperationId = processingOperation.lease.currentDurableOperationId()
+                    val hasOwnedExportJournal = try {
+                        rawPublicOperationId != null && MediaStoreExportJournal.list(jobDir).any {
+                            it.ownerOperationId == rawPublicOperationId
+                        }
+                    } catch (failure: Throwable) {
+                        cleanupFailure = combineSettlementFailure(primaryWorkerFailure, failure)
+                        false
+                    }
+                    if (cleanupFailure is Error || cleanupFailure is CancellationException) {
+                        throw cleanupFailure!!
+                    }
+                    if (processingOperation.lease.currentDurableOperationKind() == KeplerActiveOperationKind.PUBLIC_EXPORT &&
+                        hasOwnedExportJournal &&
+                        KeplerJobMetadata.isOperationOwner(jobDir, processingOperation.lease)
+                    ) {
+                        try {
+                            settleOwnedPublicExportInterruption(
+                                jobDir = jobDir,
+                                ownerLease = processingOperation.lease,
+                                failureMessage = publicOutcome?.currentError
+                                    ?: primaryWorkerFailure?.message
+                                    ?: "RAW public export terminal settlement required.",
+                                finalOutputFormat = finalOutputFormat,
+                                disposition = if (cancellation.isCancelled) {
+                                    PublicExportInterruptionDisposition.CANCELLED
+                                } else {
+                                    PublicExportInterruptionDisposition.FAILED
+                                }
+                            )
+                        } catch (failure: Throwable) {
+                            cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+                        }
+                    }
                     try {
                         processingOperation.release()
                     } catch (failure: Throwable) {
-                        cleanupFailure = failure
+                        cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
                     }
                     try {
                         thread.quitSafely()
@@ -1686,9 +1884,19 @@ fun captureProcessExportRawNightFusion(
             } catch (failure: Error) {
                 var cleanupFailure: Throwable? = null
                 try {
+                    recordRawOuterTerminalFailureWhileOwned(
+                        jobDir,
+                        processingOperation,
+                        "RAW processing worker dispatch failed: ${failure.message}",
+                        onStatus = {}
+                    )
+                } catch (secondary: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
+                }
+                try {
                     processingOperation.release()
                 } catch (secondary: Throwable) {
-                    cleanupFailure = secondary
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
                 }
                 try {
                     thread.quitSafely()
@@ -1696,6 +1904,32 @@ fun captureProcessExportRawNightFusion(
                     cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
                 }
                 throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
+            } catch (cancelled: CancellationException) {
+                var cleanupFailure: Throwable? = null
+                try {
+                    recordNormalPreCommitTerminal(
+                        jobDir = jobDir,
+                        attemptStatus = "CANCELLED",
+                        pipelineStage = "CANCELLED",
+                        processStatus = "EXPORT_CANCELLED_BEFORE_COMMIT",
+                        reason = "RAW processing worker dispatch cancelled.",
+                        operationId = processingOperation.operationId,
+                        operationLease = processingOperation.lease
+                    )
+                } catch (secondary: Throwable) {
+                    cleanupFailure = secondary
+                }
+                try {
+                    processingOperation.release()
+                } catch (secondary: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
+                }
+                try {
+                    thread.quitSafely()
+                } catch (secondary: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
+                }
+                throw requireNotNull(combineSettlementFailure(cancelled, cleanupFailure))
             } catch (failure: Exception) {
                 Log.e("KeplerRawPipeline", "RAW processing worker dispatch failed", failure)
                 false
@@ -1769,7 +2003,34 @@ internal fun reprocessRawJob(
         }
     }
     val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
-    val processingOperation = acquireRawProcessingOperation(jobDir, operationLease)
+    val processingOperation = try {
+        acquireRawProcessingOperation(jobDir, operationLease)
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (failure: Error) {
+        throw failure
+    } catch (failure: Exception) {
+        val outcome = RawFusionPublicExportOutcome.UncommittedFailure(
+            base = RawFusionProcessResult(false, null, null, null, null, failure.message),
+            finalOutputFormat = finalOutputFormat,
+            currentLocalPreview = null,
+            currentLocalOutput = null,
+            currentError = failure.message ?: "RAW reprocess operation setup failed"
+        )
+        terminal.complete(
+            ReprocessWorkerOutcome(
+                result = Result.failure(failure),
+                publicExportCommitted = false,
+                terminalError = failure,
+                publicOutcome = outcome
+            )
+        )
+        post("PIPELINE_FAILED: RAW reprocess operation setup failed; cache kept.")
+        return ReprocessWorkerRun(
+            terminal = terminal,
+            cancel = { (cancellation as? KeplerPipelineCancellationToken)?.cancel() }
+        )
+    }
     if (processingOperation == null) {
         val failure = ProcessingAlreadyActiveException(jobDir)
         val outcome = RawFusionPublicExportOutcome.UncommittedFailure(
@@ -1905,6 +2166,8 @@ internal fun reprocessRawJob(
             post("Exporting reprocessed ${requestedFormat.label}...")
             try {
                 resetRawExportAttemptDiagnostics(jobDir)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (resetError: Exception) {
                 Log.e(
                     "KeplerRawPipeline",
@@ -1969,7 +2232,7 @@ internal fun reprocessRawJob(
                 )
             }
             var committedExport: GalleryExportResult? = null
-            if (exportAttempted.success && !exportAttempted.uriString.isNullOrBlank()) {
+            if (exportAttempted.publicCommitted && !exportAttempted.uriString.isNullOrBlank()) {
                 committedExport = exportAttempted
                 val pendingOutcome = RawFusionPublicExportOutcome.CommittedPendingVerification(
                     base = process,
@@ -1981,6 +2244,8 @@ internal fun reprocessRawJob(
                 publicOutcome = pendingOutcome
                 try {
                     persistReprocessCommitCheckpoint(jobDir, exportAttempted)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (checkpointError: Exception) {
                     Log.e(
                         "KeplerRawPipeline",
@@ -1998,7 +2263,10 @@ internal fun reprocessRawJob(
                     finalOutputFormat = finalOutputFormat,
                     currentLocalPreview = currentPreviewFile,
                     currentLocalOutput = currentLocalResultFile,
-                    currentError = exportAttempted.errorMessage ?: "Export failed"
+                    currentError = exportAttempted.errorMessage ?: "Export failed",
+                    exportEvidence = exportAttempted.takeIf {
+                        it.publicCommitState != GalleryExportCommitState.NOT_COMMITTED
+                    }
                 )
                 val reason = exportAttempted.errorMessage ?: "Export failed"
                 post("RAW reprocess export failed; source frames kept. $reason")
@@ -2045,6 +2313,8 @@ internal fun reprocessRawJob(
             publicOutcome = verifiedOutcome
             try {
                 markReprocessCommitCheckpointVerified(jobDir)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (checkpointError: Exception) {
                 Log.e(
                     "KeplerRawPipeline",
@@ -2106,6 +2376,8 @@ internal fun reprocessRawJob(
             if (currentPreviewFile == null && exportBitmap != null) {
                 currentPreviewFile = try {
                     writeBoundedReprocessPreview(jobDir, exportBitmap!!)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (previewError: Exception) {
                     post("RAW reprocess preview write failed: ${previewError.message}")
                     null
@@ -2137,7 +2409,8 @@ internal fun reprocessRawJob(
                     finalOutputFormat = finalOutputFormat,
                     currentLocalPreview = currentPreviewFile,
                     currentLocalOutput = currentLocalResultFile,
-                    currentError = "RAW reprocess cancelled"
+                    currentError = "RAW reprocess cancelled",
+                    cancellationRequested = true
                 )
                 terminalResult = Result.failure(ce)
             } else if (publicOutcome!!.verified) {
@@ -2293,6 +2566,8 @@ private fun recordRawPublicExportAttempt(jobDir: File, status: String, error: St
         }
     } catch (metadataError: Error) {
         throw metadataError
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (metadataError: Exception) {
         Log.e(
             "KeplerRawPipeline",
@@ -2319,7 +2594,7 @@ private fun recordRawPublicExportAttempt(jobDir: File, status: String, error: St
  * @param reason the error or cancellation reason
  * @throws Exception if metadata persistence fails
  */
-private fun recordNormalPreCommitTerminal(
+internal fun recordNormalPreCommitTerminal(
     jobDir: File,
     attemptStatus: String,
     pipelineStage: String,
@@ -2329,21 +2604,40 @@ private fun recordNormalPreCommitTerminal(
     operationId: String? = null,
     operationLease: JobOperationLease? = null
 ) {
-    KeplerJobMetadata.update(jobDir) { job ->
-        val effectivePartial = if (operationLease != null) {
-            currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, operationLease)
-        } else {
-            localOutputCommitted
+    // A RAW wrapper may have handed the same lease from PROCESSING_RAW (P) to
+    // PUBLIC_EXPORT (E).  The durable terminal marker must follow the lease's
+    // current exact owner, not the wrapper's stale initial ID.
+    val exactOperationId = operationLease?.currentDurableOperationId() ?: operationId
+    try {
+        KeplerJobMetadata.update(jobDir) { job ->
+            val effectivePartial = if (operationLease != null) {
+                currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, operationLease)
+            } else {
+                localOutputCommitted
+            }
+            job.put("rawPublicExportAttemptStatus", if (effectivePartial) "PARTIAL" else attemptStatus)
+                .put("rawPublicExportAttemptError", reason)
+                .put("rawPublicExportAttemptAt", System.currentTimeMillis())
+                .put("currentPipelineStage", if (effectivePartial) "PARTIAL" else pipelineStage)
+                .put("processStatus", if (effectivePartial) "LOCAL_OUTPUT_COMMITTED_EXPORT_FAILED" else processStatus)
+                .put("userCanMoveDevice", true)
+            if (exactOperationId != null && job.optString(ACTIVE_OPERATION_ID) == exactOperationId) {
+                job.put(TERMINAL_OPERATION_ID, exactOperationId)
+            }
         }
-        job.put("rawPublicExportAttemptStatus", if (effectivePartial) "PARTIAL" else attemptStatus)
-            .put("rawPublicExportAttemptError", reason)
-            .put("rawPublicExportAttemptAt", System.currentTimeMillis())
-            .put("currentPipelineStage", if (effectivePartial) "PARTIAL" else pipelineStage)
-            .put("processStatus", if (effectivePartial) "LOCAL_OUTPUT_COMMITTED_EXPORT_FAILED" else processStatus)
-            .put("userCanMoveDevice", true)
-        if (operationId != null && job.optString(ACTIVE_OPERATION_ID) == operationId) {
-            job.put(TERMINAL_OPERATION_ID, operationId)
+    } catch (failure: Throwable) {
+        if (operationLease != null && exactOperationId != null) {
+            operationLease.markTerminalSettlementPending(
+                PendingTerminalSettlement(
+                    operationId = exactOperationId,
+                    attemptStatus = attemptStatus,
+                    pipelineStage = pipelineStage,
+                    processStatus = processStatus,
+                    reason = reason
+                )
+            )
         }
+        throw failure
     }
 }
 
@@ -2483,6 +2777,9 @@ private fun updateRawNativeQualityDiagnostics(jobDir: File, bitmap: Bitmap) {
     } catch (fatal: Error) {
         primaryFailure = fatal
         throw fatal
+    } catch (cancelled: CancellationException) {
+        primaryFailure = cancelled
+        throw cancelled
     } catch (e: Exception) {
         primaryFailure = e
         Log.e(

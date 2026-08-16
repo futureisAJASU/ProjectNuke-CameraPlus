@@ -393,7 +393,11 @@ internal object KeplerRecoveryCoordinator {
                 if (job.optString("recoveryState") == PROCESSING_CLEANUP_REQUIRED) {
                     KeplerJobMetadata.clearProcessingCleanupRequired(jobDir)
                 }
-                val classification = if (job.optBoolean("processingOutputCommitted", false)) {
+                // A stale boolean is not a current result.  Recovery must require the exact
+                // current-attempt claim and the surviving claimed file before describing this
+                // cut as a usable local result (SOURCE_ONLY and other destructive cleanup may
+                // intentionally leave the historical claim fields behind).
+                val classification = if (currentProcessingAttemptHasRequiredOutputClaim(jobDir)) {
                     KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL
                 } else {
                     KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT
@@ -431,7 +435,7 @@ internal object KeplerRecoveryCoordinator {
                         cleanupFailures = cleanupFailures
                     )
                 }
-                val localCommitted = job.optBoolean("processingOutputCommitted", false)
+                val localCommitted = currentProcessingAttemptHasRequiredOutputClaim(jobDir)
                 val artifactCleanupDebt = artifactResults
                     .filter {
                         it.classification == ProcessingArtifactRecoveryClassification.ADOPTED_CURRENT_WITH_CLEANUP_DEBT ||
@@ -503,7 +507,7 @@ internal object KeplerRecoveryCoordinator {
                 }
             }
             if (activeOperation.isBlank() &&
-                job.optBoolean("processingOutputCommitted", false) &&
+                currentProcessingAttemptHasRequiredOutputClaim(jobDir) &&
                 job.optString("currentPipelineStage") !in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")) {
                 KeplerJobMetadata.update(jobDir) {
                     it.put("recoveryState", "STABLE")
