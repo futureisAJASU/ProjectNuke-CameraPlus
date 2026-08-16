@@ -1053,9 +1053,30 @@ internal fun markMediaStoreExportJournalsTerminalPersisted(
     }
     val ownerOperationId = metadata?.optString(TERMINAL_OPERATION_ID)?.takeIf { it.isNotBlank() }
         ?: return
-    MediaStoreExportJournal.list(jobDir).forEach { journal ->
-        if (journal.ownerOperationId == ownerOperationId && !journal.terminalMetadataPersisted) {
-            journal.markTerminalPersisted(jobDir, ownerOperationId)
+    // A journal acknowledges its terminal metadata only when its evidence matches the durable
+    // terminal record (journal reconciliation happens BEFORE the acknowledgement).  An UNKNOWN
+    // commit record has no settled evidence: no journal may be acknowledged for it here, because
+    // only the authoritative export settlement or recovery can settle that evidence.  The ack
+    // authority guard therefore defers every acknowledgement for `!publicCommitKnown` records.
+    val explicitCommitState = metadata.optString("exportCommitState")
+    val committedFlag = metadata.optBoolean("galleryExportCommitted", false)
+    val verifiedFlag = metadata.optBoolean("exportVerified", false)
+    val ackEligibleStates: Set<MediaStoreExportState>? = when {
+        explicitCommitState == GalleryExportCommitState.UNKNOWN.name -> null
+        verifiedFlag || explicitCommitState == GalleryExportCommitState.VERIFIED.name ->
+            setOf(MediaStoreExportState.VERIFIED)
+        committedFlag || explicitCommitState == GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED.name ->
+            setOf(MediaStoreExportState.PUBLIC_COMMITTED, MediaStoreExportState.VERIFIED)
+        else -> setOf(MediaStoreExportState.CLEANED, MediaStoreExportState.INSERT_FAILED_NO_ROW)
+    }
+    if (ackEligibleStates != null) {
+        MediaStoreExportJournal.list(jobDir).forEach { journal ->
+            if (journal.ownerOperationId == ownerOperationId &&
+                !journal.terminalMetadataPersisted &&
+                journal.state in ackEligibleStates
+            ) {
+                journal.markTerminalPersisted(jobDir, ownerOperationId)
+            }
         }
     }
     val stage = try {
