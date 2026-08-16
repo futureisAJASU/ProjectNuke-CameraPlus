@@ -27,10 +27,11 @@ internal fun persistYuvCaptureSetupFailure(
     var operationId: String? = null
     var primaryFailure: Throwable? = null
     try {
-        operationId = KeplerJobMetadata.beginActiveOperation(
+operationId = KeplerJobMetadata.beginActiveOperation(
             jobDir,
             kind = KeplerActiveOperationKind.PROCESSING_YUV,
-            ownerLease = lease
+            ownerLease = lease,
+            consumesProcessingHandoff = true
         )
         KeplerJobMetadata.update(jobDir) { job ->
             job.put("currentPipelineStage", "FAILED")
@@ -246,11 +247,12 @@ fun captureProcessExportNightFusion(
                     terminalFailure = combineSettlementFailure(failure, secondary)
                 }
                 try {
-                    val operationId = pipelineLease.currentDurableOperationId()
+val operationId = pipelineLease.currentDurableOperationId()
                         ?: KeplerJobMetadata.beginActiveOperation(
                             jobDir,
                             kind = KeplerActiveOperationKind.PROCESSING_YUV,
-                            ownerLease = pipelineLease
+                            ownerLease = pipelineLease,
+                            consumesProcessingHandoff = true
                         )
                     KeplerJobMetadata.update(jobDir) { job ->
                         job.put("currentPipelineStage", "FAILED")

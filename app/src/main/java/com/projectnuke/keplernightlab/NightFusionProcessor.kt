@@ -148,7 +148,8 @@ fun processLatestNightFusionV02(
             val operationId = KeplerJobMetadata.beginActiveOperation(
                 target,
                 kind = KeplerActiveOperationKind.PROCESSING_YUV,
-                ownerLease = lease
+                ownerLease = lease,
+                consumesProcessingHandoff = true
             )
             KeplerJobMetadata.update(target) { job ->
                 job.put("currentPipelineStage", "FAILED")
