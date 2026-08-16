@@ -4227,7 +4227,7 @@ private fun writeReprocessPartialPublicOnly(
             .put("galleryVisible", false)
             .put("galleryDisplayUnavailable", true)
             .put("finalOutputFormatSetting", outputSettings.name)
-            .put("exportStatus", "EXPORTED")
+            .put("exportStatus", if (exportVerified) "EXPORTED" else "EXPORT_UNVERIFIED")
             .put("exportVerified", exportVerified)
             .put("galleryExportCommitted", export?.publicCommitted == true)
             .put("exportCommitState", export?.publicCommitState?.name ?: GalleryExportCommitState.NOT_COMMITTED.name)

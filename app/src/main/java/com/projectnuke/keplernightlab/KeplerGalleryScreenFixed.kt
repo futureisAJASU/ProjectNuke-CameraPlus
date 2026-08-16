@@ -391,9 +391,10 @@ internal fun KeplerGalleryJobSummary.isFailedGalleryJob(): Boolean {
         NoFollowFileSystem.isRealFile(it.toPath()) &&
             !metadata?.optBoolean("galleryDisplayUnavailable", false).orFalse()
     } == true
-    val usablePublicResult = finalExportExists &&
+val usablePublicResult = finalExportExists &&
         metadata?.optBoolean("galleryExportCommitted", false) == true &&
-        metadata.optString("exportUri").isNotBlank()
+        metadata.optString("exportUri").isNotBlank() &&
+        metadata?.optString("exportCommitState") != GalleryExportCommitState.UNKNOWN.name
     if (usableLocalResult || usablePublicResult) return false
 
     // Recovery-blocked or quarantined jobs require their evidence-preserving
