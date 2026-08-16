@@ -2,6 +2,9 @@ package com.projectnuke.keplernightlab
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.PackageManager
+import android.Manifest
+import androidx.core.content.ContextCompat
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.ImageFormat
@@ -1594,6 +1597,10 @@ fun captureRawBurstForFusion(
             postReceiveImage(image.timestamp, image, imageReader.maxImages)
         }, handler)
 
+        // CAMERA permission is declared in manifest; explicitly check before openCamera to satisfy lint
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            throw SecurityException("CAMERA permission not granted")
+        }
         cameraManager.openCamera(
             cameraId,
             object : CameraDevice.StateCallback() {
