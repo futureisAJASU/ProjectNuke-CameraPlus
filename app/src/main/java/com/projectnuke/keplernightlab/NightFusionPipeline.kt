@@ -137,10 +137,25 @@ fun captureProcessExportNightFusion(
         captureMode = captureMode,
         processingParams = processingParams,
         captureCancellationHandle = captureCancellationHandle,
-        onComplete = { jobDir ->
+onComplete = { jobDir ->
             try {
                 cancellation.throwIfCancelled()
             } catch (_: CancellationException) {
+                try {
+                    // The capture already published its processing handoff; no worker will
+                    // consume it now, so settle it durably instead of blocking the job.
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(jobDir)
+                } catch (settledError: Error) {
+                    throw settledError
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (settlementError: Exception) {
+                    android.util.Log.e(
+                        "KeplerYuvPipeline",
+                        "Failed to settle YUV processing handoff after cancellation: ${settlementError.message}",
+                        settlementError
+                    )
+                }
                 post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.CANCELLED, message = "Capture cancelled before processing started.")
                 return@captureYuvBurstColorWithMotion

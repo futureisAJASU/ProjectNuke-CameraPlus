@@ -894,24 +894,39 @@ fun captureProcessExportRawNightFusion(
             try {
                 cancellation.throwIfCancelled()
             } catch (_: CancellationException) {
-                try {
-                    recordNormalPreCommitTerminal(
-                        jobDir,
-                        attemptStatus = "CANCELLED",
-                        pipelineStage = "CANCELLED",
-                        processStatus = "EXPORT_CANCELLED_BEFORE_COMMIT",
-                        reason = "Capture cancelled before processing started."
-                    )
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (metadataError: Exception) {
-                    Log.e(
-                        "KeplerRawPipeline",
-                        "Failed to persist RAW pre-commit cancellation metadata: ${metadataError.message}",
-                        metadataError
-                    )
-                }
-                post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
+try {
+                        recordNormalPreCommitTerminal(
+                            jobDir,
+                            attemptStatus = "CANCELLED",
+                            pipelineStage = "CANCELLED",
+                            processStatus = "EXPORT_CANCELLED_BEFORE_COMMIT",
+                            reason = "Capture cancelled before processing started."
+                        )
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (metadataError: Exception) {
+                        Log.e(
+                            "KeplerRawPipeline",
+                            "Failed to persist RAW pre-commit cancellation metadata: ${metadataError.message}",
+                            metadataError
+                        )
+                    }
+                    try {
+                        // The capture already published its processing handoff; no worker will
+                        // consume it now, so settle it durably instead of blocking the job.
+                        KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(jobDir)
+                    } catch (settledError: Error) {
+                        throw settledError
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (settlementError: Exception) {
+                        Log.e(
+                            "KeplerRawPipeline",
+                            "Failed to settle RAW processing handoff after cancellation: ${settlementError.message}",
+                            settlementError
+                        )
+                    }
+                    post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 terminal.publish(
                     CameraPipelineEvent.Terminal.Kind.CANCELLED,
                     message = "Capture cancelled before RAW processing started."

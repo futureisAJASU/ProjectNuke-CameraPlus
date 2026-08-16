@@ -708,10 +708,21 @@ fun captureProcessExportSuperResolutionFusion(
         captureMode = CaptureMode.MULTI_FRAME,
         processingParams = processingParams,
         captureCancellationHandle = captureCancellationHandle,
-        onComplete = { sourceJobDir ->
+onComplete = { sourceJobDir ->
             try {
                 cancellation.throwIfCancelled()
             } catch (_: CancellationException) {
+                try {
+                    // The capture already published its processing handoff; no worker will
+                    // consume it now, so settle it durably instead of blocking the job.
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(sourceJobDir)
+                } catch (settledError: Error) {
+                    throw settledError
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (settlementError: Exception) {
+                    Log.e("KeplerSuperResolution", "processing handoff settlement after cancellation failed", settlementError)
+                }
                 post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.CANCELLED, message = "Capture cancelled before Super Resolution processing.")
                 return@captureYuvBurstColorWithMotion

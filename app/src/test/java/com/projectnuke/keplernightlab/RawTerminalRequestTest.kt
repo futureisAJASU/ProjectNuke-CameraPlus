@@ -1,7 +1,9 @@
 package com.projectnuke.keplernightlab
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RawTerminalRequestTest {
@@ -78,6 +80,12 @@ class RawTerminalRequestTest {
             ),
             RawOutputCleanupStatus.entries.toSet()
         )
+    }
+
+    @Test
+    fun processingHandoffIsPublishedOnlyAfterDurableSuccessTerminal() {
+        assertTrue(shouldPublishRawCaptureProcessingHandoff(RawTerminalCompletionKind.SUCCESS))
+        assertFalse(shouldPublishRawCaptureProcessingHandoff(RawTerminalCompletionKind.ERROR))
     }
 
     @Test

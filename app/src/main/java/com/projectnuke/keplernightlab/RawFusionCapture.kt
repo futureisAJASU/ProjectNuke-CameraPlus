@@ -128,6 +128,12 @@ private data class RawSaveFrameRequest(
 )
 
 @SuppressLint("MissingPermission")
+/** A capture handoff is offered to processing only after a durable SUCCESS terminal. Cancelled
+ *  or failed captures never publish one: no worker will run for them, and an unconsumed handoff
+ *  would block every later mutation until a restart. */
+internal fun shouldPublishRawCaptureProcessingHandoff(completionKind: RawTerminalCompletionKind): Boolean =
+    completionKind == RawTerminalCompletionKind.SUCCESS
+
 fun captureRawBurstForFusion(
     context: Context,
     cameraId: String,
@@ -922,7 +928,9 @@ fun captureRawBurstForFusion(
                             throw failure
                         }
                     } finally {
-                        if (durableCaptureTerminalPersisted) {
+                        if (durableCaptureTerminalPersisted &&
+                            shouldPublishRawCaptureProcessingHandoff(request.completionKind)
+                        ) {
                             val handoffPublished = KeplerJobMetadata.publishProcessingHandoff(
                                     jobDir,
                                     durableCaptureOperationId,
