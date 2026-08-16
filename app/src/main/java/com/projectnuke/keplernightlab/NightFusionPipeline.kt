@@ -917,25 +917,35 @@ internal fun reprocessYuvJob(
                         ownerLease = operationLease
                     )
                 },
-                cleanup = { bitmap.recycle() }
+cleanup = { bitmap.recycle() }
             )
-            if (!export.publicCommitted || export.uriString.isNullOrBlank()) {
+            val exportCommitState = export.publicCommitState
+            val hasPublicCommitEvidence = exportCommitState != GalleryExportCommitState.NOT_COMMITTED
+            if (hasPublicCommitEvidence) {
+                // Preserve exact export evidence for all non-NOT_COMMITTED states (UNKNOWN,
+                // PUBLIC_COMMITTED_UNVERIFIED, VERIFIED)
+                committedExport = export
+                publicExportCommitted = export.publicCommitted
+                val verified = verifyCommittedGalleryExport(context, export) is GalleryExportVerification.Verified
+                exportVerified = verified
+                if (exportCommitState == GalleryExportCommitState.UNKNOWN) {
+                    terminalDisposition = ReprocessTerminalDisposition.COMMITTED_PARTIAL
+                    post("PIPELINE_COMPLETE_PARTIAL: YUV reprocess export commit state UNKNOWN; exact URI preserved.")
+                } else if (!verified) {
+                    terminalDisposition = ReprocessTerminalDisposition.COMMITTED_PARTIAL
+                    post("PIPELINE_COMPLETE_PARTIAL: YUV reprocess export verification incomplete.")
+                } else {
+                    terminalDisposition = ReprocessTerminalDisposition.VERIFIED_SUCCESS
+                    post(
+                        "PIPELINE_COMPLETE: ${if (singleFrame) "Single photo" else "YUV reprocess"} " +
+                            "saved ${export.formatUsed.label}; used $enabledFrames/$totalFrames frames; cache kept."
+                    )
+                }
+                terminalResult = Result.success(Unit)
+            } else {
+                // NOT_COMMITTED: ordinary export failure
                 error(export.errorMessage ?: "YUV export failed")
             }
-            publicExportCommitted = true
-            committedExport = export
-            val verified = verifyCommittedGalleryExport(context, export) is GalleryExportVerification.Verified
-            exportVerified = verified
-            if (!verified) {
-                terminalDisposition = ReprocessTerminalDisposition.COMMITTED_PARTIAL
-                error("YUV export verification failed")
-            }
-            terminalDisposition = ReprocessTerminalDisposition.VERIFIED_SUCCESS
-            post(
-                "PIPELINE_COMPLETE: ${if (singleFrame) "Single photo" else "YUV reprocess"} " +
-                    "saved ${export.formatUsed.label}; used $enabledFrames/$totalFrames frames; cache kept."
-            )
-            terminalResult = Result.success(Unit)
         } catch (ce: kotlinx.coroutines.CancellationException) {
             post("PIPELINE_CANCELLED: YUV reprocess cancelled; source frames kept.")
             terminalResult = Result.failure(ce)

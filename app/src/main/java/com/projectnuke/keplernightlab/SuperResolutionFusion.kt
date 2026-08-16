@@ -820,11 +820,13 @@ onComplete = { sourceJobDir ->
                     }
 return evidence
                 }
-                fun consumeSourceHandoffIfStillPresent() {
-                    try {
-                        // Idempotent backstop: the worker already consumed the source handoff at
-                        // start; a transient write failure may have left it, and a success
-                        // terminal must never follow an unconsumed source handoff.
+                fun consumeSourceHandoffIfStillPresent(): Boolean {
+                    // Idempotent backstop: the worker already consumed the source handoff at
+                    // start; a transient write failure may have left it, and a success
+                    // terminal must never follow an unconsumed source handoff.
+                    // Returns true if handoff was already absent or successfully consumed,
+                    // false if persistence failed and the handoff remains.
+                    return try {
                         KeplerJobMetadata.consumeProcessingHandoff(
                             sourceJobDir,
                             KeplerActiveOperationKind.PROCESSING_YUV
@@ -833,6 +835,7 @@ return evidence
                         throw settledError
                     } catch (settledFailure: Exception) {
                         Log.e("KeplerSuperResolution", "source handoff re-consume failed", settledFailure)
+                        false
                     }
                 }
 try {
@@ -840,7 +843,26 @@ try {
                     // The processed frames leave the source job: transfer (consume) the
                     // capture's processing handoff so the source job converges instead of
                     // staying handoff-locked, since the worker never owns it.
-                    consumeSourceHandoffIfStillPresent()
+                    val handoffConsumed = consumeSourceHandoffIfStillPresent()
+                    if (!handoffConsumed) {
+                        // Persistence failed - the handoff remains. We must not proceed to a
+                        // successful terminal while the source handoff is unresolved.
+                        val error = "Source handoff consume failed; cannot proceed to terminal."
+                        post("PIPELINE_FAILED: $error")
+                        requiredOutputCommitted = outputDirForSettlement?.let { dir ->
+                            currentProcessingAttemptHasRequiredOutputClaimForLease(dir, outputLease)
+                        } == true
+                        terminal.publish(
+                            exportOutcomeTerminalKind(
+                                requiredOutputCommitted = requiredOutputCommitted,
+                                publicExportCommitted = false,
+                                verified = false
+                            ),
+                            requiredOutputCommitted = requiredOutputCommitted,
+                            message = error
+                        )
+                        return@post
+                    }
                     val sourceFrames = readColorBurstFrameFiles(sourceJobDir)
                     cancellation.throwIfCancelled()
                     val outputDir = createSuperResolutionJobDirectory(context)
@@ -951,7 +973,23 @@ if (!verified) {
                         // The shared exporter has already persisted the committed-unverified
                         // result.  A second failure writer would reopen a settled PUBLIC_EXPORT
                         // boundary and could erase the exact committed URI.
-                        consumeSourceHandoffIfStillPresent()
+                        val handoffConsumed = consumeSourceHandoffIfStillPresent()
+                        if (!handoffConsumed) {
+                            val error = "Source handoff consume failed after verification failure; cannot proceed to terminal."
+                            post("PIPELINE_FAILED: $error")
+                            terminal.publish(
+                                exportOutcomeTerminalKind(
+                                    requiredOutputCommitted = requiredOutputCommitted,
+                                    publicExportCommitted = publicExportCommitted,
+                                    verified = false
+                                ),
+                                requiredOutputCommitted = requiredOutputCommitted,
+                                publicExportCommitted = publicExportCommitted,
+                                verified = false,
+                                message = error
+                            )
+                            return@post
+                        }
                         post("PIPELINE_COMPLETE_PARTIAL: 24M Fusion export verification was not proven.")
                         terminal.publish(
                             exportOutcomeTerminalKind(
@@ -968,7 +1006,19 @@ if (!verified) {
                     }
 
                     if (cancellation.isCancelled) {
-                        consumeSourceHandoffIfStillPresent()
+                        val handoffConsumedOnCancel = consumeSourceHandoffIfStillPresent()
+                        if (!handoffConsumedOnCancel) {
+                            val error = "Source handoff consume failed after cancellation; cannot proceed to terminal."
+                            post("PIPELINE_FAILED: $error")
+                            terminal.publish(
+                                CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+                                requiredOutputCommitted = requiredOutputCommitted,
+                                publicExportCommitted = publicExportCommitted,
+                                verified = verified,
+                                message = error
+                            )
+                            return@post
+                        }
                         updateExportMetadata(outputDir, export, true, finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
                             postExportCancellationRequested = true, postExportWorkSkipped = true,
@@ -989,7 +1039,19 @@ post(
                             "used ${result.usedFrameCount}/${result.inputFrameCount} frames, " +
                             "fallback=${result.fallbackUsed}."
                     )
-                    consumeSourceHandoffIfStillPresent()
+                    val handoffConsumedOnSuccess = consumeSourceHandoffIfStillPresent()
+                    if (!handoffConsumedOnSuccess) {
+                        val error = "Source handoff consume failed after verified success; cannot proceed to terminal."
+                        post("PIPELINE_FAILED: $error")
+                        terminal.publish(
+                            CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
+                            requiredOutputCommitted = true,
+                            publicExportCommitted = true,
+                            verified = true,
+                            message = error
+                        )
+                        return@post
+                    }
                     terminal.publish(
                         CameraPipelineEvent.Terminal.Kind.COMPLETE,
                         requiredOutputCommitted = true,

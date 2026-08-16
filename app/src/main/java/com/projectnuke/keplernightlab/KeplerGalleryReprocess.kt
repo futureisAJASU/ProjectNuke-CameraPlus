@@ -514,12 +514,10 @@ val target = try { requireReprocessSafeJobDirectory(context, jobDir) }
     catch (ie: InternalError) { throw ie }
     catch (e: Error) { throw e }
     catch (sf: Exception) { return@withContext Result.failure(sf) }
-    // Same-process UNKNOWN public commit-state convergence: a previous attempt whose commit
-    // state could not be determined is re-reconciled (exactly as restart recovery would) before
-    // this mutation proceeds, so the reprocess gate sees converged evidence instead of a stale
-    // COMMIT_UNKNOWN record with a blocking pre-commit journal.
+    // Bounded same-process MediaStore debt convergence driven by ACTUAL unresolved current journals,
+    // not merely `job.exportCommitState == UNKNOWN`. Every relevant journal is inspected by role.
     try {
-        settleUnknownPublicCommitState(context, target)
+        settleMediaStoreExportDebt(context, target)
     } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
     catch (oom: OutOfMemoryError) { throw oom }
     catch (td: ThreadDeath) { throw td }
@@ -527,9 +525,9 @@ val target = try { requireReprocessSafeJobDirectory(context, jobDir) }
     catch (ie: InternalError) { throw ie }
     catch (e: Error) { throw e }
     catch (settleFailure: Exception) {
-        // The COMMIT_UNKNOWN record is durable evidence; restart recovery stays authoritative
+        // Unresolved journals remain durable evidence; restart recovery stays authoritative
         // when the same-process reconciliation cannot settle it.
-        android.util.Log.w("KeplerGalleryReprocess", "Unknown public commit state settlement failed", settleFailure)
+        android.util.Log.w("KeplerGalleryReprocess", "MediaStore export debt settlement failed", settleFailure)
     }
     val session = ReprocessTransactionSession(target)
     val operationLease = try {
@@ -1650,7 +1648,7 @@ internal fun finalizeTransaction(
         Result.failure(IllegalStateException("Operation lease owner mismatch during finalization"))
     )
 
-    val currentAttemptLocalOutput = try {
+val currentAttemptLocalOutput = try {
         currentProcessingAttemptRequiredOutputFileForLease(jobDir, ownedLease)
     } catch (failure: Throwable) {
         val priorFailure = outcome.terminalError ?: terminal.exceptionOrNull()
@@ -1658,12 +1656,14 @@ internal fun finalizeTransaction(
         if (combined is Error || combined is CancellationException) throw combined
         null
     }
-val currentAttemptHasLocalResult = currentAttemptLocalOutput != null
-    val hasUnknownPublicExport = outcome.publicExportCommitted == false &&
-        outcome.exportVerified == false &&
-        outcome.export?.publicCommitState == GalleryExportCommitState.UNKNOWN &&
-        !currentAttemptHasLocalResult &&
-        (outcome.finalOutputFile?.isFile != true || outcome.finalOutputFile.length() == 0L)
+    val currentAttemptHasLocalResult = currentAttemptLocalOutput != null
+    // UNKNOWN means "whether a NEW external public result committed is unresolved"; this is
+    // independent of any current local output.  A local result can make the local transaction
+    // usable, but it never makes the unknown external side effect rollback-safe.
+    val publicExportUnknown = outcome.export?.publicCommitState == GalleryExportCommitState.UNKNOWN
+    val hasUnknownPublicExport = publicExportUnknown &&
+        outcome.publicExportCommitted == false &&
+        outcome.exportVerified == false
     val hasUsableOutput = outcome.publicExportCommitted || outcome.exportVerified ||
         (outcome.finalOutputFile?.isFile == true && outcome.finalOutputFile.length() > 0L) ||
         currentAttemptHasLocalResult
@@ -1712,8 +1712,9 @@ val currentAttemptHasLocalResult = currentAttemptLocalOutput != null
       terminalResult
     },
             onFailure = { metadataError ->
-                if (outcome.publicExportCommitted) {
-                    // Public export committed but terminal metadata failed: quarantine, never rollback.
+                if (outcome.publicExportCommitted || publicExportUnknown) {
+                    // Public export is committed or its commit authority is UNKNOWN: a NEW public
+                    // row may already exist.  Quarantine/defer; NEVER roll back this transaction.
                     return@fold quarantineWithPersistence(transaction, metadataError)
                 }
                 rollback(session, transaction, ownedLease, jobDir, jobKind, outcome, metadataError)
@@ -1900,6 +1901,31 @@ internal fun rollback(
 }
 
 /**
+ * Settles a reprocess terminal owner without ever generic-clearing a specialized PUBLIC_EXPORT.
+ * PUBLIC_EXPORT uses its journal-settled terminal mediation: ACTIVE is cleared only when every
+ * owner-correlated journal is terminal-acked/proven; otherwise ACTIVE + lease remain reachable
+ * debt for the next acquisition/settlement.  Returns true when the durable owner marker is gone.
+ */
+private fun settleReprocessTerminalOwner(jobDir: File, lease: JobOperationLease): MediaStoreExportTerminalSettlementStatus {
+    val activeOperationId = try {
+        KeplerJobMetadata.read(jobDir).optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        null
+    } ?: return MediaStoreExportTerminalSettlementStatus.SETTLED
+    if (lease.currentDurableOperationKind() == KeplerActiveOperationKind.PUBLIC_EXPORT) {
+        return markMediaStoreExportJournalsTerminalPersisted(jobDir, lease)
+    }
+    val cleared = KeplerJobMetadata.clearActiveOperation(jobDir, activeOperationId, lease)
+    return if (cleared || !KeplerJobMetadata.isCurrentActiveOperation(jobDir, activeOperationId)) {
+        MediaStoreExportTerminalSettlementStatus.SETTLED
+    } else {
+        MediaStoreExportTerminalSettlementStatus.DEFERRED
+    }
+}
+
+/**
  * Shared terminal-cleanup-debt helper. Called after durable COMMITTED or ROLLED_BACK.
  * Fallback removal, quarantine-marker removal, warning metadata, and backup cleanup are cleanup debt only.
  * Always releases the operation lease in the outermost `finally`. Never downgrades terminal result.
@@ -1977,18 +2003,10 @@ private fun performTerminalCleanupDebt(
     } finally {
         var ownerSettled = true
         try {
-            val activeOperationId = KeplerJobMetadata.read(jobDir)
-                .optString(ACTIVE_OPERATION_ID)
-                .takeIf { it.isNotBlank() }
-            if (activeOperationId != null) {
-                check(KeplerJobMetadata.isOperationOwner(jobDir, lease)) {
-                    "Reprocess terminal cleanup lost the exact owner lease"
-                }
-                val cleared = KeplerJobMetadata.clearActiveOperation(jobDir, activeOperationId, lease)
-                ownerSettled = cleared || !KeplerJobMetadata.isCurrentActiveOperation(jobDir, activeOperationId)
-                if (!ownerSettled) {
-                    warnings += "Durable reprocess owner cleanup remains pending."
-                }
+            val settlementStatus = settleReprocessTerminalOwner(jobDir, lease)
+            ownerSettled = settlementStatus == MediaStoreExportTerminalSettlementStatus.SETTLED
+            if (!ownerSettled) {
+                warnings += "Durable reprocess owner cleanup remains pending (status=$settlementStatus)."
             }
         } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
         catch (oom: OutOfMemoryError) { throw oom }
@@ -4062,7 +4080,7 @@ private fun writeReprocessSuccess(
         .put("galleryDisplayUnavailable", false)
         .put("canReprocess", sourceFrameCount > 0)
         .put("finalOutputFormatSetting", outputSettings.name)
-        .put("exportStatus", if (export == null) "NOT_EXPORTED" else "EXPORTED")
+        .put("exportStatus", reprocessExportStatus(export))
         .put("exportVerified", exportVerified)
         .put("galleryExportCommitted", export?.publicCommitted == true)
         .put("exportCommitState", export?.publicCommitState?.name ?: GalleryExportCommitState.NOT_COMMITTED.name)
@@ -4081,7 +4099,7 @@ private fun writeReprocessSuccess(
         .put("rawSidecarExportedFiles", JSONArray(sidecarResult?.exportedFiles ?: emptyList<String>()))
         .put("rawSidecarError", sidecarResult?.errorMessage ?: JSONObject.NULL)
         .put("reprocessError", JSONObject.NULL)
-        .put("reprocessWarning", currentWarning ?: JSONObject.NULL)
+        .put("reprocessWarning", reprocessExportWarning(export) ?: currentWarning ?: JSONObject.NULL)
     if (currentWarning != null) {
         val previousWarnings = job.optJSONArray("reprocessWarnings") ?: JSONArray().also { job.put("reprocessWarnings", it) }
         previousWarnings.put(currentWarning)
@@ -4107,6 +4125,26 @@ private fun writeReprocessSuccess(
     putReprocessAvailability(jobDir, job, sourceFrameCount, finalOutputFile)
     recordReprocessTerminalMetadata(job, "COMPLETE", null)
     }
+}
+
+/** Explicit four-state commit-state mapper for reprocess metadata writers. */
+private fun reprocessExportStatus(export: GalleryExportResult?): String = when {
+    export == null -> "NOT_EXPORTED"
+    export.publicCommitState == GalleryExportCommitState.NOT_COMMITTED -> "EXPORT_FAILED"
+    export.publicCommitState == GalleryExportCommitState.UNKNOWN -> "EXPORT_COMMIT_UNKNOWN"
+    export.publicCommitState == GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED -> "COMMITTED_UNVERIFIED"
+    export.publicCommitState == GalleryExportCommitState.VERIFIED -> "EXPORTED"
+    else -> "NOT_EXPORTED"
+}
+
+/** Explicit warning message matching the commit state. */
+private fun reprocessExportWarning(export: GalleryExportResult?): String? = when {
+    export == null -> null
+    export.publicCommitState == GalleryExportCommitState.NOT_COMMITTED -> "Local result preserved; public export failed."
+    export.publicCommitState == GalleryExportCommitState.UNKNOWN -> "Public export commit state could not yet be resolved."
+    export.publicCommitState == GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED -> "Public export committed; verification incomplete."
+    export.publicCommitState == GalleryExportCommitState.VERIFIED -> null
+    else -> null
 }
 
 private fun writeReprocessFailure(jobDir: File, error: String) {
@@ -4164,7 +4202,7 @@ private fun writeReprocessPartial(
         .put("galleryVisible", finalOutputFile?.isFile == true)
         .put("galleryDisplayUnavailable", finalOutputFile?.isFile != true)
         .put("finalOutputFormatSetting", outputSettings.name)
-        .put("exportStatus", if (exportVerified) "EXPORTED" else "EXPORT_UNVERIFIED")
+        .put("exportStatus", reprocessExportStatus(export))
         .put("exportVerified", exportVerified)
         .put("galleryExportCommitted", export?.publicCommitted == true)
         .put("exportCommitState", export?.publicCommitState?.name ?: GalleryExportCommitState.NOT_COMMITTED.name)
@@ -4182,7 +4220,7 @@ private fun writeReprocessPartial(
         })
         .put("rawSidecarExportedFiles", JSONArray(sidecarResult?.exportedFiles ?: emptyList<String>()))
         .put("rawSidecarError", sidecarResult?.errorMessage ?: JSONObject.NULL)
-        .put("reprocessWarning", currentWarning ?: JSONObject.NULL)
+        .put("reprocessWarning", reprocessExportWarning(export) ?: currentWarning ?: JSONObject.NULL)
     if (currentWarning != null) {
         val previousWarnings = job.optJSONArray("reprocessWarnings") ?: JSONArray().also { job.put("reprocessWarnings", it) }
         previousWarnings.put(currentWarning)
@@ -4237,10 +4275,11 @@ private fun writeReprocessPartialPublicOnly(
             .put("galleryVisible", false)
             .put("galleryDisplayUnavailable", true)
             .put("finalOutputFormatSetting", outputSettings.name)
-            .put("exportStatus", if (exportVerified) "EXPORTED" else "EXPORT_UNVERIFIED")
-            .put("exportVerified", exportVerified)
-            .put("galleryExportCommitted", export?.publicCommitted == true)
-            .put("exportCommitState", export?.publicCommitState?.name ?: GalleryExportCommitState.NOT_COMMITTED.name)
+.put("exportStatus", reprocessExportStatus(export))
+.put("exportVerified", exportVerified)
+        .put("galleryExportCommitted", export?.publicCommitted == true)
+        .put("exportCommitState", export?.publicCommitState?.name ?: GalleryExportCommitState.NOT_COMMITTED.name)
+        .put("reprocessWarning", reprocessExportWarning(export) ?: currentWarning ?: JSONObject.NULL)
             .put("exportUri", export?.uriString ?: JSONObject.NULL)
             .put("exportDisplayName", export?.displayName ?: JSONObject.NULL)
             .put("exportMimeType", export?.mimeType ?: JSONObject.NULL)
@@ -4256,7 +4295,7 @@ private fun writeReprocessPartialPublicOnly(
             .put("rawSidecarExportedFiles", JSONArray(sidecarResult?.exportedFiles ?: emptyList<String>()))
             .put("rawSidecarError", sidecarResult?.errorMessage ?: JSONObject.NULL)
             .put("reprocessError", JSONObject.NULL)
-            .put("reprocessWarning", currentWarning ?: JSONObject.NULL)
+            .put("reprocessWarning", reprocessExportWarning(export) ?: currentWarning ?: JSONObject.NULL)
         if (currentWarning != null) {
             val previousWarnings = job.optJSONArray("reprocessWarnings") ?: JSONArray().also { job.put("reprocessWarnings", it) }
             previousWarnings.put(currentWarning)

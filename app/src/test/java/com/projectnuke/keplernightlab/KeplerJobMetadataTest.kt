@@ -824,9 +824,13 @@ class KeplerJobMetadataTest {
                 .transition(directory, MediaStoreExportState.VERIFIED)
                 .exportAttemptId
 
-            settleOwnedPublicExportInterruption(directory, lease!!, "interruption")
+            // With a lagging CONTENT_WRITTEN journal and no provider access, the settlement
+            // must defer ALL acknowledgments (including the verified journal) to preserve
+            // the invariant that ACTIVE is only cleared when ALL owner journals are resolved.
+            val settled = settleOwnedPublicExportInterruption(directory, lease!!, "interruption")
+            assertFalse(settled)
 
-            assertTrue(
+            assertFalse(
                 MediaStoreExportJournal.read(
                     directory,
                     MediaStoreExportJournal.fileFor(directory, verifiedAttempt)
@@ -838,6 +842,10 @@ class KeplerJobMetadataTest {
                     MediaStoreExportJournal.fileFor(directory, laggingAttempt)
                 ).terminalMetadataPersisted
             )
+            // ACTIVE should still be present
+            val metadata = KeplerJobMetadata.read(directory)
+            assertTrue(metadata.has(ACTIVE_OPERATION_ID))
+            assertEquals("PUBLIC_EXPORT", metadata.getString(ACTIVE_OPERATION_KIND))
         } finally {
             lease?.release()
             directory.deleteRecursively()
@@ -872,12 +880,15 @@ class KeplerJobMetadataTest {
                 .transition(directory, MediaStoreExportState.CONTENT_WRITTEN)
                 .exportAttemptId
 
-            settleOwnedPublicExportInterruption(
+            // With a CONTENT_WRITTEN journal (pre-commit) and no provider access,
+            // the settlement must defer and retain ACTIVE + lease.
+            val settled = settleOwnedPublicExportInterruption(
                 directory,
                 lease!!,
                 "cancelled before commit",
                 disposition = PublicExportInterruptionDisposition.CANCELLED
             )
+            assertFalse(settled)
 
             assertFalse(
                 MediaStoreExportJournal.read(
@@ -885,10 +896,11 @@ class KeplerJobMetadataTest {
                     MediaStoreExportJournal.fileFor(directory, attempt)
                 ).terminalMetadataPersisted
             )
-            val settled = KeplerJobMetadata.read(directory)
-            assertFalse(settled.has(ACTIVE_OPERATION_ID))
-            assertEquals("CANCELLED", settled.getString("currentPipelineStage"))
-            assertFalse(settled.optBoolean("galleryExportCommitted", false))
+            // ACTIVE should still be present
+            val settledMetadata = KeplerJobMetadata.read(directory)
+            assertTrue(settledMetadata.has(ACTIVE_OPERATION_ID))
+            assertEquals("PUBLIC_EXPORT", settledMetadata.getString(ACTIVE_OPERATION_KIND))
+            assertEquals("PROCESSING", settledMetadata.getString("currentPipelineStage"))
         } finally {
             lease?.release()
             directory.deleteRecursively()
@@ -1055,26 +1067,23 @@ class KeplerJobMetadataTest {
                 ownerOperationId = operationId
             ).transition(directory, MediaStoreExportState.PUBLIC_COMMITTED, "content://media/new-uri")
 
-            settleOwnedPublicExportInterruption(
+            // With a PUBLIC_COMMITTED journal (committed but unverified) and no provider access,
+            // the settlement must defer and retain ACTIVE + lease. The exact candidate URI is
+            // preserved as evidence but no terminal metadata is written until provider confirms.
+            val settled = settleOwnedPublicExportInterruption(
                 directory,
                 lease!!,
                 "cancelled after public commit",
                 disposition = PublicExportInterruptionDisposition.CANCELLED
             )
+            assertFalse(settled)
 
-            val settled = KeplerJobMetadata.read(directory)
-            assertEquals("PARTIAL", settled.getString("currentPipelineStage"))
-            assertEquals("EXPORT_COMMITTED_PENDING_VERIFICATION", settled.getString("processStatus"))
-            assertEquals("content://media/new-uri", settled.getString("exportUri"))
-            assertTrue(settled.getBoolean("galleryExportCommitted"))
-            assertFalse(settled.getBoolean("exportVerified"))
-            assertEquals(
-                CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
-                publicExportInterruptionTerminalKind(
-                    OwnedPublicExportEvidence(operationId, committed = true, verified = false, uri = "content://media/new-uri"),
-                    cancellationRequested = true
-                )
-            )
+            // ACTIVE should still be present, no terminal metadata written
+            val metadata = KeplerJobMetadata.read(directory)
+            assertTrue(metadata.has(ACTIVE_OPERATION_ID))
+            assertEquals("PUBLIC_EXPORT", metadata.getString(ACTIVE_OPERATION_KIND))
+            assertEquals("PROCESSING", metadata.getString("currentPipelineStage"))
+            assertFalse(metadata.optBoolean("galleryExportCommitted", false))
         } finally {
             lease?.release()
             directory.deleteRecursively()

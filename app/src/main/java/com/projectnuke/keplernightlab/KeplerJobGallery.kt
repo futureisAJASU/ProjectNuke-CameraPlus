@@ -94,19 +94,21 @@ data class KeplerGalleryFrame(
 fun loadJobJson(jobDir: File): JSONObject =
     KeplerJobMetadata.read(jobDir)
 
-fun saveJobJson(jobDir: File, job: JSONObject) {
+fun saveJobJson(context: Context, jobDir: File, job: JSONObject) {
     val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
         jobDir,
         JobRecoveryMutationIntent.METADATA_EDIT
     )
     try {
+        // Attempt safe debt convergence before mutation
+        settleMediaStoreExportDebt(context, jobDir)
         KeplerJobMetadata.write(jobDir, job)
     } finally {
         lease.release()
     }
 }
 
-fun setFrameExcluded(jobDir: File, frameIndex: Int, excluded: Boolean) {
+fun setFrameExcluded(context: Context, jobDir: File, frameIndex: Int, excluded: Boolean) {
     // External mutation: acquire own operation lease, reject unresolved transactions
     val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
         jobDir,
@@ -114,6 +116,8 @@ fun setFrameExcluded(jobDir: File, frameIndex: Int, excluded: Boolean) {
     )
     try {
         require(!isReprocessQuarantined(jobDir)) { "Cannot modify frames of a quarantined or unresolved reprocess job." }
+        // Attempt safe debt convergence before mutation
+        settleMediaStoreExportDebt(context, jobDir)
         KeplerJobMetadata.update(jobDir) { job ->
         val frames = job.getJSONArray("frames")
         var found = false
