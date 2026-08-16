@@ -788,6 +788,7 @@ private fun decodeLumaThumbnail(file: File): LumaThumbnail {
             inMutable = true
         }
     ) ?: error("Could not decode frame: ${file.name}")
+    var primaryFailure: Throwable? = null
     return try {
         val pixels = IntArray(bitmap.width * bitmap.height)
         val luma = ByteArray(pixels.size)
@@ -805,8 +806,18 @@ private fun decodeLumaThumbnail(file: File): LumaThumbnail {
             luma = luma,
             mean = sum.toFloat() / pixels.size.coerceAtLeast(1)
         )
+    } catch (failure: Throwable) {
+        primaryFailure = failure
+        throw failure
     } finally {
-        bitmap.recycle()
+        var cleanupFailure: Throwable? = null
+        try {
+            bitmap.recycle()
+        } catch (failure: Throwable) {
+            cleanupFailure = failure
+        }
+        val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+        if (combined !== primaryFailure) throw requireNotNull(combined)
     }
 }
 
@@ -966,12 +977,23 @@ private fun mergeClassicFrames(
                 Rect(0, tileTop, width, tileBottom),
                 decodeOpts
             ) ?: error("Could not decode reference tile")
+            var referencePixelsFailure: Throwable? = null
             val referencePixels = try {
                 IntArray(pixelCount).also {
                     referenceBitmap.getPixels(it, 0, width, 0, 0, width, tileHeight)
                 }
+            } catch (failure: Throwable) {
+                referencePixelsFailure = failure
+                throw failure
             } finally {
-                referenceBitmap.recycle()
+                var cleanupFailure: Throwable? = null
+                try {
+                    referenceBitmap.recycle()
+                } catch (failure: Throwable) {
+                    cleanupFailure = failure
+                }
+                val combined = combineSettlementFailure(referencePixelsFailure, cleanupFailure)
+                if (combined !== referencePixelsFailure) throw requireNotNull(combined)
             }
 
             val sumR = FloatArray(pixelCount)
@@ -1005,6 +1027,7 @@ private fun mergeClassicFrames(
         val region = Rect(sourceLeft, sourceTop, sourceRight, sourceBottom)
         val frameBitmap = decoders.getValue(frame).decodeRegion(region, decodeOpts)
             ?: return@frameLoop
+                var framePixelsFailure: Throwable? = null
                 val (frameWidth, frameHeight, framePixels) = try {
                     val frameWidth = frameBitmap.width
                     val frameHeight = frameBitmap.height
@@ -1013,8 +1036,18 @@ private fun mergeClassicFrames(
                         framePixels, 0, frameWidth, 0, 0, frameWidth, frameHeight
                     )
                     Triple(frameWidth, frameHeight, framePixels)
+                } catch (failure: Throwable) {
+                    framePixelsFailure = failure
+                    throw failure
                 } finally {
-                    frameBitmap.recycle()
+                    var cleanupFailure: Throwable? = null
+                    try {
+                        frameBitmap.recycle()
+                    } catch (failure: Throwable) {
+                        cleanupFailure = failure
+                    }
+                    val combined = combineSettlementFailure(framePixelsFailure, cleanupFailure)
+                    if (combined !== framePixelsFailure) throw requireNotNull(combined)
                 }
 
                 val alignmentWeight = alignmentWeight(
@@ -1598,6 +1631,7 @@ private fun generateFusionDebugArtifacts(
         )
         var fusedPreview: Bitmap? = null
         var comparison: Bitmap? = null
+        var debugPrimaryFailure: Throwable? = null
         try {
             fusedPreview = Bitmap.createScaledBitmap(
                 fusedBitmap,
@@ -1625,13 +1659,27 @@ private fun generateFusionDebugArtifacts(
                 finalImage = yuvFinalPreview,
                 compareFileName = "yuv_compare_reference_vs_final.png"
             )
+        } catch (failure: Throwable) {
+            debugPrimaryFailure = failure
+            throw failure
         } finally {
-            comparison?.recycle()
-            if (fusedPreview != null && fusedPreview !== fusedBitmap) fusedPreview.recycle()
-            yuvBeforeDenoisePreview.recycle()
-            yuvNoSharpenPreview.recycle()
-            yuvFinalPreview.recycle()
-            referencePreview.recycle()
+            var cleanupFailure: Throwable? = null
+            listOfNotNull(
+                comparison,
+                fusedPreview?.takeUnless { it === fusedBitmap },
+                yuvBeforeDenoisePreview,
+                yuvNoSharpenPreview,
+                yuvFinalPreview,
+                referencePreview
+            ).forEach { bitmap ->
+                try {
+                    bitmap.recycle()
+                } catch (failure: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+                }
+            }
+            val combined = combineSettlementFailure(debugPrimaryFailure, cleanupFailure)
+            if (combined !== debugPrimaryFailure) throw requireNotNull(combined)
         }
         job.put("referenceFrameDebugFile", referenceOutput.name)
             .put("yuvReferencePreviewFile", yuvReferenceOutput.name)

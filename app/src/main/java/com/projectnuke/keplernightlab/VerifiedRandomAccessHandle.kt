@@ -5,6 +5,7 @@ import java.io.RandomAccessFile
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.security.MessageDigest
+import java.util.concurrent.CancellationException
 
 /**
  * Owns the exact RandomAccessFile used for RAW processing. The opened handle
@@ -43,6 +44,8 @@ internal class VerifiedRandomAccessHandle private constructor(
             null
         } catch (fatal: Error) {
             throw fatal
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (failure: Exception) {
             failure
         }
@@ -62,25 +65,12 @@ internal class VerifiedRandomAccessHandle private constructor(
         } finally {
             val closeFailure = try {
                 close()
-            } catch (closeFatal: Error) {
-                when {
-                    primaryFailure is Error -> {
-                        if (primaryFailure !== closeFatal) primaryFailure.addSuppressed(closeFatal)
-                        throw primaryFailure
-                    }
-                    primaryFailure != null -> {
-                        closeFatal.addSuppressed(primaryFailure)
-                        throw closeFatal
-                    }
-                    else -> throw closeFatal
-                }
+            } catch (settlementFailure: Throwable) {
+                settlementFailure
             }
             if (closeFailure != null) {
-                if (primaryFailure != null) {
-                    primaryFailure.addSuppressed(closeFailure)
-                } else {
-                    throw closeFailure
-                }
+                val combined = combineSettlementFailure(primaryFailure, closeFailure)
+                if (combined !== primaryFailure) throw requireNotNull(combined)
             }
         }
     }
@@ -118,21 +108,13 @@ internal class VerifiedRandomAccessHandle private constructor(
                     closeAction = { randomAccess.close() }
                 )
             } catch (failure: Throwable) {
+                var closeFailure: Throwable? = null
                 try {
                     randomAccess.close()
-                } catch (closeFailure: Throwable) {
-                    when {
-                        failure is Error -> {
-                            if (failure !== closeFailure) failure.addSuppressed(closeFailure)
-                        }
-                        closeFailure is Error -> {
-                            closeFailure.addSuppressed(failure)
-                            throw closeFailure
-                        }
-                        else -> failure.addSuppressed(closeFailure)
-                    }
+                } catch (secondary: Throwable) {
+                    closeFailure = secondary
                 }
-                throw failure
+                throw requireNotNull(combineSettlementFailure(failure, closeFailure))
             }
         }
 

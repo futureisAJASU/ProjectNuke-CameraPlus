@@ -1000,6 +1000,7 @@ private fun writeRawFusionDebugPreviews(
     var fusedBitmap: Bitmap? = null
     var referenceBitmap: Bitmap? = null
     var compare: Bitmap? = null
+    var primaryFailure: Throwable? = null
     try {
         cancellation.throwIfCancelled()
         val refProxy = requireNotNull(reference.proxy)
@@ -1028,15 +1029,26 @@ private fun writeRawFusionDebugPreviews(
             .put("rawDebugArtifactStatus", "COMPLETE")
             .remove("rawDebugArtifactError")
     } catch (ce: CancellationException) {
+        primaryFailure = ce
         throw ce
+    } catch (fatal: Error) {
+        primaryFailure = fatal
+        throw fatal
     } catch (error: Exception) {
+        primaryFailure = error
         job.put("rawDebugArtifactStatus", "FAILED")
             .put("rawDebugArtifactError", "${error.javaClass.simpleName}: ${error.message}".take(240))
     } finally {
-        refBitmap?.takeUnless { it.isRecycled }?.recycle()
-        fusedBitmap?.takeUnless { it.isRecycled }?.recycle()
-        referenceBitmap?.takeUnless { it.isRecycled }?.recycle()
-        compare?.takeUnless { it.isRecycled }?.recycle()
+        var cleanupFailure: Throwable? = null
+        listOfNotNull(refBitmap, fusedBitmap, referenceBitmap, compare).forEach { bitmap ->
+            try {
+                bitmap.takeUnless { it.isRecycled }?.recycle()
+            } catch (failure: Throwable) {
+                cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+            }
+        }
+        val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+        if (combined !== primaryFailure) throw requireNotNull(combined)
     }
 }
 
