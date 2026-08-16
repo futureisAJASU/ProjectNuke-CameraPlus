@@ -954,8 +954,26 @@ fun captureRawBurstForFusion(
                             } else {
                                 durableCaptureLease.release()
                             }
-                        } else {
-                            Log.e("KeplerRawCapture", "retaining capture lease after terminal metadata settlement failure")
+} else {
+                            // The capture terminal record did not persist: register exact terminal debt so the next
+                            // production entry converges it and CLEARS the CAPTURE_RAW owner.  The handoff was
+                            // intentionally never published (no durable success claim), and the replay of the
+                            // terminal record + exact-owner clear is the same convergence path every other owner uses.
+                            val replayStatus = if (request.status == CaptureTerminalStatus.CANCELLED) {
+                                Triple("CANCELLED", "CANCELLED", "CAPTURE_CANCELLED")
+                            } else {
+                                Triple("FAILED", "FAILED", "PIPELINE_FAILED")
+                            }
+                            durableCaptureLease.markTerminalSettlementPending(
+                                PendingTerminalSettlement(
+                                    operationId = durableCaptureOperationId,
+                                    attemptStatus = replayStatus.first,
+                                    pipelineStage = replayStatus.second,
+                                    processStatus = replayStatus.third,
+                                    reason = "RAW capture terminal metadata settlement failed: ${request.reason ?: request.jobStatus}"
+                                )
+                            )
+                            Log.e("KeplerRawCapture", "retaining capture lease with terminal settlement debt after metadata failure")
                         }
                         cleanup()
                         publishRawTerminalSnapshot(

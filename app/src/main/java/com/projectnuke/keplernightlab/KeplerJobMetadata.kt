@@ -450,7 +450,8 @@ internal fun consumeProcessingHandoff(
         update(jobDir) { job ->
             if (operationId != null &&
                 (job.optString(ACTIVE_OPERATION_ID) != operationId ||
-                    job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id)
+                    job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id ||
+                    job.optString(ACTIVE_OPERATION_KIND) == KeplerActiveOperationKind.PUBLIC_EXPORT.name)
             ) return@update
             matched = true
             job.put("recoveryState", PROCESSING_CLEANUP_REQUIRED)
@@ -936,7 +937,8 @@ internal fun consumeProcessingHandoff(
      */
     internal fun settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
         jobDir: File,
-        ownerLease: JobOperationLease? = null
+        ownerLease: JobOperationLease? = null,
+        settleOnlyIfPresent: Boolean = false
     ): Boolean {
         val handoffPresent = try {
             read(jobDir).optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()
@@ -948,6 +950,7 @@ internal fun consumeProcessingHandoff(
             return false
         }
         if (!handoffPresent) {
+            if (settleOnlyIfPresent) return true
             if (ownerLease == null) return true
             val current = try {
                 read(jobDir)

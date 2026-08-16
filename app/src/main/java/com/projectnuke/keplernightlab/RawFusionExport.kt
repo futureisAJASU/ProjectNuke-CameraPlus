@@ -967,8 +967,15 @@ try {
                         reason = "RAW processing operation setup failed: ${failure.message}",
                         operationId = activeId
                     )
-                } catch (secondary: Throwable) {
+} catch (secondary: Throwable) {
                     terminalFailure = combineSettlementFailure(terminalFailure, secondary)
+                }
+                try {
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
+                        jobDir, settleOnlyIfPresent = true
+                    )
+                } catch (handoffFailure: Throwable) {
+                    terminalFailure = combineSettlementFailure(terminalFailure, handoffFailure)
                 }
                 if (terminalFailure is Error || terminalFailure is CancellationException) {
                     throw terminalFailure!!

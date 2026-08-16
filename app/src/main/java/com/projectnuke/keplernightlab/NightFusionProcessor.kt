@@ -411,6 +411,13 @@ fun processLatestNightFusionV02(
                 }
                 Log.e("KeplerYuvPipeline", "failed to persist processing failure metadata", failure)
             }
+            try {
+                KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
+                    jobDir!!, operationLease, settleOnlyIfPresent = true
+                )
+            } catch (handoffFailure: Throwable) {
+                primaryFailure = combineSettlementFailure(primaryFailure, handoffFailure)
+            }
             postTerminal(
                 if (requiredOutputCommitted) {
                     CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
@@ -444,13 +451,33 @@ fun processLatestNightFusionV02(
     } catch (failure: Error) {
         var cleanupFailure: Throwable? = null
         try {
+            val jobDir = findLatestColorBurstJobDir(context)
+            if (jobDir != null) {
+                KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
+                    jobDir, settleOnlyIfPresent = true
+                )
+            }
+        } catch (handoffFailure: Throwable) {
+            cleanupFailure = combineSettlementFailure(cleanupFailure, handoffFailure)
+        }
+        try {
             workerThread.quitSafely()
         } catch (secondary: Throwable) {
-            cleanupFailure = secondary
+            cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
         }
         throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
     } catch (cancelled: CancellationException) {
         var cleanupFailure: Throwable? = null
+        try {
+            val jobDir = findLatestColorBurstJobDir(context)
+            if (jobDir != null) {
+                KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
+                    jobDir, settleOnlyIfPresent = true
+                )
+            }
+        } catch (handoffFailure: Throwable) {
+            cleanupFailure = combineSettlementFailure(cleanupFailure, handoffFailure)
+        }
         try { workerThread.quitSafely() } catch (failure: Throwable) { cleanupFailure = failure }
         throw requireNotNull(combineSettlementFailure(cancelled, cleanupFailure))
     } catch (failure: Exception) {

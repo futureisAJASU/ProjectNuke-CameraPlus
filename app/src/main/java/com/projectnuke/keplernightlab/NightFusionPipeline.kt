@@ -336,6 +336,13 @@ val operationId = pipelineLease.currentDurableOperationId()
                         secondaryFailure = combineSettlementFailure(secondaryFailure, secondary)
                     }
                 }
+try {
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
+                        jobDir, pipelineLease
+                    )
+                } catch (secondary: Throwable) {
+                    secondaryFailure = combineSettlementFailure(secondaryFailure, secondary)
+                }
                 try {
                     pipelineLease.releaseIfProcessingSettled()
                 } catch (secondary: Throwable) {
@@ -611,7 +618,7 @@ val operationId = pipelineLease.currentDurableOperationId()
                         }
                         null
                     }
-                    terminal.publish(
+terminal.publish(
                         publicExportInterruptionTerminalKind(
                             evidence,
                             cancellationRequested = false,
@@ -623,6 +630,13 @@ val operationId = pipelineLease.currentDurableOperationId()
                         verified = evidence?.verified ?: verified,
                         message = e.message
                     )
+                    try {
+                        KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
+                            jobDir, pipelineLease, settleOnlyIfPresent = true
+                        )
+                    } catch (handoffFailure: Throwable) {
+                        primaryFailure = combineSettlementFailure(primaryFailure, handoffFailure)
+                    }
                 } catch (fatal: Error) {
                     primaryFailure = fatal
                     throw fatal
@@ -700,7 +714,7 @@ val operationId = pipelineLease.currentDurableOperationId()
                                 .put(TERMINAL_OPERATION_ID, operationId)
                                 .put("userCanMoveDevice", true)
                         }
-                        if (!KeplerJobMetadata.clearActiveOperation(jobDir, operationId, pipelineLease)) {
+if (!KeplerJobMetadata.clearActiveOperation(jobDir, operationId, pipelineLease)) {
                             pipelineLease.markDurableSettlementPending(operationId)
                         }
                     } catch (failure: Error) {
@@ -717,6 +731,15 @@ val operationId = pipelineLease.currentDurableOperationId()
                         )
                         android.util.Log.e("KeplerYuvPipeline", "worker dispatch terminal persistence failed", failure)
                     }
+                }
+                try {
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
+                        jobDir, pipelineLease
+                    )
+                } catch (failure: Error) {
+                    throw failure
+                } catch (failure: Exception) {
+                    pipelineLease.markProcessingHandoffSettlementPending()
                 }
                 try {
                     workerThread.quitSafely()

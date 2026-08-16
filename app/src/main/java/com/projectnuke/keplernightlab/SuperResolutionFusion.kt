@@ -1120,9 +1120,25 @@ post(
                     if (combined !== primaryFailure) throw requireNotNull(combined)
                 }
             } } catch (failure: Error) {
-                throw failure
+                var cleanupFailure: Throwable? = null
+                try {
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
+                        sourceJobDir, settleOnlyIfPresent = true
+                    )
+                } catch (handoffFailure: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, handoffFailure)
+                }
+                throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
             } catch (cancelled: CancellationException) {
-                throw cancelled
+                var cleanupFailure: Throwable? = null
+                try {
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
+                        sourceJobDir, settleOnlyIfPresent = true
+                    )
+                } catch (handoffFailure: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, handoffFailure)
+                }
+                throw requireNotNull(combineSettlementFailure(cancelled, cleanupFailure))
             } catch (failure: Exception) {
                 Log.e("KeplerSuperResolution", "worker dispatch failed", failure)
                 false
