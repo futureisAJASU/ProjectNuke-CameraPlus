@@ -716,8 +716,60 @@ fun captureProcessExportSuperResolutionFusion(
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.CANCELLED, message = "Capture cancelled before Super Resolution processing.")
                 return@captureYuvBurstColorWithMotion
             }
-            val workerThread = HandlerThread("KeplerSuperResolutionThread").apply { start() }
-            val workerHandler = Handler(workerThread.looper)
+            var startedWorkerThread: HandlerThread? = null
+            val workerThread: HandlerThread
+            val workerHandler: Handler
+            try {
+                val candidate = HandlerThread("KeplerSuperResolutionThread")
+                startedWorkerThread = candidate
+                candidate.start()
+                workerThread = candidate
+                workerHandler = Handler(workerThread.looper)
+            } catch (cancelled: CancellationException) {
+                var cleanupFailure: Throwable? = null
+                try { startedWorkerThread?.quitSafely() } catch (failure: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+                }
+                try {
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(sourceJobDir)
+                } catch (failure: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+                }
+                throw requireNotNull(combineSettlementFailure(cancelled, cleanupFailure))
+            } catch (failure: Error) {
+                var cleanupFailure: Throwable? = null
+                try { startedWorkerThread?.quitSafely() } catch (secondary: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
+                }
+                try {
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(sourceJobDir)
+                } catch (secondary: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
+                }
+                throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
+            } catch (failure: Exception) {
+                var cleanupFailure: Throwable? = null
+                try {
+                    startedWorkerThread?.quitSafely()
+                } catch (secondary: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
+                }
+                try {
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(sourceJobDir)
+                } catch (secondary: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
+                }
+                val combined = combineSettlementFailure(failure, cleanupFailure)
+                if (combined !== failure) {
+                    throw requireNotNull(combined)
+                }
+                post("PIPELINE_FAILED: Super Resolution worker setup failed.")
+                terminal.publish(
+                    CameraPipelineEvent.Terminal.Kind.FAILED,
+                    message = "Super Resolution worker setup failed."
+                )
+                return@captureYuvBurstColorWithMotion
+            }
             val workerPosted = try {
                 workerHandler.post {
                 var requiredOutputCommitted = false
@@ -824,7 +876,7 @@ fun captureProcessExportSuperResolutionFusion(
                         },
                         cleanup = { bitmap.recycle() }
                     )
-                    if (!export.success || export.uriString.isNullOrBlank()) {
+                    if (!export.publicCommitted || export.uriString.isNullOrBlank()) {
                         updateExportFailure(
                             jobDir = outputDir,
                             error = export.errorMessage ?: "Unknown export failure",
@@ -835,7 +887,7 @@ fun captureProcessExportSuperResolutionFusion(
                             operationLease = outputLease
                         )
                         post("PIPELINE_FAILED: 24M Fusion export failed. ${export.errorMessage}")
-                        val currentPublicCommit = export.success && !export.uriString.isNullOrBlank()
+                        val currentPublicCommit = export.publicCommitted
                         val currentRequiredOutputCommitted = requiredOutputCommitted ||
                             currentProcessingAttemptHasRequiredOutputClaimForLease(outputDir, outputLease)
                         terminal.publish(
@@ -854,7 +906,7 @@ fun captureProcessExportSuperResolutionFusion(
                     verified = verifyCommittedGalleryExport(context, export) is GalleryExportVerification.Verified
                     requiredOutputCommitted = requiredOutputCommitted ||
                         currentProcessingAttemptHasRequiredOutputClaimForLease(outputDir, outputLease)
-                    publicExportCommitted = export.success && !export.uriString.isNullOrBlank()
+                    publicExportCommitted = export.publicCommitted
                     updateExportMetadata(
                         jobDir = outputDir,
                         export = export,
@@ -862,19 +914,14 @@ fun captureProcessExportSuperResolutionFusion(
                         finalOutputFormat = finalOutputFormat,
                         rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
                         ,postExportCancellationRequested = cancellation.isCancelled,
-                        postExportWorkSkipped = cancellation.isCancelled
+                        postExportWorkSkipped = cancellation.isCancelled,
+                        operationLease = outputLease
                     )
                     if (!verified) {
-                        updateExportFailure(
-                            jobDir = outputDir,
-                            error = "Export verification failed",
-                            finalOutputFormat = finalOutputFormat,
-                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
-                            ,export = export,
-                            requiredOutputCommitted = requiredOutputCommitted,
-                            operationLease = outputLease
-                        )
-                        post("PIPELINE_FAILED: 24M Fusion export verification failed.")
+                        // The shared exporter has already persisted the committed-unverified
+                        // result.  A second failure writer would reopen a settled PUBLIC_EXPORT
+                        // boundary and could erase the exact committed URI.
+                        post("PIPELINE_COMPLETE_PARTIAL: 24M Fusion export verification was not proven.")
                         terminal.publish(
                             exportOutcomeTerminalKind(
                                 requiredOutputCommitted = requiredOutputCommitted,
@@ -892,7 +939,8 @@ fun captureProcessExportSuperResolutionFusion(
                     if (cancellation.isCancelled) {
                         updateExportMetadata(outputDir, export, true, finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
-                            postExportCancellationRequested = true, postExportWorkSkipped = true)
+                            postExportCancellationRequested = true, postExportWorkSkipped = true,
+                            operationLease = outputLease)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. Cache was kept.")
                         terminal.publish(
                             CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
@@ -1040,6 +1088,8 @@ fun captureProcessExportSuperResolutionFusion(
                 }
             } } catch (failure: Error) {
                 throw failure
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (failure: Exception) {
                 Log.e("KeplerSuperResolution", "worker dispatch failed", failure)
                 false
@@ -1057,7 +1107,15 @@ fun captureProcessExportSuperResolutionFusion(
                 if (!handoffSettled) {
                     Log.e("KeplerSuperResolution", "processing handoff remains protected after dispatch failure")
                 }
-                workerThread.quitSafely()
+                try {
+                    workerThread.quitSafely()
+                } catch (failure: Error) {
+                    throw failure
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    Log.e("KeplerSuperResolution", "worker shutdown after dispatch failure failed", failure)
+                }
                 post("PIPELINE_FAILED: 24M Fusion worker could not start.")
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = "24M Fusion worker could not start.")
             }
@@ -1345,6 +1403,7 @@ private fun fuseFramesTiled(
     val sourceHalo = ceil(maximumAcceptedShift).toInt() + outputHalo
     val decoders = linkedMapOf<Int, BitmapRegionDecoder>()
     var finished = false
+    var primaryFailure: Throwable? = null
     try {
         frames.forEach { frame ->
             cancellation.throwIfCancelled()
@@ -1443,17 +1502,29 @@ private fun fuseFramesTiled(
         }
         cancellation.throwIfCancelled()
         return sink.finish().also { finished = true }
+    } catch (failure: Throwable) {
+        primaryFailure = failure
+        throw failure
     } finally {
+        var cleanupFailure: Throwable? = null
         decoders.values.forEach { decoder ->
             try {
                 decoder.recycle()
             } catch (failure: Error) {
-                throw failure
+                cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
             } catch (_: Exception) {
                 // Decoder cleanup is best effort for ordinary exceptions.
             }
         }
-        if (!finished) sink.abort()
+        if (!finished) {
+            try {
+                sink.abort()
+            } catch (failure: Throwable) {
+                cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+            }
+        }
+        val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
+        if (combined !== primaryFailure) throw requireNotNull(combined)
     }
 }
 

@@ -120,8 +120,109 @@ fun processLatestNightFusionV02(
         }
     }
 
-    val workerThread = HandlerThread("KeplerNightFusionV02Thread").apply { start() }
-    val workerHandler = Handler(workerThread.looper)
+    fun persistStandaloneSetupFailure(failure: Exception) {
+        val target = try {
+            findLatestColorBurstJobDir(context)
+        } catch (secondary: Error) {
+            throw secondary
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        } ?: return
+        val lease = try {
+            KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                target,
+                JobRecoveryMutationIntent.PROCESSING_START,
+                consumesProcessingHandoff = true
+            )
+        } catch (secondary: Error) {
+            throw secondary
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return
+        }
+        var primaryFailure: Throwable? = null
+        try {
+            val operationId = KeplerJobMetadata.beginActiveOperation(
+                target,
+                kind = KeplerActiveOperationKind.PROCESSING_YUV,
+                ownerLease = lease
+            )
+            KeplerJobMetadata.update(target) { job ->
+                job.put("currentPipelineStage", "FAILED")
+                    .put("processStatus", "PIPELINE_FAILED")
+                    .put("pipelineFailed", true)
+                    .put("pipelineFailureSource", "processLatestNightFusionV02.setup")
+                    .put("pipelineFailureType", failure.javaClass.name)
+                    .put("pipelineFailureMessage", failure.message ?: failure.javaClass.simpleName)
+                    .put(TERMINAL_OPERATION_ID, operationId)
+                    .put("userCanMoveDevice", true)
+            }
+            KeplerJobMetadata.clearActiveOperation(target, operationId, lease)
+        } catch (secondary: Error) {
+            primaryFailure = secondary
+            throw secondary
+        } catch (failure: Exception) {
+            val operationId = lease.currentDurableOperationId()
+            if (operationId != null) {
+                try {
+                    lease.markTerminalSettlementPending(
+                        PendingTerminalSettlement(
+                            operationId = operationId,
+                            attemptStatus = "FAILED",
+                            pipelineStage = "FAILED",
+                            processStatus = "PIPELINE_FAILED",
+                            reason = failure.message ?: failure.javaClass.simpleName
+                        )
+                    )
+                } catch (secondary: Throwable) {
+                    primaryFailure = combineSettlementFailure(failure, secondary)
+                }
+            }
+        } finally {
+            try {
+                lease.releaseIfProcessingSettled()
+            } catch (secondary: Throwable) {
+                val combined = combineSettlementFailure(primaryFailure, secondary)
+                if (combined !== primaryFailure) throw requireNotNull(combined)
+            }
+        }
+        if (primaryFailure is Error || primaryFailure is CancellationException) {
+            throw primaryFailure!!
+        }
+    }
+
+    var startedThread: HandlerThread? = null
+    val workerThread: HandlerThread
+    val workerHandler: Handler
+    try {
+        val candidate = HandlerThread("KeplerNightFusionV02Thread")
+        startedThread = candidate
+        candidate.start()
+        workerThread = candidate
+        workerHandler = Handler(workerThread.looper)
+    } catch (cancelled: CancellationException) {
+        var cleanupFailure: Throwable? = null
+        try { startedThread?.quitSafely() } catch (failure: Throwable) { cleanupFailure = failure }
+        throw requireNotNull(combineSettlementFailure(cancelled, cleanupFailure))
+    } catch (failure: Error) {
+        var cleanupFailure: Throwable? = null
+        try { startedThread?.quitSafely() } catch (secondary: Throwable) { cleanupFailure = secondary }
+        throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
+    } catch (failure: Exception) {
+        try {
+            startedThread?.quitSafely()
+        } catch (cleanupFailure: Throwable) {
+            if (cleanupFailure is Error || cleanupFailure is CancellationException) {
+                throw cleanupFailure
+            }
+        }
+        persistStandaloneSetupFailure(failure)
+        postTerminal(CameraPipelineEvent.Terminal.Kind.FAILED, "PIPELINE_FAILED: YUV Night Fusion worker setup failed.")
+        return
+    }
 
     val workerPosted = try {
         (workerPostOperation ?: workerHandler::post).invoke(Runnable {
@@ -129,6 +230,21 @@ fun processLatestNightFusionV02(
         var operationLease: JobOperationLease? = null
         var requiredOutputCommitted = false
         var primaryFailure: Throwable? = null
+        fun retainTerminalSettlement(stage: String, processStatus: String, reason: String) {
+            val exactOperationId = operationLease?.currentDurableOperationId() ?: return
+            operationLease?.markTerminalSettlementPending(
+                PendingTerminalSettlement(
+                    operationId = exactOperationId,
+                    attemptStatus = when (stage) {
+                        "CANCELLED" -> "CANCELLED"
+                        else -> "FAILED"
+                    },
+                    pipelineStage = stage,
+                    processStatus = processStatus,
+                    reason = reason
+                )
+            )
+        }
         try {
             cancellation.throwIfCancelled()
             jobDir = findLatestColorBurstJobDir(context)
@@ -196,6 +312,19 @@ fun processLatestNightFusionV02(
                     }
                 } catch (failure: Throwable) {
                     primaryFailure = combineSettlementFailure(primaryFailure, failure)
+                    try {
+                        retainTerminalSettlement(
+                            stage = if (requiredOutputCommitted) "PARTIAL" else "CANCELLED",
+                            processStatus = if (requiredOutputCommitted) {
+                                "PIPELINE_CANCELLED_KEEPING_CACHE"
+                            } else {
+                                "PIPELINE_CANCELLED"
+                            },
+                            reason = "YUV Night Fusion processing cancelled"
+                        )
+                    } catch (secondary: Throwable) {
+                        primaryFailure = combineSettlementFailure(primaryFailure, secondary)
+                    }
                     if (primaryFailure is Error || primaryFailure is CancellationException) {
                         throw primaryFailure!!
                     }
@@ -213,6 +342,18 @@ fun processLatestNightFusionV02(
             )
         } catch (e: Exception) {
             primaryFailure = e
+            if (e is ProcessingAlreadyActiveException ||
+                e is ProcessingCleanupRequiredException ||
+                e is JobRecoveryMutationBlockedException
+            ) {
+                // This worker never acquired the exact durable owner.  Do not write FAILED into
+                // a job that is currently owned by another operation or blocked by recovery.
+                postTerminal(
+                    CameraPipelineEvent.Terminal.Kind.FAILED,
+                    "PIPELINE_FAILED: YUV Night Fusion is blocked; existing operation kept."
+                )
+                return@Runnable
+            }
             try {
                 requiredOutputCommitted = requiredOutputCommitted || jobDir?.let {
                     currentProcessingAttemptHasRequiredOutputClaimForLease(it, operationLease)
@@ -251,6 +392,19 @@ fun processLatestNightFusionV02(
                 }
             } catch (failure: Throwable) {
                 primaryFailure = combineSettlementFailure(primaryFailure, failure)
+                try {
+                    retainTerminalSettlement(
+                        stage = if (requiredOutputCommitted) "PARTIAL" else "FAILED",
+                        processStatus = if (requiredOutputCommitted) {
+                            "PIPELINE_FAILED_KEEPING_CACHE"
+                        } else {
+                            "PIPELINE_FAILED"
+                        },
+                        reason = e.shortMessage()
+                    )
+                } catch (secondary: Throwable) {
+                    primaryFailure = combineSettlementFailure(primaryFailure, secondary)
+                }
                 if (primaryFailure is Error || primaryFailure is CancellationException) {
                     throw primaryFailure!!
                 }
@@ -294,24 +448,33 @@ fun processLatestNightFusionV02(
             cleanupFailure = secondary
         }
         throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
+    } catch (cancelled: CancellationException) {
+        var cleanupFailure: Throwable? = null
+        try { workerThread.quitSafely() } catch (failure: Throwable) { cleanupFailure = failure }
+        throw requireNotNull(combineSettlementFailure(cancelled, cleanupFailure))
     } catch (failure: Exception) {
         Log.e("KeplerYuvPipeline", "worker dispatch failed", failure)
         false
     }
     if (!workerPosted) {
-        val handoffSettled = try {
-            val jobDir = findLatestColorBurstJobDir(context)
-            jobDir == null || KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(jobDir)
+        try {
+            persistStandaloneSetupFailure(
+                IllegalStateException("YUV Night Fusion worker could not start")
+            )
         } catch (failure: Error) {
             throw failure
         } catch (failure: Exception) {
-            Log.e("KeplerYuvPipeline", "processing handoff settlement failed", failure)
-            false
+            Log.e("KeplerYuvPipeline", "worker dispatch terminal persistence failed", failure)
         }
-        if (!handoffSettled) {
-            Log.e("KeplerYuvPipeline", "processing handoff remains protected after dispatch failure")
+        try {
+            workerThread.quitSafely()
+        } catch (failure: Error) {
+            throw failure
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            Log.e("KeplerYuvPipeline", "worker shutdown after dispatch failure failed", failure)
         }
-        workerThread.quitSafely()
         postTerminal(CameraPipelineEvent.Terminal.Kind.FAILED, "PIPELINE_FAILED: YUV Night Fusion worker could not start; cache kept.")
     }
 }

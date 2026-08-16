@@ -13,6 +13,65 @@ import java.util.concurrent.CancellationException
 import java.util.Date
 import java.util.Locale
 
+/** Durably settles a capture handoff when outer YUV setup fails before a worker lease is used. */
+internal fun persistYuvCaptureSetupFailure(
+    jobDir: File,
+    source: String,
+    failure: Exception
+) {
+    val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+        jobDir,
+        JobRecoveryMutationIntent.PROCESSING_START,
+        consumesProcessingHandoff = true
+    )
+    var operationId: String? = null
+    var primaryFailure: Throwable? = null
+    try {
+        operationId = KeplerJobMetadata.beginActiveOperation(
+            jobDir,
+            kind = KeplerActiveOperationKind.PROCESSING_YUV,
+            ownerLease = lease
+        )
+        KeplerJobMetadata.update(jobDir) { job ->
+            job.put("currentPipelineStage", "FAILED")
+                .put("processStatus", "PIPELINE_FAILED")
+                .put("pipelineFailed", true)
+                .put("pipelineFailureSource", source)
+                .put("pipelineFailureType", failure.javaClass.name)
+                .put("pipelineFailureMessage", failure.message ?: failure.javaClass.simpleName)
+                .put("userCanMoveDevice", true)
+                .put(TERMINAL_OPERATION_ID, operationId)
+        }
+        if (!KeplerJobMetadata.clearActiveOperation(jobDir, operationId, lease)) {
+            lease.markDurableSettlementPending(operationId)
+        }
+    } catch (terminalFailure: Throwable) {
+        primaryFailure = terminalFailure
+        try {
+            operationId?.let {
+                lease.markTerminalSettlementPending(
+                    PendingTerminalSettlement(
+                        operationId = it,
+                        attemptStatus = "FAILED",
+                        pipelineStage = "FAILED",
+                        processStatus = "PIPELINE_FAILED",
+                        reason = failure.message ?: failure.javaClass.simpleName
+                    )
+                )
+            }
+        } catch (secondary: Throwable) {
+            primaryFailure = combineSettlementFailure(primaryFailure, secondary)
+        }
+    } finally {
+        try {
+            lease.releaseIfProcessingSettled()
+        } catch (secondary: Throwable) {
+            primaryFailure = combineSettlementFailure(primaryFailure, secondary)
+        }
+    }
+    primaryFailure?.let { throw it }
+}
+
 fun captureProcessExportNightFusion(
     context: Context,
     cameraId: String,
@@ -85,15 +144,41 @@ fun captureProcessExportNightFusion(
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.CANCELLED, message = "Capture cancelled before processing started.")
                 return@captureYuvBurstColorWithMotion
             }
-            KeplerJobMetadata.update(jobDir) { current ->
-                current.put("captureMode", captureMode.name)
-                    .put("processingPresetName", processingParams.presetName)
-                    .put("processingParams", processingParams.clamped().toJson())
-                if (captureMode == CaptureMode.SINGLE_FRAME) {
-                    current.put("jobType", "YUV_SINGLE_FRAME")
-                        .put("requestedFrames", 1)
-                        .put("savedFrames", 1)
+            try {
+                KeplerJobMetadata.update(jobDir) { current ->
+                    current.put("captureMode", captureMode.name)
+                        .put("processingPresetName", processingParams.presetName)
+                        .put("processingParams", processingParams.clamped().toJson())
+                    if (captureMode == CaptureMode.SINGLE_FRAME) {
+                        current.put("jobType", "YUV_SINGLE_FRAME")
+                            .put("requestedFrames", 1)
+                            .put("savedFrames", 1)
+                    }
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Error) {
+                throw failure
+            } catch (failure: Exception) {
+                var settlementFailure: Throwable? = null
+                try {
+                    persistYuvCaptureSetupFailure(
+                        jobDir,
+                        "captureProcessExportNightFusion.metadataInitialization",
+                        failure
+                    )
+                } catch (secondary: Throwable) {
+                    settlementFailure = secondary
+                }
+                if (settlementFailure is Error || settlementFailure is CancellationException) {
+                    throw requireNotNull(combineSettlementFailure(failure, settlementFailure))
+                }
+                post("PIPELINE_FAILED: Capture metadata initialization failed; cache kept.")
+                terminal.publish(
+                    CameraPipelineEvent.Terminal.Kind.FAILED,
+                    message = "Capture metadata initialization failed; cache kept."
+                )
+                return@captureYuvBurstColorWithMotion
             }
             val pipelineLease = try {
                 KeplerJobMetadata.acquireRecoveryCheckedOperation(
@@ -103,7 +188,22 @@ fun captureProcessExportNightFusion(
                 )
             } catch (failure: Error) {
                 throw failure
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (failure: Exception) {
+                var settlementFailure: Throwable? = null
+                try {
+                    persistYuvCaptureSetupFailure(
+                        jobDir = jobDir,
+                        source = "captureProcessExportNightFusion.processingOwnership",
+                        failure = failure
+                    )
+                } catch (secondary: Throwable) {
+                    settlementFailure = secondary
+                }
+                if (settlementFailure is Error || settlementFailure is CancellationException) {
+                    throw requireNotNull(combineSettlementFailure(failure, settlementFailure))
+                }
                 post("PIPELINE_FAILED: Capture processing ownership could not be reserved; cache kept.")
                 terminal.publish(
                     CameraPipelineEvent.Terminal.Kind.FAILED,
@@ -111,8 +211,126 @@ fun captureProcessExportNightFusion(
                 )
                 return@captureYuvBurstColorWithMotion
             }
-            val workerThread = HandlerThread("KeplerCaptureProcessExportThread").apply { start() }
-            val workerHandler = Handler(workerThread.looper)
+            var startedThread: HandlerThread? = null
+            val workerThread: HandlerThread
+            val workerHandler: Handler
+            try {
+                val candidate = HandlerThread("KeplerCaptureProcessExportThread")
+                startedThread = candidate
+                candidate.start()
+                workerThread = candidate
+                workerHandler = Handler(workerThread.looper)
+            } catch (cancelled: CancellationException) {
+                var cleanupFailure: Throwable? = null
+                try { startedThread?.quitSafely() } catch (failure: Throwable) { cleanupFailure = failure }
+                try {
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(jobDir, pipelineLease)
+                } catch (failure: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+                }
+                throw requireNotNull(combineSettlementFailure(cancelled, cleanupFailure))
+            } catch (failure: Error) {
+                var cleanupFailure: Throwable? = null
+                try { startedThread?.quitSafely() } catch (secondary: Throwable) { cleanupFailure = secondary }
+                try {
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(jobDir, pipelineLease)
+                } catch (secondary: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
+                }
+                throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
+            } catch (failure: Exception) {
+                var terminalFailure: Throwable? = null
+                try {
+                    startedThread?.quitSafely()
+                } catch (secondary: Throwable) {
+                    terminalFailure = combineSettlementFailure(failure, secondary)
+                }
+                try {
+                    val operationId = pipelineLease.currentDurableOperationId()
+                        ?: KeplerJobMetadata.beginActiveOperation(
+                            jobDir,
+                            kind = KeplerActiveOperationKind.PROCESSING_YUV,
+                            ownerLease = pipelineLease
+                        )
+                    KeplerJobMetadata.update(jobDir) { job ->
+                        job.put("currentPipelineStage", "FAILED")
+                            .put("processStatus", "PIPELINE_FAILED")
+                            .put("pipelineFailed", true)
+                            .put("pipelineFailureSource", "captureProcessExportNightFusion.setup")
+                            .put("pipelineFailureType", failure.javaClass.name)
+                            .put("pipelineFailureMessage", failure.message ?: failure.javaClass.simpleName)
+                            .put("userCanMoveDevice", true)
+                            .put(TERMINAL_OPERATION_ID, operationId)
+                    }
+                    KeplerJobMetadata.clearActiveOperation(jobDir, operationId, pipelineLease)
+                } catch (secondary: Throwable) {
+                    terminalFailure = combineSettlementFailure(failure, secondary)
+                }
+                try {
+                    if (terminalFailure == null) pipelineLease.releaseIfProcessingSettled()
+                } catch (secondary: Throwable) {
+                    terminalFailure = combineSettlementFailure(terminalFailure ?: failure, secondary)
+                }
+                if (terminalFailure is Error || terminalFailure is CancellationException) {
+                    throw terminalFailure!!
+                }
+                post("PIPELINE_FAILED: YUV worker setup failed; cache kept.")
+                terminal.publish(
+                    CameraPipelineEvent.Terminal.Kind.FAILED,
+                    message = "YUV worker setup failed; cache kept."
+                )
+                return@captureYuvBurstColorWithMotion
+            }
+            fun settleWorkerDispatchFailure(primary: Throwable, cancelled: Boolean): Throwable {
+                var secondaryFailure: Throwable? = null
+                val operationId = try {
+                    pipelineLease.currentDurableOperationId()
+                        ?: KeplerJobMetadata.read(jobDir).optString(ACTIVE_OPERATION_ID)
+                            .takeIf { it.isNotBlank() }
+                } catch (secondary: Throwable) {
+                    secondaryFailure = combineSettlementFailure(secondaryFailure, secondary)
+                    null
+                }
+                if (operationId != null) {
+                    try {
+                        KeplerJobMetadata.update(jobDir) { job ->
+                            job.put("currentPipelineStage", if (cancelled) "CANCELLED" else "FAILED")
+                                .put("processStatus", if (cancelled) "PIPELINE_CANCELLED" else "PIPELINE_FAILED")
+                                .put("pipelineFailed", !cancelled)
+                                .put("pipelineFailureSource", "captureProcessExportNightFusion.workerDispatch")
+                                .put("pipelineFailureType", primary.javaClass.name)
+                                .put("pipelineFailureMessage", primary.message ?: primary.javaClass.simpleName)
+                                .put(TERMINAL_OPERATION_ID, operationId)
+                                .put("userCanMoveDevice", true)
+                        }
+                        if (!KeplerJobMetadata.clearActiveOperation(jobDir, operationId, pipelineLease)) {
+                            pipelineLease.markDurableSettlementPending(operationId)
+                        }
+                    } catch (secondary: Throwable) {
+                        pipelineLease.markTerminalSettlementPending(
+                            PendingTerminalSettlement(
+                                operationId = operationId,
+                                attemptStatus = if (cancelled) "CANCELLED" else "FAILED",
+                                pipelineStage = if (cancelled) "CANCELLED" else "FAILED",
+                                processStatus = if (cancelled) "PIPELINE_CANCELLED" else "PIPELINE_FAILED",
+                                reason = primary.message ?: primary.javaClass.simpleName
+                            )
+                        )
+                        secondaryFailure = combineSettlementFailure(secondaryFailure, secondary)
+                    }
+                }
+                try {
+                    pipelineLease.releaseIfProcessingSettled()
+                } catch (secondary: Throwable) {
+                    secondaryFailure = combineSettlementFailure(secondaryFailure, secondary)
+                }
+                try {
+                    workerThread.quitSafely()
+                } catch (secondary: Throwable) {
+                    secondaryFailure = combineSettlementFailure(secondaryFailure, secondary)
+                }
+                return requireNotNull(combineSettlementFailure(primary, secondaryFailure))
+            }
             val workerPosted = try { workerHandler.post {
                 var requiredOutputCommitted = false
                 var publicExportCommitted = false
@@ -198,7 +416,7 @@ fun captureProcessExportNightFusion(
                         cleanup = { bitmap.recycle() }
                     )
 
-                    if (!export.success || export.uriString.isNullOrBlank()) {
+                    if (!export.publicCommitted || export.uriString.isNullOrBlank()) {
                         updateExportFailure(
                             jobDir = jobDir,
                             error = export.errorMessage ?: "Unknown export failure",
@@ -209,7 +427,7 @@ fun captureProcessExportNightFusion(
                             operationLease = pipelineLease
                         )
                         post("PIPELINE_FAILED: Export failed; keeping cache. ${export.errorMessage}")
-                        val currentPublicCommit = export.success && !export.uriString.isNullOrBlank()
+                        val currentPublicCommit = export.publicCommitted
                         val currentRequiredOutputCommitted = requiredOutputCommitted ||
                             currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, pipelineLease)
                         terminal.publish(
@@ -227,7 +445,7 @@ fun captureProcessExportNightFusion(
 
                     post("Verifying gallery output...")
                     verified = verifyCommittedGalleryExport(context, export) is GalleryExportVerification.Verified
-                    publicExportCommitted = export.success && !export.uriString.isNullOrBlank()
+                    publicExportCommitted = export.publicCommitted
                     requiredOutputCommitted = requiredOutputCommitted ||
                         currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, pipelineLease)
                     updateExportMetadata(
@@ -237,20 +455,15 @@ fun captureProcessExportNightFusion(
                         finalOutputFormat = finalOutputFormat,
                         rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
                         ,postExportCancellationRequested = cancellation.isCancelled,
-                        postExportWorkSkipped = cancellation.isCancelled
+                        postExportWorkSkipped = cancellation.isCancelled,
+                        operationLease = pipelineLease
                     )
 
                     if (!verified) {
-                        updateExportFailure(
-                            jobDir = jobDir,
-                            error = "Export verification failed",
-                            finalOutputFormat = finalOutputFormat,
-                            rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar
-                            ,export = export,
-                            requiredOutputCommitted = requiredOutputCommitted,
-                            operationLease = pipelineLease
-                        )
-                        post("PIPELINE_FAILED: Export verification failed; keeping source frames.")
+                        // updateExportMetadata already persisted the exact committed URI as a
+                        // canonical PARTIAL result.  Do not run the pre-commit failure writer a
+                        // second time or clear/reclassify the same PUBLIC_EXPORT owner.
+                        post("PIPELINE_COMPLETE_PARTIAL: Export verification was not proven; keeping source frames.")
                         terminal.publish(
                             exportOutcomeTerminalKind(
                                 requiredOutputCommitted = requiredOutputCommitted,
@@ -268,7 +481,8 @@ fun captureProcessExportNightFusion(
                     if (cancellation.isCancelled) {
                         updateExportMetadata(jobDir, export, true, finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
-                            postExportCancellationRequested = true, postExportWorkSkipped = true)
+                            postExportCancellationRequested = true, postExportWorkSkipped = true,
+                            operationLease = pipelineLease)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. Cache was kept.")
                         terminal.publish(
                             CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL,
@@ -294,7 +508,8 @@ fun captureProcessExportNightFusion(
                             finalOutputFormat = finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
                             postExportCancellationRequested = true,
-                            postExportWorkSkipped = true
+                            postExportWorkSkipped = true,
+                            operationLease = pipelineLease
                         )
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. Cache was kept.")
                         terminal.publish(
@@ -436,28 +651,65 @@ fun captureProcessExportNightFusion(
                         throw combined
                     }
                 }
-            } } catch (failure: Error) {
-                throw failure
+            } } catch (cancelled: CancellationException) {
+                throw settleWorkerDispatchFailure(cancelled, cancelled = true)
+            } catch (failure: Error) {
+                throw settleWorkerDispatchFailure(failure, cancelled = false)
             } catch (failure: Exception) {
                 android.util.Log.e("KeplerYuvPipeline", "capture/process worker dispatch failed", failure)
                 false
             }
             if (!workerPosted) {
-                val handoffSettled = try {
-                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
-                        jobDir,
-                        pipelineLease
-                    )
+                val operationId = try {
+                    pipelineLease.currentDurableOperationId()
+                        ?: KeplerJobMetadata.read(jobDir).optString(ACTIVE_OPERATION_ID)
+                            .takeIf { it.isNotBlank() }
                 } catch (failure: Error) {
                     throw failure
                 } catch (failure: Exception) {
-                    android.util.Log.e("KeplerYuvPipeline", "processing handoff settlement failed", failure)
-                    false
+                    pipelineLease.markProcessingHandoffSettlementPending()
+                    android.util.Log.e("KeplerYuvPipeline", "worker dispatch owner inspection failed", failure)
+                    null
                 }
-                if (!handoffSettled) {
-                    android.util.Log.e("KeplerYuvPipeline", "retaining processing lease after handoff settlement failure")
+                if (operationId != null) {
+                    try {
+                        KeplerJobMetadata.update(jobDir) { job ->
+                            job.put("currentPipelineStage", "FAILED")
+                                .put("processStatus", "PIPELINE_FAILED")
+                                .put("pipelineFailed", true)
+                                .put("pipelineFailureSource", "captureProcessExportNightFusion.workerDispatch")
+                                .put("pipelineFailureType", IllegalStateException::class.java.name)
+                                .put("pipelineFailureMessage", "YUV worker could not be posted")
+                                .put(TERMINAL_OPERATION_ID, operationId)
+                                .put("userCanMoveDevice", true)
+                        }
+                        if (!KeplerJobMetadata.clearActiveOperation(jobDir, operationId, pipelineLease)) {
+                            pipelineLease.markDurableSettlementPending(operationId)
+                        }
+                    } catch (failure: Error) {
+                        throw failure
+                    } catch (failure: Exception) {
+                        pipelineLease.markTerminalSettlementPending(
+                            PendingTerminalSettlement(
+                                operationId = operationId,
+                                attemptStatus = "FAILED",
+                                pipelineStage = "FAILED",
+                                processStatus = "PIPELINE_FAILED",
+                                reason = "YUV worker could not be posted"
+                            )
+                        )
+                        android.util.Log.e("KeplerYuvPipeline", "worker dispatch terminal persistence failed", failure)
+                    }
                 }
-                workerThread.quitSafely()
+                try {
+                    workerThread.quitSafely()
+                } catch (failure: Error) {
+                    throw failure
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    android.util.Log.e("KeplerYuvPipeline", "worker shutdown after dispatch failure failed", failure)
+                }
                 post("PIPELINE_FAILED: Capture processing worker could not start; cache kept.")
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = "Capture processing worker could not start.")
             }
@@ -499,8 +751,25 @@ internal fun reprocessYuvJob(
         return result == ProcessingCallbackDispatchResult.ACCEPTED
     }
     val terminal = CompletableDeferred<ReprocessWorkerOutcome>()
-    val workerThread = HandlerThread("KeplerYuvReprocessThread").apply { start() }
-    val workerHandler = Handler(workerThread.looper)
+    var startedThread: HandlerThread? = null
+    val workerThread: HandlerThread
+    val workerHandler: Handler
+    try {
+        val candidate = HandlerThread("KeplerYuvReprocessThread")
+        startedThread = candidate
+        candidate.start()
+        workerThread = candidate
+        workerHandler = Handler(workerThread.looper)
+    } catch (failure: Error) {
+        var cleanupFailure: Throwable? = null
+        try { startedThread?.quitSafely() } catch (secondary: Throwable) { cleanupFailure = secondary }
+        throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
+    } catch (failure: Exception) {
+        try { startedThread?.quitSafely() } catch (secondary: Throwable) {
+            if (secondary is Error || secondary is CancellationException) throw secondary
+        }
+        throw failure
+    }
     val workerPosted = try {
         (workerPostOperation ?: workerHandler::post).invoke(Runnable {
         val jobFile = NoFollowFileSystem.requireDirectChildFile(jobDir, JOB_JSON_FILE_NAME)
@@ -610,7 +879,7 @@ internal fun reprocessYuvJob(
                 },
                 cleanup = { bitmap.recycle() }
             )
-            if (!export.success || export.uriString.isNullOrBlank()) {
+            if (!export.publicCommitted || export.uriString.isNullOrBlank()) {
                 error(export.errorMessage ?: "YUV export failed")
             }
             publicExportCommitted = true
@@ -684,6 +953,14 @@ internal fun reprocessYuvJob(
             cleanupFailure = secondary
         }
         throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
+    } catch (cancelled: CancellationException) {
+        var cleanupFailure: Throwable? = null
+        try {
+            workerThread.quitSafely()
+        } catch (secondary: Throwable) {
+            cleanupFailure = secondary
+        }
+        throw requireNotNull(combineSettlementFailure(cancelled, cleanupFailure))
     } catch (_: Exception) {
         false
     }
