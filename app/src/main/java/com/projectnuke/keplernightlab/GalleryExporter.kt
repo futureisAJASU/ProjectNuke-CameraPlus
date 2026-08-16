@@ -1315,6 +1315,143 @@ internal fun updateRawPublicExportOutcome(
     markMediaStoreExportJournalsTerminalPersisted(jobDir, operationLease)
 }
 
+/**
+ * Same-process convergence for an UNKNOWN public commit state at the next mutation entry.
+ * A terminal job whose metadata still records `exportCommitState=UNKNOWN` with preserved URI
+ * evidence is re-reconciled exactly as restart recovery would reconcile the same evidence:
+ *
+ * - Every export journal is classified against the provider (verified/pending/absent), and the
+ *   same side effects restart recovery applies are applied: complete verifiable content is
+ *   committed, unverifiable pending rows are deleted, journal states follow the observed truth.
+ * - The linked MAIN_IMAGE classification then converges the metadata:
+ *   - committed+verified → VERIFIED (`galleryExportCommitted=true`, `exportVerified=true`, job
+ *     again mutable, recovery claims cleared);
+ *   - committed+unverified → PUBLIC_COMMITTED_UNVERIFIED with the exact verification debt
+ *     restart recovery records (job stays blocked until the committed result is verified);
+ *   - proven absent/pending → NOT_COMMITTED (linkage removed, job again mutable);
+ *   - delete failure stays CLEANUP_REQUIRED and is recorded as the same ambiguous recovery debt
+ *     restart recovery records;
+ *   - inconclusive inspection leaves COMMIT_UNKNOWN untouched; restart recovery remains the
+ *     authority for that evidence.
+ *
+ * A job that already records a real committed claim (`galleryExportCommitted=true`) is never
+ * touched: UNKNOWN is not a commit claim, so an already-committed result is always preserved.
+ * Fatal errors are rethrown without any metadata write; non-fatal failures leave the state
+ * untouched. Returns true when the durable evidence converged.
+ */
+internal fun settleUnknownPublicCommitState(
+    context: Context,
+    jobDir: File,
+    access: MediaStoreExportRecoveryAccess = ContextMediaStoreExportRecoveryAccess(context)
+): Boolean = try {
+    var converged = false
+    var inconclusive = false
+    var settledLinkage = ""
+    var classificationByAttempt: Map<String, MediaStoreExportRecoveryResult> = emptyMap()
+    KeplerJobMetadata.update(jobDir) { job ->
+        if (job.optString("exportCommitState") != GalleryExportCommitState.UNKNOWN.name) return@update
+        if (job.optBoolean("galleryExportCommitted", false)) return@update
+        settledLinkage = job.optString("galleryPublicExportLinkage").takeIf { it.isNotBlank() } ?: return@update
+        val journals = MediaStoreExportJournal.list(jobDir)
+        val results = recoverMediaStoreExportJournals(jobDir, access)
+        // The export journals are the durable authority for each attempt's evidence. Recover
+        // every journal with the exact restart classification (including its provider side
+        // effects), then converge the metadata from the linked MAIN_IMAGE classification.
+        classificationByAttempt = results.associateBy { it.attemptId }
+        val mainJournal = journals.asSequence()
+            .filter { it.role == MediaStoreExportRole.MAIN_IMAGE && it.uri == settledLinkage }
+            .firstOrNull()
+            ?: return@update
+        val mainClassification = classificationByAttempt[mainJournal.exportAttemptId]?.classification ?: return@update
+        when (mainClassification) {
+            MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED,
+            MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED -> {
+                converged = true
+                job.put("exportCommitState", GalleryExportCommitState.VERIFIED.name)
+                    .put("exportStatus", "EXPORTED")
+                    .put("galleryExportCommitted", true)
+                    .put("exportVerified", true)
+                    .put("recoveryState", "STABLE")
+                    .put("lastRecoveryClassification", mainClassification.name)
+                    .put("lastRecoveryMessage", "공개 내보내기 결과를 확인했습니다.")
+                    .put("recoveredAt", System.currentTimeMillis())
+                    .put("exportDisplayName", mainJournal.displayName)
+                    .put("exportMimeType", mainJournal.mimeType)
+                job.remove("recoveryMessage")
+                job.remove("exportVerificationFailed")
+            }
+            MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED -> {
+                converged = true
+                job.put("exportCommitState", GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED.name)
+                    .put("exportStatus", "COMMITTED_UNVERIFIED")
+                    .put("galleryExportCommitted", true)
+                    .put("exportVerified", false)
+                    .put("exportVerificationFailed", true)
+                    .put("recoveryState", "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION")
+                    .put("recoveryMessage", "공개 내보내기 결과가 저장되었지만 확인이 필요합니다.")
+            }
+            MediaStoreExportRecoveryClassification.PENDING_DELETED,
+            MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING,
+            MediaStoreExportRecoveryClassification.CLEANED -> {
+                converged = true
+                job.put("exportCommitState", GalleryExportCommitState.NOT_COMMITTED.name)
+                    .put("exportStatus", "FAILED")
+                    .put("galleryExportCommitted", false)
+                    .put("exportVerified", false)
+                    .put("recoveryState", "STABLE")
+                    .put("lastRecoveryClassification", mainClassification.name)
+                    .put("lastRecoveryMessage", "공개 내보내기 결과가 없음을 확인했습니다.")
+                    .put("recoveredAt", System.currentTimeMillis())
+                    .put("exportError", "Public commit state was unknown; provider inspection proves no committed row.")
+                job.remove("recoveryMessage")
+                job.remove("exportVerificationFailed")
+                job.remove("galleryPublicExportLinkage")
+            }
+            MediaStoreExportRecoveryClassification.DELETE_FAILED -> {
+                converged = true
+                job.put("exportCommitState", GalleryExportCommitState.NOT_COMMITTED.name)
+                    .put("exportStatus", "FAILED")
+                    .put("galleryExportCommitted", false)
+                    .put("exportVerified", false)
+                    .put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
+                    .put("recoveryMessage", classificationByAttempt[mainJournal.exportAttemptId]?.message
+                        ?: "내보내기 정리 증거를 확인할 수 없어 추가 확인이 필요합니다.")
+                    .put("exportError", "Public commit state was unknown; provider inspection proves no committed row.")
+                job.remove("galleryPublicExportLinkage")
+            }
+            else -> {
+                // AMBIGUOUS / INSERT_RESULT_UNKNOWN: conclusive inspection is impossible, so the
+                // UNKNOWN record and its journals stay untouched for restart recovery.
+                inconclusive = true
+            }
+        }
+    }
+    if (converged && !inconclusive) {
+        // A row proven absent is settled evidence: no cleanup work remains for that journal, so a
+        // pre-commit journal is moved to CLEANED and can no longer block the mutation gate.
+        // Genuine DELETE_FAILED debt is retained as CLEANUP_REQUIRED (the guard excludes it).
+        MediaStoreExportJournal.list(jobDir)
+            .filter { journal ->
+                journal.state in setOf(
+                    MediaStoreExportState.PREPARED,
+                    MediaStoreExportState.ROW_INSERTED,
+                    MediaStoreExportState.CONTENT_WRITTEN
+                ) && classificationByAttempt[journal.exportAttemptId]?.classification ==
+                    MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING
+            }
+            .forEach { journal ->
+                journal.transition(jobDir, MediaStoreExportState.CLEANED)
+            }
+    }
+    converged
+} catch (failure: Error) {
+    throw failure
+} catch (cancelled: CancellationException) {
+    throw cancelled
+} catch (_: Exception) {
+    false
+}
+
 fun requestedOutputFormatForSetting(finalOutputFormat: FinalOutputFormat): OutputFormat = when {
     finalOutputFormat.shouldExportHeif -> OutputFormat.HEIF
     finalOutputFormat.shouldExportJpeg -> OutputFormat.JPEG

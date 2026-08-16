@@ -506,7 +506,7 @@ suspend fun reprocessKeplerGalleryJob(
         withContext(Dispatchers.Main) { onProgress(message) }
     }
 
-    val target = try { requireReprocessSafeJobDirectory(context, jobDir) }
+val target = try { requireReprocessSafeJobDirectory(context, jobDir) }
     catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
     catch (oom: OutOfMemoryError) { throw oom }
     catch (td: ThreadDeath) { throw td }
@@ -514,6 +514,23 @@ suspend fun reprocessKeplerGalleryJob(
     catch (ie: InternalError) { throw ie }
     catch (e: Error) { throw e }
     catch (sf: Exception) { return@withContext Result.failure(sf) }
+    // Same-process UNKNOWN public commit-state convergence: a previous attempt whose commit
+    // state could not be determined is re-reconciled (exactly as restart recovery would) before
+    // this mutation proceeds, so the reprocess gate sees converged evidence instead of a stale
+    // COMMIT_UNKNOWN record with a blocking pre-commit journal.
+    try {
+        settleUnknownPublicCommitState(context, target)
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (oom: OutOfMemoryError) { throw oom }
+    catch (td: ThreadDeath) { throw td }
+    catch (le: LinkageError) { throw le }
+    catch (ie: InternalError) { throw ie }
+    catch (e: Error) { throw e }
+    catch (settleFailure: Exception) {
+        // The COMMIT_UNKNOWN record is durable evidence; restart recovery stays authoritative
+        // when the same-process reconciliation cannot settle it.
+        android.util.Log.w("KeplerGalleryReprocess", "Unknown public commit state settlement failed", settleFailure)
+    }
     val session = ReprocessTransactionSession(target)
     val operationLease = try {
         session.acquireLease(JobRecoveryMutationIntent.REPROCESS)
