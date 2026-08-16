@@ -1658,11 +1658,16 @@ internal fun finalizeTransaction(
         if (combined is Error || combined is CancellationException) throw combined
         null
     }
-    val currentAttemptHasLocalResult = currentAttemptLocalOutput != null
+val currentAttemptHasLocalResult = currentAttemptLocalOutput != null
+    val hasUnknownPublicExport = outcome.publicExportCommitted == false &&
+        outcome.exportVerified == false &&
+        outcome.export?.publicCommitState == GalleryExportCommitState.UNKNOWN &&
+        !currentAttemptHasLocalResult &&
+        (outcome.finalOutputFile?.isFile != true || outcome.finalOutputFile.length() == 0L)
     val hasUsableOutput = outcome.publicExportCommitted || outcome.exportVerified ||
         (outcome.finalOutputFile?.isFile == true && outcome.finalOutputFile.length() > 0L) ||
         currentAttemptHasLocalResult
-    val shouldCommit = (outcome.disposition == ReprocessTerminalDisposition.VERIFIED_SUCCESS ||
+    val shouldCommit = !hasUnknownPublicExport && (outcome.disposition == ReprocessTerminalDisposition.VERIFIED_SUCCESS ||
         outcome.disposition == ReprocessTerminalDisposition.COMMITTED_PARTIAL ||
         outcome.publicExportCommitted || currentAttemptHasLocalResult) && hasUsableOutput
 
@@ -1715,8 +1720,13 @@ internal fun finalizeTransaction(
             }
         )
     } else {
-        rollback(session, transaction, ownedLease, jobDir, jobKind, outcome,
-            outcome.terminalError ?: IllegalStateException("Reprocess worker failed."))
+        if (hasUnknownPublicExport) {
+            quarantineWithPersistence(transaction,
+                outcome.terminalError ?: IllegalStateException("Reprocess worker failed with UNKNOWN public export evidence; deferred."))
+        } else {
+            rollback(session, transaction, ownedLease, jobDir, jobKind, outcome,
+                outcome.terminalError ?: IllegalStateException("Reprocess worker failed."))
+        }
     }
 }
 
