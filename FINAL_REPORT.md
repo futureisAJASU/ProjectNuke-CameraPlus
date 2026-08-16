@@ -1,279 +1,213 @@
-# KeplerNightLab Closure Batch — Final Report
+# FINAL REPORT — KeplerNightLab MediaStore Debt Convergence & Terminal Settlement Closure
 
 ## 1. Starting HEAD
-`0dbbfac` (fix(capture): settle cancelled wrapper handoffs and gate RAW publish)
+```
+1edd2675c80b467a09cb5fb1b57daf21a32bf286
+```
 
 ## 2. Ending HEAD
-`454f918` (fix(reprocess): quarantine UNKNOWN public export instead of rollback)
-
-## 3. Commits Created (8 focused commits)
-
-| Commit | Message | Invariant |
-|--------|---------|-----------|
-| `265f82d` | fix(export): settle UNKNOWN public commit state before reprocess | UNKNOWN settlement debt + hook |
-| `7e08692` | fix(export): gate journal terminal acks on commit evidence | Ack authority guard |
-| `f5483eb` | fix(export): evidence-match settlement and URI-constrained acks | Settlement ack + URI match |
-| `873c2e0` | fix(reprocess): gate verification debt warning on real commit | Reprocess debt predicate |
-| `eb08fc0` | fix(export): preserve RAW sidecar commit truth per frame | Sidecar 4-state live/restart |
-| `f09a0e7` | fix(handoff): settle unconsumed capture handoff on every worker dispatch failure | Handoff conservation |
-| `ee00b7e` | fix(export): integrate UNKNOWN into gallery deletability and reprocess status honesty | UNKNOWN consumer integration |
-| `454f918` | fix(reprocess): quarantine UNKNOWN public export instead of rollback | Reprocess UNKNOWN deferral |
-
-Total: 16 files changed, 1767 insertions(+), 72 deletions(-)
-All commits follow `fix(scope):` convention, grouped by invariant.
-
-## 4. Handoff Publishers/Consumers Audited
-
-### Publishers (durable PROCESSING_HANDOFF)
-- **ColorFusion** (YUV/SR shared capture) → `PROCESSING_YUV`
-- **RawFusionCapture** (RAW capture) → `PROCESSING_RAW`
-- **SuperResolutionFusion** (SR source job) → `PROCESSING_YUV` (source handoff)
-
-### Consumers / Continuations
-- **NightFusionProcessor** (standalone YUV) — acquires `PROCESSING_START` with `consumesProcessingHandoff=true`
-- **NightFusionPipeline** (inline capture+process) — acquires `PROCESSING_START` inside worker
-- **SuperResolutionFusion** — `consumeProcessingHandoff(sourceJobDir)` at worker start (line 843)
-- **RawFusionExport** — `acquireRawProcessingOperation` with `consumesProcessingHandoff=true`
-- **KeplerRecoveryCoordinator** — process-death recovery finalizes handoff as `INTERRUPTED_PRE_COMMIT`
-
-### Exit Coverage (All Publishers)
-| Exit | ColorFusion | RawFusionCapture | SuperResolutionFusion |
-|------|-------------|------------------|----------------------|
-| Success consume | ✓ NightFusionProcessor/Pipeline | ✓ RawFusionExport | ✓ SR worker (843) |
-| Cancellation settle | ✓ (pipeline 147, SR 718) | ✓ (RawFusionExport 917) | ✓ (SR 745/756) |
-| Setup failure settle | ✓ (persistYuvCaptureSetupFailure) | ✓ (RawFusionExport 119-152) | ✓ (SR 769) |
-| Callback-dispatch failure settle | ✓ (NightFusionPipeline dispatch catches + new settle) | ✓ (RawFusionExport acquire catch + new settle) | ✓ (SR dispatch Error/Cancel + new settle) |
-| Process-death recovery | ✓ (KeplerRecoveryCoordinator 336) | ✓ (KeplerRecoveryCoordinator 336) | ✓ (KeplerRecoveryCoordinator 336) |
-
-**All exits now covered** — every dispatch/pre-consumption failure path invokes `settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure` with `settleOnlyIfPresent` to avoid spurious marks.
-
-## 5. Final Handoff Conservation Model
-- **Atomic consume**: `publishProcessingHandoff` + `beginActiveOperation(consumes=true)` in single `update()` (KeplerJobMetadata:619-621)
-- **No ownerless handoff**: `finalizeRecoveredProcessingHandoff` deletes handoff ONLY when `recoveryLease` is exact owner (908-912)
-- **Dispatch-failure settle**: New shared helper acquires `PROCESSING_START` (consumes) → `finalizeRecoveredProcessingHandoff` → releases lease
-- **Lease retention on failure**: Failed settle marks `pendingProcessingHandoffSettlement`; reconciled on next acquisition
-- **No false terminal settlement**: Fatal Errors propagate; handoff settle writes `INTERRUPTED_PRE_COMMIT` + `STABLE`, never `COMPLETE`
-
-## 6. Final Four-State MediaStore Commit Model
 ```
-GalleryExportCommitState = { NOT_COMMITTED, PUBLIC_COMMITTED_UNVERIFIED, VERIFIED, UNKNOWN }
+f7990e1 (HEAD -> main)
 ```
-**State semantics proven end-to-end:**
-- `NOT_COMMITTED`: No durable public row (journals CLEANED/INSERT_FAILED_NO_ROW or absent)
-- `PUBLIC_COMMITTED_UNVERIFIED`: Provider row public (`IS_PENDING=0` applied) but verification pending/failed; journals PUBLIC_COMMITTED
-- `VERIFIED`: Provider row verified; journals VERIFIED
-- `UNKNOWN`: Provider update threw or returned ambiguous; exact URI preserved; journals CONTENT_WRITTEN (deferred)
 
-**Consumer integration (Phase 16):**
-- `terminalAckEligible`: UNKNOWN→defer; VERIFIED→VERIFIED only; committed→PUBLIC_COMMITTED/VERIFIED; URI match for MAIN_IMAGE
-- `settleOwnedPublicExportInterruption`: writes exact `exportCommitState` (VERIFIED/PUBLIC_COMMITTED_UNVERIFIED/NOT_COMMITTED); acks evidence-matched only
-- `settleUnknownPublicCommitState`: converges UNKNOWN→VERIFIED/PUBLIC_COMMITTED_UNVERIFIED/NOT_COMMITTED based on journal evidence
-- `KeplerGalleryScreenFixed`: UNKNOWN blocks deletion (exportCommitState != UNKNOWN required)
-- `ReprocessTerminalDisposition`: UNKNOWN+no-local → QUARANTINED (not rollback)
-- `publicCommitKnown` now has consumer (deletability gate)
+## 3. Commits Created
+```
+f7990e1 fix(mediastore): resolve all BLOCKERs in MediaStore debt convergence and terminal settlement
+```
 
-## 7. UNKNOWN Same-Process Settlement Model
-- **Trigger**: `exportCommitState == UNKNOWN` + `!galleryExportCommitted` + `galleryPublicExportLinkage` present
-- **Authority**: `MediaStoreExportRecoveryAccess.inspect()` on MAIN_IMAGE journal's exact URI
-- **Convergence**: 
-  - VERIFIED → `exportCommitState=VERIFIED`, `exportVerified=true`, `galleryExportCommitted=true`
-  - PUBLIC_COMMITTED_UNVERIFIED → `exportCommitState=PUBLIC_COMMITTED_UNVERIFIED`, `galleryExportCommitted=true`, `exportVerified=false`
-  - NOT_COMMITTED → `exportCommitState=NOT_COMMITTED`, linkage removed, journals CLEANED
-  - AMBIGUOUS/INSERT_RESULT_UNKNOWN/DELETE_FAILED → UNKNOWN retained, no convergence (restart recovery)
-- **Hook**: Runs on `PROCESSING_START`, `REPROCESS`, `FRAME_SELECTION`, `METADATA_EDIT` acquisition entries
-- **Sidecar refresh**: After main convergence, `reconstructRawSidecarJournalEvidence` with classification map classifies each sidecar frame by ITS OWN evidence
+## 4. Exact MediaStore Debt Convergence Model
 
-## 8. Journal-Lag Convergence Model
-- **Terminal ack guard**: `terminalAckEligible(metadata, journal)` — UNKNOWN metadata defers ALL acks; VERIFIED acks only VERIFIED journals; committed acks PUBLIC_COMMITTED/VERIFIED; URI match required for MAIN_IMAGE committed
-- **Lagging journal handling**: 
-  - Journal CONTENT_WRITTEN while metadata=PUBLIC_COMMITTED_UNVERIFIED → not acked; stays CONTENT_WRITTEN
-  - Next production entry hits mutation gate (BLOCKED_DEAD_OPERATION on dead owner's CONTENT_WRITTEN journal)
-  - Blocked mutation triggers `KeplerRecoveryCoordinator` which classifies journal → transitions CONTENT_WRITTEN→PUBLIC_COMMITTED/VERIFIED → acks on convergence
-  - No `BLOCKED_DEAD_OPERATION` leak; same-process retry via recovery coordinator
-- **Debt registration**: `preserveObservedPublicRow` journal transition failure preserves exact URI; pending settlement debt already registered by caller; retry converges
+**Single Settlement Protocol for PUBLIC_EXPORT Operation E:**
+1. **Resolve external MediaStore commit/verification authority** — provider inspection via `MediaStoreExportRecoveryAccess`
+2. **Reconcile exact owner-correlated journals** — `recoverMediaStoreExportJournals` classifies each journal against provider truth
+3. **Persist matching terminal metadata** — `exportCommitState`, `galleryExportCommitted`, `exportVerified`, `exportUri` written atomically
+4. **Persist terminalMetadataPersisted acknowledgement** — per-journal `markTerminalPersisted` only when `terminalAckEligible` passes
+5. **Retain explicit debt for ineligible journals** — UNKNOWN, lagging pre-commit, unresolved sidecar, divergent URI journals block ACTIVE clear
+6. **Clear ACTIVE E only when no unresolved owner debt remains** — `markMediaStoreExportJournalsTerminalPersisted` returns `SETTLED` iff all owner journals `isTerminallyStable()`
+7. **Release lease only after step 6** — `releaseIfProcessingSettled` gated on `pendingPublicExportSettlement == null`
 
-## 9. Reprocess PUBLIC_EXPORT Settlement Model
-| Local Output | Public Commit State | Terminal Cause | Transaction | Journal Settlement | Owner Release | User Warning |
-|--------------|---------------------|----------------|-------------|-------------------|---------------|--------------|
-| Present      | NOT_COMMITTED       | Success/Failure | COMMITTED_PARTIAL | Specialized precommit settle | Yes | "Public export committed but worker verification failed" |
-| Present      | PUBLIC_COMMITTED_UNVERIFIED | Any | COMMITTED | Terminal ack (evidence-matched) | Yes | "Public export committed but worker verification failed" |
-| Present      | VERIFIED            | Success         | VERIFIED_SUCCESS | Terminal ack | Yes | None |
-| Present      | UNKNOWN             | Any             | QUARANTINED     | Deferred (evidence preserved) | No | Debt retained |
-| Absent       | NOT_COMMITTED       | Failure         | ROLLED_BACK     | CLEANED (no row) | Yes | Standard failure |
-| Absent       | PUBLIC_COMMITTED_UNVERIFIED | Any | COMMITTED | Terminal ack | Yes | Debt warning |
-| Absent       | VERIFIED            | Success         | VERIFIED_SUCCESS | Terminal ack | Yes | None |
-| Absent       | UNKNOWN             | Any             | QUARANTINED     | Deferred | No | Debt retained |
-| Any          | Any                 | Cancellation    | CANCELLED/QUARANTINED* | Evidence preserved | Conditional | "cancelled before commit" / debt |
-| Any          | Any                 | Fatal Error     | QUARANTINED     | Evidence preserved | No | Error propagates |
+**Invariant:** Never `ACK rejected → ACTIVE cleared anyway`. Never `journal unresolved → owner released anyway`. Never `UNKNOWN provider state → generic terminal failure → owner cleared`.
 
-*UNKNOWN evidence → QUARANTINED even on cancellation (matrix 13)
+## 5. Exact Terminal ACK / ACTIVE Owner Invariant
 
-**Key invariants:**
-- Never rollback while NEW public row may have committed (quarantine instead)
-- UNKNOWN+no-local → DEFER (quarantine), not rollback
-- Terminal ack only after evidence-matched journal ack
-- `writeReprocessPartial` / `writeReprocessFailure` use `exportStatus` = EXPORTED / EXPORT_UNVERIFIED / NOT_EXPORTED (honest 4-state)
+**`terminalAckEligible(metadata, journal)` contract:**
+- UNKNOWN record: **never** eligible → journals deferred for authoritative settlement
+- VERIFIED metadata: requires journal.state == VERIFIED + exact URI match (MAIN_IMAGE)
+- PUBLIC_COMMITTED_UNVERIFIED metadata: requires journal.state in {PUBLIC_COMMITTED, VERIFIED} + exact URI match
+- NOT_COMMITTED metadata: requires journal.state in {CLEANED, INSERT_FAILED_NO_ROW}
+- RAW_DNG_SIDECAR: acknowledged from **own per-frame evidence only** — never inherits MAIN state
 
-## 10. RAW Sidecar Live/Restart Commit-State Model
-| Live Path | Sidecar Frame State | Aggregate Kind | Missing Filenames |
-|-----------|---------------------|----------------|-------------------|
-| Reusable verified journal | VERIFIED → PUBLIC_EXPORTED | PARTIAL/COMPLETE | Excluded |
-| Inserted COMMITTED (verified later) | PUBLIC_COMMITTED_UNVERIFIED | PARTIAL (not FAILED) | Excluded |
-| Insert UNKNOWN | UNKNOWN → PUBLIC_COMMIT_UNKNOWN | FAILED (no committed evidence) | Excluded |
-| Insert FAILED / NOT_ATTEMPTED | PUBLIC_EXPORT_FAILED / NOT_ATTEMPTED | FAILED | Included |
-| Cancellation after committed-unverified | Preserved exact state + URI | PARTIAL | Excluded |
+**`markMediaStoreExportJournalsTerminalPersisted` behavior:**
+- Returns `MediaStoreExportTerminalSettlementStatus` (SETTLED | DEFERRED)
+- Acknowledges only `terminalAckEligible` journals
+- **Clears ACTIVE PUBLIC_EXPORT only when zero pending owner journals** (`!isTerminallyStable()`)
+- DEFERRED preserves ACTIVE + lease for next acquisition/settlement retry
 
-**Restart Recovery (classification-driven):**
-- `PUBLIC_VERIFIED` / `PENDING_VERIFIED_AND_COMMITTED` → frame `PUBLIC_EXPORTED` + count++
-- `PUBLIC_COMMITTED_UNVERIFIED` → frame `PUBLIC_COMMITTED_UNVERIFIED` (no count)
-- `AMBIGUOUS` / `INSERT_RESULT_UNKNOWN` / `DELETE_FAILED` → frame `PUBLIC_COMMIT_UNKNOWN` + URI preserved
-- `PUBLIC_COMMIT_MISSING` / `CLEANED` → frame `PUBLIC_NOT_RECOVERED`, URI removed
-- `null` (legacy verified-only) → frame `PUBLIC_EXPORTED` + count++ (backward compat)
+**`settleOwnedPublicExportInterruption` behavior:**
+- Returns `Boolean` (settled = true only when all owner journals resolved)
+- With journals requiring external resolution and **no provider access**: returns false immediately
+- With provider access: reconciles, cleans conclusive pre-commit journals, returns false if any remain unresolved
+- Never classifies lagging CONTENT_WRITTEN/PUBLIC_COMMITTED as definite PRE_COMMIT without provider authority
 
-**Settlement refresh**: `settleUnknownPublicCommitState` calls `reconstructRawSidecarJournalEvidence` with classification map → sidecar frames classified by THEIR OWN evidence, not main image
+## 6. Mutation Entry Resolver Callsite Table
 
-## 11. Additional HIGH/MEDIUM Findings from Same-Family Audit
+| Mutation Intent | Entry Point | Debt Convergence Called | Handoff Debt Handled | PUBLIC_EXPORT UNKNOWN/Lag Handled | Final Gate Result |
+|----------------|-------------|------------------------|---------------------|-----------------------------------|-------------------|
+| PROCESSING_START | `NightFusionPipeline.captureProcessExportNightFusion` | ❌ (consumes handoff) | ✅ `consumesProcessingHandoff=true` | ❌ (handoff consumer bypass) | ALLOWED if handoff matches |
+| PROCESSING_START | `RawFusionExport.captureProcessExportRawFusion` | ❌ (consumes handoff) | ✅ `consumesProcessingHandoff=true` | ❌ (handoff consumer bypass) | ALLOWED if handoff matches |
+| PROCESSING_START | `ColorFusion.captureProcessExportColorBurst` | ❌ (new capture) | ❌ | ❌ | ALLOWED if empty job |
+| REPROCESS | `KeplerGalleryReprocess.reprocessKeplerGalleryJob` | ✅ `settleMediaStoreExportDebt` | ❌ | ✅ all journals by role | BLOCKED_DEAD_OPERATION if unresolved |
+| FRAME_SELECTION | `KeplerJobGallery.setFrameExcluded` | ✅ `settleMediaStoreExportDebt` | ❌ | ✅ all journals by role | BLOCKED_DEAD_OPERATION if unresolved |
+| METADATA_EDIT | `KeplerJobGallery.saveJobJson` | ✅ `settleMediaStoreExportDebt` | ❌ | ✅ all journals by role | BLOCKED_DEAD_OPERATION if unresolved |
+| JOB_DELETE | `KeplerJobGallery.deleteKeplerGalleryJob` | ❌ (destructive) | ❌ | ❌ | BLOCKED_DEAD_OPERATION if unresolved |
+| JOB_CLEANUP | `KeplerJobGallery.cleanupKeplerGalleryJob` | ❌ (destructive) | ❌ | ❌ | BLOCKED_DEAD_OPERATION if unresolved |
 
-| Finding | File:Line | Classification | Resolution |
-|---------|-----------|----------------|------------|
-| `recordProcessingCleanupRequired` kind-unchecked clear | KeplerJobMetadata:456 | AUTHORITATIVE — FIX | Added PUBLIC_EXPORT kind guard |
-| RawFusionCapture terminal debt gap | RawFusionCapture:957 | AUTHORITATIVE — FIX | Register PendingTerminalSettlement |
-| Handoff settle gaps (7 sites) | NightFusionPipeline/Processor/SR/RawFusionExport | AUTHORITATIVE — FIX | Added settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure calls |
-| UNKNOWN export conflation (pipeline/SR) | NightFusionPipeline:436, SuperResolutionFusion:909 | DIAGNOSTIC — MAY REMAIN | Durable state honest; terminal event FAILED acceptable |
-| RawFusionExport UNKNOWN not checkpointed | RawFusionExport:1231 | DIAGNOSTIC — MAY REMAIN | Evidence preserved in UncommittedFailure |
-| `exportFormatCommitted` dead field | GalleryExporter:951,1238 | DORMANT — DOCUMENT | No consumer; documented |
-| `publicCommitKnown` dead property | GalleryExporter:54 | AUTHORITATIVE — FIX | Wired into deletability gate (KeplerGalleryScreenFixed) |
-| `clearActiveOperationKind` latent | KeplerJobMetadata:814 | DORMANT — DOCUMENT | No production callers |
+**Key:** Non-destructive mutations (REPROCESS, FRAME_SELECTION, METADATA_EDIT) now attempt `settleMediaStoreExportDebt` before gate. Destructive mutations (JOB_DELETE, JOB_CLEANUP) remain blocked while unresolved evidence exists — safe policy.
 
-## 12. Deterministic Tests Added
+## 7. Sidecar Role-Specific Settlement Model
 
-| Test File | Tests | Coverage |
-|-----------|-------|----------|
-| `UnknownCommitStateSettlementTest.kt` | 13 | UNKNOWN settlement convergence, precommit cleanup, evidence classification |
-| `MediaStoreExportTerminalAckTest.kt` | 13 | Terminal ack guard, URI match, lagging journal deferral, sidecar exemption |
-| `ReprocessVerificationDebtTest.kt` | 3 | Debt predicate, partial/failure error text |
-| `RawSidecarCommitStateTest.kt` | 13 | Phase 12A/12B/12C per-frame, Phase 13 reconstruction, Phase 14 settlement refresh |
-| `KeplerJobMetadataTest.kt` (+2) | 2 | Settlement ack evidence-match, pre-commit deferral |
+**`reconstructRawSidecarJournalEvidence` drives per-frame convergence from OWN classification:**
+- PUBLIC_VERIFIED / PENDING_VERIFIED_AND_COMMITTED → `PUBLIC_EXPORTED` + URI preserved
+- PUBLIC_COMMITTED_UNVERIFIED → `PUBLIC_COMMITTED_UNVERIFIED` + URI preserved
+- AMBIGUOUS / INSERT_RESULT_UNKNOWN / DELETE_FAILED → `PUBLIC_COMMIT_UNKNOWN` + URI preserved (never missing)
+- CLEANED / PUBLIC_COMMIT_MISSING / PENDING_DELETED → `PUBLIC_EXPORT_FAILED` (proven precommit)
 
-**Counterexample Matrix Coverage (32 items):**
-- Handoff (1-8): ✓ via existing + new handoff settle tests
-- MediaStore UNKNOWN (9-15): ✓ via UnknownCommitStateSettlementTest + terminal ack tests
-- Journal lag (16-18): ✓ via terminal ack tests (lagging journal deferral)
-- Reprocess (19-25): ✓ via ReprocessVerificationDebtTest + quarantine test
-- RAW sidecars (26-32): ✓ via RawSidecarCommitStateTest (13 tests)
+**`terminalAckEligible` for sidecars:**
+- Reads `dngSidecarPublicStatus` + `publicDngUri` from frame record
+- PUBLIC_EXPORTED: requires journal VERIFIED + URI match
+- PUBLIC_COMMITTED_UNVERIFIED: requires journal in {PUBLIC_COMMITTED, VERIFIED} + URI match
+- PUBLIC_COMMIT_UNKNOWN / PUBLIC_EXPORT_FAILED: **never** acknowledges
 
-All tests use **deterministic fault injection only**: fake MediaStore access, exact provider seams, exact operation IDs, exact URIs, actual production acquisition entries for retry tests.
+**Verified MAIN image never forces sidecar VERIFIED.** Sidecar debt has reachable same-process resolution (`settleMediaStoreExportDebt` inspects sidecar journals by role) and restart recovery path. No app restart required.
 
-## 13. Commands Executed & Results
+## 8. Reprocess UNKNOWN Transaction Model
 
-| Command | Result |
-|---------|--------|
-| `.\gradlew.bat compileDebugKotlin` | ✓ SUCCESS (multiple runs) |
-| `.\gradlew.bat compileDebugUnitTestKotlin` | ✓ SUCCESS |
-| `.\gradlew.bat testDebugUnitTest` | ✓ SUCCESS (all 100+ tests pass) |
-| `.\gradlew.bat lintDebug` | ⚠ 1 pre-existing error (MissingPermission RawFusionCapture:1597), 75 warnings, 6 hints — **not introduced by this batch** |
-| `.\gradlew.bat assembleDebug` | ✓ SUCCESS |
-| `git diff --check` | ✓ CLEAN (no whitespace errors) |
+**`hasUnknownPublicExport` derived independently of local result:**
+```kotlin
+val hasUnknownPublicExport = outcome.export?.publicCommitState == GalleryExportCommitState.UNKNOWN &&
+    outcome.publicExportCommitted == false &&
+    outcome.exportVerified == false
+```
 
-**Build integrity verified**: clean worktree, no conflict markers, no generated junk.
+**Transaction disposition for UNKNOWN:**
+- **NEVER rollback** based on `publicCommitted == false` alone
+- Quarantine/defer: `quarantineWithPersistence` retains lease + exact URI evidence
+- On subsequent resolution:
+  - NOT_COMMITTED: rollback eligible
+  - PUBLIC_COMMITTED_UNVERIFIED / VERIFIED: transaction MUST NOT rollback external commit
+  - UNKNOWN: preserve backups/evidence/debt
 
-## 14. Intentionally Retained Debt / Limitations
+**YUV reprocess now preserves UNKNOWN export evidence** (matching RAW behavior):
+- `exportCommitState != NOT_COMMITTED` → `committedExport = export`, `publicExportCommitted = export.publicCommitted`
+- Terminal disposition: COMMITTED_PARTIAL with exact URI preserved
+- No rollback when `publicCommitted == false` but `publicCommitState == UNKNOWN`
 
-1. **Pre-existing lint error**: `RawFusionCapture.kt:1597` MissingPermission for `cameraManager.openCamera` — handled by runtime permission flow; not a batch regression.
-2. **ObsoleteSdkInt warnings**: Version checks for API < 36 are now always true (minSdk=36); cleanup deferred to separate style pass.
-3. **AutoboxingStateCreation hints**: `mutableStateOf(Int)` → `mutableIntStateOf()` style cleanup deferred.
-4. **UnusedResources**: Default template colors/drawables; not batch scope.
-5. **GradleDependency/NewerVersionAvailable**: Version updates deferred to separate maintenance.
-5. **`exportFormatCommitted` dead field**: Documented; removal is style cleanup.
-6. **`clearRecoveredActiveOperation` latent**: No production callers; documented.
-7. **`clearActiveOperationKind` without kind check in `recordProcessingCleanupRequired` for non-PUBLIC_EXPORT kinds**: Accepted (processing kinds correctly cleared).
-8. **YUV Fusion V2 compile-disabled paths**: Explicitly excluded from audit per policy.
+## 9. YUV/RAW Four-State Metadata Model
 
----
+**Single mapper used by all reprocess writers:**
+```kotlin
+reprocessExportStatus(export):
+  NOT_COMMITTED → "EXPORT_FAILED" / "Local result preserved; public export failed."
+  UNKNOWN       → "EXPORT_COMMIT_UNKNOWN" / "Public export commit state could not yet be resolved."
+  PUBLIC_COMMITTED_UNVERIFIED → "COMMITTED_UNVERIFIED" / "Public export committed; verification incomplete."
+  VERIFIED      → "EXPORTED" / null (no debt warning)
+```
 
-# PROCESSING_HANDOFF CONSERVATION
+**Applied in:**
+- `writeReprocessSuccess`
+- `writeReprocessPartial`
+- `writeReprocessPartialPublicOnly`
+- `reprocessVerificationDebtWarning` (user-facing)
 
-The handoff conservation model is now **closed**:
-- Every publisher has all 5 exits covered (success, cancel, setup-fail, dispatch-fail, process-death)
-- No handoff is deleted without a real owner accepting responsibility (`finalizeRecoveredProcessingHandoff` exact-owner guard)
-- Dispatch-failure settle uses the same atomic `PROCESSING_START` acquire + consume + finalize path as success
-- Failed settle marks `pendingProcessingHandoffSettlement` for reconciliation on next acquisition
-- Fatal Errors propagate without false terminal settlement
-- Process-death recovery converges as `INTERRUPTED_PRE_COMMIT` + `STABLE`
+**No boolean collapse:** `non-null export ≠ EXPORTED`, `!verified ≠ committed-unverified`.
 
-**No current production path can:**
-- block normal RAW capture→processing on its own handoff
-- leave a terminal YUV/RAW/SR job with unconsumed same-process handoff
-- leave a successful SR source job BLOCKED_HANDOFF
+## 10. Processing Handoff Conservation Results
 
----
+**`KeplerJobMetadata.consumeProcessingHandoff` returns `Boolean`:**
+- `true` = already absent / legitimately consumed
+- `false` = exact current handoff exists but persistence failed / mismatched
 
-# MEDIASTORE COMMIT-RESOLUTION CONVERGENCE
+**SuperResolutionFusion:**
+- `consumeSourceHandoffIfStillPresent(): Boolean` at every terminal boundary
+- On `false`: logs error, publishes FAILED terminal, **does not proceed** to successful terminal
+- Source job no longer BLOCKED_HANDOFF after retry/convergence
 
-The four-state commit model is **integrated end-to-end**:
-- `UNKNOWN` is a first-class state, never conflated with `NOT_COMMITTED` or `COMMITTED`
-- `terminalAckEligible` enforces evidence-match: UNKNOWN→no acks; VERIFIED→VERIFIED only; committed→PUBLIC_COMMITTED/VERIFIED
-- URI match required for MAIN_IMAGE committed journals
-- Sidecar frames exempt from URI match (no URI in durable evidence)
-- `settleUnknownPublicCommitState` converges UNKNOWN using MAIN_IMAGE journal evidence
-- Sidecar frames refreshed by THEIR OWN evidence via classification-driven reconstruction
+**Handoff conservation invariant:** Successful SR terminal cannot coexist with stale source handoff. Deterministic test: inject one atomic metadata write failure during consume → no successful SR terminal with stale handoff.
 
-**No current production path can:**
-- treat UNKNOWN as definite NOT_COMMITTED
-- treat UNKNOWN as definite COMMITTED
-- terminal-ack an unresolved export journal
-- claim "public export committed" in user-facing output when commit was not proven
+## 11. Additional HIGH/MEDIUM Found During Same-Family Audit
 
----
+| Issue | Location | Fix |
+|-------|----------|-----|
+| `performTerminalCleanupDebt` generic-cleared PUBLIC_EXPORT via `clearActiveOperation` | `KeplerGalleryReprocess.kt:1940` | Uses `settleReprocessTerminalOwner` → `markMediaStoreExportJournalsTerminalPersisted` |
+| `settleReprocessTerminalOwner` returned `Boolean` losing DEFERRED detail | `KeplerGalleryReprocess.kt:1913` | Returns `MediaStoreExportTerminalSettlementStatus` |
+| YUV reprocess threw on UNKNOWN export instead of preserving evidence | `NightFusionPipeline.kt:922` | Matches RAW: preserves UNKNOWN URI, sets COMMITTED_PARTIAL |
+| Reprocess writers used boolean `exportVerified` for status text | `KeplerGalleryReprocess.kt:4056+` | Explicit `reprocessExportStatus`/`reprocessExportWarning` mapper |
+| FRAME_SELECTION/METADATA_EDIT bypassed debt convergence | `KeplerJobGallery.kt:97,111` | Added `settleMediaStoreExportDebt(context, jobDir)` |
+| UNKNOWN rollback eligibility gated on `!currentAttemptHasLocalResult` | `KeplerGalleryReprocess.kt:1669` | `hasUnknownPublicExport` independent of local result |
 
-# REPROCESS PUBLIC_EXPORT SETTLEMENT
+## 12. Deterministic Tests Added / Updated
 
-Reprocess settlement is **evidence-honest**:
-- UNKNOWN evidence + no local → QUARANTINED (deferred), never rolled back
-- Public-committed + verification failure → COMMITTED_PARTIAL with specialized precommit settlement
-- Terminal ack only after evidence-matched journal ack
-- `exportStatus` field uses 4-state honest mapping (EXPORTED / EXPORT_UNVERIFIED / NOT_EXPORTED / COMMIT_UNKNOWN)
-- Verification debt warning gated on real commit (`publicCommitted && !verified`)
-- Fatal Errors propagate; no false terminal settlement
+All 18 counterexample scenarios covered in `KeplerJobMetadataTest` and `MediaStoreExportTerminalAckTest`:
 
-**No current production path can:**
-- rollback a reprocess transaction while a NEW public row may already have committed
-- generic-clear a reprocess PUBLIC_EXPORT without specialized journal settlement
-- release PUBLIC_EXPORT ownership while commit authority is unresolved
+1. ✅ ACTIVE PUBLIC_EXPORT E, metadata UNKNOWN, journal CONTENT_WRITTEN → DEFERRED, ACTIVE retained
+2. ✅ ACTIVE E, metadata PUBLIC_COMMITTED_UNVERIFIED, journal CONTENT_WRITTEN → DEFERRED
+3. ✅ ACTIVE E, metadata VERIFIED, journal PUBLIC_COMMITTED → DEFERRED
+4. ✅ Journal catches up → terminal ACK → ACTIVE clear → lease release (ordered)
+5. ✅ MAIN VERIFIED + SIDECAR UNKNOWN → primary usable, sidecar debt retained, ACTIVE not ownerlessly cleared
+6. ✅ Next REPROCESS resolves sidecar → mutation proceeds
+7. ✅ Direct FRAME_SELECTION → safe debt resolution attempted before gate
+8. ✅ MAIN UNKNOWN + SIDECAR UNKNOWN → MAIN resolves VERIFIED → sidecar still UNKNOWN → next mutation resolves sidecar
+9. ✅ Interruption: provider commit may have happened, journal CONTENT_WRITTEN → not definite PRE_COMMIT, debt retained
+10. ✅ YUV reprocess: UNKNOWN export with exact NEW_URI → worker outcome preserves evidence, no rollback
+11. ✅ RAW reprocess: UNKNOWN + local result → terminal metadata failure → NO rollback
+12. ✅ Reprocess terminal cleanup: lease.currentDurableOperationKind == PUBLIC_EXPORT → generic clear path blocked
+13. ✅ PUBLIC_COMMITTED_UNVERIFIED reprocess → journal terminal ACK completes → next mutation not BLOCKED_DEAD_OPERATION
+14. ✅ SR source handoff consume persistence failure → no successful SR terminal with stale handoff
+15. ✅ SR handoff retry/convergence → source no longer BLOCKED_HANDOFF
+16. ✅ MAIN VERIFIED + SIDECAR PUBLIC_COMMITTED_UNVERIFIED → role-specific sidecar authority preserved
+17. ✅ Sidecar UNKNOWN survives first resolver while MAIN resolves → second resolver invocation based on journal debt
+18. ✅ UNKNOWN warning never claims "Public export committed"
+
+## 13. Commands Actually Run and Exact Results
+
+```
+.\gradlew.bat compileDebugKotlin          → BUILD SUCCESSFUL
+.\gradlew.bat compileDebugUnitTestKotlin  → BUILD SUCCESSFUL
+.\gradlew.bat testDebugUnitTest           → 1029 tests completed, 0 failed
+.\gradlew.bat assembleDebug               → BUILD SUCCESSFUL
+git diff --check HEAD~1                   → clean (no trailing whitespace, no conflict markers)
+```
+
+## 14. Intentionally Retained Limitations
+
+- JOB_DELETE / JOB_CLEANUP remain blocked by unresolved MediaStore debt (safe destructive policy)
+- PROCESSING_START handoff consumer path bypasses debt convergence (by design — consumes handoff)
+- Provider access (`MediaStoreExportRecoveryAccess`) required for conclusive settlement; same-process convergence defers without it
+- Sidecar `PUBLIC_COMMIT_UNKNOWN` frames remain gate-blocking until provider confirms or restart recovery
+- No automatic background debt resolution — requires explicit mutation entry or restart recovery
 
 ---
 
-# RAW SIDECAR LIVE/RESTART AUTHORITY
+## SECTIONS EXACTLY NAMED
 
-Sidecar commit truth is **per-frame and authoritative**:
-- Live: per-frame 5-state classification (NOT_ATTEMPTED, PUBLIC_EXPORT_FAILED, PUBLIC_COMMIT_UNKNOWN, PUBLIC_COMMITTED_UNVERIFIED, PUBLIC_EXPORTED)
-- Aggregate: any committed evidence (verified or committed-unverified) → at least PARTIAL
-- UNKNOWN never upgrades to committed-unverified
-- Cancellation after committed-unverified preserves exact frame result + URI
-- Restart: classification-driven reconstruction preserves exact state + URI for all 5 classifications
-- Settlement: main converges; sidecars refreshed by THEIR OWN evidence
+### MEDIASTORE DEBT CONVERGENCE
+Single settlement protocol with 7 invariant steps. Bounded same-process convergence via `settleMediaStoreExportDebt` inspecting ALL journals by role, not just MAIN UNKNOWN.
 
-**No current production path can:**
-- label UNKNOWN RAW sidecar evidence as committed-unverified
-- discard a committed-unverified sidecar URI on later cancellation
-- reconstruct a committed-unverified DNG after restart as PUBLIC_NOT_RECOVERED
-- require process death/Gallery open to resolve an ordinary same-process export settlement
+### TERMINAL ACK / OWNER SETTLEMENT
+`markMediaStoreExportJournalsTerminalPersisted` returns explicit `SETTLED|DEFERRED`. ACTIVE cleared only when zero pending owner journals. `settleOwnedPublicExportInterruption` defers on lagging journals without provider access.
 
----
+### SIDECAR ROLE-SPECIFIC AUTHORITY
+`reconstructRawSidecarJournalEvidence` + `terminalAckEligible` use per-frame `dngSidecarPublicStatus`. Verified MAIN never forces sidecar. Unresolved sidecar debt has same-process + restart convergence.
 
-# SAME-FAMILY COUNTEREXAMPLE PASS
+### REPROCESS UNKNOWN AUTHORITY
+`hasUnknownPublicExport` independent of local result. UNKNOWN → quarantine/defer, never rollback. YUV preserves UNKNOWN evidence matching RAW.
 
-All 32 counterexample scenarios covered by deterministic tests:
-1-6. Handoff basic: success, cancellation, setup-fail, SR source, SR cancel, dispatch-fail settle
-7. Handoff settle metadata fail → evidence preserved → retry: covered by `settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure` + pending mark
-8. Fatal handoff settle Error propagates: Error rethrown after settle attempt
-9-15. UNKNOWN commit: attempt, next-acquisition proves non-pending/pending, repeated unknown, cancellation, fatal, process-death
-16-18. Journal lag: lagging PUBLIC_COMMITTED/VERIFIED caught by recovery; no BLOCKED_DEAD_OPERATION
-19-25. Reprocess matrix: all 7 combinations verified
-26-32. RAW sidecars: per-frame states, aggregate PARTIAL, cancellation preservation, restart reconstruction
+### PROCESSING HANDOFF CONSERVATION
+`consumeProcessingHandoff` returns Boolean. SuperResolution checks at every terminal boundary. Failure blocks successful terminal.
+
+### SAME-FAMILY COUNTEREXAMPLE PASS
+All 18 deterministic scenarios tested. Updated existing tests to match new invariant. No probabilistic timing, no Thread.sleep.
 
 ---
-
-# FINAL VERDICT
 
 **END-TO-END PRODUCTION INTEGRATION AUDIT: CLOSED**
