@@ -1074,4 +1074,101 @@ class KeplerJobMetadataTest {
             directory.deleteRecursively()
         }
     }
+
+    @Test
+    fun consumeProcessingHandoffClearsOnlyCorrelatedCurrentRuntimeHandoff() {
+        val directory = Files.createTempDirectory("kepler-consume-handoff-").toFile()
+        try {
+            KeplerJobMetadata.write(directory, JSONObject().put("status", "PROCESSING"))
+            KeplerJobMetadata.update(directory) {
+                it.put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                    .put(PROCESSING_HANDOFF_OPERATION_ID, "handoff-1")
+                    .put(PROCESSING_HANDOFF_KIND, KeplerActiveOperationKind.PROCESSING_YUV.name)
+                it.put(PROCESSING_HANDOFF_CREATED_AT, 123L)
+            }
+
+            assertTrue(KeplerJobMetadata.consumeProcessingHandoff(directory, KeplerActiveOperationKind.PROCESSING_YUV))
+            val consumed = KeplerJobMetadata.read(directory)
+            assertFalse(consumed.has(PROCESSING_HANDOFF_OPERATION_ID))
+            assertFalse(consumed.has(PROCESSING_HANDOFF_RUNTIME_SESSION_ID))
+            assertFalse(consumed.has(PROCESSING_HANDOFF_KIND))
+            assertFalse(consumed.has(PROCESSING_HANDOFF_CREATED_AT))
+            assertFalse(KeplerJobMetadata.consumeProcessingHandoff(directory, KeplerActiveOperationKind.PROCESSING_YUV))
+
+            KeplerJobMetadata.update(directory) {
+                it.put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                    .put(PROCESSING_HANDOFF_OPERATION_ID, "handoff-2")
+                    .put(PROCESSING_HANDOFF_KIND, KeplerActiveOperationKind.PROCESSING_RAW.name)
+            }
+            assertFalse(KeplerJobMetadata.consumeProcessingHandoff(directory, KeplerActiveOperationKind.PROCESSING_YUV))
+            assertEquals(
+                KeplerActiveOperationKind.PROCESSING_RAW.name,
+                KeplerJobMetadata.read(directory).getString(PROCESSING_HANDOFF_KIND)
+            )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun consumeProcessingHandoffRefusesForeignRuntimeHandoff() {
+        val directory = Files.createTempDirectory("kepler-consume-handoff-foreign-").toFile()
+        try {
+            KeplerJobMetadata.write(directory, JSONObject()
+                .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, "dead-runtime")
+                .put(PROCESSING_HANDOFF_OPERATION_ID, "foreign-handoff")
+                .put(PROCESSING_HANDOFF_KIND, KeplerActiveOperationKind.PROCESSING_YUV.name))
+            assertFalse(KeplerJobMetadata.consumeProcessingHandoff(directory, KeplerActiveOperationKind.PROCESSING_YUV))
+            assertEquals(
+                "foreign-handoff",
+                KeplerJobMetadata.read(directory).getString(PROCESSING_HANDOFF_OPERATION_ID)
+            )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun consumeProcessingHandoffWriteFaultRetriesIdempotently() {
+        val directory = Files.createTempDirectory("kepler-consume-handoff-write-fault-").toFile()
+        val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
+        try {
+            KeplerJobMetadata.write(directory, JSONObject()
+                .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(PROCESSING_HANDOFF_OPERATION_ID, "handoff-1")
+                .put(PROCESSING_HANDOFF_KIND, KeplerActiveOperationKind.PROCESSING_YUV.name))
+            KeplerJobMetadata.atomicWriteFailureForTest = IllegalStateException("consume write failed")
+
+            assertFalse(KeplerJobMetadata.consumeProcessingHandoff(directory, KeplerActiveOperationKind.PROCESSING_YUV))
+            assertTrue(KeplerJobMetadata.read(directory).has(PROCESSING_HANDOFF_OPERATION_ID))
+
+            assertTrue(KeplerJobMetadata.consumeProcessingHandoff(directory, KeplerActiveOperationKind.PROCESSING_YUV))
+            assertFalse(KeplerJobMetadata.read(directory).has(PROCESSING_HANDOFF_OPERATION_ID))
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun consumedSourceHandoffAllowsLaterReprocessAcquisition() {
+        val directory = Files.createTempDirectory("kepler-consume-handoff-reprocess-").toFile()
+        var lease: JobOperationLease? = null
+        try {
+            KeplerJobMetadata.write(directory, JSONObject()
+                .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(PROCESSING_HANDOFF_OPERATION_ID, "source-handoff")
+                .put(PROCESSING_HANDOFF_KIND, KeplerActiveOperationKind.PROCESSING_YUV.name))
+            assertThrows(JobRecoveryMutationBlockedException::class.java) {
+                KeplerJobMetadata.acquireRecoveryCheckedOperation(directory, JobRecoveryMutationIntent.REPROCESS)
+            }
+
+            assertTrue(KeplerJobMetadata.consumeProcessingHandoff(directory, KeplerActiveOperationKind.PROCESSING_YUV))
+            lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(directory, JobRecoveryMutationIntent.REPROCESS)
+            assertFalse(KeplerJobMetadata.read(directory).has(PROCESSING_HANDOFF_OPERATION_ID))
+        } finally {
+            lease?.release()
+            directory.deleteRecursively()
+        }
+    }
 }

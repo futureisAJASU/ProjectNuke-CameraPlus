@@ -818,10 +818,29 @@ onComplete = { sourceJobDir ->
                     } catch (settlementFailure: Exception) {
                         Log.e("KeplerSuperResolution", "public export owner settlement failed", settlementFailure)
                     }
-                    return evidence
+return evidence
                 }
-                try {
+                fun consumeSourceHandoffIfStillPresent() {
+                    try {
+                        // Idempotent backstop: the worker already consumed the source handoff at
+                        // start; a transient write failure may have left it, and a success
+                        // terminal must never follow an unconsumed source handoff.
+                        KeplerJobMetadata.consumeProcessingHandoff(
+                            sourceJobDir,
+                            KeplerActiveOperationKind.PROCESSING_YUV
+                        )
+                    } catch (settledError: Error) {
+                        throw settledError
+                    } catch (settledFailure: Exception) {
+                        Log.e("KeplerSuperResolution", "source handoff re-consume failed", settledFailure)
+                    }
+                }
+try {
                     cancellation.throwIfCancelled()
+                    // The processed frames leave the source job: transfer (consume) the
+                    // capture's processing handoff so the source job converges instead of
+                    // staying handoff-locked, since the worker never owns it.
+                    consumeSourceHandoffIfStillPresent()
                     val sourceFrames = readColorBurstFrameFiles(sourceJobDir)
                     cancellation.throwIfCancelled()
                     val outputDir = createSuperResolutionJobDirectory(context)
@@ -928,10 +947,11 @@ onComplete = { sourceJobDir ->
                         postExportWorkSkipped = cancellation.isCancelled,
                         operationLease = outputLease
                     )
-                    if (!verified) {
+if (!verified) {
                         // The shared exporter has already persisted the committed-unverified
                         // result.  A second failure writer would reopen a settled PUBLIC_EXPORT
                         // boundary and could erase the exact committed URI.
+                        consumeSourceHandoffIfStillPresent()
                         post("PIPELINE_COMPLETE_PARTIAL: 24M Fusion export verification was not proven.")
                         terminal.publish(
                             exportOutcomeTerminalKind(
@@ -948,6 +968,7 @@ onComplete = { sourceJobDir ->
                     }
 
                     if (cancellation.isCancelled) {
+                        consumeSourceHandoffIfStillPresent()
                         updateExportMetadata(outputDir, export, true, finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
                             postExportCancellationRequested = true, postExportWorkSkipped = true,
@@ -962,12 +983,13 @@ onComplete = { sourceJobDir ->
                         )
                         return@post
                     }
-                    post(
+post(
                         "PIPELINE_COMPLETE: 24M Fusion complete " +
                             "${result.outputWidth}x${result.outputHeight}, " +
                             "used ${result.usedFrameCount}/${result.inputFrameCount} frames, " +
                             "fallback=${result.fallbackUsed}."
                     )
+                    consumeSourceHandoffIfStillPresent()
                     terminal.publish(
                         CameraPipelineEvent.Terminal.Kind.COMPLETE,
                         requiredOutputCommitted = true,

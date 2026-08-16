@@ -277,8 +277,42 @@ object KeplerJobMetadata {
         lease
     }
 
-    /**
-     * Retries a terminal owner clear recorded by an operation scope that has already returned.
+    /** Correlation + removal shared by [consumeProcessingHandoff] and handoff-consuming
+ *  acquisitions, so every consumption path enforces the exact same authority:
+ *  current runtime session, exact job metadata, and exact handoff kind. */
+private fun correlateAndRemoveProcessingHandoff(job: JSONObject, kind: KeplerActiveOperationKind): Boolean {
+    if (job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID) != KeplerRuntimeSession.id ||
+        job.optString(PROCESSING_HANDOFF_KIND) != kind.name
+    ) return false
+    job.remove(PROCESSING_HANDOFF_RUNTIME_SESSION_ID)
+    job.remove(PROCESSING_HANDOFF_OPERATION_ID)
+    job.remove(PROCESSING_HANDOFF_KIND)
+    job.remove(PROCESSING_HANDOFF_CREATED_AT)
+    return true
+}
+
+/**
+ * Atomically clears the current-runtime processing handoff for [kind] on [jobDir].
+ * Idempotent: returns false when no correlated handoff was present, so the same
+ * worker can re-assert consumption before a terminal publish without side effects.
+ */
+internal fun consumeProcessingHandoff(
+    jobDir: File,
+    kind: KeplerActiveOperationKind
+): Boolean = try {
+    var matched = false
+    update(jobDir) { job ->
+        matched = correlateAndRemoveProcessingHandoff(job, kind)
+    }
+    matched
+} catch (failure: Error) {
+    throw failure
+} catch (_: Exception) {
+    false
+}
+
+/**
+ * Retries a terminal owner clear recorded by an operation scope that has already returned.
      * The retained lease is still the only process-local authority, so a successful retry can
      * release it immediately; a failed retry leaves the exact owner protected for the next
      * production mutation/recovery entry.
@@ -582,14 +616,9 @@ object KeplerJobMetadata {
                     .put(ACTIVE_OPERATION_KIND, kind.name)
                     .put(ACTIVE_OPERATION_STARTED_AT, startedAt)
                     .put(ACTIVE_OPERATION_UPDATED_AT, startedAt)
-                if (consumesProcessingHandoff &&
-                    job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id &&
-                    job.optString(PROCESSING_HANDOFF_KIND) == kind.name
-                ) {
-                    job.remove(PROCESSING_HANDOFF_RUNTIME_SESSION_ID)
-                    job.remove(PROCESSING_HANDOFF_OPERATION_ID)
-                    job.remove(PROCESSING_HANDOFF_KIND)
-                    job.remove(PROCESSING_HANDOFF_CREATED_AT)
+                if (consumesProcessingHandoff) {
+                    // A mismatched or foreign handoff is left untouched for its own consumer.
+                    correlateAndRemoveProcessingHandoff(job, kind)
                 }
                 job.remove(TERMINAL_OPERATION_ID)
             }
