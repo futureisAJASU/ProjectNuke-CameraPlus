@@ -419,9 +419,26 @@ private fun combineCause(primary: Throwable, vararg suppressed: Throwable?): Thr
 
 /** Compact cause/suppressed helper used by rollback, cleanup, terminal metadata, quarantine, and late-finalization. */
 private fun combineCauseWithMessage(primary: Throwable, message: String, suppressedFailure: Throwable?): Throwable {
-    val wrapping = if (primary.message != message) RuntimeException(message, primary) else primary
+    val wrapping = if (primary is Error || primary is kotlinx.coroutines.CancellationException || primary.message == message) {
+        primary
+    } else {
+        RuntimeException(message, primary)
+    }
     if (suppressedFailure != null && suppressedFailure !== primary) addSuppressedSafe(wrapping, suppressedFailure)
     return wrapping
+}
+
+private fun combineSettlementFailureWithMessage(
+    primary: Throwable,
+    message: String,
+    secondary: Throwable?
+): Throwable {
+    val contextualPrimary = if (primary is Error || primary is kotlinx.coroutines.CancellationException) {
+        primary
+    } else {
+        RuntimeException(message, primary)
+    }
+    return requireNotNull(combineSettlementFailure(contextualPrimary, secondary))
 }
 
 /** Structured completed-terminal helper. Avoids [Deferred.getCompleted] experimental opt-in and
@@ -447,9 +464,10 @@ private suspend fun resolveWorkerTerminal(
         Result.success(terminal.await())
     } catch (ce: kotlinx.coroutines.CancellationException) {
         if (currentCoroutineContext().isActive) {
-            // Worker Deferred was cancelled, but this coroutine is still active.
-            // Confirmed worker failure, not callback cancellation.
-            Result.failure(IllegalStateException("Reprocess worker deferred was cancelled.", ce))
+            // Worker Deferred was cancelled, but this coroutine is still active.  Preserve the
+            // cancellation identity so rollback/finalization records CANCELLED rather than a
+            // synthetic ordinary worker failure.
+            Result.failure(ce)
         } else {
             // This coroutine is cancelled → callback/retry cancellation, propagate.
             throw ce
@@ -688,6 +706,21 @@ selectionMode = resolveSelectionMode(job, frameSelection)
             }
         }
         throw callerCancellation
+    } catch (fatal: Error) {
+        // A fatal startup/worker boundary must still leave durable transaction evidence before it
+        // escapes.  Do not run quarantine after a terminal result was already stored.
+        val tx = transaction
+        if (tx != null && session.existingTerminalResult() == null) {
+            var quarantineFailure: Throwable? = null
+            try {
+                val quarantined = quarantineWithPersistence(tx, fatal)
+                quarantineFailure = quarantined.result.exceptionOrNull()
+            } catch (secondary: Throwable) {
+                quarantineFailure = secondary
+            }
+            throw requireNotNull(combineSettlementFailure(fatal, quarantineFailure))
+        }
+        throw fatal
     } catch (unexpected: Exception) {
         val tx = transaction ?: run {
             // Pre-ACTIVE unexpected: metadata is untouched beneath the lease; outer finally releases it.
@@ -797,13 +830,18 @@ private fun settleTerminalResult(
             Result.failure(IllegalStateException("No transaction available to settle terminal result."))
         )
     }
-    fun finalizeAndPropagate(terminal: Result<ReprocessWorkerOutcome>): ReprocessFinalizationResult {
+    fun finalizeAndPropagate(
+        terminal: Result<ReprocessWorkerOutcome>,
+        propagateCancellation: Boolean = true
+    ): ReprocessFinalizationResult {
         val settled = finalizeTransaction(
             session, transaction, target, jobKind, outputSettings, selectionMode,
             resolvedSelection, terminal
         )
         settled.result.exceptionOrNull()?.let { failure ->
-            if (failure is CancellationException || failure is Error) throw failure
+            if (failure is Error || (failure is CancellationException && propagateCancellation)) {
+                throw failure
+            }
         }
         terminal.getOrNull()?.terminalError?.let { failure ->
             if (failure is CancellationException || failure is Error) throw failure
@@ -812,7 +850,10 @@ private fun settleTerminalResult(
     }
     return when (acquisition) {
         is WorkerTerminalResult.TerminalReceived -> finalizeAndPropagate(Result.success(acquisition.outcome))
-        is WorkerTerminalResult.DeferredExceptionalCompletion -> finalizeAndPropagate(Result.failure(acquisition.cause))
+        is WorkerTerminalResult.DeferredExceptionalCompletion -> finalizeAndPropagate(
+            Result.failure(acquisition.cause),
+            propagateCancellation = acquisition.cause !is CancellationException
+        )
         is WorkerTerminalResult.WorkerExitedAfterCancellation -> finalizeAndPropagate(
             acquisition.outcome?.let { Result.success(it) }
                 ?: Result.failure(
@@ -1337,10 +1378,6 @@ internal fun strictRootEvidence(jobDir: File, transaction: ReprocessTransaction)
     val durable = try {
         loadStrictManifest(manifestFile)
     } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-    catch (oom: OutOfMemoryError) { throw oom }
-    catch (td: ThreadDeath) { throw td }
-    catch (le: LinkageError) { throw le }
-    catch (ie: InternalError) { throw ie }
     catch (e: Error) { throw e }
     catch (manifestFailure: Exception) {
         return if (markerInspectionError != null) RootEvidence.InspectionFailed(markerInspectionError)
@@ -1443,10 +1480,6 @@ internal fun classifyMarkerPath(marker: File, parentDir: File): MarkerPathClassi
         if (markerParent != canonicalParent) return MarkerPathClassification.NotDirectChild
         MarkerPathClassification.Valid(marker)
     } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-    catch (oom: OutOfMemoryError) { throw oom }
-    catch (td: ThreadDeath) { throw td }
-    catch (le: LinkageError) { throw le }
-    catch (ie: InternalError) { throw ie }
     catch (e: Error) { throw e }
     catch (ex: Exception) { MarkerPathClassification.InspectionError(ex) }
 }
@@ -1518,13 +1551,18 @@ internal fun finalizeTransaction(
     }
     val currentManifest = loadStrictManifest(File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE))
     val outcome = terminal.getOrElse { terminalError ->
-        if (terminalError is CancellationException || terminalError is Error) throw terminalError
-        // Exceptional Deferred completion is a confirmed worker exit, not an unresolved timeout.
-        // It therefore follows the ordinary uncommitted rollback settlement path.
+        if (terminalError is Error) throw terminalError
+        // A worker cancellation is a confirmed terminal cut, not an unresolved timeout and not
+        // an ordinary processing failure. Carry the original CancellationException through the
+        // rollback writer so durable metadata records CANCELLED while identity is preserved.
         ReprocessWorkerOutcome(
             result = Result.failure(terminalError),
             publicExportCommitted = false,
-            disposition = ReprocessTerminalDisposition.UNCOMMITTED_FAILURE,
+            disposition = if (terminalError is CancellationException) {
+                ReprocessTerminalDisposition.CANCELLED
+            } else {
+                ReprocessTerminalDisposition.UNCOMMITTED_FAILURE
+            },
             terminalError = terminalError
         )
     }
@@ -1533,9 +1571,21 @@ internal fun finalizeTransaction(
         ReprocessTransactionState.COMMITTED -> {
             if (operationLease != null && KeplerJobMetadata.isOperationOwner(jobDir, operationLease)) {
                 try {
-                    operationLease.releaseIfProcessingSettled()
+                    val activeOperationId = KeplerJobMetadata.read(jobDir)
+                        .optString(ACTIVE_OPERATION_ID)
+                        .takeIf { it.isNotBlank() }
+                    val cleared = activeOperationId?.let {
+                        KeplerJobMetadata.clearActiveOperation(jobDir, it, operationLease)
+                    } ?: true
+                    if (cleared || activeOperationId == null ||
+                        !KeplerJobMetadata.isCurrentActiveOperation(jobDir, activeOperationId)
+                    ) {
+                        operationLease.releaseIfProcessingSettled()
+                    }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
+                } catch (failure: Error) {
+                    throw failure
                 } catch (_: Exception) {}
             }
             val saved = ReprocessFinalizationResult(
@@ -1549,9 +1599,21 @@ internal fun finalizeTransaction(
         ReprocessTransactionState.ROLLED_BACK -> {
             if (operationLease != null && KeplerJobMetadata.isOperationOwner(jobDir, operationLease)) {
                 try {
-                    operationLease.releaseIfProcessingSettled()
+                    val activeOperationId = KeplerJobMetadata.read(jobDir)
+                        .optString(ACTIVE_OPERATION_ID)
+                        .takeIf { it.isNotBlank() }
+                    val cleared = activeOperationId?.let {
+                        KeplerJobMetadata.clearActiveOperation(jobDir, it, operationLease)
+                    } ?: true
+                    if (cleared || activeOperationId == null ||
+                        !KeplerJobMetadata.isCurrentActiveOperation(jobDir, activeOperationId)
+                    ) {
+                        operationLease.releaseIfProcessingSettled()
+                    }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
+                } catch (failure: Error) {
+                    throw failure
                 } catch (_: Exception) {}
             }
             val saved = ReprocessFinalizationResult(
@@ -1675,29 +1737,22 @@ internal fun quarantineWithPersistence(
     var stateError: Throwable? = null
     try {
         writeQuarantineMarker(transaction)
-    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-    catch (oom: OutOfMemoryError) { throw oom }
-    catch (td: ThreadDeath) { throw td }
-    catch (le: LinkageError) { throw le }
-    catch (ie: InternalError) { throw ie }
-    catch (e: Error) { throw e }
+    } catch (ce: kotlinx.coroutines.CancellationException) { markerError = ce }
+    catch (e: Error) { markerError = e }
     catch (mf: Exception) { markerError = mf }
     try {
         writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED)
-    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-    catch (oom: OutOfMemoryError) { throw oom }
-    catch (td: ThreadDeath) { throw td }
-    catch (le: LinkageError) { throw le }
-    catch (ie: InternalError) { throw ie }
-    catch (e: Error) { throw e }
+    } catch (ce: kotlinx.coroutines.CancellationException) { stateError = ce }
+    catch (e: Error) { stateError = e }
     catch (sf: Exception) { stateError = sf }
 
     // Inner try used addSuppressed for linked failures; replace with narrow helper that ignores
     // only self-suppression or IllegalArgumentException for invalid suppression.
     val combined: Throwable = if (markerError != null || stateError != null) {
-        val wrapping = combineCauseWithMessage(originalError, "Quarantine persistence failed after processing error", markerError)
-        if (stateError != null) addSuppressedSafe(wrapping, stateError)
-        wrapping
+        var combined = combineSettlementFailure(originalError, markerError)
+            ?: originalError
+        combined = combineSettlementFailure(combined, stateError) ?: combined
+        combined
     } else originalError
 
     // Fallback only when both root mechanisms failed. Use one narrow suppressed-error helper and
@@ -1705,17 +1760,26 @@ internal fun quarantineWithPersistence(
     if (markerError != null && stateError != null) {
         try {
             ensureDurableFallbackQuarantine(transaction.backupRoot.parentFile ?: transaction.backupRoot, transaction)
+            if (combined is Error || combined is kotlinx.coroutines.CancellationException) {
+                throw combined
+            }
             return ReprocessFinalizationResult(ReprocessFinalizationState.QUARANTINED, Result.failure(combined))
-        } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-        catch (oom: OutOfMemoryError) { throw oom }
-        catch (td: ThreadDeath) { throw td }
-        catch (le: LinkageError) { throw le }
-        catch (ie: InternalError) { throw ie }
-        catch (e: Error) { throw e }
-        catch (fallbackError: Exception) {
-            val finalError = combineCauseWithMessage(combined, "Fallback quarantine persistence failed", fallbackError)
+        } catch (secondary: Error) {
+            throw requireNotNull(combineSettlementFailure(combined, secondary))
+        } catch (secondary: kotlinx.coroutines.CancellationException) {
+            throw requireNotNull(combineSettlementFailure(combined, secondary))
+        } catch (fallbackError: Exception) {
+            val finalError = combineSettlementFailureWithMessage(
+                combined, "Fallback quarantine persistence failed", fallbackError
+            )
+            if (finalError is Error || finalError is kotlinx.coroutines.CancellationException) {
+                throw finalError
+            }
             return ReprocessFinalizationResult(ReprocessFinalizationState.QUARANTINED, Result.failure(finalError))
         }
+    }
+    if (combined is Error || combined is kotlinx.coroutines.CancellationException) {
+        throw combined
     }
     return ReprocessFinalizationResult(ReprocessFinalizationState.QUARANTINED, Result.failure(combined))
 }
@@ -1738,7 +1802,7 @@ internal fun rollback(
     if (restore.isFailure) {
         val restoreError = restore.exceptionOrNull()
             ?: IllegalStateException("Rollback restore failed without a cause")
-        val linked = combineCauseWithMessage(
+        val linked = combineSettlementFailureWithMessage(
             error, "Rollback restore failed: ${restoreError.message}", restoreError
         )
         return quarantineWithPersistence(transaction, linked)
@@ -1747,7 +1811,7 @@ internal fun rollback(
         .exceptionOrNull()?.let { deleteError ->
             return quarantineWithPersistence(
                 transaction,
-                combineCauseWithMessage(error, "Created-file deletion failed during rollback", deleteError)
+                combineSettlementFailureWithMessage(error, "Created-file deletion failed during rollback", deleteError)
             )
         }
     val metadataError = try {
@@ -1762,10 +1826,12 @@ internal fun rollback(
                     PublicExportInterruptionDisposition.FAILED
                 }
             )
-        } catch (settlementFailure: Exception) {
+        } catch (settlementFailure: Throwable) {
             return quarantineWithPersistence(
                 transaction,
-                combineCauseWithMessage(error, "Public export owner settlement failed during rollback", settlementFailure)
+                combineSettlementFailureWithMessage(
+                    error, "Public export owner settlement failed during rollback", settlementFailure
+                )
             )
         }
         if (outcome.disposition == ReprocessTerminalDisposition.CANCELLED) {
@@ -1774,34 +1840,35 @@ internal fun rollback(
             writeReprocessFailure(jobDir, "${error.javaClass.simpleName}: ${error.message}")
         }
         null
-    } catch (e: OutOfMemoryError) { throw e
-    } catch (e: ThreadDeath) { throw e
-    } catch (e: LinkageError) { throw e
-    } catch (e: InternalError) { throw e
-    } catch (e: Error) { throw e
-    } catch (metadataFailure: Exception) {
+    } catch (metadataFailure: Throwable) {
         metadataFailure
     }
     if (metadataError != null) {
         return quarantineWithPersistence(
-            transaction, combineCauseWithMessage(error, "Terminal metadata failure during rollback", metadataError)
+            transaction,
+            combineSettlementFailureWithMessage(error, "Terminal metadata failure during rollback", metadataError)
         )
     }
     try {
         writeTransactionState(transaction, ReprocessTransactionState.ROLLED_BACK)
-    } catch (e: OutOfMemoryError) { throw e
-    } catch (e: ThreadDeath) { throw e
-    } catch (e: LinkageError) { throw e
-    } catch (e: InternalError) { throw e
-    } catch (e: Error) { throw e
-    } catch (stateFailure: Exception) {
+    } catch (stateFailure: Throwable) {
         return quarantineWithPersistence(
-            transaction, combineCauseWithMessage(error, "State persistence failure during rollback", stateFailure)
+            transaction,
+            combineSettlementFailureWithMessage(error, "State persistence failure during rollback", stateFailure)
         )
     }
     val rolledBack = ReprocessFinalizationResult(ReprocessFinalizationState.ROLLED_BACK, Result.failure(error))
     session.storeTerminalResult(rolledBack)
-    performTerminalCleanupDebt(transaction, jobDir, ReprocessTransactionState.ROLLED_BACK, operationLease)
+    var cleanupFailure: Throwable? = null
+    try {
+        performTerminalCleanupDebt(transaction, jobDir, ReprocessTransactionState.ROLLED_BACK, operationLease)
+    } catch (failure: Throwable) {
+        cleanupFailure = failure
+    }
+    cleanupFailure?.let { failure ->
+        val combined = requireNotNull(combineSettlementFailure(error, failure))
+        if (combined is Error || combined is CancellationException) throw combined
+    }
     return rolledBack
 }
 
@@ -2076,6 +2143,7 @@ private fun finalizeReprocessOutcome(
     val finalFile = (outcome.finalOutputFile ?: currentAttemptLocalOutput)
         ?.takeIf { it.isFile && it.length() > 0L }
     val previewFile = outcome.previewFile?.takeIf { it.isFile && it.length() > 0L } ?: finalFile
+    val hasPublicOnlyWithoutPreview = outcome.publicExportCommitted && finalFile == null && previewFile == null
     val uncommittedNoOutput = outcome.result.isSuccess && !outcome.publicExportCommitted &&
         finalFile?.isFile != true && !currentAttemptLocalResult
     if (uncommittedNoOutput && (previewFile == null || previewFile == finalFile)) {
@@ -2093,32 +2161,43 @@ private fun finalizeReprocessOutcome(
             cancellationRequested = outcome.postExportCancellationRequested || it.postExportCancellationRequested,
             currentLocalOutput = it.currentLocalOutput ?: finalFile,
             currentAttemptLocalResult = currentAttemptLocalResult ||
-                (outcome.result.isSuccess && finalFile?.isFile == true && it.base.outputCommitted)
+                (outcome.result.isSuccess && finalFile?.isFile == true && it.base.outputCommitted),
+            publicOnlyWithoutPreview = hasPublicOnlyWithoutPreview
         )
     }
     val verifiedSuccess = if (rawPolicy != null) {
         rawPolicy.durablePipelineStage == "COMPLETE"
     } else {
-        outcome.result.isSuccess && outcome.exportVerified
+        outcome.result.isSuccess && outcome.exportVerified &&
+            outcome.export?.publicCommitState == GalleryExportCommitState.VERIFIED
     }
-    val publicOnlyWithoutPreview = verifiedSuccess && outcome.publicExportCommitted && finalFile == null && previewFile == null
+    val effectiveExportVerified = rawPolicy?.publicVerified ?: (
+        outcome.exportVerified && outcome.export?.publicCommitState == GalleryExportCommitState.VERIFIED
+    )
+    val publicOnlyWithoutPreview = rawPolicy?.let {
+        it.durablePipelineStage == "PARTIAL" && outcome.publicExportCommitted && finalFile == null && previewFile == null
+    } == true
     val sidecarResult = publicOutcome?.sidecar ?: outcome.sidecar
     val postExportCancellation = outcome.postExportCancellationRequested ||
         (publicOutcome?.postExportCancellationRequested == true)
     val postExportWorkSkipped = outcome.postExportWorkSkipped ||
         (publicOutcome?.postExportWorkSkipped == true)
     val currentWarning = publicOutcome?.currentWarning
-    if (verifiedSuccess && !publicOnlyWithoutPreview) {
+    val cancelledWithoutUsableResult = rawPolicy?.durablePipelineStage == "CANCELLED" ||
+        (rawPolicy == null && outcome.disposition == ReprocessTerminalDisposition.CANCELLED && !outcome.publicExportCommitted)
+    if (cancelledWithoutUsableResult) {
+        writeReprocessCancelled(jobDir, outcome.terminalError?.message)
+    } else if (verifiedSuccess && !publicOnlyWithoutPreview) {
         writeReprocessSuccess(
             jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile,
-            selectionMode, includedFrameIndices, outcome.export, outcome.exportVerified,
+            selectionMode, includedFrameIndices, outcome.export, effectiveExportVerified,
             outputSettings, sidecarResult, postExportCancellation, postExportWorkSkipped,
             currentWarning
         )
     } else if (publicOnlyWithoutPreview) {
         writeReprocessPartialPublicOnly(
             jobDir, jobKind, includedFrameIndices.size, outcome.export,
-            outcome.exportVerified, outputSettings, outcome.terminalError?.message,
+            effectiveExportVerified, outputSettings, outcome.terminalError?.message,
             sidecarResult, postExportCancellation, postExportWorkSkipped,
             currentWarning
         )
@@ -2127,7 +2206,7 @@ private fun finalizeReprocessOutcome(
             jobDir, jobKind, includedFrameIndices.size, finalFile, previewFile,
             selectionMode, includedFrameIndices,
             outcome.result.exceptionOrNull()?.message, outcome.export,
-            outcome.exportVerified, outputSettings, sidecarResult,
+            effectiveExportVerified, outputSettings, sidecarResult,
             postExportCancellation, postExportWorkSkipped, currentWarning
         )
     }
@@ -3939,7 +4018,8 @@ private fun writeReprocessSuccess(
         .put("finalOutputFormatSetting", outputSettings.name)
         .put("exportStatus", if (export == null) "NOT_EXPORTED" else "EXPORTED")
         .put("exportVerified", exportVerified)
-        .put("galleryExportCommitted", export?.success == true && !export.uriString.isNullOrBlank())
+        .put("galleryExportCommitted", export?.publicCommitted == true)
+        .put("exportCommitState", export?.publicCommitState?.name ?: GalleryExportCommitState.NOT_COMMITTED.name)
         .put("exportUri", export?.uriString ?: JSONObject.NULL)
         .put("exportDisplayName", export?.displayName ?: JSONObject.NULL)
         .put("exportMimeType", export?.mimeType ?: JSONObject.NULL)
@@ -4036,7 +4116,8 @@ private fun writeReprocessPartial(
         .put("finalOutputFormatSetting", outputSettings.name)
         .put("exportStatus", if (exportVerified) "EXPORTED" else "EXPORT_UNVERIFIED")
         .put("exportVerified", exportVerified)
-        .put("galleryExportCommitted", export?.success == true && !export?.uriString.isNullOrBlank())
+        .put("galleryExportCommitted", export?.publicCommitted == true)
+        .put("exportCommitState", export?.publicCommitState?.name ?: GalleryExportCommitState.NOT_COMMITTED.name)
         .put("exportUri", export?.uriString ?: JSONObject.NULL)
         .put("exportDisplayName", export?.displayName ?: JSONObject.NULL)
         .put("exportMimeType", export?.mimeType ?: JSONObject.NULL)
@@ -4104,7 +4185,8 @@ private fun writeReprocessPartialPublicOnly(
             .put("finalOutputFormatSetting", outputSettings.name)
             .put("exportStatus", "EXPORTED")
             .put("exportVerified", exportVerified)
-            .put("galleryExportCommitted", export?.success == true && !export.uriString.isNullOrBlank())
+            .put("galleryExportCommitted", export?.publicCommitted == true)
+            .put("exportCommitState", export?.publicCommitState?.name ?: GalleryExportCommitState.NOT_COMMITTED.name)
             .put("exportUri", export?.uriString ?: JSONObject.NULL)
             .put("exportDisplayName", export?.displayName ?: JSONObject.NULL)
             .put("exportMimeType", export?.mimeType ?: JSONObject.NULL)

@@ -1113,6 +1113,10 @@ fun captureRawBurstForFusion(
                             // Provider directory-force is an optional durability fence.
                         }
                         dngSaved = true
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (fatal: Error) {
+                        throw fatal
                     } catch (e: Exception) {
                         dngFailure = "${e.javaClass.simpleName}: ${e.message}"
                         post("RAW DNG sidecar failed; continuing with raw16 fusion.")
