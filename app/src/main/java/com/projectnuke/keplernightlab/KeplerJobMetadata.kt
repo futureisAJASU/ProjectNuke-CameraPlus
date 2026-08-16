@@ -529,13 +529,20 @@ object KeplerJobMetadata {
         job
     }
 
-    /** Persists restart-reconciliation ownership without replacing the live in-process lease. */
+    /**
+     * Persists restart-reconciliation ownership without replacing the live in-process lease.
+     * When [consumesProcessingHandoff] is set, a current-runtime capture handoff whose kind
+     * matches [kind] is consumed in the same atomic write as the operation start, so a
+     * published handoff can never be observed as consumed without the owning operation being
+     * durably active (and vice versa).
+     */
     internal fun beginActiveOperation(
         jobDir: File,
         operationId: String = UUID.randomUUID().toString(),
         kind: KeplerActiveOperationKind,
         startedAt: Long = System.currentTimeMillis(),
-        ownerLease: JobOperationLease? = null
+        ownerLease: JobOperationLease? = null,
+        consumesProcessingHandoff: Boolean = false
     ): String = withJobLock(jobDir) {
         val key = jobDir.toPath().toAbsolutePath().normalize().toString()
         val lease = if (ownerLease != null) {
@@ -555,7 +562,12 @@ object KeplerJobMetadata {
         try {
             val outcome = inspectRecoveryMutationGate(
                 jobDir,
-                JobRecoveryMutationIntent.METADATA_EDIT,
+                if (consumesProcessingHandoff) {
+                    JobRecoveryMutationIntent.PROCESSING_START
+                } else {
+                    JobRecoveryMutationIntent.METADATA_EDIT
+                },
+                consumesProcessingHandoff = consumesProcessingHandoff,
                 ownerLease = lease
             )
             if (outcome == JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP) {
@@ -570,6 +582,15 @@ object KeplerJobMetadata {
                     .put(ACTIVE_OPERATION_KIND, kind.name)
                     .put(ACTIVE_OPERATION_STARTED_AT, startedAt)
                     .put(ACTIVE_OPERATION_UPDATED_AT, startedAt)
+                if (consumesProcessingHandoff &&
+                    job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id &&
+                    job.optString(PROCESSING_HANDOFF_KIND) == kind.name
+                ) {
+                    job.remove(PROCESSING_HANDOFF_RUNTIME_SESSION_ID)
+                    job.remove(PROCESSING_HANDOFF_OPERATION_ID)
+                    job.remove(PROCESSING_HANDOFF_KIND)
+                    job.remove(PROCESSING_HANDOFF_CREATED_AT)
+                }
                 job.remove(TERMINAL_OPERATION_ID)
             }
             lease.markDurableOperation(operationId, kind)

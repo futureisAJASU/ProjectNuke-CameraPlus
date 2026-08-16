@@ -83,10 +83,11 @@ internal fun acquireRawProcessingOperation(
     jobDir: File,
     borrowedLease: JobOperationLease? = null
 ): RawProcessingOperation? {
-    val ownsLease = borrowedLease == null
+val ownsLease = borrowedLease == null
     val lease = borrowedLease ?: KeplerJobMetadata.acquireRecoveryCheckedOperation(
         jobDir,
-        JobRecoveryMutationIntent.PROCESSING_START
+        JobRecoveryMutationIntent.PROCESSING_START,
+        consumesProcessingHandoff = true
     )
     if (!KeplerJobMetadata.isOperationOwner(jobDir, lease)) {
         if (ownsLease) lease.release()
@@ -108,11 +109,12 @@ internal fun acquireRawProcessingOperation(
     val operationId = if (hasJobMetadata) {
         val requestedOperationId = UUID.randomUUID().toString()
         try {
-            KeplerJobMetadata.beginActiveOperation(
+KeplerJobMetadata.beginActiveOperation(
                 jobDir,
                 operationId = requestedOperationId,
                 kind = KeplerActiveOperationKind.PROCESSING_RAW,
-                ownerLease = lease
+                ownerLease = lease,
+                consumesProcessingHandoff = true
             )
         } catch (failure: Throwable) {
             var cleanupFailure: Throwable? = null
