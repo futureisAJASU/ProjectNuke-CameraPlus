@@ -2228,10 +2228,29 @@ private fun finalizeReprocessOutcome(
         )
     }
     clearReprocessCommitCheckpoint(jobDir)
+    // The result warning is durable-debt truth, not generic noise: it fires only when this
+    // outcome really committed a public export whose verification is incomplete.  Pure
+    // cancellations, uncommitted failures, and UNKNOWN commit states carry no such debt.
     return KeplerReprocessResult(jobDir, jobKind, displayFile, previewFile, bytes,
-        listOfNotNull(if (verifiedSuccess) null else "Public export committed; reprocess verification incomplete")
+        listOfNotNull(reprocessVerificationDebtWarning(
+            effectiveExportVerified = effectiveExportVerified,
+            publicCommitted = rawPolicy?.publicCommitted ?:
+                (outcome.publicExportCommitted || outcome.export?.publicCommitted == true)
+        ))
     )
 }
+
+/**
+ * Exact reprocess-verification debt warning: a committed public export with incomplete
+ * verification.  UNKNOWN commit records are never claimed as committed here, so they carry
+ * no warning either.
+ */
+internal fun reprocessVerificationDebtWarning(
+    effectiveExportVerified: Boolean,
+    publicCommitted: Boolean
+): String? = if (!effectiveExportVerified && publicCommitted) {
+    "Public export committed; reprocess verification incomplete"
+} else null
 
 /**
  * Tests-only helper that cancels a worker and awaits its terminal outcome. Production code uses
@@ -4126,7 +4145,11 @@ private fun writeReprocessPartial(
         .put("frameSelectionMode", selectionMode.name)
         .put("includedFrameIndices", JSONArray(includedFrameIndices.sorted()))
         .put("reprocessSourceFrameCount", sourceFrameCount)
-        .put("reprocessError", error ?: "Public export committed but worker verification failed")
+        .put("reprocessError", error ?: if (export?.publicCommitted == true) {
+            "Public export committed but worker verification failed"
+        } else {
+            "Reprocess worker verification failed"
+        })
         .put("finalOutputAvailable", finalOutputFile?.isFile == true)
         .put("galleryVisible", finalOutputFile?.isFile == true)
         .put("galleryDisplayUnavailable", finalOutputFile?.isFile != true)
@@ -4170,7 +4193,11 @@ private fun writeReprocessPartial(
             }
         }
     putReprocessAvailability(jobDir, job, sourceFrameCount, finalOutputFile)
-    recordReprocessTerminalMetadata(job, "PARTIAL", error ?: "Public export committed but worker verification failed")
+    recordReprocessTerminalMetadata(job, "PARTIAL", error ?: if (export?.publicCommitted == true) {
+        "Public export committed but worker verification failed"
+    } else {
+        "Reprocess worker verification failed"
+    })
     }
 }
 
