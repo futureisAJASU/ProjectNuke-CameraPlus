@@ -321,14 +321,24 @@ internal object KeplerRecoveryCoordinator {
             }
             if (terminalOperationId == activeOperation && activeOperation.isNotBlank() &&
                 job.optString("currentPipelineStage") in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")) {
-                markMediaStoreExportJournalsTerminalPersisted(jobDir)
-                check(KeplerJobMetadata.finalizeRecoveredTerminalOperation(jobDir, activeOperation, lease)) {
-                    "Could not durably finalize terminal operation $activeOperation"
+                val terminalStatus = markMediaStoreExportJournalsTerminalPersisted(jobDir)
+                if (terminalStatus == MediaStoreExportTerminalSettlementStatus.SETTLED) {
+                    check(KeplerJobMetadata.finalizeRecoveredTerminalOperation(jobDir, activeOperation, lease)) {
+                        "Could not durably finalize terminal operation $activeOperation"
+                    }
+                    return KeplerJobRecoveryResult(
+                        jobDir,
+                        KeplerJobRecoveryClassification.RECOVERED,
+                        actions = exportResults.map { it.classification.name },
+                        cleanupFailures = cleanupFailures
+                    )
                 }
+                // DEFERRED terminal settlement: the exact retained owner must be protected
+                // for the next production mutation/recovery entry.
                 return KeplerJobRecoveryResult(
                     jobDir,
-                    KeplerJobRecoveryClassification.RECOVERED,
-                    actions = exportResults.map { it.classification.name },
+                    KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT,
+                    actions = listOf("TERMINAL_DEFERRED"),
                     cleanupFailures = cleanupFailures
                 )
             }

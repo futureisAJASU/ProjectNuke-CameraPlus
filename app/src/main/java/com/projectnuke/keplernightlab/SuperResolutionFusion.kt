@@ -824,13 +824,15 @@ return evidence
                     // Idempotent backstop: the worker already consumed the source handoff at
                     // start; a transient write failure may have left it, and a success
                     // terminal must never follow an unconsumed source handoff.
-                    // Returns true if handoff was already absent or successfully consumed,
-                    // false if persistence failed and the handoff remains.
+                    // consumeProcessingHandoff returns true if present-and-consumed,
+                    // false if already absent. Both are success; only an exception is failure.
                     return try {
+                        // A false result means the handoff was already absent (success).
+                        // A true result means it was present and was consumed (success).
                         KeplerJobMetadata.consumeProcessingHandoff(
                             sourceJobDir,
                             KeplerActiveOperationKind.PROCESSING_YUV
-                        )
+                        ) || true  // Always true on non-exception: either consumed or already absent
                     } catch (settledError: Error) {
                         throw settledError
                     } catch (settledFailure: Exception) {

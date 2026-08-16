@@ -733,9 +733,12 @@ if (!KeplerJobMetadata.clearActiveOperation(jobDir, operationId, pipelineLease))
                     }
                 }
                 try {
-                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
+                    val handoffSettled = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
                         jobDir, pipelineLease
                     )
+                    if (!handoffSettled) {
+                        pipelineLease.markProcessingHandoffSettlementPending()
+                    }
                 } catch (failure: Error) {
                     throw failure
                 } catch (failure: Exception) {

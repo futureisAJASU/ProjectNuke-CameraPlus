@@ -95,13 +95,17 @@ fun loadJobJson(jobDir: File): JSONObject =
     KeplerJobMetadata.read(jobDir)
 
 fun saveJobJson(context: Context, jobDir: File, job: JSONObject) {
+    // Resolve provider-aware retained debt BEFORE acquiring mutation lease
+    if (!settleMediaStoreExportDebt(context, jobDir)) {
+        throw JobRecoveryMutationBlockedException(
+            JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION
+        )
+    }
     val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
         jobDir,
         JobRecoveryMutationIntent.METADATA_EDIT
     )
     try {
-        // Attempt safe debt convergence before mutation
-        settleMediaStoreExportDebt(context, jobDir)
         KeplerJobMetadata.write(jobDir, job)
     } finally {
         lease.release()
@@ -109,6 +113,12 @@ fun saveJobJson(context: Context, jobDir: File, job: JSONObject) {
 }
 
 fun setFrameExcluded(context: Context, jobDir: File, frameIndex: Int, excluded: Boolean) {
+    // Resolve provider-aware retained debt BEFORE acquiring mutation lease
+    if (!settleMediaStoreExportDebt(context, jobDir)) {
+        throw JobRecoveryMutationBlockedException(
+            JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION
+        )
+    }
     // External mutation: acquire own operation lease, reject unresolved transactions
     val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
         jobDir,
@@ -116,8 +126,6 @@ fun setFrameExcluded(context: Context, jobDir: File, frameIndex: Int, excluded: 
     )
     try {
         require(!isReprocessQuarantined(jobDir)) { "Cannot modify frames of a quarantined or unresolved reprocess job." }
-        // Attempt safe debt convergence before mutation
-        settleMediaStoreExportDebt(context, jobDir)
         KeplerJobMetadata.update(jobDir) { job ->
         val frames = job.getJSONArray("frames")
         var found = false

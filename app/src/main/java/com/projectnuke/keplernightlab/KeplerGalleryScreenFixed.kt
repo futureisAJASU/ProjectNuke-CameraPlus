@@ -738,7 +738,7 @@ private fun KeplerGalleryDetailScreenFixedV2(
                 showReview = false
                 scope.launch {
                     withContext(Dispatchers.IO) {
-                        saveFrameSelection(currentJob.directory, frameSelectionMode, frameReviewItems)
+                        saveFrameSelection(context, currentJob.directory, frameSelectionMode, frameReviewItems)
                     }
                     refreshKey++
                 }
@@ -772,7 +772,7 @@ private fun KeplerGalleryDetailScreenFixedV2(
                     showAiDialog = null
                     scope.launch {
                         withContext(Dispatchers.IO) {
-                            saveFrameSelection(currentJob.directory, FrameSelectionMode.AI_RECOMMENDED, updated)
+                            saveFrameSelection(context, currentJob.directory, FrameSelectionMode.AI_RECOMMENDED, updated)
                         }
                         actionStatus = recommendation.summary
                         refreshKey++
@@ -862,7 +862,7 @@ private fun KeplerGalleryDetailScreenFixedV2(
                                         frameReviewItems = updated
                                         frameSelectionMode = FrameSelectionMode.AUTO_RULE_BASED
                                         withContext(Dispatchers.IO) {
-                                            saveFrameSelection(currentJob.directory, FrameSelectionMode.AUTO_RULE_BASED, updated)
+                                            saveFrameSelection(context, currentJob.directory, FrameSelectionMode.AUTO_RULE_BASED, updated)
                                         }
                                         actionStatus = recommendation.summary
                                         refreshKey++
@@ -894,7 +894,7 @@ private fun KeplerGalleryDetailScreenFixedV2(
                                     try {
                                     val selected = frameReviewItems.filter { it.included }.map { it.index }.toSet()
                                     withContext(Dispatchers.IO) {
-                                        saveFrameSelection(currentJob.directory, frameSelectionMode, frameReviewItems)
+                        saveFrameSelection(context, currentJob.directory, frameSelectionMode, frameReviewItems)
                                     }
                                     val result = reprocessKeplerGalleryJob(
                                         context = context,

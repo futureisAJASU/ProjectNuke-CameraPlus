@@ -170,10 +170,17 @@ fun loadFrameReviewItems(
 }
 
 fun saveFrameSelection(
+    context: Context,
     jobDir: File,
     mode: FrameSelectionMode,
     frames: List<KeplerFrameReviewItem>
 ): Result<Unit> = try {
+    // Resolve provider-aware retained debt BEFORE acquiring mutation lease
+    if (!settleMediaStoreExportDebt(context, jobDir)) {
+        throw JobRecoveryMutationBlockedException(
+            JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION
+        )
+    }
     // External mutation: acquire own operation lease, reject unresolved transactions
     val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
         jobDir,

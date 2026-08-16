@@ -1608,7 +1608,7 @@ internal fun settleUnknownPublicCommitState(
                     .put("exportVerified", true)
                     .put("recoveryState", "STABLE")
                     .put("lastRecoveryClassification", mainClassification.name)
-                    .put("lastRecoveryMessage", "공개 내보내기 결과를 확인했습니다.")
+                    .put("lastRecoveryMessage", "Converged from unknown to verified.")
                     .put("recoveredAt", System.currentTimeMillis())
                     .put("exportDisplayName", mainJournal.displayName)
                     .put("exportMimeType", mainJournal.mimeType)
@@ -1623,7 +1623,7 @@ internal fun settleUnknownPublicCommitState(
                     .put("exportVerified", false)
                     .put("exportVerificationFailed", true)
                     .put("recoveryState", "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION")
-                    .put("recoveryMessage", "공개 내보내기 결과가 저장되었지만 확인이 필요합니다.")
+                    .put("recoveryMessage", "Public commit found but verification pending; recovery required.")
             }
             MediaStoreExportRecoveryClassification.PENDING_DELETED,
             MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING,
@@ -1635,7 +1635,7 @@ internal fun settleUnknownPublicCommitState(
                     .put("exportVerified", false)
                     .put("recoveryState", "STABLE")
                     .put("lastRecoveryClassification", mainClassification.name)
-                    .put("lastRecoveryMessage", "공개 내보내기 결과가 없음을 확인했습니다.")
+                    .put("lastRecoveryMessage", "Converged from unknown; no committed row found.")
                     .put("recoveredAt", System.currentTimeMillis())
                     .put("exportError", "Public commit state was unknown; provider inspection proves no committed row.")
                 job.remove("recoveryMessage")
@@ -1650,7 +1650,7 @@ internal fun settleUnknownPublicCommitState(
                     .put("exportVerified", false)
                     .put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
                     .put("recoveryMessage", classificationByAttempt[mainJournal.exportAttemptId]?.message
-                        ?: "내보내기 정리 증거를 확인할 수 없어 추가 확인이 필요합니다.")
+                        ?: "Delete failed; ambiguous recovery state.")
                     .put("exportError", "Public commit state was unknown; provider inspection proves no committed row.")
                 job.remove("galleryPublicExportLinkage")
             }

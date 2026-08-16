@@ -1586,15 +1586,10 @@ internal fun finalizeTransaction(
         ReprocessTransactionState.COMMITTED -> {
             if (operationLease != null && KeplerJobMetadata.isOperationOwner(jobDir, operationLease)) {
                 try {
-                    val activeOperationId = KeplerJobMetadata.read(jobDir)
-                        .optString(ACTIVE_OPERATION_ID)
-                        .takeIf { it.isNotBlank() }
-                    val cleared = activeOperationId?.let {
-                        KeplerJobMetadata.clearActiveOperation(jobDir, it, operationLease)
-                    } ?: true
-                    if (cleared || activeOperationId == null ||
-                        !KeplerJobMetadata.isCurrentActiveOperation(jobDir, activeOperationId)
-                    ) {
+                    val terminalStatus = settleReprocessTerminalOwner(jobDir, operationLease)
+                    val durableClearDone = terminalStatus == MediaStoreExportTerminalSettlementStatus.SETTLED ||
+                        operationLease.currentDurableOperationKind() != KeplerActiveOperationKind.PUBLIC_EXPORT
+                    if (durableClearDone || !KeplerJobMetadata.isOperationActive(jobDir)) {
                         operationLease.releaseIfProcessingSettled()
                     }
                 } catch (cancelled: CancellationException) {
@@ -1614,15 +1609,10 @@ internal fun finalizeTransaction(
         ReprocessTransactionState.ROLLED_BACK -> {
             if (operationLease != null && KeplerJobMetadata.isOperationOwner(jobDir, operationLease)) {
                 try {
-                    val activeOperationId = KeplerJobMetadata.read(jobDir)
-                        .optString(ACTIVE_OPERATION_ID)
-                        .takeIf { it.isNotBlank() }
-                    val cleared = activeOperationId?.let {
-                        KeplerJobMetadata.clearActiveOperation(jobDir, it, operationLease)
-                    } ?: true
-                    if (cleared || activeOperationId == null ||
-                        !KeplerJobMetadata.isCurrentActiveOperation(jobDir, activeOperationId)
-                    ) {
+                    val terminalStatus = settleReprocessTerminalOwner(jobDir, operationLease)
+                    val durableClearDone = terminalStatus == MediaStoreExportTerminalSettlementStatus.SETTLED ||
+                        operationLease.currentDurableOperationKind() != KeplerActiveOperationKind.PUBLIC_EXPORT
+                    if (durableClearDone || !KeplerJobMetadata.isOperationActive(jobDir)) {
                         operationLease.releaseIfProcessingSettled()
                     }
                 } catch (cancelled: CancellationException) {
@@ -1844,7 +1834,7 @@ internal fun rollback(
         }
     val metadataError = try {
         try {
-            settleOwnedPublicExportInterruption(
+            val settled = settleOwnedPublicExportInterruption(
                 jobDir = jobDir,
                 ownerLease = operationLease,
                 failureMessage = error.message ?: "Reprocess public export ended before terminal metadata was settled.",
@@ -1852,8 +1842,18 @@ internal fun rollback(
                     PublicExportInterruptionDisposition.CANCELLED
                 } else {
                     PublicExportInterruptionDisposition.FAILED
-                }
+                },
+                access = null
             )
+            if (!settled) {
+                return quarantineWithPersistence(
+                    transaction,
+                    combineSettlementFailureWithMessage(
+                        error, "Public export owner settlement failed during rollback (retained for retry)",
+                        IllegalStateException("Public export settlement returned false; retained owner protected")
+                    )
+                )
+            }
         } catch (settlementFailure: Throwable) {
             return quarantineWithPersistence(
                 transaction,

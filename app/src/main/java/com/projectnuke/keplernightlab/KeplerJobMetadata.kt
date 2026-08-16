@@ -201,16 +201,7 @@ object KeplerJobMetadata {
             if (settledAuthoritative && !reconcileSettledAuthoritativeProcessingJournals(jobDir, job)) {
                 return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_SETTLED_JOURNAL
             }
-            val exportJournals = MediaStoreExportJournal.list(jobDir)
-            val exportBlocks = exportJournals.any { journal ->
-                journal.state in setOf(
-                    MediaStoreExportState.PREPARED,
-                    MediaStoreExportState.ROW_INSERTED,
-                    MediaStoreExportState.CONTENT_WRITTEN,
-                    MediaStoreExportState.PUBLIC_COMMITTED,
-                    MediaStoreExportState.CLEANUP_REQUIRED
-                )
-            }
+            val exportBlocks = MediaStoreExportJournal.list(jobDir).any { it.isGateBlocking() }
             if (exportBlocks) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION
             when (job.optString("recoveryState")) {
                 PROCESSING_CLEANUP_REQUIRED -> JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP
@@ -319,7 +310,8 @@ internal fun consumeProcessingHandoff(
      */
     private fun reconcilePendingDurableSettlement(
         jobDir: File,
-        lease: JobOperationLease
+        lease: JobOperationLease,
+        access: MediaStoreExportRecoveryAccess? = null
     ): Boolean {
         val pendingTerminal = lease.pendingTerminalSettlement()
         if (pendingTerminal != null) {
@@ -356,7 +348,8 @@ internal fun consumeProcessingHandoff(
                     ownerLease = lease,
                     failureMessage = pendingPublicExport.failureMessage,
                     finalOutputFormat = pendingPublicExport.finalOutputFormat,
-                    disposition = pendingPublicExport.disposition
+                    disposition = pendingPublicExport.disposition,
+                    access = access
                 )
             } catch (failure: Error) {
                 throw failure
@@ -491,6 +484,9 @@ internal fun consumeProcessingHandoff(
     /** True if the given lease is the actual job operation owner. Public for production checks. */
     fun isOperationOwner(jobDir: File, lease: JobOperationLease): Boolean =
         operationLeases[jobDir.toPath().toAbsolutePath().normalize().toString()] === lease
+
+    fun findOperationLease(jobDir: File): JobOperationLease? =
+        operationLeases[jobDir.toPath().toAbsolutePath().normalize().toString()]
 
     internal fun releaseOperation(lease: JobOperationLease) {
         autoOperationLeases.remove(lease.key)

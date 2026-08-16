@@ -15,6 +15,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.robolectric.RuntimeEnvironment
 import org.robolectric.RobolectricTestRunner
 import java.io.File
 import java.io.IOException
@@ -133,7 +134,7 @@ class KeplerGalleryReprocessProtocolTest {
                 assertTrue(KeplerJobMetadata.isOperationActive(directory))
                 assertTrue(KeplerJobMetadata.isOperationOwner(directory, lease))
                 val frames = listOf(frame(directory))
-                assertFalse(saveFrameSelection(directory, FrameSelectionMode.AUTO_RULE_BASED, frames).isSuccess)
+                assertFalse(saveFrameSelection(RuntimeEnvironment.application, directory, FrameSelectionMode.AUTO_RULE_BASED, frames).isSuccess)
                 assertTrue(saveFrameSelectionInternal(directory, FrameSelectionMode.AUTO_RULE_BASED, frames, lease).isSuccess)
             } finally {
                 lease.release()
