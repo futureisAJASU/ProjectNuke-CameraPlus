@@ -15,6 +15,19 @@ import java.security.MessageDigest
 import java.util.concurrent.CancellationException
 
 internal var mediaStoreAbandonDeleteFailureForTest: Throwable? = null
+/**
+ * Test seam for the provider cut where changing IS_PENDING may apply its side effect and then
+ * throw.  null means use the real provider query; true/false explicitly reports the resulting
+ * public state (true = non-pending row, false = still pending/absent).
+ */
+internal var mediaStorePublicCommitStateForTest: ((Uri) -> Boolean?)? = null
+
+enum class GalleryExportCommitState {
+    NOT_COMMITTED,
+    PUBLIC_COMMITTED_UNVERIFIED,
+    VERIFIED,
+    UNKNOWN
+}
 
 data class GalleryExportResult(
     val success: Boolean,
@@ -27,8 +40,20 @@ data class GalleryExportResult(
     val errorMessage: String?,
     val attemptedFormats: List<OutputFormat> = listOf(formatUsed),
     val candidateFailureReasons: List<String> = emptyList(),
-    val verification: GalleryExportVerification? = null
-)
+    val verification: GalleryExportVerification? = null,
+    /** Explicit public commit state; [success] remains the verified-success compatibility flag. */
+    val publicCommitState: GalleryExportCommitState = when {
+        success && !uriString.isNullOrBlank() -> GalleryExportCommitState.VERIFIED
+        else -> GalleryExportCommitState.NOT_COMMITTED
+    }
+) {
+    val publicCommitted: Boolean
+        get() = publicCommitState == GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED ||
+            publicCommitState == GalleryExportCommitState.VERIFIED
+
+    val publicCommitKnown: Boolean
+        get() = publicCommitState != GalleryExportCommitState.UNKNOWN
+}
 
 data class RawSidecarExportResult(
     val success: Boolean,
@@ -119,11 +144,24 @@ fun exportNightFusionBitmapToGallery(
     ownerLease: JobOperationLease? = null
 ): GalleryExportResult {
     val exportOperationId = if (jobDir != null && NoFollowFileSystem.resolveDirectChild(jobDir, JOB_JSON_FILE_NAME, requireFile = true) != null) {
-        KeplerJobMetadata.beginActiveOperation(
-            jobDir,
-            kind = KeplerActiveOperationKind.PUBLIC_EXPORT,
-            ownerLease = ownerLease
-        )
+        val existingOperationId = ownerLease?.currentDurableOperationId()
+        if (existingOperationId != null) {
+            // Public export is a phase transition of the exact enclosing operation.  Reusing the
+            // lease's current ID keeps PROCESSING_YUV/PROCESSING_SR/PROCESSING_RAW from being
+            // replaced by an ownerless nested PUBLIC_EXPORT ID.
+            KeplerJobMetadata.beginActiveOperation(
+                jobDir,
+                operationId = existingOperationId,
+                kind = KeplerActiveOperationKind.PUBLIC_EXPORT,
+                ownerLease = ownerLease
+            )
+        } else {
+            KeplerJobMetadata.beginActiveOperation(
+                jobDir,
+                kind = KeplerActiveOperationKind.PUBLIC_EXPORT,
+                ownerLease = ownerLease
+            )
+        }
     } else null
     val attempts = when (requestedFormat) {
         OutputFormat.HEIF -> listOf(OutputFormat.HEIF, OutputFormat.JPEG, OutputFormat.PNG)
@@ -145,10 +183,10 @@ fun exportNightFusionBitmapToGallery(
             jobDir = jobDir,
             ownerOperationId = exportOperationId
         )
-        if (!result.success) {
+        if (!result.success && result.publicCommitState == GalleryExportCommitState.NOT_COMMITTED) {
             cancellation.throwIfCancelled()
         }
-        if (result.success) {
+        if (result.publicCommitState != GalleryExportCommitState.NOT_COMMITTED) {
             return result.copy(
                 attemptedFormats = attempts.takeWhile { it != format } + format,
                 candidateFailureReasons = errors.toList()
@@ -402,14 +440,27 @@ internal fun verifyCommittedGalleryExport(
     context: Context,
     export: GalleryExportResult
 ): GalleryExportVerification {
-    val previous = export.verification as? GalleryExportVerification.Verified
+    // GalleryExporter owns the authoritative verification.  A second provider read may race
+    // with MediaStore visibility and must never downgrade a durable VERIFIED journal/result.
+    val authoritative = export.verification
+    if (authoritative != null) {
+        // A provider verification can succeed immediately before the journal's VERIFIED
+        // transition fails.  Until that durable transition is acknowledged, keep the live
+        // result at committed-unverified so it agrees with restart recovery.
+        if (export.publicCommitState == GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED &&
+            authoritative is GalleryExportVerification.Verified
+        ) {
+            return GalleryExportVerification.RetryableFailure(
+                "Public row verified but export verification settlement is pending."
+            )
+        }
+        return authoritative
+    }
     return verifyGalleryExportResult(
         context = context,
         uriString = export.uriString.orEmpty(),
         expectation = GalleryExportExpectation(
-            format = export.formatUsed,
-            width = previous?.width,
-            height = previous?.height
+            format = export.formatUsed
         )
     )
 }
@@ -512,6 +563,18 @@ fun exportRawSidecarsToPublicStorage(
                 publicFailureByFrame[frame.frameIndex] = failure
                 return@forEach
             }
+            val publicEvidence = result.commitState != GalleryExportCommitState.NOT_COMMITTED
+            if (publicEvidence) {
+                // A sidecar has the same public commit boundary as the main image.  Retain its
+                // exact URI even when verification or journal acknowledgement is incomplete.
+                publicByFrame[frame.frameIndex] = result.uri.toString()
+            }
+            if (result.commitState == GalleryExportCommitState.UNKNOWN) {
+                val failure = "${file.name}: public DNG commit state could not be determined"
+                publicFailures += failure
+                publicFailureByFrame[frame.frameIndex] = failure
+                return@forEach
+            }
             val verificationError = verifyPublicDng(
                 context = context,
                 uri = result.uri,
@@ -528,17 +591,9 @@ fun exportRawSidecarsToPublicStorage(
                 val verificationFailure = IllegalStateException(
                     "${file.name}: $verificationError"
                 )
-                try {
-                    result.journal?.let { abandonMediaStoreAttempt(context, jobDir, it, result.uri) }
-                } catch (cleanupFailure: Throwable) {
-                    val combined = combineSettlementFailure(verificationFailure, cleanupFailure)
-                    if (combined is Error || combined is CancellationException) throw combined
-                    Log.e(
-                        "KeplerRawPipeline",
-                        "RAW sidecar abandonment failed after verification failure: ${cleanupFailure.message}",
-                        cleanupFailure
-                    )
-                }
+                // RAW_DNG_SIDECAR crosses the same irreversible public boundary as MAIN_IMAGE.
+                // Verification failure is partial evidence, never permission to delete a
+                // non-pending row that restart recovery would preserve.
                 val failure = verificationFailure.message ?: "${file.name}: $verificationError"
                 publicFailures += failure
                 publicFailureByFrame[frame.frameIndex] = failure
@@ -674,6 +729,8 @@ private fun verifyPublicDng(
         digest.digest().joinToString("") { "%02x".format(it) } != expected.sha256 -> "Committed public DNG SHA-256 mismatch"
         else -> null
     }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (error: Exception) {
         "Committed public DNG verification failed: ${error.javaClass.simpleName}: ${error.message}"
     }
@@ -706,6 +763,7 @@ private fun rawSidecarOutcome(
             localStatus = frame.localStatus,
             localFailure = frame.localFailure,
             publicStatus = when {
+                publicFailure != null && publicUri != null -> "PUBLIC_COMMITTED_UNVERIFIED"
                 publicUri != null -> "PUBLIC_EXPORTED"
                 publicFailure != null -> "PUBLIC_EXPORT_FAILED"
                 else -> "NOT_ATTEMPTED"
@@ -747,6 +805,8 @@ fun queryMediaSize(context: Context, uri: Uri): Long {
         } ?: 0L
     } catch (failure: Error) {
         throw failure
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (_: Exception) {
         0L
     }
@@ -755,6 +815,8 @@ fun queryMediaSize(context: Context, uri: Uri): Long {
         context.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: 0L
     } catch (failure: Error) {
         throw failure
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (_: Exception) {
         0L
     }
@@ -765,6 +827,8 @@ fun queryMediaSize(context: Context, uri: Uri): Long {
         } else 0L
     } catch (failure: Error) {
         throw failure
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (_: Exception) {
         0L
     }
@@ -778,18 +842,26 @@ fun updateExportMetadata(
     rawSidecarResult: RawSidecarExportResult? = null,
     rawSidecarIgnored: Boolean = false,
     postExportCancellationRequested: Boolean = false,
-    postExportWorkSkipped: Boolean = false
+    postExportWorkSkipped: Boolean = false,
+    operationLease: JobOperationLease? = null
 ) {
     lateinit var pipelineStatusForLog: String
     lateinit var finalOutputSourceForLog: String
     lateinit var nativePostprocessRgbaFileForLog: String
     lateinit var rawRenderDebugFileForLog: String
     KeplerJobMetadata.update(jobDir) { job ->
-        val verifiedPartial = verified && (postExportCancellationRequested || postExportWorkSkipped)
+        val publicCommitted = export?.publicCommitted == true
+        val publicCommitUnknown = export?.publicCommitState == GalleryExportCommitState.UNKNOWN
+        val effectiveVerified = verified &&
+            export?.publicCommitState == GalleryExportCommitState.VERIFIED &&
+            publicCommitted &&
+            !publicCommitUnknown
+        val verifiedPartial = effectiveVerified && (postExportCancellationRequested || postExportWorkSkipped)
         val durableStage = when {
-            !verified -> "PROCESSING"
+            publicCommitted && !effectiveVerified -> "PARTIAL"
             verifiedPartial -> "PARTIAL"
-            else -> "COMPLETE"
+            effectiveVerified -> "COMPLETE"
+            else -> "FAILED"
         }
         if (durableStage == "COMPLETE" || durableStage == "PARTIAL") {
             job.optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }?.let { job.put(TERMINAL_OPERATION_ID, it) }
@@ -799,17 +871,22 @@ fun updateExportMetadata(
             .put(
                 "processStatus",
                 when {
+                    publicCommitted && !effectiveVerified -> "EXPORT_COMMITTED_UNVERIFIED"
+                    publicCommitUnknown -> "COMMIT_UNKNOWN"
                     verifiedPartial -> "PIPELINE_COMPLETE_PARTIAL"
-                    verified -> "PIPELINE_COMPLETE"
-                    else -> job.optString("processStatus", "PROCESSING")
+                    effectiveVerified -> "PIPELINE_COMPLETE"
+                    else -> "EXPORT_FAILED_KEEPING_CACHE"
                 }
             )
+            .put("exportCommitState", export?.publicCommitState?.name ?: GalleryExportCommitState.NOT_COMMITTED.name)
             .put("exportStatus", when {
                 export == null -> "FAILED"
-                verified -> "EXPORTED"
+                export.publicCommitState == GalleryExportCommitState.UNKNOWN -> "COMMIT_UNKNOWN"
+                publicCommitted && !effectiveVerified -> "COMMITTED_UNVERIFIED"
+                effectiveVerified -> "EXPORTED"
                 else -> "EXPORT_UNVERIFIED"
             })
-            .put("exportVerified", verified)
+            .put("exportVerified", effectiveVerified)
             .put("exportUri", export?.uriString ?: JSONObject.NULL)
             .put("exportDisplayName", export?.displayName ?: JSONObject.NULL)
             .put("exportMimeType", export?.mimeType ?: JSONObject.NULL)
@@ -823,7 +900,7 @@ fun updateExportMetadata(
             .put("exportCommittedHeight", (export?.verification as? GalleryExportVerification.Verified)?.height ?: 0)
             .put("exportFallbackUsed", export?.fallbackUsed ?: false)
             .put("exportFileSizeBytes", export?.fileSizeBytes ?: 0L)
-            .put("galleryExportCommitted", export?.success == true && !export?.uriString.isNullOrBlank())
+            .put("galleryExportCommitted", export?.publicCommitted == true)
             .put("postExportCancellationRequested", postExportCancellationRequested)
             .put("postExportWorkSkipped", postExportWorkSkipped)
             .put("rawSidecarRequested", finalOutputFormat.shouldExportRawSidecar)
@@ -859,6 +936,14 @@ fun updateExportMetadata(
                 else -> rawSidecarResult?.errorMessage ?: JSONObject.NULL
             })
             .put("exportedAt", System.currentTimeMillis())
+        if (export?.publicCommitted == true && !export.uriString.isNullOrBlank()) {
+            job.put("galleryPublicExportLinkage", export.uriString)
+        } else if (export?.publicCommitState == GalleryExportCommitState.UNKNOWN && !export.uriString.isNullOrBlank()) {
+            // Unknown commit state is preserved as evidence, but is not claimed as committed.
+            job.put("galleryPublicExportLinkage", export.uriString)
+        } else {
+            job.remove("galleryPublicExportLinkage")
+        }
         rawSidecarResult?.frameResults?.forEach { frameResult ->
             val frameArray = job.optJSONArray("frames")
             for (index in 0 until (frameArray?.length() ?: 0)) {
@@ -890,7 +975,7 @@ fun updateExportMetadata(
             "nativePostprocessRgbaFile=$nativePostprocessRgbaFileForLog " +
             "rawRenderDebugFile=$rawRenderDebugFileForLog"
     )
-    markMediaStoreExportJournalsTerminalPersisted(jobDir)
+    markMediaStoreExportJournalsTerminalPersisted(jobDir, operationLease)
 }
 
 fun updateExportFailure(
@@ -902,7 +987,7 @@ fun updateExportFailure(
     requiredOutputCommitted: Boolean = currentProcessingAttemptHasRequiredOutputClaim(jobDir),
     operationLease: JobOperationLease? = null
 ) {
-    val currentPublicCommit = export?.success == true && !export.uriString.isNullOrBlank()
+    val currentPublicCommit = export?.publicCommitted == true
     val currentLocalCommit = requiredOutputCommitted || if (operationLease != null) {
         currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, operationLease)
     } else {
@@ -917,8 +1002,15 @@ fun updateExportFailure(
                 if (currentPublicCommit) "EXPORT_COMMITTED_UNVERIFIED" else "EXPORT_FAILED_KEEPING_CACHE"
             )
             .put("currentPipelineStage", if (usableCurrentResult) "PARTIAL" else "FAILED")
-            .put("exportStatus", if (currentPublicCommit) "COMMITTED_UNVERIFIED" else "FAILED")
+            .put("exportCommitState", export?.publicCommitState?.name ?: GalleryExportCommitState.NOT_COMMITTED.name)
+            .put("exportStatus", when {
+                currentPublicCommit -> "COMMITTED_UNVERIFIED"
+                export?.publicCommitState == GalleryExportCommitState.UNKNOWN -> "COMMIT_UNKNOWN"
+                else -> "FAILED"
+            })
             .put("exportError", error)
+            .put("exportVerified", false)
+            .put("galleryExportCommitted", currentPublicCommit)
             .put("rawSidecarRequested", finalOutputFormat.shouldExportRawSidecar)
             .put("rawSidecarExportStatus", if (rawSidecarIgnored) "UNAVAILABLE" else "SKIPPED")
             .put("rawSidecarError", if (rawSidecarIgnored) "RAW sidecar unavailable for YUV pipeline." else JSONObject.NULL)
@@ -932,12 +1024,26 @@ fun updateExportFailure(
                 .put("galleryExportCommitted", true)
                 .put("exportUri", export?.uriString ?: JSONObject.NULL)
                 .put("exportVerificationFailed", true)
+        } else if (export?.publicCommitState == GalleryExportCommitState.UNKNOWN && !export.uriString.isNullOrBlank()) {
+            job.put("exportUri", export.uriString)
+                .put("galleryPublicExportLinkage", export.uriString)
+                .put("exportCommitState", GalleryExportCommitState.UNKNOWN.name)
+                .put("exportVerificationFailed", true)
+        } else {
+            // Preserve a prior export URI as historical evidence, but clear every current
+            // commit flag/linkage so an old public result cannot be counted for this attempt.
+            // Current-result readers require the explicit commit/verification fields together
+            // with the URI, so retaining the string does not make it a new result.
+            job.remove("galleryPublicExportLinkage")
         }
     }
-    markMediaStoreExportJournalsTerminalPersisted(jobDir)
+    markMediaStoreExportJournalsTerminalPersisted(jobDir, operationLease)
 }
 
-internal fun markMediaStoreExportJournalsTerminalPersisted(jobDir: File) {
+internal fun markMediaStoreExportJournalsTerminalPersisted(
+    jobDir: File,
+    ownerLease: JobOperationLease? = null
+) {
     val metadata = try {
         KeplerJobMetadata.read(jobDir)
     } catch (failure: Error) {
@@ -960,7 +1066,7 @@ internal fun markMediaStoreExportJournalsTerminalPersisted(jobDir: File) {
         null
     }
     if (stage != null && stage != "PROCESSING") {
-        KeplerJobMetadata.clearActiveOperationKind(jobDir, KeplerActiveOperationKind.PUBLIC_EXPORT)
+        KeplerJobMetadata.clearActiveOperationKind(jobDir, KeplerActiveOperationKind.PUBLIC_EXPORT, ownerLease)
     }
 }
 
@@ -992,7 +1098,8 @@ internal fun markMediaStoreExportJournalsTerminalPersisted(jobDir: File) {
  */
 internal fun updateRawPublicExportOutcome(
     jobDir: File,
-    outcome: RawFusionPublicExportOutcome
+    outcome: RawFusionPublicExportOutcome,
+    operationLease: JobOperationLease? = null
 ) {
     val terminalPolicy = deriveRawFusionOutcomePolicy(
         outcome = outcome,
@@ -1011,9 +1118,19 @@ internal fun updateRawPublicExportOutcome(
                 is RawFusionPublicExportOutcome.CommittedVerificationFailure -> "EXPORT_UNVERIFIED"
                 is RawFusionPublicExportOutcome.CommittedCancelledBeforeVerification -> "EXPORT_COMMITTED_CANCELLED"
                 is RawFusionPublicExportOutcome.CommittedInterruptedBeforeVerification -> "EXPORT_COMMITTED_INTERRUPTED"
-                is RawFusionPublicExportOutcome.UncommittedFailure -> "FAILED"
+                is RawFusionPublicExportOutcome.UncommittedFailure ->
+                    if (outcome.export?.publicCommitState == GalleryExportCommitState.UNKNOWN) {
+                        "COMMIT_UNKNOWN"
+                    } else if (outcome.committed) {
+                        "COMMITTED_UNVERIFIED"
+                    } else if (outcome.postExportCancellationRequested && !terminalPolicy.hasCurrentLocalResult) {
+                        "CANCELLED"
+                    } else {
+                        "FAILED"
+                    }
             })
-            .put("exportVerified", outcome.verified)
+            .put("exportCommitState", outcome.export?.publicCommitState?.name ?: GalleryExportCommitState.NOT_COMMITTED.name)
+            .put("exportVerified", terminalPolicy.publicVerified)
             .put("exportUri", outcome.export?.uriString ?: JSONObject.NULL)
             .put("exportDisplayName", outcome.export?.displayName ?: JSONObject.NULL)
             .put("exportMimeType", outcome.export?.mimeType ?: JSONObject.NULL)
@@ -1027,7 +1144,7 @@ internal fun updateRawPublicExportOutcome(
             .put("exportCommittedHeight", (outcome.export?.verification as? GalleryExportVerification.Verified)?.height ?: 0)
             .put("exportFallbackUsed", outcome.export?.fallbackUsed ?: false)
             .put("exportFileSizeBytes", outcome.export?.fileSizeBytes ?: 0L)
-            .put("galleryExportCommitted", outcome.committed)
+            .put("galleryExportCommitted", terminalPolicy.publicCommitted)
             .put("postExportCancellationRequested", outcome.postExportCancellationRequested)
             .put("postExportWorkSkipped", outcome.postExportWorkSkipped)
             .put("rawSidecarRequested", outcome.finalOutputFormat.shouldExportRawSidecar)
@@ -1085,7 +1202,8 @@ internal fun updateRawPublicExportOutcome(
         } else {
             job.remove("currentWarning")
         }
-        val isCommittedOutcome = outcome is RawFusionPublicExportOutcome.CommittedPendingVerification ||
+        val isCommittedOutcome = outcome.committed ||
+            outcome is RawFusionPublicExportOutcome.CommittedPendingVerification ||
             outcome is RawFusionPublicExportOutcome.CommittedVerificationFailure ||
             outcome is RawFusionPublicExportOutcome.CommittedCancelledBeforeVerification ||
             outcome is RawFusionPublicExportOutcome.CommittedInterruptedBeforeVerification ||
@@ -1143,7 +1261,9 @@ internal fun updateRawPublicExportOutcome(
                 job.put("currentPipelineStage", terminalPolicy.durablePipelineStage)
                     .put(
                         "processStatus",
-                        if (terminalPolicy.hasCurrentLocalResult) {
+                        if (outcome.postExportCancellationRequested && !terminalPolicy.hasCurrentLocalResult) {
+                            "EXPORT_CANCELLED_BEFORE_COMMIT"
+                        } else if (terminalPolicy.hasCurrentLocalResult) {
                             "LOCAL_OUTPUT_COMMITTED_EXPORT_FAILED"
                         } else {
                             "EXPORT_FAILED_KEEPING_CACHE"
@@ -1192,7 +1312,7 @@ internal fun updateRawPublicExportOutcome(
             job.remove("galleryPublicExportLinkage")
         }
     }
-    markMediaStoreExportJournalsTerminalPersisted(jobDir)
+    markMediaStoreExportJournalsTerminalPersisted(jobDir, operationLease)
 }
 
 fun requestedOutputFormatForSetting(finalOutputFormat: FinalOutputFormat): OutputFormat = when {
@@ -1243,6 +1363,23 @@ private fun writeGalleryBitmap(
         errorMessage = "MediaStore insert/write failed"
     )
 
+    if (inserted.commitState == GalleryExportCommitState.UNKNOWN) {
+        return GalleryExportResult(
+            success = false,
+            uriString = inserted.uri.toString(),
+            displayName = displayName,
+            mimeType = format.mimeType,
+            fileSizeBytes = inserted.size,
+            formatUsed = format,
+            fallbackUsed = fallbackUsed,
+            errorMessage = "MediaStore public commit state could not be determined; preserving exact URI evidence.",
+            attemptedFormats = listOf(format),
+            candidateFailureReasons = listOf("MediaStore public commit state unknown"),
+            verification = null,
+            publicCommitState = GalleryExportCommitState.UNKNOWN
+        )
+    }
+
     val committedUri = inserted.uri
     val verification = verifyGalleryExportResult(
         context = context,
@@ -1255,19 +1392,6 @@ private fun writeGalleryBitmap(
     )
 
     if (verification !is GalleryExportVerification.Verified) {
-        jobDir?.let { owner ->
-            inserted.journal?.let { journal ->
-                val verificationFailure = IllegalStateException(
-                    "Verification failed: ${(verification as? GalleryExportVerification.RetryableFailure)?.reason
-                        ?: (verification as? GalleryExportVerification.PermanentFailure)?.reason}"
-                )
-                try {
-                    abandonMediaStoreAttempt(context, owner, journal, committedUri)
-                } catch (cleanupFailure: Throwable) {
-                    throw requireNotNull(combineSettlementFailure(verificationFailure, cleanupFailure))
-                }
-            }
-        }
         return GalleryExportResult(
             success = false,
             uriString = committedUri.toString(),
@@ -1279,12 +1403,36 @@ private fun writeGalleryBitmap(
             errorMessage = "Verification failed: ${(verification as? GalleryExportVerification.RetryableFailure)?.reason ?: (verification as? GalleryExportVerification.PermanentFailure)?.reason}",
             attemptedFormats = listOf(format),
             candidateFailureReasons = listOf((verification as? GalleryExportVerification.RetryableFailure)?.reason ?: (verification as? GalleryExportVerification.PermanentFailure)?.reason.orEmpty()),
-            verification = verification
+            verification = verification,
+            publicCommitState = GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED
         )
     }
 
     jobDir?.let { owner ->
-        inserted.journal?.transition(owner, MediaStoreExportState.VERIFIED)
+        try {
+            inserted.journal?.transition(owner, MediaStoreExportState.VERIFIED)
+        } catch (failure: Error) {
+            throw failure
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            return GalleryExportResult(
+                success = false,
+                uriString = committedUri.toString(),
+                displayName = verification.displayName,
+                mimeType = verification.mediaStoreMime,
+                fileSizeBytes = verification.size,
+                formatUsed = verification.detectedFormat,
+                fallbackUsed = fallbackUsed,
+                errorMessage = "Public row verified but export journal verification could not be persisted: ${failure.message}",
+                attemptedFormats = listOf(format),
+                candidateFailureReasons = listOf(failure.message ?: "Export journal verification failed"),
+                verification = GalleryExportVerification.RetryableFailure(
+                    "Export journal verification could not be persisted: ${failure.message}"
+                ),
+                publicCommitState = GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED
+            )
+        }
     }
 
     return GalleryExportResult(
@@ -1297,7 +1445,8 @@ private fun writeGalleryBitmap(
         fallbackUsed = fallbackUsed,
         errorMessage = null,
         attemptedFormats = listOf(format),
-        verification = verification
+        verification = verification,
+        publicCommitState = GalleryExportCommitState.VERIFIED
     )
 }
 
@@ -1321,6 +1470,8 @@ internal fun deleteMediaStoreRowForAbandon(context: Context, uri: Uri): Boolean 
         context.contentResolver.delete(uri, null, null) == 1
     } catch (failure: Error) {
         throw failure
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (_: Exception) {
         false
     }
@@ -1329,8 +1480,43 @@ internal fun deleteMediaStoreRowForAbandon(context: Context, uri: Uri): Boolean 
 private data class InsertedPublicFile(
     val uri: Uri,
     val size: Long,
-    val journal: MediaStoreExportJournal?
+    val journal: MediaStoreExportJournal?,
+    val commitState: GalleryExportCommitState = GalleryExportCommitState.VERIFIED
 )
+
+/** Returns true for a proven non-pending row, false for an absent/pending row, null when unknown. */
+private fun inspectPublicCommitState(context: Context, uri: Uri): Boolean? {
+    mediaStorePublicCommitStateForTest?.let { return it(uri) }
+    return try {
+        val cursor = context.contentResolver.query(
+            uri,
+            arrayOf(MediaStore.MediaColumns.IS_PENDING),
+            null,
+            null,
+            null
+        ) ?: return null
+        cursor.use {
+            if (!it.moveToFirst()) return false
+            it.getInt(0) == 0
+        }
+    } catch (failure: Error) {
+        throw failure
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun inspectPublicCommitStatePreservingPrimary(
+    context: Context,
+    uri: Uri,
+    primary: Throwable
+): Boolean? = try {
+    inspectPublicCommitState(context, uri)
+} catch (secondary: Throwable) {
+    throw requireNotNull(combineSettlementFailure(primary, secondary))
+}
 
 private fun insertPublicFile(
     context: Context,
@@ -1360,6 +1546,44 @@ private fun insertPublicFile(
     var uri: Uri? = null
     var journal: MediaStoreExportJournal? = null
     var insertReturned = false
+    var publicCommitAttempted = false
+
+    fun preserveObservedPublicRow(
+        state: Boolean?,
+        primaryFailure: Throwable? = null
+    ): InsertedPublicFile? {
+        if (uri == null || state == false) return null
+        val commitState = if (state == true) {
+            // A journal write can fail after the provider has made the row public. Keep the
+            // pre-commit evidence in place; recovery will retry the same transition.
+            try {
+                journal = journal?.transition(jobDir!!, MediaStoreExportState.PUBLIC_COMMITTED, uri.toString())
+            } catch (secondary: Throwable) {
+                if (secondary is Error || secondary is CancellationException) {
+                    throw requireNotNull(combineSettlementFailure(primaryFailure, secondary))
+                }
+                // The exact URI and provider state remain the authoritative evidence.
+            }
+            GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED
+        } else {
+            // Unknown provider state is never safe to abandon or use for fallback.
+            GalleryExportCommitState.UNKNOWN
+        }
+        return InsertedPublicFile(
+            uri = uri!!,
+                size = try {
+                    queryMediaSize(context, uri!!)
+                } catch (secondary: Throwable) {
+                    if (secondary is Error || secondary is CancellationException) {
+                        throw requireNotNull(combineSettlementFailure(primaryFailure, secondary))
+                    }
+                    0L
+                },
+            journal = journal,
+            commitState = commitState
+        )
+    }
+
     return try {
         cancellation.throwIfCancelled()
         journal = jobDir?.let {
@@ -1390,26 +1614,53 @@ private fun insertPublicFile(
         resolver.openOutputStream(uri)?.use(writer) ?: error("openOutputStream returned null")
         journal = journal?.transition(jobDir!!, MediaStoreExportState.CONTENT_WRITTEN)
         cancellation.throwIfCancelled()
-        val updateCount = resolver.update(
-            uri,
-            ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) },
-            null,
-            null
-        )
+        publicCommitAttempted = true
+        val updateCount = try {
+            resolver.update(
+                uri,
+                ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) },
+                null,
+                null
+            )
+        } catch (failure: Exception) {
+            preserveObservedPublicRow(
+                inspectPublicCommitStatePreservingPrimary(context, uri, failure), failure
+            )?.let { return it }
+            throw failure
+        }
         if (updateCount != 1) {
+            preserveObservedPublicRow(inspectPublicCommitState(context, uri))?.let { return it }
             journal?.let { journal = abandonMediaStoreAttempt(context, jobDir!!, it, uri!!) }
             return null
         }
-        journal = journal?.transition(jobDir!!, MediaStoreExportState.PUBLIC_COMMITTED)
+        try {
+            journal = journal?.transition(jobDir!!, MediaStoreExportState.PUBLIC_COMMITTED)
+        } catch (failure: Exception) {
+            preserveObservedPublicRow(true)?.let { return it }
+            throw failure
+        }
         val mediaSize = try {
             queryMediaSize(context, uri)
         } catch (failure: Error) {
             throw failure
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
             0L
         }
-        InsertedPublicFile(uri, mediaSize, journal)
+        InsertedPublicFile(uri, mediaSize, journal, GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED)
     } catch (ce: CancellationException) {
+        if (publicCommitAttempted) {
+            val observed = inspectPublicCommitStatePreservingPrimary(context, uri!!, ce)
+            if (observed == true) {
+                try {
+                    preserveObservedPublicRow(observed, ce)?.let { return it }
+                } catch (secondary: Throwable) {
+                    throw requireNotNull(combineSettlementFailure(ce, secondary))
+                }
+            }
+            if (observed == null) throw ce
+        }
         var cleanupFailure: Throwable? = null
         if (insertReturned && uri != null && journal != null) {
             try {
@@ -1419,7 +1670,36 @@ private fun insertPublicFile(
             }
         }
         throw requireNotNull(combineSettlementFailure(ce, cleanupFailure))
-    } catch (error: Throwable) {
+    } catch (error: Error) {
+        // A fatal provider/journal failure must escape, but a row proven public must not be
+        // deleted as though the commit never happened.
+        val observed = if (publicCommitAttempted && uri != null) {
+            inspectPublicCommitStatePreservingPrimary(context, uri!!, error)
+        } else false
+        if (observed == true) {
+            try {
+                journal = journal?.transition(jobDir!!, MediaStoreExportState.PUBLIC_COMMITTED, uri!!.toString())
+            } catch (secondary: Throwable) {
+                throw requireNotNull(combineSettlementFailure(error, secondary))
+            }
+        } else if (observed == null) {
+            throw error
+        } else if (insertReturned && uri != null && journal != null) {
+            var cleanupFailure: Throwable? = null
+            try {
+                journal = abandonMediaStoreAttempt(context, jobDir!!, journal!!, uri!!)
+            } catch (failure: Throwable) {
+                cleanupFailure = failure
+            }
+            throw requireNotNull(combineSettlementFailure(error, cleanupFailure))
+        }
+        throw error
+    } catch (error: Exception) {
+        if (publicCommitAttempted) {
+            preserveObservedPublicRow(
+                inspectPublicCommitStatePreservingPrimary(context, uri!!, error), error
+            )?.let { return it }
+        }
         var cleanupFailure: Throwable? = null
         if (insertReturned && uri != null && journal != null) {
             try {

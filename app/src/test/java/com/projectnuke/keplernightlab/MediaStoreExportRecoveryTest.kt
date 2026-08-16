@@ -27,9 +27,15 @@ class MediaStoreExportRecoveryTest {
         var committed = false
         var deleteFailure: Throwable? = null
         var setPendingFailure: Throwable? = null
+        var setPendingSideEffectThenFailure = false
         override fun inspect(uri: Uri, journal: MediaStoreExportJournal) =
             MediaStoreExportInspection(exists, pending, verified, inspectionFailed = inspectionFailed)
         override fun setPending(uri: Uri, pending: Boolean): Boolean {
+            if (setPendingSideEffectThenFailure) {
+                this.pending = pending
+                committed = true
+                throw IOException("commit applied before provider failure")
+            }
             setPendingFailure?.let { throw it }
             if (!commitSucceeds) return false
             this.pending = pending
@@ -203,6 +209,24 @@ class MediaStoreExportRecoveryTest {
     }
 
     @Test
+    fun nonPendingContentWrittenRowIsPreservedAsCommittedUnverifiedEvidence() {
+        val dir = Files.createTempDirectory("media-recovery-content-written-public-").toFile()
+        try {
+            journal(dir, MediaStoreExportState.CONTENT_WRITTEN)
+            val access = FakeAccess(pending = false, verified = false)
+
+            val result = recoverMediaStoreExportJournals(dir, access).single()
+
+            assertEquals(MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED, result.classification)
+            assertFalse(access.deleted)
+            assertEquals(MediaStoreExportState.PUBLIC_COMMITTED, MediaStoreExportJournal.list(dir).single().state)
+            assertTrue(MediaStoreExportJournal.list(dir).single().uri!!.contains("/7"))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
     fun insertWithoutUriIsAmbiguousAndJournalIsPreserved() {
         val dir = Files.createTempDirectory("media-recovery-unknown-").toFile()
         try {
@@ -293,6 +317,24 @@ class MediaStoreExportRecoveryTest {
             }
             assertEquals(MediaStoreExportState.ROW_INSERTED, MediaStoreExportJournal.list(dir).single().state)
         } finally { dir.deleteRecursively() }
+    }
+
+    @Test
+    fun pendingCommitSideEffectThenExceptionIsReconciledAsPublicEvidence() {
+        val dir = Files.createTempDirectory("media-recovery-commit-side-effect-").toFile()
+        try {
+            journal(dir)
+            val access = FakeAccess(pending = true, verified = true).apply {
+                setPendingSideEffectThenFailure = true
+            }
+            val result = recoverMediaStoreExportJournals(dir, access).single()
+            assertEquals(MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED, result.classification)
+            assertTrue(access.committed)
+            assertFalse(access.deleted)
+            assertEquals(MediaStoreExportState.VERIFIED, MediaStoreExportJournal.list(dir).single().state)
+        } finally {
+            dir.deleteRecursively()
+        }
     }
 
     @Test

@@ -5,6 +5,7 @@ import android.content.Context
 import android.net.Uri
 import android.provider.MediaStore
 import java.io.File
+import java.util.concurrent.CancellationException
 
 internal enum class MediaStoreExportRecoveryClassification {
     CLEANED,
@@ -122,7 +123,6 @@ internal fun reconstructMainExportEvidence(
         .filter { it.role == MediaStoreExportRole.MAIN_IMAGE }
         .filter { it.ownerOperationId == activeOperationId }
         .filter { it.uri != null }
-        .filter { it.state == MediaStoreExportState.VERIFIED || it.state == MediaStoreExportState.PUBLIC_COMMITTED }
         .mapNotNull { candidate ->
             val result = resultByAttempt[candidate.exportAttemptId]
             val verified = result?.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
@@ -208,6 +208,8 @@ private fun recoverMediaStoreExportJournal(
             access.delete(abandonedUri)
         } catch (failure: Error) {
             throw failure
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
             false
         }
@@ -269,6 +271,8 @@ private fun recoverMediaStoreExportJournal(
                 access.delete(uri)
             } catch (failure: Error) {
                 throw failure
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (_: Exception) {
                 false
             }
@@ -286,14 +290,47 @@ private fun recoverMediaStoreExportJournal(
                 inspection.message ?: "Pending MediaStore content was not verifiable."
             )
         }
+        fun reconcileActualCommitAfterFailure(): MediaStoreExportRecoveryResult? {
+            val afterFailure = try {
+                access.inspect(uri, journal)
+            } catch (failure: Error) {
+                throw failure
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                return null
+            }
+            if (afterFailure.inspectionFailed || !afterFailure.exists || afterFailure.pending) {
+                return null
+            }
+            if (!afterFailure.verified) {
+                journal.transition(jobDir, MediaStoreExportState.PUBLIC_COMMITTED)
+                return MediaStoreExportRecoveryResult(
+                    journal.exportAttemptId,
+                    MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED,
+                    afterFailure.message ?: "MediaStore commit succeeded but verification remains unresolved."
+                )
+            }
+            journal.transition(jobDir, MediaStoreExportState.PUBLIC_COMMITTED)
+            journal.transition(jobDir, MediaStoreExportState.VERIFIED)
+            return MediaStoreExportRecoveryResult(
+                journal.exportAttemptId,
+                MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED,
+                afterFailure.message ?: "MediaStore commit and verification were observed after the commit call failed."
+            )
+        }
+
         val committed = try {
             access.setPending(uri, false)
         } catch (failure: Error) {
             throw failure
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
             false
         }
         if (!committed) {
+            reconcileActualCommitAfterFailure()?.let { return it }
             return MediaStoreExportRecoveryResult(
                 journal.exportAttemptId,
                 MediaStoreExportRecoveryClassification.AMBIGUOUS,
@@ -308,7 +345,7 @@ private fun recoverMediaStoreExportJournal(
         )
     }
     if (!inspection.verified) {
-        if (journal.state == MediaStoreExportState.VERIFIED) {
+        if (journal.state != MediaStoreExportState.PUBLIC_COMMITTED) {
             journal.transition(jobDir, MediaStoreExportState.PUBLIC_COMMITTED)
         }
         return MediaStoreExportRecoveryResult(
@@ -368,6 +405,10 @@ internal class ContextMediaStoreExportRecoveryAccess(
                 }
             }
             MediaStoreExportInspection(true, pending, verified)
+        } catch (failure: Error) {
+            throw failure
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (failure: Exception) {
             MediaStoreExportInspection(false, false, false, "MediaStore inspection failed: ${failure.message}", inspectionFailed = true)
         }
