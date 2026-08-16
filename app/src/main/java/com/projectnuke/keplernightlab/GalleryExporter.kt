@@ -493,10 +493,11 @@ fun exportRawSidecarsToPublicStorage(
         return RawSidecarExportResult.failed("No DNG sidecars were requested in job.json")
     }
 
-    val exported = mutableListOf<String>()
+val exported = mutableListOf<String>()
     val publicFailures = mutableListOf<String>()
     val publicByFrame = linkedMapOf<Int, String>()
     val publicFailureByFrame = linkedMapOf<Int, String>()
+    val commitStateByFrame = linkedMapOf<Int, GalleryExportCommitState>()
     try {
         manifest.expected.forEach { frame ->
             val file = frame.localFile ?: return@forEach
@@ -524,10 +525,11 @@ fun exportRawSidecarsToPublicStorage(
                     inspection.exists && !inspection.pending && inspection.verified
                 }
             }
-            if (reusable != null) {
+if (reusable != null) {
                 reusable.transition(jobDir, MediaStoreExportState.VERIFIED, expectedSha256Override = sourceDigest.sha256)
                 exported += reusable.uri!!
                 publicByFrame[frame.frameIndex] = reusable.uri
+                commitStateByFrame[frame.frameIndex] = GalleryExportCommitState.VERIFIED
                 return@forEach
             }
             var copiedDigest: NoFollowFileSystem.StreamDigest? = null
@@ -566,10 +568,11 @@ fun exportRawSidecarsToPublicStorage(
                 }
             }
 
-            if (result == null) {
+if (result == null) {
                 val failure = "${file.name}: MediaStore insert/write failed"
                 publicFailures += failure
                 publicFailureByFrame[frame.frameIndex] = failure
+                commitStateByFrame[frame.frameIndex] = GalleryExportCommitState.NOT_COMMITTED
                 return@forEach
             }
             val publicEvidence = result.commitState != GalleryExportCommitState.NOT_COMMITTED
@@ -582,6 +585,7 @@ fun exportRawSidecarsToPublicStorage(
                 val failure = "${file.name}: public DNG commit state could not be determined"
                 publicFailures += failure
                 publicFailureByFrame[frame.frameIndex] = failure
+                commitStateByFrame[frame.frameIndex] = GalleryExportCommitState.UNKNOWN
                 return@forEach
             }
             val verificationError = verifyPublicDng(
@@ -596,7 +600,7 @@ fun exportRawSidecarsToPublicStorage(
                     expectedSha256Override = sourceDigest.sha256
                 )
             }
-            if (verificationError != null) {
+if (verificationError != null) {
                 val verificationFailure = IllegalStateException(
                     "${file.name}: $verificationError"
                 )
@@ -606,20 +610,31 @@ fun exportRawSidecarsToPublicStorage(
                 val failure = verificationFailure.message ?: "${file.name}: $verificationError"
                 publicFailures += failure
                 publicFailureByFrame[frame.frameIndex] = failure
+                commitStateByFrame[frame.frameIndex] = GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED
             } else {
                 result.journal?.transition(jobDir, MediaStoreExportState.VERIFIED)
                 exported += result.uri.toString()
                 publicByFrame[frame.frameIndex] = result.uri.toString()
+                commitStateByFrame[frame.frameIndex] = GalleryExportCommitState.VERIFIED
             }
         }
-    } catch (ce: CancellationException) {
-        if (exported.isNotEmpty()) {
-            return rawSidecarOutcome(manifest, exported, publicFailures + "Cancellation after partial public commit", true, publicByFrame, publicFailureByFrame)
+} catch (ce: CancellationException) {
+        // Any frame that crossed (or may have crossed) the public commit boundary keeps its full
+        // per-frame result through cancellation.  The static "before any commit" result is used
+        // only when no frame reached the boundary at all.
+        if (publicByFrame.isNotEmpty()) {
+            return rawSidecarOutcome(
+                manifest, exported, publicFailures + "Cancellation after partial public commit",
+                true, publicByFrame, publicFailureByFrame, commitStateByFrame
+            )
         }
         return RawSidecarExportResult.cancelled()
     }
 
-    return rawSidecarOutcome(manifest, exported, publicFailures, false, publicByFrame, publicFailureByFrame)
+    return rawSidecarOutcome(
+        manifest, exported, publicFailures, false,
+        publicByFrame, publicFailureByFrame, commitStateByFrame
+    )
 }
 
 internal data class RawSidecarManifestFrame(
@@ -745,23 +760,60 @@ private fun verifyPublicDng(
     }
 }
 
+/**
+ * Per-frame public status for a RAW DNG sidecar, classified by the frame's OWN commit evidence.
+ * UNKNOWN commit state is never upgraded to a proven commit: it stays PUBLIC_COMMIT_UNKNOWN.
+ */
+internal fun sidecarFramePublicStatus(
+    commitState: GalleryExportCommitState?,
+    publicUri: String?,
+    publicFailure: String?
+): String = when (commitState) {
+    GalleryExportCommitState.VERIFIED -> "PUBLIC_EXPORTED"
+    GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED -> "PUBLIC_COMMITTED_UNVERIFIED"
+    GalleryExportCommitState.UNKNOWN -> "PUBLIC_COMMIT_UNKNOWN"
+    GalleryExportCommitState.NOT_COMMITTED -> "PUBLIC_EXPORT_FAILED"
+    null -> when {
+        publicFailure != null && publicUri != null -> "PUBLIC_COMMITTED_UNVERIFIED"
+        publicUri != null -> "PUBLIC_EXPORTED"
+        publicFailure != null -> "PUBLIC_EXPORT_FAILED"
+        else -> "NOT_ATTEMPTED"
+    }
+}
+
+/** Aggregate sidecar kind: any proven committed evidence (verified or committed-unverified)
+ *  yields at least PARTIAL.  UNKNOWN-only evidence never becomes a committed claim. */
+internal fun rawSidecarAggregateKind(
+    complete: Boolean,
+    frameResults: List<RawSidecarFrameResult>,
+    exported: List<String>
+): RawSidecarOutcomeKind = when {
+    complete -> RawSidecarOutcomeKind.COMPLETE
+    frameResults.any { it.publicStatus == "PUBLIC_EXPORTED" || it.publicStatus == "PUBLIC_COMMITTED_UNVERIFIED" } ->
+        RawSidecarOutcomeKind.PARTIAL
+    exported.isNotEmpty() -> RawSidecarOutcomeKind.PARTIAL
+    else -> RawSidecarOutcomeKind.FAILED
+}
+
+/** A publicly committed or commit-unknown DNG is never "missing".  Only not-committed and
+ *  not-attempted frames are missing. */
+internal fun rawSidecarMissingFilenames(frameResults: List<RawSidecarFrameResult>): List<String> =
+    frameResults.filter { it.requested && it.publicStatus in setOf("PUBLIC_EXPORT_FAILED", "NOT_ATTEMPTED") }
+        .map { it.localFilename ?: "frame_${it.frameIndex.toString().padStart(2, '0')}.dng" }
+
 private fun rawSidecarOutcome(
     manifest: RawSidecarManifest,
     exported: List<String>,
     publicFailures: List<String>,
     cancelled: Boolean = false,
     publicByFrame: Map<Int, String> = emptyMap(),
-    publicFailureByFrame: Map<Int, String> = emptyMap()
+    publicFailureByFrame: Map<Int, String> = emptyMap(),
+    commitStateByFrame: Map<Int, GalleryExportCommitState> = emptyMap()
 ): RawSidecarExportResult {
     val requestedCount = manifest.frames.count { it.requested }
     val locallySavedCount = manifest.frames.count { it.localFile != null }
     val localFailedCount = manifest.frames.count { it.localFailure != null }
     val complete = locallySavedCount == requestedCount && exported.size == locallySavedCount && publicFailures.isEmpty() && localFailedCount == 0
-    val kind = when {
-        complete -> RawSidecarOutcomeKind.COMPLETE
-        exported.isNotEmpty() -> RawSidecarOutcomeKind.PARTIAL
-        else -> RawSidecarOutcomeKind.FAILED
-    }
     val frameResults = manifest.frames.map { frame ->
         val publicUri = publicByFrame[frame.frameIndex]
         val publicFailure = publicFailureByFrame[frame.frameIndex]
@@ -771,16 +823,12 @@ private fun rawSidecarOutcome(
             localFilename = frame.localFilename,
             localStatus = frame.localStatus,
             localFailure = frame.localFailure,
-            publicStatus = when {
-                publicFailure != null && publicUri != null -> "PUBLIC_COMMITTED_UNVERIFIED"
-                publicUri != null -> "PUBLIC_EXPORTED"
-                publicFailure != null -> "PUBLIC_EXPORT_FAILED"
-                else -> "NOT_ATTEMPTED"
-            },
+            publicStatus = sidecarFramePublicStatus(commitStateByFrame[frame.frameIndex], publicUri, publicFailure),
             publicUri = publicUri,
             publicFailure = publicFailure
         )
     }
+    val kind = rawSidecarAggregateKind(complete, frameResults, exported)
     return RawSidecarExportResult(
         success = kind == RawSidecarOutcomeKind.COMPLETE || kind == RawSidecarOutcomeKind.PARTIAL,
         exportedFiles = exported,
@@ -790,8 +838,7 @@ private fun rawSidecarOutcome(
         expectedCount = requestedCount,
         locallySavedCount = locallySavedCount,
         publicExportedCount = exported.size,
-        missingFilenames = frameResults.filter { it.requested && it.publicStatus != "PUBLIC_EXPORTED" }
-            .map { it.localFilename ?: "frame_${it.frameIndex.toString().padStart(2, '0')}.dng" },
+        missingFilenames = rawSidecarMissingFilenames(frameResults),
         localFailures = manifest.localFailures,
         publicFailures = publicFailures,
         requestedCount = requestedCount,
@@ -1494,6 +1541,17 @@ internal fun settleUnknownPublicCommitState(
             .forEach { journal ->
                 journal.transition(jobDir, MediaStoreExportState.CLEANED)
             }
+        // Sidecar frames are classified by their OWN evidence, exactly like restart recovery:
+        // verified/committed-unverified URIs are preserved, unresolved evidence stays commit-unknown,
+        // and rows proven absent stop claiming a public URI.  This keeps live execution, restart
+        // recovery, and same-process settlement on the same sidecar truth.
+        KeplerJobMetadata.update(jobDir) { job ->
+            reconstructRawSidecarJournalEvidence(
+                jobDir,
+                job,
+                classifications = classificationByAttempt.mapValues { it.value.classification }
+            )
+        }
     }
     converged
 } catch (failure: Error) {

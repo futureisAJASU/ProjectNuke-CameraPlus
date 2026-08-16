@@ -299,7 +299,8 @@ internal object KeplerRecoveryCoordinator {
                 val recoveredAttemptIds = exportResults
                     .filter { result ->
                         result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
-                            result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED
+                            result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED ||
+                            result.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED
                     }
                     .filter { result ->
                         MediaStoreExportJournal.list(jobDir).any { journal ->
@@ -313,7 +314,8 @@ internal object KeplerRecoveryCoordinator {
                         jobDir,
                         current,
                         MediaStoreExportJournal.list(jobDir),
-                        recoveredAttemptIds
+                        recoveredAttemptIds,
+                        classifications = exportResults.associate { it.attemptId to it.classification }
                     )
                 }
             }

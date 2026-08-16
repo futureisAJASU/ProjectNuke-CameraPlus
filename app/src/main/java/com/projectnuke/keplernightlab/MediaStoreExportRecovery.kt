@@ -50,7 +50,8 @@ internal fun reconstructRawSidecarJournalEvidence(
     jobDir: File,
     job: org.json.JSONObject,
     journals: List<MediaStoreExportJournal> = MediaStoreExportJournal.list(jobDir),
-    verifiedAttemptIds: Set<String>? = null
+    verifiedAttemptIds: Set<String>? = null,
+    classifications: Map<String, MediaStoreExportRecoveryClassification>? = null
 ): Int {
     val manifest = try {
         loadRawSidecarManifest(jobDir)
@@ -60,12 +61,14 @@ internal fun reconstructRawSidecarJournalEvidence(
         null
     }
         ?: return 0
+    val classificationDriven = classifications != null
     val candidates = journals.filter {
         it.role == MediaStoreExportRole.RAW_DNG_SIDECAR &&
             it.frameIndex != null &&
             it.uri != null &&
-            it.state == MediaStoreExportState.VERIFIED &&
-            (verifiedAttemptIds == null || it.exportAttemptId in verifiedAttemptIds)
+            (classificationDriven && it.exportAttemptId in classifications!!.keys ||
+                !classificationDriven && it.state == MediaStoreExportState.VERIFIED &&
+                (verifiedAttemptIds == null || it.exportAttemptId in verifiedAttemptIds))
     }
     var count = 0
     val frames = job.optJSONArray("frames") ?: return 0
@@ -94,10 +97,45 @@ internal fun reconstructRawSidecarJournalEvidence(
                 .thenByDescending { it.exportAttemptId })
             .firstOrNull()
         if (journal != null) {
-            frame.put("dngSidecarPublicStatus", "PUBLIC_EXPORTED")
-                .put("publicDngUri", journal.uri)
-                .remove("publicDngError")
-            count += 1
+            val classification = if (classificationDriven) {
+                classifications?.get(journal.exportAttemptId)
+            } else {
+                null
+            }
+            when (classification) {
+                MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED,
+                MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED -> {
+                    frame.put("dngSidecarPublicStatus", "PUBLIC_EXPORTED")
+                        .put("publicDngUri", journal.uri)
+                        .remove("publicDngError")
+                    count += 1
+                }
+                MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED -> {
+                    frame.put("dngSidecarPublicStatus", "PUBLIC_COMMITTED_UNVERIFIED")
+                        .put("publicDngUri", journal.uri)
+                        .remove("publicDngError")
+                }
+                MediaStoreExportRecoveryClassification.AMBIGUOUS,
+                MediaStoreExportRecoveryClassification.INSERT_RESULT_UNKNOWN,
+                MediaStoreExportRecoveryClassification.DELETE_FAILED -> {
+                    // Unresolved evidence is preserved: the exact URI stays and the frame is
+                    // reported as commit-unknown, never as missing.
+                    frame.put("dngSidecarPublicStatus", "PUBLIC_COMMIT_UNKNOWN")
+                        .put("publicDngUri", journal.uri)
+                        .remove("publicDngError")
+                }
+                null -> {
+                    // Legacy verified-only reconstruction.
+                    frame.put("dngSidecarPublicStatus", "PUBLIC_EXPORTED")
+                        .put("publicDngUri", journal.uri)
+                        .remove("publicDngError")
+                    count += 1
+                }
+                else -> {
+                    frame.put("dngSidecarPublicStatus", "PUBLIC_NOT_RECOVERED")
+                        .remove("publicDngUri")
+                }
+            }
         } else if (manifestFrame?.requested == true) {
             frame.put("dngSidecarPublicStatus", "PUBLIC_NOT_RECOVERED")
                 .remove("publicDngUri")
