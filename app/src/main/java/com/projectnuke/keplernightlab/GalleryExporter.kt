@@ -361,7 +361,7 @@ internal fun settleOwnedPublicExportInterruption(
         job.put(TERMINAL_OPERATION_ID, evidence.operationId)
             .put("exportError", failureMessage)
             .put("exportedAt", System.currentTimeMillis())
-        if (evidence.committed) {
+if (evidence.committed) {
             // These fields belong to this exact operation only.  On a
             // pre-commit interruption, preserve any previous terminal export
             // linkage instead of replacing it with null/false.
@@ -369,6 +369,11 @@ internal fun settleOwnedPublicExportInterruption(
                 .put("galleryPublicExportLinkage", evidence.uri ?: JSONObject.NULL)
                 .put("galleryExportCommitted", true)
                 .put("exportVerified", evidence.verified)
+                .put(
+                    "exportCommitState",
+                    if (evidence.verified) GalleryExportCommitState.VERIFIED.name
+                    else GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED.name
+                )
         }
         when {
             evidence.verified -> job.put("currentPipelineStage", "PARTIAL")
@@ -398,8 +403,12 @@ internal fun settleOwnedPublicExportInterruption(
                 .remove("recoveryMessage")
         }
     }
-    // A journal may acknowledge only after the matching terminal metadata write.
-    ownerJournals.forEach { it.markTerminalPersisted(jobDir, evidence.operationId) }
+// A journal may acknowledge only after the matching terminal metadata write. The
+    // acknowledgement is evidence-matched, so lagging or divergent journals stay deferred
+    // for the authoritative settlement/recovery that may later converge them.
+    val terminalMetadata = KeplerJobMetadata.read(jobDir)
+    ownerJournals.filter { terminalAckEligible(terminalMetadata, it) }
+        .forEach { it.markTerminalPersisted(jobDir, evidence.operationId) }
     KeplerJobMetadata.update(jobDir) { job ->
         check(job.optString(ACTIVE_OPERATION_ID) == evidence.operationId &&
             job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id &&
@@ -1040,6 +1049,46 @@ fun updateExportFailure(
     markMediaStoreExportJournalsTerminalPersisted(jobDir, operationLease)
 }
 
+/**
+ * Evidence-match contract for a journal terminal acknowledgement: the durable terminal record and
+ * the journal must agree on the commit state and, for the MAIN_IMAGE result, on the exact public
+ * URI. An UNKNOWN record never satisfies the contract, so its journals stay acknowledged only by
+ * the authoritative settlement/recovery that also converges the record.  Lagging pre-commit and
+ * divergent-URI journals stay deferred for the same authority.
+ */
+internal fun terminalAckEligible(
+    metadata: org.json.JSONObject,
+    journal: MediaStoreExportJournal
+): Boolean {
+    val explicitCommitState = metadata.optString("exportCommitState")
+    val stateEligible: Boolean = when {
+        explicitCommitState == GalleryExportCommitState.UNKNOWN.name -> false
+        metadata.optBoolean("exportVerified", false) ||
+            explicitCommitState == GalleryExportCommitState.VERIFIED.name ->
+            journal.state == MediaStoreExportState.VERIFIED
+        metadata.optBoolean("galleryExportCommitted", false) ||
+            explicitCommitState == GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED.name ->
+            journal.state in setOf(
+                MediaStoreExportState.PUBLIC_COMMITTED,
+                MediaStoreExportState.VERIFIED
+            )
+        else -> journal.state in setOf(
+            MediaStoreExportState.CLEANED,
+            MediaStoreExportState.INSERT_FAILED_NO_ROW
+        )
+    }
+    if (!stateEligible) return false
+    if (journal.role == MediaStoreExportRole.MAIN_IMAGE &&
+        journal.state in setOf(MediaStoreExportState.PUBLIC_COMMITTED, MediaStoreExportState.VERIFIED)
+    ) {
+        val claimedUri = metadata.optString("exportUri").takeIf { it.isNotBlank() }
+            ?: metadata.optString("galleryPublicExportLinkage").takeIf { it.isNotBlank() }
+            ?: return false
+        return journal.uri == claimedUri
+    }
+    return true
+}
+
 internal fun markMediaStoreExportJournalsTerminalPersisted(
     jobDir: File,
     ownerLease: JobOperationLease? = null
@@ -1050,33 +1099,15 @@ internal fun markMediaStoreExportJournalsTerminalPersisted(
         throw failure
     } catch (_: Exception) {
         null
-    }
-    val ownerOperationId = metadata?.optString(TERMINAL_OPERATION_ID)?.takeIf { it.isNotBlank() }
+    } ?: return
+    val ownerOperationId = metadata.optString(TERMINAL_OPERATION_ID).takeIf { it.isNotBlank() }
         ?: return
-    // A journal acknowledges its terminal metadata only when its evidence matches the durable
-    // terminal record (journal reconciliation happens BEFORE the acknowledgement).  An UNKNOWN
-    // commit record has no settled evidence: no journal may be acknowledged for it here, because
-    // only the authoritative export settlement or recovery can settle that evidence.  The ack
-    // authority guard therefore defers every acknowledgement for `!publicCommitKnown` records.
-    val explicitCommitState = metadata.optString("exportCommitState")
-    val committedFlag = metadata.optBoolean("galleryExportCommitted", false)
-    val verifiedFlag = metadata.optBoolean("exportVerified", false)
-    val ackEligibleStates: Set<MediaStoreExportState>? = when {
-        explicitCommitState == GalleryExportCommitState.UNKNOWN.name -> null
-        verifiedFlag || explicitCommitState == GalleryExportCommitState.VERIFIED.name ->
-            setOf(MediaStoreExportState.VERIFIED)
-        committedFlag || explicitCommitState == GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED.name ->
-            setOf(MediaStoreExportState.PUBLIC_COMMITTED, MediaStoreExportState.VERIFIED)
-        else -> setOf(MediaStoreExportState.CLEANED, MediaStoreExportState.INSERT_FAILED_NO_ROW)
-    }
-    if (ackEligibleStates != null) {
-        MediaStoreExportJournal.list(jobDir).forEach { journal ->
-            if (journal.ownerOperationId == ownerOperationId &&
-                !journal.terminalMetadataPersisted &&
-                journal.state in ackEligibleStates
-            ) {
-                journal.markTerminalPersisted(jobDir, ownerOperationId)
-            }
+    MediaStoreExportJournal.list(jobDir).forEach { journal ->
+        if (journal.ownerOperationId == ownerOperationId &&
+            !journal.terminalMetadataPersisted &&
+            terminalAckEligible(metadata, journal)
+        ) {
+            journal.markTerminalPersisted(jobDir, ownerOperationId)
         }
     }
     val stage = try {

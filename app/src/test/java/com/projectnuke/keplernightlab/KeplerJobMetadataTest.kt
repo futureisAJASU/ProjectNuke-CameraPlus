@@ -783,6 +783,118 @@ class KeplerJobMetadataTest {
     }
 
     @Test
+    fun settledPublicExportAcknowledgesOnlyEvidenceMatchingJournals() {
+        val directory = Files.createTempDirectory("kepler-public-export-ack-match-").toFile()
+        var lease: JobOperationLease? = null
+        try {
+            KeplerJobMetadata.write(directory, JSONObject().put("currentPipelineStage", "PROCESSING"))
+            lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                directory,
+                JobRecoveryMutationIntent.PROCESSING_START
+            )
+            val operationId = KeplerJobMetadata.beginActiveOperation(
+                directory,
+                kind = KeplerActiveOperationKind.PUBLIC_EXPORT,
+                ownerLease = lease
+            )
+            val laggingAttempt = MediaStoreExportJournal.create(
+                directory,
+                MediaStoreExportRole.MAIN_IMAGE,
+                null,
+                "result.jpg",
+                "Pictures/Kepler",
+                "image/jpeg",
+                Uri.parse("content://media/external/images/media"),
+                ownerOperationId = operationId
+            ).transition(directory, MediaStoreExportState.ROW_INSERTED, "content://media/43")
+                .transition(directory, MediaStoreExportState.CONTENT_WRITTEN)
+                .exportAttemptId
+            val verifiedAttempt = MediaStoreExportJournal.create(
+                directory,
+                MediaStoreExportRole.MAIN_IMAGE,
+                null,
+                "result.jpg",
+                "Pictures/Kepler",
+                "image/jpeg",
+                Uri.parse("content://media/external/images/media"),
+                ownerOperationId = operationId
+            ).transition(directory, MediaStoreExportState.ROW_INSERTED, "content://media/42")
+                .transition(directory, MediaStoreExportState.CONTENT_WRITTEN)
+                .transition(directory, MediaStoreExportState.PUBLIC_COMMITTED)
+                .transition(directory, MediaStoreExportState.VERIFIED)
+                .exportAttemptId
+
+            settleOwnedPublicExportInterruption(directory, lease!!, "interruption")
+
+            assertTrue(
+                MediaStoreExportJournal.read(
+                    directory,
+                    MediaStoreExportJournal.fileFor(directory, verifiedAttempt)
+                ).terminalMetadataPersisted
+            )
+            assertFalse(
+                MediaStoreExportJournal.read(
+                    directory,
+                    MediaStoreExportJournal.fileFor(directory, laggingAttempt)
+                ).terminalMetadataPersisted
+            )
+        } finally {
+            lease?.release()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun preCommitSettlementDefersUnmatchedJournalAcknowledgment() {
+        val directory = Files.createTempDirectory("kepler-public-export-ack-precommit-").toFile()
+        var lease: JobOperationLease? = null
+        try {
+            KeplerJobMetadata.write(directory, JSONObject().put("currentPipelineStage", "PROCESSING"))
+            lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                directory,
+                JobRecoveryMutationIntent.PROCESSING_START
+            )
+            val operationId = KeplerJobMetadata.beginActiveOperation(
+                directory,
+                kind = KeplerActiveOperationKind.PUBLIC_EXPORT,
+                ownerLease = lease
+            )
+            val attempt = MediaStoreExportJournal.create(
+                directory,
+                MediaStoreExportRole.MAIN_IMAGE,
+                null,
+                "result.jpg",
+                "Pictures/Kepler",
+                "image/jpeg",
+                Uri.parse("content://media/external/images/media"),
+                ownerOperationId = operationId
+            ).transition(directory, MediaStoreExportState.ROW_INSERTED, "content://media/42")
+                .transition(directory, MediaStoreExportState.CONTENT_WRITTEN)
+                .exportAttemptId
+
+            settleOwnedPublicExportInterruption(
+                directory,
+                lease!!,
+                "cancelled before commit",
+                disposition = PublicExportInterruptionDisposition.CANCELLED
+            )
+
+            assertFalse(
+                MediaStoreExportJournal.read(
+                    directory,
+                    MediaStoreExportJournal.fileFor(directory, attempt)
+                ).terminalMetadataPersisted
+            )
+            val settled = KeplerJobMetadata.read(directory)
+            assertFalse(settled.has(ACTIVE_OPERATION_ID))
+            assertEquals("CANCELLED", settled.getString("currentPipelineStage"))
+            assertFalse(settled.optBoolean("galleryExportCommitted", false))
+        } finally {
+            lease?.release()
+            directory.deleteRecursively()
+        }
+    }
+        @Test
     fun publicExportSettlementDebtConvergesAfterActiveClearFailure() {
         val directory = Files.createTempDirectory("kepler-public-export-clear-debt-").toFile()
         var lease: JobOperationLease? = null
