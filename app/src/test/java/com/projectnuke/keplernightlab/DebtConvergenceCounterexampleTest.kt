@@ -1663,7 +1663,8 @@ class DebtConvergenceCounterexampleTest {
             assertEquals("The exact lease stays registered",
                 lease, KeplerJobMetadata.findOperationLease(job))
             assertTrue("The pending marker is preserved", lease.hasPendingProcessingHandoffSettlement())
-            assertTrue(KeplerJobMetadata.clearActiveOperation(job, "noop", lease) || true)
+            assertFalse("A non-existent operation clear must not affect the retained lease",
+                KeplerJobMetadata.clearActiveOperation(job, "noop", lease))
             assertTrue("The handoff settlement completion clears the pending marker",
                 lease.completeProcessingHandoffSettlement())
             assertTrue("A cleared handoff debt allows the release",
@@ -2106,6 +2107,103 @@ class DebtConvergenceCounterexampleTest {
             assertEquals("CANCELLED", KeplerJobMetadata.read(job).getString("currentPipelineStage"))
         } finally {
             KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
+            job.deleteRecursively()
+        }
+    }
+
+    /** Phase 4: REAL production-lifetime test for initial read failure.
+     *  When ownerLease == null and the first handoff inspection fails with an ordinary
+     *  exception, a reserved process-local authority must exist and carry the pending
+     *  handoff settlement. After fault removal, the next real mutation converges. */
+    @Test
+    fun initialReadFailureReservesRetryAuthorityAndConverges() {
+        val job = tempJob("counterexample-bound29-")
+        val previousInitialFailure = KeplerJobMetadata.settleInitialReadFailureForTest
+        try {
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(PROCESSING_HANDOFF_OPERATION_ID, "H29")
+                .put(PROCESSING_HANDOFF_KIND, "PROCESSING_YUV"))
+            KeplerJobMetadata.settleInitialReadFailureForTest = java.io.IOException("injected initial read failure")
+            val settled = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(job)
+            assertFalse("Initial read failure must return false", settled)
+            val retained = KeplerJobMetadata.findOperationLease(job)
+            assertNotNull("Reserved retry authority must exist after initial read failure", retained)
+            assertTrue("Reserved authority carries pending handoff settlement",
+                retained!!.hasPendingProcessingHandoffSettlement())
+            assertTrue("Durable handoff remains",
+                KeplerJobMetadata.read(job).has(PROCESSING_HANDOFF_OPERATION_ID))
+
+            // Clear the injected failure.
+            KeplerJobMetadata.settleInitialReadFailureForTest = null
+            val retrySettled = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(job, retained)
+            assertTrue("Retry settlement succeeds after fault removal", retrySettled)
+            assertFalse("Durable handoff settled",
+                KeplerJobMetadata.read(job).has(PROCESSING_HANDOFF_OPERATION_ID))
+            assertFalse("Pending marker cleared", retained!!.hasPendingProcessingHandoffSettlement())
+            assertNull("Reserved lease released after settlement",
+                KeplerJobMetadata.findOperationLease(job))
+        } finally {
+            KeplerJobMetadata.settleInitialReadFailureForTest = previousInitialFailure
+            job.deleteRecursively()
+        }
+    }
+
+    /** Phase 5: REAL production-lifetime test for acquisition failure.
+     *  When the initial inspection succeeds but the PROCESSING_START acquisition
+     *  encounters an ordinary failure, no second lease is created when an exact
+     *  owner exists; when no exact owner exists, the reserved authority retains the
+     *  debt. After fault removal, settlement converges. */
+    @Test
+    fun acquisitionFailureAfterInspectionRetainsAuthority() {
+        val job = tempJob("counterexample-bound30-")
+        val previousRecoveryFailure = KeplerJobMetadata.settleRecoveryCheckFailureForTest
+        val previousWriteFailure = KeplerJobMetadata.atomicWriteFailureForTest
+        try {
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(PROCESSING_HANDOFF_OPERATION_ID, "H30")
+                .put(PROCESSING_HANDOFF_KIND, "PROCESSING_YUV"))
+
+            // Control A: existing exact owner present; no second lease created.
+            val existingLease = KeplerJobMetadata.acquireOperation(job)!!
+            existingLease.markDurableOperation("existing-op", KeplerActiveOperationKind.PROCESSING_YUV)
+            KeplerJobMetadata.settleRecoveryCheckFailureForTest = java.io.IOException("injected acquisition failure")
+            val settledExisting = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(job)
+            assertTrue("Existing owner handles settlement without creating a second lease", settledExisting)
+            assertEquals("Existing owner remains authoritative",
+                existingLease, KeplerJobMetadata.findOperationLease(job))
+
+            // Control B: no existing owner; reserved authority handles any settlement failure.
+            existingLease.release()
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(PROCESSING_HANDOFF_OPERATION_ID, "H30")
+                .put(PROCESSING_HANDOFF_KIND, "PROCESSING_YUV"))
+            KeplerJobMetadata.atomicWriteFailureForTest = java.io.IOException("injected settlement write failure")
+            val settledReserved = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(job)
+            assertFalse("Reserved authority retains debt when settlement fails", settledReserved)
+            val retainedReserved = KeplerJobMetadata.findOperationLease(job)
+            assertNotNull("Reserved retry authority exists", retainedReserved)
+            assertTrue("Reserved authority carries pending handoff settlement",
+                retainedReserved!!.hasPendingProcessingHandoffSettlement())
+
+            // After fault removal, settlement converges.
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            KeplerJobMetadata.settleRecoveryCheckFailureForTest = null
+            val retrySettled = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(job, retainedReserved)
+            assertTrue("Retry settlement succeeds after fault removal", retrySettled)
+            assertFalse("Durable handoff settled",
+                KeplerJobMetadata.read(job).has(PROCESSING_HANDOFF_OPERATION_ID))
+            assertNull("Reserved lease released after settlement",
+                KeplerJobMetadata.findOperationLease(job))
+        } finally {
+            KeplerJobMetadata.settleInitialReadFailureForTest = null
+            KeplerJobMetadata.settleRecoveryCheckFailureForTest = previousRecoveryFailure
+            KeplerJobMetadata.atomicWriteFailureForTest = previousWriteFailure
             job.deleteRecursively()
         }
     }

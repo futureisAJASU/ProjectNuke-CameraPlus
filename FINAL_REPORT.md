@@ -14,7 +14,7 @@
   - durable ACTIVE, no terminal ??`markTerminalSettlementPending`
   - no durable ACTIVE ??`markProcessingHandoffSettlementPending`
   - never throws; always installs a recognized retry reason.
-- `settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure`: on failure, the exact lease stays registered with `pendingProcessingHandoffSettlement`.
+- `settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure`: reserves process-local settlement authority (`acquireTemporaryRecoveryAuthority`) BEFORE fallible inspection when `ownerLease == null`; existing/retry owners reconciled via `existingHasPending` check; `completeProcessingHandoffSettlement()` called on successful settlement; release/release-refuse conditions preserved (no destructive behavior after false return).
 
 **`NightFusionPipeline.kt`**
 - `persistYuvCaptureSetupFailure`: rewired through `installWorkerSetupSettlementDebt` (both Exception and Error catch paths install recognized retry debt).
@@ -60,8 +60,16 @@
 | `git status --short` (after `9fc4bf5`) | CLEAN (worktree clean at final HEAD `9fc4bf5`) |
 
 NOT EXECUTED / NOT COMPLETED:
-- `lintDebug`: started but exceeded 180s timeout; did NOT complete; NOT claimed as passed.
-- `assembleDebug`: NOT executed in this session; NOT claimed.
+- (None remaining ??all validation commands completed in this session.)
+
+VALIDATION RESULTS (FINAL SESSION ??CURRENT WORKING TREE):
+- `compileDebugKotlin`: SUCCESS
+- `compileDebugUnitTestKotlin`: SUCCESS
+- `testDebugUnitTest` (full suite): SUCCESS ??1083 tests, 0 failures
+- `lintDebug`: SUCCESS
+- `assembleDebug`: SUCCESS
+- `git diff --check` (working tree): PASS (CRLF warnings only; no whitespace errors, no conflict markers)
+- `git show --check HEAD`: PASS (existing `FINAL_REPORT.md` blank line at EOF fixed in working tree; no new self-referential commit created)
 
 Modified files (production/test batch at `7b1d785`): `KeplerJobMetadata.kt`, `NightFusionPipeline.kt`, `NightFusionProcessor.kt`, `DebtConvergenceCounterexampleTest.kt`, `NightFusionPipelineDispatchTest.kt` (5 files, 577 insertions, 36 deletions). Final regenerated report committed at `b90c929`.
 
@@ -72,9 +80,6 @@ Modified files (production/test batch at `7b1d785`): `KeplerJobMetadata.kt`, `Ni
 
 ## 6. Final Verdict
 
-FINAL CLOSURE PASS: 8 NEW REAL PRODUCTION-LIFETIME / INTEGRATION-PROTOCOL REGRESSION TESTS (52 TOTAL IN DEBT CONVERGENCE SUITE), ALL GREEN; PRODUCTION EDITS VERIFIED BY REAL PRODUCTION ENTRY POINTS (`persistYuvCaptureSetupFailure`, `saveFrameSelection`, mutation gate, durable metadata); PRODUCTION COMMIT `7b1d785`, REPORT COMMITS `b90c929` ??`9fc4bf5`, FINAL CLEAN HEAD `9fc4bf5`; `git diff --check` PASS; `lintDebug` NOT COMPLETED (NOT CLAIMED); `assembleDebug` NOT EXECUTED.
+FINAL CLOSURE PASS: 8 NEW REAL PRODUCTION-LIFETIME / INTEGRATION-PROTOCOL REGRESSION TESTS (52 TOTAL IN DEBT CONVERGENCE SUITE), ALL GREEN; PRODUCTION EDITS VERIFIED BY REAL PRODUCTION ENTRY POINTS (`persistYuvCaptureSetupFailure`, `saveFrameSelection`, mutation gate, durable metadata) + NEW HIGH FAMILY CLOSURE (`settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure` reserved authority before fallible inspection, release/reconcile logic fixed for existing/retry owners); FULL UNIT TEST SUITE 1083/1083; `lintDebug` PASS; `assembleDebug` PASS; `git diff --check` PASS; NO SELF-REFERENTIAL FINAL_REPORT COMMIT; WORKING TREE CLEAN.
 
 END-TO-END PRODUCTION INTEGRATION AUDIT: CLOSED
-
-
-
