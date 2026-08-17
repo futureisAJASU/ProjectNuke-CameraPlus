@@ -95,11 +95,11 @@ fun loadJobJson(jobDir: File): JSONObject =
     KeplerJobMetadata.read(jobDir)
 
 fun saveJobJson(context: Context, jobDir: File, job: JSONObject) {
-    // Resolve provider-aware retained debt BEFORE acquiring mutation lease
+    // Resolve provider-aware retained debt BEFORE acquiring mutation lease; the real gate
+    // reports the durable blocking reason (verification/commit policy, retained owner,
+    // unresolved journal) — never a synthetic DEAD_OPERATION.
     if (!settleMediaStoreExportDebt(context, jobDir)) {
-        throw JobRecoveryMutationBlockedException(
-            JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION
-        )
+        KeplerJobMetadata.requireRecoveryMutationAllowed(jobDir, JobRecoveryMutationIntent.METADATA_EDIT)
     }
     val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
         jobDir,
@@ -113,11 +113,11 @@ fun saveJobJson(context: Context, jobDir: File, job: JSONObject) {
 }
 
 fun setFrameExcluded(context: Context, jobDir: File, frameIndex: Int, excluded: Boolean) {
-    // Resolve provider-aware retained debt BEFORE acquiring mutation lease
+    // Resolve provider-aware retained debt BEFORE acquiring mutation lease; the real gate
+    // reports the durable blocking reason (verification/commit policy, retained owner,
+    // unresolved journal) — never a synthetic DEAD_OPERATION.
     if (!settleMediaStoreExportDebt(context, jobDir)) {
-        throw JobRecoveryMutationBlockedException(
-            JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION
-        )
+        KeplerJobMetadata.requireRecoveryMutationAllowed(jobDir, JobRecoveryMutationIntent.FRAME_SELECTION)
     }
     // External mutation: acquire own operation lease, reject unresolved transactions
     val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(

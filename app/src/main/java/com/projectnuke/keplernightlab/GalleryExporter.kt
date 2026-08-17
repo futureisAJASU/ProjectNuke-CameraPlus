@@ -1222,26 +1222,24 @@ internal fun terminalAckEligible(
         val sidecarStatus = frame?.optString("dngSidecarPublicStatus")
             ?.takeIf { it.isNotBlank() }
         if (sidecarStatus != null) {
+            // Exact-URI authority: the durable sidecar frame record must reference the SAME URI
+            // as the journal.  A missing or divergent durable URI never acknowledges the journal.
             val sidecarUri = frame.optString("publicDngUri").takeIf { it.isNotBlank() }
             val journalUri = journal.uri?.takeIf { it.isNotBlank() }
+            if (sidecarUri == null || sidecarUri != journalUri) return false
             return when (sidecarStatus) {
-                "PUBLIC_EXPORTED" ->
-                    journal.state == MediaStoreExportState.VERIFIED &&
-                        (sidecarUri == null || sidecarUri == journalUri)
-                "PUBLIC_COMMITTED_UNVERIFIED" ->
-                    journal.state in setOf(
-                        MediaStoreExportState.PUBLIC_COMMITTED,
-                        MediaStoreExportState.VERIFIED
-                    ) && (sidecarUri == null || sidecarUri == journalUri)
+                "PUBLIC_EXPORTED" -> journal.state == MediaStoreExportState.VERIFIED
+                "PUBLIC_COMMITTED_UNVERIFIED" -> journal.state in setOf(
+                    MediaStoreExportState.PUBLIC_COMMITTED,
+                    MediaStoreExportState.VERIFIED
+                )
                 else -> false
             }
         }
-        // No own frame record: the journal's own durable state is the sidecar's evidence. Never
-        // force a sidecar to VERIFIED from MAIN policy; a committed sidecar remains commit-debt.
-        return journal.state in setOf(
-            MediaStoreExportState.VERIFIED,
-            MediaStoreExportState.PUBLIC_COMMITTED
-        )
+        // No own frame record: the journal's own durable state is the sidecar's evidence.  Never
+        // force a sidecar to VERIFIED from MAIN policy; a committed sidecar without the
+        // reconstructed exact frame/URI record remains commit-debt and stays deferred.
+        return journal.state == MediaStoreExportState.VERIFIED
     }
     val explicitCommitState = metadata.optString("exportCommitState")
     val stateEligible: Boolean = when {
@@ -1754,7 +1752,10 @@ internal fun settleUnknownPublicCommitState(
  * Settlement authorities (never two concurrent):
  * - CASE A: an exact retained process-local PUBLIC_EXPORT lease is the single authority: the
  *   provider/journal/metadata convergence runs under that retained owner and releases it on
- *   success; UNKNOWN evidence keeps E retained (`false`) so nothing is lost.
+ *   success; UNKNOWN evidence keeps E retained (`false`) so nothing is lost.  A CURRENT-runtime
+ *   retained owner settles with live-owner semantics when its pipeline already registered the
+ *   interruption settlement (destroyed worker scope); a dead-runtime retained owner settles the
+ *   restart-recovery case.
  * - CASE B: otherwise a single temporary recovery authority is reserved under the job lock, the
  *   convergence runs under it, the temporary authority is released, and the caller re-runs the
  *   mutation gate before acquiring its own lease.  No second durable journal is ever created.
@@ -1766,8 +1767,9 @@ internal fun settleUnknownPublicCommitState(
  * row intentionally keeps the gate blocked and returns `false`: the exact journals/metadata/URI
  * remain the same reachable debt for restart recovery and the next same-process pass.
  *
- * Never runs while a live current-runtime operation owns the job: that owner performs its own
- * settlement/recovery.  Fatal Errors and CancellationException propagate unchanged.
+ * Never settles a still-live pipeline owner (retained PUBLIC_EXPORT lease without a registered
+ * interruption settlement, or any other live current-runtime operation): that owner performs its
+ * own settlement/recovery.  Fatal Errors and CancellationException propagate unchanged.
  */
 internal fun settleMediaStoreExportDebt(
     context: Context,
@@ -1786,11 +1788,21 @@ internal fun settleMediaStoreExportDebt(
         if (metadata.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id &&
             metadata.optString(ACTIVE_OPERATION_ID).isNotBlank()
         ) {
+            // CASE A-live: the exact retained PUBLIC_EXPORT lease is settled with LIVE-OWNER
+            // semantics when its pipeline already registered the interruption settlement and the
+            // worker scope is gone.  The same lease E settles and releases before any new
+            // mutation acquires.  A retained lease without a registered settlement still belongs
+            // to a live pipeline; the job stays busy for it.
+            if (retainedLease != null && retainedLease.pendingPublicExportSettlement() != null) {
+                return KeplerJobMetadata.withJobLock(jobDir) {
+                    settleRetainedPublicExportLease(jobDir, retainedLease, access, allowDeadOwner = false)
+                }
+            }
             // A live current-process operation owns this job; it settles/acks its own journals.
             return false
         }
         if (retainedLease != null) {
-            // CASE A: the exact retained lease is the single recovery settlement authority.
+            // CASE A: the exact retained dead-owner lease is the single recovery settlement authority.
             return KeplerJobMetadata.withJobLock(jobDir) {
                 settleRetainedPublicExportLease(jobDir, retainedLease, access)
             }
@@ -1881,14 +1893,22 @@ internal fun settleMediaStoreExportDebt(
  * settlement is registered first, then the shared owner protocol runs with provider access.
  * UNKNOWN/unresolved evidence keeps E retained (`false`); a converged owner is released and its
  * durable marker cleared.  Never creates a second lease or a second durable journal.
+ * [allowDeadOwner] selects the owner semantics: `false` settles a current-runtime retained owner
+ * (registered interruption settlement required), `true` settles the dead-owner restart case.
  */
 private fun settleRetainedPublicExportLease(
     jobDir: File,
     lease: JobOperationLease,
-    access: MediaStoreExportRecoveryAccess
+    access: MediaStoreExportRecoveryAccess,
+    allowDeadOwner: Boolean = true
 ): Boolean {
     val operationId = lease.currentDurableOperationId() ?: return false
     if (lease.pendingPublicExportSettlement() == null) {
+        if (!allowDeadOwner) {
+            // A live pipeline must register the interruption settlement itself; this debt
+            // coordinator never invents one for a still-live owner.
+            return false
+        }
         lease.registerPublicExportSettlement(
             operationId = operationId,
             failureMessage = "Retained PUBLIC_EXPORT lease settled by the same-process debt coordinator.",
@@ -1903,7 +1923,7 @@ private fun settleRetainedPublicExportLease(
             failureMessage = "Retained PUBLIC_EXPORT lease settled by the same-process debt coordinator.",
             disposition = PublicExportInterruptionDisposition.FAILED,
             access = access,
-            allowDeadOwner = true
+            allowDeadOwner = allowDeadOwner
         )
     } catch (failure: Error) {
         throw failure
@@ -1941,14 +1961,18 @@ private fun finalizeConvergedDeadExportOwner(jobDir: File) {
     if (job.optString(ACTIVE_OPERATION_KIND) != KeplerActiveOperationKind.PUBLIC_EXPORT.name) return
     val ownerJournals = MediaStoreExportJournal.list(jobDir)
         .filter { it.ownerOperationId == activeId }
-    if (ownerJournals.any { it.isGateBlocking() || it.requiresExternalCommitResolution() }) return
+    // Provider-resolution debt (a lagging commit-band row, AMBIGUOUS cut) can never be
+    // acknowledged without external authority: keep the owner retained for that pass.
+    if (ownerJournals.any { it.requiresExternalCommitResolution() }) return
     if (job.optString(TERMINAL_OPERATION_ID) == activeId &&
         job.optString("currentPipelineStage") in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")
     ) {
         // Mirror the restart-recovery terminal contract exactly: the owner-correlated journals
         // are acknowledged (terminal-persisted) first; the terminal finalizer runs only when
         // settlement is SETTLED.  A DEFERRED ACK (ineligible or unresolved journal) retains the
-        // owner so the next entry retries the same protocol.
+        // owner so the next entry retries the same protocol.  This branch runs BEFORE the
+        // generic gate-blocking check because an ACK-eligible unacknowledged VERIFIED or
+        // PUBLIC_COMMITTED journal is settled by this protocol itself.
         if (markMediaStoreExportJournalsTerminalPersisted(jobDir) !=
             MediaStoreExportTerminalSettlementStatus.SETTLED
         ) {
@@ -1957,6 +1981,20 @@ private fun finalizeConvergedDeadExportOwner(jobDir: File) {
         check(KeplerJobMetadata.finalizeRecoveredTerminalOperation(jobDir, activeId)) {
             "Could not durably finalize dead terminal operation $activeId"
         }
+        return
+    }
+    // Interrupted-owner branch: run the same evidence-matched ACK pass as the owner-settlement
+    // protocol FIRST — journals whose durable record matches (verified/committed + exact URI /
+    // own role evidence) are acknowledged; a journal that remains terminally unstable after the
+    // ACK pass keeps the owner retained for the next settlement entry.  This is what lets an
+    // ACK-eligible unacknowledged VERIFIED or PUBLIC_COMMITTED journal converge here too.
+    MediaStoreExportJournal.list(jobDir)
+        .filter { it.ownerOperationId == activeId && !it.terminalMetadataPersisted }
+        .filter { terminalAckEligible(job, it) }
+        .forEach { it.markTerminalPersisted(jobDir, activeId) }
+    if (MediaStoreExportJournal.list(jobDir)
+            .any { it.ownerOperationId == activeId && !it.isTerminallyStable() }
+    ) {
         return
     }
     val committed = job.optBoolean("galleryExportCommitted", false) &&

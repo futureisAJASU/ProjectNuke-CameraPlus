@@ -143,7 +143,7 @@ class KeplerJobMetadataTest {
     }
 
     @Test
-    fun selfAcquiredHandoffSettlementDoesNotLeakLeaseWhenWriteFails() {
+    fun selfAcquiredHandoffSettlementRetainsLeaseWhenWriteFails() {
         val directory = Files.createTempDirectory("kepler-dispatch-handoff-leak-").toFile()
         val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
         try {
@@ -159,7 +159,14 @@ class KeplerJobMetadataTest {
             assertFalse(
                 KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(directory)
             )
-            assertFalse(KeplerJobMetadata.isOperationActive(directory))
+            assertTrue(
+                "The self-acquired lease is retained while the settlement is pending",
+                KeplerJobMetadata.isOperationActive(directory)
+            )
+            assertNotNull(
+                "The retained lease keeps the handoff debt owned",
+                KeplerJobMetadata.findOperationLease(directory)
+            )
             assertTrue(KeplerJobMetadata.read(directory).has(PROCESSING_HANDOFF_OPERATION_ID))
 
             KeplerJobMetadata.atomicWriteFailureForTest = null
@@ -175,7 +182,7 @@ class KeplerJobMetadataTest {
     }
 
     @Test
-    fun selfAcquiredHandoffFatalSettlementDoesNotLeakLease() {
+    fun selfAcquiredHandoffFatalSettlementRetainsLease() {
         val directory = Files.createTempDirectory("kepler-dispatch-handoff-fatal-leak-").toFile()
         val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
         try {
@@ -191,13 +198,17 @@ class KeplerJobMetadataTest {
             assertThrows(AssertionError::class.java) {
                 KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(directory)
             }
-            assertFalse(KeplerJobMetadata.isOperationActive(directory))
+            assertTrue(
+                "The self-acquired lease is retained even on fatal settlement failure",
+                KeplerJobMetadata.isOperationActive(directory)
+            )
             assertTrue(KeplerJobMetadata.read(directory).has(PROCESSING_HANDOFF_OPERATION_ID))
 
             KeplerJobMetadata.atomicWriteFailureForTest = null
             assertTrue(
                 KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(directory)
             )
+            assertFalse(KeplerJobMetadata.isOperationActive(directory))
         } finally {
             KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
             directory.deleteRecursively()

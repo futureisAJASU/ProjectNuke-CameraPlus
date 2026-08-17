@@ -119,6 +119,12 @@ internal var restoreBackupsKickbackCount: Int = 0
 internal var createdOutputKickbackCount: Int = 0
 @Volatile
 internal var fallbackWriteCount: Int = 0
+/** Test-only counters for rollback ordering: prove external-authority settlement precedes any
+ *  destructive restore/delete, and prove ZERO destructive invocation on committed evidence. */
+@Volatile
+internal var restoreBackupsInvocationCount: Int = 0
+@Volatile
+internal var removeTransactionCreatedFilesInvocationCount: Int = 0
 /** Convenience accessor aligned with the [KeplerJobMetadata.leaseReleaseCount] storage. */
 internal val leaseReleaseCount: Int
     get() = KeplerJobMetadata.leaseReleaseCount
@@ -645,7 +651,8 @@ selectionMode = resolveSelectionMode(job, frameSelection)
             if (it is Error) throw it
             return@withContext finalizeTransaction(
                 session, transaction, target, capability.jobKind, outputSettings, selectionMode,
-                resolvedSelection, Result.failure(it)
+                resolvedSelection, Result.failure(it),
+                ContextMediaStoreExportRecoveryAccess(context)
             ).result
         }
         check(KeplerJobMetadata.isOperationOwner(target, operationLease)) {
@@ -694,7 +701,7 @@ selectionMode = resolveSelectionMode(job, frameSelection)
         val terminalOutcome = acquireWorkerTerminal(worker, callerCancellation = null)
         val finalization = settleTerminalResult(
             session, transaction, target, capability.jobKind, outputSettings, selectionMode,
-            resolvedSelection, worker, terminalOutcome
+            resolvedSelection, worker, terminalOutcome, ContextMediaStoreExportRecoveryAccess(context)
         )
         return@withContext finalization.result
     } catch (callerCancellation: kotlinx.coroutines.CancellationException) {
@@ -706,7 +713,7 @@ selectionMode = resolveSelectionMode(job, frameSelection)
             val acquisition = acquireWorkerTerminal(worker, callerCancellation)
             val settled = settleTerminalResult(
                 session, tx, target, kind, outputSettings, selectionMode, resolvedSelection,
-                worker, acquisition
+                worker, acquisition, ContextMediaStoreExportRecoveryAccess(context)
             )
             settled.result.exceptionOrNull()?.let { settlementFailure ->
                 try { callerCancellation.addSuppressed(settlementFailure) } catch (_: Exception) { }
@@ -714,7 +721,7 @@ selectionMode = resolveSelectionMode(job, frameSelection)
         } else if (tx != null) {
             val settled = finalizeTransaction(
                 session, tx, target, kind, outputSettings, selectionMode, resolvedSelection,
-                Result.failure(callerCancellation)
+                Result.failure(callerCancellation), ContextMediaStoreExportRecoveryAccess(context)
             )
             settled.result.exceptionOrNull()?.let { settlementFailure ->
                 try { callerCancellation.addSuppressed(settlementFailure) } catch (_: Exception) { }
@@ -744,7 +751,7 @@ selectionMode = resolveSelectionMode(job, frameSelection)
         return@withContext finalizeTransaction(
             session, tx, target, kind,
             outputSettings, selectionMode, resolvedSelection,
-            Result.failure(unexpected)
+            Result.failure(unexpected), ContextMediaStoreExportRecoveryAccess(context)
         ).result
     } finally {
         // One authority for pre-transaction release; after ownership transfer the outer cleanup
@@ -837,7 +844,8 @@ private fun settleTerminalResult(
     selectionMode: FrameSelectionMode,
     resolvedSelection: Set<Int>,
     worker: ReprocessWorkerRun?,
-    acquisition: WorkerTerminalResult
+    acquisition: WorkerTerminalResult,
+    access: MediaStoreExportRecoveryAccess? = null
 ): ReprocessFinalizationResult {
     if (transaction == null) {
         return ReprocessFinalizationResult(
@@ -851,7 +859,7 @@ private fun settleTerminalResult(
     ): ReprocessFinalizationResult {
         val settled = finalizeTransaction(
             session, transaction, target, jobKind, outputSettings, selectionMode,
-            resolvedSelection, terminal
+            resolvedSelection, terminal, access
         )
         settled.result.exceptionOrNull()?.let { failure ->
             if (failure is Error || (failure is CancellationException && propagateCancellation)) {
@@ -1546,7 +1554,8 @@ internal fun finalizeTransaction(
     outputSettings: FinalOutputFormat,
     selectionMode: FrameSelectionMode,
     includedFrameIndices: Set<Int>,
-    terminal: Result<ReprocessWorkerOutcome>
+    terminal: Result<ReprocessWorkerOutcome>,
+    access: MediaStoreExportRecoveryAccess? = null
 ): ReprocessFinalizationResult {
     val operationLease = session.lease
     // Idempotency: duplicate finalization of the same terminal transaction returns the exact cached
@@ -1707,7 +1716,7 @@ val currentAttemptLocalOutput = try {
                     // row may already exist.  Quarantine/defer; NEVER roll back this transaction.
                     return@fold quarantineWithPersistence(transaction, metadataError)
                 }
-                rollback(session, transaction, ownedLease, jobDir, jobKind, outcome, metadataError)
+                rollback(session, transaction, ownedLease, jobDir, jobKind, outcome, metadataError, access)
             }
         )
     } else {
@@ -1716,7 +1725,7 @@ val currentAttemptLocalOutput = try {
                 outcome.terminalError ?: IllegalStateException("Reprocess worker failed with UNKNOWN public export evidence; deferred."))
         } else {
             rollback(session, transaction, ownedLease, jobDir, jobKind, outcome,
-                outcome.terminalError ?: IllegalStateException("Reprocess worker failed."))
+                outcome.terminalError ?: IllegalStateException("Reprocess worker failed."), access)
         }
     }
 }
@@ -1804,7 +1813,10 @@ internal fun quarantineWithPersistence(
 
 /**
  * Exact rollback path. Returns ROLLED_BACK (lease released) or QUARANTINED (lease retained).
- * Does not begin target mutation until every backup and the durable manifest have been validated.
+ * External-authority settlement runs BEFORE any destructive op: the exact PUBLIC_EXPORT owner is
+ * proven/settled with provider access first, and a durably committed/verified public result
+ * refuses rollback entirely (QUARANTINED, ZERO destructive invocation).  Only then are backups
+ * restored and created files removed (after the durable manifest has been validated).
  * Preserves the original error and links restore/deletion/state failures through suppressed attachments.
  */
 internal fun rollback(
@@ -1814,8 +1826,77 @@ internal fun rollback(
     jobDir: File,
     jobKind: ReprocessJobKind,
     outcome: ReprocessWorkerOutcome,
-    error: Throwable
+    error: Throwable,
+    access: MediaStoreExportRecoveryAccess? = null
 ): ReprocessFinalizationResult {
+    // External-authority preflight BEFORE any backup restore or created-file deletion.  An
+    // unresolved public-export owner (journal requires exact provider commit resolution) is
+    // quarantined with the lease retained and the transaction evidence untouched.
+    val settled = try {
+        settleOwnedPublicExportInterruption(
+            jobDir = jobDir,
+            ownerLease = operationLease,
+            failureMessage = error.message ?: "Reprocess public export ended before terminal metadata was settled.",
+            disposition = if (outcome.disposition == ReprocessTerminalDisposition.CANCELLED) {
+                PublicExportInterruptionDisposition.CANCELLED
+            } else {
+                PublicExportInterruptionDisposition.FAILED
+            },
+            access = access
+        )
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (failure: Error) {
+        throw failure
+    } catch (settlementFailure: Exception) {
+        return quarantineWithPersistence(
+            transaction,
+            combineSettlementFailureWithMessage(
+                error, "Public export owner settlement failed during rollback", settlementFailure
+            )
+        )
+    }
+    if (!settled) {
+        return quarantineWithPersistence(
+            transaction,
+            combineSettlementFailureWithMessage(
+                error, "Public export owner settlement failed during rollback (retained for retry)",
+                IllegalStateException("Public export settlement returned false; retained owner protected")
+            )
+        )
+    }
+    // Committed evidence check AFTER settlement: provider reconciliation may have proven a NEW
+    // public row.  A committed or verified durable record means rollback would delete a live
+    // public result — quarantine and refuse, never restore/delete over committed evidence.
+    val durableAfterSettlement = try {
+        KeplerJobMetadata.read(jobDir)
+    } catch (failure: Error) {
+        throw failure
+    } catch (committedCheckFailure: Exception) {
+        return quarantineWithPersistence(
+            transaction,
+            combineSettlementFailureWithMessage(
+                error, "Committed-evidence check failed after settlement; rollback refused", committedCheckFailure
+            )
+        )
+    }
+    if ((durableAfterSettlement.optBoolean("galleryExportCommitted", false) &&
+            durableAfterSettlement.optString("exportUri").isNotBlank()) ||
+        durableAfterSettlement.optBoolean("exportVerified", false)
+    ) {
+        // The export owner was already settled and its ACTIVE marker cleared, so the retained
+        // reprocess lease is registered as pending durable settlement: the next real production
+        // acquisition reconciles it under this exact lease and releases it automatically.
+        operationLease.currentDurableOperationId()?.let { operationLease.markDurableSettlementPending(it) }
+        return quarantineWithPersistence(
+            transaction,
+            combineSettlementFailureWithMessage(
+                error,
+                "Committed public export proven after settlement; rollback refused",
+                IllegalStateException("A new public result is durably committed; deleting it is unsafe")
+            )
+        )
+    }
     val restore = restoreBackups(jobDir, transaction)
     if (restore.isFailure) {
         val restoreError = restore.exceptionOrNull()
@@ -1833,35 +1914,6 @@ internal fun rollback(
             )
         }
     val metadataError = try {
-        try {
-            val settled = settleOwnedPublicExportInterruption(
-                jobDir = jobDir,
-                ownerLease = operationLease,
-                failureMessage = error.message ?: "Reprocess public export ended before terminal metadata was settled.",
-                disposition = if (outcome.disposition == ReprocessTerminalDisposition.CANCELLED) {
-                    PublicExportInterruptionDisposition.CANCELLED
-                } else {
-                    PublicExportInterruptionDisposition.FAILED
-                },
-                access = null
-            )
-            if (!settled) {
-                return quarantineWithPersistence(
-                    transaction,
-                    combineSettlementFailureWithMessage(
-                        error, "Public export owner settlement failed during rollback (retained for retry)",
-                        IllegalStateException("Public export settlement returned false; retained owner protected")
-                    )
-                )
-            }
-        } catch (settlementFailure: Throwable) {
-            return quarantineWithPersistence(
-                transaction,
-                combineSettlementFailureWithMessage(
-                    error, "Public export owner settlement failed during rollback", settlementFailure
-                )
-            )
-        }
         if (outcome.disposition == ReprocessTerminalDisposition.CANCELLED) {
             writeReprocessCancelled(jobDir, error.message)
         } else {
@@ -2080,6 +2132,7 @@ private fun removeTransactionCreatedFiles(
     transaction: ReprocessTransaction,
     originalError: Throwable
 ): Result<Unit> {
+    removeTransactionCreatedFilesInvocationCount += 1
     return try {
         val manifest = loadStrictManifest(File(transaction.backupRoot, REPROCESS_TX_MANIFEST_FILE))
         require(manifest.hasSameImmutableIdentity(transaction.manifest)) {
@@ -3629,6 +3682,7 @@ internal fun backupReprocessTransaction(
  * The durable manifest is authoritative; corrupt/missing evidence never falls back to the in-memory snapshot.
  */
 internal fun restoreBackups(jobDir: File, transaction: ReprocessTransaction): Result<Unit> {
+    restoreBackupsInvocationCount += 1
     var primaryFailure: Throwable? = null
     return try {
     val root = transaction.backupRoot.canonicalFile

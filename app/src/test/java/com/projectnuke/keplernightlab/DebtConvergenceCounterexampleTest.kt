@@ -749,4 +749,878 @@ class DebtConvergenceCounterexampleTest {
             job.deleteRecursively()
         }
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // Phase 13 (BOUNDED AUDIT): 20 production-lifetime counterexamples.
+    // ---------------------------------------------------------------------------------------------
+
+    private fun registeredLiveRetainedOwner(
+        job: File,
+        operationId: String,
+        uri: String,
+        journalState: MediaStoreExportState
+    ): JobOperationLease {
+        KeplerJobMetadata.write(job, JSONObject()
+            .put("jobType", "YUV_NIGHT_FUSION")
+            .put("currentPipelineStage", "PROCESSING")
+            .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+            .put(ACTIVE_OPERATION_ID, operationId)
+            .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name))
+        mediaStoreJournal(job, MediaStoreExportRole.MAIN_IMAGE, "result.jpg", ownerOperationId = operationId)
+            .transition(job, journalState, uri)
+        val lease = KeplerJobMetadata.acquireOperation(job)!!
+        lease.markDurableOperation(operationId, KeplerActiveOperationKind.PUBLIC_EXPORT)
+        lease.markPublicExportSettlementPending(
+            PendingPublicExportSettlement(
+                operationId = operationId,
+                failureMessage = "Pipeline worker scope destroyed mid-export",
+                finalOutputFormat = null,
+                disposition = PublicExportInterruptionDisposition.FAILED
+            )
+        )
+        return lease
+    }
+
+    private fun recoveryRoot(label: String): Pair<File, File> {
+        val base = Files.createTempDirectory(label).toFile()
+        val root = File(base, "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_RECOVERED").apply { mkdirs() }
+        return root to job
+    }
+
+    /** Minimal in-memory cursor: reports exactly one published MediaStore row
+ *  (IS_PENDING=0 at column 0 to mirror the production projection, _SIZE=1024). */
+    private class PublishedMediaStoreRowCursor : org.robolectric.fakes.BaseCursor() {
+        private val columns = arrayOf("IS_PENDING", "_ID", "_SIZE", "_display_name", "mime_type")
+        private var advanced = false
+        override fun getCount(): Int = 1
+        override fun moveToFirst(): Boolean {
+            advanced = false
+            return true
+        }
+        override fun moveToNext(): Boolean {
+            if (advanced) return false
+            advanced = true
+            return true
+        }
+        override fun getColumnNames(): Array<String> = columns
+        override fun getColumnCount(): Int = columns.size
+        override fun getColumnName(column: Int): String = columns[column]
+        override fun getColumnIndex(columnName: String): Int =
+            columns.indexOfFirst { it.equals(columnName, ignoreCase = true) }
+        override fun getString(column: Int): String = when {
+            column >= columns.size -> ""
+            columns[column].equals("_ID", true) || columns[column].equals("_SIZE", true) -> "1024"
+            columns[column].equals("IS_PENDING", true) -> "0"
+            columns[column].equals("_display_name", true) -> "result.jpg"
+            columns[column].equals("mime_type", true) -> "image/jpeg"
+            else -> ""
+        }
+        override fun getLong(column: Int): Long = getString(column).toLong()
+        override fun getInt(column: Int): Int = getString(column).toInt()
+        override fun isNull(column: Int): Boolean = false
+        override fun close() = Unit
+        override fun isClosed(): Boolean = false
+    }
+
+    /** 1. A CURRENT-runtime retained PUBLIC_EXPORT owner (destroyed worker scope) settles under
+     *  the exact retained lease E with live-owner semantics BEFORE any new mutation acquires,
+     *  then a real Gallery mutation entry succeeds. */
+    @Test
+    fun retainedCurrentRuntimeOwnerSettlesBeforeNextMutationAcquires() {
+        val job = tempJob("counterexample-bound1-")
+        try {
+            val operationId = "live-retained-export"
+            val uri = "content://media/external/images/media/98"
+            val lease = registeredLiveRetainedOwner(job, operationId, uri, MediaStoreExportState.ROW_INSERTED)
+
+            assertNull("E occupies the only lease slot while retained",
+                KeplerJobMetadata.acquireOperation(job))
+            val settled = settleMediaStoreExportDebt(
+                org.robolectric.RuntimeEnvironment.getApplication(), job,
+                FakeAccess(pending = false, verified = false, exists = false)
+            )
+            assertTrue("Current-runtime retained owner must settle with provider evidence", settled)
+            assertNull("The exact retained lease is released on successful settlement",
+                KeplerJobMetadata.findOperationLease(job))
+            assertNull("The retained lease's durable owner marker is cleared",
+                lease.currentDurableOperationId())
+            assertEquals(MediaStoreExportState.CLEANED, MediaStoreExportJournal.list(job).single().state)
+            assertEquals("", KeplerJobMetadata.read(job).optString(ACTIVE_OPERATION_ID))
+            assertEquals(
+                JobRecoveryMutationGateOutcome.ALLOWED,
+                KeplerJobMetadata.inspectRecoveryMutationGate(job, JobRecoveryMutationIntent.FRAME_SELECTION)
+            )
+            val saved = saveFrameSelection(
+                org.robolectric.RuntimeEnvironment.getApplication(), job,
+                FrameSelectionMode.AUTO_RULE_BASED, emptyList()
+            )
+            assertTrue("The next real mutation entry must succeed after settlement", saved.isSuccess)
+        } finally {
+            job.deleteRecursively()
+        }
+    }
+
+    /** 2. The next real production Gallery entry (saveFrameSelection) performs the retained
+     *  current-runtime settlement itself: the exact lease settles in-band (conclusive provider
+     *  evidence), the ENTRY then reports the remaining verification debt with the REAL gate
+     *  reason — and once the provider verifies, the next entry succeeds. */
+    @Test
+    fun currentRuntimeRetainedOwnerConvergesViaGalleryMutationEntry() {
+        val job = tempJob("counterexample-bound2-")
+        try {
+            val operationId = "live-retained-entry"
+            val uri = "content://media/external/images/media/100"
+            registeredLiveRetainedOwner(job, operationId, uri, MediaStoreExportState.ROW_INSERTED)
+            val context = org.robolectric.RuntimeEnvironment.getApplication()
+            org.robolectric.Shadows.shadowOf(context.contentResolver).setCursor(
+                Uri.parse(uri), PublishedMediaStoreRowCursor()
+            )
+            val blocked = saveFrameSelection(
+                context, job,
+                FrameSelectionMode.AUTO_RULE_BASED, emptyList()
+            )
+            assertFalse("The first entry settles the retained owner but the committed-unverified row still blocks", blocked.isSuccess)
+            assertEquals("The remaining debt is the REAL verification reason, not DEAD_OPERATION",
+                JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION,
+                (blocked.exceptionOrNull() as? JobRecoveryMutationBlockedException)?.outcome)
+            assertNull("The retained owner is released by the in-band settlement",
+                KeplerJobMetadata.findOperationLease(job))
+            assertEquals("The durable owner marker is cleared by the in-band settlement",
+                "", KeplerJobMetadata.read(job).optString(ACTIVE_OPERATION_ID))
+            assertEquals("The terminal is persisted by the in-band settlement",
+                operationId, KeplerJobMetadata.read(job).optString(TERMINAL_OPERATION_ID))
+            assertTrue("The journal advanced past ROW_INSERTED within the entry pass",
+                MediaStoreExportJournal.list(job).single().state != MediaStoreExportState.ROW_INSERTED)
+            val converged = settleMediaStoreExportDebt(
+                context, job,
+                FakeAccess(pending = false, verified = true, exists = true)
+            )
+            assertTrue("A verified provider pass converges the committed-unverified row", converged)
+            assertEquals("VERIFIED", KeplerJobMetadata.read(job).getString("exportCommitState"))
+            val saved = saveFrameSelection(
+                context, job,
+                FrameSelectionMode.AUTO_RULE_BASED, emptyList()
+            )
+            assertTrue("The next real mutation entry succeeds after verification", saved.isSuccess)
+        } finally {
+            job.deleteRecursively()
+        }
+    }
+
+    /** 3. A provider-inconclusive retained current-runtime owner keeps the exact lease retained;
+     *  the real entry is blocked and no mutation happens. */
+    @Test
+    fun providerUnknownRetainedCurrentRuntimeOwnerBlocksRealEntry() {
+        val job = tempJob("counterexample-bound3-")
+        try {
+            val operationId = "live-retained-unknown"
+            val uri = "content://media/external/images/media/101"
+            val lease = registeredLiveRetainedOwner(job, operationId, uri, MediaStoreExportState.ROW_INSERTED)
+            val saved = saveFrameSelection(
+                org.robolectric.RuntimeEnvironment.getApplication(), job,
+                FrameSelectionMode.AUTO_RULE_BASED, emptyList()
+            )
+            assertFalse("The real entry must be blocked while provider evidence is inconclusive", saved.isSuccess)
+            val blocked = saved.exceptionOrNull() as? JobRecoveryMutationBlockedException
+            assertNotNull("The blocked reason is the real gate outcome", blocked)
+            assertEquals("The exact retained lease is preserved for the next entry",
+                lease, KeplerJobMetadata.findOperationLease(job))
+            assertEquals(
+                MediaStoreExportState.ROW_INSERTED,
+                MediaStoreExportJournal.list(job).single().state
+            )
+        } finally {
+            job.deleteRecursively()
+        }
+    }
+
+    /** 4. FRAME_SELECTION on a committed-unverified record reports the real verification reason
+     *  through the production entry — never a synthetic dead operation. */
+    @Test
+    fun committedUnverifiedRecordBlocksFrameSelectionWithVerificationReason_NotDeadOperation() {
+        val job = tempJob("counterexample-bound4-")
+        try {
+            val uri = "content://media/external/images/media/102"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("currentPipelineStage", "PARTIAL")
+                .put("galleryExportCommitted", true)
+                .put("exportUri", uri)
+                .put("exportCommitState", GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED.name)
+                .put("recoveryState", "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION"))
+            mediaStoreJournal(job, MediaStoreExportRole.MAIN_IMAGE, "result.jpg", ownerOperationId = "op")
+                .transition(job, MediaStoreExportState.PUBLIC_COMMITTED, uri)
+            val saved = saveFrameSelection(
+                org.robolectric.RuntimeEnvironment.getApplication(), job,
+                FrameSelectionMode.AUTO_RULE_BASED, emptyList()
+            )
+            assertFalse(saved.isSuccess)
+            val blocked = saved.exceptionOrNull() as? JobRecoveryMutationBlockedException
+            assertNotNull("The real gate reason is reported", blocked)
+            assertEquals(
+                "Verification debt must report BLOCKED_EXPORT_VERIFICATION, never BLOCKED_DEAD_OPERATION",
+                JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION, blocked!!.outcome
+            )
+            assertEquals(MediaStoreExportState.PUBLIC_COMMITTED,
+                MediaStoreExportJournal.list(job).single().state)
+        } finally {
+            job.deleteRecursively()
+        }
+    }
+
+    /** 5. An unacknowledged VERIFIED journal blocks with the settlement reason; the durable ACK
+     *  is the debt-clearing authority and never re-blocks. */
+    @Test
+    fun unacknowledgedVerifiedJournalBlocksWithSettlementReasonUntilAcked() {
+        val job = tempJob("counterexample-bound5-")
+        try {
+            val operationId = "verified-settlement"
+            val uri = "content://media/external/images/media/103"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("currentPipelineStage", "PARTIAL")
+                .put("galleryExportCommitted", true)
+                .put("exportVerified", true)
+                .put("exportUri", uri)
+                .put("exportCommitState", GalleryExportCommitState.VERIFIED.name)
+                .put("recoveryState", "STABLE")
+                .put(TERMINAL_OPERATION_ID, operationId))
+            val journal = mediaStoreJournal(
+                job, MediaStoreExportRole.MAIN_IMAGE, "result.jpg", ownerOperationId = operationId
+            ).transition(job, MediaStoreExportState.VERIFIED, uri)
+            assertEquals(
+                "Unacknowledged VERIFIED journal blocks with the settlement reason",
+                JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_SETTLEMENT,
+                KeplerJobMetadata.inspectRecoveryMutationGate(job, JobRecoveryMutationIntent.REPROCESS)
+            )
+            journal.markTerminalPersisted(job, operationId)
+            assertEquals(
+                "The durable terminal ACK clears the debt; the gate never re-blocks",
+                JobRecoveryMutationGateOutcome.ALLOWED,
+                KeplerJobMetadata.inspectRecoveryMutationGate(job, JobRecoveryMutationIntent.REPROCESS)
+            )
+        } finally {
+            job.deleteRecursively()
+        }
+    }
+
+    /** 6. A terminal-ACKed VERIFIED journal is never re-blocked by a contradicting provider
+     *  read; the ACK is the debt-clearing authority. */
+    @Test
+    fun ackedVerifiedJournalIsNeverRevertedByProviderContradiction() {
+        val job = tempJob("counterexample-bound6-")
+        try {
+            val operationId = "acked-owner"
+            val uri = "content://media/external/images/media/104"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("currentPipelineStage", "COMPLETE")
+                .put("galleryExportCommitted", true)
+                .put("exportVerified", true)
+                .put("exportUri", uri)
+                .put("exportCommitState", GalleryExportCommitState.VERIFIED.name)
+                .put("recoveryState", "STABLE")
+                .put(TERMINAL_OPERATION_ID, operationId))
+            val journal = mediaStoreJournal(
+                job, MediaStoreExportRole.MAIN_IMAGE, "result.jpg", ownerOperationId = operationId
+            ).transition(job, MediaStoreExportState.VERIFIED, uri)
+                .markTerminalPersisted(job, operationId)
+            val settled = settleMediaStoreExportDebt(
+                org.robolectric.RuntimeEnvironment.getApplication(), job,
+                FakeAccess(pending = false, verified = false, exists = false)
+            )
+            assertTrue("ACKed journal debt must stay cleared even under provider contradiction", settled)
+            assertTrue("The durable ACK survives the provider read",
+                MediaStoreExportJournal.list(job).single().terminalMetadataPersisted)
+            assertEquals(GalleryExportCommitState.VERIFIED.name,
+                KeplerJobMetadata.read(job).getString("exportCommitState"))
+        } finally {
+            job.deleteRecursively()
+        }
+    }
+
+    /** 7. Recovery DEFERRED terminal settlement classifies from the MAIN record evidence
+     *  (committed-unverified), NEVER mechanically downgrades to INTERRUPTED_PRE_COMMIT, and
+     *  writes the durable classification. */
+    @Test
+    fun recoveryDeferredSettlementClassifiesFromMainEvidence() {
+        val (base, job) = recoveryRoot("counterexample-bound7-")
+        try {
+            val operationId = "deferred-export"
+            val uri = "content://media/external/images/media/105"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("currentPipelineStage", "PARTIAL")
+                .put("galleryExportCommitted", true)
+                .put("exportUri", uri)
+                .put("exportCommitState", GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED.name)
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, operationId)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name)
+                .put(TERMINAL_OPERATION_ID, operationId))
+            mediaStoreJournal(job, MediaStoreExportRole.MAIN_IMAGE, "result.jpg", ownerOperationId = operationId)
+                .transition(job, MediaStoreExportState.PUBLIC_COMMITTED, uri)
+            val sidecar = mediaStoreJournal(
+                job, MediaStoreExportRole.RAW_DNG_SIDECAR, "frame.dng",
+                ownerOperationId = operationId, frameIndex = 0
+            ).transition(job, MediaStoreExportState.PREPARED)
+            val report = KeplerRecoveryCoordinator.recoverRoots(
+                listOf(base),
+                FakeAccess(pending = false, verified = false, exists = true)
+            )
+            val result = report.jobs.single { it.jobDir == job }
+            assertEquals(
+                "DEFERRED must classify from MAIN committed evidence, not INTERRUPTED_PRE_COMMIT",
+                KeplerJobRecoveryClassification.PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION,
+                result.classification
+            )
+            assertEquals("PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION",
+                KeplerJobMetadata.read(job).getString("recoveryState"))
+            assertEquals("The exact owner is retained for the next entry",
+                operationId, KeplerJobMetadata.read(job).optString(ACTIVE_OPERATION_ID))
+            val journals = MediaStoreExportJournal.list(job)
+            assertTrue("Main committed journal is terminal-ACKed",
+                journals.first { it.role == MediaStoreExportRole.MAIN_IMAGE }.terminalMetadataPersisted)
+            assertFalse("Unresolved sidecar journal is not ACKed",
+                journals.first { it.role == MediaStoreExportRole.RAW_DNG_SIDECAR }.terminalMetadataPersisted)
+            assertFalse("Sidecar journal was not force-acked",
+                sidecar.terminalMetadataPersisted)
+        } finally {
+            base.deleteRecursively()
+        }
+    }
+
+    /** 8. The recovery terminal finalizer preserves the verification policy: a committed-unverified
+     *  terminal owner keeps PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION instead of STABLE. */
+    @Test
+    fun recoveryTerminalFinalizerPreservesVerificationPolicy() {
+        val (base, job) = recoveryRoot("counterexample-bound8-")
+        try {
+            val operationId = "terminal-policy"
+            val uri = "content://media/external/images/media/106"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("currentPipelineStage", "PARTIAL")
+                .put("galleryExportCommitted", true)
+                .put("exportUri", uri)
+                .put("exportCommitState", GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED.name)
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, operationId)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name)
+                .put(TERMINAL_OPERATION_ID, operationId))
+            mediaStoreJournal(job, MediaStoreExportRole.MAIN_IMAGE, "result.jpg", ownerOperationId = operationId)
+                .transition(job, MediaStoreExportState.PUBLIC_COMMITTED, uri)
+            val report = KeplerRecoveryCoordinator.recoverRoots(
+                listOf(base),
+                FakeAccess(pending = false, verified = false, exists = true)
+            )
+            val result = report.jobs.single { it.jobDir == job }
+            assertEquals(KeplerJobRecoveryClassification.RECOVERED, result.classification)
+            assertEquals(
+                "Committed-unverified terminal owner keeps its verification policy, never STABLE",
+                "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION",
+                KeplerJobMetadata.read(job).getString("recoveryState")
+            )
+            assertEquals("", KeplerJobMetadata.read(job).optString(ACTIVE_OPERATION_ID))
+            assertEquals(
+                JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION,
+                KeplerJobMetadata.inspectRecoveryMutationGate(job, JobRecoveryMutationIntent.REPROCESS)
+            )
+        } finally {
+            base.deleteRecursively()
+        }
+    }
+
+    /** 9. Role-aware aggregation: a verified MAIN image is never downgraded by a committed-unverified
+     *  SIDECAR result; the sidecar stays its own commit debt. */
+    @Test
+    fun verifiedMainNeverDowngradedByCommittedUnverifiedSidecar() {
+        val (base, job) = recoveryRoot("counterexample-bound9-")
+        try {
+            val operationId = "verified-main"
+            val mainUri = "content://media/external/images/media/107"
+            val sidecarUri = "content://media/external/file/108"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("currentPipelineStage", "PARTIAL")
+                .put("galleryExportCommitted", true)
+                .put("exportVerified", true)
+                .put("exportUri", mainUri)
+                .put("exportCommitState", GalleryExportCommitState.VERIFIED.name)
+                .put(ACTIVE_RUNTIME_SESSION_ID, "old-runtime")
+                .put(ACTIVE_OPERATION_ID, operationId)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name)
+                .put(TERMINAL_OPERATION_ID, operationId))
+            mediaStoreJournal(job, MediaStoreExportRole.MAIN_IMAGE, "result.jpg", ownerOperationId = operationId)
+                .transition(job, MediaStoreExportState.VERIFIED, mainUri)
+            val sidecar = mediaStoreJournal(
+                job, MediaStoreExportRole.RAW_DNG_SIDECAR, "frame.dng",
+                ownerOperationId = operationId, frameIndex = 0
+            ).transition(job, MediaStoreExportState.PUBLIC_COMMITTED, sidecarUri)
+            val report = KeplerRecoveryCoordinator.recoverRoots(
+                listOf(base),
+                object : MediaStoreExportRecoveryAccess {
+                    override fun inspect(uri: Uri, journal: MediaStoreExportJournal) =
+                        MediaStoreExportInspection(true, false, uri.toString() == mainUri)
+                    override fun setPending(uri: Uri, pending: Boolean) = true
+                    override fun delete(uri: Uri) = true
+                }
+            )
+            val result = report.jobs.single { it.jobDir == job }
+            assertEquals(
+                KeplerJobRecoveryClassification.PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL,
+                result.classification
+            )
+            val metadata = KeplerJobMetadata.read(job)
+            assertEquals("VERIFIED", metadata.getString("exportCommitState"))
+            assertEquals(
+                "Main verification policy is preserved; the sidecar result never downgrades it",
+                "STABLE", metadata.getString("recoveryState")
+            )
+            assertTrue("Verified main journal is ACKed",
+                MediaStoreExportJournal.list(job)
+                    .first { it.role == MediaStoreExportRole.MAIN_IMAGE }.terminalMetadataPersisted)
+            assertFalse("Sidecar commit debt stays its own journal debt",
+                sidecar.terminalMetadataPersisted)
+        } finally {
+            base.deleteRecursively()
+        }
+    }
+
+    /** 10. Rollback with a committed owner: settlement precedes every destructive op; a durably
+     *  committed public result refuses rollback with ZERO restore/delete invocation. */
+    @Test
+    fun rollbackSettlesExternalAuthorityBeforeAnyDestructiveOp() {
+        val job = tempJob("counterexample-bound10-")
+        val previousRestore = restoreBackupsInvocationCount
+        val previousDelete = removeTransactionCreatedFilesInvocationCount
+        try {
+            val operationId = "reb-proc-export"
+            val uri = "content://media/external/images/media/109"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "RAW_NIGHT_FUSION")
+                .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, operationId)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name))
+            val target = File(job, "raw_fusion_final.png").apply { writeText("before") }
+            val transaction = backupReprocessTransaction(job, listOf(target)).getOrThrow()
+            target.writeText("after!")
+            mediaStoreJournal(job, MediaStoreExportRole.MAIN_IMAGE, "result.jpg", ownerOperationId = operationId)
+                .transition(job, MediaStoreExportState.PUBLIC_COMMITTED, uri)
+            val session = ReprocessTransactionSession(job)
+            val lease = KeplerJobMetadata.acquireOperation(job)!!
+            session.bindForLegacyFinalizer(transaction, lease)
+            val error = IllegalStateException("worker failed")
+            val result = rollback(
+                session, transaction, lease, job, ReprocessJobKind.RAW_FUSION,
+                ReprocessWorkerOutcome(result = Result.failure(error), publicExportCommitted = false),
+                error,
+                FakeAccess(pending = false, verified = false, exists = true)
+            )
+            assertEquals("Committed evidence refuses rollback",
+                ReprocessFinalizationState.QUARANTINED, result.state)
+            assertEquals("ZERO backup restores on committed evidence",
+                previousRestore, restoreBackupsInvocationCount)
+            assertEquals("ZERO created-file deletions on committed evidence",
+                previousDelete, removeTransactionCreatedFilesInvocationCount)
+            assertEquals("The worker-mutated file is untouched", "after!", target.readText())
+            assertTrue("The transaction evidence is quarantined durably",
+                File(transaction.backupRoot, ".reprocess_quarantine").isFile)
+            assertEquals("Committed record was written by the settlement",
+                "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION",
+                KeplerJobMetadata.read(job).optString("recoveryState"))
+        } finally {
+            lateFinalizationHandoffScope = null
+            restoreBackupsInvocationCount = previousRestore
+            removeTransactionCreatedFilesInvocationCount = previousDelete
+            job.deleteRecursively()
+        }
+    }
+
+    /** 11. Rollback on a proven pre-commit cut: settlement resolves first, then restore/delete
+     *  run exactly once and the job returns ROLLED_BACK with the original files. */
+    @Test
+    fun rollbackPreCommitProvesExternalAuthorityThenRestores() {
+        val job = tempJob("counterexample-bound11-")
+        val previousRestore = restoreBackupsInvocationCount
+        val previousDelete = removeTransactionCreatedFilesInvocationCount
+        try {
+            val operationId = "reb-precommit"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "RAW_NIGHT_FUSION")
+                .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, operationId)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name))
+            val target = File(job, "raw_fusion_final.png").apply { writeText("before") }
+            val transaction = backupReprocessTransaction(job, listOf(target)).getOrThrow()
+            target.writeText("after!")
+            mediaStoreJournal(job, MediaStoreExportRole.MAIN_IMAGE, "result.jpg", ownerOperationId = operationId)
+                .transition(job, MediaStoreExportState.ROW_INSERTED, "content://media/external/images/media/110")
+            val session = ReprocessTransactionSession(job)
+            val lease = KeplerJobMetadata.acquireOperation(job)!!
+            session.bindForLegacyFinalizer(transaction, lease)
+            val error = IllegalStateException("worker failed")
+            val result = rollback(
+                session, transaction, lease, job, ReprocessJobKind.RAW_FUSION,
+                ReprocessWorkerOutcome(result = Result.failure(error), publicExportCommitted = false),
+                error,
+                FakeAccess(pending = false, verified = false, exists = false)
+            )
+            assertEquals(ReprocessFinalizationState.ROLLED_BACK, result.state)
+            assertEquals("Settlement proves pre-commit BEFORE restore; restore runs exactly once",
+                previousRestore + 1, restoreBackupsInvocationCount)
+            assertEquals("Created-file deletion runs exactly once",
+                previousDelete + 1, removeTransactionCreatedFilesInvocationCount)
+            assertEquals("The original file is restored", "before", target.readText())
+            assertFalse(KeplerJobMetadata.isOperationActive(job))
+        } finally {
+            lateFinalizationHandoffScope = null
+            restoreBackupsInvocationCount = previousRestore
+            removeTransactionCreatedFilesInvocationCount = previousDelete
+            job.deleteRecursively()
+        }
+    }
+
+    /** 12. Rollback with inconclusive provider evidence: NO destructive op runs and the owner
+     *  lease is retained for the next retry. */
+    @Test
+    fun rollbackInconclusiveEvidenceBlocksAllDestructiveOps() {
+        val job = tempJob("counterexample-bound12-")
+        val previousRestore = restoreBackupsInvocationCount
+        val previousDelete = removeTransactionCreatedFilesInvocationCount
+        try {
+            val operationId = "reb-unknown"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "RAW_NIGHT_FUSION")
+                .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, operationId)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name))
+            val target = File(job, "raw_fusion_final.png").apply { writeText("before") }
+            val transaction = backupReprocessTransaction(job, listOf(target)).getOrThrow()
+            target.writeText("after!")
+            mediaStoreJournal(job, MediaStoreExportRole.MAIN_IMAGE, "result.jpg", ownerOperationId = operationId)
+                .transition(job, MediaStoreExportState.ROW_INSERTED, "content://media/external/images/media/111")
+            val session = ReprocessTransactionSession(job)
+            val lease = KeplerJobMetadata.acquireOperation(job)!!
+            session.bindForLegacyFinalizer(transaction, lease)
+            val error = IllegalStateException("worker failed")
+            val result = rollback(
+                session, transaction, lease, job, ReprocessJobKind.RAW_FUSION,
+                ReprocessWorkerOutcome(result = Result.failure(error), publicExportCommitted = false),
+                error,
+                FakeAccess(pending = true, verified = false, inspectionFailed = true)
+            )
+            assertEquals(ReprocessFinalizationState.QUARANTINED, result.state)
+            assertEquals("Zero destructive ops on inconclusive evidence",
+                previousRestore, restoreBackupsInvocationCount)
+            assertEquals(previousDelete, removeTransactionCreatedFilesInvocationCount)
+            assertEquals("Worker-mutated file untouched", "after!", target.readText())
+            assertTrue("The retained owner protects the job for the next entry",
+                KeplerJobMetadata.isOperationActive(job))
+        } finally {
+            lateFinalizationHandoffScope = null
+            restoreBackupsInvocationCount = previousRestore
+            removeTransactionCreatedFilesInvocationCount = previousDelete
+            job.deleteRecursively()
+        }
+    }
+
+    /** 13. Rollback without provider access on commit-resolution debt is fail-closed: ZERO
+     *  destructive invocation, quarantined, owner retained. */
+    @Test
+    fun rollbackWithoutProviderRefusesDestructiveOps() {
+        val job = tempJob("counterexample-bound13-")
+        val previousRestore = restoreBackupsInvocationCount
+        val previousDelete = removeTransactionCreatedFilesInvocationCount
+        try {
+            val operationId = "reb-noaccess"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "RAW_NIGHT_FUSION")
+                .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, operationId)
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name))
+            val target = File(job, "raw_fusion_final.png").apply { writeText("before") }
+            val transaction = backupReprocessTransaction(job, listOf(target)).getOrThrow()
+            target.writeText("after!")
+            mediaStoreJournal(job, MediaStoreExportRole.MAIN_IMAGE, "result.jpg", ownerOperationId = operationId)
+                .transition(job, MediaStoreExportState.ROW_INSERTED, "content://media/external/images/media/112")
+            val session = ReprocessTransactionSession(job)
+            val lease = KeplerJobMetadata.acquireOperation(job)!!
+            session.bindForLegacyFinalizer(transaction, lease)
+            val error = IllegalStateException("worker failed")
+            val result = rollback(
+                session, transaction, lease, job, ReprocessJobKind.RAW_FUSION,
+                ReprocessWorkerOutcome(result = Result.failure(error), publicExportCommitted = false),
+                error
+            )
+            assertEquals(ReprocessFinalizationState.QUARANTINED, result.state)
+            assertEquals("Zero destructive ops without provider authority",
+                previousRestore, restoreBackupsInvocationCount)
+            assertEquals(previousDelete, removeTransactionCreatedFilesInvocationCount)
+            assertEquals("Worker-mutated file untouched", "after!", target.readText())
+            assertTrue(KeplerJobMetadata.isOperationActive(job))
+        } finally {
+            lateFinalizationHandoffScope = null
+            restoreBackupsInvocationCount = previousRestore
+            removeTransactionCreatedFilesInvocationCount = previousDelete
+            job.deleteRecursively()
+        }
+    }
+
+    /** 14. YUV absorbing terminal: a failed handoff settlement retains the self-acquired lease
+     *  with its pending marker; the next real mutation acquisition reconciles and converges. */
+    @Test
+    fun handoffSettlementFailureRetainsYuvLeaseUntilNextMutation() {
+        val job = tempJob("counterexample-bound14-")
+        val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
+        try {
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, "capture-yuv")
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.CAPTURE_YUV.name)
+                .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(PROCESSING_HANDOFF_OPERATION_ID, "capture-yuv")
+                .put(PROCESSING_HANDOFF_KIND, "PROCESSING_YUV"))
+            KeplerJobMetadata.atomicWriteFailureForTest = java.io.IOException("injected handoff write failure")
+            val settled = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(job)
+            assertFalse("Failed handoff settlement reports false", settled)
+            assertNotNull("The self-acquired lease is retained on failure",
+                KeplerJobMetadata.findOperationLease(job))
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            val first = runCatching {
+                KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                    job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
+                )
+            }.exceptionOrNull()
+            assertTrue("The first reconcile settles the handoff but keeps the capture marker pending",
+                first is ProcessingAlreadyActiveException)
+            val acquired = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
+            )
+            assertEquals(
+                "Second acquisition reconciles the pending marker and acquires",
+                JobRecoveryMutationGateOutcome.ALLOWED, acquired.let {
+                    KeplerJobMetadata.inspectRecoveryMutationGate(job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true)
+                }
+            )
+            KeplerJobMetadata.releaseOperation(acquired)
+            assertEquals("", KeplerJobMetadata.read(job).optString(PROCESSING_HANDOFF_OPERATION_ID))
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
+            job.deleteRecursively()
+        }
+    }
+
+    /** 15. RAW absorbing terminal: the same retained-settlement contract holds for the RAW entry. */
+    @Test
+    fun handoffSettlementFailureRetainsRawLeaseUntilNextMutation() {
+        val job = tempJob("counterexample-bound15-")
+        val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
+        try {
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "RAW_NIGHT_FUSION")
+                .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, "capture-raw")
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.CAPTURE_RAW.name)
+                .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(PROCESSING_HANDOFF_OPERATION_ID, "capture-raw")
+                .put(PROCESSING_HANDOFF_KIND, "PROCESSING_RAW"))
+            KeplerJobMetadata.atomicWriteFailureForTest = java.io.IOException("injected raw handoff write failure")
+            val settled = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(job)
+            assertFalse(settled)
+            val retained = KeplerJobMetadata.findOperationLease(job)
+            assertNotNull("RAW absorbing terminal retains its lease on failure", retained)
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            val acquired = runCatching {
+                KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                    job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
+                )
+            }.getOrElse { firstFailure ->
+                if (firstFailure is ProcessingAlreadyActiveException) {
+                    KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                        job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
+                    )
+                } else {
+                    throw firstFailure
+                }
+            }
+            if (acquired != null) KeplerJobMetadata.releaseOperation(acquired)
+            assertEquals("", KeplerJobMetadata.read(job).optString(PROCESSING_HANDOFF_OPERATION_ID))
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
+            job.deleteRecursively()
+        }
+    }
+
+    /** 16. Caller-owned lease (processor path): failed settlement marks the pending marker on the
+     *  exact caller lease and never releases it. */
+    @Test
+    fun absorbingTerminalCallerLeaseRetainedOnFailedSettlement() {
+        val job = tempJob("counterexample-bound16-")
+        val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
+        try {
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, "capture-caller")
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.CAPTURE_YUV.name)
+                .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(PROCESSING_HANDOFF_OPERATION_ID, "capture-caller")
+                .put(PROCESSING_HANDOFF_KIND, "PROCESSING_YUV"))
+            val lease = KeplerJobMetadata.acquireOperation(job)!!
+            KeplerJobMetadata.atomicWriteFailureForTest = java.io.IOException("injected caller write failure")
+            val settled = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(job, lease)
+            assertFalse(settled)
+            assertEquals("The caller lease is retained and marked", lease, KeplerJobMetadata.findOperationLease(job))
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            runCatching {
+                KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                    job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
+                )
+            }
+            val second = runCatching {
+                KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                    job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
+                )
+            }.getOrNull()
+            if (second != null) KeplerJobMetadata.releaseOperation(second)
+            assertEquals("", KeplerJobMetadata.read(job).optString(PROCESSING_HANDOFF_OPERATION_ID))
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
+            job.deleteRecursively()
+        }
+    }
+
+    /** 17. SR consume path fail-closed: a persistence failure leaves the correlated handoff
+     *  untouched for retry; the retry consumes it exactly once — success never follows an
+     *  unconsumed handoff. */
+    @Test
+    fun srConsumePathFailsClosedAndDebtRetries() {
+        val job = tempJob("counterexample-bound17-")
+        val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
+        try {
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, "sr-source")
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.CAPTURE_YUV.name)
+                .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(PROCESSING_HANDOFF_OPERATION_ID, "sr-source")
+                .put(PROCESSING_HANDOFF_KIND, "PROCESSING_YUV"))
+            KeplerJobMetadata.atomicWriteFailureForTest = java.io.IOException("injected consume write failure")
+            val consumed = KeplerJobMetadata.consumeProcessingHandoff(job, KeplerActiveOperationKind.PROCESSING_YUV)
+            assertFalse("Consume persistence failure is NOT success", consumed)
+            assertEquals("The handoff remains correlated for the retry",
+                KeplerJobMetadata.ProcessingHandoffPresence.CORRELATED,
+                KeplerJobMetadata.inspectProcessingHandoff(job, KeplerActiveOperationKind.PROCESSING_YUV))
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            assertTrue("The retry consumes exactly once",
+                KeplerJobMetadata.consumeProcessingHandoff(job, KeplerActiveOperationKind.PROCESSING_YUV))
+            assertEquals("Consumed handoff reports absent",
+                KeplerJobMetadata.ProcessingHandoffPresence.ABSENT,
+                KeplerJobMetadata.inspectProcessingHandoff(job, KeplerActiveOperationKind.PROCESSING_YUV))
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
+            job.deleteRecursively()
+        }
+    }
+
+    /** 18. A committed-unverified sidecar with a DIVERGENT durable frame URI is never
+     *  acknowledged; only the exact-URI record acknowledges. */
+    @Test
+    fun sidecarCommittedUnverifiedRequiresExactUri() {
+        val job = tempJob("counterexample-bound18-")
+        try {
+            val journalUri = "content://media/external/file/113"
+            val divergentUri = "content://media/external/file/114"
+            val metadata = JSONObject()
+                .put("currentPipelineStage", "COMPLETE")
+                .put("galleryExportCommitted", true)
+                .put("exportVerified", true)
+                .put("exportUri", "content://media/external/images/media/115")
+                .put("frames", org.json.JSONArray().put(JSONObject()
+                    .put("frameIndex", 0)
+                    .put("dngSidecarPublicStatus", "PUBLIC_COMMITTED_UNVERIFIED")
+                    .put("publicDngUri", divergentUri)))
+            val journal = mediaStoreJournal(
+                job, MediaStoreExportRole.RAW_DNG_SIDECAR, "frame.dng", ownerOperationId = "op", frameIndex = 0
+            ).transition(job, MediaStoreExportState.PUBLIC_COMMITTED, journalUri)
+            assertFalse("Divergent durable URI never acknowledges the sidecar journal",
+                terminalAckEligible(metadata, journal))
+            val exact = MediaStoreExportJournal.read(job, MediaStoreExportJournal.fileFor(job, journal.exportAttemptId))
+                .transition(job, MediaStoreExportState.PUBLIC_COMMITTED, divergentUri)
+            assertTrue("Exact-URI committed-unverified record is the sidecar's own ACK evidence",
+                terminalAckEligible(metadata, exact))
+        } finally {
+            job.deleteRecursively()
+        }
+    }
+
+    /** 19. A sidecar WITHOUT an own frame record: only its own VERIFIED journal state
+     *  acknowledges; PUBLIC_COMMITTED stays commit debt. */
+    @Test
+    fun sidecarWithoutFrameRecordVerifiedOwnEvidenceOnly() {
+        val job = tempJob("counterexample-bound19-")
+        try {
+            val metadata = JSONObject()
+                .put("currentPipelineStage", "COMPLETE")
+                .put("galleryExportCommitted", true)
+                .put("exportVerified", true)
+                .put("exportUri", "content://media/external/images/media/116")
+            val committed = mediaStoreJournal(
+                job, MediaStoreExportRole.RAW_DNG_SIDECAR, "frame.dng", ownerOperationId = "op", frameIndex = 0
+            ).transition(job, MediaStoreExportState.PUBLIC_COMMITTED, "content://media/external/file/117")
+            assertFalse("Committed sidecar without reconstructed exact frame/URI record is NOT acked",
+                terminalAckEligible(metadata, committed))
+            val verified = MediaStoreExportJournal.read(job, MediaStoreExportJournal.fileFor(job, committed.exportAttemptId))
+                .transition(job, MediaStoreExportState.VERIFIED, "content://media/external/file/117")
+            assertTrue("The journal's own VERIFIED durable state is its own ACK evidence",
+                terminalAckEligible(metadata, verified))
+        } finally {
+            job.deleteRecursively()
+        }
+    }
+
+    /** 20. CASE B single temporary authority: an inconclusive pass retains the debt and leaves no
+     *  second authority; the deterministic retry converges exactly once. */
+    @Test
+    fun singleAuthorityNeverDoubleSettlesUnderSerialPasses() {
+        val job = tempJob("counterexample-bound20-")
+        try {
+            val uri = "content://media/external/images/media/118"
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("currentPipelineStage", "FAILED")
+                .put("exportCommitState", GalleryExportCommitState.UNKNOWN.name)
+                .put("exportUri", uri)
+                .put("galleryPublicExportLinkage", uri)
+                .put("galleryExportCommitted", false))
+            val journal = mediaStoreJournal(job, MediaStoreExportRole.MAIN_IMAGE, "result.jpg", ownerOperationId = "op")
+                .transition(job, MediaStoreExportState.ROW_INSERTED, uri)
+                .transition(job, MediaStoreExportState.CONTENT_WRITTEN)
+            val access = FakeAccess(pending = true, verified = false, inspectionFailed = true)
+            val first = settleMediaStoreExportDebt(
+                org.robolectric.RuntimeEnvironment.getApplication(), job, access
+            )
+            assertFalse("Inconclusive first pass keeps the debt", first)
+            assertEquals("Inconclusive pass leaves the journal evidence untouched in-band",
+                MediaStoreExportState.CONTENT_WRITTEN,
+                MediaStoreExportJournal.list(job).single().state)
+            assertNull("No authority survives the pass",
+                KeplerJobMetadata.findOperationLease(job))
+            access.inspectionFailed = false
+            access.pending = false
+            access.exists = false
+            val second = settleMediaStoreExportDebt(
+                org.robolectric.RuntimeEnvironment.getApplication(), job, access
+            )
+            assertTrue("Deterministic retry converges exactly once", second)
+            assertEquals("The journal converges to CLEANED exactly once",
+                MediaStoreExportState.CLEANED, MediaStoreExportJournal.list(job).single().state)
+            assertEquals(
+                JobRecoveryMutationGateOutcome.ALLOWED,
+                KeplerJobMetadata.inspectRecoveryMutationGate(job, JobRecoveryMutationIntent.REPROCESS)
+            )
+        } finally {
+            job.deleteRecursively()
+        }
+    }
 }

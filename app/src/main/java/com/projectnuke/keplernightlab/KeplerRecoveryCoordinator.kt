@@ -263,10 +263,16 @@ internal object KeplerRecoveryCoordinator {
                     cleanupFailures = cleanupFailures
                 )
             }
-            if (exportResults.any {
-                    it.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING ||
-                        it.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED
+            if (exportResults.any { result ->
+                    val journal = exportJournalsById[result.attemptId]
+                    (result.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING ||
+                        result.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED) &&
+                        journal?.role == MediaStoreExportRole.MAIN_IMAGE &&
+                        (activeOperation.isBlank() || journal.ownerOperationId == activeOperation)
                 }) {
+                // Role-aware aggregation: only the MAIN image record's own recovery evidence may
+                // record the committed-pending-verification policy.  A sidecar's commit-unknown
+                // result never forces the MAIN record into verification debt.
                 KeplerJobMetadata.update(jobDir) {
                     it.put("recoveryState", "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION")
                         .put("recoveryMessage", "공개 내보내기 증거를 확인할 수 없어 복구가 필요합니다.")
@@ -334,10 +340,34 @@ internal object KeplerRecoveryCoordinator {
                     )
                 }
                 // DEFERRED terminal settlement: the exact retained owner must be protected
-                // for the next production mutation/recovery entry.
+                // for the next production mutation/recovery entry.  Classify from the MAIN
+                // record's durable evidence — never a mechanical INTERRUPTED_PRE_COMMIT —
+                // and write that classification so the same-process gate maps the real reason.
+                val terminalDebtClassification = when {
+                    recoveredMainVerified || job.optBoolean("exportVerified", false) ->
+                        KeplerJobRecoveryClassification.PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL
+                    recoveredMainCommit || job.optBoolean("galleryExportCommitted", false) ->
+                        KeplerJobRecoveryClassification.PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION
+                    job.optString("exportCommitState") == GalleryExportCommitState.UNKNOWN.name ->
+                        KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT
+                    else -> KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT
+                }
+                KeplerJobMetadata.update(jobDir) { current ->
+                    current.put("lastRecoveryClassification", terminalDebtClassification.name)
+                        .put("lastRecoveryMessage", "종료 작업의 정리 확인이 끝나지 않아 소유권을 보존했습니다.")
+                        .put("recoveredAt", System.currentTimeMillis())
+                    when (terminalDebtClassification) {
+                        KeplerJobRecoveryClassification.PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL ->
+                            current.put("recoveryState", "STABLE").remove("recoveryMessage")
+                        KeplerJobRecoveryClassification.PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION ->
+                            current.put("recoveryState", "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION")
+                                .put("recoveryMessage", "공개 내보내기 결과의 확인이 완료되지 않아 추가 확인이 필요합니다.")
+                        else -> current.put("recoveryState", "STABLE").remove("recoveryMessage")
+                    }
+                }
                 return KeplerJobRecoveryResult(
                     jobDir,
-                    KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT,
+                    terminalDebtClassification,
                     actions = listOf("TERMINAL_DEFERRED"),
                     cleanupFailures = cleanupFailures
                 )

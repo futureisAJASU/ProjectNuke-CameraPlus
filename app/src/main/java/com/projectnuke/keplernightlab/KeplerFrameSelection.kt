@@ -175,11 +175,12 @@ fun saveFrameSelection(
     mode: FrameSelectionMode,
     frames: List<KeplerFrameReviewItem>
 ): Result<Unit> = try {
-    // Resolve provider-aware retained debt BEFORE acquiring mutation lease
+    // Resolve provider-aware retained debt BEFORE acquiring mutation lease; the real gate
+    // reports the durable blocking reason (verification/commit policy, retained owner,
+    // unresolved journal) — never a synthetic DEAD_OPERATION.  A clean gate here means the
+    // debt cleared during the pass and the mutation may proceed.
     if (!settleMediaStoreExportDebt(context, jobDir)) {
-        throw JobRecoveryMutationBlockedException(
-            JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION
-        )
+        KeplerJobMetadata.requireRecoveryMutationAllowed(jobDir, JobRecoveryMutationIntent.FRAME_SELECTION)
     }
     // External mutation: acquire own operation lease, reject unresolved transactions
     val lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(

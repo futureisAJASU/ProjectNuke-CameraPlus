@@ -64,6 +64,7 @@ internal enum class JobRecoveryMutationGateOutcome {
     BLOCKED_AMBIGUOUS_RECOVERY,
     BLOCKED_PUBLIC_COMMIT_MISSING,
     BLOCKED_EXPORT_VERIFICATION,
+    BLOCKED_EXPORT_SETTLEMENT,
     BLOCKED_INVALID_PROCESSING_JOURNAL,
     BLOCKED_INVALID_EXPORT_JOURNAL,
     BLOCKED_SETTLED_JOURNAL,
@@ -82,6 +83,7 @@ internal class JobRecoveryMutationBlockedException(
         JobRecoveryMutationGateOutcome.BLOCKED_AMBIGUOUS_RECOVERY -> "복구되지 않은 작업 증거가 있어 지금은 작업을 변경할 수 없습니다."
         JobRecoveryMutationGateOutcome.BLOCKED_PUBLIC_COMMIT_MISSING -> "공개 결과의 커밋 증거가 없어 지금은 작업을 변경할 수 없습니다."
         JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION -> "공개 결과를 확인하지 못해 지금은 작업을 변경할 수 없습니다."
+        JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_SETTLEMENT -> "공개 내보내기의 작업 정리 확인이 끝나지 않아 지금은 작업을 변경할 수 없습니다."
         JobRecoveryMutationGateOutcome.BLOCKED_INVALID_PROCESSING_JOURNAL -> "처리 복구 기록을 읽을 수 없어 지금은 작업을 변경할 수 없습니다."
         JobRecoveryMutationGateOutcome.BLOCKED_REPROCESS_QUARANTINE -> "복구 중인 작업은 지금 변경할 수 없습니다."
         JobRecoveryMutationGateOutcome.INSPECTION_FAILED -> "작업 복구 상태를 확인하지 못해 지금은 작업을 변경할 수 없습니다."
@@ -203,6 +205,21 @@ object KeplerJobMetadata {
             }
             val exportBlocks = MediaStoreExportJournal.list(jobDir).any { it.isGateBlocking() }
             if (exportBlocks) return@withJobLock exportDebtGateOutcome(job)
+            // Terminal settlement debt: a VERIFIED journal whose terminal ACK was never persisted
+            // blocks mutations ONLY when that journal is owned by the durably recorded terminal
+            // operation (a finalized but unacknowledged terminal).  Converged-verified debt without
+            // operation correlation (e.g. an UNKNOWN record the shared engine settled) is not
+            // settlement debt.
+            val terminalOperationId = job.optString(TERMINAL_OPERATION_ID)
+            if (terminalOperationId.isNotBlank() &&
+                MediaStoreExportJournal.list(jobDir).any {
+                    it.state == MediaStoreExportState.VERIFIED &&
+                        !it.isTerminallyStable() &&
+                        it.ownerOperationId == terminalOperationId
+                }
+            ) {
+                return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_SETTLEMENT
+            }
             when (job.optString("recoveryState")) {
                 PROCESSING_CLEANUP_REQUIRED -> JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP
                 "AMBIGUOUS_RECOVERY_REQUIRED" -> JobRecoveryMutationGateOutcome.BLOCKED_AMBIGUOUS_RECOVERY
@@ -230,7 +247,9 @@ object KeplerJobMetadata {
     /**
      * Maps export-debt blocking evidence to the actual durable reason instead of defaulting to
      * DEAD_OPERATION. A committed-unverified or UNKNOWN record is verification debt (the gate maps
-     * the durable policy); genuine journal debt without a recorded policy stays DEAD_OPERATION.
+     * the durable policy); a terminal-recorded job whose journal ACK is still pending is
+     * settlement debt; genuine dead-owner journal debt without a recorded policy stays
+     * DEAD_OPERATION.
      */
     private fun exportDebtGateOutcome(job: JSONObject): JobRecoveryMutationGateOutcome = when {
         job.optString("recoveryState") == "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION" ->
@@ -245,6 +264,9 @@ object KeplerJobMetadata {
             JobRecoveryMutationGateOutcome.BLOCKED_PUBLIC_COMMIT_MISSING
         job.optString("recoveryState") == PROCESSING_CLEANUP_REQUIRED ->
             JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP
+        job.optString("recoveryState").ifBlank { "STABLE" } == "STABLE" &&
+            job.optString(TERMINAL_OPERATION_ID).isNotBlank() ->
+            JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_SETTLEMENT
         else -> JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION
     }
 
@@ -885,7 +907,10 @@ internal fun inspectProcessingHandoff(
         matched
     }.getOrDefault(false)
 
-    /** Atomically settles a dead terminal export owner and removes obsolete recovery gating. */
+    /** Atomically settles a dead terminal export owner and removes obsolete recovery gating.
+     *  The verification policy is preserved: a committed-unverified terminal owner stays
+     *  PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION (the gate keeps reporting verification debt);
+     *  only a verified terminal owner becomes STABLE. */
     internal fun finalizeRecoveredTerminalOperation(
         jobDir: File,
         operationId: String,
@@ -900,11 +925,27 @@ internal fun inspectProcessingHandoff(
                 job.optString("currentPipelineStage") !in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")
             ) return@update
             matched = true
-            job.put("recoveryState", "STABLE")
-                .put("lastRecoveryClassification", "RECOVERED")
-                .put("lastRecoveryMessage", "앱이 다시 시작된 후 완료된 내보내기 결과를 확인했습니다.")
-                .put("recoveredAt", System.currentTimeMillis())
-            job.remove("recoveryMessage")
+            val commitState = job.optString("exportCommitState")
+            val verified = job.optBoolean("exportVerified", false) ||
+                commitState == GalleryExportCommitState.VERIFIED.name
+            val committedUnverified = !verified &&
+                (job.optBoolean("galleryExportCommitted", false) ||
+                    commitState == GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED.name)
+            if (committedUnverified) {
+                job.put("recoveryState", "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION")
+                    .put("lastRecoveryClassification",
+                        KeplerJobRecoveryClassification.PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION.name)
+                    .put("lastRecoveryMessage",
+                        "앱이 다시 시작된 후 완료된 내보내기는 확인되지 않아 추가 확인이 필요합니다.")
+                    .put("recoveryMessage",
+                        "공개 내보내기 결과의 확인이 완료되지 않아 추가 확인이 필요합니다.")
+            } else {
+                job.put("recoveryState", "STABLE")
+                    .put("lastRecoveryClassification", "RECOVERED")
+                    .put("lastRecoveryMessage", "앱이 다시 시작된 후 완료된 내보내기 결과를 확인했습니다.")
+                job.remove("recoveryMessage")
+            }
+            job.put("recoveredAt", System.currentTimeMillis())
             job.remove(ACTIVE_RUNTIME_SESSION_ID)
             job.remove(ACTIVE_OPERATION_ID)
             job.remove(ACTIVE_OPERATION_KIND)
@@ -1038,22 +1079,42 @@ internal fun inspectProcessingHandoff(
             return false
         }
 
+        if (ownerLease == null) {
+            // This acquisition already reconciled the retained lease's pending handoff marker and
+            // settled the handoff under it; only a caller-owned lease still holds a handoff to
+            // finalize here.  A self-acquired settlement that finds the handoff consumed by its
+            // own acquisition is settled: release and report success.
+            val stillPresent = try {
+                read(jobDir).optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                false
+            }
+            if (!stillPresent) {
+                lease.release()
+                return true
+            }
+        }
+
         val settled = try {
             finalizeRecoveredProcessingHandoff(jobDir, lease)
         } catch (failure: Error) {
-            if (ownerLease == null) {
-                lease.release()
-            } else {
-                ownerLease.markProcessingHandoffSettlementPending()
-            }
+            // Failed or fatal settlement: the lease stays registered with its pending handoff
+            // marker so the durable handoff debt is never ownerless while the process is alive.
+            lease.markProcessingHandoffSettlementPending()
             throw failure
         } catch (_: Exception) {
             false
         }
-        if (settled || ownerLease == null) {
+        if (settled) {
             lease.release()
         } else {
-            ownerLease.markProcessingHandoffSettlementPending()
+            // Failed settlement: the exact lease (self-acquired or caller-owned) is retained with
+            // its pending handoff marker.  The next real mutation acquisition reconciles the
+            // pending marker under THIS lease (retrying the same protocol) and releases it only
+            // when the settlement is durably SETTLED.
+            lease.markProcessingHandoffSettlementPending()
         }
         return settled
     }
