@@ -44,7 +44,7 @@
 **C. UNIT-CONTRACT** (single-function contract mapping — covered by A/B)
 - The 8 tests cover `releaseIfProcessingSettled`, `installWorkerSetupSettlementDebt`, `persistYuvCaptureSetupFailure`, `persistStandaloneSetupFailure`, and the retention/retry/release contract.
 
-## 4. Validation Results (Exact Commands Executed — Final Tree at `7b1d785`)
+## 4. Validation Results (Exact Commands Executed — Final Tree at `b90c929`)
 
 | Command | Result |
 |---|---|
@@ -55,13 +55,14 @@
 | `testDebugUnitTest` — `NightFusionPipelineDispatchTest` (5 tests) | SUCCESS — 5/5 green, 0 failures |
 | `git diff --check` | PASS (LF/CRLF warnings only; no conflict markers, no whitespace errors) |
 | `git commit -m "feat(debt): retained-lease retry-reason / handoff-settlement closure ..."` | SUCCESS — created `7b1d785` |
-| `git status --short` | CLEAN (worktree clean at final HEAD) |
+| `git commit -m "docs: regenerate FINAL_REPORT.md at committed HEAD 7b1d785"` | SUCCESS — created `b90c929` |
+| `git status --short` (after `b90c929`) | CLEAN (worktree clean at final HEAD `b90c929`) |
 
 NOT EXECUTED / NOT COMPLETED:
 - `lintDebug`: started but exceeded 180s timeout; did NOT complete; NOT claimed as passed.
 - `assembleDebug`: NOT executed in this session; NOT claimed.
 
-Modified files (committed at `7b1d785`): `KeplerJobMetadata.kt`, `NightFusionPipeline.kt`, `NightFusionProcessor.kt`, `DebtConvergenceCounterexampleTest.kt`, `NightFusionPipelineDispatchTest.kt` (5 files changed, 577 insertions, 36 deletions).
+Modified files (production/test batch at `7b1d785`): `KeplerJobMetadata.kt`, `NightFusionPipeline.kt`, `NightFusionProcessor.kt`, `DebtConvergenceCounterexampleTest.kt`, `NightFusionPipelineDispatchTest.kt` (5 files, 577 insertions, 36 deletions). Final regenerated report committed at `b90c929`.
 
 ## 5. Model Audit Sections (Same-Family Pass — Handled)
 - `releaseIfProcessingSettled` now honors the pending handoff debt; the exact lease is never released prematurely (verified by bound21, production code inspection).
@@ -70,6 +71,6 @@ Modified files (committed at `7b1d785`): `KeplerJobMetadata.kt`, `NightFusionPip
 
 ## 6. Final Verdict
 
-FINAL CLOSURE PASS: 8 NEW REAL PRODUCTION-LIFETIME / INTEGRATION-PROTOCOL REGRESSION TESTS (52 TOTAL IN DEBT CONVERGENCE SUITE), ALL GREEN; PRODUCTION EDITS VERIFIED BY REAL PRODUCTION ENTRY POINTS (`persistYuvCaptureSetupFailure`, `saveFrameSelection`, mutation gate, durable metadata); ACTUAL COMMIT `7b1d785` AT CLEAN WORKTREE; `git diff --check` PASS; `lintDebug` NOT COMPLETED (NOT CLAIMED); `assembleDebug` NOT EXECUTED.
+FINAL CLOSURE PASS: 8 NEW REAL PRODUCTION-LIFETIME / INTEGRATION-PROTOCOL REGRESSION TESTS (52 TOTAL IN DEBT CONVERGENCE SUITE), ALL GREEN; PRODUCTION EDITS VERIFIED BY REAL PRODUCTION ENTRY POINTS (`persistYuvCaptureSetupFailure`, `saveFrameSelection`, mutation gate, durable metadata); ACTUAL PRODUCTION COMMIT `7b1d785`, FINAL REPORT COMMITTED AT `b90c929`, CLEAN WORKTREE AT `b90c929`; `git diff --check` PASS; `lintDebug` NOT COMPLETED (NOT CLAIMED); `assembleDebug` NOT EXECUTED.
 
 END-TO-END PRODUCTION INTEGRATION AUDIT: CLOSED
