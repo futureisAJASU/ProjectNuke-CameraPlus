@@ -202,7 +202,7 @@ object KeplerJobMetadata {
                 return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_SETTLED_JOURNAL
             }
             val exportBlocks = MediaStoreExportJournal.list(jobDir).any { it.isGateBlocking() }
-            if (exportBlocks) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION
+            if (exportBlocks) return@withJobLock exportDebtGateOutcome(job)
             when (job.optString("recoveryState")) {
                 PROCESSING_CLEANUP_REQUIRED -> JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP
                 "AMBIGUOUS_RECOVERY_REQUIRED" -> JobRecoveryMutationGateOutcome.BLOCKED_AMBIGUOUS_RECOVERY
@@ -225,6 +225,27 @@ object KeplerJobMetadata {
             throw ProcessingCleanupRequiredException()
         }
         if (outcome != JobRecoveryMutationGateOutcome.ALLOWED) throw JobRecoveryMutationBlockedException(outcome)
+    }
+
+    /**
+     * Maps export-debt blocking evidence to the actual durable reason instead of defaulting to
+     * DEAD_OPERATION. A committed-unverified or UNKNOWN record is verification debt (the gate maps
+     * the durable policy); genuine journal debt without a recorded policy stays DEAD_OPERATION.
+     */
+    private fun exportDebtGateOutcome(job: JSONObject): JobRecoveryMutationGateOutcome = when {
+        job.optString("recoveryState") == "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION" ->
+            JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION
+        job.optString("exportCommitState") == GalleryExportCommitState.UNKNOWN.name ->
+            JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION
+        job.optString("exportCommitState") == GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED.name ->
+            JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION
+        job.optString("recoveryState") == "AMBIGUOUS_RECOVERY_REQUIRED" ->
+            JobRecoveryMutationGateOutcome.BLOCKED_AMBIGUOUS_RECOVERY
+        job.optString("recoveryState") == "PUBLIC_COMMIT_MISSING" ->
+            JobRecoveryMutationGateOutcome.BLOCKED_PUBLIC_COMMIT_MISSING
+        job.optString("recoveryState") == PROCESSING_CLEANUP_REQUIRED ->
+            JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP
+        else -> JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION
     }
 
     fun acquireOperation(jobDir: File): JobOperationLease? {
@@ -268,6 +289,21 @@ object KeplerJobMetadata {
         lease
     }
 
+    /**
+     * Reserves the single process-local recovery-authority slot for [jobDir] when no other lease
+     * is currently held.  Used by the same-process debt coordinator (CASE B) so the
+     * provider/journal/metadata convergence can never race a concurrent mutation acquisition.
+     * Returns null while any lease is held: that live/retained owner performs its own settlement,
+     * and the coordinator refuses to run as a second authority.  Released via [releaseOperation].
+     */
+    internal fun acquireTemporaryRecoveryAuthority(jobDir: File): JobOperationLease? =
+        withJobLock(jobDir) {
+            val key = jobDir.toPath().toAbsolutePath().normalize().toString()
+            if (operationLeases.containsKey(key)) return@withJobLock null
+            val lease = JobOperationLease(key)
+            if (operationLeases.putIfAbsent(key, lease) == null) lease else null
+        }
+
     /** Correlation + removal shared by [consumeProcessingHandoff] and handoff-consuming
  *  acquisitions, so every consumption path enforces the exact same authority:
  *  current runtime session, exact job metadata, and exact handoff kind. */
@@ -300,6 +336,31 @@ internal fun consumeProcessingHandoff(
     throw failure
 } catch (_: Exception) {
     false
+}
+
+/** Whether a processing handoff is absent, exactly correlated to [kind], or present-but-unrelated. */
+internal enum class ProcessingHandoffPresence { ABSENT, CORRELATED, UNRELATED }
+
+/**
+ * Inspects the processing handoff on [jobDir] for [kind] WITHOUT consuming it, so callers can
+ * distinguish "absent" (idempotent success) from "present but not consumable" (must not proceed
+ * to a success terminal).  Fail-closed: an unreadable job reports [ProcessingHandoffPresence.UNRELATED].
+ */
+internal fun inspectProcessingHandoff(
+    jobDir: File,
+    kind: KeplerActiveOperationKind
+): ProcessingHandoffPresence = try {
+    val job = read(jobDir)
+    when {
+        job.optString(PROCESSING_HANDOFF_OPERATION_ID).isBlank() -> ProcessingHandoffPresence.ABSENT
+        job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id &&
+            job.optString(PROCESSING_HANDOFF_KIND) == kind.name -> ProcessingHandoffPresence.CORRELATED
+        else -> ProcessingHandoffPresence.UNRELATED
+    }
+} catch (failure: Error) {
+    throw failure
+} catch (_: Exception) {
+    ProcessingHandoffPresence.UNRELATED
 }
 
 /**

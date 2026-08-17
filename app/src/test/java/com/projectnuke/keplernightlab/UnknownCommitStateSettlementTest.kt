@@ -133,9 +133,10 @@ class UnknownCommitStateSettlementTest {
             assertEquals(LINKAGE, job.getString("galleryPublicExportLinkage"))
             assertEquals(MediaStoreExportState.PUBLIC_COMMITTED, MediaStoreExportJournal.list(dir).single().state)
             // Committed-but-unverified evidence keeps the mutation gate blocked exactly as
-            // restart recovery leaves it, until the committed result is verified.
+            // restart recovery leaves it, until the committed result is verified. The gate
+            // reports the REAL reason: verification debt, not a dead operation.
             assertEquals(
-                JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION,
+                JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION,
                 KeplerJobMetadata.inspectRecoveryMutationGate(dir, JobRecoveryMutationIntent.REPROCESS)
             )
         } finally {
@@ -207,10 +208,11 @@ class UnknownCommitStateSettlementTest {
             assertEquals("AMBIGUOUS_RECOVERY_REQUIRED", job.getString("recoveryState"))
             assertFalse(job.has("galleryPublicExportLinkage"))
             // The failed delete is retained as blocking evidence, exactly as restart recovery
-            // retains DELETE_FAILED for a pending row whose cleanup could not complete.
+            // retains DELETE_FAILED for a pending row whose cleanup could not complete. The gate
+            // reports the real durable record reason (ambiguous recovery), not a dead operation.
             assertEquals(MediaStoreExportState.CONTENT_WRITTEN, MediaStoreExportJournal.list(dir).single().state)
             assertEquals(
-                JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION,
+                JobRecoveryMutationGateOutcome.BLOCKED_AMBIGUOUS_RECOVERY,
                 KeplerJobMetadata.inspectRecoveryMutationGate(dir, JobRecoveryMutationIntent.REPROCESS)
             )
         } finally {

@@ -824,15 +824,22 @@ return evidence
                     // Idempotent backstop: the worker already consumed the source handoff at
                     // start; a transient write failure may have left it, and a success
                     // terminal must never follow an unconsumed source handoff.
-                    // consumeProcessingHandoff returns true if present-and-consumed,
-                    // false if already absent. Both are success; only an exception is failure.
+                    // An ABSENT handoff is success (already consumed); a CORRELATED handoff is
+                    // consumed atomically (true on success); a present-but-UNRELATED handoff or
+                    // a persistence failure is NOT success and fails the terminal.
                     return try {
-                        // A false result means the handoff was already absent (success).
-                        // A true result means it was present and was consumed (success).
-                        KeplerJobMetadata.consumeProcessingHandoff(
+                        when (KeplerJobMetadata.inspectProcessingHandoff(
                             sourceJobDir,
                             KeplerActiveOperationKind.PROCESSING_YUV
-                        ) || true  // Always true on non-exception: either consumed or already absent
+                        )) {
+                            KeplerJobMetadata.ProcessingHandoffPresence.ABSENT -> true
+                            KeplerJobMetadata.ProcessingHandoffPresence.CORRELATED ->
+                                KeplerJobMetadata.consumeProcessingHandoff(
+                                    sourceJobDir,
+                                    KeplerActiveOperationKind.PROCESSING_YUV
+                                )
+                            KeplerJobMetadata.ProcessingHandoffPresence.UNRELATED -> false
+                        }
                     } catch (settledError: Error) {
                         throw settledError
                     } catch (settledFailure: Exception) {

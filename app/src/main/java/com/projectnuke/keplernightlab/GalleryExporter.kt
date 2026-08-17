@@ -294,7 +294,8 @@ internal fun exportOutcomeTerminalKind(
 /** Reads only evidence owned by the exact current PUBLIC_EXPORT operation. */
 internal fun inspectOwnedPublicExportEvidence(
     jobDir: File,
-    ownerLease: JobOperationLease
+    ownerLease: JobOperationLease,
+    allowDeadOwner: Boolean = false
 ): OwnedPublicExportEvidence? {
     check(KeplerJobMetadata.isOperationOwner(jobDir, ownerLease)) {
         "Public export evidence requires the exact owning lease"
@@ -304,8 +305,14 @@ internal fun inspectOwnedPublicExportEvidence(
     if (operationId.isBlank() || metadata.optString(ACTIVE_OPERATION_KIND) != KeplerActiveOperationKind.PUBLIC_EXPORT.name) {
         return null
     }
-    check(metadata.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id) {
-        "Public export evidence requires a current-runtime owner"
+    if (!allowDeadOwner) {
+        check(metadata.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id) {
+            "Public export evidence requires a current-runtime owner"
+        }
+    } else {
+        check(metadata.optString(ACTIVE_RUNTIME_SESSION_ID) != KeplerRuntimeSession.id) {
+            "Public export evidence for a retained dead owner must not borrow a live owner"
+        }
     }
     val main = MediaStoreExportJournal.list(jobDir)
         .asSequence()
@@ -333,7 +340,8 @@ internal fun settleOwnedPublicExportInterruption(
     failureMessage: String,
     finalOutputFormat: FinalOutputFormat? = null,
     disposition: PublicExportInterruptionDisposition = PublicExportInterruptionDisposition.FAILED,
-    access: MediaStoreExportRecoveryAccess? = null
+    access: MediaStoreExportRecoveryAccess? = null,
+    allowDeadOwner: Boolean = false
 ): Boolean {
     check(KeplerJobMetadata.isOperationOwner(jobDir, ownerLease)) {
         "Public export settlement requires the exact owning lease"
@@ -358,8 +366,14 @@ internal fun settleOwnedPublicExportInterruption(
         if (operationId.isBlank()) rememberedOperationId?.let(ownerLease::clearDurableOperation)
         return true
     }
-    check(metadata.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id) {
-        "Public export settlement requires a current-runtime owner"
+    if (allowDeadOwner) {
+        check(metadata.optString(ACTIVE_RUNTIME_SESSION_ID) != KeplerRuntimeSession.id) {
+            "Public export settlement for a retained dead owner must not borrow a live owner"
+        }
+    } else {
+        check(metadata.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id) {
+            "Public export settlement requires a current-runtime owner"
+        }
     }
     ownerLease.registerPublicExportSettlement(
         operationId = operationId,
@@ -426,7 +440,7 @@ internal fun settleOwnedPublicExportInterruption(
 
     // Re-read the durable record after provider reconciliation so the evidence reflects the
     // authoritative external state (a lagging journal caught up to PUBLIC_COMMITTED/VERIFIED).
-    val evidence = inspectOwnedPublicExportEvidence(jobDir, ownerLease)
+    val evidence = inspectOwnedPublicExportEvidence(jobDir, ownerLease, allowDeadOwner)
         ?: return true
 
     // Durable terminal metadata must be written before journal acknowledgement.
@@ -434,7 +448,7 @@ internal fun settleOwnedPublicExportInterruption(
     // be retained if either persistence boundary fails.
     KeplerJobMetadata.update(jobDir) { job ->
         check(job.optString(ACTIVE_OPERATION_ID) == evidence.operationId &&
-            job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id &&
+            (allowDeadOwner || job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id) &&
             job.optString(ACTIVE_OPERATION_KIND) == KeplerActiveOperationKind.PUBLIC_EXPORT.name
         ) { "Public export owner changed during settlement" }
         finalOutputFormat?.let { job.put("finalOutputFormatSetting", it.name) }
@@ -497,7 +511,7 @@ if (evidence.committed) {
     if (pendingOwnerJournals.isNotEmpty()) return false
     KeplerJobMetadata.update(jobDir) { job ->
         check(job.optString(ACTIVE_OPERATION_ID) == evidence.operationId &&
-            job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id &&
+            (allowDeadOwner || job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id) &&
             job.optString(TERMINAL_OPERATION_ID) == evidence.operationId
         ) { "Public export owner changed before release" }
         job.remove(ACTIVE_RUNTIME_SESSION_ID)
@@ -1193,6 +1207,42 @@ internal fun terminalAckEligible(
     metadata: org.json.JSONObject,
     journal: MediaStoreExportJournal
 ): Boolean {
+    // Role-first: RAW_DNG_SIDECAR journals acknowledge only from THEIR OWN durable per-frame
+    // evidence, never by inheriting the MAIN image state.  A verified MAIN image must not force
+    // a sidecar journal to VERIFIED, and PUBLIC_COMMIT_UNKNOWN/PUBLIC_EXPORT_FAILED evidence
+    // never acknowledges. A committed-unverified sidecar acknowledges only when the exact durable
+    // sidecar URI matches the journal URI; a sidecar without an own frame record stays deferred
+    // for the authoritative settlement/recovery that records that evidence.
+    if (journal.role == MediaStoreExportRole.RAW_DNG_SIDECAR) {
+        val frame = if (journal.frameIndex != null) {
+            frameRecordByIndex(metadata, journal.frameIndex)
+        } else {
+            null
+        }
+        val sidecarStatus = frame?.optString("dngSidecarPublicStatus")
+            ?.takeIf { it.isNotBlank() }
+        if (sidecarStatus != null) {
+            val sidecarUri = frame.optString("publicDngUri").takeIf { it.isNotBlank() }
+            val journalUri = journal.uri?.takeIf { it.isNotBlank() }
+            return when (sidecarStatus) {
+                "PUBLIC_EXPORTED" ->
+                    journal.state == MediaStoreExportState.VERIFIED &&
+                        (sidecarUri == null || sidecarUri == journalUri)
+                "PUBLIC_COMMITTED_UNVERIFIED" ->
+                    journal.state in setOf(
+                        MediaStoreExportState.PUBLIC_COMMITTED,
+                        MediaStoreExportState.VERIFIED
+                    ) && (sidecarUri == null || sidecarUri == journalUri)
+                else -> false
+            }
+        }
+        // No own frame record: the journal's own durable state is the sidecar's evidence. Never
+        // force a sidecar to VERIFIED from MAIN policy; a committed sidecar remains commit-debt.
+        return journal.state in setOf(
+            MediaStoreExportState.VERIFIED,
+            MediaStoreExportState.PUBLIC_COMMITTED
+        )
+    }
     val explicitCommitState = metadata.optString("exportCommitState")
     val stateEligible: Boolean = when {
         explicitCommitState == GalleryExportCommitState.UNKNOWN.name -> false
@@ -1211,28 +1261,6 @@ internal fun terminalAckEligible(
         )
     }
     if (!stateEligible) return false
-    // RAW_DNG_SIDECAR journals acknowledge from THEIR OWN durable per-frame evidence, never by
-    // inheriting the MAIN image state.  A verified MAIN image must not force a sidecar journal to
-    // VERIFIED, and PUBLIC_COMMIT_UNKNOWN/PUBLIC_EXPORT_FAILED evidence never acknowledges.
-    if (journal.role == MediaStoreExportRole.RAW_DNG_SIDECAR && journal.frameIndex != null) {
-        val frame = frameRecordByIndex(metadata, journal.frameIndex)
-        val sidecarStatus = frame?.optString("dngSidecarPublicStatus")
-        if (sidecarStatus != null) {
-            val sidecarUri = frame.optString("publicDngUri").takeIf { it.isNotBlank() }
-            val journalUri = journal.uri?.takeIf { it.isNotBlank() }
-            return when (sidecarStatus) {
-                "PUBLIC_EXPORTED" ->
-                    journal.state == MediaStoreExportState.VERIFIED &&
-                        (sidecarUri == null || sidecarUri == journalUri)
-                "PUBLIC_COMMITTED_UNVERIFIED" ->
-                    journal.state in setOf(
-                        MediaStoreExportState.PUBLIC_COMMITTED,
-                        MediaStoreExportState.VERIFIED
-                    ) && (sidecarUri == null || sidecarUri == journalUri)
-                else -> false
-            }
-        }
-    }
     if (journal.role == MediaStoreExportRole.MAIN_IMAGE &&
         journal.state in setOf(MediaStoreExportState.PUBLIC_COMMITTED, MediaStoreExportState.VERIFIED)
     ) {
@@ -1555,7 +1583,10 @@ internal fun updateRawPublicExportOutcome(
 }
 
 /**
- * Same-process convergence for an UNKNOWN public commit state at the next mutation entry.
+ * Shared engine for converging a durable `exportCommitState == UNKNOWN` record at the next
+ * mutation entry.  This is the ONE policy implementation for MAIN commit-state convergence;
+ * [settleUnknownPublicCommitState] is a thin wrapper and [settleMediaStoreExportDebt] delegates
+ * to the same engine, so no duplicated policy engine exists anywhere else in production.
  * A terminal job whose metadata still records `exportCommitState=UNKNOWN` with preserved URI
  * evidence is re-reconciled exactly as restart recovery would reconcile the same evidence:
  *
@@ -1578,7 +1609,7 @@ internal fun updateRawPublicExportOutcome(
  * Fatal errors are rethrown without any metadata write; non-fatal failures leave the state
  * untouched. Returns true when the durable evidence converged.
  */
-internal fun settleUnknownPublicCommitState(
+internal fun convergeUnknownCommitStateRecord(
     context: Context,
     jobDir: File,
     access: MediaStoreExportRecoveryAccess = ContextMediaStoreExportRecoveryAccess(context)
@@ -1702,14 +1733,33 @@ internal fun settleUnknownPublicCommitState(
     false
 }
 
+/** Thin wrapper over the shared [convergeUnknownCommitStateRecord] engine; no policy duplication. */
+internal fun settleUnknownPublicCommitState(
+    context: Context,
+    jobDir: File,
+    access: MediaStoreExportRecoveryAccess = ContextMediaStoreExportRecoveryAccess(context)
+): Boolean = convergeUnknownCommitStateRecord(context, jobDir, access)
+
 /**
  * Bounded same-process MediaStore debt convergence driven by ACTUAL unresolved current journals,
  * not by `job.exportCommitState == UNKNOWN`.  Every relevant journal is inspected by role:
  *
  * - MAIN_IMAGE journals are reconciled against the provider and the current linkage/metadata is
- *   converged exactly like restart recovery.
+ *   converged exactly like restart recovery (UNKNOWN records through the shared
+ *   [convergeUnknownCommitStateRecord] engine; committed-unverified records only ever move FORWARD
+ *   to VERIFIED with exact current journal+URI correlation).
  * - RAW_DNG_SIDECAR journals converge from THEIR OWN evidence (verified / committed-unverified /
  *   commit-unknown / proven precommit) independent of the MAIN image state.
+ *
+ * Settlement authorities (never two concurrent):
+ * - CASE A: an exact retained process-local PUBLIC_EXPORT lease is the single authority: the
+ *   provider/journal/metadata convergence runs under that retained owner and releases it on
+ *   success; UNKNOWN evidence keeps E retained (`false`) so nothing is lost.
+ * - CASE B: otherwise a single temporary recovery authority is reserved under the job lock, the
+ *   convergence runs under it, the temporary authority is released, and the caller re-runs the
+ *   mutation gate before acquiring its own lease.  No second durable journal is ever created.
+ * - A dead ACTIVE PUBLIC_EXPORT owner with converged/terminal metadata is finalized in the same
+ *   process (no restart) by the shared dead-owner finalizer.
  *
  * Returns `true` when the pass left no journal in a mutation-gate-blocking state.  An UNKNOWN
  * (inconclusive provider) journal, `DELETE_FAILED`, or a committed-unverified PUBLIC_COMMITTED
@@ -1739,83 +1789,201 @@ internal fun settleMediaStoreExportDebt(
             // A live current-process operation owns this job; it settles/acks its own journals.
             return false
         }
-        // When a retained PUBLIC_EXPORT lease exists without a live runtime marker,
-        // the settlement must reconcile through that exact owner (CASE A retained lease).
-        if (retainedLease != null && metadata.optString(ACTIVE_RUNTIME_SESSION_ID).isBlank()) {
-            val pendingPublicExport = retainedLease.pendingPublicExportSettlement()
-            if (pendingPublicExport != null) {
-                val settled = try {
-                    settleOwnedPublicExportInterruption(
-                        jobDir = jobDir,
-                        ownerLease = retainedLease,
-                        failureMessage = pendingPublicExport.failureMessage,
-                        finalOutputFormat = pendingPublicExport.finalOutputFormat,
-                        disposition = pendingPublicExport.disposition,
-                        access = access
-                    )
-                } catch (failure: Error) {
-                    throw failure
-                } catch (_: Exception) {
-                    false
+        if (retainedLease != null) {
+            // CASE A: the exact retained lease is the single recovery settlement authority.
+            return KeplerJobMetadata.withJobLock(jobDir) {
+                settleRetainedPublicExportLease(jobDir, retainedLease, access)
+            }
+        }
+        val journals = MediaStoreExportJournal.list(jobDir)
+        val unknownRecord = metadata.optString("exportCommitState") == GalleryExportCommitState.UNKNOWN.name &&
+            !metadata.optBoolean("galleryExportCommitted", false)
+        val committedUnverifiedUpgradeCandidate = metadata.optString("exportCommitState") ==
+            GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED.name &&
+            metadata.optBoolean("galleryExportCommitted", false) &&
+            metadata.optString("exportUri").isNotBlank()
+        if (journals.none { it.isGateBlocking() } && !unknownRecord && !committedUnverifiedUpgradeCandidate) {
+            // No journal debt and no record to converge.  A dead ACTIVE PUBLIC_EXPORT owner with
+            // already-terminal durable metadata is still finalized same-process (no restart).
+            finalizeConvergedDeadExportOwner(jobDir)
+            return MediaStoreExportJournal.list(jobDir).none { it.isGateBlocking() }
+        }
+        // CASE B: exactly one temporary recovery authority is reserved under the job lock so the
+        // provider/journal/metadata convergence can never race a concurrent mutation acquisition.
+        KeplerJobMetadata.withJobLock(jobDir) {
+            val authority = KeplerJobMetadata.acquireTemporaryRecoveryAuthority(jobDir)
+                ?: return@withJobLock false
+            try {
+                if (unknownRecord) {
+                    // Shared engine, single policy: converges the UNKNOWN record and its journals.
+                    convergeUnknownCommitStateRecord(context, jobDir, access)
                 }
-                if (!settled) return false
-                retainedLease.completePublicExportSettlement(pendingPublicExport.operationId)
-                retainedLease.release()
-                return true
+                val results = recoverMediaStoreExportJournals(jobDir, access)
+                val classificationByAttempt = results.associateBy { it.attemptId }
+                val hasConclusiveEvidence = classificationByAttempt.values.any {
+                    it.classification in setOf(
+                        MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED,
+                        MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED,
+                        MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED,
+                        MediaStoreExportRecoveryClassification.PENDING_DELETED,
+                        MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING,
+                        MediaStoreExportRecoveryClassification.CLEANED,
+                        MediaStoreExportRecoveryClassification.DELETE_FAILED
+                    )
+                }
+                if (hasConclusiveEvidence) {
+                    // Proven pre-commit/no-row evidence moves pre-commit-band journals to CLEANED
+                    // so they no longer block the mutation gate.  DELETE_FAILED stays
+                    // CLEANUP_REQUIRED (guard excludes it).
+                    MediaStoreExportJournal.list(jobDir)
+                        .filter { journal ->
+                            journal.state in setOf(
+                                MediaStoreExportState.PREPARED,
+                                MediaStoreExportState.ROW_INSERTED,
+                                MediaStoreExportState.CONTENT_WRITTEN
+                            ) && classificationByAttempt[journal.exportAttemptId]?.classification in setOf(
+                                MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING,
+                                MediaStoreExportRecoveryClassification.PENDING_DELETED,
+                                MediaStoreExportRecoveryClassification.CLEANED
+                            )
+                        }
+                        .forEach { journal -> journal.transition(jobDir, MediaStoreExportState.CLEANED) }
+                }
+                // Role-aware convergence: sidecars from their own evidence; the MAIN record only
+                // moves forward (UNKNOWN handled by the shared engine above; committed-unverified
+                // upgraded to VERIFIED here, never downgraded).
+                convergeMainAndSidecarEvidence(jobDir, classificationByAttempt)
+                // Dead ACTIVE PUBLIC_EXPORT owners with terminal/converged evidence finalize in
+                // the same process without another restart.
+                finalizeConvergedDeadExportOwner(jobDir)
+                // The debt remains (still blocked after this deterministic provider pass) whenever
+                // any journal still sits in a mutation-gate-blocking state: AMBIGUOUS /
+                // INSERT_RESULT_UNKNOWN / DELETE_FAILED / committed-but-unverified rows.
+                !MediaStoreExportJournal.list(jobDir).any { it.isGateBlocking() }
+            } finally {
+                // The single temporary authority is released; the caller re-runs the gate before
+                // acquiring its own mutation lease.
+                KeplerJobMetadata.releaseOperation(authority)
             }
         }
-        if (MediaStoreExportJournal.list(jobDir).none { it.isGateBlocking() }) {
-            return true
-        }
-    val results = recoverMediaStoreExportJournals(jobDir, access)
-    val classificationByAttempt = results.associateBy { it.attemptId }
-
-    val hasConclusiveEvidence = classificationByAttempt.values.any {
-        it.classification in setOf(
-            MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED,
-            MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED,
-            MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED,
-            MediaStoreExportRecoveryClassification.PENDING_DELETED,
-            MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING,
-            MediaStoreExportRecoveryClassification.CLEANED,
-            MediaStoreExportRecoveryClassification.DELETE_FAILED
-        )
+    } catch (failure: Error) {
+        throw failure
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        false
     }
-    if (hasConclusiveEvidence) {
-        // Proven pre-commit/no-row evidence moves pre-commit-band journals to CLEANED so they no
-        // longer block the mutation gate.  DELETE_FAILED stays CLEANUP_REQUIRED (guard excludes it).
-        MediaStoreExportJournal.list(jobDir)
-            .filter { journal ->
-                journal.state in setOf(
-                    MediaStoreExportState.PREPARED,
-                    MediaStoreExportState.ROW_INSERTED,
-                    MediaStoreExportState.CONTENT_WRITTEN
-                ) && classificationByAttempt[journal.exportAttemptId]?.classification in setOf(
-                    MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING,
-                    MediaStoreExportRecoveryClassification.PENDING_DELETED,
-                    MediaStoreExportRecoveryClassification.CLEANED
-                )
-            }
-            .forEach { journal -> journal.transition(jobDir, MediaStoreExportState.CLEANED) }
-    }
-    convergeMainAndSidecarEvidence(jobDir, classificationByAttempt)
-    // The debt remains (still blocked after this deterministic provider pass) whenever any journal
-    // still sits in a mutation-gate-blocking state: AMBIGUOUS / INSERT_RESULT_UNKNOWN /
-    // DELETE_FAILED / committed-but-unverified rows.
-    !MediaStoreExportJournal.list(jobDir).any { it.isGateBlocking() }
-} catch (failure: Error) {
-    throw failure
-} catch (cancelled: CancellationException) {
-    throw cancelled
-} catch (_: Exception) {
-    false
-}
 }
 
 /**
- * Converges MAIN linkage metadata (only when its record is UNKNOWN) and every RAW_DNG_SIDECAR
- * frame from its OWN classification.  Sidecars are always reconstructed by role: a verified MAIN
- * image never forces sidecars, and unresolved sidecar journals stay commit-unknown debt.
+ * CASE A: the exact retained process-local PUBLIC_EXPORT lease is the single recovery settlement
+ * authority.  If no pending settlement is registered, the exact operation's interruption
+ * settlement is registered first, then the shared owner protocol runs with provider access.
+ * UNKNOWN/unresolved evidence keeps E retained (`false`); a converged owner is released and its
+ * durable marker cleared.  Never creates a second lease or a second durable journal.
+ */
+private fun settleRetainedPublicExportLease(
+    jobDir: File,
+    lease: JobOperationLease,
+    access: MediaStoreExportRecoveryAccess
+): Boolean {
+    val operationId = lease.currentDurableOperationId() ?: return false
+    if (lease.pendingPublicExportSettlement() == null) {
+        lease.registerPublicExportSettlement(
+            operationId = operationId,
+            failureMessage = "Retained PUBLIC_EXPORT lease settled by the same-process debt coordinator.",
+            finalOutputFormat = null,
+            disposition = PublicExportInterruptionDisposition.FAILED
+        )
+    }
+    val settled = try {
+        settleOwnedPublicExportInterruption(
+            jobDir = jobDir,
+            ownerLease = lease,
+            failureMessage = "Retained PUBLIC_EXPORT lease settled by the same-process debt coordinator.",
+            disposition = PublicExportInterruptionDisposition.FAILED,
+            access = access,
+            allowDeadOwner = true
+        )
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        false
+    }
+    if (!settled) {
+        // UNKNOWN or otherwise-unresolved evidence: E stays retained; the exact journals,
+        // metadata, and lease remain the same reachable debt for the next entry.
+        return false
+    }
+    lease.completePublicExportSettlement(operationId)
+    lease.clearDurableOperation(operationId)
+    lease.release()
+    return true
+}
+
+/**
+ * Same-process dead-ACTIVE convergence: an ACTIVE PUBLIC_EXPORT owner whose runtime is dead is
+ * finalized here without another restart, exactly like restart recovery would finalize it.
+ * Terminal metadata matches go through the terminal finalizer (which preserves the verification
+ * policy); otherwise the recovered evidence classifies the cut.  Owner-correlated journals that
+ * still require settlement keep the owner retained for the next entry.
+ */
+private fun finalizeConvergedDeadExportOwner(jobDir: File) {
+    val job = try {
+        KeplerJobMetadata.read(jobDir)
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        return
+    }
+    val activeId = job.optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() } ?: return
+    if (job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id) return
+    if (job.optString(ACTIVE_OPERATION_KIND) != KeplerActiveOperationKind.PUBLIC_EXPORT.name) return
+    val ownerJournals = MediaStoreExportJournal.list(jobDir)
+        .filter { it.ownerOperationId == activeId }
+    if (ownerJournals.any { it.isGateBlocking() || it.requiresExternalCommitResolution() }) return
+    if (job.optString(TERMINAL_OPERATION_ID) == activeId &&
+        job.optString("currentPipelineStage") in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")
+    ) {
+        // Mirror the restart-recovery terminal contract exactly: the owner-correlated journals
+        // are acknowledged (terminal-persisted) first; the terminal finalizer runs only when
+        // settlement is SETTLED.  A DEFERRED ACK (ineligible or unresolved journal) retains the
+        // owner so the next entry retries the same protocol.
+        if (markMediaStoreExportJournalsTerminalPersisted(jobDir) !=
+            MediaStoreExportTerminalSettlementStatus.SETTLED
+        ) {
+            return
+        }
+        check(KeplerJobMetadata.finalizeRecoveredTerminalOperation(jobDir, activeId)) {
+            "Could not durably finalize dead terminal operation $activeId"
+        }
+        return
+    }
+    val committed = job.optBoolean("galleryExportCommitted", false) &&
+        job.optString("exportUri").isNotBlank()
+    val verified = job.optBoolean("exportVerified", false)
+    val classification = when {
+        verified -> KeplerJobRecoveryClassification.PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL
+        committed -> KeplerJobRecoveryClassification.PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION
+        currentProcessingAttemptHasRequiredOutputClaim(jobDir) ->
+            KeplerJobRecoveryClassification.LOCAL_OUTPUT_COMMITTED_PENDING_TERMINAL
+        else -> KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT
+    }
+    check(KeplerJobMetadata.finalizeRecoveredInterruptedOperation(
+        jobDir,
+        activeId,
+        classification,
+        "같은 프로세스에서 이전 실행의 내보내기 증거를 안전하게 확인했습니다."
+    )) { "Could not durably finalize dead interrupted export operation $activeId" }
+}
+
+/**
+ * Converges every RAW_DNG_SIDECAR frame from its OWN classification and moves the MAIN record
+ * only forward: a committed-unverified record may be upgraded to VERIFIED when the exact current
+ * journal+URI+operation correlation proves it; VERIFIED is never downgraded by this pass.  The
+ * UNKNOWN record converges ONLY through the shared [convergeUnknownCommitStateRecord] engine.
+ * Sidecars are always reconstructed by role: a verified MAIN image never forces sidecars, and
+ * unresolved sidecar journals stay commit-unknown debt.
  */
 private fun convergeMainAndSidecarEvidence(
     jobDir: File,
@@ -1827,15 +1995,26 @@ private fun convergeMainAndSidecarEvidence(
             job,
             classifications = classificationByAttempt.mapValues { it.value.classification }
         )
-        // MAIN linkage convergence remains gated on the exact UNKNOWN record; a VERIFIED or
-        // committed record is already authoritative and must not be downgraded by this pass.
-        if (job.optString("exportCommitState") != GalleryExportCommitState.UNKNOWN.name) return@update
-        if (job.optBoolean("galleryExportCommitted", false)) return@update
-        val settledLinkage = job.optString("galleryPublicExportLinkage")
-            .takeIf { it.isNotBlank() } ?: return@update
+        // MAIN convergence: the UNKNOWN record is handled ONLY by the shared engine; a VERIFIED
+        // record is authoritative and never downgraded; a committed-unverified record may only
+        // move FORWARD to VERIFIED with the exact current journal+URI+operation correlation.
+        val commitState = job.optString("exportCommitState")
+        if (commitState == GalleryExportCommitState.UNKNOWN.name) return@update
+        if (commitState == GalleryExportCommitState.VERIFIED.name) return@update
+        if (!job.optBoolean("galleryExportCommitted", false)) return@update
+        val settledLinkage = job.optString("exportUri").takeIf { it.isNotBlank() }
+            ?: job.optString("galleryPublicExportLinkage").takeIf { it.isNotBlank() }
+            ?: return@update
+        val authorityOperationId = job.optString(TERMINAL_OPERATION_ID).takeIf { it.isNotBlank() }
+            ?: job.optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() }
         val journals = MediaStoreExportJournal.list(jobDir)
         val mainJournal = journals.asSequence()
-            .filter { it.role == MediaStoreExportRole.MAIN_IMAGE && it.uri == settledLinkage }
+            .filter {
+                it.role == MediaStoreExportRole.MAIN_IMAGE &&
+                    it.uri == settledLinkage &&
+                    (authorityOperationId == null ||
+                        it.ownerOperationId == authorityOperationId || it.ownerOperationId.isNullOrBlank())
+            }
             .firstOrNull() ?: return@update
         val mainClassification = classificationByAttempt[mainJournal.exportAttemptId]?.classification
             ?: return@update
@@ -1855,58 +2034,16 @@ private fun convergeMainAndSidecarEvidence(
                 job.remove("recoveryMessage")
                 job.remove("exportVerificationFailed")
             }
-            MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED -> {
-                job.put("exportCommitState", GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED.name)
-                    .put("exportStatus", "COMMITTED_UNVERIFIED")
-                    .put("galleryExportCommitted", true)
-                    .put("exportVerified", false)
-                    .put("exportVerificationFailed", true)
-                    .put("recoveryState", "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION")
-                    .put("recoveryMessage", "공개 내보내기 결과가 저장되었지만 확인이 필요합니다.")
-            }
-            MediaStoreExportRecoveryClassification.PENDING_DELETED,
-            MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING,
-            MediaStoreExportRecoveryClassification.CLEANED -> {
-                job.put("exportCommitState", GalleryExportCommitState.NOT_COMMITTED.name)
-                    .put("exportStatus", "FAILED")
-                    .put("galleryExportCommitted", false)
-                    .put("exportVerified", false)
-                    .put("recoveryState", "STABLE")
-                    .put("lastRecoveryClassification", mainClassification.name)
-                    .put("lastRecoveryMessage", "공개 내보내기 결과가 없음을 확인했습니다.")
-                    .put("recoveredAt", System.currentTimeMillis())
-                    .put(
-                        "exportError",
-                        "Public commit state was unknown; provider inspection proves no committed row."
-                    )
-                job.remove("recoveryMessage")
-                job.remove("exportVerificationFailed")
-                job.remove("galleryPublicExportLinkage")
-            }
-            MediaStoreExportRecoveryClassification.DELETE_FAILED -> {
-                job.put("exportCommitState", GalleryExportCommitState.NOT_COMMITTED.name)
-                    .put("exportStatus", "FAILED")
-                    .put("galleryExportCommitted", false)
-                    .put("exportVerified", false)
-                    .put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
-                    .put(
-                        "recoveryMessage",
-                        classificationByAttempt[mainJournal.exportAttemptId]?.message
-                            ?: "내보내기 정리 증거를 확인할 수 없어 추가 확인이 필요합니다."
-                    )
-                    .put(
-                        "exportError",
-                        "Public commit state was unknown; reconcile inspection did not prove a committed row."
-                    )
-                job.remove("galleryPublicExportLinkage")
-            }
+            // Never downgrade a committed record: classifications that cannot prove VERIFIED
+            // (committed-unverified, delete failure, proven pre-commit) leave the authoritative
+            // committed record untouched.
             else -> Unit
         }
     }
 }
 
 internal fun MediaStoreExportJournal.isGateBlocking(): Boolean =
-    state in setOf(
+    !isTerminallyStable() && state in setOf(
         MediaStoreExportState.PREPARED,
         MediaStoreExportState.ROW_INSERTED,
         MediaStoreExportState.CONTENT_WRITTEN,
