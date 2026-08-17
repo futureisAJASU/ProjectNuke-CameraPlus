@@ -83,8 +83,7 @@ internal fun MediaStoreExportJournal.requiresExternalCommitResolution(): Boolean
     !isTerminallyStable() &&
         state in setOf(
             MediaStoreExportState.ROW_INSERTED,
-            MediaStoreExportState.CONTENT_WRITTEN,
-            MediaStoreExportState.PUBLIC_COMMITTED
+            MediaStoreExportState.CONTENT_WRITTEN
         ) &&
         !uri.isNullOrBlank()
 
@@ -1293,7 +1292,12 @@ internal fun markMediaStoreExportJournalsTerminalPersisted(
             null
         }
         if (stage != null && stage != "PROCESSING") {
-            KeplerJobMetadata.clearActiveOperationKind(jobDir, KeplerActiveOperationKind.PUBLIC_EXPORT, ownerLease)
+            val cleared = KeplerJobMetadata.clearActiveOperationKind(jobDir, KeplerActiveOperationKind.PUBLIC_EXPORT, ownerLease)
+            // If ACTIVE clear fails but the operation is still current, the settlement must
+            // remain deferred so the retained lease protects the exact owner.
+            if (!cleared && KeplerJobMetadata.isCurrentActiveOperation(jobDir, ownerOperationId)) {
+                return MediaStoreExportTerminalSettlementStatus.DEFERRED
+            }
         }
         MediaStoreExportTerminalSettlementStatus.SETTLED
     } catch (failure: Error) {
@@ -1722,11 +1726,43 @@ internal fun settleMediaStoreExportDebt(
 ): Boolean {
     return try {
         val metadata = KeplerJobMetadata.read(jobDir)
+        // Resolve any exact retained PUBLIC_EXPORT lease so provider settlement uses
+        // the same durable owner authority as restart recovery.
+        val retainedLease = KeplerJobMetadata.findOperationLease(jobDir)?.let { lease ->
+            if (lease.currentDurableOperationKind() == KeplerActiveOperationKind.PUBLIC_EXPORT &&
+                lease.currentDurableOperationId()?.isNotBlank() == true
+            ) lease else null
+        }
         if (metadata.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id &&
             metadata.optString(ACTIVE_OPERATION_ID).isNotBlank()
         ) {
             // A live current-process operation owns this job; it settles/acks its own journals.
             return false
+        }
+        // When a retained PUBLIC_EXPORT lease exists without a live runtime marker,
+        // the settlement must reconcile through that exact owner (CASE A retained lease).
+        if (retainedLease != null && metadata.optString(ACTIVE_RUNTIME_SESSION_ID).isBlank()) {
+            val pendingPublicExport = retainedLease.pendingPublicExportSettlement()
+            if (pendingPublicExport != null) {
+                val settled = try {
+                    settleOwnedPublicExportInterruption(
+                        jobDir = jobDir,
+                        ownerLease = retainedLease,
+                        failureMessage = pendingPublicExport.failureMessage,
+                        finalOutputFormat = pendingPublicExport.finalOutputFormat,
+                        disposition = pendingPublicExport.disposition,
+                        access = access
+                    )
+                } catch (failure: Error) {
+                    throw failure
+                } catch (_: Exception) {
+                    false
+                }
+                if (!settled) return false
+                retainedLease.completePublicExportSettlement(pendingPublicExport.operationId)
+                retainedLease.release()
+                return true
+            }
         }
         if (MediaStoreExportJournal.list(jobDir).none { it.isGateBlocking() }) {
             return true

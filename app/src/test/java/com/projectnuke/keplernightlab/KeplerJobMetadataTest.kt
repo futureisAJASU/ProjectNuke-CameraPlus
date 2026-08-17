@@ -1067,23 +1067,24 @@ class KeplerJobMetadataTest {
                 ownerOperationId = operationId
             ).transition(directory, MediaStoreExportState.PUBLIC_COMMITTED, "content://media/new-uri")
 
-            // With a PUBLIC_COMMITTED journal (committed but unverified) and no provider access,
-            // the settlement must defer and retain ACTIVE + lease. The exact candidate URI is
-            // preserved as evidence but no terminal metadata is written until provider confirms.
+            // Phase 7 fix: PUBLIC_COMMITTED does NOT require external resolution.
+            // The settlement treats the committed journal as conclusive evidence,
+            // writes terminal metadata (committed, unverified), and completes.
             val settled = settleOwnedPublicExportInterruption(
                 directory,
                 lease!!,
                 "cancelled after public commit",
                 disposition = PublicExportInterruptionDisposition.CANCELLED
             )
-            assertFalse(settled)
+            assertTrue("PUBLIC_COMMITTED is conclusive without provider access", settled)
 
-            // ACTIVE should still be present, no terminal metadata written
+            // The committed evidence is preserved even with cancellation
             val metadata = KeplerJobMetadata.read(directory)
-            assertTrue(metadata.has(ACTIVE_OPERATION_ID))
-            assertEquals("PUBLIC_EXPORT", metadata.getString(ACTIVE_OPERATION_KIND))
-            assertEquals("PROCESSING", metadata.getString("currentPipelineStage"))
-            assertFalse(metadata.optBoolean("galleryExportCommitted", false))
+            assertTrue(metadata.getBoolean("galleryExportCommitted"))
+            assertFalse(metadata.getBoolean("exportVerified"))
+            assertEquals("PARTIAL", metadata.getString("currentPipelineStage"))
+            assertEquals("EXPORT_COMMITTED_PENDING_VERIFICATION", metadata.getString("processStatus"))
+            assertFalse(metadata.has(ACTIVE_OPERATION_ID))
         } finally {
             lease?.release()
             directory.deleteRecursively()
