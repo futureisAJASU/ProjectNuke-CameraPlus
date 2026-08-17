@@ -47,22 +47,15 @@ operationId = KeplerJobMetadata.beginActiveOperation(
             lease.markDurableSettlementPending(operationId)
         }
     } catch (terminalFailure: Throwable) {
-        primaryFailure = terminalFailure
-        try {
-            operationId?.let {
-                lease.markTerminalSettlementPending(
-                    PendingTerminalSettlement(
-                        operationId = it,
-                        attemptStatus = "FAILED",
-                        pipelineStage = "FAILED",
-                        processStatus = "PIPELINE_FAILED",
-                        reason = failure.message ?: failure.javaClass.simpleName
-                    )
-                )
-            }
-        } catch (secondary: Throwable) {
-            primaryFailure = combineSettlementFailure(primaryFailure, secondary)
-        }
+        // Every secondary terminalization failure installs a retry reason BEFORE the scope
+        // returns: an established durable operation becomes a pending terminal settlement; a
+        // missing durable owner leaves the exact lease protecting the capture handoff.
+        primaryFailure = KeplerJobMetadata.installWorkerSetupSettlementDebt(
+            jobDir,
+            lease,
+            reason = failure.message ?: failure.javaClass.simpleName,
+            primaryFailure = terminalFailure
+        )
     } finally {
         try {
             lease.releaseIfProcessingSettled()
@@ -279,9 +272,18 @@ val operationId = pipelineLease.currentDurableOperationId()
                             .put("userCanMoveDevice", true)
                             .put(TERMINAL_OPERATION_ID, operationId)
                     }
-                    KeplerJobMetadata.clearActiveOperation(jobDir, operationId, pipelineLease)
+KeplerJobMetadata.clearActiveOperation(jobDir, operationId, pipelineLease)
                 } catch (secondary: Throwable) {
-                    terminalFailure = combineSettlementFailure(failure, secondary)
+                    // Every secondary terminalization failure installs a retry reason BEFORE
+                    // leaving the scope: an established durable operation becomes a pending
+                    // terminal settlement; a missing durable owner leaves the exact lease
+                    // protecting the capture processing handoff.
+                    terminalFailure = KeplerJobMetadata.installWorkerSetupSettlementDebt(
+                        jobDir,
+                        pipelineLease,
+                        reason = failure.message ?: failure.javaClass.simpleName,
+                        primaryFailure = combineSettlementFailure(failure, secondary)
+                    )
                 }
                 try {
                     if (terminalFailure == null) pipelineLease.releaseIfProcessingSettled()

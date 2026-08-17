@@ -1029,6 +1029,54 @@ internal fun inspectProcessingHandoff(
     }
 
     /**
+     * Installs the deterministic retry reason for a secondary worker-setup/terminalization
+     * failure BEFORE an operation scope returns, so a returned scope can never leave the exact
+     * lease registered without a reason [reconcilePendingDurableSettlement] understands:
+     *  - a durable ACTIVE operation with durable terminal evidence → pending durable settlement;
+     *  - a durable ACTIVE operation without durable terminal evidence → pending terminal settlement;
+     *  - a missing durable owner leaves the exact lease protecting the capture processing
+     *    handoff (pending processing-handoff settlement).
+     * Returns [primaryFailure] combined with any marking failure. Never throws.
+     */
+    internal fun installWorkerSetupSettlementDebt(
+        jobDir: File,
+        lease: JobOperationLease,
+        reason: String,
+        primaryFailure: Throwable? = null
+    ): Throwable? {
+        return try {
+            val durableId = lease.currentDurableOperationId()
+            if (durableId != null) {
+                val durableTerminalEvidence = try {
+                    val job = read(jobDir)
+                    job.optString(TERMINAL_OPERATION_ID).isNotBlank()
+                } catch (_: Exception) {
+                    false
+                }
+                if (durableTerminalEvidence) {
+                    lease.markDurableSettlementPending(durableId)
+                } else {
+                    lease.markTerminalSettlementPending(
+                        PendingTerminalSettlement(
+                            operationId = durableId,
+                            attemptStatus = "FAILED",
+                            pipelineStage = "FAILED",
+                            processStatus = "PIPELINE_FAILED",
+                            reason = reason
+                        )
+                    )
+                }
+            } else {
+                lease.markProcessingHandoffSettlementPending()
+            }
+            primaryFailure
+        } catch (secondary: Throwable) {
+            lease.currentDurableOperationId()?.let { lease.markDurableSettlementPending(it) }
+            combineSettlementFailure(primaryFailure, secondary)
+        }
+    }
+
+    /**
      * Settles a capture handoff when its processing worker could not be posted.
      * The exact lease is retained if the metadata settlement fails so a durable
      * handoff cannot become ownerless while the process is still alive.
@@ -1296,6 +1344,10 @@ class JobOperationLease internal constructor(internal val key: String) {
     internal fun releaseIfProcessingSettled(): Boolean {
         if (pendingPublicExportSettlement.get() != null) return false
         if (pendingTerminalSettlement.get() != null || pendingDurableSettlementId.get() != null) return false
+        // A pending processing-handoff settlement means the exact lease is the same-process
+        // retry owner of a durable handoff debt: releasing E here would leave the handoff
+        // ownerless while the process is alive.
+        if (pendingProcessingHandoffSettlement.get()) return false
         // A nested PUBLIC_EXPORT (or any newer durable operation) is still owned by this lease.
         // The wrapper must settle/clear that exact operation before releasing the top-level lease.
         currentDurableOperationId.get()?.let {

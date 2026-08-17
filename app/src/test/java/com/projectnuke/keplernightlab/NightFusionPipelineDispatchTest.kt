@@ -103,7 +103,10 @@ class NightFusionPipelineDispatchTest {
                     failure = IllegalStateException("camera setup failed")
                 )
             }
-            assertFalse(KeplerJobMetadata.isOperationActive(dir))
+            // The exact lease is retained with a pending processing-handoff settlement reason:
+            // the durable handoff is never ownerless while the process is alive.
+            assertTrue(KeplerJobMetadata.isOperationActive(dir))
+            assertTrue(KeplerJobMetadata.findOperationLease(dir)!!.hasPendingProcessingHandoffSettlement())
             assertFalse(KeplerJobMetadata.read(dir).has(ACTIVE_OPERATION_ID))
             assertTrue(KeplerJobMetadata.read(dir).has(PROCESSING_HANDOFF_OPERATION_ID))
 

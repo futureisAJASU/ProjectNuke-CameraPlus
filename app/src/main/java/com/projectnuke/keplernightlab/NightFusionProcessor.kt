@@ -163,25 +163,23 @@ fun processLatestNightFusionV02(
             }
             KeplerJobMetadata.clearActiveOperation(target, operationId, lease)
         } catch (secondary: Error) {
-            primaryFailure = secondary
+            // A fatal terminalization failure still installs the deterministic retry reason on
+            // the exact lease BEFORE the scope returns; the finally can never release a lease
+            // that still protects a durable handoff or an unpersisted terminal.
+            primaryFailure = KeplerJobMetadata.installWorkerSetupSettlementDebt(
+                target,
+                lease,
+                reason = failure.message ?: failure.javaClass.simpleName,
+                primaryFailure = secondary
+            )
             throw secondary
         } catch (failure: Exception) {
-            val operationId = lease.currentDurableOperationId()
-            if (operationId != null) {
-                try {
-                    lease.markTerminalSettlementPending(
-                        PendingTerminalSettlement(
-                            operationId = operationId,
-                            attemptStatus = "FAILED",
-                            pipelineStage = "FAILED",
-                            processStatus = "PIPELINE_FAILED",
-                            reason = failure.message ?: failure.javaClass.simpleName
-                        )
-                    )
-                } catch (secondary: Throwable) {
-                    primaryFailure = combineSettlementFailure(failure, secondary)
-                }
-            }
+            primaryFailure = KeplerJobMetadata.installWorkerSetupSettlementDebt(
+                target,
+                lease,
+                reason = failure.message ?: failure.javaClass.simpleName,
+                primaryFailure = failure
+            )
         } finally {
             try {
                 lease.releaseIfProcessingSettled()
