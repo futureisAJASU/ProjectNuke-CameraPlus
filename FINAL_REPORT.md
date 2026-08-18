@@ -1,33 +1,35 @@
 # FINAL REPORT — Production Closure State
 
 ## 1. Starting Point
-- Starting HEAD: `c2c04bf1ec5339c883c5f7a1d0d6813770df9807`
-- Previous commit: `b2f057a` (trailing whitespace in `KeplerJobMetadata.kt`, `KeplerJobMetadataTest.kt`)
-- This batch: bounded processing-handoff retry-owner / lease-release / reconciliation totality closure (Phase 1–9).
+- Starting HEAD: `ef0725384376296f748cf39db026d4a0adf3ab88`
+- Previous commit: `25adc35` (handoff-retry-owner: fix Phase 1-5 totality invariants and add authority-classification tests)
+- This batch: bounded live-lease-vs-retained-debt classification closure (Phase 1–12).
 
 ## 2. Production Fixes Applied
 
 **`KeplerJobMetadata.kt`**
-- **Phase 1**: Initial metadata read failure now uses `AuthorityType`-aware marking. `EXISTING_LIVE_OR_UNRELATED` is never mutated; `NONE_AVAILABLE` guarantees a reachable retry authority before returning false.
-- **Phase 2**: `CALLER_OWNED` handoff completion no longer raw-releases. Uses `releaseIfProcessingSettled()` so caller-owned leases with other pending debt (terminal, public-export, durable) remain registered until that debt converges.
-- **Phase 3**: `reconcilePendingDurableSettlement` preserves `pendingProcessingHandoffSettlement` until the post-handoff ACTIVE-state read succeeds and the replacement disposition (`pendingDurableSettlementId` or release) is installed. There is never an instant where the last retry reason is removed before the fallible transition.
-- **Phase 4**: `EXISTING_PENDING_HANDOFF_RETRY` with proven-absent handoff now calls `completeProcessingHandoffSettlement()` and `releaseIfProcessingSettled()`. Handoff debt is cleared even when other debt keeps the lease registered.
-- **Phase 5**: `NONE_AVAILABLE` acquisition failure falls back to `acquireTemporaryRecoveryAuthority` to guarantee a reachable exact authority before returning false.
-- **Phase 7**: Removed catch-all `Exception` swallowing in `settleUnconsumedProcessingHandoff_realMetadataCorrupt_preservesRetryOwnership`. The test now fails if the helper unexpectedly throws an ordinary metadata exception.
-- **Phase 9**: Bounded same-family pass over all retry-owner helpers and `NightFusionPipeline`/`NightFusionProcessor` callsites. No new HIGH/MEDIUM in this family.
+- **Phase 1**: Added `hasPendingReconciliationDebt()` predicate on `JobOperationLease`. Returns `true` only when at least one explicit retained settlement marker is present: `pendingTerminalSettlement`, `pendingPublicExportSettlement`, `pendingProcessingHandoffSettlement`, or `pendingDurableSettlementId`. `currentDurableOperationId` is intentionally excluded so a normal live durable owner is never mistaken for retained debt.
+- **Phase 1**: `reconcilePendingDurableSettlement` now fails closed at entry: `if (!lease.hasPendingReconciliationDebt()) return false`. A competing acquisition can never reach `releaseIfProcessingSettled()` for a clean live lease.
+- **Phase 2**: Both `acquireOperation` and `acquireRecoveryCheckedOperation` retain the original blocking semantics for a clean existing lease: `acquireOperation` returns `null`; `acquireRecoveryCheckedOperation` throws `ProcessingAlreadyActiveException`. No mutation, release, or reconciliation is performed on the live owner.
 
 **`KeplerJobMetadataTest.kt`**
-- **Phase 8**: Added explicit authority-classification tests for all four real authority classes:
-  - `CALLER_OWNED`: handoff success + pending terminal debt retains lease
-  - `SELF_RESERVED`: initial read failure retains self-reserved lease with pending marker; proven absent releases
-  - `EXISTING_PENDING_HANDOFF_RETRY`: no-handoff + pending terminal clears handoff marker but retains lease; no-handoff + no other debt releases lease
-  - `EXISTING_LIVE_OR_UNRELATED`: handoff present returns false/busy, owner untouched; initial read failure adds no handoff marker; handoff consumed concurrently leaves owner untouched
-- **Phase 3**: Added `reconcilePendingDurableSettlement_handoffAbsent_postHandoffReadFailure_preservesPendingMarker` with `reconcilePostHandoffReadFailureForTest` seam.
-- **Phase 7**: Removed catch-all `Exception` block from metadata-corrupt regression test.
+- **Phase 3**: Restored `recoveryCheckedAcquisitionSerializesCompetingMutations` to the original serialization contract: exactly one concurrent acquisition succeeds; the loser is blocked and the winner's lease remains exact and unreleased.
+- **Phase 4**: Added `cleanLiveLeaseCannotBeReconciledByCompetitor` — verifies that a clean lease with no pending debt is never released, reconciled, or mutated by a competing `acquireRecoveryCheckedOperation` or `acquireOperation`.
+- **Phase 5**: Added `liveDurableOwnerIsNotConvertedToSettlementDebtByCompetitor` — verifies that a lease with `currentDurableOperationId` set and no pending debt is untouched by a competing acquisition; `pendingDurableSettlementId` is never spuriously installed.
+- **Phase 8**: Multi-debt drain tests (`terminalAndHandoffDebtDrainInSingleReconcile`, `terminalSettled_handoffRetryFailsAgain_leaseRetained`, `handoffSettlementCreatesDurableDebt_drainedInSamePass`, `reconcilePendingDurableSettlementTotality_terminalPlusHandoff`) remain intact and passing.
+
+**`KeplerRecoveryCoordinatorTest.kt`**
+- **Phase 6**: Added `recoverRootsSerializesAgainstLiveCleanLease` — drives real `recoverRoots` against a job whose clean lease is held by another thread. Verifies recovery returns `SKIP_ACTIVE_CURRENT_PROCESS`, the lease remains registered and exact, and after release a retry recovers the job.
+
+**`KeplerGalleryReprocessProtocolTest.kt`**
+- **Phase 7**: Added `reprocessPreTransferLeaseWindowBlocksCompetingAcquisition` — verifies that a `ReprocessTransactionSession` lease acquired before `transferOwnership` blocks competing `acquireRecoveryCheckedOperation` and `acquireOperation`, and that `releaseIfUnowned` releases cleanly so a retry succeeds.
+
+**`DebtConvergenceCounterexampleTest.kt`**
+- **Phase 11**: Fixed `temporaryRecoveryAuthorityIsSingleSlotReservedAndReleased` — a clean temporary recovery authority is a live owner and must not be released by `acquireOperation`. While held, `acquireOperation` is blocked; after release the slot is freed.
 
 ## 3. Validation Results
 
-Production closure commit: `25adc35`
+Production closure commit: `ec1d8d9`
 
 | Command | Result |
 |---|---|
@@ -36,12 +38,22 @@ Production closure commit: `25adc35`
 | `testDebugUnitTest` (full suite) | SUCCESS |
 | `lintDebug` | SUCCESS |
 | `assembleDebug` | SUCCESS |
-| `git diff --check c2c04bf..HEAD` | PASS |
+| `git diff --check 8f3dc61..HEAD` | PASS |
 | `git show --check HEAD` | PASS |
 | `git status --short` | CLEAN |
 
 ## 4. Final Verdict
 
-All targeted processing-handoff retry-owner / lease-release / reconciliation totality defects fixed. Full compile/unit/lint/assemble passes. Diff and show checks are clean. Worktree clean.
+- A clean live lease can never be released or reconciled by a competing acquisition.
+- A live durable owner cannot be mutated into pending settlement by a competitor.
+- Competing mutations remain strictly serialized.
+- Explicit retained debt leases still reconcile through `hasPendingReconciliationDebt()`.
+- Terminal + handoff multi-debt still drains correctly.
+- RecoveryCoordinator's lease remains exclusive while recovery runs.
+- Reprocess pre-transfer lease remains exclusive.
+- Targeted/full unit/lint/assemble all pass.
+- Diff/show checks pass.
+- Report provenance is current.
+- No new HIGH/MEDIUM in this bounded owner-vs-retained classification family.
 
 END-TO-END PRODUCTION INTEGRATION AUDIT: CLOSED
