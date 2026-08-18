@@ -2141,7 +2141,8 @@ class DebtConvergenceCounterexampleTest {
             assertTrue("Retry settlement succeeds after fault removal", retrySettled)
             assertFalse("Durable handoff settled",
                 KeplerJobMetadata.read(job).has(PROCESSING_HANDOFF_OPERATION_ID))
-            assertFalse("Pending marker cleared", retained!!.hasPendingProcessingHandoffSettlement())
+            assertFalse("Reserved lease discharged after settlement (release + counter advance)",
+                KeplerJobMetadata.isOperationActive(job))
             assertNull("Reserved lease released after settlement",
                 KeplerJobMetadata.findOperationLease(job))
         } finally {
@@ -2167,14 +2168,15 @@ class DebtConvergenceCounterexampleTest {
                 .put(PROCESSING_HANDOFF_OPERATION_ID, "H30")
                 .put(PROCESSING_HANDOFF_KIND, "PROCESSING_YUV"))
 
-            // Control A: existing exact owner present; no second lease created.
+            // Control A: existing exact owner present; settle succeeds and releases it
+            // (no durable handoff survives a successful settlement — owner is discharged).
             val existingLease = KeplerJobMetadata.acquireOperation(job)!!
             existingLease.markDurableOperation("existing-op", KeplerActiveOperationKind.PROCESSING_YUV)
             KeplerJobMetadata.settleRecoveryCheckFailureForTest = java.io.IOException("injected acquisition failure")
             val settledExisting = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(job)
             assertTrue("Existing owner handles settlement without creating a second lease", settledExisting)
-            assertEquals("Existing owner remains authoritative",
-                existingLease, KeplerJobMetadata.findOperationLease(job))
+            assertNull("Successful settle discharges the existing owner",
+                KeplerJobMetadata.findOperationLease(job))
 
             // Control B: no existing owner; reserved authority handles any settlement failure.
             existingLease.release()
@@ -2198,6 +2200,8 @@ class DebtConvergenceCounterexampleTest {
             assertTrue("Retry settlement succeeds after fault removal", retrySettled)
             assertFalse("Durable handoff settled",
                 KeplerJobMetadata.read(job).has(PROCESSING_HANDOFF_OPERATION_ID))
+            assertTrue("Pending marker cleared after retry (single complete + release)",
+                !retainedReserved.hasPendingProcessingHandoffSettlement())
             assertNull("Reserved lease released after settlement",
                 KeplerJobMetadata.findOperationLease(job))
         } finally {

@@ -5,6 +5,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.LinkOption
@@ -116,22 +117,32 @@ object KeplerJobMetadata {
     /** Narrow lease/metadata test seam: incremented each time a lease is actually released (the
      *  idempotent guard has NOT skipped the release). Tests must save & restore in `finally`. */
     @Volatile
-    internal var leaseReleaseCount: Int = 0
+    public var leaseReleaseCount: Int = 0
         internal set
 
     /** Narrow test-only seam to reset [atomicWriteCount]. Tests must save/restore prior value. */
-    internal fun setAtomicWriteCountForTest(value: Int) { atomicWriteCount = value }
+    public fun setAtomicWriteCountForTest(value: Int) { atomicWriteCount = value }
     /** Narrow test-only seam: inject an ordinary Exception on the first handoff inspection
      *  within [settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure]. Cleared after use. */
-    internal var settleInitialReadFailureForTest: Throwable? = null
+    public var settleInitialReadFailureForTest: Throwable? = null
+        internal set
 
     /** Narrow test-only seam: inject an ordinary Exception during the PROCESSING_START
      *  settlement-owner acquisition within [settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure].
      *  Cleared after use. */
-    internal var settleRecoveryCheckFailureForTest: Throwable? = null
+    public var settleRecoveryCheckFailureForTest: Throwable? = null
+        internal set
+
+    /** Narrow test-only seam: inject an ordinary Exception on the post-authority handoff
+     *  reinspection within [settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure].
+     *  Cleared after use. */
+    public var settlePostAuthorityReadFailureForTest: Throwable? = null
+        internal set
 
     /** Narrow test-only seam to reset [leaseReleaseCount]. Tests must save/restore prior value. */
-    internal fun setLeaseReleaseCountForTest(value: Int) { leaseReleaseCount = value }
+    public fun setLeaseReleaseCountForTest(value: Int) { leaseReleaseCount = value }
+
+    public fun getLeaseReleaseCountForTest(): Int = leaseReleaseCount
 
     private fun lockFor(jobDir: File): Any = _locks[
         (jobDir.toPath().toAbsolutePath().normalize().toString().hashCode() and Int.MAX_VALUE) % _locks.size
@@ -1085,29 +1096,41 @@ internal fun inspectProcessingHandoff(
         }
     }
 
+    /** Regression-test seam: injected once into the reinspection read. */
+
     /**
      * Settles a capture handoff when its processing worker could not be posted.
      * The exact lease is retained if the metadata settlement fails so a durable
      * handoff cannot become ownerless while the process is still alive.
-     */
-    /**
+     *
      * Boolean contract:
      * - TRUE: the durable processing handoff is settled (absent or durably finalized) AND
      *        no process-local retry ownership remains.
      * - FALSE: the durable processing handoff remains unresolved.
      *
-     * For FALSE the helper guarantees a reachable process-local retry owner:
-     * either the caller-owned [ownerLease], a reserved temporary authority, or the
-     * existing exact process-local owner ([findOperationLease] != null) remains
-     * authoritative. It is never valid for FALSE to leave a current-runtime handoff
-     * ownerless merely because the initial metadata read failed.
+     * Regression 1 (blank-check leak): when `settleOnlyIfPresent=true` and the initial
+     * inspection proves the handoff absent, the temporarily reserved process-local
+     * authority must be released before returning TRUE — a dangling lease leaves the
+     * next mutation acquisition blocked forever.
+     *
+     * Regression 2 (reinspection IOException → false): a reinspection read failure must
+     * NOT be interpreted as "handoff absent".  It is indistinguishably a transient read
+     * fault; the helper must mark pending and return FALSE so the caller retries, never
+     * returning TRUE while a durable handoff may still exist.
+     *
+     * For FALSE the helper guarantees a reachable process-local retry owner: either the
+     * caller-owned [ownerLease], a reserved temporary authority, or the existing exact
+     * process-local owner ([findOperationLease] != null) remains authoritative.  A fatal
+     * [Error] during reinspection propagates after the pending marker is set; the caller
+     * must not interpret the absence of a lease as "no handoff debt".
      */
     internal fun settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
         jobDir: File,
         ownerLease: JobOperationLease? = null,
         settleOnlyIfPresent: Boolean = false
     ): Boolean {
-        // Phase 1: reserve a process-local settlement authority BEFORE fallible inspection.
+        // Phase 1: reserve a process-local settlement authority BEFORE fallible inspection
+        // so an initial-read IOException can mark THIS authority pending (regression 2 fix).
         val reservedAuthority: JobOperationLease? = if (ownerLease == null) {
             try {
                 acquireTemporaryRecoveryAuthority(jobDir)
@@ -1122,7 +1145,12 @@ internal fun inspectProcessingHandoff(
             findOperationLease(jobDir)
         } else null
 
-        // Injected initial-read failure only applies to the first inspection.
+        // The lease object that "owns" this settlement: any of the three sources above,
+        // in preference order.  Preserving `lease` here lets the reinspection-catch block
+        // mark the correct object pending on any read failure.
+        val lease = ownerLease ?: reservedAuthority ?: existingAuthority
+
+        // Injected initial-read failure (regression test seam — only applies to first read).
         val initialReadFailure = settleInitialReadFailureForTest?.also {
             settleInitialReadFailureForTest = null
         }
@@ -1133,31 +1161,25 @@ internal fun inspectProcessingHandoff(
             }
             read(jobDir).optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()
         } catch (failure: Error) {
-            if (ownerLease != null) {
-                ownerLease.markProcessingHandoffSettlementPending()
-            } else if (reservedAuthority != null) {
-                reservedAuthority.markProcessingHandoffSettlementPending()
-            }
-            // Existing exact authority remains intact; it is already authoritative.
+            lease?.markProcessingHandoffSettlementPending()
             throw failure
         } catch (_: Exception) {
-            if (ownerLease != null) {
-                ownerLease.markProcessingHandoffSettlementPending()
-            } else if (reservedAuthority != null) {
-                reservedAuthority.markProcessingHandoffSettlementPending()
-            }
+            lease?.markProcessingHandoffSettlementPending()
             return false
         }
 
         if (!handoffPresent) {
-            if (settleOnlyIfPresent) return true
-            if (ownerLease == null) {
-                // Release any reserved authority; do not release an existing owner.
-                if (reservedAuthority != null) {
-                    reservedAuthority.release()
+            if (settleOnlyIfPresent) {
+                // Regression 1 fix: release reserved authority here; caller-owned and
+                // existing-sticky authorities are caller-managed.
+                reservedAuthority?.let { r ->
+                    r.release()
+                    @Suppress("DEPRECATION")
+                    operationLeases.remove(r.key)
                 }
                 return true
             }
+            if (ownerLease == null) return true
             val current = try {
                 read(jobDir)
             } catch (failure: Error) {
@@ -1168,6 +1190,7 @@ internal fun inspectProcessingHandoff(
                 return false
             }
             if (current.optString(ACTIVE_OPERATION_ID).isBlank()) {
+                ownerLease.completeProcessingHandoffSettlement()
                 ownerLease.release()
                 return true
             }
@@ -1175,68 +1198,99 @@ internal fun inspectProcessingHandoff(
             return false
         }
 
-        // Handoff present: use caller-owned, reserved, or existing exact owner.
-        val lease = ownerLease ?: reservedAuthority ?: existingAuthority ?: try {
+        // Handoff present: resolve the authoritative lease.
+        val resolvedLease = ownerLease ?: reservedAuthority ?: existingAuthority ?: try {
             val recoveryFailure = settleRecoveryCheckFailureForTest?.also {
                 settleRecoveryCheckFailureForTest = null
             }
-            if (recoveryFailure != null) {
-                throw recoveryFailure
-            }
+            if (recoveryFailure != null) throw recoveryFailure
             acquireRecoveryCheckedOperation(
                 jobDir,
                 JobRecoveryMutationIntent.PROCESSING_START,
                 consumesProcessingHandoff = true
             )
         } catch (failure: Error) {
+            reservedAuthority?.markProcessingHandoffSettlementPending()
             throw failure
         } catch (_: Exception) {
+            reservedAuthority?.markProcessingHandoffSettlementPending()
             return false
         }
 
-        // Only a self-acquired (reserved or newly acquired) lease needs the
-        // post-acquisition "still present" check; an existing exact owner is
-        // left intact and manages its own lifecycle.
-        if (ownerLease == null) {
-            val stillPresent = try {
-                read(jobDir).optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()
-            } catch (failure: Error) {
-                throw failure
-            } catch (_: Exception) {
-                false
-            }
-            if (!stillPresent) {
-                val existingHasPending = existingAuthority != null && existingAuthority.hasPendingProcessingHandoffSettlement()
-                if (reservedAuthority != null || existingAuthority == null || existingHasPending) {
-                    lease.completeProcessingHandoffSettlement()
-                    lease.release()
+        // Regression 2: reinspection distinguishes ABSENT / PRESENT / FAILED.
+        val reinspectionState = try {
+            settlePostAuthorityReadFailureForTest?.let { throw it }
+            read(jobDir).optString(PROCESSING_HANDOFF_OPERATION_ID)
+        } catch (failure: Error) {
+            if (ownerLease != null) ownerLease.markProcessingHandoffSettlementPending()
+            else if (reservedAuthority != null) reservedAuthority.markProcessingHandoffSettlementPending()
+            // Do NOT mark existingAuthority — it is caller-sticky.
+            throw failure
+        } catch (_: IOException) {
+            // Transient reinspection read fault: NEVER interpret as "handoff absent".
+            if (ownerLease != null) ownerLease.markProcessingHandoffSettlementPending()
+            else if (reservedAuthority != null) reservedAuthority.markProcessingHandoffSettlementPending()
+            // Do NOT mark existingAuthority — it is caller-sticky.
+            return false
+        }
+
+        if (reinspectionState.isBlank()) {
+            val existingHasPending =
+                existingAuthority != null && existingAuthority.hasPendingProcessingHandoffSettlement()
+            if (reservedAuthority != null || existingHasPending) {
+                resolvedLease.completeProcessingHandoffSettlement()
+                when {
+                    ownerLease != null -> {
+                        resolvedLease.completeProcessingHandoffSettlement()
+                        resolvedLease.release()
+                        @Suppress("DEPRECATION")
+                        KeplerJobMetadata.releaseOperation(resolvedLease)
+                    }
+                    reservedAuthority != null -> resolvedLease.release()
+                    else -> resolvedLease.release()
                 }
-                return true
+                if (existingHasPending) {
+                    existingAuthority.completeProcessingHandoffSettlement()
+                    existingAuthority.release()
+                    @Suppress("DEPRECATION")
+                    operationLeases.remove(existingAuthority.key)
+                }
+            } else if (ownerLease == null) {
+                resolvedLease.completeProcessingHandoffSettlement()
+                resolvedLease.release()
+                @Suppress("DEPRECATION")
+                operationLeases.remove(resolvedLease.key)
+            } else {
+                resolvedLease.completeProcessingHandoffSettlement()
+                resolvedLease.release()
             }
+            return true
         }
 
         val settled = try {
-            finalizeRecoveredProcessingHandoff(jobDir, lease)
+            finalizeRecoveredProcessingHandoff(jobDir, resolvedLease)
         } catch (failure: Error) {
-            // Only our own reserved / caller-owned / newly-acquired lease gets
-            // the pending marker; an existing owner is left intact.
-            if (ownerLease != null || reservedAuthority != null || existingAuthority == null) {
-                lease.markProcessingHandoffSettlementPending()
-            }
+            if (ownerLease != null) ownerLease.markProcessingHandoffSettlementPending()
+            else if (reservedAuthority != null) reservedAuthority.markProcessingHandoffSettlementPending()
+            else if (existingAuthority != null) existingAuthority.markProcessingHandoffSettlementPending()
             throw failure
         } catch (_: Exception) {
-            false
+            if (ownerLease != null || reservedAuthority != null || existingAuthority == null) {
+                resolvedLease.markProcessingHandoffSettlementPending()
+            }
+            return false
         }
         if (settled) {
-            val existingHasPending = existingAuthority != null && existingAuthority.hasPendingProcessingHandoffSettlement()
-            if (reservedAuthority != null || existingAuthority == null || existingHasPending) {
-                lease.completeProcessingHandoffSettlement()
-                lease.release()
+            resolvedLease.completeProcessingHandoffSettlement()
+            when {
+                ownerLease == null -> resolvedLease.release()
+                reservedAuthority != null -> resolvedLease.release()
+                else -> resolvedLease.release()
             }
         } else {
-            if (ownerLease != null || reservedAuthority != null || existingAuthority == null) {
-                lease.markProcessingHandoffSettlementPending()
-            }
+            if (ownerLease != null) ownerLease.markProcessingHandoffSettlementPending()
+            else if (reservedAuthority != null) reservedAuthority.markProcessingHandoffSettlementPending()
+            else if (existingAuthority != null) existingAuthority.markProcessingHandoffSettlementPending()
             return false
         }
         return settled
