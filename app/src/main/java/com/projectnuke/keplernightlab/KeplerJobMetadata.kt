@@ -1221,18 +1221,13 @@ internal fun inspectProcessingHandoff(
                     }
                     if (current.optString(ACTIVE_OPERATION_ID).isBlank()) {
                         ownerLease.completeProcessingHandoffSettlement()
-<<<<<<< HEAD
                         ownerLease.releaseIfProcessingSettled()
-=======
-                        ownerLease.release()
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
                         return true
                     }
                     ownerLease.markDurableSettlementPending(current.optString(ACTIVE_OPERATION_ID))
                     return false
                 }
                 AuthorityType.SELF_RESERVED -> {
-<<<<<<< HEAD
                     reservedAuthority?.releaseIfProcessingSettled()
                     return true
                 }
@@ -1245,25 +1240,6 @@ internal fun inspectProcessingHandoff(
                     return true
                 }
                 AuthorityType.NONE_AVAILABLE -> {
-=======
-                    // Phase 1: Release the self-reserved authority regardless of settleOnlyIfPresent
-                    // when there's no handoff present
-                    reservedAuthority?.release()
-                    return true
-                }
-                AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> {
-                    // No handoff present, but existing authority has pending handoff settlement
-                    // Don't release it here as it might have other debt
-                    return true
-                }
-                AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {
-                    // No handoff present and existing lease is unrelated, so no handoff to settle
-                    // Just return true to indicate success (no handoff found to process)
-                    return true
-                }
-                AuthorityType.NONE_AVAILABLE -> {
-                    // No authority available to handle this, return true for consistency
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
                     return true
                 }
             }
@@ -1290,14 +1266,10 @@ internal fun inspectProcessingHandoff(
                     reservedAuthority?.markProcessingHandoffSettlementPending()
                     throw failure
                 } catch (_: Exception) {
-<<<<<<< HEAD
                     val fallbackAuthority = reservedAuthority ?: run {
                         try { acquireTemporaryRecoveryAuthority(jobDir) } catch (_: Exception) { null }
                     }
                     fallbackAuthority?.markProcessingHandoffSettlementPending()
-=======
-                    reservedAuthority?.markProcessingHandoffSettlementPending()
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
                     return false
                 }
             }
@@ -1309,63 +1281,35 @@ internal fun inspectProcessingHandoff(
             settlePostAuthorityReadFailureForTest?.let { throw it }
             read(jobDir).optString(PROCESSING_HANDOFF_OPERATION_ID)
         } catch (failure: Error) {
-<<<<<<< HEAD
-=======
-            // Phase 2: Fatal error handling - mark pending and rethrow
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             when (authorityType) {
                 AuthorityType.CALLER_OWNED -> ownerLease?.markProcessingHandoffSettlementPending()
                 AuthorityType.SELF_RESERVED -> reservedAuthority?.markProcessingHandoffSettlementPending()
                 AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> existingAuthority?.markProcessingHandoffSettlementPending()
-<<<<<<< HEAD
                 AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {}
                 AuthorityType.NONE_AVAILABLE -> resolvedLease?.markProcessingHandoffSettlementPending()
             }
             throw failure
         } catch (_: KeplerJobMetadataException) {
-=======
-                AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {}  // Do NOT mark existing unrelated authority
-                AuthorityType.NONE_AVAILABLE -> reservedAuthority?.markProcessingHandoffSettlementPending()
-            }
-            throw failure
-        } catch (_: KeplerJobMetadataException) {
-            // Phase 2: Real production metadata read failure - mark pending and return false
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             when (authorityType) {
                 AuthorityType.CALLER_OWNED -> ownerLease?.markProcessingHandoffSettlementPending()
                 AuthorityType.SELF_RESERVED -> reservedAuthority?.markProcessingHandoffSettlementPending()
                 AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> existingAuthority?.markProcessingHandoffSettlementPending()
-<<<<<<< HEAD
                 AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {}
                 AuthorityType.NONE_AVAILABLE -> resolvedLease?.markProcessingHandoffSettlementPending()
             }
             return false
         } catch (_: IOException) {
-=======
-                AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {}  // Do NOT mark existing unrelated authority
-                AuthorityType.NONE_AVAILABLE -> reservedAuthority?.markProcessingHandoffSettlementPending()
-            }
-            return false
-        } catch (_: IOException) {
-            // Fall-back for any remaining IOException cases
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             when (authorityType) {
                 AuthorityType.CALLER_OWNED -> ownerLease?.markProcessingHandoffSettlementPending()
                 AuthorityType.SELF_RESERVED -> reservedAuthority?.markProcessingHandoffSettlementPending()
                 AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> existingAuthority?.markProcessingHandoffSettlementPending()
-<<<<<<< HEAD
                 AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {}
                 AuthorityType.NONE_AVAILABLE -> resolvedLease?.markProcessingHandoffSettlementPending()
-=======
-                AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {}  // Do NOT mark existing unrelated authority
-                AuthorityType.NONE_AVAILABLE -> reservedAuthority?.markProcessingHandoffSettlementPending()
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             }
             return false
         }
 
         if (reinspectionState.isBlank()) {
-<<<<<<< HEAD
             if (resolvedLease != null) {
                 resolvedLease.completeProcessingHandoffSettlement()
                 when (authorityType) {
@@ -1374,31 +1318,6 @@ internal fun inspectProcessingHandoff(
                     AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> resolvedLease.releaseIfProcessingSettled()
                     AuthorityType.EXISTING_LIVE_OR_UNRELATED -> { /* unreachable */ }
                     AuthorityType.NONE_AVAILABLE -> resolvedLease.releaseIfProcessingSettled()
-=======
-            // Handoff was consumed by another thread - settle the lease properly
-            if (resolvedLease != null) {
-                resolvedLease.completeProcessingHandoffSettlement()
-                
-                // Phase 7: Use safe release mechanism that considers all debt
-                when (authorityType) {
-                    AuthorityType.CALLER_OWNED -> {
-                        resolvedLease.release()
-                    }
-                    AuthorityType.SELF_RESERVED -> {
-                        resolvedLease.release()
-                    }
-                    AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> {
-                        // For existing pending handoff retry owners, use safe release that considers debt
-                        resolvedLease.releaseIfProcessingSettled()
-                    }
-                    AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {
-                        // Shouldn't reach here as we'd have returned false earlier
-                        resolvedLease.release()
-                    }
-                    AuthorityType.NONE_AVAILABLE -> {
-                        resolvedLease.release()
-                    }
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
                 }
             }
             return true
@@ -1421,7 +1340,6 @@ internal fun inspectProcessingHandoff(
             }
             return false
         }
-<<<<<<< HEAD
 
         if (settled) {
             resolvedLease?.completeProcessingHandoffSettlement()
@@ -1431,44 +1349,14 @@ internal fun inspectProcessingHandoff(
                 AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> resolvedLease?.releaseIfProcessingSettled()
                 AuthorityType.EXISTING_LIVE_OR_UNRELATED -> { /* unreachable */ }
                 AuthorityType.NONE_AVAILABLE -> resolvedLease?.releaseIfProcessingSettled()
-=======
-        
-        if (settled) {
-            resolvedLease?.completeProcessingHandoffSettlement()
-            
-            // Phase 7: Use safe release mechanism considering all debt
-            when (authorityType) {
-                AuthorityType.CALLER_OWNED -> {
-                    resolvedLease?.release()
-                }
-                AuthorityType.SELF_RESERVED -> {
-                    resolvedLease?.release()
-                }
-                AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> {
-                    // For existing pending handoff retry owners, use safe release that considers debt
-                    resolvedLease?.releaseIfProcessingSettled()
-                }
-                AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {
-                    // Shouldn't reach here as we'd have returned false earlier
-                    resolvedLease?.release()
-                }
-                AuthorityType.NONE_AVAILABLE -> {
-                    resolvedLease?.release()
-                }
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             }
         } else {
             when (authorityType) {
                 AuthorityType.CALLER_OWNED -> ownerLease?.markProcessingHandoffSettlementPending()
                 AuthorityType.SELF_RESERVED -> reservedAuthority?.markProcessingHandoffSettlementPending()
                 AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> existingAuthority?.markProcessingHandoffSettlementPending()
-<<<<<<< HEAD
                 AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {}
                 AuthorityType.NONE_AVAILABLE -> resolvedLease?.markProcessingHandoffSettlementPending()
-=======
-                AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {}  // Do NOT mark existing unrelated authority
-                AuthorityType.NONE_AVAILABLE -> reservedAuthority?.markProcessingHandoffSettlementPending()
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             }
             return false
         }

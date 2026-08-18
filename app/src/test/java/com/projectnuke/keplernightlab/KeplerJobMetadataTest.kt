@@ -1358,12 +1358,7 @@ class KeplerJobMetadataTest {
                     .put(PROCESSING_HANDOFF_OPERATION_ID, "handoff-operation")
                     .put(PROCESSING_HANDOFF_KIND, KeplerActiveOperationKind.PROCESSING_YUV.name)
             )
-<<<<<<< HEAD
 
-=======
-            
-            // Create a file that causes KeplerJobMetadataCorrupt
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             val jobFile = File(directory, JOB_JSON_FILE_NAME)
             jobFile.writeText("{invalid json")
 
@@ -1373,34 +1368,17 @@ class KeplerJobMetadataTest {
             )
 
             assertFalse(result)
-<<<<<<< HEAD
-=======
-            // Verify the lease is still active and has pending settlement
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             assertTrue(KeplerJobMetadata.isOperationActive(directory))
             val retrievedLease = KeplerJobMetadata.findOperationLease(directory)
             assertNotNull(retrievedLease)
             assertTrue(retrievedLease!!.hasPendingProcessingHandoffSettlement())
-<<<<<<< HEAD
 
         } finally {
-=======
-            
-        } catch (e: Exception) {
-            // Expected due to corrupted JSON, but we can test with a custom exception injection
-        } finally {
-            // Clean up the corrupted file for further cleanup
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             val jobFile = File(directory, JOB_JSON_FILE_NAME)
             if (jobFile.exists()) {
                 jobFile.delete()
             }
-<<<<<<< HEAD
 
-=======
-            
-            // Write valid JSON for proper cleanup
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             KeplerJobMetadata.write(
                 directory,
                 JSONObject()
@@ -1408,12 +1386,7 @@ class KeplerJobMetadataTest {
                     .put(PROCESSING_HANDOFF_OPERATION_ID, "handoff-operation")
                     .put(PROCESSING_HANDOFF_KIND, KeplerActiveOperationKind.PROCESSING_YUV.name)
             )
-<<<<<<< HEAD
 
-=======
-            
-            // Force cleanup by getting lease and releasing it if needed
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             lease = KeplerJobMetadata.findOperationLease(directory)
             lease?.release()
             directory.deleteRecursively()
@@ -1426,7 +1399,6 @@ class KeplerJobMetadataTest {
         var lease: JobOperationLease? = null
         try {
             KeplerJobMetadata.write(directory, JSONObject().put("status", "PROCESSING"))
-<<<<<<< HEAD
 
             // Create a normal operation lease (not for handoff settlement)
             lease = KeplerJobMetadata.acquireOperation(directory)
@@ -1435,36 +1407,18 @@ class KeplerJobMetadataTest {
             // Verify lease exists
             assertTrue(KeplerJobMetadata.isOperationActive(directory))
 
-=======
-            
-            // Create a normal operation lease (not for handoff settlement)
-            lease = KeplerJobMetadata.acquireOperation(directory)
-            assertNotNull(lease)
-            
-            // Verify lease exists
-            assertTrue(KeplerJobMetadata.isOperationActive(directory))
-            
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             // Call the helper with ownerLease=null, which should find the existing lease
             // but NOT release it since it's not a pending handoff retry
             val result = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
                 directory,
                 ownerLease = null
             )
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             // The existing lease should remain in place, and the result depends on handoff presence
             assertTrue(KeplerJobMetadata.isOperationActive(directory))
             val existing = KeplerJobMetadata.findOperationLease(directory)
             assertNotNull(existing)
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
         } finally {
             lease?.release()
             directory.deleteRecursively()
@@ -1483,7 +1437,6 @@ class KeplerJobMetadataTest {
                     .put(PROCESSING_HANDOFF_OPERATION_ID, "handoff-operation")
                     .put(PROCESSING_HANDOFF_KIND, KeplerActiveOperationKind.PROCESSING_YUV.name)
             )
-<<<<<<< HEAD
 
             // Create an operation lease and mark it as having pending handoff settlement
             lease = KeplerJobMetadata.acquireOperation(directory)
@@ -1494,28 +1447,12 @@ class KeplerJobMetadataTest {
 
             assertTrue(lease.hasPendingProcessingHandoffSettlement())
 
-=======
-            
-            // Create an operation lease and mark it as having pending handoff settlement
-            lease = KeplerJobMetadata.acquireOperation(directory)
-            assertNotNull(lease)
-            
-            // Manually mark the lease as having pending processing handoff settlement
-            lease!!.markProcessingHandoffSettlementPending()
-            
-            assertTrue(lease.hasPendingProcessingHandoffSettlement())
-            
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             // Call the helper to settle the handoff - it should reuse the same lease
             val result = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
                 directory,
                 ownerLease = null
             )
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             assertTrue(result)
             // The lease should still exist but now be settled
             val stillExists = KeplerJobMetadata.findOperationLease(directory)
@@ -1523,11 +1460,7 @@ class KeplerJobMetadataTest {
                 // If it still exists, it might have other debt preventing release
                 assertTrue(stillExists.releaseIfProcessingSettled())
             }
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
         } finally {
             lease?.release()
             directory.deleteRecursively()
@@ -1546,38 +1479,23 @@ class KeplerJobMetadataTest {
                     .put(PROCESSING_HANDOFF_OPERATION_ID, "handoff-operation")
                     .put(PROCESSING_HANDOFF_KIND, KeplerActiveOperationKind.PROCESSING_YUV.name)
             )
-<<<<<<< HEAD
 
             // Set up a test failure that simulates a fatal error during post-authority read
             KeplerJobMetadata.settlePostAuthorityReadFailureForTest = AssertionError("fatal test error")
 
-=======
-            
-            // Set up a test failure that simulates a fatal error during post-authority read
-            KeplerJobMetadata.settlePostAuthorityReadFailureForTest = AssertionError("fatal test error")
-            
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             assertThrows(AssertionError::class.java) {
                 KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
                     directory,
                     ownerLease = null
                 )
             }
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             // The lease should be retained with pending settlement flag
             assertTrue(KeplerJobMetadata.isOperationActive(directory))
             val existingLease = KeplerJobMetadata.findOperationLease(directory)
             assertNotNull(existingLease)
             assertTrue(existingLease!!.hasPendingProcessingHandoffSettlement())
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
         } finally {
             KeplerJobMetadata.settlePostAuthorityReadFailureForTest = null
             lease = KeplerJobMetadata.findOperationLease(directory)
@@ -1592,7 +1510,6 @@ class KeplerJobMetadataTest {
         var lease: JobOperationLease? = null
         try {
             KeplerJobMetadata.write(directory, JSONObject().put("status", "PROCESSING"))
-<<<<<<< HEAD
 
             // Create an existing live lease that's not related to handoff settlement
             lease = KeplerJobMetadata.acquireOperation(directory)
@@ -1600,41 +1517,23 @@ class KeplerJobMetadataTest {
 
             assertTrue(KeplerJobMetadata.isOperationActive(directory))
 
-=======
-            
-            // Create an existing live lease that's not related to handoff settlement
-            lease = KeplerJobMetadata.acquireOperation(directory)
-            assertNotNull(lease)
-            
-            assertTrue(KeplerJobMetadata.isOperationActive(directory))
-            
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             // Call the settle helper with no handoff present - the existing unrelated lease should remain
             val result = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
                 directory,
                 ownerLease = null
             )
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
             assertTrue(result)
             // The existing lease should still be active since there was no handoff to process
             assertTrue(KeplerJobMetadata.isOperationActive(directory))
             val existing = KeplerJobMetadata.findOperationLease(directory)
             assertNotNull(existing)
-<<<<<<< HEAD
 
-=======
-            
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
         } finally {
             lease?.release()
             directory.deleteRecursively()
         }
     }
-<<<<<<< HEAD
 
     @Test
     fun callerOwnedHandoffSettlement_retainsLeaseWhenTerminalDebtExists() {
@@ -1884,6 +1783,4 @@ class KeplerJobMetadataTest {
             directory.deleteRecursively()
         }
     }
-=======
->>>>>>> b2f057a5da6c887edf03ea26f3d9ff1957d04753
 }
