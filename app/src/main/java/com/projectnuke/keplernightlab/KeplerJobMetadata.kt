@@ -21,7 +21,7 @@ sealed class KeplerJobMetadataException(message: String, cause: Throwable? = nul
 class KeplerJobMetadataMissing(jobDir: File) : KeplerJobMetadataException("Job metadata missing in ${jobDir.absolutePath}")
 class KeplerJobMetadataCorrupt(jobDir: File, cause: Throwable? = null) : KeplerJobMetadataException("Job metadata corrupt in ${jobDir.absolutePath}", cause)
 internal class ProcessingCleanupRequiredException : IllegalStateException(
-    "?�전 처리 ?�업???�일 ?�리가 ?�료?��? ?�아 지금�? ?�시 ?�성?????�습?�다."
+    "?�전 처리 ?�업???�일 ?�리가 ?�료?��? ?�아 지금�? ?�시 ?�성?????�습?�다."
 )
 internal const val PROCESSING_CLEANUP_REQUIRED = "PROCESSING_CLEANUP_REQUIRED"
 
@@ -77,19 +77,19 @@ internal class JobRecoveryMutationBlockedException(
     val outcome: JobRecoveryMutationGateOutcome
 ) : IllegalStateException(
     when (outcome) {
-        JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION -> "?�전 ?�행???�업 ?�유권이 ?�직 복구?��? ?�아 지금�? ?�업??변경할 ???�습?�다."
-        JobRecoveryMutationGateOutcome.BLOCKED_HANDOFF -> "촬영 결과??처리 ?�계가 ?�직 ?�료?��? ?�아 지금�? ?�업??변경할 ???�습?�다."
-        JobRecoveryMutationGateOutcome.BLOCKED_ORPHANED_JOB_METADATA -> "?�업 메�??�이?��? ?�어 복구 ?�인 ?�에???�업??변경할 ???�습?�다."
-        JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP -> "?�전 처리 ?�업???�일 ?�리가 ?�료?��? ?�아 지금�? ?�업??변경할 ???�습?�다."
-        JobRecoveryMutationGateOutcome.BLOCKED_AMBIGUOUS_RECOVERY -> "복구?��? ?��? ?�업 증거가 ?�어 지금�? ?�업??변경할 ???�습?�다."
-        JobRecoveryMutationGateOutcome.BLOCKED_PUBLIC_COMMIT_MISSING -> "공개 결과??커밋 증거가 ?�어 지금�? ?�업??변경할 ???�습?�다."
-        JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION -> "공개 결과�??�인?��? 못해 지금�? ?�업??변경할 ???�습?�다."
-        JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_SETTLEMENT -> "공개 ?�보?�기???�업 ?�리 ?�인???�나지 ?�아 지금�? ?�업??변경할 ???�습?�다."
-        JobRecoveryMutationGateOutcome.BLOCKED_INVALID_PROCESSING_JOURNAL -> "처리 복구 기록???�을 ???�어 지금�? ?�업??변경할 ???�습?�다."
-        JobRecoveryMutationGateOutcome.BLOCKED_REPROCESS_QUARANTINE -> "복구 중인 ?�업?� 지�?변경할 ???�습?�다."
-        JobRecoveryMutationGateOutcome.INSPECTION_FAILED -> "?�업 복구 ?�태�??�인?��? 못해 지금�? ?�업??변경할 ???�습?�다."
-        JobRecoveryMutationGateOutcome.BLOCKED_INVALID_EXPORT_JOURNAL -> "?�보?�기 복구 기록???�을 ???�어 지금�? ?�업??변경할 ???�습?�다."
-        JobRecoveryMutationGateOutcome.BLOCKED_SETTLED_JOURNAL -> "?�료??처리 기록???�리가 ?�나지 ?�아 지금�? 결과 경로�?변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION -> "?�전 ?�행???�업 ?�유권이 ?�직 복구?��? ?�아 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_HANDOFF -> "촬영 결과??처리 ?�계가 ?�직 ?�료?��? ?�아 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_ORPHANED_JOB_METADATA -> "?�업 메�??�이?��? ?�어 복구 ?�인 ?�에???�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP -> "?�전 처리 ?�업???�일 ?�리가 ?�료?��? ?�아 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_AMBIGUOUS_RECOVERY -> "복구?��? ?��? ?�업 증거가 ?�어 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_PUBLIC_COMMIT_MISSING -> "공개 결과??커밋 증거가 ?�어 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION -> "공개 결과�??�인?��? 못해 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_SETTLEMENT -> "공개 ?�보?�기???�업 ?�리 ?�인???�나지 ?�아 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_INVALID_PROCESSING_JOURNAL -> "처리 복구 기록???�을 ???�어 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_REPROCESS_QUARANTINE -> "복구 중인 ?�업?� 지�?변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.INSPECTION_FAILED -> "?�업 복구 ?�태�??�인?��? 못해 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_INVALID_EXPORT_JOURNAL -> "?�보?�기 복구 기록???�을 ???�어 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_SETTLED_JOURNAL -> "?�료??처리 기록???�리가 ?�나지 ?�아 지금�? 결과 경로�?변경할 ???�습?�다."
         JobRecoveryMutationGateOutcome.ALLOWED -> ""
     }
 )
@@ -441,12 +441,11 @@ internal fun inspectProcessingHandoff(
             }
             if (!persisted) return false
             lease.completeTerminalSettlement(pendingTerminal.operationId)
-            val cleared = clearActiveOperation(jobDir, pendingTerminal.operationId, lease)
-            if (!cleared && isCurrentActiveOperation(jobDir, pendingTerminal.operationId)) return false
-            lease.clearDurableOperation(pendingTerminal.operationId)
+            val activeOperationId = lease.currentDurableOperationId() ?: pendingTerminal.operationId
+            val cleared = clearActiveOperation(jobDir, activeOperationId, lease)
+            if (!cleared && isCurrentActiveOperation(jobDir, activeOperationId)) return false
+            lease.clearDurableOperation(activeOperationId)
             lease.completeDurableSettlement(pendingTerminal.operationId)
-            lease.release()
-            return true
         }
         val pendingPublicExport = lease.pendingPublicExportSettlement()
         if (pendingPublicExport != null) {
@@ -466,8 +465,6 @@ internal fun inspectProcessingHandoff(
             }
             if (!settled) return false
             lease.completePublicExportSettlement(pendingPublicExport.operationId)
-            lease.release()
-            return true
         }
         if (lease.hasPendingProcessingHandoffSettlement()) {
             val handoffPresent = try {
@@ -496,16 +493,12 @@ internal fun inspectProcessingHandoff(
                 return false
             }
             val activeId = current.optString(ACTIVE_OPERATION_ID)
-            if (activeId.isBlank()) {
-                lease.completeProcessingHandoffSettlement()
-                lease.release()
-                return true
+            if (activeId.isNotBlank()) {
+                lease.markDurableSettlementPending(activeId)
             }
-            lease.markDurableSettlementPending(activeId)
             lease.completeProcessingHandoffSettlement()
-            return false
         }
-        val pendingId = lease.pendingDurableSettlementId() ?: return false
+        val pendingId = lease.pendingDurableSettlementId() ?: return lease.releaseIfProcessingSettled()
         val job = try {
             read(jobDir)
         } catch (failure: Error) {
@@ -517,15 +510,14 @@ internal fun inspectProcessingHandoff(
         val activeRuntime = job.optString(ACTIVE_RUNTIME_SESSION_ID)
         if (activeId.isBlank()) {
             lease.completeDurableSettlement(pendingId)
-            lease.release()
-            return true
+        } else if (activeId == pendingId && activeRuntime == KeplerRuntimeSession.id) {
+            val cleared = clearActiveOperation(jobDir, pendingId, lease)
+            if (!cleared && isCurrentActiveOperation(jobDir, pendingId)) return false
+            lease.completeDurableSettlement(pendingId)
+        } else {
+            return false
         }
-        if (activeId != pendingId || activeRuntime != KeplerRuntimeSession.id) return false
-        val cleared = clearActiveOperation(jobDir, pendingId, lease)
-        if (!cleared && isCurrentActiveOperation(jobDir, pendingId)) return false
-        lease.completeDurableSettlement(pendingId)
-        lease.release()
-        return true
+        return lease.releaseIfProcessingSettled()
     }
 
     internal fun hasProcessingCleanupBlocker(jobDir: File): Boolean = try {
@@ -560,9 +552,9 @@ internal fun inspectProcessingHandoff(
             job.put("recoveryState", PROCESSING_CLEANUP_REQUIRED)
                 .put("processingCleanupDebt", JSONArray(failures.distinct()))
                 .put("lastRecoveryClassification", historicalClassification)
-                .put("lastRecoveryMessage", "처리 결과??보존?�었지�??�전 ?�업???�일 ?�리가 ?�직 ?�료?��? ?�았?�니??")
+                .put("lastRecoveryMessage", "처리 결과??보존?�었지�??�전 ?�업???�일 ?�리가 ?�직 ?�료?��? ?�았?�니??")
                 .put("recoveredAt", System.currentTimeMillis())
-                .put("recoveryMessage", "?�전 처리 ?�업???�일 ?�리가 ?�료?��? ?�아 지금�? ?�시 ?�성?????�습?�다.")
+                .put("recoveryMessage", "?�전 처리 ?�업???�일 ?�리가 ?�료?��? ?�아 지금�? ?�시 ?�성?????�습?�다.")
             if (operationId != null) {
                 job.remove(ACTIVE_RUNTIME_SESSION_ID)
                 job.remove(ACTIVE_OPERATION_ID)
@@ -963,13 +955,13 @@ internal fun inspectProcessingHandoff(
                     .put("lastRecoveryClassification",
                         KeplerJobRecoveryClassification.PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION.name)
                     .put("lastRecoveryMessage",
-                        "?�이 ?�시 ?�작?????�료???�보?�기???�인?��? ?�아 추�? ?�인???�요?�니??")
+                        "?�이 ?�시 ?�작?????�료???�보?�기???�인?��? ?�아 추�? ?�인???�요?�니??")
                     .put("recoveryMessage",
-                        "공개 ?�보?�기 결과???�인???�료?��? ?�아 추�? ?�인???�요?�니??")
+                        "공개 ?�보?�기 결과???�인???�료?��? ?�아 추�? ?�인???�요?�니??")
             } else {
                 job.put("recoveryState", "STABLE")
                     .put("lastRecoveryClassification", "RECOVERED")
-                    .put("lastRecoveryMessage", "?�이 ?�시 ?�작?????�료???�보?�기 결과�??�인?�습?�다.")
+                    .put("lastRecoveryMessage", "?�이 ?�시 ?�작?????�료???�보?�기 결과�??�인?�습?�다.")
                 job.remove("recoveryMessage")
             }
             job.put("recoveredAt", System.currentTimeMillis())
@@ -1039,7 +1031,7 @@ internal fun inspectProcessingHandoff(
             matched = true
             job.put("recoveryState", "STABLE")
                 .put("lastRecoveryClassification", KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name)
-                .put("lastRecoveryMessage", "처리가 ?�작?�기 ???�전 ?�행??종료?�었지�??�본 ?�레?�을 ?�시 ?�용?????�습?�다.")
+                .put("lastRecoveryMessage", "처리가 ?�작?�기 ???�전 ?�행??종료?�었지�??�본 ?�레?�을 ?�시 ?�용?????�습?�다.")
                 .put("recoveredAt", System.currentTimeMillis())
             job.remove("recoveryMessage")
             job.remove(PROCESSING_HANDOFF_RUNTIME_SESSION_ID)

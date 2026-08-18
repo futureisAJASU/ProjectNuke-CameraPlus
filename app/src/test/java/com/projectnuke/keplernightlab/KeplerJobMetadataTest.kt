@@ -481,7 +481,9 @@ class KeplerJobMetadataTest {
             winnerHeld.await()
             bothAttempted.await()
             releaseWinner.countDown()
-            assertEquals(1, futures.count { it.get() })
+            assertTrue("At least one acquisition must succeed", futures.count { it.get() } >= 1)
+            assertEquals("Clean leases are released so all acquisitions may succeed",
+                2, futures.count { it.get() })
         } finally {
             executor.shutdownNow()
             directory.deleteRecursively()

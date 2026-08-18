@@ -17,10 +17,10 @@ class RawProcessingOperationTest {
     @Test
     fun workerDispatchFailureRetainsOuterOperationThroughTerminalMetadata() {
         val dir = Files.createTempDirectory("raw-worker-dispatch-failure").toFile()
+        KeplerJobMetadata.write(dir, JSONObject().put("jobType", "RAW_CAPTURE"))
         val operation = acquireRawProcessingOperation(dir)
         assertNotNull(operation)
         try {
-            KeplerJobMetadata.write(dir, JSONObject().put("jobType", "RAW_CAPTURE"))
             var callbackPublished = false
             recordRawOuterTerminalFailureWhileOwned(
                 jobDir = dir,

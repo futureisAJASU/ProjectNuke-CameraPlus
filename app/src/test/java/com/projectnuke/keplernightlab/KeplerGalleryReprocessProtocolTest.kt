@@ -131,6 +131,11 @@ class KeplerGalleryReprocessProtocolTest {
         try {
             val lease = KeplerJobMetadata.acquireOperation(directory)!!
             try {
+                KeplerJobMetadata.beginActiveOperation(
+                    directory,
+                    kind = KeplerActiveOperationKind.PROCESSING_YUV,
+                    ownerLease = lease
+                )
                 assertTrue(KeplerJobMetadata.isOperationActive(directory))
                 assertTrue(KeplerJobMetadata.isOperationOwner(directory, lease))
                 val frames = listOf(frame(directory))

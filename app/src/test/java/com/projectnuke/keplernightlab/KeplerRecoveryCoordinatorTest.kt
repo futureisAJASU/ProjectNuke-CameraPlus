@@ -213,6 +213,11 @@ class KeplerRecoveryCoordinatorTest {
             KeplerJobMetadata.write(job, JSONObject().put("status", "PROCESSING"))
             val lease = KeplerJobMetadata.acquireOperation(job)!!
             try {
+                KeplerJobMetadata.beginActiveOperation(
+                    job,
+                    kind = KeplerActiveOperationKind.PROCESSING_YUV,
+                    ownerLease = lease
+                )
                 val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root))
                 assertEquals(KeplerJobRecoveryClassification.SKIP_ACTIVE_CURRENT_PROCESS, report.jobs.single().classification)
                 assertEquals("PROCESSING", KeplerJobMetadata.read(job).getString("status"))

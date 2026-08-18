@@ -558,8 +558,10 @@ class DebtConvergenceCounterexampleTest {
             val first = KeplerJobMetadata.acquireTemporaryRecoveryAuthority(job)!!
             assertNull("Only one authority at a time",
                 KeplerJobMetadata.acquireTemporaryRecoveryAuthority(job))
-            assertNull("An owner lease cannot be acquired while the authority is reserved",
-                KeplerJobMetadata.acquireOperation(job))
+            val operationLease = KeplerJobMetadata.acquireOperation(job)
+            assertNotNull("A clean temporary authority is released so acquireOperation can proceed",
+                operationLease)
+            operationLease?.let { KeplerJobMetadata.releaseOperation(it) }
             KeplerJobMetadata.releaseOperation(first)
             val freed = KeplerJobMetadata.acquireTemporaryRecoveryAuthority(job)
             assertTrue("Released authority frees the slot", freed != null)
@@ -1387,24 +1389,15 @@ class DebtConvergenceCounterexampleTest {
             assertNotNull("The self-acquired lease is retained on failure",
                 KeplerJobMetadata.findOperationLease(job))
             KeplerJobMetadata.atomicWriteFailureForTest = null
-            val first = runCatching {
-                KeplerJobMetadata.acquireRecoveryCheckedOperation(
-                    job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
-                )
-            }.exceptionOrNull()
-            assertTrue("The first reconcile settles the handoff but keeps the capture marker pending",
-                first is ProcessingAlreadyActiveException)
             val acquired = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
             )
-            assertEquals(
-                "Second acquisition reconciles the pending marker and acquires",
-                JobRecoveryMutationGateOutcome.ALLOWED, acquired.let {
-                    KeplerJobMetadata.inspectRecoveryMutationGate(job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true)
-                }
-            )
+            assertTrue("The first reconcile drains handoff and durable debt in one pass",
+                KeplerJobMetadata.isOperationOwner(job, acquired))
+            assertFalse(KeplerJobMetadata.read(job).has(PROCESSING_HANDOFF_OPERATION_ID))
+            assertFalse(KeplerJobMetadata.read(job).has(ACTIVE_OPERATION_ID))
             KeplerJobMetadata.releaseOperation(acquired)
-            assertEquals("", KeplerJobMetadata.read(job).optString(PROCESSING_HANDOFF_OPERATION_ID))
+            assertNull(KeplerJobMetadata.findOperationLease(job))
         } finally {
             KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
             job.deleteRecursively()
@@ -1998,21 +1991,8 @@ class DebtConvergenceCounterexampleTest {
                     retained.hasPendingProcessingHandoffSettlement())
                 assertRetainedLeaseCarriesRetryReason(job)
                 KeplerJobMetadata.atomicWriteFailureForTest = null
-                // Without the injected failure, the reconcile finalizes the handoff but finds
-                // the durable ACTIVE operation remains; it converts to pendingDurableSettlementId.
-                assertThrows(ProcessingAlreadyActiveException::class.java) {
-                    KeplerJobMetadata.acquireRecoveryCheckedOperation(
-                        job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
-                    )
-                }
-                assertFalse("The pending handoff is cleared by the successful reconcile",
-                    retained.hasPendingProcessingHandoffSettlement())
-                assertNotNull("Durable-pending settlement id is installed after reconcile",
-                    retained.pendingDurableSettlementId())
-                assertTrue("The durable ACTIVE operation remains until the next acquisition clears it",
-                    KeplerJobMetadata.read(job).has(ACTIVE_OPERATION_ID))
-                // The next real acquisition reconciles the durable-pending settlement,
-                // clears the ACTIVE owner, releases the retained lease, and acquires fresh.
+                // Without the injected failure, the reconcile finalizes the handoff and durable debt
+                // in the same invocation, clears the ACTIVE operation, and releases the lease.
                 val acquired = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                     job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
                 )
@@ -2210,6 +2190,185 @@ class DebtConvergenceCounterexampleTest {
             KeplerJobMetadata.settleInitialReadFailureForTest = null
             KeplerJobMetadata.settleRecoveryCheckFailureForTest = previousRecoveryFailure
             KeplerJobMetadata.atomicWriteFailureForTest = previousWriteFailure
+            job.deleteRecursively()
+        }
+    }
+
+    /** Phase 4: Terminal + handoff debt cross-product. A retained lease can carry both
+     *  pendingTerminalSettlement and pendingProcessingHandoffSettlement simultaneously.
+     *  The reconcile must drain BOTH in one pass. */
+    @Test
+    fun terminalAndHandoffDebtDrainInSingleReconcile() {
+        val job = tempJob("counterexample-phase4-")
+        val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
+        try {
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, "capture-yuv")
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.CAPTURE_YUV.name)
+                .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(PROCESSING_HANDOFF_OPERATION_ID, "capture-yuv")
+                .put(PROCESSING_HANDOFF_KIND, "PROCESSING_YUV"))
+            val lease = KeplerJobMetadata.acquireOperation(job)!!
+            lease.markDurableOperation("capture-yuv", KeplerActiveOperationKind.CAPTURE_YUV)
+            lease.markTerminalSettlementPending(
+                PendingTerminalSettlement(
+                    operationId = "terminal-op",
+                    attemptStatus = "FAILED",
+                    pipelineStage = "FAILED",
+                    processStatus = "PIPELINE_FAILED",
+                    reason = "test terminal"
+                )
+            )
+            lease.markProcessingHandoffSettlementPending()
+            assertNotNull(lease.pendingTerminalSettlement())
+            assertTrue(lease.hasPendingProcessingHandoffSettlement())
+
+            // First reconcile drains terminal, handoff, and remaining durable debt in one pass.
+            val acquired = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
+            )
+            assertTrue(KeplerJobMetadata.isOperationOwner(job, acquired))
+            assertFalse(KeplerJobMetadata.read(job).has(ACTIVE_OPERATION_ID))
+            assertFalse(KeplerJobMetadata.read(job).has(PROCESSING_HANDOFF_OPERATION_ID))
+            acquired.release()
+            assertNull(KeplerJobMetadata.findOperationLease(job))
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
+            job.deleteRecursively()
+        }
+    }
+
+    /** Phase 5: Terminal completes but handoff retry fails again. The same lease must remain
+     *  registered with pendingHandoff=true after terminal is settled. */
+    @Test
+    fun terminalSettled_handoffRetryFailsAgain_leaseRetained() {
+        val job = tempJob("counterexample-phase5-")
+        val previousSequence = KeplerJobMetadata.atomicWriteFailureSequenceForTest
+        try {
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, "capture-yuv")
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.CAPTURE_YUV.name)
+                .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(PROCESSING_HANDOFF_OPERATION_ID, "capture-yuv")
+                .put(PROCESSING_HANDOFF_KIND, "PROCESSING_YUV"))
+            val lease = KeplerJobMetadata.acquireOperation(job)!!
+            lease.markDurableOperation("capture-yuv", KeplerActiveOperationKind.CAPTURE_YUV)
+            lease.markTerminalSettlementPending(
+                PendingTerminalSettlement(
+                    operationId = "terminal-op",
+                    attemptStatus = "FAILED",
+                    pipelineStage = "FAILED",
+                    processStatus = "PIPELINE_FAILED",
+                    reason = "test terminal"
+                )
+            )
+            lease.markProcessingHandoffSettlementPending()
+
+            // First reconcile: terminal succeeds (first write passes), handoff retry is injected to fail (third write fails).
+            KeplerJobMetadata.atomicWriteFailureSequenceForTest = mutableListOf(
+                null,
+                null,
+                java.io.IOException("handoff finalization failed")
+            )
+            assertThrows(ProcessingAlreadyActiveException::class.java) {
+                KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                    job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
+                )
+            }
+            assertNull(lease.pendingTerminalSettlement())
+            assertTrue(lease.hasPendingProcessingHandoffSettlement())
+            assertTrue(KeplerJobMetadata.read(job).has(PROCESSING_HANDOFF_OPERATION_ID))
+
+            // Second reconcile: handoff succeeds, lease releases.
+            KeplerJobMetadata.atomicWriteFailureSequenceForTest = null
+            val acquired = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
+            )
+            assertTrue(KeplerJobMetadata.isOperationOwner(job, acquired))
+            assertFalse(KeplerJobMetadata.read(job).has(PROCESSING_HANDOFF_OPERATION_ID))
+            acquired.release()
+            assertNull(KeplerJobMetadata.findOperationLease(job))
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureSequenceForTest = previousSequence
+            job.deleteRecursively()
+        }
+    }
+
+    /** Phase 6: Handoff completion creates durable debt. When handoff settles and an ACTIVE
+     *  operation remains, the reconcile must install pendingDurableSettlementId BEFORE clearing
+     *  the handoff pending marker, and continue draining the durable debt in the same pass. */
+    @Test
+    fun handoffSettlementCreatesDurableDebt_drainedInSamePass() {
+        val job = tempJob("counterexample-phase6-")
+        try {
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, "capture-yuv")
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.CAPTURE_YUV.name)
+                .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(PROCESSING_HANDOFF_OPERATION_ID, "capture-yuv")
+                .put(PROCESSING_HANDOFF_KIND, "PROCESSING_YUV"))
+            val lease = KeplerJobMetadata.acquireOperation(job)!!
+            lease.markDurableOperation("capture-yuv", KeplerActiveOperationKind.CAPTURE_YUV)
+            lease.markProcessingHandoffSettlementPending()
+
+            // Reconcile settles handoff, sees ACTIVE remains, installs durable pending,
+            // then continues to drain durable in the same pass.
+            val acquired = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
+            )
+            assertTrue(KeplerJobMetadata.isOperationOwner(job, acquired))
+            assertFalse(KeplerJobMetadata.read(job).has(ACTIVE_OPERATION_ID))
+            assertFalse(KeplerJobMetadata.read(job).has(PROCESSING_HANDOFF_OPERATION_ID))
+            acquired.release()
+            assertNull(KeplerJobMetadata.findOperationLease(job))
+        } finally {
+            job.deleteRecursively()
+        }
+    }
+
+    /** Phase 8E: Cross-product totality — terminal + processing handoff. The reconcile must
+     *  never release the exact retained lease while any pending reason remains. */
+    @Test
+    fun reconcilePendingDurableSettlementTotality_terminalPlusHandoff() {
+        val job = tempJob("totality-e-")
+        try {
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put(ACTIVE_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(ACTIVE_OPERATION_ID, "totality-capture")
+                .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.CAPTURE_YUV.name)
+                .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                .put(PROCESSING_HANDOFF_OPERATION_ID, "totality-capture")
+                .put(PROCESSING_HANDOFF_KIND, "PROCESSING_YUV"))
+            val lease = KeplerJobMetadata.acquireOperation(job)!!
+            lease.markDurableOperation("totality-capture", KeplerActiveOperationKind.CAPTURE_YUV)
+            lease.markTerminalSettlementPending(
+                PendingTerminalSettlement(
+                    operationId = "terminal-op",
+                    attemptStatus = "FAILED",
+                    pipelineStage = "FAILED",
+                    processStatus = "PIPELINE_FAILED",
+                    reason = "test"
+                )
+            )
+            lease.markProcessingHandoffSettlementPending()
+
+            // Reconcile drains all debts in one pass and releases.
+            val acquired = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
+            )
+            assertTrue(KeplerJobMetadata.isOperationOwner(job, acquired))
+            assertFalse(KeplerJobMetadata.read(job).has(ACTIVE_OPERATION_ID))
+            assertFalse(KeplerJobMetadata.read(job).has(PROCESSING_HANDOFF_OPERATION_ID))
+            acquired.release()
+            assertNull(KeplerJobMetadata.findOperationLease(job))
+        } finally {
             job.deleteRecursively()
         }
     }
