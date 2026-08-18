@@ -558,11 +558,12 @@ class DebtConvergenceCounterexampleTest {
             val first = KeplerJobMetadata.acquireTemporaryRecoveryAuthority(job)!!
             assertNull("Only one authority at a time",
                 KeplerJobMetadata.acquireTemporaryRecoveryAuthority(job))
-            val operationLease = KeplerJobMetadata.acquireOperation(job)
-            assertNotNull("A clean temporary authority is released so acquireOperation can proceed",
-                operationLease)
-            operationLease?.let { KeplerJobMetadata.releaseOperation(it) }
+            assertNull("Clean temporary authority blocks acquireOperation",
+                KeplerJobMetadata.acquireOperation(job))
             KeplerJobMetadata.releaseOperation(first)
+            val operationLease = KeplerJobMetadata.acquireOperation(job)
+            assertNotNull("Released authority frees the slot", operationLease)
+            operationLease?.let { KeplerJobMetadata.releaseOperation(it) }
             val freed = KeplerJobMetadata.acquireTemporaryRecoveryAuthority(job)
             assertTrue("Released authority frees the slot", freed != null)
             freed?.let { KeplerJobMetadata.releaseOperation(it) }

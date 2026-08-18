@@ -5,6 +5,7 @@ import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertThrows
 import org.junit.Test
@@ -481,11 +482,69 @@ class KeplerJobMetadataTest {
             winnerHeld.await()
             bothAttempted.await()
             releaseWinner.countDown()
-            assertTrue("At least one acquisition must succeed", futures.count { it.get() } >= 1)
-            assertEquals("Clean leases are released so all acquisitions may succeed",
-                2, futures.count { it.get() })
+            assertEquals("Exactly one concurrent acquisition may succeed",
+                1, futures.count { it.get() })
         } finally {
             executor.shutdownNow()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun cleanLiveLeaseCannotBeReconciledByCompetitor() {
+        val directory = Files.createTempDirectory("kepler-clean-live-lease-").toFile()
+        var lease: JobOperationLease? = null
+        try {
+            KeplerJobMetadata.write(directory, JSONObject().put("status", "COMPLETE"))
+            lease = KeplerJobMetadata.acquireOperation(directory)
+            assertNotNull(lease)
+            assertTrue(KeplerJobMetadata.isOperationOwner(directory, lease!!))
+
+            assertThrows(ProcessingAlreadyActiveException::class.java) {
+                KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                    directory,
+                    JobRecoveryMutationIntent.JOB_DELETE
+                )
+            }
+            assertNull(KeplerJobMetadata.acquireOperation(directory))
+
+            assertEquals(lease, KeplerJobMetadata.findOperationLease(directory))
+            assertNull(lease.pendingTerminalSettlement())
+            assertNull(lease.pendingPublicExportSettlement())
+            assertFalse(lease.hasPendingProcessingHandoffSettlement())
+            assertNull(lease.pendingDurableSettlementId())
+            assertNull(lease.currentDurableOperationId())
+        } finally {
+            lease?.release()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun liveDurableOwnerIsNotConvertedToSettlementDebtByCompetitor() {
+        val directory = Files.createTempDirectory("kepler-live-durable-owner-").toFile()
+        var lease: JobOperationLease? = null
+        try {
+            KeplerJobMetadata.write(directory, JSONObject().put("status", "COMPLETE"))
+            lease = KeplerJobMetadata.acquireOperation(directory)
+            assertNotNull(lease)
+            lease!!.markDurableOperation("op-P", KeplerActiveOperationKind.PROCESSING_YUV)
+
+            assertThrows(ProcessingAlreadyActiveException::class.java) {
+                KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                    directory,
+                    JobRecoveryMutationIntent.PROCESSING_START
+                )
+            }
+
+            assertEquals(lease, KeplerJobMetadata.findOperationLease(directory))
+            assertEquals("op-P", lease.currentDurableOperationId())
+            assertNull(lease.pendingDurableSettlementId())
+            assertNull(lease.pendingTerminalSettlement())
+            assertNull(lease.pendingPublicExportSettlement())
+            assertFalse(lease.hasPendingProcessingHandoffSettlement())
+        } finally {
+            lease?.release()
             directory.deleteRecursively()
         }
     }

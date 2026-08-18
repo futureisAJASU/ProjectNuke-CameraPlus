@@ -20,6 +20,8 @@ import org.robolectric.RobolectricTestRunner
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 
 @RunWith(RobolectricTestRunner::class)
 class KeplerGalleryReprocessProtocolTest {
@@ -3364,4 +3366,37 @@ private fun rootManifest(txId: String, root: File): ReprocessTransactionManifest
   backedUpPaths = emptySet(),
   backupEntries = emptyMap()
 )
+
+    @Test
+    fun reprocessPreTransferLeaseWindowBlocksCompetingAcquisition() {
+        val directory = Files.createTempDirectory("kepler-reprocess-pre-transfer-").toFile()
+        try {
+            KeplerJobMetadata.write(directory, JSONObject().put("status", "COMPLETE"))
+            val session = ReprocessTransactionSession(directory)
+            val lease = session.acquireLease()
+            assertNotNull(lease)
+            assertTrue(KeplerJobMetadata.isOperationOwner(directory, lease!!))
+
+            assertThrows(ProcessingAlreadyActiveException::class.java) {
+                KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                    directory,
+                    JobRecoveryMutationIntent.REPROCESS
+                )
+            }
+            assertNull(KeplerJobMetadata.acquireOperation(directory))
+
+            assertEquals(lease, KeplerJobMetadata.findOperationLease(directory))
+            session.releaseIfUnowned()
+            assertNull(KeplerJobMetadata.findOperationLease(directory))
+
+            val acquired = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                directory,
+                JobRecoveryMutationIntent.REPROCESS
+            )
+            assertNotNull(acquired)
+            acquired.release()
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
 }

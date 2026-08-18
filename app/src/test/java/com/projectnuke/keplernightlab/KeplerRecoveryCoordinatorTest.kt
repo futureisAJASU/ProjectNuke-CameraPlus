@@ -5,6 +5,7 @@ import org.json.JSONObject
 import org.json.JSONArray
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertThrows
 import org.junit.Test
@@ -12,6 +13,8 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 
 @RunWith(RobolectricTestRunner::class)
 class KeplerRecoveryCoordinatorTest {
@@ -921,5 +924,39 @@ class KeplerRecoveryCoordinatorTest {
             val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
             assertEquals(KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED, report.jobs.single().classification)
         } finally { root.deleteRecursively() }
+    }
+
+    @Test
+    fun recoverRootsSerializesAgainstLiveCleanLease() {
+        val root = File(Files.createTempDirectory("kepler-recovery-live-lease-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_live").apply { mkdirs() }
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            KeplerJobMetadata.write(job, JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("status", "COMPLETE"))
+            val lease = KeplerJobMetadata.acquireOperation(job)
+            assertNotNull(lease)
+            val recoveryLatch = CountDownLatch(1)
+            val recoveryDone = CountDownLatch(1)
+            val future = executor.submit<KeplerRecoveryReport> {
+                recoveryLatch.countDown()
+                val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
+                recoveryDone.countDown()
+                report
+            }
+            recoveryLatch.await()
+            val firstReport = future.get()
+            assertEquals(KeplerJobRecoveryClassification.SKIP_ACTIVE_CURRENT_PROCESS, firstReport.jobs.single().classification)
+            assertEquals(lease, KeplerJobMetadata.findOperationLease(job))
+            assertTrue(KeplerJobMetadata.isOperationOwner(job, lease!!))
+            lease.release()
+            recoveryDone.await()
+            val secondReport = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
+            assertEquals(KeplerJobRecoveryClassification.RECOVERED, secondReport.jobs.single().classification)
+        } finally {
+            executor.shutdownNow()
+            root.deleteRecursively()
+        }
     }
 }

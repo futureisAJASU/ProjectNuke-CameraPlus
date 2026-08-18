@@ -421,6 +421,7 @@ internal fun inspectProcessingHandoff(
         lease: JobOperationLease,
         access: MediaStoreExportRecoveryAccess? = null
     ): Boolean {
+        if (!lease.hasPendingReconciliationDebt()) return false
         val pendingTerminal = lease.pendingTerminalSettlement()
         if (pendingTerminal != null) {
             val persisted = try {
@@ -1510,6 +1511,12 @@ class JobOperationLease internal constructor(internal val key: String) {
 
     internal fun hasPendingProcessingHandoffSettlement(): Boolean =
         pendingProcessingHandoffSettlement.get()
+
+    internal fun hasPendingReconciliationDebt(): Boolean =
+        pendingTerminalSettlement.get() != null ||
+            pendingPublicExportSettlement.get() != null ||
+            pendingProcessingHandoffSettlement.get() ||
+            pendingDurableSettlementId.get() != null
 
     internal fun completeProcessingHandoffSettlement(): Boolean =
         pendingProcessingHandoffSettlement.compareAndSet(true, false)
