@@ -2168,18 +2168,20 @@ class DebtConvergenceCounterexampleTest {
                 .put(PROCESSING_HANDOFF_OPERATION_ID, "H30")
                 .put(PROCESSING_HANDOFF_KIND, "PROCESSING_YUV"))
 
-            // Control A: existing exact owner present; settle succeeds and releases it
-            // (no durable handoff survives a successful settlement — owner is discharged).
+            // Control A: existing unrelated/live owner present; settlement MUST NOT commandeer it.
+            // The helper should return false/busy and leave the existing owner authoritative.
             val existingLease = KeplerJobMetadata.acquireOperation(job)!!
             existingLease.markDurableOperation("existing-op", KeplerActiveOperationKind.PROCESSING_YUV)
             KeplerJobMetadata.settleRecoveryCheckFailureForTest = java.io.IOException("injected acquisition failure")
             val settledExisting = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(job)
-            assertTrue("Existing owner handles settlement without creating a second lease", settledExisting)
-            assertNull("Successful settle discharges the existing owner",
+            assertFalse("Existing unrelated owner must not be commandeered for handoff settlement", settledExisting)
+            assertNotNull("Existing owner remains authoritative and is NOT released",
                 KeplerJobMetadata.findOperationLease(job))
 
-            // Control B: no existing owner; reserved authority handles any settlement failure.
+            // Clean up the existing lease before Control B
             existingLease.release()
+
+            // Control B: no existing owner; reserved authority handles any settlement failure.
             KeplerJobMetadata.write(job, JSONObject()
                 .put("jobType", "YUV_NIGHT_FUSION")
                 .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
