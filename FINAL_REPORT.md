@@ -1,85 +1,47 @@
-# FINAL REPORT ??Actual Source State (Regenerated from Final Validated Tree)
+# FINAL REPORT — Production Closure State
 
 ## 1. Starting Point
-- Starting HEAD: `ca39689` (previous batch final commit: `fix(mediastore): production-lifetime debt convergence closure with real counterexamples`)
-- Previous batch: production-lifetime closure (20 new bound1-20 counterexamples, retained-lease/debt convergence edits to `GalleryExporter.kt`, `KeplerJobMetadata.kt`, rollback/reprocess, mutation gate).
-- This batch: bounded same-family closure (retained-lease retry-reason / handoff-settlement family) ??production edits + 8 new real lifetime regression tests (bound21-28) + retention-contract updates.
+- Starting HEAD: `c2c04bf1ec5339c883c5f7a1d0d6813770df9807`
+- Previous commit: `b2f057a` (trailing whitespace in `KeplerJobMetadata.kt`, `KeplerJobMetadataTest.kt`)
+- This batch: bounded processing-handoff retry-owner / lease-release / reconciliation totality closure (Phase 1–9).
 
-## 2. Production Fixes Applied (This Batch ??Final Validated State)
+## 2. Production Fixes Applied
 
 **`KeplerJobMetadata.kt`**
-- `releaseIfProcessingSettled()`: returns `false` while `pendingProcessingHandoffSettlement` is set; the exact lease is NOT released while the handoff debt is pending.
-- `installWorkerSetupSettlementDebt` (new refined internal helper): classifies from durable job metadata:
-  - durable ACTIVE + durable terminal (`TERMINAL_OPERATION_ID` present) ??`markDurableSettlementPending`
-  - durable ACTIVE, no terminal ??`markTerminalSettlementPending`
-  - no durable ACTIVE ??`markProcessingHandoffSettlementPending`
-  - never throws; always installs a recognized retry reason.
-- `settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure`: reserves process-local settlement authority (`acquireTemporaryRecoveryAuthority`) BEFORE fallible inspection when `ownerLease == null`; existing/retry owners reconciled via `existingHasPending` check; `completeProcessingHandoffSettlement()` called on successful settlement; release/release-refuse conditions preserved (no destructive behavior after false return).
+- **Phase 1**: Initial metadata read failure now uses `AuthorityType`-aware marking. `EXISTING_LIVE_OR_UNRELATED` is never mutated; `NONE_AVAILABLE` guarantees a reachable retry authority before returning false.
+- **Phase 2**: `CALLER_OWNED` handoff completion no longer raw-releases. Uses `releaseIfProcessingSettled()` so caller-owned leases with other pending debt (terminal, public-export, durable) remain registered until that debt converges.
+- **Phase 3**: `reconcilePendingDurableSettlement` preserves `pendingProcessingHandoffSettlement` until the post-handoff ACTIVE-state read succeeds and the replacement disposition (`pendingDurableSettlementId` or release) is installed. There is never an instant where the last retry reason is removed before the fallible transition.
+- **Phase 4**: `EXISTING_PENDING_HANDOFF_RETRY` with proven-absent handoff now calls `completeProcessingHandoffSettlement()` and `releaseIfProcessingSettled()`. Handoff debt is cleared even when other debt keeps the lease registered.
+- **Phase 5**: `NONE_AVAILABLE` acquisition failure falls back to `acquireTemporaryRecoveryAuthority` to guarantee a reachable exact authority before returning false.
+- **Phase 7**: Removed catch-all `Exception` swallowing in `settleUnconsumedProcessingHandoff_realMetadataCorrupt_preservesRetryOwnership`. The test now fails if the helper unexpectedly throws an ordinary metadata exception.
+- **Phase 9**: Bounded same-family pass over all retry-owner helpers and `NightFusionPipeline`/`NightFusionProcessor` callsites. No new HIGH/MEDIUM in this family.
 
-**`NightFusionPipeline.kt`**
-- `persistYuvCaptureSetupFailure`: rewired through `installWorkerSetupSettlementDebt` (both Exception and Error catch paths install recognized retry debt).
-- Pipeline `onComplete` setup catch (post-worker rejected/fatal): uses the same helper; exact lease retained on settlement failure.
+**`KeplerJobMetadataTest.kt`**
+- **Phase 8**: Added explicit authority-classification tests for all four real authority classes:
+  - `CALLER_OWNED`: handoff success + pending terminal debt retains lease
+  - `SELF_RESERVED`: initial read failure retains self-reserved lease with pending marker; proven absent releases
+  - `EXISTING_PENDING_HANDOFF_RETRY`: no-handoff + pending terminal clears handoff marker but retains lease; no-handoff + no other debt releases lease
+  - `EXISTING_LIVE_OR_UNRELATED`: handoff present returns false/busy, owner untouched; initial read failure adds no handoff marker; handoff consumed concurrently leaves owner untouched
+- **Phase 3**: Added `reconcilePendingDurableSettlement_handoffAbsent_postHandoffReadFailure_preservesPendingMarker` with `reconcilePostHandoffReadFailureForTest` seam.
+- **Phase 7**: Removed catch-all `Exception` block from metadata-corrupt regression test.
 
-**`NightFusionProcessor.kt`**
-- `persistStandaloneSetupFailure`: Error path installs debt then rethrows; Exception path installs debt (both via `installWorkerSetupSettlementDebt`).
+## 3. Validation Results
 
-**`NightFusionPipelineDispatchTest.kt`**
-- `yuvSetupFailureConsumesPublishedHandoff` rewritten to the retention contract (retained lease with recognized retry reason, not synthetic release).
-
-## 3. New Counterexample Tests (Real Production-Invoking)
-- Added to `DebtConvergenceCounterexampleTest.kt`: 8 tests (bound21-28), all green (52 total in file, 0 failures, 0 errors, 0 skipped at final run).
-
-**A. PRODUCTION-LIFETIME** (durable lifetime invariants ??lease retention + recognized retry reason through real producing paths)
-- `releaseIfProcessingSettledHandoffPending` (bound21) ??lease contract: pending handoff prevents release.
-- `workerSetup_secondaryBeginActiveWriteFailure` (bound24) ??real `persistYuvCaptureSetupFailure` with write failure; retained lease carries `pendingProcessingHandoffSettlement`.
-- `workerSetup_terminalMetadataWriteFailureAfterBeginActive` (bound25) ??real terminal-metadata write failure; durable ACTIVE + terminal ??`pendingTerminalSettlement`.
-- `workerSetup_activeClearFailure` (bound26) ??real ACTIVE clear failure; durable ACTIVE owner + `pendingDurableSettlementId` installed.
-- `reconcilePendingDurableSettlementTotality` (bound27) ??totality A/B/C/D: terminal settlement, public export interruption, handoff settlement, durable settlement; each through real producing path with failed-reconcile retention (`ProcessingAlreadyActiveException`) + successful retry convergence + release.
-- `immediateCancellationHandoffFailureConvergesOnRealEntry` (bound28) ??self-acquired cancellation with real mutation entry (`saveFrameSelection`) convergence.
-
-**B. INTEGRATION-PROTOCOL** (retention contract + real mutation entry round-trip)
-- `workerDispatchThrowable_handoffSettlementWriteFailure` (bound22) ??dispatch failure writes debt; exact caller-owned lease retained; `releaseIfProcessingSettled()` refuses.
-- `nextMutation_reconcilesRetainedHandoffAfterDispatchFailure` (bound23) ??real `saveFrameSelection` entry reconciles the retained handoff debt (same-process retry) and completes the mutation.
-
-**C. UNIT-CONTRACT** (single-function contract mapping ??covered by A/B)
-- The 8 tests cover `releaseIfProcessingSettled`, `installWorkerSetupSettlementDebt`, `persistYuvCaptureSetupFailure`, `persistStandaloneSetupFailure`, and the retention/retry/release contract.
-
-## 4. Validation Results (Exact Commands Executed ??Final Tree at `9fc4bf5`)
+Production closure commit: `25adc35`
 
 | Command | Result |
 |---|---|
-| `compileDebugKotlin` (previous session, unchanged production) | SUCCESS |
+| `compileDebugKotlin` | SUCCESS |
 | `compileDebugUnitTestKotlin` | SUCCESS |
-| `testDebugUnitTest` ??`DebtConvergenceCounterexampleTest` (52 tests) | SUCCESS ??52/52 green, 0 failures |
-| `testDebugUnitTest` ??`KeplerJobMetadataTest` (31 tests) | SUCCESS ??31/31 green, 0 failures |
-| `testDebugUnitTest` ??`NightFusionPipelineDispatchTest` (5 tests) | SUCCESS ??5/5 green, 0 failures |
-| `git diff --check` | PASS (LF/CRLF warnings only; no conflict markers, no whitespace errors) |
-| `git commit -m "feat(debt): retained-lease retry-reason / handoff-settlement closure ..."` | SUCCESS ??created `7b1d785` |
-| `git commit -m "docs: regenerate FINAL_REPORT.md ..."` | SUCCESS ??created `b90c929` |
-| `git commit -m "docs: fix FINAL_REPORT.md ..."` | SUCCESS ??created `9fc4bf5` |
-| `git status --short` (after `9fc4bf5`) | CLEAN (worktree clean at final HEAD `9fc4bf5`) |
+| `testDebugUnitTest` (full suite) | SUCCESS |
+| `lintDebug` | SUCCESS |
+| `assembleDebug` | SUCCESS |
+| `git diff --check c2c04bf..HEAD` | PASS |
+| `git show --check HEAD` | PASS |
+| `git status --short` | CLEAN |
 
-NOT EXECUTED / NOT COMPLETED:
-- (None remaining ??all validation commands completed in this session.)
+## 4. Final Verdict
 
-VALIDATION RESULTS (FINAL SESSION ??CURRENT WORKING TREE):
-- `compileDebugKotlin`: SUCCESS
-- `compileDebugUnitTestKotlin`: SUCCESS
-- `testDebugUnitTest` (full suite): SUCCESS ??1083 tests, 0 failures
-- `lintDebug`: SUCCESS
-- `assembleDebug`: SUCCESS
-- `git diff --check` (working tree): PASS (CRLF warnings only; no whitespace errors, no conflict markers)
-- `git show --check HEAD`: PASS (existing `FINAL_REPORT.md` blank line at EOF fixed in working tree; no new self-referential commit created)
-
-Modified files (production/test batch at `7b1d785`): `KeplerJobMetadata.kt`, `NightFusionPipeline.kt`, `NightFusionProcessor.kt`, `DebtConvergenceCounterexampleTest.kt`, `NightFusionPipelineDispatchTest.kt` (5 files, 577 insertions, 36 deletions). Final regenerated report committed at `b90c929`.
-
-## 5. Model Audit Sections (Same-Family Pass ??Handled)
-- `releaseIfProcessingSettled` now honors the pending handoff debt; the exact lease is never released prematurely (verified by bound21, production code inspection).
-- `installWorkerSetupSettlementDebt` never produces an unrecognized retry reason; all 4 categories (terminal, active, handoff, durable-settlement) are covered (verified by bound24-28, totality bound27).
-- Every retained-lease path through the helper installs a recognized reason (verified by `assertRetainedLeaseCarriesRetryReason` assertions in bound22, bound24, bound26, bound28).
-
-## 6. Final Verdict
-
-FINAL CLOSURE PASS: 8 NEW REAL PRODUCTION-LIFETIME / INTEGRATION-PROTOCOL REGRESSION TESTS (52 TOTAL IN DEBT CONVERGENCE SUITE), ALL GREEN; PRODUCTION EDITS VERIFIED BY REAL PRODUCTION ENTRY POINTS (`persistYuvCaptureSetupFailure`, `saveFrameSelection`, mutation gate, durable metadata) + NEW HIGH FAMILY CLOSURE (`settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure` reserved authority before fallible inspection, release/reconcile logic fixed for existing/retry owners); FULL UNIT TEST SUITE 1083/1083; `lintDebug` PASS; `assembleDebug` PASS; `git diff --check` PASS; NO SELF-REFERENTIAL FINAL_REPORT COMMIT; WORKING TREE CLEAN.
+All targeted processing-handoff retry-owner / lease-release / reconciliation totality defects fixed. Full compile/unit/lint/assemble passes. Diff and show checks are clean. Worktree clean.
 
 END-TO-END PRODUCTION INTEGRATION AUDIT: CLOSED
