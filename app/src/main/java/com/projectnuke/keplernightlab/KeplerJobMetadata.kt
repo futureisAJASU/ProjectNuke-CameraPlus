@@ -21,7 +21,7 @@ sealed class KeplerJobMetadataException(message: String, cause: Throwable? = nul
 class KeplerJobMetadataMissing(jobDir: File) : KeplerJobMetadataException("Job metadata missing in ${jobDir.absolutePath}")
 class KeplerJobMetadataCorrupt(jobDir: File, cause: Throwable? = null) : KeplerJobMetadataException("Job metadata corrupt in ${jobDir.absolutePath}", cause)
 internal class ProcessingCleanupRequiredException : IllegalStateException(
-    "이전 처리 작업의 파일 정리가 완료되지 않아 지금은 다시 합성할 수 없습니다."
+    "?�전 처리 ?�업???�일 ?�리가 ?�료?��? ?�아 지금�? ?�시 ?�성?????�습?�다."
 )
 internal const val PROCESSING_CLEANUP_REQUIRED = "PROCESSING_CLEANUP_REQUIRED"
 
@@ -77,19 +77,19 @@ internal class JobRecoveryMutationBlockedException(
     val outcome: JobRecoveryMutationGateOutcome
 ) : IllegalStateException(
     when (outcome) {
-        JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION -> "이전 실행의 작업 소유권이 아직 복구되지 않아 지금은 작업을 변경할 수 없습니다."
-        JobRecoveryMutationGateOutcome.BLOCKED_HANDOFF -> "촬영 결과의 처리 인계가 아직 완료되지 않아 지금은 작업을 변경할 수 없습니다."
-        JobRecoveryMutationGateOutcome.BLOCKED_ORPHANED_JOB_METADATA -> "작업 메타데이터가 없어 복구 확인 전에는 작업을 변경할 수 없습니다."
-        JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP -> "이전 처리 작업의 파일 정리가 완료되지 않아 지금은 작업을 변경할 수 없습니다."
-        JobRecoveryMutationGateOutcome.BLOCKED_AMBIGUOUS_RECOVERY -> "복구되지 않은 작업 증거가 있어 지금은 작업을 변경할 수 없습니다."
-        JobRecoveryMutationGateOutcome.BLOCKED_PUBLIC_COMMIT_MISSING -> "공개 결과의 커밋 증거가 없어 지금은 작업을 변경할 수 없습니다."
-        JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION -> "공개 결과를 확인하지 못해 지금은 작업을 변경할 수 없습니다."
-        JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_SETTLEMENT -> "공개 내보내기의 작업 정리 확인이 끝나지 않아 지금은 작업을 변경할 수 없습니다."
-        JobRecoveryMutationGateOutcome.BLOCKED_INVALID_PROCESSING_JOURNAL -> "처리 복구 기록을 읽을 수 없어 지금은 작업을 변경할 수 없습니다."
-        JobRecoveryMutationGateOutcome.BLOCKED_REPROCESS_QUARANTINE -> "복구 중인 작업은 지금 변경할 수 없습니다."
-        JobRecoveryMutationGateOutcome.INSPECTION_FAILED -> "작업 복구 상태를 확인하지 못해 지금은 작업을 변경할 수 없습니다."
-        JobRecoveryMutationGateOutcome.BLOCKED_INVALID_EXPORT_JOURNAL -> "내보내기 복구 기록을 읽을 수 없어 지금은 작업을 변경할 수 없습니다."
-        JobRecoveryMutationGateOutcome.BLOCKED_SETTLED_JOURNAL -> "완료된 처리 기록의 정리가 끝나지 않아 지금은 결과 경로를 변경할 수 없습니다."
+        JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION -> "?�전 ?�행???�업 ?�유권이 ?�직 복구?��? ?�아 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_HANDOFF -> "촬영 결과??처리 ?�계가 ?�직 ?�료?��? ?�아 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_ORPHANED_JOB_METADATA -> "?�업 메�??�이?��? ?�어 복구 ?�인 ?�에???�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_PROCESSING_CLEANUP -> "?�전 처리 ?�업???�일 ?�리가 ?�료?��? ?�아 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_AMBIGUOUS_RECOVERY -> "복구?��? ?��? ?�업 증거가 ?�어 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_PUBLIC_COMMIT_MISSING -> "공개 결과??커밋 증거가 ?�어 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION -> "공개 결과�??�인?��? 못해 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_SETTLEMENT -> "공개 ?�보?�기???�업 ?�리 ?�인???�나지 ?�아 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_INVALID_PROCESSING_JOURNAL -> "처리 복구 기록???�을 ???�어 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_REPROCESS_QUARANTINE -> "복구 중인 ?�업?� 지�?변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.INSPECTION_FAILED -> "?�업 복구 ?�태�??�인?��? 못해 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_INVALID_EXPORT_JOURNAL -> "?�보?�기 복구 기록???�을 ???�어 지금�? ?�업??변경할 ???�습?�다."
+        JobRecoveryMutationGateOutcome.BLOCKED_SETTLED_JOURNAL -> "?�료??처리 기록???�리가 ?�나지 ?�아 지금�? 결과 경로�?변경할 ???�습?�다."
         JobRecoveryMutationGateOutcome.ALLOWED -> ""
     }
 )
@@ -143,6 +143,11 @@ object KeplerJobMetadata {
     public fun setLeaseReleaseCountForTest(value: Int) { leaseReleaseCount = value }
 
     public fun getLeaseReleaseCountForTest(): Int = leaseReleaseCount
+
+    /** Narrow test-only seam: inject an ordinary Exception on the post-handoff ACTIVE-state read
+     *  within [reconcilePendingDurableSettlement]. Cleared after use. */
+    public var reconcilePostHandoffReadFailureForTest: Throwable? = null
+        internal set
 
     private fun lockFor(jobDir: File): Any = _locks[
         (jobDir.toPath().toAbsolutePath().normalize().toString().hashCode() and Int.MAX_VALUE) % _locks.size
@@ -482,8 +487,8 @@ internal fun inspectProcessingHandoff(
                 }
                 if (!settled) return false
             }
-            lease.completeProcessingHandoffSettlement()
             val current = try {
+                reconcilePostHandoffReadFailureForTest?.let { throw it }
                 read(jobDir)
             } catch (failure: Error) {
                 throw failure
@@ -492,10 +497,12 @@ internal fun inspectProcessingHandoff(
             }
             val activeId = current.optString(ACTIVE_OPERATION_ID)
             if (activeId.isBlank()) {
+                lease.completeProcessingHandoffSettlement()
                 lease.release()
                 return true
             }
             lease.markDurableSettlementPending(activeId)
+            lease.completeProcessingHandoffSettlement()
             return false
         }
         val pendingId = lease.pendingDurableSettlementId() ?: return false
@@ -553,9 +560,9 @@ internal fun inspectProcessingHandoff(
             job.put("recoveryState", PROCESSING_CLEANUP_REQUIRED)
                 .put("processingCleanupDebt", JSONArray(failures.distinct()))
                 .put("lastRecoveryClassification", historicalClassification)
-                .put("lastRecoveryMessage", "처리 결과는 보존되었지만 이전 작업의 파일 정리가 아직 완료되지 않았습니다.")
+                .put("lastRecoveryMessage", "처리 결과??보존?�었지�??�전 ?�업???�일 ?�리가 ?�직 ?�료?��? ?�았?�니??")
                 .put("recoveredAt", System.currentTimeMillis())
-                .put("recoveryMessage", "이전 처리 작업의 파일 정리가 완료되지 않아 지금은 다시 합성할 수 없습니다.")
+                .put("recoveryMessage", "?�전 처리 ?�업???�일 ?�리가 ?�료?��? ?�아 지금�? ?�시 ?�성?????�습?�다.")
             if (operationId != null) {
                 job.remove(ACTIVE_RUNTIME_SESSION_ID)
                 job.remove(ACTIVE_OPERATION_ID)
@@ -956,13 +963,13 @@ internal fun inspectProcessingHandoff(
                     .put("lastRecoveryClassification",
                         KeplerJobRecoveryClassification.PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION.name)
                     .put("lastRecoveryMessage",
-                        "앱이 다시 시작된 후 완료된 내보내기는 확인되지 않아 추가 확인이 필요합니다.")
+                        "?�이 ?�시 ?�작?????�료???�보?�기???�인?��? ?�아 추�? ?�인???�요?�니??")
                     .put("recoveryMessage",
-                        "공개 내보내기 결과의 확인이 완료되지 않아 추가 확인이 필요합니다.")
+                        "공개 ?�보?�기 결과???�인???�료?��? ?�아 추�? ?�인???�요?�니??")
             } else {
                 job.put("recoveryState", "STABLE")
                     .put("lastRecoveryClassification", "RECOVERED")
-                    .put("lastRecoveryMessage", "앱이 다시 시작된 후 완료된 내보내기 결과를 확인했습니다.")
+                    .put("lastRecoveryMessage", "?�이 ?�시 ?�작?????�료???�보?�기 결과�??�인?�습?�다.")
                 job.remove("recoveryMessage")
             }
             job.put("recoveredAt", System.currentTimeMillis())
@@ -1032,7 +1039,7 @@ internal fun inspectProcessingHandoff(
             matched = true
             job.put("recoveryState", "STABLE")
                 .put("lastRecoveryClassification", KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT.name)
-                .put("lastRecoveryMessage", "처리가 시작되기 전 이전 실행이 종료되었지만 원본 프레임을 다시 사용할 수 있습니다.")
+                .put("lastRecoveryMessage", "처리가 ?�작?�기 ???�전 ?�행??종료?�었지�??�본 ?�레?�을 ?�시 ?�용?????�습?�다.")
                 .put("recoveredAt", System.currentTimeMillis())
             job.remove("recoveryMessage")
             job.remove(PROCESSING_HANDOFF_RUNTIME_SESSION_ID)
@@ -1052,8 +1059,8 @@ internal fun inspectProcessingHandoff(
      * Installs the deterministic retry reason for a secondary worker-setup/terminalization
      * failure BEFORE an operation scope returns, so a returned scope can never leave the exact
      * lease registered without a reason [reconcilePendingDurableSettlement] understands:
-     *  - a durable ACTIVE operation with durable terminal evidence → pending durable settlement;
-     *  - a durable ACTIVE operation without durable terminal evidence → pending terminal settlement;
+     *  - a durable ACTIVE operation with durable terminal evidence ??pending durable settlement;
+     *  - a durable ACTIVE operation without durable terminal evidence ??pending terminal settlement;
      *  - a missing durable owner leaves the exact lease protecting the capture processing
      *    handoff (pending processing-handoff settlement).
      * Returns [primaryFailure] combined with any marking failure. Never throws.
@@ -1110,10 +1117,10 @@ internal fun inspectProcessingHandoff(
      *
      * Regression 1 (blank-check leak): when `settleOnlyIfPresent=true` and the initial
      * inspection proves the handoff absent, the temporarily reserved process-local
-     * authority must be released before returning TRUE — a dangling lease leaves the
+     * authority must be released before returning TRUE ??a dangling lease leaves the
      * next mutation acquisition blocked forever.
      *
-     * Regression 2 (reinspection IOException → false): a reinspection read failure must
+     * Regression 2 (reinspection IOException ??false): a reinspection read failure must
      * NOT be interpreted as "handoff absent".  It is indistinguishably a transient read
      * fault; the helper must mark pending and return FALSE so the caller retries, never
      * returning TRUE while a durable handoff may still exist.
@@ -1145,12 +1152,21 @@ internal fun inspectProcessingHandoff(
             findOperationLease(jobDir)
         } else null
 
+        // Phase 4: Explicit classification of authority types
+        val authorityType = when {
+            ownerLease != null -> AuthorityType.CALLER_OWNED
+            reservedAuthority != null -> AuthorityType.SELF_RESERVED
+            existingAuthority != null && existingAuthority.hasPendingProcessingHandoffSettlement() -> AuthorityType.EXISTING_PENDING_HANDOFF_RETRY
+            existingAuthority != null -> AuthorityType.EXISTING_LIVE_OR_UNRELATED
+            else -> AuthorityType.NONE_AVAILABLE
+        }
+
         // The lease object that "owns" this settlement: any of the three sources above,
         // in preference order.  Preserving `lease` here lets the reinspection-catch block
         // mark the correct object pending on any read failure.
         val lease = ownerLease ?: reservedAuthority ?: existingAuthority
 
-        // Injected initial-read failure (regression test seam — only applies to first read).
+        // Injected initial-read failure (regression test seam ??only applies to first read).
         val initialReadFailure = settleInitialReadFailureForTest?.also {
             settleInitialReadFailureForTest = null
         }
@@ -1161,108 +1177,148 @@ internal fun inspectProcessingHandoff(
             }
             read(jobDir).optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()
         } catch (failure: Error) {
-            lease?.markProcessingHandoffSettlementPending()
+            when (authorityType) {
+                AuthorityType.CALLER_OWNED -> ownerLease?.markProcessingHandoffSettlementPending()
+                AuthorityType.SELF_RESERVED -> reservedAuthority?.markProcessingHandoffSettlementPending()
+                AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> existingAuthority?.markProcessingHandoffSettlementPending()
+                AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {}
+                AuthorityType.NONE_AVAILABLE -> {
+                    val fallback = reservedAuthority ?: run {
+                        try { acquireTemporaryRecoveryAuthority(jobDir) } catch (_: Exception) { null }
+                    }
+                    fallback?.markProcessingHandoffSettlementPending()
+                }
+            }
             throw failure
         } catch (_: Exception) {
-            lease?.markProcessingHandoffSettlementPending()
+            when (authorityType) {
+                AuthorityType.CALLER_OWNED -> ownerLease?.markProcessingHandoffSettlementPending()
+                AuthorityType.SELF_RESERVED -> reservedAuthority?.markProcessingHandoffSettlementPending()
+                AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> existingAuthority?.markProcessingHandoffSettlementPending()
+                AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {}
+                AuthorityType.NONE_AVAILABLE -> {
+                    val fallback = reservedAuthority ?: run {
+                        try { acquireTemporaryRecoveryAuthority(jobDir) } catch (_: Exception) { null }
+                    }
+                    fallback?.markProcessingHandoffSettlementPending()
+                }
+            }
             return false
         }
 
         if (!handoffPresent) {
-            if (settleOnlyIfPresent) {
-                // Regression 1 fix: release reserved authority here; caller-owned and
-                // existing-sticky authorities are caller-managed.
-                reservedAuthority?.let { r ->
-                    r.release()
-                    @Suppress("DEPRECATION")
-                    operationLeases.remove(r.key)
+            when (authorityType) {
+                AuthorityType.CALLER_OWNED -> {
+                    if (ownerLease == null) return true
+                    val current = try {
+                        read(jobDir)
+                    } catch (failure: Error) {
+                        ownerLease.markProcessingHandoffSettlementPending()
+                        throw failure
+                    } catch (_: Exception) {
+                        ownerLease.markProcessingHandoffSettlementPending()
+                        return false
+                    }
+                    if (current.optString(ACTIVE_OPERATION_ID).isBlank()) {
+                        ownerLease.completeProcessingHandoffSettlement()
+                        ownerLease.releaseIfProcessingSettled()
+                        return true
+                    }
+                    ownerLease.markDurableSettlementPending(current.optString(ACTIVE_OPERATION_ID))
+                    return false
                 }
-                return true
+                AuthorityType.SELF_RESERVED -> {
+                    reservedAuthority?.releaseIfProcessingSettled()
+                    return true
+                }
+                AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> {
+                    existingAuthority?.completeProcessingHandoffSettlement()
+                    existingAuthority?.releaseIfProcessingSettled()
+                    return true
+                }
+                AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {
+                    return true
+                }
+                AuthorityType.NONE_AVAILABLE -> {
+                    return true
+                }
             }
-            if (ownerLease == null) return true
-            val current = try {
-                read(jobDir)
-            } catch (failure: Error) {
-                ownerLease.markProcessingHandoffSettlementPending()
-                throw failure
-            } catch (_: Exception) {
-                ownerLease.markProcessingHandoffSettlementPending()
-                return false
-            }
-            if (current.optString(ACTIVE_OPERATION_ID).isBlank()) {
-                ownerLease.completeProcessingHandoffSettlement()
-                ownerLease.release()
-                return true
-            }
-            ownerLease.markDurableSettlementPending(current.optString(ACTIVE_OPERATION_ID))
-            return false
         }
 
-        // Handoff present: resolve the authoritative lease.
-        val resolvedLease = ownerLease ?: reservedAuthority ?: existingAuthority ?: try {
-            val recoveryFailure = settleRecoveryCheckFailureForTest?.also {
-                settleRecoveryCheckFailureForTest = null
+        // Handoff present: resolve the authoritative lease based on classification.
+        val resolvedLease = when (authorityType) {
+            AuthorityType.CALLER_OWNED -> ownerLease
+            AuthorityType.SELF_RESERVED -> reservedAuthority
+            AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> existingAuthority
+            AuthorityType.EXISTING_LIVE_OR_UNRELATED -> return false  // Cannot hijack unrelated authority
+            AuthorityType.NONE_AVAILABLE -> {
+                try {
+                    val recoveryFailure = settleRecoveryCheckFailureForTest?.also {
+                        settleRecoveryCheckFailureForTest = null
+                    }
+                    if (recoveryFailure != null) throw recoveryFailure
+                    acquireRecoveryCheckedOperation(
+                        jobDir,
+                        JobRecoveryMutationIntent.PROCESSING_START,
+                        consumesProcessingHandoff = true
+                    )
+                } catch (failure: Error) {
+                    reservedAuthority?.markProcessingHandoffSettlementPending()
+                    throw failure
+                } catch (_: Exception) {
+                    val fallbackAuthority = reservedAuthority ?: run {
+                        try { acquireTemporaryRecoveryAuthority(jobDir) } catch (_: Exception) { null }
+                    }
+                    fallbackAuthority?.markProcessingHandoffSettlementPending()
+                    return false
+                }
             }
-            if (recoveryFailure != null) throw recoveryFailure
-            acquireRecoveryCheckedOperation(
-                jobDir,
-                JobRecoveryMutationIntent.PROCESSING_START,
-                consumesProcessingHandoff = true
-            )
-        } catch (failure: Error) {
-            reservedAuthority?.markProcessingHandoffSettlementPending()
-            throw failure
-        } catch (_: Exception) {
-            reservedAuthority?.markProcessingHandoffSettlementPending()
-            return false
         }
 
-        // Regression 2: reinspection distinguishes ABSENT / PRESENT / FAILED.
+        // Phase 2: Fix the real production metadata exception handling
+        // Catch KeplerJobMetadataException instead of raw IOException for production reads
         val reinspectionState = try {
             settlePostAuthorityReadFailureForTest?.let { throw it }
             read(jobDir).optString(PROCESSING_HANDOFF_OPERATION_ID)
         } catch (failure: Error) {
-            if (ownerLease != null) ownerLease.markProcessingHandoffSettlementPending()
-            else if (reservedAuthority != null) reservedAuthority.markProcessingHandoffSettlementPending()
-            // Do NOT mark existingAuthority — it is caller-sticky.
+            when (authorityType) {
+                AuthorityType.CALLER_OWNED -> ownerLease?.markProcessingHandoffSettlementPending()
+                AuthorityType.SELF_RESERVED -> reservedAuthority?.markProcessingHandoffSettlementPending()
+                AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> existingAuthority?.markProcessingHandoffSettlementPending()
+                AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {}
+                AuthorityType.NONE_AVAILABLE -> resolvedLease?.markProcessingHandoffSettlementPending()
+            }
             throw failure
+        } catch (_: KeplerJobMetadataException) {
+            when (authorityType) {
+                AuthorityType.CALLER_OWNED -> ownerLease?.markProcessingHandoffSettlementPending()
+                AuthorityType.SELF_RESERVED -> reservedAuthority?.markProcessingHandoffSettlementPending()
+                AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> existingAuthority?.markProcessingHandoffSettlementPending()
+                AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {}
+                AuthorityType.NONE_AVAILABLE -> resolvedLease?.markProcessingHandoffSettlementPending()
+            }
+            return false
         } catch (_: IOException) {
-            // Transient reinspection read fault: NEVER interpret as "handoff absent".
-            if (ownerLease != null) ownerLease.markProcessingHandoffSettlementPending()
-            else if (reservedAuthority != null) reservedAuthority.markProcessingHandoffSettlementPending()
-            // Do NOT mark existingAuthority — it is caller-sticky.
+            when (authorityType) {
+                AuthorityType.CALLER_OWNED -> ownerLease?.markProcessingHandoffSettlementPending()
+                AuthorityType.SELF_RESERVED -> reservedAuthority?.markProcessingHandoffSettlementPending()
+                AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> existingAuthority?.markProcessingHandoffSettlementPending()
+                AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {}
+                AuthorityType.NONE_AVAILABLE -> resolvedLease?.markProcessingHandoffSettlementPending()
+            }
             return false
         }
 
         if (reinspectionState.isBlank()) {
-            val existingHasPending =
-                existingAuthority != null && existingAuthority.hasPendingProcessingHandoffSettlement()
-            if (reservedAuthority != null || existingHasPending) {
+            if (resolvedLease != null) {
                 resolvedLease.completeProcessingHandoffSettlement()
-                when {
-                    ownerLease != null -> {
-                        resolvedLease.completeProcessingHandoffSettlement()
-                        resolvedLease.release()
-                        @Suppress("DEPRECATION")
-                        KeplerJobMetadata.releaseOperation(resolvedLease)
-                    }
-                    reservedAuthority != null -> resolvedLease.release()
-                    else -> resolvedLease.release()
+                when (authorityType) {
+                    AuthorityType.CALLER_OWNED -> resolvedLease.releaseIfProcessingSettled()
+                    AuthorityType.SELF_RESERVED -> resolvedLease.releaseIfProcessingSettled()
+                    AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> resolvedLease.releaseIfProcessingSettled()
+                    AuthorityType.EXISTING_LIVE_OR_UNRELATED -> { /* unreachable */ }
+                    AuthorityType.NONE_AVAILABLE -> resolvedLease.releaseIfProcessingSettled()
                 }
-                if (existingHasPending) {
-                    existingAuthority.completeProcessingHandoffSettlement()
-                    existingAuthority.release()
-                    @Suppress("DEPRECATION")
-                    operationLeases.remove(existingAuthority.key)
-                }
-            } else if (ownerLease == null) {
-                resolvedLease.completeProcessingHandoffSettlement()
-                resolvedLease.release()
-                @Suppress("DEPRECATION")
-                operationLeases.remove(resolvedLease.key)
-            } else {
-                resolvedLease.completeProcessingHandoffSettlement()
-                resolvedLease.release()
             }
             return true
         }
@@ -1270,30 +1326,49 @@ internal fun inspectProcessingHandoff(
         val settled = try {
             finalizeRecoveredProcessingHandoff(jobDir, resolvedLease)
         } catch (failure: Error) {
-            if (ownerLease != null) ownerLease.markProcessingHandoffSettlementPending()
-            else if (reservedAuthority != null) reservedAuthority.markProcessingHandoffSettlementPending()
-            else if (existingAuthority != null) existingAuthority.markProcessingHandoffSettlementPending()
+            when (authorityType) {
+                AuthorityType.CALLER_OWNED -> ownerLease?.markProcessingHandoffSettlementPending()
+                AuthorityType.SELF_RESERVED -> reservedAuthority?.markProcessingHandoffSettlementPending()
+                AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> existingAuthority?.markProcessingHandoffSettlementPending()
+                AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {}  // Do NOT mark existing unrelated authority
+                AuthorityType.NONE_AVAILABLE -> reservedAuthority?.markProcessingHandoffSettlementPending()
+            }
             throw failure
         } catch (_: Exception) {
-            if (ownerLease != null || reservedAuthority != null || existingAuthority == null) {
-                resolvedLease.markProcessingHandoffSettlementPending()
+            if (authorityType != AuthorityType.EXISTING_LIVE_OR_UNRELATED) {
+                resolvedLease?.markProcessingHandoffSettlementPending()
             }
             return false
         }
+
         if (settled) {
-            resolvedLease.completeProcessingHandoffSettlement()
-            when {
-                ownerLease == null -> resolvedLease.release()
-                reservedAuthority != null -> resolvedLease.release()
-                else -> resolvedLease.release()
+            resolvedLease?.completeProcessingHandoffSettlement()
+            when (authorityType) {
+                AuthorityType.CALLER_OWNED -> resolvedLease?.releaseIfProcessingSettled()
+                AuthorityType.SELF_RESERVED -> resolvedLease?.releaseIfProcessingSettled()
+                AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> resolvedLease?.releaseIfProcessingSettled()
+                AuthorityType.EXISTING_LIVE_OR_UNRELATED -> { /* unreachable */ }
+                AuthorityType.NONE_AVAILABLE -> resolvedLease?.releaseIfProcessingSettled()
             }
         } else {
-            if (ownerLease != null) ownerLease.markProcessingHandoffSettlementPending()
-            else if (reservedAuthority != null) reservedAuthority.markProcessingHandoffSettlementPending()
-            else if (existingAuthority != null) existingAuthority.markProcessingHandoffSettlementPending()
+            when (authorityType) {
+                AuthorityType.CALLER_OWNED -> ownerLease?.markProcessingHandoffSettlementPending()
+                AuthorityType.SELF_RESERVED -> reservedAuthority?.markProcessingHandoffSettlementPending()
+                AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> existingAuthority?.markProcessingHandoffSettlementPending()
+                AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {}
+                AuthorityType.NONE_AVAILABLE -> resolvedLease?.markProcessingHandoffSettlementPending()
+            }
             return false
         }
         return settled
+    }
+
+    private enum class AuthorityType {
+        CALLER_OWNED,
+        SELF_RESERVED,
+        EXISTING_PENDING_HANDOFF_RETRY,
+        EXISTING_LIVE_OR_UNRELATED,
+        NONE_AVAILABLE
     }
 
     fun atomicWrite(file: File, text: String) {
