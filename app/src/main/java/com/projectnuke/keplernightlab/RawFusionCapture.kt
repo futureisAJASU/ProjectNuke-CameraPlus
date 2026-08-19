@@ -939,24 +939,37 @@ fun captureRawBurstForFusion(
                                     durableCaptureOperationId,
                                     KeplerActiveOperationKind.PROCESSING_RAW
                                 )
-                             val ownerSettled = if (handoffPublished) {
-                                 KeplerJobMetadata.clearActiveOperation(
-                                     jobDir,
-                                     durableCaptureOperationId,
-                                     durableCaptureLease
-                                 )
-                             } else {
-                                 KeplerJobMetadata.settleCaptureOwnerAfterHandoffFailure(
-                                     jobDir,
-                                     durableCaptureOperationId,
-                                     durableCaptureLease
-                                 )
-                             }
-                             if (!ownerSettled) {
-                                 durableCaptureLease.releaseOrRetainForReconciliation()
-                             } else {
-                                 durableCaptureLease.release()
-                             }
+                              var ownerSettled = false
+                              var ownerClearFailure: Throwable? = null
+                              try {
+                                  ownerSettled = if (handoffPublished) {
+                                      KeplerJobMetadata.clearActiveOperation(
+                                          jobDir,
+                                          durableCaptureOperationId,
+                                          durableCaptureLease
+                                      )
+                                  } else {
+                                      KeplerJobMetadata.settleCaptureOwnerAfterHandoffFailure(
+                                          jobDir,
+                                          durableCaptureOperationId,
+                                          durableCaptureLease
+                                      )
+                                  }
+                              } catch (failure: Error) {
+                                  ownerClearFailure = failure
+                              } catch (failure: kotlinx.coroutines.CancellationException) {
+                                  ownerClearFailure = failure
+                              }
+                              if (ownerClearFailure == null) {
+                                  if (!ownerSettled) {
+                                      durableCaptureLease.releaseOrRetainForReconciliation()
+                                  } else {
+                                      durableCaptureLease.release()
+                                  }
+                              } else {
+                                  durableCaptureLease.releaseOrRetainForReconciliation()
+                                  throw ownerClearFailure
+                              }
 } else {
                             // The capture terminal record did not persist: register exact terminal debt so the next
                             // production entry converges it and CLEARS the CAPTURE_RAW owner.  The handoff was

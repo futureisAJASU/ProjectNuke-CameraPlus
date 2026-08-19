@@ -237,12 +237,22 @@ onComplete = { jobDir ->
                 } catch (failure: Throwable) {
                     cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
                 }
+                try {
+                    pipelineLease.releaseOrRetainForReconciliation()
+                } catch (failure: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+                }
                 throw requireNotNull(combineSettlementFailure(cancelled, cleanupFailure))
             } catch (failure: Error) {
                 var cleanupFailure: Throwable? = null
                 try { startedThread?.quitSafely() } catch (secondary: Throwable) { cleanupFailure = secondary }
                 try {
                     KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(jobDir, pipelineLease)
+                } catch (secondary: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
+                }
+                try {
+                    pipelineLease.releaseOrRetainForReconciliation()
                 } catch (secondary: Throwable) {
                     cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
                 }
@@ -693,12 +703,17 @@ terminal.publish(
                 false
             }
             if (!workerPosted) {
+                var ownerExitFailure: Throwable? = null
                 val operationId = try {
                     pipelineLease.currentDurableOperationId()
                         ?: KeplerJobMetadata.read(jobDir).optString(ACTIVE_OPERATION_ID)
                             .takeIf { it.isNotBlank() }
                 } catch (failure: Error) {
-                    throw failure
+                    ownerExitFailure = failure
+                    null
+                } catch (failure: CancellationException) {
+                    ownerExitFailure = failure
+                    null
                 } catch (failure: Exception) {
                     pipelineLease.markProcessingHandoffSettlementPending()
                     android.util.Log.e("KeplerYuvPipeline", "worker dispatch owner inspection failed", failure)
@@ -716,11 +731,13 @@ terminal.publish(
                                 .put(TERMINAL_OPERATION_ID, operationId)
                                 .put("userCanMoveDevice", true)
                         }
-if (!KeplerJobMetadata.clearActiveOperation(jobDir, operationId, pipelineLease)) {
+                        if (!KeplerJobMetadata.clearActiveOperation(jobDir, operationId, pipelineLease)) {
                             pipelineLease.markDurableSettlementPending(operationId)
                         }
                     } catch (failure: Error) {
-                        throw failure
+                        ownerExitFailure = combineSettlementFailure(ownerExitFailure, failure)
+                    } catch (failure: CancellationException) {
+                        ownerExitFailure = combineSettlementFailure(ownerExitFailure, failure)
                     } catch (failure: Exception) {
                         pipelineLease.markTerminalSettlementPending(
                             PendingTerminalSettlement(
@@ -734,7 +751,7 @@ if (!KeplerJobMetadata.clearActiveOperation(jobDir, operationId, pipelineLease))
                         android.util.Log.e("KeplerYuvPipeline", "worker dispatch terminal persistence failed", failure)
                     }
                 }
-try {
+                try {
                     val handoffSettled = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
                         jobDir, pipelineLease
                     )
@@ -742,24 +759,33 @@ try {
                         pipelineLease.markProcessingHandoffSettlementPending()
                     }
                 } catch (failure: Error) {
-                    throw failure
+                    ownerExitFailure = combineSettlementFailure(ownerExitFailure, failure)
+                } catch (failure: CancellationException) {
+                    ownerExitFailure = combineSettlementFailure(ownerExitFailure, failure)
                 } catch (failure: Exception) {
                     pipelineLease.markProcessingHandoffSettlementPending()
+                    android.util.Log.e("KeplerYuvPipeline", "worker dispatch handoff settlement failed", failure)
                 }
                 try {
                     workerThread.quitSafely()
                 } catch (failure: Error) {
-                    throw failure
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
+                    ownerExitFailure = combineSettlementFailure(ownerExitFailure, failure)
+                } catch (failure: CancellationException) {
+                    ownerExitFailure = combineSettlementFailure(ownerExitFailure, failure)
                 } catch (failure: Exception) {
                     android.util.Log.e("KeplerYuvPipeline", "worker shutdown after dispatch failure failed", failure)
                 }
-                // Owner relinquish boundary: all cleanup complete, now release or retain for reconciliation
                 try {
                     pipelineLease.releaseOrRetainForReconciliation()
-                } catch (secondary: Throwable) {
-                    android.util.Log.e("KeplerYuvPipeline", "owner relinquish boundary failed", secondary)
+                } catch (failure: Error) {
+                    ownerExitFailure = combineSettlementFailure(ownerExitFailure, failure)
+                } catch (failure: CancellationException) {
+                    ownerExitFailure = combineSettlementFailure(ownerExitFailure, failure)
+                } catch (failure: Exception) {
+                    android.util.Log.e("KeplerYuvPipeline", "owner relinquish boundary failed", failure)
+                }
+                if (ownerExitFailure is Error || ownerExitFailure is CancellationException) {
+                    throw ownerExitFailure!!
                 }
                 post("PIPELINE_FAILED: Capture processing worker could not start; cache kept.")
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = "Capture processing worker could not start.")

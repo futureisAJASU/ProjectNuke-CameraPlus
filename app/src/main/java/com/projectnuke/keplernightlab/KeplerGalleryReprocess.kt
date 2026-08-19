@@ -1887,9 +1887,7 @@ internal fun rollback(
         // The export owner was already settled and its ACTIVE marker cleared, so the retained
         // reprocess lease is registered as pending durable settlement: the next real production
         // acquisition reconciles it under this exact lease and releases it automatically.
-        operationLease.currentDurableOperationId()?.let { operationLease.markDurableSettlementPending(it) }
-        operationLease.releaseOrRetainForReconciliation()
-        return quarantineWithPersistence(
+        val quarantineResult = quarantineWithPersistence(
             transaction,
             combineSettlementFailureWithMessage(
                 error,
@@ -1897,6 +1895,9 @@ internal fun rollback(
                 IllegalStateException("A new public result is durably committed; deleting it is unsafe")
             )
         )
+        operationLease.currentDurableOperationId()?.let { operationLease.markDurableSettlementPending(it) }
+        operationLease.releaseOrRetainForReconciliation()
+        return quarantineResult
     }
     val restore = restoreBackups(jobDir, transaction)
     if (restore.isFailure) {

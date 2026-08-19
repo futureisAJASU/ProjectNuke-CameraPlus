@@ -319,8 +319,6 @@ class RawProcessingOperationTest {
             assertNotNull(KeplerJobMetadata.read(dir).optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() })
 
             KeplerJobMetadata.atomicWriteFailureForTest = null
-            // Mark reconciliation ready: the original owner has finished its work
-            scope.lease.markReconciliationReady()
             val next = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 dir,
                 JobRecoveryMutationIntent.REPROCESS

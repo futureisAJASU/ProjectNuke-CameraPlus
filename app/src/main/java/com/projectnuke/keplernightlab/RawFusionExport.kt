@@ -33,46 +33,57 @@ internal class RawProcessingOperation internal constructor(
     fun release() {
         if (released.get()) return
         if (!ownsLease) {
-            // A reprocess worker borrows the transaction's outer lease.  Its wrapper must not
-            // clear PROCESSING_RAW/PUBLIC_EXPORT here: the transaction finalizer still owns the
-            // exact durable operation and must write terminal metadata before clearing it.
             released.compareAndSet(false, true)
             return
         }
         if (lease.pendingTerminalSettlement() != null || lease.pendingPublicExportSettlement() != null) {
             Log.e("KeplerRawPipeline", "retaining RAW lease until durable terminal settlement is retried")
-            lease.markReconciliationReady()
+            lease.releaseOrRetainForReconciliation()
             return
         }
-        // The durable lease is authoritative if a nested PUBLIC_EXPORT transition occurred.
-        // Never settle the stale wrapper id while a newer durable operation owns the job.
-        val operationId = lease.currentDurableOperationId() ?: activeOperationId
-        val cleared = operationId?.let { KeplerJobMetadata.clearActiveOperation(jobDir, it, lease) } ?: true
-        if (!cleared) {
-            val currentActiveId = try {
-                KeplerJobMetadata.read(jobDir).optString(ACTIVE_OPERATION_ID)
-            } catch (failure: Error) {
-                throw failure
-            } catch (_: Exception) {
-                lease.markDurableSettlementPending(operationId)
-                lease.markReconciliationReady()
+        try {
+            val operationId = lease.currentDurableOperationId() ?: activeOperationId
+            val cleared = operationId?.let { KeplerJobMetadata.clearActiveOperation(jobDir, it, lease) } ?: true
+            if (!cleared) {
+                val currentActiveId = try {
+                    KeplerJobMetadata.read(jobDir).optString(ACTIVE_OPERATION_ID)
+                } catch (failure: Error) {
+                    throw failure
+                } catch (_: Exception) {
+                    lease.markDurableSettlementPending(operationId)
+                    lease.releaseOrRetainForReconciliation()
+                    return
+                }
+                if (currentActiveId.isNotBlank() && currentActiveId != operationId) {
+                    lease.markDurableSettlementPending(currentActiveId)
+                    lease.releaseOrRetainForReconciliation()
+                    Log.e("KeplerRawPipeline", "retaining RAW lease for newer durable operation $currentActiveId")
+                    return
+                }
+            }
+            if (!cleared && operationId?.let { KeplerJobMetadata.isCurrentActiveOperation(jobDir, it) } == true) {
+                Log.e("KeplerRawPipeline", "retaining RAW operation lease after durable owner clear failure")
+                lease.releaseOrRetainForReconciliation()
                 return
             }
-            if (currentActiveId.isNotBlank() && currentActiveId != operationId) {
-                lease.markDurableSettlementPending(currentActiveId)
-                lease.markReconciliationReady()
-                Log.e("KeplerRawPipeline", "retaining RAW lease for newer durable operation $currentActiveId")
-                return
+            operationId?.let { lease.clearDurableOperation(it) }
+            if (!released.compareAndSet(false, true)) return
+            if (ownsLease) lease.release()
+        } catch (failure: Error) {
+            try {
+                lease.releaseOrRetainForReconciliation()
+            } catch (secondary: Throwable) {
+                // secondary failure is suppressed by the primary Error
             }
+            throw failure
+        } catch (failure: kotlinx.coroutines.CancellationException) {
+            try {
+                lease.releaseOrRetainForReconciliation()
+            } catch (secondary: Throwable) {
+                // secondary failure is suppressed by the primary cancellation
+            }
+            throw failure
         }
-        if (!cleared && operationId?.let { KeplerJobMetadata.isCurrentActiveOperation(jobDir, it) } == true) {
-            Log.e("KeplerRawPipeline", "retaining RAW operation lease after durable owner clear failure")
-            lease.markReconciliationReady()
-            return
-        }
-        operationId?.let { lease.clearDurableOperation(it) }
-        if (!released.compareAndSet(false, true)) return
-        if (ownsLease) lease.release()
     }
 
     /** Reclaims durable evidence after the nested ProcessingAttempt releases its sublease. */
@@ -128,7 +139,6 @@ KeplerJobMetadata.beginActiveOperation(
                 cleanupFailure = secondary
                 true
             } catch (_: Exception) {
-                // A failed read cannot prove that the attempted durable write did not land.
                 true
             }
             if (durableOwnerMayRemain) {
@@ -147,7 +157,7 @@ KeplerJobMetadata.beginActiveOperation(
                 }
                 if (ownsLease) {
                     try {
-                        lease.markReconciliationReady()
+                        lease.releaseOrRetainForReconciliation()
                     } catch (secondary: Throwable) {
                         cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
                     }
