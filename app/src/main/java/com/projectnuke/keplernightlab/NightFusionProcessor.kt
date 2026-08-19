@@ -182,7 +182,7 @@ fun processLatestNightFusionV02(
             )
         } finally {
             try {
-                lease.releaseIfProcessingSettled()
+                lease.releaseOrRetainForReconciliation()
             } catch (secondary: Throwable) {
                 val combined = combineSettlementFailure(primaryFailure, secondary)
                 if (combined !== primaryFailure) throw requireNotNull(combined)
@@ -431,8 +431,8 @@ fun processLatestNightFusionV02(
         } finally {
             var cleanupFailure: Throwable? = null
             try {
-                if (operationLease?.releaseIfProcessingSettled() == false) {
-                    Log.e("KeplerYuvPipeline", "retaining processing lease after durable attempt settlement failure")
+                if (operationLease?.releaseOrRetainForReconciliation() == false) {
+                    Log.e("KeplerYuvPipeline", "retaining processing lease for reconciliation after durable attempt settlement")
                 }
             } catch (failure: Throwable) {
                 cleanupFailure = combineSettlementFailure(cleanupFailure, failure)

@@ -34,6 +34,8 @@ class ProcessingAttemptTest {
             val oldLease = requireNotNull(retainedLease)
             assertTrue(KeplerJobMetadata.isOperationOwner(dir, oldLease))
             assertTrue(KeplerJobMetadata.read(dir).has(ACTIVE_OPERATION_ID))
+            // Mark reconciliation ready: the original owner has finished its work
+            oldLease.markReconciliationReady()
 
             val next = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 dir,

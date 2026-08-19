@@ -1599,7 +1599,7 @@ internal fun finalizeTransaction(
                     val durableClearDone = terminalStatus == MediaStoreExportTerminalSettlementStatus.SETTLED ||
                         operationLease.currentDurableOperationKind() != KeplerActiveOperationKind.PUBLIC_EXPORT
                     if (durableClearDone || !KeplerJobMetadata.isOperationActive(jobDir)) {
-                        operationLease.releaseIfProcessingSettled()
+                        operationLease.releaseOrRetainForReconciliation()
                     }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -1622,7 +1622,7 @@ internal fun finalizeTransaction(
                     val durableClearDone = terminalStatus == MediaStoreExportTerminalSettlementStatus.SETTLED ||
                         operationLease.currentDurableOperationKind() != KeplerActiveOperationKind.PUBLIC_EXPORT
                     if (durableClearDone || !KeplerJobMetadata.isOperationActive(jobDir)) {
-                        operationLease.releaseIfProcessingSettled()
+                        operationLease.releaseOrRetainForReconciliation()
                     }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -2072,8 +2072,8 @@ private fun performTerminalCleanupDebt(
         }
         if (ownerSettled) {
             try {
-                if (!lease.releaseIfProcessingSettled()) {
-                    warnings += "Processing owner settlement remains pending."
+                if (!lease.releaseOrRetainForReconciliation()) {
+                    warnings += "Processing owner retained for reconciliation."
                 }
             } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
             catch (oom: OutOfMemoryError) { throw oom }

@@ -2737,10 +2737,10 @@ fun processRawFusionJob(
         )
     } finally {
         var cleanupFailure: Throwable? = null
-        if (ownsOperationLease) {
+if (ownsOperationLease) {
             try {
-                if (!processingLease.releaseIfProcessingSettled()) {
-                    Log.e("KeplerRawFusion", "retaining processing lease after nested attempt settlement failure")
+                if (!processingLease.releaseOrRetainForReconciliation()) {
+                    Log.e("KeplerRawFusion", "retaining processing lease for reconciliation after nested attempt settlement")
                 }
             } catch (failure: Throwable) {
                 cleanupFailure = failure

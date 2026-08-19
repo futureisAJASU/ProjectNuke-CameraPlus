@@ -1390,6 +1390,8 @@ class DebtConvergenceCounterexampleTest {
             assertNotNull("The self-acquired lease is retained on failure",
                 KeplerJobMetadata.findOperationLease(job))
             KeplerJobMetadata.atomicWriteFailureForTest = null
+            // Mark reconciliation ready: the self-acquired authority has finished its work
+            KeplerJobMetadata.findOperationLease(job)!!.markReconciliationReady()
             val acquired = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
             )
@@ -1425,6 +1427,8 @@ class DebtConvergenceCounterexampleTest {
             val retained = KeplerJobMetadata.findOperationLease(job)
             assertNotNull("RAW absorbing terminal retains its lease on failure", retained)
             KeplerJobMetadata.atomicWriteFailureForTest = null
+            // Mark reconciliation ready: the self-acquired authority has finished its work
+            retained!!.markReconciliationReady()
             val acquired = runCatching {
                 KeplerJobMetadata.acquireRecoveryCheckedOperation(
                     job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
@@ -1467,6 +1471,8 @@ class DebtConvergenceCounterexampleTest {
             assertFalse(settled)
             assertEquals("The caller lease is retained and marked", lease, KeplerJobMetadata.findOperationLease(job))
             KeplerJobMetadata.atomicWriteFailureForTest = null
+            // Mark reconciliation ready: the caller owner has finished all work
+            lease.markReconciliationReady()
             runCatching {
                 KeplerJobMetadata.acquireRecoveryCheckedOperation(
                     job, JobRecoveryMutationIntent.PROCESSING_START, consumesProcessingHandoff = true
@@ -1726,6 +1732,8 @@ class DebtConvergenceCounterexampleTest {
             assertFalse(lease.releaseIfProcessingSettled())
             assertEquals(lease, KeplerJobMetadata.findOperationLease(job))
             KeplerJobMetadata.atomicWriteFailureForTest = null
+            // Mark reconciliation ready: the original owner has finished all work
+            lease.markReconciliationReady()
 
             val saved = saveFrameSelection(context, job, FrameSelectionMode.AUTO_RULE_BASED, emptyList())
             assertTrue("The real mutation entry converges the retained handoff debt and proceeds", saved.isSuccess)
@@ -1761,8 +1769,10 @@ class DebtConvergenceCounterexampleTest {
             }
             val retained = KeplerJobMetadata.findOperationLease(job)
             assertNotNull("The exact lease is retained", retained)
+            // Mark reconciliation ready: the original owner (persistYuvCaptureSetupFailure) has finished all work
+            retained!!.markReconciliationReady()
             assertTrue("The pending handoff retry reason is installed",
-                retained!!.hasPendingProcessingHandoffSettlement())
+                retained.hasPendingProcessingHandoffSettlement())
             assertTrue("The durable handoff is still owned",
                 KeplerJobMetadata.read(job).has(PROCESSING_HANDOFF_OPERATION_ID))
             assertFalse("No durable owner was established",
@@ -1800,7 +1810,9 @@ class DebtConvergenceCounterexampleTest {
             }
             val retained = KeplerJobMetadata.findOperationLease(job)
             assertNotNull("The exact lease is retained", retained)
-            val pendingTerminal = retained!!.pendingTerminalSettlement()
+            // Mark reconciliation ready: the original owner has finished all work
+            retained!!.markReconciliationReady()
+            val pendingTerminal = retained.pendingTerminalSettlement()
             assertNotNull("The pending terminal settlement is installed", pendingTerminal)
             assertEquals("FAILED", pendingTerminal!!.attemptStatus)
             assertEquals("PIPELINE_FAILED", pendingTerminal.processStatus)
@@ -1856,6 +1868,8 @@ class DebtConvergenceCounterexampleTest {
             assertEquals("The pending durable settlement id matches the durable owner",
                 durableActiveId, retained!!.pendingDurableSettlementId())
             assertRetainedLeaseCarriesRetryReason(job)
+            // Mark reconciliation ready: the original owner has finished all work
+            retained!!.markReconciliationReady()
             KeplerJobMetadata.atomicWriteFailureSequenceForTest = null
 
             val acquired = KeplerJobMetadata.acquireRecoveryCheckedOperation(
@@ -1895,6 +1909,8 @@ class DebtConvergenceCounterexampleTest {
                     persistYuvCaptureSetupFailure(job, "test.setup", IllegalStateException("setup failed"))
                 }
                 val retained = KeplerJobMetadata.findOperationLease(job)!!
+                // Mark reconciliation ready: the original owner (persistYuvCaptureSetupFailure) has finished all work
+                retained.markReconciliationReady()
                 val reason = retained.pendingTerminalSettlement()!!
                 KeplerJobMetadata.atomicWriteFailureSequenceForTest = null
                 KeplerJobMetadata.atomicWriteFailureForTest = java.io.IOException("reconcile terminal write failed")
@@ -1978,6 +1994,8 @@ class DebtConvergenceCounterexampleTest {
                 KeplerJobMetadata.atomicWriteFailureForTest = java.io.IOException("injected handoff write failure")
                 assertFalse(KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(job))
                 val retained = KeplerJobMetadata.findOperationLease(job)!!
+                // Mark reconciliation ready: the original owner has finished all work
+                retained.markReconciliationReady()
                 assertTrue(retained.hasPendingProcessingHandoffSettlement())
                 KeplerJobMetadata.atomicWriteFailureForTest = null
                 KeplerJobMetadata.atomicWriteFailureForTest = java.io.IOException("reconcile handoff write failed")
@@ -2023,6 +2041,8 @@ class DebtConvergenceCounterexampleTest {
                 // returns false; the function installs durable-pending and completes.
                 persistYuvCaptureSetupFailure(job, "test.setup", IllegalStateException("setup failed"))
                 val retained = KeplerJobMetadata.findOperationLease(job)!!
+                // Mark reconciliation ready: the original owner has finished all work
+                retained.markReconciliationReady()
                 val pendingId = retained.pendingDurableSettlementId()!!
                 assertEquals("The pending id matches the durable owner",
                     KeplerJobMetadata.read(job).optString(ACTIVE_OPERATION_ID), pendingId)
@@ -2067,8 +2087,10 @@ class DebtConvergenceCounterexampleTest {
                 KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(job))
             val retained = KeplerJobMetadata.findOperationLease(job)
             assertNotNull("The self-acquired lease is retained", retained)
+            // Mark reconciliation ready: the self-reserved authority has finished its work
+            retained!!.markReconciliationReady()
             assertTrue("The pending handoff retry reason is installed",
-                retained!!.hasPendingProcessingHandoffSettlement())
+                retained.hasPendingProcessingHandoffSettlement())
             KeplerJobMetadata.atomicWriteFailureForTest = null
             // The typed terminal may publish for the UI while the handoff debt stays owned.
             KeplerJobMetadata.update(job) { it
@@ -2223,8 +2245,11 @@ class DebtConvergenceCounterexampleTest {
                 )
             )
             lease.markProcessingHandoffSettlementPending()
+            // Mark reconciliation ready: the original owner has finished all work
+            lease.markReconciliationReady()
             assertNotNull(lease.pendingTerminalSettlement())
             assertTrue(lease.hasPendingProcessingHandoffSettlement())
+            assertTrue(lease.isReconciliationReady())
 
             // First reconcile drains terminal, handoff, and remaining durable debt in one pass.
             val acquired = KeplerJobMetadata.acquireRecoveryCheckedOperation(
@@ -2268,6 +2293,8 @@ class DebtConvergenceCounterexampleTest {
                 )
             )
             lease.markProcessingHandoffSettlementPending()
+            // Mark reconciliation ready: the original owner has finished all work
+            lease.markReconciliationReady()
 
             // First reconcile: terminal succeeds (first write passes), handoff retry is injected to fail (third write fails).
             KeplerJobMetadata.atomicWriteFailureSequenceForTest = mutableListOf(
@@ -2317,6 +2344,8 @@ class DebtConvergenceCounterexampleTest {
             val lease = KeplerJobMetadata.acquireOperation(job)!!
             lease.markDurableOperation("capture-yuv", KeplerActiveOperationKind.CAPTURE_YUV)
             lease.markProcessingHandoffSettlementPending()
+            // Mark reconciliation ready: the original owner has finished all work
+            lease.markReconciliationReady()
 
             // Reconcile settles handoff, sees ACTIVE remains, installs durable pending,
             // then continues to drain durable in the same pass.
@@ -2359,6 +2388,8 @@ class DebtConvergenceCounterexampleTest {
                 )
             )
             lease.markProcessingHandoffSettlementPending()
+            // Mark reconciliation ready: the original owner has finished all work
+            lease.markReconciliationReady()
 
             // Reconcile drains all debts in one pass and releases.
             val acquired = KeplerJobMetadata.acquireRecoveryCheckedOperation(

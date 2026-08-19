@@ -1169,10 +1169,10 @@ post(
                         }
                         try {
                             if (exportSettlementSucceeded) {
-                                if (!lease.releaseIfProcessingSettled()) {
+                                if (!lease.releaseOrRetainForReconciliation()) {
                                     Log.e(
                                         "KeplerSuperResolution",
-                                        "retaining processing lease after durable attempt settlement failure"
+                                        "retaining processing lease for reconciliation after durable attempt settlement"
                                     )
                                 }
                             } else {

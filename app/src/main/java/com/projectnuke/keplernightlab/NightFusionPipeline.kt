@@ -56,9 +56,9 @@ operationId = KeplerJobMetadata.beginActiveOperation(
             reason = failure.message ?: failure.javaClass.simpleName,
             primaryFailure = terminalFailure
         )
-    } finally {
+} finally {
         try {
-            lease.releaseIfProcessingSettled()
+            lease.releaseOrRetainForReconciliation()
         } catch (secondary: Throwable) {
             primaryFailure = combineSettlementFailure(primaryFailure, secondary)
         }
@@ -285,8 +285,8 @@ KeplerJobMetadata.clearActiveOperation(jobDir, operationId, pipelineLease)
                         primaryFailure = combineSettlementFailure(failure, secondary)
                     )
                 }
-                try {
-                    if (terminalFailure == null) pipelineLease.releaseIfProcessingSettled()
+try {
+                    if (terminalFailure == null) pipelineLease.releaseOrRetainForReconciliation()
                 } catch (secondary: Throwable) {
                     terminalFailure = combineSettlementFailure(terminalFailure ?: failure, secondary)
                 }
@@ -346,7 +346,7 @@ try {
                     secondaryFailure = combineSettlementFailure(secondaryFailure, secondary)
                 }
                 try {
-                    pipelineLease.releaseIfProcessingSettled()
+                    pipelineLease.releaseOrRetainForReconciliation()
                 } catch (secondary: Throwable) {
                     secondaryFailure = combineSettlementFailure(secondaryFailure, secondary)
                 }
@@ -660,12 +660,12 @@ terminal.publish(
                             android.util.Log.e("KeplerYuvPipeline", "public export owner settlement failed", settlementFailure)
                         }
                     }
-                    try {
+try {
                         if (exportSettlementSucceeded) {
-                            if (!pipelineLease.releaseIfProcessingSettled()) {
+                            if (!pipelineLease.releaseOrRetainForReconciliation()) {
                                 android.util.Log.e(
                                     "KeplerYuvPipeline",
-                                    "retaining processing lease after durable attempt settlement failure"
+                                    "retaining processing lease for reconciliation after durable attempt settlement"
                                 )
                             }
                         } else {
@@ -734,7 +734,7 @@ if (!KeplerJobMetadata.clearActiveOperation(jobDir, operationId, pipelineLease))
                         android.util.Log.e("KeplerYuvPipeline", "worker dispatch terminal persistence failed", failure)
                     }
                 }
-                try {
+try {
                     val handoffSettled = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
                         jobDir, pipelineLease
                     )
@@ -754,6 +754,12 @@ if (!KeplerJobMetadata.clearActiveOperation(jobDir, operationId, pipelineLease))
                     throw cancelled
                 } catch (failure: Exception) {
                     android.util.Log.e("KeplerYuvPipeline", "worker shutdown after dispatch failure failed", failure)
+                }
+                // Owner relinquish boundary: all cleanup complete, now release or retain for reconciliation
+                try {
+                    pipelineLease.releaseOrRetainForReconciliation()
+                } catch (secondary: Throwable) {
+                    android.util.Log.e("KeplerYuvPipeline", "owner relinquish boundary failed", secondary)
                 }
                 post("PIPELINE_FAILED: Capture processing worker could not start; cache kept.")
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = "Capture processing worker could not start.")

@@ -248,6 +248,8 @@ class KeplerJobMetadataTest {
             assertTrue(KeplerJobMetadata.read(directory).has(PROCESSING_HANDOFF_OPERATION_ID))
 
             KeplerJobMetadata.atomicWriteFailureForTest = null
+            // Mark reconciliation ready: the owner has finished its work
+            lease!!.markReconciliationReady()
             replacement = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.PROCESSING_START,
@@ -341,6 +343,8 @@ class KeplerJobMetadataTest {
             }
 
             KeplerJobMetadata.atomicWriteFailureForTest = null
+            // Mark reconciliation ready: the original owner has finished its work
+            lease!!.markReconciliationReady()
             val next = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.REPROCESS
@@ -374,6 +378,8 @@ class KeplerJobMetadataTest {
             assertEquals(attempt.id, KeplerJobMetadata.read(directory).getString(ACTIVE_OPERATION_ID))
 
             KeplerJobMetadata.atomicWriteFailureForTest = null
+            // Mark reconciliation ready: the original owner has finished its work
+            lease!!.markReconciliationReady()
             val next = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.REPROCESS
@@ -433,6 +439,8 @@ class KeplerJobMetadataTest {
             assertTrue(KeplerJobMetadata.isOperationOwner(directory, ownerLease))
 
             KeplerJobMetadata.atomicWriteFailureForTest = null
+            // Mark reconciliation ready: the original owner has finished its work
+            ownerLease.markReconciliationReady()
             val next = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.REPROCESS
@@ -722,7 +730,9 @@ class KeplerJobMetadataTest {
             // must retry the specialized PUBLIC_EXPORT protocol before it can
             // reserve a new mutation lease.
             KeplerJobMetadata.atomicWriteFailureForTest = null
+            // Mark reconciliation ready: the original owner has finished its work
             val oldLease = lease!!
+            oldLease.markReconciliationReady()
             val nextLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.REPROCESS
@@ -778,7 +788,9 @@ class KeplerJobMetadataTest {
                 )
             }
             KeplerJobMetadata.atomicWriteFailureForTest = null
+            // Mark reconciliation ready: the original owner has finished its work
             val oldLease = lease!!
+            oldLease.markReconciliationReady()
             val nextLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.REPROCESS
@@ -839,7 +851,9 @@ class KeplerJobMetadataTest {
             assertFalse(MediaStoreExportJournal.read(directory, MediaStoreExportJournal.fileFor(directory, journal.exportAttemptId)).terminalMetadataPersisted)
 
             KeplerJobMetadata.atomicWriteFailureSequenceForTest = null
+            // Mark reconciliation ready: the original owner has finished its work
             val oldLease = lease!!
+            oldLease.markReconciliationReady()
             val nextLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.REPROCESS
@@ -1018,7 +1032,9 @@ class KeplerJobMetadataTest {
             assertTrue(MediaStoreExportJournal.read(directory, MediaStoreExportJournal.fileFor(directory, journal.exportAttemptId)).terminalMetadataPersisted)
 
             KeplerJobMetadata.atomicWriteFailureSequenceForTest = null
+            // Mark reconciliation ready: the original owner has finished its work
             val oldLease = lease!!
+            oldLease.markReconciliationReady()
             val nextLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.REPROCESS
@@ -1233,7 +1249,9 @@ class KeplerJobMetadataTest {
             assertNotNull(lease!!.pendingPublicExportSettlement())
 
             KeplerJobMetadata.atomicWriteFailureForTest = null
+            // Mark reconciliation ready: the original owner has finished its work
             val oldLease = lease!!
+            oldLease.markReconciliationReady()
             val nextLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.REPROCESS
@@ -1830,6 +1848,8 @@ class KeplerJobMetadataTest {
 
             KeplerJobMetadata.reconcilePostHandoffReadFailureForTest = null
 
+            // Mark reconciliation ready: the original owner has finished its work
+            lease!!.markReconciliationReady()
             val acquired = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.PROCESSING_START,
@@ -1841,6 +1861,357 @@ class KeplerJobMetadataTest {
         } finally {
             KeplerJobMetadata.reconcilePostHandoffReadFailureForTest = null
             lease?.release()
+            directory.deleteRecursively()
+        }
+    }
+
+    /** P0 Regression: Live owner with pending debt must block competitor reconciliation
+     *  until the original owner explicitly marks the lease reconciliation-ready.
+     *
+     *  Scenario:
+     *  - Thread A (original owner) acquires lease E
+     *  - Thread A installs pending terminal settlement T
+     *  - Thread A PAUSES before owner handoff cleanup/reconciliation-ready transition
+     *  - Thread B (competitor) attempts acquireRecoveryCheckedOperation
+     *  - Expected: BLOCKED (ProcessingAlreadyActive), B must NOT reconcile T
+     *  - E remains registered, T remains pending, no NEW lease N exists
+     *  - Resume Thread A: finish handoff cleanup, reach owner-exit boundary
+     *  - E becomes reconciliationReady=true
+     *  - Thread A returns
+     *  - Thread B retry: SAME E is reconciled, pending debts drain, E releases
+     *  - B then acquires NEW N
+     */
+    @Test
+    fun liveOwnerWithPendingDebtBlocksCompetitorUntilReconciliationReady() {
+        val directory = Files.createTempDirectory("kepler-live-pending-race-").toFile()
+        val ownerPauseLatch = CountDownLatch(1)
+        val ownerResumedLatch = CountDownLatch(1)
+        val competitorBlockedLatch = CountDownLatch(1)
+        val competitorCanProceedLatch = CountDownLatch(1)
+        var ownerLease: JobOperationLease? = null
+        var competitorLease: JobOperationLease? = null
+        var competitorException: Exception? = null
+        var competitorRetryLease: JobOperationLease? = null
+        var capturedOperationId: String? = null
+
+        try {
+            // Setup: create job with processing handoff
+            KeplerJobMetadata.write(
+                directory,
+                JSONObject()
+                    .put("jobType", "YUV_NIGHT_FUSION")
+                    .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                    .put(PROCESSING_HANDOFF_OPERATION_ID, "capture-1")
+                    .put(PROCESSING_HANDOFF_KIND, KeplerActiveOperationKind.PROCESSING_YUV.name)
+            )
+
+            // Thread A: Original owner acquires lease and installs pending terminal settlement
+            val ownerThread = Thread {
+                try {
+                    ownerLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                        directory,
+                        JobRecoveryMutationIntent.PROCESSING_START,
+                        consumesProcessingHandoff = true
+                    )
+                    assertNotNull(ownerLease)
+
+                    // Create a durable operation (simulating the worker having started)
+                    val operationId = KeplerJobMetadata.beginActiveOperation(
+                        directory,
+                        kind = KeplerActiveOperationKind.PROCESSING_YUV,
+                        ownerLease = ownerLease!!,
+                        consumesProcessingHandoff = true
+                    )
+                    capturedOperationId = operationId
+
+                    // Simulate terminal persistence failure: install pending terminal settlement
+                    ownerLease!!.markTerminalSettlementPending(
+                        PendingTerminalSettlement(
+                            operationId = operationId,
+                            attemptStatus = "FAILED",
+                            pipelineStage = "FAILED",
+                            processStatus = "PIPELINE_FAILED",
+                            reason = "terminal persistence failed"
+                        )
+                    )
+
+                    // Verify state: has pending debt, NOT reconciliation ready
+                    assertTrue("Owner lease has pending reconciliation debt", ownerLease!!.hasPendingReconciliationDebt())
+                    assertFalse("Owner lease is NOT reconciliation ready yet", ownerLease!!.isReconciliationReady())
+
+                    // Signal that owner has installed pending debt and is paused
+                    ownerPauseLatch.countDown()
+
+                    // Wait for competitor to attempt and block
+                    competitorBlockedLatch.await()
+
+                    // NOW: Owner finishes handoff cleanup and reaches owner-exit boundary
+                    // Simulate handoff settlement attempt
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(directory, ownerLease!!)
+
+                    // Owner relinquish boundary: release or retain for reconciliation
+                    val released = ownerLease!!.releaseOrRetainForReconciliation()
+                    assertFalse("Lease should be retained for reconciliation (pending debt remains)", released)
+                    assertTrue("Lease is now reconciliation ready", ownerLease!!.isReconciliationReady())
+
+                    // Owner returns
+                } catch (e: Exception) {
+                    android.util.Log.e("KeplerJobMetadataTest", "Owner thread failed", e)
+                } finally {
+                    ownerResumedLatch.countDown()
+                }
+            }
+
+            // Thread B: Competitor attempts acquisition while owner is paused
+            val competitorThread = Thread {
+                try {
+                    // Wait for owner to install pending debt and pause
+                    ownerPauseLatch.await()
+
+                    // Competitor attempts acquisition - should be BLOCKED
+                    try {
+                        competitorLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                            directory,
+                            JobRecoveryMutationIntent.PROCESSING_START,
+                            consumesProcessingHandoff = true
+                        )
+                    } catch (e: ProcessingAlreadyActiveException) {
+                        competitorException = e
+                    }
+
+                    // Signal that competitor was blocked
+                    competitorBlockedLatch.countDown()
+
+                    // Wait for owner to finish and mark reconciliation ready
+                    ownerResumedLatch.await()
+
+                    // NOW competitor retries - should succeed and reconcile the SAME lease
+                    competitorRetryLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                        directory,
+                        JobRecoveryMutationIntent.PROCESSING_START,
+                        consumesProcessingHandoff = true
+                    )
+                } catch (e: Exception) {
+                    android.util.Log.e("KeplerJobMetadataTest", "Competitor thread failed", e)
+                } finally {
+                    competitorCanProceedLatch.countDown()
+                }
+            }
+
+            ownerThread.start()
+            competitorThread.start()
+
+            // Wait for both threads to complete
+            ownerThread.join(10000)
+            competitorThread.join(10000)
+
+            // Assertions
+            assertNotNull("Owner should have acquired lease", ownerLease)
+            assertNotNull("Competitor should have been blocked with ProcessingAlreadyActiveException", competitorException)
+            assertTrue("Competitor exception should be ProcessingAlreadyActiveException", competitorException is ProcessingAlreadyActiveException)
+            assertNull("Competitor should NOT have acquired lease on first attempt", competitorLease)
+
+            // After owner marks reconciliation ready and returns, competitor should acquire the SAME lease (reconciled)
+            assertNotNull("Competitor should acquire lease on retry", competitorRetryLease)
+            assertTrue("Competitor should own the job after reconciliation", KeplerJobMetadata.isOperationOwner(directory, competitorRetryLease!!))
+
+            // The original lease should have been released and a new lease acquired
+            assertFalse("Original owner lease should no longer be active", KeplerJobMetadata.isOperationOwner(directory, ownerLease!!))
+            assertTrue("Competitor should have a different lease after reconciliation", ownerLease != competitorRetryLease)
+
+            // Verify terminal settlement was reconciled
+            val finalMetadata = KeplerJobMetadata.read(directory)
+            assertEquals("Terminal settlement should be persisted", "FAILED", finalMetadata.getString("currentPipelineStage"))
+            assertEquals(capturedOperationId, finalMetadata.optString(TERMINAL_OPERATION_ID))
+
+            // Cleanup
+            competitorRetryLease?.release()
+
+        } finally {
+            ownerLease?.release()
+            competitorLease?.release()
+            competitorRetryLease?.release()
+            directory.deleteRecursively()
+        }
+    }
+
+    /** P0 Regression: Exact terminal + handoff cross-product race.
+     *
+     *  Scenario (Phase 9):
+     *  - Thread A: E live, terminal persistence fails → pendingTerminal T
+     *  - Thread A PAUSES before owner-exit boundary
+     *  - Thread B acquisition: Expected BLOCKED, T NOT reconciled, E NOT released
+     *  - Resume A: owner reaches final relinquish boundary → reconciliationReady=true
+     *  - Assert E carries: pendingTerminal, reconciliationReady=true
+     *  - Thread B retry: terminal debt drains under SAME E
+     *  - E releases after terminal settles
+     *  - B acquires N
+     */
+    @Test
+    fun terminalAndHandoffRaceBeforeReconciliationReady() {
+        val directory = Files.createTempDirectory("kepler-terminal-handoff-race-").toFile()
+        val ownerPauseLatch = CountDownLatch(1)
+        val ownerResumedLatch = CountDownLatch(1)
+        val competitorBlockedLatch = CountDownLatch(1)
+        val competitorCanProceedLatch = CountDownLatch(1)
+        var ownerLease: JobOperationLease? = null
+        var competitorLease: JobOperationLease? = null
+        var competitorException: Exception? = null
+        var competitorRetryLease: JobOperationLease? = null
+        var capturedOperationId: String? = null
+
+        try {
+            // Setup: create job with processing handoff
+            KeplerJobMetadata.write(
+                directory,
+                JSONObject()
+                    .put("jobType", "YUV_NIGHT_FUSION")
+                    .put(PROCESSING_HANDOFF_RUNTIME_SESSION_ID, KeplerRuntimeSession.id)
+                    .put(PROCESSING_HANDOFF_OPERATION_ID, "capture-1")
+                    .put(PROCESSING_HANDOFF_KIND, KeplerActiveOperationKind.PROCESSING_YUV.name)
+            )
+
+            // Thread A: Original owner acquires lease (consumes handoff as production does)
+            val ownerThread = Thread {
+                try {
+                    ownerLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                        directory,
+                        JobRecoveryMutationIntent.PROCESSING_START,
+                        consumesProcessingHandoff = true
+                    )
+                    assertNotNull(ownerLease)
+
+                    // Create a durable operation (handoff already consumed during acquisition)
+                    val operationId = KeplerJobMetadata.beginActiveOperation(
+                        directory,
+                        kind = KeplerActiveOperationKind.PROCESSING_YUV,
+                        ownerLease = ownerLease!!,
+                        consumesProcessingHandoff = true
+                    )
+                    capturedOperationId = operationId
+
+                    // Simulate terminal persistence failure: install pending terminal settlement
+                    ownerLease!!.markTerminalSettlementPending(
+                        PendingTerminalSettlement(
+                            operationId = operationId,
+                            attemptStatus = "FAILED",
+                            pipelineStage = "FAILED",
+                            processStatus = "PIPELINE_FAILED",
+                            reason = "terminal persistence failed"
+                        )
+                    )
+
+                    // Verify state: has pending terminal debt, handoff already consumed, NOT reconciliation ready
+                    assertTrue("Owner lease has pending terminal debt", ownerLease!!.pendingTerminalSettlement() != null)
+                    assertFalse("Handoff already consumed during acquisition", ownerLease!!.hasPendingProcessingHandoffSettlement())
+                    assertFalse("Owner lease is NOT reconciliation ready yet", ownerLease!!.isReconciliationReady())
+
+                    // Signal that owner has installed pending terminal debt and is paused
+                    // BEFORE reaching owner-exit boundary
+                    ownerPauseLatch.countDown()
+
+                    // Wait for competitor to attempt and block
+                    competitorBlockedLatch.await()
+
+                    // NOW: Owner first clears the active operation (matching production flow in settleWorkerDispatchFailure)
+                    val cleared = KeplerJobMetadata.clearActiveOperation(directory, capturedOperationId!!, ownerLease!!)
+                    // If clear fails, it installs durable settlement pending (matching production)
+                    if (!cleared) {
+                        ownerLease!!.markDurableSettlementPending(capturedOperationId!!)
+                    }
+                    // Then attempts handoff settlement (handoff already consumed, so this succeeds)
+                    val handoffSettled = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(directory, ownerLease!!)
+                    assertTrue("Handoff already consumed, settlement succeeds", handoffSettled)
+
+                    // Owner reaches final relinquish boundary
+                    val released = ownerLease!!.releaseOrRetainForReconciliation()
+                    assertFalse("Lease should be retained for reconciliation (terminal debt remains)", released)
+                    assertTrue("Lease is now reconciliation ready", ownerLease!!.isReconciliationReady())
+
+                    // Verify final state before owner returns
+                    assertTrue("Lease carries pending terminal", ownerLease!!.pendingTerminalSettlement() != null)
+                    assertFalse("No pending handoff (already settled)", ownerLease!!.hasPendingProcessingHandoffSettlement())
+                    assertTrue("Lease is reconciliation ready", ownerLease!!.isReconciliationReady())
+
+                } catch (e: Exception) {
+                    android.util.Log.e("KeplerJobMetadataTest", "Owner thread failed", e)
+                } finally {
+                    ownerResumedLatch.countDown()
+                }
+            }
+
+            // Thread B: Competitor attempts acquisition while owner is paused
+            val competitorThread = Thread {
+                try {
+                    // Wait for owner to install pending terminal debt and pause
+                    ownerPauseLatch.await()
+
+                    // Competitor attempts acquisition - should be BLOCKED
+                    try {
+                        competitorLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                            directory,
+                            JobRecoveryMutationIntent.PROCESSING_START,
+                            consumesProcessingHandoff = true
+                        )
+                    } catch (e: ProcessingAlreadyActiveException) {
+                        competitorException = e
+                    }
+
+                    // Signal that competitor was blocked
+                    competitorBlockedLatch.countDown()
+
+                    // Wait for owner to finish and mark reconciliation ready
+                    ownerResumedLatch.await()
+
+                    // NOW competitor retries - should succeed and reconcile terminal debt under SAME E
+                    competitorRetryLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                        directory,
+                        JobRecoveryMutationIntent.PROCESSING_START,
+                        consumesProcessingHandoff = true
+                    )
+
+                } catch (e: Exception) {
+                    android.util.Log.e("KeplerJobMetadataTest", "Competitor thread failed", e)
+                } finally {
+                    competitorCanProceedLatch.countDown()
+                }
+            }
+
+            ownerThread.start()
+            competitorThread.start()
+
+            // Wait for both threads to complete
+            ownerThread.join(10000)
+            competitorThread.join(10000)
+
+            // Assertions
+            assertNotNull("Owner should have acquired lease", ownerLease)
+            assertNotNull("Competitor should have been blocked with ProcessingAlreadyActiveException", competitorException)
+            assertTrue("Competitor exception should be ProcessingAlreadyActiveException", competitorException is ProcessingAlreadyActiveException)
+            assertNull("Competitor should NOT have acquired lease on first attempt", competitorLease)
+
+            // After owner marks reconciliation ready and returns, competitor should acquire the SAME lease (reconciled)
+            assertNotNull("Competitor should acquire lease on retry", competitorRetryLease)
+            assertTrue("Competitor should own the job after reconciliation", KeplerJobMetadata.isOperationOwner(directory, competitorRetryLease!!))
+
+            // The original lease should have been released and a new lease acquired
+            assertFalse("Original owner lease should no longer be active", KeplerJobMetadata.isOperationOwner(directory, ownerLease!!))
+            assertTrue("Competitor should have a different lease after reconciliation", ownerLease != competitorRetryLease)
+
+            // Verify terminal was reconciled
+            val finalMetadata = KeplerJobMetadata.read(directory)
+            assertEquals("Terminal settlement should be persisted", "FAILED", finalMetadata.getString("currentPipelineStage"))
+            assertEquals(capturedOperationId, finalMetadata.optString(TERMINAL_OPERATION_ID))
+            assertFalse("Processing handoff should be settled", finalMetadata.has(PROCESSING_HANDOFF_OPERATION_ID))
+            assertEquals("Recovery state should be STABLE", "STABLE", finalMetadata.getString("recoveryState"))
+
+            // Cleanup
+            competitorRetryLease?.release()
+
+        } finally {
+            ownerLease?.release()
+            competitorLease?.release()
+            competitorRetryLease?.release()
             directory.deleteRecursively()
         }
     }

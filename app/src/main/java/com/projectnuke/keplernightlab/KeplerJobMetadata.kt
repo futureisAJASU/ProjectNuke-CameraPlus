@@ -422,6 +422,7 @@ internal fun inspectProcessingHandoff(
         access: MediaStoreExportRecoveryAccess? = null
     ): Boolean {
         if (!lease.hasPendingReconciliationDebt()) return false
+        if (!lease.isReconciliationReady()) return false
         val pendingTerminal = lease.pendingTerminalSettlement()
         if (pendingTerminal != null) {
             val persisted = try {
@@ -1214,7 +1215,7 @@ internal fun inspectProcessingHandoff(
                     }
                     if (current.optString(ACTIVE_OPERATION_ID).isBlank()) {
                         ownerLease.completeProcessingHandoffSettlement()
-                        ownerLease.releaseIfProcessingSettled()
+                        ownerLease.releaseOrRetainForReconciliation()
                         return true
                     }
                     ownerLease.markDurableSettlementPending(current.optString(ACTIVE_OPERATION_ID))
@@ -1226,7 +1227,7 @@ internal fun inspectProcessingHandoff(
                 }
                 AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> {
                     existingAuthority?.completeProcessingHandoffSettlement()
-                    existingAuthority?.releaseIfProcessingSettled()
+                    existingAuthority?.releaseOrRetainForReconciliation()
                     return true
                 }
                 AuthorityType.EXISTING_LIVE_OR_UNRELATED -> {
@@ -1306,9 +1307,9 @@ internal fun inspectProcessingHandoff(
             if (resolvedLease != null) {
                 resolvedLease.completeProcessingHandoffSettlement()
                 when (authorityType) {
-                    AuthorityType.CALLER_OWNED -> resolvedLease.releaseIfProcessingSettled()
+                    AuthorityType.CALLER_OWNED -> resolvedLease.releaseOrRetainForReconciliation()
                     AuthorityType.SELF_RESERVED -> resolvedLease.releaseIfProcessingSettled()
-                    AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> resolvedLease.releaseIfProcessingSettled()
+                    AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> resolvedLease.releaseOrRetainForReconciliation()
                     AuthorityType.EXISTING_LIVE_OR_UNRELATED -> { /* unreachable */ }
                     AuthorityType.NONE_AVAILABLE -> resolvedLease.releaseIfProcessingSettled()
                 }
@@ -1337,9 +1338,9 @@ internal fun inspectProcessingHandoff(
         if (settled) {
             resolvedLease?.completeProcessingHandoffSettlement()
             when (authorityType) {
-                AuthorityType.CALLER_OWNED -> resolvedLease?.releaseIfProcessingSettled()
+                AuthorityType.CALLER_OWNED -> resolvedLease?.releaseOrRetainForReconciliation()
                 AuthorityType.SELF_RESERVED -> resolvedLease?.releaseIfProcessingSettled()
-                AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> resolvedLease?.releaseIfProcessingSettled()
+                AuthorityType.EXISTING_PENDING_HANDOFF_RETRY -> resolvedLease?.releaseOrRetainForReconciliation()
                 AuthorityType.EXISTING_LIVE_OR_UNRELATED -> { /* unreachable */ }
                 AuthorityType.NONE_AVAILABLE -> resolvedLease?.releaseIfProcessingSettled()
             }
@@ -1423,6 +1424,7 @@ class JobOperationLease internal constructor(internal val key: String) {
         java.util.concurrent.atomic.AtomicReference<String?>(null)
     private val currentDurableOperationKind =
         java.util.concurrent.atomic.AtomicReference<KeplerActiveOperationKind?>(null)
+    private val reconciliationReady = AtomicBoolean(false)
 
     internal fun claimProcessingAttempt(attemptId: String): Boolean {
         if (released.get() || !processingAttemptId.compareAndSet(null, attemptId)) return false
@@ -1518,6 +1520,19 @@ class JobOperationLease internal constructor(internal val key: String) {
             pendingProcessingHandoffSettlement.get() ||
             pendingDurableSettlementId.get() != null
 
+    /** True only when the original owner has explicitly marked this lease as ready for
+     *  reconciliation by a competing acquisition. Pending debt markers alone do NOT imply
+     *  reconciliation readiness; the owner must finish its own cleanup before calling
+     *  [markReconciliationReady]. */
+    internal fun isReconciliationReady(): Boolean = reconciliationReady.get()
+
+    /** Called ONLY by the original owner scope at its exact relinquish boundary.
+     *  Transitions the lease from LIVE/LIVE_WITH_PENDING_DEBT to RETAINED_READY_FOR_RECONCILIATION.
+     *  After this point, the original owner must NOT perform any further lease/job authority work. */
+    internal fun markReconciliationReady() {
+        reconciliationReady.set(true)
+    }
+
     internal fun completeProcessingHandoffSettlement(): Boolean =
         pendingProcessingHandoffSettlement.compareAndSet(true, false)
 
@@ -1536,6 +1551,23 @@ class JobOperationLease internal constructor(internal val key: String) {
             if (current != expected) return false
             if (reference.compareAndSet(current, null)) return true
         }
+    }
+
+    /**
+     * Owner-relinquish boundary: called by the original owner scope when it has finished
+     * all lease/job ownership work and is ready to either release or retain for reconciliation.
+     * If explicit pending reconciliation debt remains, marks the lease reconciliation-ready
+     * and retains it for a competing acquisition to reconcile. Otherwise, releases normally.
+     * Returns true if the lease was released, false if retained for reconciliation.
+     */
+    internal fun releaseOrRetainForReconciliation(): Boolean {
+        if (!hasPendingReconciliationDebt()) {
+            // No explicit pending debt: normal release path (delegates to existing logic)
+            return releaseIfProcessingSettled()
+        }
+        // Explicit pending debt remains: mark reconciliation-ready and retain
+        markReconciliationReady()
+        return false
     }
 
     /**
