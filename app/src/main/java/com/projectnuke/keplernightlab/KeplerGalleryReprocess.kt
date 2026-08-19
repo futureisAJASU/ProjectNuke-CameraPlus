@@ -1887,15 +1887,26 @@ internal fun rollback(
         // The export owner was already settled and its ACTIVE marker cleared, so the retained
         // reprocess lease is registered as pending durable settlement: the next real production
         // acquisition reconciles it under this exact lease and releases it automatically.
-        val quarantineResult = quarantineWithPersistence(
-            transaction,
-            combineSettlementFailureWithMessage(
-                error,
-                "Committed public export proven after settlement; rollback refused",
-                IllegalStateException("A new public result is durably committed; deleting it is unsafe")
-            )
-        )
+        // Install debt BEFORE quarantine persistence so the lease remains LIVE_WITH_PENDING_DEBT
+        // (reconciliationReady == false) during the entire quarantine persistence boundary.
         operationLease.currentDurableOperationId()?.let { operationLease.markDurableSettlementPending(it) }
+        val quarantineResult = try {
+            quarantineWithPersistence(
+                transaction,
+                combineSettlementFailureWithMessage(
+                    error,
+                    "Committed public export proven after settlement; rollback refused",
+                    IllegalStateException("A new public result is durably committed; deleting it is unsafe")
+                )
+            )
+        } catch (primary: Throwable) {
+            try {
+                operationLease.releaseOrRetainForReconciliation()
+            } catch (secondary: Throwable) {
+                throw combineSettlementFailure(primary, secondary) ?: primary
+            }
+            throw primary
+        }
         operationLease.releaseOrRetainForReconciliation()
         return quarantineResult
     }

@@ -20,6 +20,7 @@ import org.robolectric.RobolectricTestRunner
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
+import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 
@@ -3395,6 +3396,52 @@ private fun rootManifest(txId: String, root: File): ReprocessTransactionManifest
             )
             assertNotNull(acquired)
             acquired.release()
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun reprocessQuarantineFatalAfterDurableEvidence_preservesFailureAndFinalizesOwner() {
+        val directory = tempJob()
+        try {
+            val session = ReprocessTransactionSession(directory)
+            val lease = session.acquireLease() ?: error("no lease")
+            KeplerJobMetadata.beginActiveOperation(
+                directory,
+                operationId = UUID.randomUUID().toString(),
+                kind = KeplerActiveOperationKind.PROCESSING_RAW,
+                ownerLease = lease,
+                consumesProcessingHandoff = true
+            )
+            val transaction = backup(directory, "final.png" to "before")
+            session.transferOwnership(transaction)
+            KeplerJobMetadata.update(directory) { job ->
+                job.put("galleryExportCommitted", true)
+                    .put("exportUri", "content://media/test")
+            }
+            val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
+            KeplerJobMetadata.atomicWriteFailureForTest = AssertionError("quarantine persistence failed")
+            try {
+                assertThrows(AssertionError::class.java) {
+                    rollback(
+                        session = session,
+                        transaction = transaction,
+                        operationLease = lease,
+                        jobDir = directory,
+                        jobKind = ReprocessJobKind.RAW_FUSION,
+                        outcome = ReprocessWorkerOutcome(
+                            result = Result.failure(IllegalStateException("worker failed")),
+                            publicExportCommitted = false,
+                            exportVerified = false
+                        ),
+                        error = IllegalStateException("rollback error")
+                    )
+                }
+                assertTrue(lease.isReconciliationReady())
+            } finally {
+                KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
+            }
         } finally {
             directory.deleteRecursively()
         }

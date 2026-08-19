@@ -317,6 +317,7 @@ class RawProcessingOperationTest {
             assertThrows(AssertionError::class.java) { scope.release() }
             assertTrue(KeplerJobMetadata.isOperationOwner(dir, scope.lease))
             assertNotNull(KeplerJobMetadata.read(dir).optString(ACTIVE_OPERATION_ID).takeIf { it.isNotBlank() })
+            assertTrue(scope.lease.isReconciliationReady())
 
             KeplerJobMetadata.atomicWriteFailureForTest = null
             val next = KeplerJobMetadata.acquireRecoveryCheckedOperation(

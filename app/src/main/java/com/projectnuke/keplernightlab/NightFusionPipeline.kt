@@ -356,12 +356,12 @@ try {
                     secondaryFailure = combineSettlementFailure(secondaryFailure, secondary)
                 }
                 try {
-                    pipelineLease.releaseOrRetainForReconciliation()
+                    workerThread.quitSafely()
                 } catch (secondary: Throwable) {
                     secondaryFailure = combineSettlementFailure(secondaryFailure, secondary)
                 }
                 try {
-                    workerThread.quitSafely()
+                    pipelineLease.releaseOrRetainForReconciliation()
                 } catch (secondary: Throwable) {
                     secondaryFailure = combineSettlementFailure(secondaryFailure, secondary)
                 }
@@ -671,6 +671,11 @@ terminal.publish(
                         }
                     }
                     try {
+                        workerThread.quitSafely()
+                    } catch (failure: Throwable) {
+                        cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+                    }
+                    try {
                         if (exportSettlementSucceeded) {
                             if (!pipelineLease.releaseOrRetainForReconciliation()) {
                                 android.util.Log.e(
@@ -681,11 +686,6 @@ terminal.publish(
                         } else {
                             pipelineLease.releaseOrRetainForReconciliation()
                         }
-                    } catch (failure: Throwable) {
-                        cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
-                    }
-                    try {
-                        workerThread.quitSafely()
                     } catch (failure: Throwable) {
                         cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
                     }

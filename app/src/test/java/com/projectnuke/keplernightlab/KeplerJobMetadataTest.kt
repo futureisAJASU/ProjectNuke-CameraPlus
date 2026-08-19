@@ -343,8 +343,7 @@ class KeplerJobMetadataTest {
             }
 
             KeplerJobMetadata.atomicWriteFailureForTest = null
-            // Mark reconciliation ready: the original owner has finished its work
-            lease!!.markReconciliationReady()
+            assertTrue(lease.isReconciliationReady())
             val next = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.REPROCESS
@@ -377,8 +376,8 @@ class KeplerJobMetadataTest {
             assertTrue(lease.isProcessingAttemptOwner(attempt.id))
             assertEquals(attempt.id, KeplerJobMetadata.read(directory).getString(ACTIVE_OPERATION_ID))
 
-KeplerJobMetadata.atomicWriteFailureForTest = null
-            lease!!.markReconciliationReady()
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            assertTrue(lease.isReconciliationReady())
             val next = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.REPROCESS

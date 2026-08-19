@@ -431,14 +431,14 @@ fun processLatestNightFusionV02(
         } finally {
             var cleanupFailure: Throwable? = null
             try {
-                if (operationLease?.releaseOrRetainForReconciliation() == false) {
-                    Log.e("KeplerYuvPipeline", "retaining processing lease for reconciliation after durable attempt settlement")
-                }
+                workerThread.quitSafely()
             } catch (failure: Throwable) {
                 cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
             }
             try {
-                workerThread.quitSafely()
+                if (operationLease?.releaseOrRetainForReconciliation() == false) {
+                    Log.e("KeplerYuvPipeline", "retaining processing lease for reconciliation after durable attempt settlement")
+                }
             } catch (failure: Throwable) {
                 cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
             }

@@ -70,19 +70,21 @@ internal class RawProcessingOperation internal constructor(
             if (!released.compareAndSet(false, true)) return
             if (ownsLease) lease.release()
         } catch (failure: Error) {
+            var cleanupFailure: Throwable? = null
             try {
                 lease.releaseOrRetainForReconciliation()
             } catch (secondary: Throwable) {
-                // secondary failure is suppressed by the primary Error
+                cleanupFailure = secondary
             }
-            throw failure
+            throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
         } catch (failure: kotlinx.coroutines.CancellationException) {
+            var cleanupFailure: Throwable? = null
             try {
                 lease.releaseOrRetainForReconciliation()
             } catch (secondary: Throwable) {
-                // secondary failure is suppressed by the primary cancellation
+                cleanupFailure = secondary
             }
-            throw failure
+            throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
         }
     }
 

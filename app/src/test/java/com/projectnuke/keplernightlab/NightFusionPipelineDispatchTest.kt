@@ -26,6 +26,17 @@ class NightFusionPipelineDispatchTest {
     }
 
     @Test
+    fun cancelledLatestNightFusionWorkerDispatchFailurePropagates() {
+        assertThrows(kotlinx.coroutines.CancellationException::class.java) {
+            processLatestNightFusionV02(
+                context = RuntimeEnvironment.getApplication(),
+                onStatus = {},
+                workerPostOperation = { throw kotlinx.coroutines.CancellationException("cancelled worker dispatch") }
+            )
+        }
+    }
+
+    @Test
     fun rejectedInitialWorkerPostCompletesTerminalWithoutHanging() = runBlocking {
         val dir = Files.createTempDirectory("yuv-reprocess-dispatch").toFile()
         try {
