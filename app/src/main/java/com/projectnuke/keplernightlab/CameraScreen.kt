@@ -76,6 +76,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -296,6 +297,7 @@ fun MainCameraScreen(
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val mainScheduler = remember { HandlerCameraUiScheduler(mainHandler) }
     val pipelineSession = remember { CameraPipelineUiSession() }
+    val hardwareE2ERecorder = remember { HardwareE2ERunRecorder.forContext(context) }
     val savedSettings = remember { CameraSettingsStore.load(context) }
 
     var status by remember { mutableStateOf("대기 중") }
@@ -322,6 +324,7 @@ fun MainCameraScreen(
     DisposableEffect(Unit) {
         onDispose {
             pipelineSession.dispose()
+            hardwareE2ERecorder.close()
             publishPipelineState()
             Log.i("KeplerPipelineState", "camera screen disposed; active pipeline cancelled")
         }
@@ -601,7 +604,8 @@ fun MainCameraScreen(
                     val success = terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE ||
                         terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
                     refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted)
-                }
+                },
+                onDiagnosticEvent = hardwareE2ERecorder::recordEvent
             )
         )
     }
@@ -613,7 +617,8 @@ fun MainCameraScreen(
                 val success = terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE ||
                     terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
                 refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted)
-            }
+            },
+            onDiagnosticEvent = hardwareE2ERecorder::recordEvent
         )
     )
     DisposableEffect(pipelineOrchestrator) {
@@ -810,6 +815,7 @@ LaunchedEffect(Unit) {
         startMessage: String,
         requestedFrames: Int = 0,
         timeoutMillis: Long = 120_000L,
+        diagnosticScenario: String = "production_main_camera_screen",
         job: (
             KeplerPipelineCancellationToken,
             KeplerCaptureCancellationHandle,
@@ -817,12 +823,31 @@ LaunchedEffect(Unit) {
             CameraPipelineEventSink
         ) -> Unit
     ) {
-        pipelineOrchestrator.start(
+        hardwareE2ERecorder.start(
+            HardwareE2ERunScenario(
+                requestedTestScenario = diagnosticScenario,
+                selectedPipelineMode = pipelineMode.name,
+                captureMode = captureMode.name,
+                requestedLensSlot = selectedLensSlot.name,
+                requestedResolution = selectedResolution.name,
+                frameCountPolicy = frameCountMode.name,
+                effectiveRequestedFrames = requestedFrames.takeIf { it > 0 } ?: latestFramePlan.framesToCapture,
+                requestedZoom = zoomUiState.zoomRatio,
+                requestedOutputFormat = finalOutputFormat.name,
+                requestedCameraId = cameraState.selection.cameraId,
+                requestedRoute = cameraState.selection.finalZoomRouteName()
+            )
+        )
+        val accepted = pipelineOrchestrator.start(
             startMessage = startMessage,
             requestedFrames = requestedFrames,
             timeoutMillis = timeoutMillis,
             job = job
         )
+        if (accepted) {
+            hardwareE2ERecorder.recordCheckpoint("PREVIEW_READY", null, null)
+            hardwareE2ERecorder.recordCheckpoint("PIPELINE_ACCEPTED", null, null)
+        }
         return
     }
 
@@ -879,6 +904,7 @@ LaunchedEffect(Unit) {
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
+            .testTag("kepler.camera.root")
     ) {
         PreviewStage(
             modifier = Modifier.fillMaxSize(),
@@ -1136,7 +1162,10 @@ LaunchedEffect(Unit) {
                         Log.i("KeplerPipelineState", "average/reprocess ignored while busy status=$status")
                         return@average
                     }
-                    runCameraJob("최근 촬영 컬러 합성 시작...") { cancellation, _, callback, onEvent ->
+                    runCameraJob(
+                        "최근 촬영 컬러 합성 시작...",
+                        diagnosticScenario = "production_reprocess"
+                    ) { cancellation, _, callback, onEvent ->
                         processLatestNightFusionV02(
                             context,
                             cancellation,
@@ -1146,13 +1175,21 @@ LaunchedEffect(Unit) {
                     }
                 },
                 onRaw = {
-                    runCameraJob("RAW DNG 촬영 준비 중...", requestedFrames = 1) { cancellation, _, callback, onEvent ->
+                    runCameraJob(
+                        "RAW DNG 촬영 준비 중...",
+                        requestedFrames = 1,
+                        diagnosticScenario = "legacy_diagnostic"
+                    ) { cancellation, _, callback, onEvent ->
                         cancellation.throwIfCancelled()
                         runHardenedRawDebugCapture(1, cancellation, pipelineSession.currentOperation()?.captureCancellation ?: KeplerCaptureCancellationHandle(), callback, onEvent)
                     }
                 },
                 onRawBurst = {
-                    runCameraJob("RAW Burst 촬영 준비 중...", requestedFrames = 4) { cancellation, _, callback, onEvent ->
+                    runCameraJob(
+                        "RAW Burst 촬영 준비 중...",
+                        requestedFrames = 4,
+                        diagnosticScenario = "legacy_diagnostic"
+                    ) { cancellation, _, callback, onEvent ->
                         cancellation.throwIfCancelled()
                         runHardenedRawDebugCapture(4, cancellation, pipelineSession.currentOperation()?.captureCancellation ?: KeplerCaptureCancellationHandle(), callback, onEvent)
                     }
@@ -1240,14 +1277,20 @@ LaunchedEffect(Unit) {
                 },
                 onRaw = {
                     currentScreen = MainScreen.CAMERA
-                    runCameraJob("RAW DNG capture preparing...") { cancellation, _, callback, onEvent ->
+                    runCameraJob(
+                        "RAW DNG capture preparing...",
+                        diagnosticScenario = "legacy_diagnostic"
+                    ) { cancellation, _, callback, onEvent ->
                         cancellation.throwIfCancelled()
                         runHardenedRawDebugCapture(1, cancellation, pipelineSession.currentOperation()?.captureCancellation ?: KeplerCaptureCancellationHandle(), callback, onEvent)
                     }
                 },
                 onRawBurst = {
                     currentScreen = MainScreen.CAMERA
-                    runCameraJob("RAW Burst capture preparing...") { cancellation, _, callback, onEvent ->
+                    runCameraJob(
+                        "RAW Burst capture preparing...",
+                        diagnosticScenario = "legacy_diagnostic"
+                    ) { cancellation, _, callback, onEvent ->
                         cancellation.throwIfCancelled()
                         runHardenedRawDebugCapture(4, cancellation, pipelineSession.currentOperation()?.captureCancellation ?: KeplerCaptureCancellationHandle(), callback, onEvent)
                     }
@@ -1274,7 +1317,11 @@ LaunchedEffect(Unit) {
                                 mainCapability.raw50Reason
                         return@test50
                     }
-                    runCameraJob("Test 50M RAW Capture: cameraId=${mainSelection.cameraId}", requestedFrames = 1) { cancellation, captureCancellation, callback, onEvent ->
+                    runCameraJob(
+                        "Test 50M RAW Capture: cameraId=${mainSelection.cameraId}",
+                        requestedFrames = 1,
+                        diagnosticScenario = "legacy_diagnostic"
+                    ) { cancellation, captureCancellation, callback, onEvent ->
                         cancellation.throwIfCancelled()
                         captureRawBurstForFusion(
                             context = context,
@@ -1335,7 +1382,8 @@ LaunchedEffect(Unit) {
                     }
                     runCameraJob(
                         "Test 50M YUV Capture: cameraId=${mainSelection.cameraId}",
-                        requestedFrames = 1
+                        requestedFrames = 1,
+                        diagnosticScenario = "legacy_diagnostic"
                     ) { cancellation, captureCancellation, callback, onEvent ->
                         cancellation.throwIfCancelled()
                         captureYuvBurstColorWithMotion(
@@ -1788,7 +1836,8 @@ fun PipelineBusyShutterIndicator(
     Box(
         modifier = modifier
             .clip(CircleShape)
-            .background(Color(0xCC111218)),
+            .background(Color(0xCC111218))
+            .testTag("kepler.pipeline.busy"),
         contentAlignment = Alignment.Center
     ) {
         Canvas(modifier = Modifier.fillMaxSize()) {
@@ -2162,7 +2211,8 @@ fun SettingsScreen(
             .background(Color.Black)
             .windowInsetsPadding(WindowInsets.safeDrawing)
             .verticalScroll(rememberScrollState())
-            .padding(horizontal = 18.dp, vertical = 12.dp),
+            .padding(horizontal = 18.dp, vertical = 12.dp)
+            .testTag("kepler.settings.root"),
         verticalArrangement = Arrangement.spacedBy(18.dp)
     ) {
         Row(
@@ -2330,7 +2380,8 @@ fun CaptureModeSettingsSection(
                 FrameModeChip(
                     text = mode.label,
                     selected = captureMode == mode,
-                    onClick = { onCaptureModeChange(mode) }
+                    onClick = { onCaptureModeChange(mode) },
+                    testTag = "kepler.settings.captureMode.${mode.name}"
                 )
             }
         }
@@ -2532,7 +2583,8 @@ fun OutputFormatSettingsSection(
                 FrameModeChip(
                     text = format.label,
                     selected = finalOutputFormat == format,
-                    onClick = { onFinalOutputFormatChange(format) }
+                    onClick = { onFinalOutputFormatChange(format) },
+                    testTag = "kepler.settings.outputFormat.${format.name}"
                 )
             }
         }
@@ -2548,7 +2600,8 @@ fun OutputFormatSettingsSection(
                     FrameModeChip(
                         text = format.label,
                         selected = finalOutputFormat == format,
-                        onClick = { onFinalOutputFormatChange(format) }
+                        onClick = { onFinalOutputFormatChange(format) },
+                        testTag = "kepler.settings.outputFormat.${format.name}"
                     )
                 }
             }
@@ -2558,7 +2611,8 @@ fun OutputFormatSettingsSection(
         FrameModeChip(
             text = FinalOutputFormat.PNG_DEBUG.label,
             selected = finalOutputFormat == FinalOutputFormat.PNG_DEBUG,
-            onClick = { onFinalOutputFormatChange(FinalOutputFormat.PNG_DEBUG) }
+            onClick = { onFinalOutputFormatChange(FinalOutputFormat.PNG_DEBUG) },
+            testTag = "kepler.settings.outputFormat.${FinalOutputFormat.PNG_DEBUG.name}"
         )
     }
 }
@@ -2591,12 +2645,14 @@ fun FrameCountSettingsSection(
             FrameModeChip(
                 text = "Auto",
                 selected = frameCountMode == FrameCountMode.AUTO,
-                onClick = { onFrameCountModeChange(FrameCountMode.AUTO) }
+                onClick = { onFrameCountModeChange(FrameCountMode.AUTO) },
+                testTag = "kepler.settings.frameCount.auto"
             )
             FrameModeChip(
                 text = "Manual",
                 selected = frameCountMode == FrameCountMode.MANUAL,
-                onClick = { onFrameCountModeChange(FrameCountMode.MANUAL) }
+                onClick = { onFrameCountModeChange(FrameCountMode.MANUAL) },
+                testTag = "kepler.settings.frameCount.manual"
             )
         }
 
@@ -2618,7 +2674,8 @@ fun FrameCountSettingsSection(
             label = "Manual",
             value = manualFrames,
             enabled = captureMode == CaptureMode.MULTI_FRAME && frameCountMode == FrameCountMode.MANUAL,
-            onChange = onManualFramesChange
+            onChange = onManualFramesChange,
+            testTagPrefix = "kepler.settings.manualFrames"
         )
 
         if (captureMode == CaptureMode.SINGLE_FRAME) {
@@ -2663,13 +2720,15 @@ fun PipelineModeSettingsSection(
             FrameModeChip(
                 text = "빠른 야간 모드",
                 selected = pipelineMode == PipelineMode.YUV_NIGHT_FUSION,
-                onClick = { onPipelineModeChange(PipelineMode.YUV_NIGHT_FUSION) }
+                onClick = { onPipelineModeChange(PipelineMode.YUV_NIGHT_FUSION) },
+                testTag = "kepler.settings.pipelineMode.YUV_NIGHT_FUSION"
             )
             FrameModeChip(
                 text = "고품질 RAW 야간 모드",
                 selected = pipelineMode == PipelineMode.RAW_NIGHT_FUSION,
                 enabled = captureMode == CaptureMode.MULTI_FRAME,
-                onClick = { onPipelineModeChange(PipelineMode.RAW_NIGHT_FUSION) }
+                onClick = { onPipelineModeChange(PipelineMode.RAW_NIGHT_FUSION) },
+                testTag = "kepler.settings.pipelineMode.RAW_NIGHT_FUSION"
             )
         }
         Text(
@@ -2744,7 +2803,8 @@ fun FrameModeChip(
     text: String,
     selected: Boolean,
     enabled: Boolean = true,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    testTag: String? = null
 ) {
     Box(
         modifier = Modifier
@@ -2757,6 +2817,7 @@ fun FrameModeChip(
                 }
             )
             .clickable(enabled = enabled, onClick = onClick)
+            .let { modifier -> testTag?.let(modifier::testTag) ?: modifier }
             .padding(horizontal = 14.dp, vertical = 8.dp),
         contentAlignment = Alignment.Center
     ) {
@@ -2773,7 +2834,8 @@ fun FrameCountStepper(
     label: String,
     value: Int,
     enabled: Boolean,
-    onChange: (Int) -> Unit
+    onChange: (Int) -> Unit,
+    testTagPrefix: String? = null
 ) {
     val alpha = if (enabled) 1.0f else 0.42f
 
@@ -2791,7 +2853,8 @@ fun FrameCountStepper(
         FrameStepButton(
             text = "-",
             enabled = enabled && value > MIN_CAPTURE_FRAMES,
-            onClick = { onChange(value - 1) }
+            onClick = { onChange(value - 1) },
+            testTag = testTagPrefix?.let { "$it.decrement" }
         )
 
         Text(
@@ -2804,7 +2867,8 @@ fun FrameCountStepper(
         FrameStepButton(
             text = "+",
             enabled = enabled && value < MAX_CAPTURE_FRAMES,
-            onClick = { onChange(value + 1) }
+            onClick = { onChange(value + 1) },
+            testTag = testTagPrefix?.let { "$it.increment" }
         )
     }
 }
@@ -2813,14 +2877,16 @@ fun FrameCountStepper(
 fun FrameStepButton(
     text: String,
     enabled: Boolean,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    testTag: String? = null
 ) {
     Box(
         modifier = Modifier
             .size(32.dp)
             .clip(CircleShape)
             .background(if (enabled) Color(0xFF303442) else Color(0xFF1B1D25))
-            .clickable(enabled = enabled, onClick = onClick),
+            .clickable(enabled = enabled, onClick = onClick)
+            .let { modifier -> testTag?.let(modifier::testTag) ?: modifier },
         contentAlignment = Alignment.Center
     ) {
         Text(

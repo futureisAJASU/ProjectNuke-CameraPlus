@@ -21,7 +21,8 @@ internal class CameraPipelineUiOrchestrator(
     internal data class Callbacks(
         val onStatus: (String) -> Unit,
         val onStateChanged: () -> Unit,
-        val onTerminal: (CameraPipelineEvent.Terminal) -> Unit
+        val onTerminal: (CameraPipelineEvent.Terminal) -> Unit,
+        val onDiagnosticEvent: ((CameraPipelineEvent) -> Unit)? = null
     )
 
     private var pendingTerminal: CameraPipelineEvent.Terminal? = null
@@ -30,6 +31,18 @@ internal class CameraPipelineUiOrchestrator(
     private val staleTerminalUiNotifications = ArrayDeque<Long>()
     private var launcherFailureValue: Throwable? = null
     private var terminalFallbackDispatchFailureValue: Throwable? = null
+
+    private fun notifyDiagnosticEvent(event: CameraPipelineEvent) {
+        try {
+            callbacks.onDiagnosticEvent?.invoke(event)
+        } catch (error: Throwable) {
+            // Diagnostics are strictly passive. A recorder failure must not alter the
+            // production session, terminal truth, or the original pipeline failure.
+            runCatching {
+                Log.w(TAG, "passive pipeline diagnostic observer failed", error)
+            }
+        }
+    }
 
     fun updateCallbacks(callbacks: Callbacks) {
         this.callbacks = callbacks
@@ -152,6 +165,7 @@ internal class CameraPipelineUiOrchestrator(
         fun acceptEvent(event: CameraPipelineEvent) {
             when (session.accept(event)) {
                 CameraPipelineUiSession.EventResult.ACCEPTED -> {
+                    notifyDiagnosticEvent(event)
                     val terminal = event as? CameraPipelineEvent.Terminal ?: return
                     synchronized(this@CameraPipelineUiOrchestrator) {
                         pendingTerminal = terminal
@@ -207,7 +221,10 @@ internal class CameraPipelineUiOrchestrator(
                             when (postSafely(0L, Runnable {
                                 if (session.snapshot().generation == generation) {
                                     when (session.accept(event)) {
-                                        CameraPipelineUiSession.EventResult.ACCEPTED -> notifyNonTerminal(event)
+                                        CameraPipelineUiSession.EventResult.ACCEPTED -> {
+                                            notifyDiagnosticEvent(event)
+                                            notifyNonTerminal(event)
+                                        }
                                         CameraPipelineUiSession.EventResult.DUPLICATE_TERMINAL,
                                         CameraPipelineUiSession.EventResult.LATE_AFTER_TERMINAL -> Unit
                                         CameraPipelineUiSession.EventResult.STALE,

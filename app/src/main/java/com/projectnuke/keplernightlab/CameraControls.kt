@@ -27,6 +27,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -66,10 +67,11 @@ fun CameraTopOverlay(
                 horizontal = TopOverlayHorizontalPadding,
                 vertical = TopOverlayVerticalPadding
             )
-            .height(TopOverlayHeight),
+            .height(TopOverlayHeight)
+            .testTag("kepler.camera.overlay"),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        CircleMiniButton(label = "⚙", onClick = onSettings)
+        CircleMiniButton(label = "⚙", onClick = onSettings, testTag = "kepler.settings.open")
 
         Column(
             modifier = Modifier
@@ -105,13 +107,14 @@ fun CameraTopOverlay(
                 CaptureResolutionMode.MP24_FUSION -> "24M Fusion"
                 else -> selectedResolution.label
             },
-            onClick = onResolutionClick
+            onClick = onResolutionClick,
+            testTag = "kepler.camera.resolution"
         )
     }
 }
 
 @Composable
-fun CircleMiniButton(label: String, onClick: () -> Unit) {
+fun CircleMiniButton(label: String, onClick: () -> Unit, testTag: String? = null) {
     Box(
         modifier = Modifier
             .size(TopMiniButtonSize)
@@ -122,7 +125,8 @@ fun CircleMiniButton(label: String, onClick: () -> Unit) {
                 color = Color.White.copy(alpha = 0.14f),
                 shape = CircleShape
             )
-            .clickable(onClick = onClick),
+            .clickable(onClick = onClick)
+            .let { modifier -> testTag?.let(modifier::testTag) ?: modifier },
         contentAlignment = Alignment.Center
     ) {
         Text(
@@ -134,12 +138,14 @@ fun CircleMiniButton(label: String, onClick: () -> Unit) {
 }
 
 @Composable
-fun TopText(text: String, onClick: () -> Unit) {
+fun TopText(text: String, onClick: () -> Unit, testTag: String? = null) {
     Text(
         text = text,
         color = Color.White,
         style = MaterialTheme.typography.titleSmall,
-        modifier = Modifier.clickable(onClick = onClick)
+        modifier = Modifier
+            .clickable(onClick = onClick)
+            .let { modifier -> testTag?.let(modifier::testTag) ?: modifier }
     )
 }
 
@@ -197,7 +203,8 @@ fun ShutterButton(
             .size(ShutterOuterSize)
             .clip(CircleShape)
             .background(Color.White.copy(alpha = if (enabled) 0.18f else 0.08f))
-            .clickable(enabled = enabled && !isCapturing, onClick = onClick),
+            .clickable(enabled = enabled && !isCapturing, onClick = onClick)
+            .testTag("kepler.camera.shutter"),
         contentAlignment = Alignment.Center
     ) {
         Box(
@@ -241,7 +248,8 @@ fun ResultThumbnail(bitmap: Bitmap?, onClick: () -> Unit) {
                 color = Color.White.copy(alpha = 0.12f),
                 shape = CircleShape
             )
-            .clickable(onClick = onClick),
+            .clickable(onClick = onClick)
+            .testTag("kepler.gallery.open"),
         contentAlignment = Alignment.Center
     ) {
         if (bitmap != null) {

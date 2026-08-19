@@ -61,6 +61,33 @@ class CameraPipelineUiOrchestratorTest {
     }
 
     @Test
+    fun diagnosticObserverFailureCannotChangeProductionTerminalTruth() {
+        val session = CameraPipelineUiSession()
+        val scheduler = ManualScheduler()
+        var sink: CameraPipelineEventSink? = null
+        var terminalEffects = 0
+        val orchestrator = CameraPipelineUiOrchestrator(
+            session,
+            scheduler,
+            CameraPipelineUiOrchestrator.Callbacks(
+                onStatus = {},
+                onStateChanged = {},
+                onTerminal = { terminalEffects++ },
+                onDiagnosticEvent = { error("diagnostic sink failed") }
+            )
+        )
+
+        orchestrator.start("capture") { _, _, _, events -> sink = events }
+        scheduler.run(250L)
+        sink!!.invoke(CameraPipelineEvent.Terminal(0L, CameraPipelineEvent.Terminal.Kind.COMPLETE))
+        scheduler.run(0L)
+
+        assertEquals(CameraPipelineEvent.Terminal.Kind.COMPLETE, session.snapshot().terminal?.kind)
+        assertEquals(1, terminalEffects)
+        assertFalse(session.snapshot().isBusy)
+    }
+
+    @Test
     fun watchdogRejectionSettlesBeforeJobStarts() {
         val session = CameraPipelineUiSession()
         val scheduler = ManualScheduler().also { it.rejectDelay = 120_000L }

@@ -369,6 +369,17 @@ fun JobDetailScreen(jobDir: File, onBack: () -> Unit) {
                         message = "Copied short summary"
                     }
                 ) { Text("Copy summary") }
+                Button(
+                    enabled = loaded != null,
+                    onClick = {
+                        copyText(
+                            clipboard,
+                            "hardware e2e snapshot",
+                            buildHardwareE2ESnapshot(context, jobDir, loaded)
+                        )
+                        message = "Copied E2E snapshot"
+                    }
+                ) { Text("Copy E2E snapshot") }
             }
             Text(
                 text = "Pipeline Inspector",
@@ -1066,4 +1077,60 @@ private fun buildShortJobSummary(jobDir: File, job: JSONObject?): String = build
     appendLine("nativePostprocess=${job.value("nativePostprocessRequired")}/${job.value("nativePostprocessUsed")}")
     appendLine("output=${job.value("outputWidth")}x${job.value("outputHeight")}")
     append("final=${job.firstValue("finalFile", "finalNightFusionFile")}")
+}
+
+internal fun buildHardwareE2ESnapshot(
+    context: Context,
+    jobDir: File,
+    detail: KeplerJobDetail?
+): String {
+    val job = detail?.job
+    val report = HardwareE2EReportStore.readReports(context)
+        .firstOrNull { it.latestJobDirectory == jobDir.absolutePath }
+    return JSONObject().apply {
+        put("jobFolder", jobDir.absolutePath)
+        put("runtimeSession", job.value(ACTIVE_RUNTIME_SESSION_ID))
+        put("operation", JSONObject().apply {
+            put("kind", job.value(ACTIVE_OPERATION_KIND))
+            put("id", job.value(ACTIVE_OPERATION_ID))
+            put("status", job.value("status"))
+            put("processStatus", job.value("processStatus"))
+        })
+        put("capture", JSONObject().apply {
+            listOf(
+                "cameraId", "physicalCameraId", "requestedPhysicalCameraId", "selectedRoute", "actualRoute", "requestedFrames", "attemptedFrames",
+                "savedFrames", "receivedImages", "completedResults", "failedCaptures", "partialCapture"
+            ).forEach { put(it, job.value(it)) }
+        })
+        put("processing", JSONObject().apply {
+            listOf(
+                "processingStatus", "processingDurationMs", "captureDurationMs", "exportDurationMs",
+                "totalDurationMs", "memoryRiskLevel", "estimatedRawFusionMemoryMb", "estimatedMemoryMb"
+            ).forEach { put(it, job.value(it)) }
+        })
+        put("export", JSONObject().apply {
+            listOf("exportStatus", "exportVerified", "publicExportCommitted", "requiredOutputCommitted", "cleanupType")
+                .forEach { put(it, job.value(it)) }
+        })
+        put("recovery", JSONObject().apply {
+            listOf(
+                "recoveryRequired", "recoveryState", "quarantineState", "quarantineMarkerPersisted",
+                "activeOperationId", "terminalOperationId"
+            ).forEach { put(it, job.value(it)) }
+        })
+        put("diagnosticError", job.value("error"))
+        put("fileInventory", JSONObject().apply {
+            put("count", detail?.files?.size ?: 0)
+            put("totalSizeBytes", detail?.totalSizeBytes ?: 0L)
+            put("files", JSONArray(detail?.files?.map { it.name }.orEmpty()))
+        })
+        report?.let {
+            put("hardwareE2E", JSONObject().apply {
+                put("runId", it.runId)
+                put("status", it.status.name)
+                put("terminalEvent", it.terminalEvent ?: "")
+                put("eventCount", it.eventHistory.size)
+            })
+        }
+    }.toString(2)
 }
