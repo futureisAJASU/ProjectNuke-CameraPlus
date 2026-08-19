@@ -3402,7 +3402,7 @@ private fun rootManifest(txId: String, root: File): ReprocessTransactionManifest
     }
 
     @Test
-    fun reprocessQuarantineFatalAfterDurableEvidence_preservesFailureAndFinalizesOwner() {
+    fun reprocessQuarantineFatalAfterDurableEvidence_preservesFailureAndFinalizesOwnerWithActiveManifest() {
         val directory = tempJob()
         try {
             val session = ReprocessTransactionSession(directory)
@@ -3420,8 +3420,10 @@ private fun rootManifest(txId: String, root: File): ReprocessTransactionManifest
                 job.put("galleryExportCommitted", true)
                     .put("exportUri", "content://media/test")
             }
-            val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
-            KeplerJobMetadata.atomicWriteFailureForTest = AssertionError("quarantine persistence failed")
+            val previousMarkerWrite = quarantineMarkerWriteOperation
+            quarantineMarkerWriteOperation = { _, _ ->
+                throw AssertionError("quarantine marker persistence failed")
+            }
             try {
                 assertThrows(AssertionError::class.java) {
                     rollback(
@@ -3438,9 +3440,73 @@ private fun rootManifest(txId: String, root: File): ReprocessTransactionManifest
                         error = IllegalStateException("rollback error")
                     )
                 }
+                assertEquals(RootEvidence.Trustworthy, strictRootEvidence(directory, transaction))
+                assertTrue(strictFallbackEvidence(directory, transaction) !== FallbackEvidence.Trustworthy)
                 assertTrue(lease.isReconciliationReady())
+                assertSame(lease, KeplerJobMetadata.findOperationLease(directory))
             } finally {
-                KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
+                quarantineMarkerWriteOperation = previousMarkerWrite
+            }
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun reprocessQuarantineNoDurableEvidence_remainsLiveNotReadyAndBlocksCompetitor() {
+        val directory = tempJob()
+        try {
+            val session = ReprocessTransactionSession(directory)
+            val lease = session.acquireLease() ?: error("no lease")
+            val operationId = UUID.randomUUID().toString()
+            KeplerJobMetadata.beginActiveOperation(
+                directory,
+                operationId = operationId,
+                kind = KeplerActiveOperationKind.PROCESSING_RAW,
+                ownerLease = lease,
+                consumesProcessingHandoff = true
+            )
+            val transaction = backup(directory, "final.png" to "before")
+            session.transferOwnership(transaction)
+            KeplerJobMetadata.update(directory) { job ->
+                job.put("galleryExportCommitted", true)
+                    .put("exportUri", "content://media/test")
+            }
+            assertTrue(transaction.backupRoot.deleteRecursively())
+
+            val previousFallbackWrite = fallbackWriteOperation
+            fallbackWriteOperation = { _, _, _ ->
+                throw AssertionError("fallback persistence failed")
+            }
+            try {
+                assertThrows(AssertionError::class.java) {
+                    rollback(
+                        session = session,
+                        transaction = transaction,
+                        operationLease = lease,
+                        jobDir = directory,
+                        jobKind = ReprocessJobKind.RAW_FUSION,
+                        outcome = ReprocessWorkerOutcome(
+                            result = Result.failure(IllegalStateException("worker failed")),
+                            publicExportCommitted = false,
+                            exportVerified = false
+                        ),
+                        error = IllegalStateException("rollback error")
+                    )
+                }
+                assertTrue(strictRootEvidence(directory, transaction) !== RootEvidence.Trustworthy)
+                assertTrue(strictFallbackEvidence(directory, transaction) !== FallbackEvidence.Trustworthy)
+                assertTrue(lease.hasPendingReconciliationDebt())
+                assertFalse(lease.isReconciliationReady())
+                assertSame(lease, KeplerJobMetadata.findOperationLease(directory))
+                assertThrows(ProcessingAlreadyActiveException::class.java) {
+                    KeplerJobMetadata.acquireRecoveryCheckedOperation(
+                        directory,
+                        JobRecoveryMutationIntent.REPROCESS
+                    )
+                }
+            } finally {
+                fallbackWriteOperation = previousFallbackWrite
             }
         } finally {
             directory.deleteRecursively()

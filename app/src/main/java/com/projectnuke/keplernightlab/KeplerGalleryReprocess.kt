@@ -1812,6 +1812,57 @@ internal fun quarantineWithPersistence(
 }
 
 /**
+ * The original owner may relinquish a quarantine lease only after persistence has left
+ * trustworthy unresolved evidence. The existing ACTIVE transaction manifest is sufficient; a
+ * newly written QUARANTINED marker/state is not required. Without trustworthy root or fallback
+ * evidence, the exact lease stays LIVE_WITH_PENDING_DEBT and not reconciliation-ready.
+ */
+private fun settleQuarantineOwnerAfterPersistence(
+    jobDir: File,
+    transaction: ReprocessTransaction,
+    operationLease: JobOperationLease,
+    quarantineResult: ReprocessFinalizationResult
+): ReprocessFinalizationResult {
+    val primaryFailure = quarantineResult.result.exceptionOrNull()
+        ?: IllegalStateException("Quarantine finalization returned without a failure")
+    val evidenceFailure = try {
+        val rootEvidence = strictRootEvidence(jobDir, transaction)
+        val fallbackEvidence = strictFallbackEvidence(jobDir, transaction)
+        if (rootEvidence === RootEvidence.Trustworthy ||
+            fallbackEvidence === FallbackEvidence.Trustworthy
+        ) {
+            null
+        } else {
+            IllegalStateException(
+                "Quarantine persistence left no trustworthy unresolved evidence " +
+                    "(root=$rootEvidence, fallback=$fallbackEvidence)"
+            )
+        }
+    } catch (failure: Throwable) {
+        failure
+    }
+    if (evidenceFailure != null) {
+        val combined = requireNotNull(combineSettlementFailure(primaryFailure, evidenceFailure))
+        if (combined is Error || combined is CancellationException) throw combined
+        return quarantineResult.copy(result = Result.failure(combined))
+    }
+
+    val releaseFailure = try {
+        operationLease.releaseOrRetainForReconciliation()
+        null
+    } catch (failure: Throwable) {
+        failure
+    }
+    if (releaseFailure != null) {
+        val combined = requireNotNull(combineSettlementFailure(primaryFailure, releaseFailure))
+        if (combined is Error || combined is CancellationException) throw combined
+        return quarantineResult.copy(result = Result.failure(combined))
+    }
+    if (primaryFailure is Error || primaryFailure is CancellationException) throw primaryFailure
+    return quarantineResult
+}
+
+/**
  * Exact rollback path. Returns ROLLED_BACK (lease released) or QUARANTINED (lease retained).
  * External-authority settlement runs BEFORE any destructive op: the exact PUBLIC_EXPORT owner is
  * proven/settled with provider access first, and a durably committed/verified public result
@@ -1829,6 +1880,7 @@ internal fun rollback(
     error: Throwable,
     access: MediaStoreExportRecoveryAccess? = null
 ): ReprocessFinalizationResult {
+    val durableOperationIdBeforeOwnerSettlement = operationLease.currentDurableOperationId()
     // External-authority preflight BEFORE any backup restore or created-file deletion.  An
     // unresolved public-export owner (journal requires exact provider commit resolution) is
     // quarantined with the lease retained and the transaction evidence untouched.
@@ -1889,7 +1941,9 @@ internal fun rollback(
         // acquisition reconciles it under this exact lease and releases it automatically.
         // Install debt BEFORE quarantine persistence so the lease remains LIVE_WITH_PENDING_DEBT
         // (reconciliationReady == false) during the entire quarantine persistence boundary.
-        operationLease.currentDurableOperationId()?.let { operationLease.markDurableSettlementPending(it) }
+        val pendingOperationId = operationLease.currentDurableOperationId()
+            ?: durableOperationIdBeforeOwnerSettlement
+        pendingOperationId?.let { operationLease.markDurableSettlementPending(it) }
         val quarantineResult = try {
             quarantineWithPersistence(
                 transaction,
@@ -1900,15 +1954,17 @@ internal fun rollback(
                 )
             )
         } catch (primary: Throwable) {
-            try {
-                operationLease.releaseOrRetainForReconciliation()
-            } catch (secondary: Throwable) {
-                throw combineSettlementFailure(primary, secondary) ?: primary
-            }
-            throw primary
+            return settleQuarantineOwnerAfterPersistence(
+                jobDir,
+                transaction,
+                operationLease,
+                ReprocessFinalizationResult(
+                    ReprocessFinalizationState.QUARANTINED,
+                    Result.failure(primary)
+                )
+            )
         }
-        operationLease.releaseOrRetainForReconciliation()
-        return quarantineResult
+        return settleQuarantineOwnerAfterPersistence(jobDir, transaction, operationLease, quarantineResult)
     }
     val restore = restoreBackups(jobDir, transaction)
     if (restore.isFailure) {
