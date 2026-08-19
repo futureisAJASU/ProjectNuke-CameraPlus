@@ -248,8 +248,10 @@ class KeplerJobMetadataTest {
             assertTrue(KeplerJobMetadata.read(directory).has(PROCESSING_HANDOFF_OPERATION_ID))
 
             KeplerJobMetadata.atomicWriteFailureForTest = null
-            // Mark reconciliation ready: the owner has finished its work
-            lease!!.markReconciliationReady()
+            // The original owner finished its work; releaseOrRetainForReconciliation advances the state machine
+            val oldLease = lease!!
+            oldLease.releaseOrRetainForReconciliation()
+            lease = null
             replacement = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.PROCESSING_START,
@@ -437,7 +439,8 @@ class KeplerJobMetadataTest {
             assertTrue(KeplerJobMetadata.isOperationOwner(directory, ownerLease))
 
 KeplerJobMetadata.atomicWriteFailureForTest = null
-            ownerLease.markReconciliationReady()
+            ownerLease.releaseOrRetainForReconciliation()
+            lease = null
             val next = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.REPROCESS
@@ -727,9 +730,10 @@ KeplerJobMetadata.atomicWriteFailureForTest = null
             // must retry the specialized PUBLIC_EXPORT protocol before it can
             // reserve a new mutation lease.
             KeplerJobMetadata.atomicWriteFailureForTest = null
-            // Mark reconciliation ready: the original owner has finished its work
+            // The original owner finished its work; releaseOrRetainForReconciliation advances the state machine
             val oldLease = lease!!
-            oldLease.markReconciliationReady()
+            oldLease.releaseOrRetainForReconciliation()
+            lease = null
             val nextLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.REPROCESS
@@ -785,9 +789,10 @@ KeplerJobMetadata.atomicWriteFailureForTest = null
                 )
             }
             KeplerJobMetadata.atomicWriteFailureForTest = null
-            // Mark reconciliation ready: the original owner has finished its work
+            // The original owner finished its work; releaseOrRetainForReconciliation advances the state machine
             val oldLease = lease!!
-            oldLease.markReconciliationReady()
+            oldLease.releaseOrRetainForReconciliation()
+            lease = null
             val nextLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.REPROCESS
@@ -848,9 +853,10 @@ KeplerJobMetadata.atomicWriteFailureForTest = null
             assertFalse(MediaStoreExportJournal.read(directory, MediaStoreExportJournal.fileFor(directory, journal.exportAttemptId)).terminalMetadataPersisted)
 
             KeplerJobMetadata.atomicWriteFailureSequenceForTest = null
-            // Mark reconciliation ready: the original owner has finished its work
+            // The original owner finished its work; releaseOrRetainForReconciliation advances the state machine
             val oldLease = lease!!
-            oldLease.markReconciliationReady()
+            oldLease.releaseOrRetainForReconciliation()
+            lease = null
             val nextLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.REPROCESS
@@ -1029,9 +1035,10 @@ KeplerJobMetadata.atomicWriteFailureForTest = null
             assertTrue(MediaStoreExportJournal.read(directory, MediaStoreExportJournal.fileFor(directory, journal.exportAttemptId)).terminalMetadataPersisted)
 
             KeplerJobMetadata.atomicWriteFailureSequenceForTest = null
-            // Mark reconciliation ready: the original owner has finished its work
+            // The original owner finished its work; releaseOrRetainForReconciliation advances the state machine
             val oldLease = lease!!
-            oldLease.markReconciliationReady()
+            oldLease.releaseOrRetainForReconciliation()
+            lease = null
             val nextLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.REPROCESS
@@ -1246,9 +1253,10 @@ KeplerJobMetadata.atomicWriteFailureForTest = null
             assertNotNull(lease!!.pendingPublicExportSettlement())
 
             KeplerJobMetadata.atomicWriteFailureForTest = null
-            // Mark reconciliation ready: the original owner has finished its work
+            // The original owner finished its work; releaseOrRetainForReconciliation advances the state machine
             val oldLease = lease!!
-            oldLease.markReconciliationReady()
+            oldLease.releaseOrRetainForReconciliation()
+            lease = null
             val nextLease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.REPROCESS
@@ -1518,11 +1526,13 @@ KeplerJobMetadata.atomicWriteFailureForTest = null
             lease = KeplerJobMetadata.acquireOperation(directory)
             assertNotNull(lease)
 
-            // Manually mark the lease as having pending processing handoff settlement
+            // Manually mark the lease as having pending processing handoff settlement,
+            // then simulate the owner finishing its work via the proper state-machine method
             lease!!.markProcessingHandoffSettlementPending()
-            lease!!.markReconciliationReady()
+            lease!!.releaseOrRetainForReconciliation()
+            lease = null
 
-            assertTrue(lease.hasPendingProcessingHandoffSettlement())
+            assertTrue(KeplerJobMetadata.findOperationLease(directory)!!.hasPendingProcessingHandoffSettlement())
 
             // Call the helper to settle the handoff - it should reuse the same lease
             val result = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
@@ -1664,9 +1674,14 @@ KeplerJobMetadata.atomicWriteFailureForTest = null
             KeplerJobMetadata.write(directory, JSONObject().put("status", "PROCESSING"))
             lease = KeplerJobMetadata.acquireOperation(directory)
             assertNotNull(lease)
+            // Simulate owner finishing its work; releaseOrRetainForReconciliation advances the state machine.
+            // markProcessingHandoffSettlementPending must come first so the lease is retained (not released)
+            // when releaseOrRetainForReconciliation is called.
             lease!!.markProcessingHandoffSettlementPending()
-            lease!!.markReconciliationReady()
-            lease.markTerminalSettlementPending(
+            lease!!.releaseOrRetainForReconciliation()
+            val retained = KeplerJobMetadata.findOperationLease(directory)
+            assertNotNull(retained)
+            retained!!.markTerminalSettlementPending(
                 PendingTerminalSettlement(
                     operationId = "terminal-op",
                     attemptStatus = "FAILED",
@@ -1682,9 +1697,7 @@ KeplerJobMetadata.atomicWriteFailureForTest = null
             )
 
             assertTrue(result)
-            assertTrue(KeplerJobMetadata.isOperationActive(directory))
-            val retained = KeplerJobMetadata.findOperationLease(directory)
-            assertNotNull(retained)
+            assertTrue("Terminal debt keeps lease alive", KeplerJobMetadata.isOperationActive(directory))
             assertFalse("Handoff marker cleared", retained!!.hasPendingProcessingHandoffSettlement())
             assertTrue("Terminal debt remains", retained.pendingTerminalSettlement() != null)
         } finally {
@@ -1702,7 +1715,9 @@ KeplerJobMetadata.atomicWriteFailureForTest = null
             lease = KeplerJobMetadata.acquireOperation(directory)
             assertNotNull(lease)
             lease!!.markProcessingHandoffSettlementPending()
-            lease!!.markReconciliationReady()
+            // Simulate owner finishing its work; releaseOrRetainForReconciliation advances the state machine
+            lease!!.releaseOrRetainForReconciliation()
+            lease = null
 
             val result = KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
                 directory,
@@ -1848,8 +1863,9 @@ KeplerJobMetadata.atomicWriteFailureForTest = null
 
             KeplerJobMetadata.reconcilePostHandoffReadFailureForTest = null
 
-            // Mark reconciliation ready: the original owner has finished its work
-            lease!!.markReconciliationReady()
+            // The original owner finished its work; releaseOrRetainForReconciliation advances the state machine
+            lease!!.releaseOrRetainForReconciliation()
+            lease = null
             val acquired = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 directory,
                 JobRecoveryMutationIntent.PROCESSING_START,
