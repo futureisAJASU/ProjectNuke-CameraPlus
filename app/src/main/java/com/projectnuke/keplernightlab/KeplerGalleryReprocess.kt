@@ -1888,6 +1888,7 @@ internal fun rollback(
         // reprocess lease is registered as pending durable settlement: the next real production
         // acquisition reconciles it under this exact lease and releases it automatically.
         operationLease.currentDurableOperationId()?.let { operationLease.markDurableSettlementPending(it) }
+        operationLease.releaseOrRetainForReconciliation()
         return quarantineWithPersistence(
             transaction,
             combineSettlementFailureWithMessage(

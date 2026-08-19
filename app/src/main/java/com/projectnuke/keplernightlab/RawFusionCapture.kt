@@ -939,24 +939,24 @@ fun captureRawBurstForFusion(
                                     durableCaptureOperationId,
                                     KeplerActiveOperationKind.PROCESSING_RAW
                                 )
-                            val ownerSettled = if (handoffPublished) {
-                                KeplerJobMetadata.clearActiveOperation(
-                                    jobDir,
-                                    durableCaptureOperationId,
-                                    durableCaptureLease
-                                )
-                            } else {
-                                KeplerJobMetadata.settleCaptureOwnerAfterHandoffFailure(
-                                    jobDir,
-                                    durableCaptureOperationId,
-                                    durableCaptureLease
-                                )
-                            }
-                            if (!ownerSettled) {
-                                Log.e("KeplerRawCapture", "retaining capture lease after handoff settlement failure")
-                            } else {
-                                durableCaptureLease.release()
-                            }
+                             val ownerSettled = if (handoffPublished) {
+                                 KeplerJobMetadata.clearActiveOperation(
+                                     jobDir,
+                                     durableCaptureOperationId,
+                                     durableCaptureLease
+                                 )
+                             } else {
+                                 KeplerJobMetadata.settleCaptureOwnerAfterHandoffFailure(
+                                     jobDir,
+                                     durableCaptureOperationId,
+                                     durableCaptureLease
+                                 )
+                             }
+                             if (!ownerSettled) {
+                                 durableCaptureLease.releaseOrRetainForReconciliation()
+                             } else {
+                                 durableCaptureLease.release()
+                             }
 } else {
                             // The capture terminal record did not persist: register exact terminal debt so the next
                             // production entry converges it and CLEARS the CAPTURE_RAW owner.  The handoff was
@@ -976,6 +976,7 @@ fun captureRawBurstForFusion(
                                     reason = "RAW capture terminal metadata settlement failed: ${request.reason ?: request.jobStatus}"
                                 )
                             )
+                            durableCaptureLease.releaseOrRetainForReconciliation()
                             Log.e("KeplerRawCapture", "retaining capture lease with terminal settlement debt after metadata failure")
                         }
                         cleanup()

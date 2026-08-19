@@ -1793,7 +1793,9 @@ internal fun settleMediaStoreExportDebt(
             // worker scope is gone.  The same lease E settles and releases before any new
             // mutation acquires.  A retained lease without a registered settlement still belongs
             // to a live pipeline; the job stays busy for it.
-            if (retainedLease != null && retainedLease.pendingPublicExportSettlement() != null) {
+            if (retainedLease != null && retainedLease.pendingPublicExportSettlement() != null &&
+                retainedLease.isReconciliationReady()
+            ) {
                 return KeplerJobMetadata.withJobLock(jobDir) {
                     settleRetainedPublicExportLease(jobDir, retainedLease, access, allowDeadOwner = false)
                 }

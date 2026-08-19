@@ -638,30 +638,31 @@ fun captureYuvBurstColorWithMotion(
                                     operationId,
                                     KeplerActiveOperationKind.PROCESSING_YUV
                                 )
-                            val ownerSettled = if (handoffPublished) {
-                                KeplerJobMetadata.clearActiveOperation(
-                                    currentBurstDir,
-                                    operationId,
-                                    durableCaptureLease
-                                )
-                            } else {
-                                KeplerJobMetadata.settleCaptureOwnerAfterHandoffFailure(
-                                    currentBurstDir,
-                                    operationId,
-                                    requireNotNull(durableCaptureLease)
-                                )
-                            }
-                            if (ownerSettled) {
-                                durableCaptureLease?.release()
-                                onComplete(currentBurstDir)
-                            } else {
-                                logYuvCaptureFailure(
-                                    stage = "handoff",
-                                    throwable = IllegalStateException("Processing handoff could not be durably settled"),
-                                    detail = "YUV capture completed but processing ownership was retained."
-                                )
-                                onError("YUV processing handoff could not be durably settled")
-                            }
+                             val ownerSettled = if (handoffPublished) {
+                                 KeplerJobMetadata.clearActiveOperation(
+                                     currentBurstDir,
+                                     operationId,
+                                     durableCaptureLease
+                                 )
+                             } else {
+                                 KeplerJobMetadata.settleCaptureOwnerAfterHandoffFailure(
+                                     currentBurstDir,
+                                     operationId,
+                                     requireNotNull(durableCaptureLease)
+                                 )
+                             }
+                             if (ownerSettled) {
+                                 durableCaptureLease?.release()
+                                 onComplete(currentBurstDir)
+                             } else {
+                                 durableCaptureLease?.releaseOrRetainForReconciliation()
+                                 logYuvCaptureFailure(
+                                     stage = "handoff",
+                                     throwable = IllegalStateException("Processing handoff could not be durably settled"),
+                                     detail = "YUV capture completed but processing ownership was retained."
+                                 )
+                                 onError("YUV processing handoff could not be durably settled")
+                             }
                         } ?: onComplete(currentBurstDir)
                     }
                     TerminalCompletionKind.ERROR -> {
@@ -677,15 +678,16 @@ fun captureYuvBurstColorWithMotion(
                                 operationId,
                                 durableCaptureLease
                             )
-                        } ?: true
-                        if (ownerSettled) {
-                            durableCaptureLease?.release()
-                        } else {
-                            android.util.Log.e(
-                                "KeplerYuvCapture",
-                                "retaining capture lease after terminal owner settlement failure"
-                            )
-                        }
+                         } ?: true
+                         if (ownerSettled) {
+                             durableCaptureLease?.release()
+                         } else {
+                             durableCaptureLease?.releaseOrRetainForReconciliation()
+                             android.util.Log.e(
+                                 "KeplerYuvCapture",
+                                 "retaining capture lease after terminal owner settlement failure"
+                             )
+                         }
                         logYuvCaptureFailure(
                             stage = "terminal",
                             throwable = request.cause,

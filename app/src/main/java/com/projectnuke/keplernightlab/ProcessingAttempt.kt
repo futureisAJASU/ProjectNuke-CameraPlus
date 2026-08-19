@@ -27,12 +27,14 @@ internal data class ProcessingAttempt(
             } catch (secondary: Throwable) {
                 cleanupFailure = secondary
             }
+            if (ownsOperationLease) operationLease?.markReconciliationReady()
             throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
         }
         if (!cleared && KeplerJobMetadata.isCurrentActiveOperation(jobDir, id)) {
             // A failed metadata write leaves the durable owner in place. Keep both
             // the sublease and its top-level lease so another mutation cannot overlap it.
             operationLease?.markProcessingSettlementPending(id)
+            if (ownsOperationLease) operationLease?.markReconciliationReady()
             return
         }
         if (!released.compareAndSet(false, true)) return

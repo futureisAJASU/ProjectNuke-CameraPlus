@@ -41,6 +41,7 @@ internal class RawProcessingOperation internal constructor(
         }
         if (lease.pendingTerminalSettlement() != null || lease.pendingPublicExportSettlement() != null) {
             Log.e("KeplerRawPipeline", "retaining RAW lease until durable terminal settlement is retried")
+            lease.markReconciliationReady()
             return
         }
         // The durable lease is authoritative if a nested PUBLIC_EXPORT transition occurred.
@@ -54,16 +55,19 @@ internal class RawProcessingOperation internal constructor(
                 throw failure
             } catch (_: Exception) {
                 lease.markDurableSettlementPending(operationId)
+                lease.markReconciliationReady()
                 return
             }
             if (currentActiveId.isNotBlank() && currentActiveId != operationId) {
                 lease.markDurableSettlementPending(currentActiveId)
+                lease.markReconciliationReady()
                 Log.e("KeplerRawPipeline", "retaining RAW lease for newer durable operation $currentActiveId")
                 return
             }
         }
         if (!cleared && operationId?.let { KeplerJobMetadata.isCurrentActiveOperation(jobDir, it) } == true) {
             Log.e("KeplerRawPipeline", "retaining RAW operation lease after durable owner clear failure")
+            lease.markReconciliationReady()
             return
         }
         operationId?.let { lease.clearDurableOperation(it) }
@@ -140,6 +144,13 @@ KeplerJobMetadata.beginActiveOperation(
                     )
                 } catch (secondary: Throwable) {
                     cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
+                }
+                if (ownsLease) {
+                    try {
+                        lease.markReconciliationReady()
+                    } catch (secondary: Throwable) {
+                        cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
+                    }
                 }
             } else if (ownsLease) {
                 try {

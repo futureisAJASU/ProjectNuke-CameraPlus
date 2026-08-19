@@ -285,8 +285,8 @@ KeplerJobMetadata.clearActiveOperation(jobDir, operationId, pipelineLease)
                         primaryFailure = combineSettlementFailure(failure, secondary)
                     )
                 }
-try {
-                    if (terminalFailure == null) pipelineLease.releaseOrRetainForReconciliation()
+                try {
+                    pipelineLease.releaseOrRetainForReconciliation()
                 } catch (secondary: Throwable) {
                     terminalFailure = combineSettlementFailure(terminalFailure ?: failure, secondary)
                 }
@@ -660,7 +660,7 @@ terminal.publish(
                             android.util.Log.e("KeplerYuvPipeline", "public export owner settlement failed", settlementFailure)
                         }
                     }
-try {
+                    try {
                         if (exportSettlementSucceeded) {
                             if (!pipelineLease.releaseOrRetainForReconciliation()) {
                                 android.util.Log.e(
@@ -669,7 +669,7 @@ try {
                                 )
                             }
                         } else {
-                            android.util.Log.e("KeplerYuvPipeline", "retaining public export lease after settlement failure")
+                            pipelineLease.releaseOrRetainForReconciliation()
                         }
                     } catch (failure: Throwable) {
                         cleanupFailure = combineSettlementFailure(cleanupFailure, failure)

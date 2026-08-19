@@ -137,11 +137,9 @@ class RawProcessingOperationTest {
                     dir,
                     JobRecoveryMutationIntent.REPROCESS
                 )
-            }
+             }
 
             KeplerJobMetadata.atomicWriteFailureForTest = null
-            // Mark reconciliation ready: the original owner has finished its work
-            scope.lease.markReconciliationReady()
             val next = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 dir,
                 JobRecoveryMutationIntent.REPROCESS

@@ -1176,7 +1176,7 @@ post(
                                     )
                                 }
                             } else {
-                                Log.e("KeplerSuperResolution", "retaining public export lease after settlement failure")
+                                lease.releaseOrRetainForReconciliation()
                             }
                         } catch (failure: Throwable) {
                             cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
