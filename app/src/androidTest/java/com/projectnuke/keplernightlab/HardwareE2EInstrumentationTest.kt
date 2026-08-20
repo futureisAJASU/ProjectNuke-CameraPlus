@@ -2,10 +2,13 @@ package com.projectnuke.keplernightlab
 
 import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.hardware.camera2.CameraManager
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
+import androidx.core.content.ContextCompat
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -61,23 +64,26 @@ class HardwareE2EInstrumentationTest {
         assumeTrue("12MP YUV is unsupported", capability?.yuv12Available == true)
 
         configureSettings(PipelineMode.YUV_NIGHT_FUSION.name)
+        val previousRunId = HardwareE2EReportStore.readLatest(targetContext)?.runId
+        val invocationStart = System.currentTimeMillis()
         composeRule.onNodeWithTag("kepler.camera.shutter").performClick()
-        awaitTerminalReport()
-
-        val report = HardwareE2EReportStore.readLatest(targetContext)
-        assertNotNullReport(report)
-        assertTrue(report!!.latestJobDirectory?.isNotBlank() == true)
-        assertTrue(report.finalJob?.readable == true)
-        assertFalse(report.finalJob?.liveOperationRegistered == true)
-        assertTrue(report.finalJob!!.requestedFrames >= 2)
-        assertTrue(report.finalJob!!.attemptedFrames >= report.finalJob!!.savedFrames)
-        assertTrue(report.finalJob!!.receivedImages >= report.finalJob!!.completedResults)
-        assertTrue(report.finalJob!!.frameManifestCount >= report.finalJob!!.savedFrames)
-        assertTrue(report.status == HardwareE2EClassification.PASS || report.status == HardwareE2EClassification.FAIL)
-        assertTrue(
-            "YUV report missing actionable terminal/job state: ${report.toJson().toString(2)}",
-            report.terminalEvent != null && report.latestJobDirectory != null
+        val report = awaitExactTerminalReport(
+            previousRunId = previousRunId,
+            invocationStart = invocationStart,
+            expectedPipeline = PipelineMode.YUV_NIGHT_FUSION.name
         )
+        assertSuccessfulSmoke(report, PipelineMode.YUV_NIGHT_FUSION.name)
+
+        val job = report.finalJob!!
+        assertEquals(4, job.requestedFrames)
+        assertTrue(job.attemptedFrames >= job.savedFrames)
+        assertTrue(job.savedFrames <= job.requestedFrames)
+        assertTrue(job.receivedImages >= job.completedResults)
+        assertTrue(job.requiredOutputFilePresent)
+        assertTrue(report.terminalFlags["requiredOutputCommitted"] == true)
+        assertTrue(job.exportStatus.uppercase() !in setOf("FAILED", "CANCELLED", "ERROR"))
+        waitForPipelineIdle()
+        composeRule.onNodeWithTag("kepler.camera.shutter").assertIsDisplayed()
     }
 
     @Test
@@ -90,26 +96,34 @@ class HardwareE2EInstrumentationTest {
         assumeTrue("12MP RAW is unsupported", capability?.raw12Available == true)
 
         configureSettings(PipelineMode.RAW_NIGHT_FUSION.name)
+        val previousRunId = HardwareE2EReportStore.readLatest(targetContext)?.runId
+        val invocationStart = System.currentTimeMillis()
         composeRule.onNodeWithTag("kepler.camera.shutter").performClick()
-        awaitTerminalReport()
+        val report = awaitExactTerminalReport(
+            previousRunId = previousRunId,
+            invocationStart = invocationStart,
+            expectedPipeline = PipelineMode.RAW_NIGHT_FUSION.name
+        )
+        assertSuccessfulSmoke(report, PipelineMode.RAW_NIGHT_FUSION.name)
 
-        val report = HardwareE2EReportStore.readLatest(targetContext)
-        assertNotNullReport(report)
-        assertTrue(report!!.finalJob?.readable == true)
-        assertFalse(report.finalJob?.liveOperationRegistered == true)
-        assertTrue(report.finalJob!!.requestedFrames >= 2)
-        assertTrue(report.finalJob!!.attemptedFrames >= report.finalJob!!.savedFrames)
-        assertTrue(report.finalJob!!.receivedImages >= report.finalJob!!.completedResults)
-        assertTrue(report.finalJob!!.fileNames.any { it.endsWith(".dng", ignoreCase = true) || it.contains("raw", ignoreCase = true) })
+        val job = report.finalJob!!
+        assertEquals(4, job.requestedFrames)
+        assertTrue(job.attemptedFrames >= job.savedFrames)
+        assertTrue(job.receivedImages >= job.completedResults)
+        assertTrue(job.frameManifestCount >= job.savedFrames)
+        assertTrue(job.rawMetadata["rawWidth"].orEmpty().isNotBlank())
+        assertTrue(job.rawMetadata["rawHeight"].orEmpty().isNotBlank())
+        assertTrue(job.fileNames.any { it.endsWith(".dng", ignoreCase = true) || it.contains("raw", ignoreCase = true) })
         assertTrue(
-            report.finalJob!!.dngSidecarSaved == null ||
-                report.finalJob!!.dngSidecarSaved == true ||
-                report.finalJob!!.dngSidecarSkipReason.isNotBlank()
+            job.dngSidecarSaved == true ||
+                job.dngSidecarSkipReason.isNotBlank() ||
+                job.dngSidecarStatuses.isNotEmpty()
         )
-        assertTrue(
-            "RAW report missing actionable terminal/job state: ${report.toJson().toString(2)}",
-            report.terminalEvent != null && report.latestJobDirectory != null
-        )
+        assertTrue(job.requiredOutputFilePresent)
+        assertTrue(report.terminalFlags["requiredOutputCommitted"] == true)
+        assertTrue(job.exportStatus.uppercase() !in setOf("FAILED", "CANCELLED", "ERROR"))
+        waitForPipelineIdle()
+        composeRule.onNodeWithTag("kepler.camera.shutter").assertIsDisplayed()
     }
 
     private fun configureSettings(pipelineModeName: String) {
@@ -126,17 +140,74 @@ class HardwareE2EInstrumentationTest {
         composeRule.onNodeWithTag("kepler.camera.root").assertIsDisplayed()
     }
 
-    private fun awaitTerminalReport() {
-        composeRule.waitUntil(180_000L) {
-            HardwareE2EReportStore.readLatest(targetContext)?.terminalEvent != null
+    private fun awaitExactTerminalReport(
+        previousRunId: String?,
+        invocationStart: Long,
+        expectedPipeline: String
+    ): HardwareE2ERunReport {
+        var runId: String? = null
+        try {
+            composeRule.waitUntil(180_000L) {
+                if (runId == null) {
+                    runId = HardwareE2EReportStore.findLatestAfter(
+                        context = targetContext,
+                        previousRunId = previousRunId,
+                        invocationStartWallClock = invocationStart,
+                        expectedScenario = "production_main_camera_screen",
+                        expectedPipeline = expectedPipeline
+                    )?.runId
+                }
+                runId?.let { exactId ->
+                    HardwareE2EReportStore.read(targetContext, exactId)?.let { report ->
+                        report.terminalEvent != null &&
+                            (report.finalJob != null || report.failure != null || report.status == HardwareE2EClassification.SKIPPED_UNSUPPORTED)
+                    }
+                } == true
+            }
+        } catch (timeout: Throwable) {
+            throw AssertionError(
+                "Timed out waiting for exact hardware run. " +
+                    "previousRunId=$previousRunId invocationStart=$invocationStart " +
+                    "lockedRunId=$runId latest=${HardwareE2EReportStore.readLatest(targetContext)?.toJson()?.toString(2)}",
+                timeout
+            )
         }
+        val exactRunId = runId ?: throw AssertionError("No new exact hardware run was observed")
+        val report = HardwareE2EReportStore.read(targetContext, exactRunId)
+            ?: throw AssertionError("Exact hardware report disappeared for runId=$exactRunId")
+        println("HARDWARE_E2E_RUN_ID=$exactRunId")
+        return report
     }
 
-    private fun assertNotNullReport(report: HardwareE2ERunReport?) {
-        assertTrue(
-            "No hardware report was produced. latest=${HardwareE2EReportStore.latestFile(targetContext)}",
-            report != null
+    private fun assertSuccessfulSmoke(report: HardwareE2ERunReport, expectedPipeline: String) {
+        assertEquals(
+            "Production smoke failed: ${diagnosticSummary(report)}",
+            HardwareE2EClassification.PASS,
+            report.status
         )
+        assertEquals(HardwareE2EClassificationReason.PASS_SUCCESS, report.classificationReason)
+        assertEquals("production_main_camera_screen", report.scenario.requestedTestScenario)
+        assertEquals(expectedPipeline, report.scenario.selectedPipelineMode)
+        assertEquals(HardwareE2EJobCorrelation.EXACT, report.jobCorrelation)
+        assertTrue(report.terminalEvent == CameraPipelineEvent.Terminal.Kind.COMPLETE.name)
+        assertTrue(report.latestJobDirectory?.isNotBlank() == true)
+        assertTrue(report.finalJob?.readable == true)
+        assertFalse(report.finalJob?.liveOperationRegistered == true)
+        assertTrue(report.finalJob?.requiredOutputFilePresent == true)
+        assertTrue(report.terminalFlags["captureResourcesSettled"] == true)
+    }
+
+    private fun diagnosticSummary(report: HardwareE2ERunReport): String =
+        report.toJson().toString(2)
+
+    private fun waitForPipelineIdle() {
+        try {
+            composeRule.waitUntil(15_000L) {
+                composeRule.onAllNodesWithTag("kepler.pipeline.busy").fetchSemanticsNodes().isEmpty()
+            }
+        } catch (timeout: Throwable) {
+            throw AssertionError("Pipeline busy state did not clear: ${HardwareE2EReportStore.readLatest(targetContext)?.toJson()?.toString(2)}", timeout)
+        }
     }
 
     private fun selectedCapability(): CameraResolutionCapability? = runCatching {
@@ -157,11 +228,13 @@ class HardwareE2EInstrumentationTest {
     }.getOrDefault(false)
 
     private fun grantCameraPermission() {
-        runCatching {
-            instrumentation.uiAutomation
-                .executeShellCommand("pm grant ${targetContext.packageName} ${Manifest.permission.CAMERA}")
-                .close()
-        }
+        instrumentation.uiAutomation
+            .executeShellCommand("pm grant ${targetContext.packageName} ${Manifest.permission.CAMERA}")
+            .close()
+        assertEquals(
+            PackageManager.PERMISSION_GRANTED,
+            ContextCompat.checkSelfPermission(targetContext, Manifest.permission.CAMERA)
+        )
     }
 
     private fun hardwareE2EEnabled(): Boolean =

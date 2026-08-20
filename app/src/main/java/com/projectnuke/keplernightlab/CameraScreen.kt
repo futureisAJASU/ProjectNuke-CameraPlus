@@ -823,20 +823,18 @@ LaunchedEffect(Unit) {
             CameraPipelineEventSink
         ) -> Unit
     ) {
-        hardwareE2ERecorder.start(
-            HardwareE2ERunScenario(
-                requestedTestScenario = diagnosticScenario,
-                selectedPipelineMode = pipelineMode.name,
-                captureMode = captureMode.name,
-                requestedLensSlot = selectedLensSlot.name,
-                requestedResolution = selectedResolution.name,
-                frameCountPolicy = frameCountMode.name,
-                effectiveRequestedFrames = requestedFrames.takeIf { it > 0 } ?: latestFramePlan.framesToCapture,
-                requestedZoom = zoomUiState.zoomRatio,
-                requestedOutputFormat = finalOutputFormat.name,
-                requestedCameraId = cameraState.selection.cameraId,
-                requestedRoute = cameraState.selection.finalZoomRouteName()
-            )
+        val scenario = HardwareE2ERunScenario(
+            requestedTestScenario = diagnosticScenario,
+            selectedPipelineMode = pipelineMode.name,
+            captureMode = captureMode.name,
+            requestedLensSlot = selectedLensSlot.name,
+            requestedResolution = selectedResolution.name,
+            frameCountPolicy = frameCountMode.name,
+            effectiveRequestedFrames = requestedFrames.takeIf { it > 0 } ?: latestFramePlan.framesToCapture,
+            requestedZoom = zoomUiState.zoomRatio,
+            requestedOutputFormat = finalOutputFormat.name,
+            requestedCameraId = cameraState.selection.cameraId,
+            requestedRoute = cameraState.selection.finalZoomRouteName()
         )
         val accepted = pipelineOrchestrator.start(
             startMessage = startMessage,
@@ -845,8 +843,9 @@ LaunchedEffect(Unit) {
             job = job
         )
         if (accepted) {
-            hardwareE2ERecorder.recordCheckpoint("PREVIEW_READY", null, null)
-            hardwareE2ERecorder.recordCheckpoint("PIPELINE_ACCEPTED", null, null)
+            hardwareE2ERecorder.start(scenario)?.let {
+                hardwareE2ERecorder.recordCheckpoint("PIPELINE_REQUEST_ACCEPTED", null, null)
+            }
         }
         return
     }
@@ -2342,7 +2341,8 @@ fun SettingsScreen(
 
                 MiniSettingsButton(
                     text = "Cache / Jobs",
-                    onClick = onOpenCacheJobs
+                    onClick = onOpenCacheJobs,
+                    testTag = "kepler.cache.jobs.open"
                 )
 
                 MiniSettingsButton(
@@ -2900,12 +2900,14 @@ fun FrameStepButton(
 @Composable
 fun MiniSettingsButton(
     text: String,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    testTag: String? = null
 ) {
     Button(
         modifier = Modifier
             .fillMaxWidth()
-            .height(46.dp),
+            .height(46.dp)
+            .let { modifier -> testTag?.let(modifier::testTag) ?: modifier },
         onClick = onClick,
         shape = RoundedCornerShape(16.dp),
         colors = ButtonDefaults.buttonColors(

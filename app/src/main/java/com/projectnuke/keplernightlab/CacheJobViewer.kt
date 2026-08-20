@@ -1128,8 +1128,15 @@ internal fun buildHardwareE2ESnapshot(
             put("hardwareE2E", JSONObject().apply {
                 put("runId", it.runId)
                 put("status", it.status.name)
+                put("classificationReason", it.classificationReason.name)
+                put("jobCorrelation", it.jobCorrelation.name)
+                put("jobCorrelationReason", it.jobCorrelationReason ?: "")
                 put("terminalEvent", it.terminalEvent ?: "")
                 put("eventCount", it.eventHistory.size)
+                put("requestedFrames", it.finalJob?.requestedFrames ?: 0)
+                put("savedFrames", it.finalJob?.savedFrames ?: 0)
+                put("receivedImages", it.finalJob?.receivedImages ?: 0)
+                put("completedResults", it.finalJob?.completedResults ?: 0)
             })
         }
     }.toString(2)

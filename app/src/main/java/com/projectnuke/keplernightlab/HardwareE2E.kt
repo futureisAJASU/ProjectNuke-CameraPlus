@@ -23,6 +23,28 @@ internal enum class HardwareE2EClassification {
     SKIPPED_UNSUPPORTED
 }
 
+internal enum class HardwareE2EClassificationReason {
+    PASS_SUCCESS,
+    FAIL_PIPELINE_TERMINAL,
+    FAIL_OUTPUT_NOT_COMMITTED,
+    FAIL_LIVE_OPERATION_REMAINS,
+    FAIL_STATE_CONTRADICTION,
+    FAIL_FRAME_ACCOUNTING,
+    FAIL_EXPORT_STATE,
+    FAIL_PARTIAL_NOT_ALLOWED,
+    INCOMPLETE_JOB_CORRELATION,
+    INCOMPLETE_REPORT,
+    INCOMPLETE_HARNESS,
+    SKIPPED_CAPABILITY
+}
+
+internal enum class HardwareE2EJobCorrelation {
+    EXACT,
+    PROBABLE,
+    AMBIGUOUS,
+    NONE
+}
+
 internal data class HardwareE2ERunScenario(
     val requestedTestScenario: String,
     val selectedPipelineMode: String,
@@ -34,7 +56,9 @@ internal data class HardwareE2ERunScenario(
     val requestedZoom: Float,
     val requestedOutputFormat: String,
     val requestedCameraId: String? = null,
-    val requestedRoute: String? = null
+    val requestedRoute: String? = null,
+    val allowPartialCompletion: Boolean = false,
+    val requiresExport: Boolean = true
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("requestedTestScenario", requestedTestScenario)
@@ -48,6 +72,8 @@ internal data class HardwareE2ERunScenario(
         put("requestedOutputFormat", requestedOutputFormat)
         requestedCameraId?.let { put("requestedCameraId", it) }
         requestedRoute?.let { put("requestedRoute", it) }
+        put("allowPartialCompletion", allowPartialCompletion)
+        put("requiresExport", requiresExport)
     }
 }
 
@@ -91,10 +117,13 @@ internal data class HardwareE2EJobSummary(
     val jobDirectory: String,
     val readable: Boolean,
     val jobType: String,
+    val captureMode: String,
+    val createdAt: Long,
     val status: String,
     val processStatus: String,
     val exportStatus: String,
     val exportVerified: Boolean,
+    val requiredOutputFilePresent: Boolean,
     val requestedFrames: Int,
     val attemptedFrames: Int,
     val savedFrames: Int,
@@ -127,10 +156,13 @@ internal data class HardwareE2EJobSummary(
         put("jobDirectory", jobDirectory)
         put("readable", readable)
         put("jobType", jobType)
+        put("captureMode", captureMode)
+        put("createdAt", createdAt)
         put("status", status)
         put("processStatus", processStatus)
         put("exportStatus", exportStatus)
         put("exportVerified", exportVerified)
+        put("requiredOutputFilePresent", requiredOutputFilePresent)
         put("requestedFrames", requestedFrames)
         put("attemptedFrames", attemptedFrames)
         put("savedFrames", savedFrames)
@@ -165,10 +197,13 @@ internal data class HardwareE2EJobSummary(
             jobDirectory = json.optString("jobDirectory"),
             readable = json.optBoolean("readable"),
             jobType = json.optString("jobType"),
+            captureMode = json.optString("captureMode"),
+            createdAt = json.optLong("createdAt"),
             status = json.optString("status"),
             processStatus = json.optString("processStatus"),
             exportStatus = json.optString("exportStatus"),
             exportVerified = json.optBoolean("exportVerified"),
+            requiredOutputFilePresent = json.optBoolean("requiredOutputFilePresent"),
             requestedFrames = json.optInt("requestedFrames"),
             attemptedFrames = json.optInt("attemptedFrames"),
             savedFrames = json.optInt("savedFrames"),
@@ -222,7 +257,11 @@ internal data class HardwareE2ERunReport(
     val latestJobDirectory: String?,
     val finalJob: HardwareE2EJobSummary?,
     val status: HardwareE2EClassification,
-    val failure: String? = null
+    val failure: String? = null,
+    val classificationReason: HardwareE2EClassificationReason = HardwareE2EClassificationReason.INCOMPLETE_REPORT,
+    val jobCorrelation: HardwareE2EJobCorrelation = HardwareE2EJobCorrelation.NONE,
+    val jobCorrelationReason: String? = null,
+    val jobCandidateCount: Int = 0
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("schemaVersion", schemaVersion)
@@ -246,6 +285,10 @@ internal data class HardwareE2ERunReport(
         latestJobDirectory?.let { put("latestJobDirectory", it) }
         finalJob?.let { put("finalJob", it.toJson()) }
         put("status", status.name)
+        put("classificationReason", classificationReason.name)
+        put("jobCorrelation", jobCorrelation.name)
+        jobCorrelationReason?.let { put("jobCorrelationReason", it) }
+        put("jobCandidateCount", jobCandidateCount)
         failure?.let { put("failure", it) }
     }
 
@@ -273,7 +316,9 @@ internal data class HardwareE2ERunReport(
                     requestedZoom = scenarioJson.optDouble("requestedZoom", 1.0).toFloat(),
                     requestedOutputFormat = scenarioJson.optString("requestedOutputFormat"),
                     requestedCameraId = scenarioJson.optString("requestedCameraId").takeIf { it.isNotBlank() },
-                    requestedRoute = scenarioJson.optString("requestedRoute").takeIf { it.isNotBlank() }
+                    requestedRoute = scenarioJson.optString("requestedRoute").takeIf { it.isNotBlank() },
+                    allowPartialCompletion = scenarioJson.optBoolean("allowPartialCompletion", false),
+                    requiresExport = scenarioJson.optBoolean("requiresExport", true)
                 ),
                 appPackage = json.optString("appPackage"),
                 appVersion = json.optString("appVersion"),
@@ -327,7 +372,15 @@ internal data class HardwareE2ERunReport(
                 status = runCatching {
                     HardwareE2EClassification.valueOf(json.optString("status"))
                 }.getOrDefault(HardwareE2EClassification.INCOMPLETE),
-                failure = json.optString("failure").takeIf { it.isNotBlank() }
+                failure = json.optString("failure").takeIf { it.isNotBlank() },
+                classificationReason = runCatching {
+                    HardwareE2EClassificationReason.valueOf(json.optString("classificationReason"))
+                }.getOrDefault(HardwareE2EClassificationReason.INCOMPLETE_REPORT),
+                jobCorrelation = runCatching {
+                    HardwareE2EJobCorrelation.valueOf(json.optString("jobCorrelation"))
+                }.getOrDefault(HardwareE2EJobCorrelation.NONE),
+                jobCorrelationReason = json.optString("jobCorrelationReason").takeIf { it.isNotBlank() },
+                jobCandidateCount = json.optInt("jobCandidateCount")
             )
         }
     }
@@ -374,8 +427,22 @@ internal object HardwareE2EReportStore {
 
     fun latestFile(context: Context): File = File(directory(context), "latest.json")
 
-    fun readReports(context: Context): List<HardwareE2ERunReport> =
-        directory(context).listFiles()
+    fun file(context: Context, runId: String): File = File(directory(context), "$runId.json")
+
+    fun read(context: Context, runId: String): HardwareE2ERunReport? = read(directory(context), runId)
+
+    fun read(reportDirectory: File, runId: String): HardwareE2ERunReport? =
+        runCatching {
+            File(reportDirectory, "$runId.json")
+                .takeIf { it.isFile }
+                ?.readText()
+                ?.let(HardwareE2EReportCodec::decode)
+        }.getOrNull()
+
+    fun readReports(context: Context): List<HardwareE2ERunReport> = readReports(directory(context))
+
+    fun readReports(reportDirectory: File): List<HardwareE2ERunReport> =
+        reportDirectory.listFiles()
             .orEmpty()
             .filter { it.isFile && it.extension == "json" && it.name != "latest.json" }
             .sortedByDescending(File::lastModified)
@@ -385,6 +452,27 @@ internal object HardwareE2EReportStore {
         runCatching {
             latestFile(context).takeIf { it.isFile }?.readText()?.let(HardwareE2EReportCodec::decode)
         }.getOrNull()
+
+    fun findLatestAfter(
+        context: Context,
+        previousRunId: String?,
+        invocationStartWallClock: Long,
+        expectedScenario: String,
+        expectedPipeline: String
+    ): HardwareE2ERunReport? = findLatestAfter(directory(context), previousRunId, invocationStartWallClock, expectedScenario, expectedPipeline)
+
+    fun findLatestAfter(
+        reportDirectory: File,
+        previousRunId: String?,
+        invocationStartWallClock: Long,
+        expectedScenario: String,
+        expectedPipeline: String
+    ): HardwareE2ERunReport? = readReports(reportDirectory).firstOrNull { report ->
+        report.runId != previousRunId &&
+            report.runStartWallClockTimestamp >= invocationStartWallClock &&
+            report.scenario.requestedTestScenario == expectedScenario &&
+            report.scenario.selectedPipelineMode == expectedPipeline
+    }
 }
 
 internal class HardwareE2ERunRecorder private constructor(
@@ -392,16 +480,27 @@ internal class HardwareE2ERunRecorder private constructor(
     private val environment: HardwareE2EEnvironment,
     private val jobFinder: () -> List<File>
 ) {
+    private val enabled = environment.debugBuild
     private val lock = Any()
     private val writer: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "KeplerHardwareE2ERecorder").apply { isDaemon = true }
     }
     private var current: HardwareE2ERunReport? = null
     private var startedAtNanos: Long = 0L
+    private var baselineJobPaths: Set<String> = emptySet()
+    private var baselineSnapshotFailure: String? = null
 
-    fun start(scenario: HardwareE2ERunScenario): String {
+    fun start(scenario: HardwareE2ERunScenario): String? {
+        if (!enabled) return null
+        synchronized(lock) {
+            current?.takeIf {
+                (it.terminalEvent == null && it.status == HardwareE2EClassification.INCOMPLETE) ||
+                    (it.terminalEvent != null && it.finalJob == null && it.failure == null)
+            }?.let { return null }
+        }
         val now = System.currentTimeMillis()
         val runId = UUID.randomUUID().toString()
+        val baseline = runCatching { jobFinder().map(File::getAbsolutePath).toSet() }
         val report = HardwareE2ERunReport(
             schemaVersion = HARDWARE_E2E_SCHEMA_VERSION,
             runId = runId,
@@ -423,13 +522,19 @@ internal class HardwareE2ERunRecorder private constructor(
             terminalFlags = emptyMap(),
             latestJobDirectory = null,
             finalJob = null,
-            status = HardwareE2EClassification.INCOMPLETE
+            status = HardwareE2EClassification.INCOMPLETE,
+            classificationReason = HardwareE2EClassificationReason.INCOMPLETE_REPORT,
+            jobCorrelationReason = baseline.exceptionOrNull()?.let {
+                "baseline job snapshot failed: ${it.javaClass.simpleName}: ${it.message}"
+            }
         )
         synchronized(lock) {
             current = report
             startedAtNanos = System.nanoTime()
+            baselineJobPaths = baseline.getOrDefault(emptySet())
+            baselineSnapshotFailure = baseline.exceptionOrNull()?.message
         }
-        recordCheckpoint("APP_STARTED", null, null)
+        recordCheckpoint("RUN_STARTED", null, null)
         return runId
     }
 
@@ -528,7 +633,14 @@ internal class HardwareE2ERunRecorder private constructor(
     }
 
     fun recordSkipped(reason: String) {
-        mutate { it.copy(status = HardwareE2EClassification.SKIPPED_UNSUPPORTED, failure = reason) }
+        if (!enabled) return
+        mutate {
+            it.copy(
+                status = HardwareE2EClassification.SKIPPED_UNSUPPORTED,
+                classificationReason = HardwareE2EClassificationReason.SKIPPED_CAPABILITY,
+                failure = reason
+            )
+        }
     }
 
     fun currentRunId(): String? = synchronized(lock) { current?.runId }
@@ -545,6 +657,7 @@ internal class HardwareE2ERunRecorder private constructor(
     }
 
     private fun mutate(transform: (HardwareE2ERunReport) -> HardwareE2ERunReport) {
+        if (!enabled) return
         val snapshot = synchronized(lock) {
             current = current?.let(transform)
             current
@@ -555,32 +668,199 @@ internal class HardwareE2ERunRecorder private constructor(
     private fun finalizeAfterTerminal(runId: String?) {
         if (runId == null) return
         writer.execute {
-            val job = runCatching {
-                jobFinder()
-                    .filter { it.isDirectory }
-                    .maxByOrNull { it.lastModified() }
-                    ?.let(::readJobSummary)
-            }.getOrElse { error ->
-                Log.w(HARDWARE_E2E_TAG, "job enrichment failed", error)
-                null
-            }
+            val reportBefore = synchronized(lock) { current?.takeIf { it.runId == runId } } ?: return@execute
+            val correlation = correlateJob(reportBefore)
             synchronized(lock) {
                 val report = current?.takeIf { it.runId == runId } ?: return@execute
-                val classification = when {
-                    report.terminalEvent == CameraPipelineEvent.Terminal.Kind.COMPLETE.name && job?.readable == true -> HardwareE2EClassification.PASS
-                    report.terminalEvent == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL.name && job?.readable == true -> HardwareE2EClassification.PASS
-                    report.terminalEvent != null -> HardwareE2EClassification.FAIL
-                    else -> HardwareE2EClassification.INCOMPLETE
-                }
+                val decision = classify(report, correlation)
                 current = report.copy(
-                    latestJobDirectory = job?.jobDirectory ?: report.latestJobDirectory,
-                    finalJob = job,
-                    status = classification,
-                    failure = job?.error ?: report.failure
+                    latestJobDirectory = correlation.summary?.jobDirectory ?: report.latestJobDirectory,
+                    finalJob = correlation.summary,
+                    status = decision.status,
+                    failure = if (decision.status == HardwareE2EClassification.PASS) {
+                        null
+                    } else {
+                        decision.reason.name + (decision.detail?.let { ": $it" } ?: "")
+                    },
+                    classificationReason = decision.reason,
+                    jobCorrelation = correlation.kind,
+                    jobCorrelationReason = correlation.detail,
+                    jobCandidateCount = correlation.candidateCount
                 )
                 persistNow(current!!)
             }
         }
+    }
+
+    private data class JobIdentity(
+        val directory: File,
+        val job: JSONObject,
+        val createdAt: Long,
+        val fresh: Boolean,
+        val metadataMatches: Boolean,
+        val metadataComplete: Boolean
+    )
+
+    private data class JobCorrelationResult(
+        val kind: HardwareE2EJobCorrelation,
+        val summary: HardwareE2EJobSummary?,
+        val detail: String?,
+        val candidateCount: Int
+    )
+
+    private data class ClassificationDecision(
+        val status: HardwareE2EClassification,
+        val reason: HardwareE2EClassificationReason,
+        val detail: String? = null
+    )
+
+    private fun correlateJob(report: HardwareE2ERunReport): JobCorrelationResult {
+        baselineSnapshotFailure?.let {
+            return JobCorrelationResult(
+                HardwareE2EJobCorrelation.NONE,
+                null,
+                "baseline job snapshot failed: $it",
+                0
+            )
+        }
+        val identities = runCatching {
+            jobFinder()
+                .filter { it.isDirectory && it.absolutePath !in baselineJobPaths }
+                .mapNotNull { directory ->
+                    val job = runCatching {
+                        JSONObject(NoFollowFileSystem.readTextVerified(File(directory, JOB_JSON_FILE_NAME)))
+                    }.getOrNull() ?: return@mapNotNull null
+                    val createdAt = job.optLong("createdAt", 0L)
+                    val fresh = if (createdAt > 0L) {
+                        createdAt >= report.runStartWallClockTimestamp
+                    } else {
+                        directory.lastModified() >= report.runStartWallClockTimestamp
+                    }
+                    if (!fresh) return@mapNotNull null
+                    val metadataComplete = job.optString("jobType").isNotBlank() ||
+                        job.optString("captureMode").isNotBlank()
+                    JobIdentity(
+                        directory = directory,
+                        job = job,
+                        createdAt = createdAt,
+                        fresh = true,
+                        metadataMatches = jobMatchesScenario(job, report.scenario),
+                        metadataComplete = metadataComplete
+                    )
+                }
+        }.getOrElse { error ->
+            return JobCorrelationResult(
+                HardwareE2EJobCorrelation.NONE,
+                null,
+                "job inspection failed: ${error.javaClass.simpleName}: ${error.message}",
+                0
+            )
+        }
+        val matching = identities.filter { it.metadataMatches }
+        return when {
+            matching.size == 1 -> JobCorrelationResult(
+                HardwareE2EJobCorrelation.EXACT,
+                readJobSummary(matching.single().directory),
+                "one new job matched the expected pipeline/capture metadata",
+                identities.size
+            )
+            matching.size > 1 -> JobCorrelationResult(
+                HardwareE2EJobCorrelation.AMBIGUOUS,
+                null,
+                "${matching.size} new jobs matched the expected pipeline/capture metadata",
+                identities.size
+            )
+            identities.size == 1 && !identities.single().metadataComplete -> JobCorrelationResult(
+                HardwareE2EJobCorrelation.PROBABLE,
+                readJobSummary(identities.single().directory),
+                "one new job was found but identifying metadata was incomplete",
+                identities.size
+            )
+            identities.size > 1 -> JobCorrelationResult(
+                HardwareE2EJobCorrelation.AMBIGUOUS,
+                null,
+                "${identities.size} new jobs were found without one trustworthy match",
+                identities.size
+            )
+            else -> JobCorrelationResult(
+                HardwareE2EJobCorrelation.NONE,
+                null,
+                "no new attributable job was found; pre-existing jobs were excluded",
+                0
+            )
+        }
+    }
+
+    private fun jobMatchesScenario(job: JSONObject, scenario: HardwareE2ERunScenario): Boolean {
+        val expectedType = if (scenario.selectedPipelineMode == PipelineMode.RAW_NIGHT_FUSION.name) {
+            "RAW_NIGHT_FUSION"
+        } else if (scenario.captureMode == CaptureMode.SINGLE_FRAME.name) {
+            "YUV_SINGLE_FRAME"
+        } else {
+            "YUV_NIGHT_FUSION"
+        }
+        val actualType = job.optString("jobType")
+        if (actualType.isNotBlank() && actualType != expectedType) return false
+        val actualCaptureMode = job.optString("captureMode")
+        if (actualCaptureMode.isNotBlank() && actualCaptureMode != scenario.captureMode) return false
+        val resolution = job.optString("requestedResolutionMode", job.optString("resolutionMode"))
+        if (resolution.isNotBlank()) {
+            val expectedDigits = scenario.requestedResolution.filter(Char::isDigit)
+            if (expectedDigits.isNotBlank() && !resolution.filter(Char::isDigit).contains(expectedDigits)) return false
+        }
+        return true
+    }
+
+    private fun classify(
+        report: HardwareE2ERunReport,
+        correlation: JobCorrelationResult
+    ): ClassificationDecision {
+        val terminal = report.eventHistory.lastOrNull { it.terminalKind != null }
+        val terminalKind = terminal?.terminalKind
+        if (terminalKind == null) {
+            return ClassificationDecision(HardwareE2EClassification.INCOMPLETE, HardwareE2EClassificationReason.INCOMPLETE_REPORT, "terminal event is missing")
+        }
+        if (terminalKind == CameraPipelineEvent.Terminal.Kind.FAILED.name ||
+            terminalKind == CameraPipelineEvent.Terminal.Kind.CANCELLED.name
+        ) {
+            return ClassificationDecision(HardwareE2EClassification.FAIL, HardwareE2EClassificationReason.FAIL_PIPELINE_TERMINAL, terminal.message)
+        }
+        if (terminalKind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL.name &&
+            !report.scenario.allowPartialCompletion
+        ) {
+            return ClassificationDecision(HardwareE2EClassification.FAIL, HardwareE2EClassificationReason.FAIL_PARTIAL_NOT_ALLOWED, "partial completion is not valid for this smoke scenario")
+        }
+        if (correlation.kind != HardwareE2EJobCorrelation.EXACT &&
+            correlation.kind != HardwareE2EJobCorrelation.PROBABLE
+        ) {
+            return ClassificationDecision(HardwareE2EClassification.INCOMPLETE, HardwareE2EClassificationReason.INCOMPLETE_JOB_CORRELATION, correlation.detail)
+        }
+        val job = correlation.summary
+            ?: return ClassificationDecision(HardwareE2EClassification.INCOMPLETE, HardwareE2EClassificationReason.INCOMPLETE_JOB_CORRELATION, "correlated job summary is missing")
+        if (!job.readable) {
+            return ClassificationDecision(HardwareE2EClassification.INCOMPLETE, HardwareE2EClassificationReason.INCOMPLETE_REPORT, job.error)
+        }
+        if (terminal.requiredOutputCommitted != true || !job.requiredOutputFilePresent) {
+            return ClassificationDecision(HardwareE2EClassification.FAIL, HardwareE2EClassificationReason.FAIL_OUTPUT_NOT_COMMITTED, "required output was not durably proven")
+        }
+        if (!terminal.captureResourcesSettled || job.liveOperationRegistered) {
+            return ClassificationDecision(HardwareE2EClassification.FAIL, HardwareE2EClassificationReason.FAIL_LIVE_OPERATION_REMAINS, "capture resources or operation lease remain live")
+        }
+        if (job.requestedFrames != report.scenario.effectiveRequestedFrames ||
+            job.savedFrames > job.requestedFrames ||
+            job.attemptedFrames < job.savedFrames ||
+            job.receivedImages < job.completedResults
+        ) {
+            return ClassificationDecision(HardwareE2EClassification.FAIL, HardwareE2EClassificationReason.FAIL_FRAME_ACCOUNTING, "job frame counts are contradictory")
+        }
+        val state = listOf(job.status, job.processStatus, job.exportStatus).joinToString(" ").uppercase()
+        if (state.contains("FAILED") || state.contains("CANCELLED") || state.contains("ERROR")) {
+            return ClassificationDecision(HardwareE2EClassification.FAIL, HardwareE2EClassificationReason.FAIL_STATE_CONTRADICTION, "job state contradicts terminal success: $state")
+        }
+        if (report.scenario.requiresExport && job.exportStatus.uppercase() in setOf("FAILED", "CANCELLED", "ERROR")) {
+            return ClassificationDecision(HardwareE2EClassification.FAIL, HardwareE2EClassificationReason.FAIL_EXPORT_STATE, "export state is ${job.exportStatus}")
+        }
+        return ClassificationDecision(HardwareE2EClassification.PASS, HardwareE2EClassificationReason.PASS_SUCCESS)
     }
 
     private fun enqueuePersist(report: HardwareE2ERunReport) {
@@ -608,7 +888,9 @@ internal class HardwareE2ERunRecorder private constructor(
             }
             reportDirectory.listFiles()
                 ?.filter { it.extension == "json" && it.name != "latest.json" }
-                ?.sortedByDescending { it.lastModified() }
+                ?.sortedByDescending { file ->
+                    if (file.name == reportFile.name) Long.MAX_VALUE else file.lastModified()
+                }
                 ?.drop(HARDWARE_E2E_MAX_REPORTS)
                 ?.forEach { it.delete() }
         }.onFailure { error ->
@@ -629,10 +911,13 @@ internal class HardwareE2ERunRecorder private constructor(
                     jobDirectory = jobDir.absolutePath,
                     readable = false,
                     jobType = "",
+                    captureMode = "",
+                    createdAt = 0L,
                     status = "",
                     processStatus = "",
                     exportStatus = "",
                     exportVerified = false,
+                    requiredOutputFilePresent = false,
                     requestedFrames = 0,
                     attemptedFrames = 0,
                     savedFrames = 0,
@@ -670,19 +955,41 @@ internal class HardwareE2ERunRecorder private constructor(
             "memoryRiskLevel", "estimatedRawFusionMemoryMb", "estimatedMemoryMb",
             "nativeWorkingSetMb", "memoryTrimmed", "lowMemoryFallback"
         )
+        val fileNames = runCatching {
+            NoFollowFileSystem.requireDirectChildren(jobDir)
+                .filter { NoFollowFileSystem.isRealFile(it.toPath()) }
+                .map(File::getName)
+                .sorted()
+        }.getOrDefault(emptyList())
+        val outputFilePresent = listOf(
+            "finalFile", "finalNightFusionFile", "outputFile", "nativePostprocessRgbaFile",
+            "averageColorFile", "galleryDisplayFile"
+        ).any { key ->
+            val value = job.optString(key)
+            value.isNotBlank() && value != JSONObject.NULL.toString() &&
+                File(if (File(value).isAbsolute) value else File(jobDir, value).path).isFile
+        } || job.optBoolean("requiredOutputCommitted", false)
+        val savedFrames = job.optInt("savedFrames", 0)
+        val requestedFrames = job.optInt("requestedFrames", savedFrames)
+        val attemptedFrames = job.optInt("attemptedFrames", savedFrames)
+        val receivedImages = job.optInt("receivedImages", savedFrames)
+        val completedResults = job.optInt("completedResults", if (job.optString("processStatus").contains("COMPLETE")) savedFrames else 0)
         return HardwareE2EJobSummary(
             jobDirectory = jobDir.absolutePath,
             readable = true,
             jobType = job.optString("jobType"),
+            captureMode = job.optString("captureMode"),
+            createdAt = job.optLong("createdAt", 0L),
             status = job.optString("status"),
             processStatus = job.optString("processStatus"),
             exportStatus = job.optString("exportStatus"),
             exportVerified = job.optBoolean("exportVerified", false),
-            requestedFrames = job.optInt("requestedFrames", 0),
-            attemptedFrames = job.optInt("attemptedFrames", 0),
-            savedFrames = job.optInt("savedFrames", 0),
-            receivedImages = job.optInt("receivedImages", 0),
-            completedResults = job.optInt("completedResults", 0),
+            requiredOutputFilePresent = outputFilePresent,
+            requestedFrames = requestedFrames,
+            attemptedFrames = attemptedFrames,
+            savedFrames = savedFrames,
+            receivedImages = receivedImages,
+            completedResults = completedResults,
             failedCaptures = job.optInt("failedCaptures", 0),
             partialCapture = job.optBoolean("partialCapture", false),
             cleanupType = job.optString("cleanupType"),
@@ -711,11 +1018,8 @@ internal class HardwareE2ERunRecorder private constructor(
             activeOperationKind = job.optString(ACTIVE_OPERATION_KIND),
             activeRuntimeSessionId = job.optString(ACTIVE_RUNTIME_SESSION_ID),
             terminalOperationId = job.optString(TERMINAL_OPERATION_ID),
-            liveOperationRegistered = KeplerJobMetadata.findOperationLease(jobDir) != null,
-            fileNames = NoFollowFileSystem.requireDirectChildren(jobDir)
-                .filter { NoFollowFileSystem.isRealFile(it.toPath()) }
-                .map(File::getName)
-                .sorted(),
+            liveOperationRegistered = runCatching { KeplerJobMetadata.findOperationLease(jobDir) != null }.getOrDefault(false),
+            fileNames = fileNames,
             error = null
         )
     }

@@ -86,7 +86,8 @@ fun CameraTopOverlay(
                 color = Color.White.copy(alpha = 0.68f),
                 style = MaterialTheme.typography.labelSmall,
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.testTag("kepler.pipeline.status")
             )
             Text(
                 text = levelText,
