@@ -26,11 +26,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
 
 @Composable
 fun KeplerAppRoot() {
@@ -78,9 +80,11 @@ fun KeplerAppRoot() {
         }
     }
 
-    MaterialTheme(colorScheme = KeplerDarkScheme) {
+MaterialTheme(colorScheme = KeplerDarkScheme) {
         Surface(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxSize()
+                .semantics { testTagsAsResourceId = true },
             color = Color.Black
         ) {
             when {

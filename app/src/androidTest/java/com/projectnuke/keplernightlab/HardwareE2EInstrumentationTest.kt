@@ -6,17 +6,18 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraManager
 import android.os.PowerManager
-import androidx.compose.ui.test.assertIsDisplayed
-import androidx.compose.ui.test.onAllNodesWithTag
-import androidx.compose.ui.test.onNodeWithTag
-import androidx.compose.ui.test.performClick
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
-import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.test.core.app.ActivityScenario
+import androidx.test.ext.junit.rules.ActivityScenarioRule
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.uiautomator.By
+import androidx.test.uiautomator.UiDevice
+import androidx.test.uiautomator.Until
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.rules.RuleChain
@@ -26,7 +27,6 @@ import org.junit.runners.model.Statement
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
-import kotlin.concurrent.thread
 
 @RunWith(AndroidJUnit4::class)
 class HardwareE2EInstrumentationTest {
@@ -41,28 +41,35 @@ class HardwareE2EInstrumentationTest {
                     )
                     assertEquals(
                         PackageManager.PERMISSION_GRANTED,
-                        ContextCompat.checkSelfPermission(
-                            instrumentation.targetContext,
-                            Manifest.permission.CAMERA
-                        )
+                        instrumentation.uiAutomation.executeShellCommand(
+                            "pm list permissions -d -g"
+                        ).let {
+                            ContextCompat.checkSelfPermission(
+                                instrumentation.targetContext,
+                                Manifest.permission.CAMERA
+                            )
+                        }
                     )
                     base.evaluate()
                 }
             }
     }
 
-    private val composeRule = createAndroidComposeRule<MainActivity>()
+    private val activityRule = ActivityScenarioRule(MainActivity::class.java)
 
     @get:Rule
     val ruleChain: TestRule = RuleChain
         .outerRule(cameraPermissionRule)
-        .around(composeRule)
+        .around(activityRule)
 
     private val instrumentation
         get() = InstrumentationRegistry.getInstrumentation()
 
     private val targetContext: Context
         get() = instrumentation.targetContext
+
+    private val device: UiDevice
+        get() = UiDevice.getInstance(instrumentation)
 
     @Test
     fun appLaunchesAndDiagnosticReportCanBeCreatedAndRead() {
@@ -76,7 +83,7 @@ class HardwareE2EInstrumentationTest {
             "Physical-device UI test requires an interactive, unlocked device. " +
                 "PowerManager.isInteractive=${deviceIsInteractive()} " +
                 "KeyguardManager.isKeyguardLocked=${deviceIsKeyguardLocked()} " +
-                "ActivityScenario state=${composeRule.activityRule.scenario.state} " +
+                "ActivityScenario state=${activityRule.scenario.state} " +
                 "CAMERA permission=${ContextCompat.checkSelfPermission(targetContext, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED}",
             deviceIsInteractive() && !deviceIsKeyguardLocked()
         )
@@ -85,11 +92,9 @@ class HardwareE2EInstrumentationTest {
 
         val hasUsableCamera = hasUsableCamera()
         if (hasUsableCamera) {
-            // ensureActivityReadyForUi() already waits for CameraScreenTestHooks.uiMounted
-            // which is set when MainCameraScreen is composed and camera root is available
-            composeRule.onNodeWithTag("kepler.camera.root").assertIsDisplayed()
-            composeRule.onNodeWithTag("kepler.settings.open").assertIsDisplayed()
-            composeRule.onNodeWithTag("kepler.camera.shutter").assertIsDisplayed()
+            assertNotNull("kepler.camera.root not found", awaitUiObject("kepler.camera.root", 10_000L))
+            assertNotNull("kepler.settings.open not found", device.findObject(By.res("kepler.settings.open")))
+            assertNotNull("kepler.camera.shutter not found", device.findObject(By.res("kepler.camera.shutter")))
         }
 
         val recorder = HardwareE2ERunRecorder.forContext(targetContext)
@@ -114,7 +119,7 @@ class HardwareE2EInstrumentationTest {
             "Physical-device UI test requires an interactive, unlocked device. " +
                 "PowerManager.isInteractive=${deviceIsInteractive()} " +
                 "KeyguardManager.isKeyguardLocked=${deviceIsKeyguardLocked()} " +
-                "ActivityScenario state=${composeRule.activityRule.scenario.state} " +
+                "ActivityScenario state=${activityRule.scenario.state} " +
                 "CAMERA permission=${ContextCompat.checkSelfPermission(targetContext, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED}",
             deviceIsInteractive() && !deviceIsKeyguardLocked()
         )
@@ -123,7 +128,9 @@ class HardwareE2EInstrumentationTest {
         configureSettings(PipelineMode.YUV_NIGHT_FUSION.name)
         val previousRunId = HardwareE2EReportStore.readLatest(targetContext)?.runId
         val invocationStart = System.currentTimeMillis()
-        composeRule.onNodeWithTag("kepler.camera.shutter").performClick()
+        val shutter = awaitUiObject("kepler.camera.shutter", 5_000L) as androidx.test.uiautomator.UiObject2
+        assertTrue("shutter not enabled", shutter.isEnabled)
+        shutter.click()
         val report = awaitExactTerminalReport(
             previousRunId = previousRunId,
             invocationStart = invocationStart,
@@ -140,7 +147,7 @@ class HardwareE2EInstrumentationTest {
         assertTrue(report.terminalFlags["requiredOutputCommitted"] == true)
         assertTrue(job.exportStatus.uppercase() !in setOf("FAILED", "CANCELLED", "ERROR"))
         waitForPipelineIdle()
-        composeRule.onNodeWithTag("kepler.camera.shutter").assertIsDisplayed()
+        assertNotNull("kepler.camera.shutter not found after capture", device.findObject(By.res("kepler.camera.shutter")))
     }
 
     @Test
@@ -154,7 +161,7 @@ class HardwareE2EInstrumentationTest {
             "Physical-device UI test requires an interactive, unlocked device. " +
                 "PowerManager.isInteractive=${deviceIsInteractive()} " +
                 "KeyguardManager.isKeyguardLocked=${deviceIsKeyguardLocked()} " +
-                "ActivityScenario state=${composeRule.activityRule.scenario.state} " +
+                "ActivityScenario state=${activityRule.scenario.state} " +
                 "CAMERA permission=${ContextCompat.checkSelfPermission(targetContext, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED}",
             deviceIsInteractive() && !deviceIsKeyguardLocked()
         )
@@ -163,7 +170,9 @@ class HardwareE2EInstrumentationTest {
         configureSettings(PipelineMode.RAW_NIGHT_FUSION.name)
         val previousRunId = HardwareE2EReportStore.readLatest(targetContext)?.runId
         val invocationStart = System.currentTimeMillis()
-        composeRule.onNodeWithTag("kepler.camera.shutter").performClick()
+        val shutter = awaitUiObject("kepler.camera.shutter", 5_000L) as androidx.test.uiautomator.UiObject2
+        assertTrue("shutter not enabled", shutter.isEnabled)
+        shutter.click()
         val report = awaitExactTerminalReport(
             previousRunId = previousRunId,
             invocationStart = invocationStart,
@@ -188,11 +197,11 @@ class HardwareE2EInstrumentationTest {
         assertTrue(report.terminalFlags["requiredOutputCommitted"] == true)
         assertTrue(job.exportStatus.uppercase() !in setOf("FAILED", "CANCELLED", "ERROR"))
         waitForPipelineIdle()
-        composeRule.onNodeWithTag("kepler.camera.shutter").assertIsDisplayed()
+        assertNotNull("kepler.camera.shutter not found after capture", device.findObject(By.res("kepler.camera.shutter")))
     }
 
     private fun ensureActivityReadyForUi() {
-        val scenario = composeRule.activityRule.scenario
+        val scenario = activityRule.scenario
 
         if (scenario.state != Lifecycle.State.RESUMED) {
             scenario.moveToState(Lifecycle.State.RESUMED)
@@ -203,26 +212,15 @@ class HardwareE2EInstrumentationTest {
             scenario.state
         )
 
-        // Reset the UI mounted flag before waiting for it to be set by the new composition
-        CameraScreenTestHooks.uiMounted = false
-        awaitCameraRoot()
+        awaitUiObject("kepler.camera.root", 10_000L)
     }
 
-    private fun awaitCameraRoot(timeoutMs: Long = 10_000L) {
-        awaitCondition(timeoutMs) {
-            CameraScreenTestHooks.uiMounted
+    private fun awaitUiObject(resourceId: String, timeoutMs: Long): Any? {
+        val obj = device.wait(Until.findObject(By.res(resourceId)), timeoutMs)
+        if (obj == null) {
+            throw AssertionError("Timed out after ${timeoutMs}ms waiting for UiObject with resourceId: $resourceId")
         }
-    }
-
-    private fun awaitCondition(timeoutMs: Long, condition: () -> Boolean) {
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline) {
-            if (condition()) {
-                return
-            }
-            Thread.sleep(50L)
-        }
-        throw AssertionError("Timed out after ${timeoutMs}ms waiting for condition")
+        return obj
     }
 
     private fun deviceIsInteractive(): Boolean {
@@ -245,11 +243,8 @@ class HardwareE2EInstrumentationTest {
             captureModeName = CaptureMode.MULTI_FRAME.name
         )
         CameraSettingsStore.save(targetContext, settings)
-        composeRule.activityRule.scenario.recreate()
+        activityRule.scenario.recreate()
         ensureActivityReadyForUi()
-        // ensureActivityReadyForUi() already waits for CameraScreenTestHooks.uiMounted
-        // which is set when MainCameraScreen is recomposed after recreate
-        composeRule.onNodeWithTag("kepler.camera.root").assertIsDisplayed()
     }
 
     private fun awaitExactTerminalReport(
@@ -314,12 +309,21 @@ class HardwareE2EInstrumentationTest {
 
     private fun waitForPipelineIdle() {
         try {
-            awaitCondition(15_000L) {
-                composeRule.onAllNodesWithTag("kepler.pipeline.busy").fetchSemanticsNodes().isEmpty()
-            }
+            device.wait(Until.gone(By.res("kepler.pipeline.busy")), 15_000L)
         } catch (timeout: Throwable) {
             throw AssertionError("Pipeline busy state did not clear: ${HardwareE2EReportStore.readLatest(targetContext)?.toJson()?.toString(2)}", timeout)
         }
+    }
+
+    private fun awaitCondition(timeoutMs: Long, condition: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (condition()) {
+                return
+            }
+            Thread.sleep(50L)
+        }
+        throw AssertionError("Timed out after ${timeoutMs}ms waiting for condition")
     }
 
     private fun selectedCapability(): CameraResolutionCapability? = runCatching {
