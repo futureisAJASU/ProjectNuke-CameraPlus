@@ -9,6 +9,7 @@ import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -16,14 +17,43 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
+import org.junit.rules.RuleChain
+import org.junit.rules.TestRule
+import org.junit.runner.Description
+import org.junit.runners.model.Statement
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class HardwareE2EInstrumentationTest {
+    private val cameraPermissionRule = object : TestRule {
+        override fun apply(base: Statement, description: Description): Statement =
+            object : Statement() {
+                override fun evaluate() {
+                    val instrumentation = InstrumentationRegistry.getInstrumentation()
+                    instrumentation.uiAutomation.grantRuntimePermission(
+                        instrumentation.targetContext.packageName,
+                        Manifest.permission.CAMERA
+                    )
+                    assertEquals(
+                        PackageManager.PERMISSION_GRANTED,
+                        ContextCompat.checkSelfPermission(
+                            instrumentation.targetContext,
+                            Manifest.permission.CAMERA
+                        )
+                    )
+                    base.evaluate()
+                }
+            }
+    }
+
+    private val composeRule = createAndroidComposeRule<MainActivity>()
+
     @get:Rule
-    val composeRule = createAndroidComposeRule<MainActivity>()
+    val ruleChain: TestRule = RuleChain
+        .outerRule(cameraPermissionRule)
+        .around(composeRule)
 
     private val instrumentation
         get() = InstrumentationRegistry.getInstrumentation()
@@ -34,8 +64,11 @@ class HardwareE2EInstrumentationTest {
     @Test
     fun appLaunchesAndDiagnosticReportCanBeCreatedAndRead() {
         assertEquals("com.projectnuke.keplernightlab", targetContext.packageName)
-        grantCameraPermission()
-        composeRule.activityRule.scenario.recreate()
+        assertEquals(
+            PackageManager.PERMISSION_GRANTED,
+            ContextCompat.checkSelfPermission(targetContext, Manifest.permission.CAMERA)
+        )
+        assertEquals(Lifecycle.State.RESUMED, composeRule.activityRule.scenario.state)
         val hasUsableCamera = hasUsableCamera()
         if (hasUsableCamera) {
             composeRule.onNodeWithTag("kepler.camera.root").assertIsDisplayed()
@@ -57,8 +90,6 @@ class HardwareE2EInstrumentationTest {
     @Test
     fun optInYuv12MpMainCameraProductionBurst() {
         assumeTrue("kepler.hardwareE2E=true is required", hardwareE2EEnabled())
-        grantCameraPermission()
-        composeRule.activityRule.scenario.recreate()
         assumeTrue("usable camera is required", hasUsableCamera())
         val capability = selectedCapability()
         assumeTrue("12MP YUV is unsupported", capability?.yuv12Available == true)
@@ -89,8 +120,6 @@ class HardwareE2EInstrumentationTest {
     @Test
     fun optInRaw12MpMainCameraProductionBurstWhenSupported() {
         assumeTrue("kepler.hardwareE2E=true is required", hardwareE2EEnabled())
-        grantCameraPermission()
-        composeRule.activityRule.scenario.recreate()
         assumeTrue("usable camera is required", hasUsableCamera())
         val capability = selectedCapability()
         assumeTrue("12MP RAW is unsupported", capability?.raw12Available == true)
@@ -226,17 +255,6 @@ class HardwareE2EInstrumentationTest {
         val manager = targetContext.getSystemService(CameraManager::class.java)
         manager.cameraIdList.isNotEmpty()
     }.getOrDefault(false)
-
-    private fun grantCameraPermission() {
-        instrumentation.uiAutomation.grantRuntimePermission(
-            targetContext.packageName,
-            Manifest.permission.CAMERA
-        )
-        assertEquals(
-            PackageManager.PERMISSION_GRANTED,
-            ContextCompat.checkSelfPermission(targetContext, Manifest.permission.CAMERA)
-        )
-    }
 
     private fun hardwareE2EEnabled(): Boolean =
         InstrumentationRegistry.getArguments()
