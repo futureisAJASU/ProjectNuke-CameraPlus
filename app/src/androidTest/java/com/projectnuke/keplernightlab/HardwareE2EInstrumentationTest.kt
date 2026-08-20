@@ -1,13 +1,16 @@
 package com.projectnuke.keplernightlab
 
 import android.Manifest
+import android.app.KeyguardManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraManager
+import android.os.PowerManager
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
+
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -68,10 +71,24 @@ class HardwareE2EInstrumentationTest {
             PackageManager.PERMISSION_GRANTED,
             ContextCompat.checkSelfPermission(targetContext, Manifest.permission.CAMERA)
         )
-        assertEquals(Lifecycle.State.RESUMED, composeRule.activityRule.scenario.state)
+
+        assumeTrue(
+            "Physical-device UI test requires an interactive, unlocked device. " +
+                "PowerManager.isInteractive=${deviceIsInteractive()} " +
+                "KeyguardManager.isKeyguardLocked=${deviceIsKeyguardLocked()} " +
+                "ActivityScenario state=${composeRule.activityRule.scenario.state} " +
+                "CAMERA permission=${ContextCompat.checkSelfPermission(targetContext, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED}",
+            deviceIsInteractive() && !deviceIsKeyguardLocked()
+        )
+
+        ensureActivityReadyForUi()
+
         val hasUsableCamera = hasUsableCamera()
         if (hasUsableCamera) {
-            composeRule.onNodeWithTag("kepler.camera.root").assertIsDisplayed()
+            composeRule.waitUntil(10_000L) {
+                composeRule.onNodeWithTag("kepler.camera.root").assertIsDisplayed()
+                true
+            }
             composeRule.onNodeWithTag("kepler.settings.open").assertIsDisplayed()
             composeRule.onNodeWithTag("kepler.camera.shutter").assertIsDisplayed()
         }
@@ -94,6 +111,16 @@ class HardwareE2EInstrumentationTest {
         val capability = selectedCapability()
         assumeTrue("12MP YUV is unsupported", capability?.yuv12Available == true)
 
+        assumeTrue(
+            "Physical-device UI test requires an interactive, unlocked device. " +
+                "PowerManager.isInteractive=${deviceIsInteractive()} " +
+                "KeyguardManager.isKeyguardLocked=${deviceIsKeyguardLocked()} " +
+                "ActivityScenario state=${composeRule.activityRule.scenario.state} " +
+                "CAMERA permission=${ContextCompat.checkSelfPermission(targetContext, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED}",
+            deviceIsInteractive() && !deviceIsKeyguardLocked()
+        )
+
+        ensureActivityReadyForUi()
         configureSettings(PipelineMode.YUV_NIGHT_FUSION.name)
         val previousRunId = HardwareE2EReportStore.readLatest(targetContext)?.runId
         val invocationStart = System.currentTimeMillis()
@@ -124,6 +151,16 @@ class HardwareE2EInstrumentationTest {
         val capability = selectedCapability()
         assumeTrue("12MP RAW is unsupported", capability?.raw12Available == true)
 
+        assumeTrue(
+            "Physical-device UI test requires an interactive, unlocked device. " +
+                "PowerManager.isInteractive=${deviceIsInteractive()} " +
+                "KeyguardManager.isKeyguardLocked=${deviceIsKeyguardLocked()} " +
+                "ActivityScenario state=${composeRule.activityRule.scenario.state} " +
+                "CAMERA permission=${ContextCompat.checkSelfPermission(targetContext, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED}",
+            deviceIsInteractive() && !deviceIsKeyguardLocked()
+        )
+
+        ensureActivityReadyForUi()
         configureSettings(PipelineMode.RAW_NIGHT_FUSION.name)
         val previousRunId = HardwareE2EReportStore.readLatest(targetContext)?.runId
         val invocationStart = System.currentTimeMillis()
@@ -155,6 +192,31 @@ class HardwareE2EInstrumentationTest {
         composeRule.onNodeWithTag("kepler.camera.shutter").assertIsDisplayed()
     }
 
+    private fun ensureActivityReadyForUi() {
+        val scenario = composeRule.activityRule.scenario
+
+        if (scenario.state != Lifecycle.State.RESUMED) {
+            scenario.moveToState(Lifecycle.State.RESUMED)
+        }
+
+        composeRule.waitForIdle()
+
+        assertEquals(
+            Lifecycle.State.RESUMED,
+            scenario.state
+        )
+    }
+
+    private fun deviceIsInteractive(): Boolean {
+        val powerManager = targetContext.getSystemService(PowerManager::class.java)
+        return powerManager.isInteractive
+    }
+
+    private fun deviceIsKeyguardLocked(): Boolean {
+        val keyguardManager = targetContext.getSystemService(KeyguardManager::class.java)
+        return keyguardManager.isKeyguardLocked
+    }
+
     private fun configureSettings(pipelineModeName: String) {
         val settings = CameraSettingsStore.load(targetContext).copy(
             selectedResolutionName = CaptureResolutionMode.MP12.name,
@@ -166,6 +228,7 @@ class HardwareE2EInstrumentationTest {
         )
         CameraSettingsStore.save(targetContext, settings)
         composeRule.activityRule.scenario.recreate()
+        ensureActivityReadyForUi()
         composeRule.onNodeWithTag("kepler.camera.root").assertIsDisplayed()
     }
 
