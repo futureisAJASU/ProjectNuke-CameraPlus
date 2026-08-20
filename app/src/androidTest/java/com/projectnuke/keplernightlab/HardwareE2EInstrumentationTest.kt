@@ -228,9 +228,10 @@ class HardwareE2EInstrumentationTest {
     }.getOrDefault(false)
 
     private fun grantCameraPermission() {
-        instrumentation.uiAutomation
-            .executeShellCommand("pm grant ${targetContext.packageName} ${Manifest.permission.CAMERA}")
-            .close()
+        instrumentation.uiAutomation.grantRuntimePermission(
+            targetContext.packageName,
+            Manifest.permission.CAMERA
+        )
         assertEquals(
             PackageManager.PERMISSION_GRANTED,
             ContextCompat.checkSelfPermission(targetContext, Manifest.permission.CAMERA)
