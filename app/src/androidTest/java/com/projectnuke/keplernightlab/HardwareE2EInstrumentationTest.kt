@@ -15,6 +15,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
+import androidx.test.uiautomator.UiObject2
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -41,14 +42,10 @@ class HardwareE2EInstrumentationTest {
                     )
                     assertEquals(
                         PackageManager.PERMISSION_GRANTED,
-                        instrumentation.uiAutomation.executeShellCommand(
-                            "pm list permissions -d -g"
-                        ).let {
-                            ContextCompat.checkSelfPermission(
-                                instrumentation.targetContext,
-                                Manifest.permission.CAMERA
-                            )
-                        }
+                        ContextCompat.checkSelfPermission(
+                            instrumentation.targetContext,
+                            Manifest.permission.CAMERA
+                        )
                     )
                     base.evaluate()
                 }
@@ -128,7 +125,7 @@ class HardwareE2EInstrumentationTest {
         configureSettings(PipelineMode.YUV_NIGHT_FUSION.name)
         val previousRunId = HardwareE2EReportStore.readLatest(targetContext)?.runId
         val invocationStart = System.currentTimeMillis()
-        val shutter = awaitUiObject("kepler.camera.shutter", 5_000L) as androidx.test.uiautomator.UiObject2
+        val shutter = awaitUiObject("kepler.camera.shutter", 5_000L)
         assertTrue("shutter not enabled", shutter.isEnabled)
         shutter.click()
         val report = awaitExactTerminalReport(
@@ -147,6 +144,7 @@ class HardwareE2EInstrumentationTest {
         assertTrue(report.terminalFlags["requiredOutputCommitted"] == true)
         assertTrue(job.exportStatus.uppercase() !in setOf("FAILED", "CANCELLED", "ERROR"))
         waitForPipelineIdle()
+        assertTrue("kepler.camera.shutter not interactable after terminal settle", device.findObject(By.res("kepler.camera.shutter"))?.isEnabled == true)
         assertNotNull("kepler.camera.shutter not found after capture", device.findObject(By.res("kepler.camera.shutter")))
     }
 
@@ -170,7 +168,7 @@ class HardwareE2EInstrumentationTest {
         configureSettings(PipelineMode.RAW_NIGHT_FUSION.name)
         val previousRunId = HardwareE2EReportStore.readLatest(targetContext)?.runId
         val invocationStart = System.currentTimeMillis()
-        val shutter = awaitUiObject("kepler.camera.shutter", 5_000L) as androidx.test.uiautomator.UiObject2
+        val shutter = awaitUiObject("kepler.camera.shutter", 5_000L)
         assertTrue("shutter not enabled", shutter.isEnabled)
         shutter.click()
         val report = awaitExactTerminalReport(
@@ -197,6 +195,7 @@ class HardwareE2EInstrumentationTest {
         assertTrue(report.terminalFlags["requiredOutputCommitted"] == true)
         assertTrue(job.exportStatus.uppercase() !in setOf("FAILED", "CANCELLED", "ERROR"))
         waitForPipelineIdle()
+        assertTrue("kepler.camera.shutter not interactable after terminal settle", device.findObject(By.res("kepler.camera.shutter"))?.isEnabled == true)
         assertNotNull("kepler.camera.shutter not found after capture", device.findObject(By.res("kepler.camera.shutter")))
     }
 
@@ -215,7 +214,10 @@ class HardwareE2EInstrumentationTest {
         awaitUiObject("kepler.camera.root", 10_000L)
     }
 
-    private fun awaitUiObject(resourceId: String, timeoutMs: Long): Any? {
+    private fun awaitUiObject(
+        resourceId: String,
+        timeoutMs: Long
+    ): UiObject2 {
         val obj = device.wait(Until.findObject(By.res(resourceId)), timeoutMs)
         if (obj == null) {
             throw AssertionError("Timed out after ${timeoutMs}ms waiting for UiObject with resourceId: $resourceId")
@@ -308,10 +310,14 @@ class HardwareE2EInstrumentationTest {
         report.toJson().toString(2)
 
     private fun waitForPipelineIdle() {
-        try {
-            device.wait(Until.gone(By.res("kepler.pipeline.busy")), 15_000L)
-        } catch (timeout: Throwable) {
-            throw AssertionError("Pipeline busy state did not clear: ${HardwareE2EReportStore.readLatest(targetContext)?.toJson()?.toString(2)}", timeout)
+        val cleared = device.wait(Until.gone(By.res("kepler.pipeline.busy")), 15_000L)
+        if (!cleared) {
+            throw AssertionError(
+                "Pipeline busy state did not clear: " +
+                    HardwareE2EReportStore.readLatest(targetContext)
+                        ?.toJson()
+                        ?.toString(2)
+            )
         }
     }
 

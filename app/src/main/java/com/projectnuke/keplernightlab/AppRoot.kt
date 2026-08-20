@@ -84,7 +84,7 @@ MaterialTheme(colorScheme = KeplerDarkScheme) {
         Surface(
             modifier = Modifier
                 .fillMaxSize()
-                .semantics { testTagsAsResourceId = true },
+                .semantics { testTagsAsResourceId = debugBuild },
             color = Color.Black
         ) {
             when {
