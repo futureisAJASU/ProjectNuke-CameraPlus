@@ -10,7 +10,6 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
-
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -27,6 +26,7 @@ import org.junit.runners.model.Statement
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
+import kotlin.concurrent.thread
 
 @RunWith(AndroidJUnit4::class)
 class HardwareE2EInstrumentationTest {
@@ -85,10 +85,9 @@ class HardwareE2EInstrumentationTest {
 
         val hasUsableCamera = hasUsableCamera()
         if (hasUsableCamera) {
-            composeRule.waitUntil(10_000L) {
-                composeRule.onNodeWithTag("kepler.camera.root").assertIsDisplayed()
-                true
-            }
+            // ensureActivityReadyForUi() already waits for CameraScreenTestHooks.uiMounted
+            // which is set when MainCameraScreen is composed and camera root is available
+            composeRule.onNodeWithTag("kepler.camera.root").assertIsDisplayed()
             composeRule.onNodeWithTag("kepler.settings.open").assertIsDisplayed()
             composeRule.onNodeWithTag("kepler.camera.shutter").assertIsDisplayed()
         }
@@ -199,12 +198,31 @@ class HardwareE2EInstrumentationTest {
             scenario.moveToState(Lifecycle.State.RESUMED)
         }
 
-        composeRule.waitForIdle()
-
         assertEquals(
             Lifecycle.State.RESUMED,
             scenario.state
         )
+
+        // Reset the UI mounted flag before waiting for it to be set by the new composition
+        CameraScreenTestHooks.uiMounted = false
+        awaitCameraRoot()
+    }
+
+    private fun awaitCameraRoot(timeoutMs: Long = 10_000L) {
+        awaitCondition(timeoutMs) {
+            CameraScreenTestHooks.uiMounted
+        }
+    }
+
+    private fun awaitCondition(timeoutMs: Long, condition: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (condition()) {
+                return
+            }
+            Thread.sleep(50L)
+        }
+        throw AssertionError("Timed out after ${timeoutMs}ms waiting for condition")
     }
 
     private fun deviceIsInteractive(): Boolean {
@@ -229,6 +247,8 @@ class HardwareE2EInstrumentationTest {
         CameraSettingsStore.save(targetContext, settings)
         composeRule.activityRule.scenario.recreate()
         ensureActivityReadyForUi()
+        // ensureActivityReadyForUi() already waits for CameraScreenTestHooks.uiMounted
+        // which is set when MainCameraScreen is recomposed after recreate
         composeRule.onNodeWithTag("kepler.camera.root").assertIsDisplayed()
     }
 
@@ -239,7 +259,7 @@ class HardwareE2EInstrumentationTest {
     ): HardwareE2ERunReport {
         var runId: String? = null
         try {
-            composeRule.waitUntil(180_000L) {
+            awaitCondition(180_000L) {
                 if (runId == null) {
                     runId = HardwareE2EReportStore.findLatestAfter(
                         context = targetContext,
@@ -294,7 +314,7 @@ class HardwareE2EInstrumentationTest {
 
     private fun waitForPipelineIdle() {
         try {
-            composeRule.waitUntil(15_000L) {
+            awaitCondition(15_000L) {
                 composeRule.onAllNodesWithTag("kepler.pipeline.busy").fetchSemanticsNodes().isEmpty()
             }
         } catch (timeout: Throwable) {

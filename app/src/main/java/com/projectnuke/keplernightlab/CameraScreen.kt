@@ -101,6 +101,13 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
+internal object CameraScreenTestHooks {
+    @Volatile
+    var uiMounted: Boolean = false
+        @Suppress("UNUSED_PROPERTY")
+        internal set
+}
+
 fun isAllowedPreviewExtension(fileName: String): Boolean {
     return when (val ext = fileName.substringAfterLast('.', "").lowercase()) {
         "png", "jpg", "jpeg", "heic", "webp" -> true
@@ -299,6 +306,10 @@ fun MainCameraScreen(
     val pipelineSession = remember { CameraPipelineUiSession() }
     val hardwareE2ERecorder = remember { HardwareE2ERunRecorder.forContext(context) }
     val savedSettings = remember { CameraSettingsStore.load(context) }
+
+    if (BuildConfig.DEBUG) {
+        CameraScreenTestHooks.uiMounted = true
+    }
 
     var status by remember { mutableStateOf("대기 중") }
     var pipelineUiState by remember { mutableStateOf(pipelineSession.snapshot()) }
