@@ -221,53 +221,40 @@ internal data class HardwareE2EJobSummary(
             exportVerified = json.optBoolean("exportVerified"),
             requiredOutputFilePresent = json.optBoolean("requiredOutputFilePresent"),
             requestedFrames = json.optInt("requestedFrames"),
-            attemptedFrames = if (json.has("attemptedFrames")) json.optInt("attemptedFrames") else null,
+            attemptedFrames = json.optNullableInt("attemptedFrames"),
             savedFrames = json.optInt("savedFrames"),
-            receivedImages = if (json.has("receivedImages")) json.optInt("receivedImages") else null,
-            completedResults = if (json.has("completedResults")) json.optInt("completedResults") else null,
+            receivedImages = json.optNullableInt("receivedImages"),
+            completedResults = json.optNullableInt("completedResults"),
             failedCaptures = json.optInt("failedCaptures"),
             partialCapture = json.optBoolean("partialCapture"),
             cleanupType = json.optString("cleanupType"),
             cameraId = json.optString("cameraId"),
             physicalCameraId = json.optString("physicalCameraId"),
             requestedPhysicalCameraId = json.optString("requestedPhysicalCameraId"),
-            dngSidecarSaved = if (json.has("dngSidecarSaved")) json.optBoolean("dngSidecarSaved") else null,
+            dngSidecarSaved = json.optNullableBoolean("dngSidecarSaved"),
             dngSidecarSkipReason = json.optString("dngSidecarSkipReason"),
             dngSidecarStatuses = json.optJSONArray("dngSidecarStatuses").toStringList(),
-            frameManifestCount = json.optJSONArray("frames")?.length() ?: 0,
-            rawMetadata = listOf(
-                "rawWidth", "rawHeight", "rowStride", "pixelStride", "rawSizeSource"
-            ).associateWith { json.optString(it) }.filterValues { it.isNotBlank() },
+            frameManifestCount = json.optInt("frameManifestCount"),
+            rawMetadata = json.optJSONObject("rawMetadata").toStringMap(),
             selectedRoute = json.optString("selectedRoute"),
             actualRoute = json.optString("actualRoute"),
-            processingTiming = listOf(
-                "captureDurationMs", "processingDurationMs", "exportDurationMs", "totalDurationMs",
-                "alignmentDurationMs", "mergeDurationMs", "demosaicDurationMs"
-            ).associateWith { json.optLong(it, -1L) }.filterValues { it >= 0L },
-            memoryFields = listOf(
-                "memoryRiskLevel", "estimatedRawFusionMemoryMb", "estimatedMemoryMb",
-                "nativeWorkingSetMb", "memoryTrimmed", "lowMemoryFallback"
-            ).associateWith { json.optString(it) }.filterValues { it.isNotBlank() },
+            processingTiming = json.optJSONObject("processingTiming").toLongMap(),
+            memoryFields = json.optJSONObject("memoryFields").toStringMap(),
             activeOperationId = json.optString(ACTIVE_OPERATION_ID),
             activeOperationKind = json.optString(ACTIVE_OPERATION_KIND),
             activeRuntimeSessionId = json.optString(ACTIVE_RUNTIME_SESSION_ID),
             terminalOperationId = json.optString(TERMINAL_OPERATION_ID),
-            liveOperationRegistered = runCatching { KeplerJobMetadata.findOperationLease(File(json.optString("jobDirectory"))) != null }.getOrDefault(false),
-            fileNames = runCatching {
-                NoFollowFileSystem.requireDirectChildren(File(json.optString("jobDirectory")))
-                    .filter { NoFollowFileSystem.isRealFile(it.toPath()) }
-                    .map(File::getName)
-                    .sorted()
-            }.getOrDefault(emptyList()),
+            liveOperationRegistered = json.optBoolean("liveOperationRegistered"),
+            fileNames = json.optJSONArray("fileNames").toStringList(),
             error = json.optString("error").takeIf { it.isNotBlank() },
-            yuvReceivedFrames = if (json.has("yuvReceivedFrames")) json.optInt("yuvReceivedFrames") else null,
-            yuvPersistedFrames = if (json.has("yuvPersistedFrames")) json.optInt("yuvPersistedFrames") else null,
-            yuvFailedFrames = if (json.has("yuvFailedFrames")) json.optInt("yuvFailedFrames") else null,
-            yuvDroppedFrames = if (json.has("yuvDroppedFrames")) json.optInt("yuvDroppedFrames") else null,
-            yuvCompletedResults = if (json.has("yuvCompletedResults")) json.optInt("yuvCompletedResults") else null,
-            yuvFirstWorkerFailureClass = json.optString("yuvFirstWorkerFailureClass").takeIf { it.isNotBlank() },
-            yuvFirstWorkerFailureMessage = json.optString("yuvFirstWorkerFailureMessage").takeIf { it.isNotBlank() },
-            yuvFirstWorkerFailureFrameIndex = if (json.has("yuvFirstWorkerFailureFrameIndex")) json.optInt("yuvFirstWorkerFailureFrameIndex") else null
+            yuvReceivedFrames = json.optNullableInt("yuvReceivedFrames"),
+            yuvPersistedFrames = json.optNullableInt("yuvPersistedFrames"),
+            yuvFailedFrames = json.optNullableInt("yuvFailedFrames"),
+            yuvDroppedFrames = json.optNullableInt("yuvDroppedFrames"),
+            yuvCompletedResults = json.optNullableInt("yuvCompletedResults"),
+            yuvFirstWorkerFailureClass = json.optNullableString("yuvFirstWorkerFailureClass"),
+            yuvFirstWorkerFailureMessage = json.optNullableString("yuvFirstWorkerFailureMessage"),
+            yuvFirstWorkerFailureFrameIndex = json.optNullableInt("yuvFirstWorkerFailureFrameIndex")
         )
     }
 }
@@ -444,6 +431,15 @@ private fun JSONObject?.toLongMap(): Map<String, Long> {
         }
     }
 }
+
+private fun JSONObject.optNullableInt(key: String): Int? =
+    if (!has(key) || isNull(key)) null else optInt(key)
+
+private fun JSONObject.optNullableBoolean(key: String): Boolean? =
+    if (!has(key) || isNull(key)) null else optBoolean(key)
+
+private fun JSONObject.optNullableString(key: String): String? =
+    if (!has(key) || isNull(key)) null else optString(key).takeIf { it.isNotBlank() }
 
 private fun JSONArray?.toStringList(): List<String> {
     if (this == null) return emptyList()
@@ -1008,9 +1004,9 @@ internal class HardwareE2ERunRecorder private constructor(
         } || job.optBoolean("requiredOutputCommitted", false)
         val savedFrames = job.optInt("savedFrames", 0)
         val requestedFrames = job.optInt("requestedFrames", savedFrames)
-        val attemptedFrames = if (job.has("attemptedFrames")) job.optInt("attemptedFrames") else null
-        val receivedImages = if (job.has("receivedImages")) job.optInt("receivedImages") else null
-        val completedResults = if (job.has("completedResults")) job.optInt("completedResults") else null
+        val attemptedFrames = job.optNullableInt("attemptedFrames")
+        val receivedImages = job.optNullableInt("receivedImages")
+        val completedResults = job.optNullableInt("completedResults")
         return HardwareE2EJobSummary(
             jobDirectory = jobDir.absolutePath,
             readable = true,
@@ -1058,14 +1054,14 @@ internal class HardwareE2ERunRecorder private constructor(
             liveOperationRegistered = runCatching { KeplerJobMetadata.findOperationLease(jobDir) != null }.getOrDefault(false),
             fileNames = fileNames,
             error = null,
-            yuvReceivedFrames = if (job.has("yuvReceivedFrames")) job.optInt("yuvReceivedFrames") else null,
-            yuvPersistedFrames = if (job.has("yuvPersistedFrames")) job.optInt("yuvPersistedFrames") else null,
-            yuvFailedFrames = if (job.has("yuvFailedFrames")) job.optInt("yuvFailedFrames") else null,
-            yuvDroppedFrames = if (job.has("yuvDroppedFrames")) job.optInt("yuvDroppedFrames") else null,
-            yuvCompletedResults = if (job.has("yuvCompletedResults")) job.optInt("yuvCompletedResults") else null,
-            yuvFirstWorkerFailureClass = job.optString("yuvFirstWorkerFailureClass").takeIf { it.isNotBlank() },
-            yuvFirstWorkerFailureMessage = job.optString("yuvFirstWorkerFailureMessage").takeIf { it.isNotBlank() },
-            yuvFirstWorkerFailureFrameIndex = if (job.has("yuvFirstWorkerFailureFrameIndex")) job.optInt("yuvFirstWorkerFailureFrameIndex") else null
+            yuvReceivedFrames = job.optNullableInt("yuvReceivedFrames"),
+            yuvPersistedFrames = job.optNullableInt("yuvPersistedFrames"),
+            yuvFailedFrames = job.optNullableInt("yuvFailedFrames"),
+            yuvDroppedFrames = job.optNullableInt("yuvDroppedFrames"),
+            yuvCompletedResults = job.optNullableInt("yuvCompletedResults"),
+            yuvFirstWorkerFailureClass = job.optNullableString("yuvFirstWorkerFailureClass"),
+            yuvFirstWorkerFailureMessage = job.optNullableString("yuvFirstWorkerFailureMessage"),
+            yuvFirstWorkerFailureFrameIndex = job.optNullableInt("yuvFirstWorkerFailureFrameIndex")
         )
     }
 

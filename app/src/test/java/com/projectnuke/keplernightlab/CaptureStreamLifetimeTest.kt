@@ -122,7 +122,7 @@ class CaptureStreamLifetimeTest {
     }
 
     @Test
-    fun yuvPngWriter_compressFalseIsPreciseFailure() {
+    fun yuvPngWriter_validBitmapProducesNonEmptyFile() {
         val tempFile = File(createTempDir(), "out.png")
         val fos = FileOutputStream(tempFile)
         val bitmap = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)

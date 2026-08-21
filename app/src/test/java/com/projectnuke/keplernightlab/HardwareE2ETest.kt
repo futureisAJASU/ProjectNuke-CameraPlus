@@ -1,5 +1,6 @@
 package com.projectnuke.keplernightlab
 
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -369,6 +370,169 @@ class HardwareE2ETest {
         assertNull(summary.receivedImages)
         assertNull(summary.completedResults)
         recorder.close()
+    }
+
+    @Test
+    fun jobSummaryCodec_roundTripsAllFields() {
+        val summary = HardwareE2EJobSummary(
+            jobDirectory = "/tmp/job-1",
+            readable = true,
+            jobType = "YUV_NIGHT_FUSION",
+            captureMode = "MULTI_FRAME",
+            createdAt = 1_000L,
+            status = "PIPELINE_COMPLETE",
+            processStatus = "PIPELINE_COMPLETE",
+            exportStatus = "COMPLETE",
+            exportVerified = true,
+            requiredOutputFilePresent = true,
+            requestedFrames = 4,
+            attemptedFrames = 4,
+            savedFrames = 4,
+            receivedImages = 4,
+            completedResults = 4,
+            failedCaptures = 0,
+            partialCapture = false,
+            cleanupType = "NONE",
+            cameraId = "cam0",
+            physicalCameraId = "phys0",
+            requestedPhysicalCameraId = "phys0",
+            dngSidecarSaved = null,
+            dngSidecarSkipReason = "",
+            dngSidecarStatuses = emptyList(),
+            frameManifestCount = 4,
+            rawMetadata = mapOf("rawWidth" to "4080", "rawHeight" to "3060"),
+            selectedRoute = "OPTICAL",
+            actualRoute = "OPTICAL",
+            processingTiming = mapOf("captureDurationMs" to 100L),
+            memoryFields = mapOf("memoryRiskLevel" to "low"),
+            activeOperationId = "op-1",
+            activeOperationKind = "PROCESSING_YUV",
+            activeRuntimeSessionId = "session-1",
+            terminalOperationId = "op-term-1",
+            liveOperationRegistered = false,
+            fileNames = listOf("job.json", "frame_00_color.png"),
+            error = null,
+            yuvReceivedFrames = 4,
+            yuvPersistedFrames = 4,
+            yuvFailedFrames = 0,
+            yuvDroppedFrames = 0,
+            yuvCompletedResults = 4,
+            yuvFirstWorkerFailureClass = null,
+            yuvFirstWorkerFailureMessage = null,
+            yuvFirstWorkerFailureFrameIndex = null
+        )
+        val decoded = HardwareE2EJobSummary.fromJson(summary.toJson())
+        assertEquals(summary, decoded)
+    }
+
+    @Test
+    fun jobSummaryCodec_explicitJsonNullsRemainNull() {
+        val json = JSONObject()
+            .put("jobDirectory", "/tmp/job-null")
+            .put("readable", true)
+            .put("jobType", "YUV_NIGHT_FUSION")
+            .put("captureMode", "MULTI_FRAME")
+            .put("createdAt", 1L)
+            .put("status", "PIPELINE_COMPLETE")
+            .put("processStatus", "PIPELINE_COMPLETE")
+            .put("exportStatus", "COMPLETE")
+            .put("exportVerified", true)
+            .put("requiredOutputFilePresent", true)
+            .put("requestedFrames", 4)
+            .put("savedFrames", 4)
+            .put("failedCaptures", 0)
+            .put("partialCapture", false)
+            .put("cleanupType", "NONE")
+            .put("cameraId", "cam0")
+            .put("physicalCameraId", "phys0")
+            .put("requestedPhysicalCameraId", "phys0")
+            .put("dngSidecarSkipReason", "")
+            .put("dngSidecarStatuses", JSONArray())
+            .put("frameManifestCount", 4)
+            .put("rawMetadata", JSONObject())
+            .put("selectedRoute", "OPTICAL")
+            .put("actualRoute", "OPTICAL")
+            .put("processingTiming", JSONObject())
+            .put("memoryFields", JSONObject())
+            .put("activeOperationId", "")
+            .put("activeOperationKind", "")
+            .put("activeRuntimeSessionId", "")
+            .put("terminalOperationId", "")
+            .put("liveOperationRegistered", false)
+            .put("fileNames", JSONArray())
+            .put("yuvReceivedFrames", JSONObject.NULL)
+            .put("yuvPersistedFrames", JSONObject.NULL)
+            .put("yuvFailedFrames", JSONObject.NULL)
+            .put("yuvDroppedFrames", JSONObject.NULL)
+            .put("yuvCompletedResults", JSONObject.NULL)
+            .put("yuvFirstWorkerFailureClass", JSONObject.NULL)
+            .put("yuvFirstWorkerFailureMessage", JSONObject.NULL)
+            .put("yuvFirstWorkerFailureFrameIndex", JSONObject.NULL)
+
+        val summary = HardwareE2EJobSummary.fromJson(json)
+        assertNull(summary.yuvReceivedFrames)
+        assertNull(summary.yuvPersistedFrames)
+        assertNull(summary.yuvFailedFrames)
+        assertNull(summary.yuvDroppedFrames)
+        assertNull(summary.yuvCompletedResults)
+        assertNull(summary.yuvFirstWorkerFailureClass)
+        assertNull(summary.yuvFirstWorkerFailureMessage)
+        assertNull(summary.yuvFirstWorkerFailureFrameIndex)
+    }
+
+    @Test
+    fun jobSummaryCodec_jsonZeroIsPreservedAsZero() {
+        val json = JSONObject()
+            .put("jobDirectory", "/tmp/job-zero")
+            .put("readable", true)
+            .put("jobType", "YUV_NIGHT_FUSION")
+            .put("captureMode", "MULTI_FRAME")
+            .put("createdAt", 1L)
+            .put("status", "PIPELINE_COMPLETE")
+            .put("processStatus", "PIPELINE_COMPLETE")
+            .put("exportStatus", "COMPLETE")
+            .put("exportVerified", true)
+            .put("requiredOutputFilePresent", true)
+            .put("requestedFrames", 4)
+            .put("savedFrames", 4)
+            .put("failedCaptures", 0)
+            .put("partialCapture", false)
+            .put("cleanupType", "NONE")
+            .put("cameraId", "cam0")
+            .put("physicalCameraId", "phys0")
+            .put("requestedPhysicalCameraId", "phys0")
+            .put("dngSidecarSkipReason", "")
+            .put("dngSidecarStatuses", JSONArray())
+            .put("frameManifestCount", 4)
+            .put("rawMetadata", JSONObject())
+            .put("selectedRoute", "OPTICAL")
+            .put("actualRoute", "OPTICAL")
+            .put("processingTiming", JSONObject())
+            .put("memoryFields", JSONObject())
+            .put("activeOperationId", "")
+            .put("activeOperationKind", "")
+            .put("activeRuntimeSessionId", "")
+            .put("terminalOperationId", "")
+            .put("liveOperationRegistered", false)
+            .put("fileNames", JSONArray())
+            .put("yuvReceivedFrames", 0)
+            .put("yuvPersistedFrames", 0)
+            .put("yuvFailedFrames", 0)
+            .put("yuvDroppedFrames", 0)
+            .put("yuvCompletedResults", 0)
+            .put("yuvFirstWorkerFailureClass", JSONObject.NULL)
+            .put("yuvFirstWorkerFailureMessage", JSONObject.NULL)
+            .put("yuvFirstWorkerFailureFrameIndex", 0)
+
+        val summary = HardwareE2EJobSummary.fromJson(json)
+        assertEquals(0, summary.yuvReceivedFrames)
+        assertEquals(0, summary.yuvPersistedFrames)
+        assertEquals(0, summary.yuvFailedFrames)
+        assertEquals(0, summary.yuvDroppedFrames)
+        assertEquals(0, summary.yuvCompletedResults)
+        assertNull(summary.yuvFirstWorkerFailureClass)
+        assertNull(summary.yuvFirstWorkerFailureMessage)
+        assertEquals(0, summary.yuvFirstWorkerFailureFrameIndex)
     }
 
     private fun successEvent() = CameraPipelineEvent.Terminal(
