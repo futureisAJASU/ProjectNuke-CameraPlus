@@ -118,7 +118,19 @@ internal class YuvCaptureSession internal constructor(
             workProcessor: YuvPngWorkProcessor,
             postStatus: (String) -> Boolean = { true },
             dispatchCallback: CallbackDispatcher = CallbackDispatcher { runnable -> runnable.run(); true },
-            writeJobJson: (status: String, savedFrames: Int, manifest: List<YuvFrameManifestEntry>) -> Unit = { _, _, _ -> },
+            writeJobJson: (
+                status: String,
+                savedFrames: Int,
+                manifest: List<YuvFrameManifestEntry>,
+                receivedFrames: Int,
+                persistedFrames: Int,
+                failedFrames: Int,
+                droppedFrames: Int,
+                completedResults: Int,
+                firstWorkerFailureClass: String?,
+                firstWorkerFailureMessage: String?,
+                firstWorkerFailureFrameIndex: Int?
+            ) -> Unit = { _, _, _, _, _, _, _, _, _, _, _ -> },
             saveMotionOnce: (File) -> Pair<String?, String?> = { _ -> null to null },
             onCaptureComplete: (File) -> Unit = {},
             onCaptureError: (message: String, cause: Throwable?) -> Unit = { _, _ -> },
@@ -127,7 +139,19 @@ internal class YuvCaptureSession internal constructor(
             finalFileVerifier: YuvFinalFileVerifier = RealYuvFinalFileVerifier,
             terminalMetadataWriter: YuvTerminalMetadataWriter =
                 YuvTerminalMetadataWriter { request ->
-                    writeJobJson(request.jobStatus, request.savedFrames, request.manifest)
+                    writeJobJson(
+                        request.jobStatus,
+                        request.savedFrames,
+                        request.manifest,
+                        request.receivedFrames,
+                        request.persistedFrames,
+                        request.failedFrames,
+                        request.droppedFrames,
+                        request.completedResults,
+                        request.firstWorkerFailureClass,
+                        request.firstWorkerFailureMessage,
+                        request.firstWorkerFailureFrameIndex
+                    )
                 },
             verifiedFileReader: YuvVerifiedFileReader =
                 YuvVerifiedFileReader { file -> NoFollowFileSystem.readBytesVerified(file) },

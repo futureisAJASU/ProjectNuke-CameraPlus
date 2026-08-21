@@ -135,7 +135,15 @@ internal class YuvTerminalRequestHandoff {
 internal data class YuvTerminalMetadataRequest(
     val jobStatus: String,
     val savedFrames: Int,
-    val manifest: List<YuvFrameManifestEntry>
+    val manifest: List<YuvFrameManifestEntry>,
+    val receivedFrames: Int,
+    val persistedFrames: Int,
+    val failedFrames: Int,
+    val droppedFrames: Int,
+    val completedResults: Int,
+    val firstWorkerFailureClass: String?,
+    val firstWorkerFailureMessage: String?,
+    val firstWorkerFailureFrameIndex: Int?
 )
 
 /**

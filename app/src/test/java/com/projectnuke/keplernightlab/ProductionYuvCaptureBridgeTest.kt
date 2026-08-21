@@ -106,7 +106,7 @@ class ProductionYuvCaptureBridgeTest {
                 }) runnable.run()
                 true
             },
-            writeJobJson = { status, _, _ ->
+            writeJobJson = { status, _, _, _, _, _, _, _, _, _, _ ->
                 if (status in TERMINAL_STATUSES) {
                     handler.post {
                         terminalLatch.countDown()

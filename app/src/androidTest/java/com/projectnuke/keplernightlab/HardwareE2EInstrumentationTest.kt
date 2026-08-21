@@ -137,9 +137,21 @@ class HardwareE2EInstrumentationTest {
 
         val job = report.finalJob!!
         assertEquals(4, job.requestedFrames)
-        assertTrue(job.attemptedFrames >= job.savedFrames)
-        assertTrue(job.savedFrames <= job.requestedFrames)
-        assertTrue(job.receivedImages >= job.completedResults)
+        job.attemptedFrames?.let { assertTrue("attemptedFrames=$it savedFrames=${job.savedFrames}", it >= job.savedFrames) }
+        assertTrue("savedFrames=${job.savedFrames} requestedFrames=${job.requestedFrames}", job.savedFrames <= job.requestedFrames)
+        job.yuvReceivedFrames?.let { received ->
+            job.yuvCompletedResults?.let { completed ->
+                assertTrue("yuvReceivedFrames=$received yuvCompletedResults=$completed", received >= completed)
+            } ?: job.receivedImages?.let { received ->
+                job.completedResults?.let { completed ->
+                    assertTrue("receivedImages=$received completedResults=$completed", received >= completed)
+                }
+            }
+        } ?: job.receivedImages?.let { received ->
+            job.completedResults?.let { completed ->
+                assertTrue("receivedImages=$received completedResults=$completed", received >= completed)
+            }
+        }
         assertTrue(job.requiredOutputFilePresent)
         assertTrue(report.terminalFlags["requiredOutputCommitted"] == true)
         assertTrue(job.exportStatus.uppercase() !in setOf("FAILED", "CANCELLED", "ERROR"))
@@ -180,8 +192,17 @@ class HardwareE2EInstrumentationTest {
 
         val job = report.finalJob!!
         assertEquals(4, job.requestedFrames)
-        assertTrue(job.attemptedFrames >= job.savedFrames)
-        assertTrue(job.receivedImages >= job.completedResults)
+        job.attemptedFrames?.let { assertTrue("attemptedFrames=$it savedFrames=${job.savedFrames}", it >= job.savedFrames) }
+        assertTrue("savedFrames=${job.savedFrames} requestedFrames=${job.requestedFrames}", job.savedFrames <= job.requestedFrames)
+        job.yuvReceivedFrames?.let { received ->
+            job.yuvCompletedResults?.let { completed ->
+                assertTrue("yuvReceivedFrames=$received yuvCompletedResults=$completed", received >= completed)
+            }
+        } ?: job.receivedImages?.let { received ->
+            job.completedResults?.let { completed ->
+                assertTrue("receivedImages=$received completedResults=$completed", received >= completed)
+            }
+        }
         assertTrue(job.frameManifestCount >= job.savedFrames)
         assertTrue(job.rawMetadata["rawWidth"].orEmpty().isNotBlank())
         assertTrue(job.rawMetadata["rawHeight"].orEmpty().isNotBlank())

@@ -283,6 +283,94 @@ class HardwareE2ETest {
         recorder.close()
     }
 
+    @Test
+    fun yuvSummary_doesNotInventMissingAccountingAsZero() {
+        val root = createTempDir()
+        val recorder = recorderFor(root)
+        recorder.start(scenario())
+        val yuvJob = File(root, "yuv-missing-accounting").apply { mkdirs() }
+        File(yuvJob, JOB_JSON_FILE_NAME).writeText(
+            JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("captureMode", CaptureMode.MULTI_FRAME.name)
+                .put("createdAt", System.currentTimeMillis())
+                .put("status", "CAPTURE_TIMEOUT")
+                .put("processStatus", "CAPTURE_TIMEOUT")
+                .put("exportStatus", "PENDING")
+                .put("requestedFrames", 4)
+                .put("savedFrames", 0)
+                .toString()
+        )
+        recorder.recordEvent(
+            CameraPipelineEvent.Terminal(
+                generation = 1L,
+                kind = CameraPipelineEvent.Terminal.Kind.FAILED,
+                counts = CameraPipelineProgressCounts(requestedFrames = 4)
+            )
+        )
+        assertTrue(recorder.awaitIdle())
+        val report = recorder.snapshot()!!
+        val summary = report.finalJob!!
+        assertEquals(4, summary.requestedFrames)
+        assertEquals(0, summary.savedFrames)
+        assertNull(summary.attemptedFrames)
+        assertNull(summary.receivedImages)
+        assertNull(summary.completedResults)
+        assertNull(summary.yuvReceivedFrames)
+        assertNull(summary.yuvPersistedFrames)
+        recorder.close()
+    }
+
+    @Test
+    fun yuvSummary_usesAuthoritativeTerminalAccountingWhenAvailable() {
+        val root = createTempDir()
+        val recorder = recorderFor(root)
+        recorder.start(scenario())
+        val yuvJob = File(root, "yuv-with-accounting").apply { mkdirs() }
+        File(yuvJob, JOB_JSON_FILE_NAME).writeText(
+            JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("captureMode", CaptureMode.MULTI_FRAME.name)
+                .put("createdAt", System.currentTimeMillis())
+                .put("status", "CAPTURE_TIMEOUT")
+                .put("processStatus", "CAPTURE_TIMEOUT")
+                .put("exportStatus", "PENDING")
+                .put("requestedFrames", 4)
+                .put("savedFrames", 0)
+                .put("yuvReceivedFrames", 4)
+                .put("yuvPersistedFrames", 0)
+                .put("yuvFailedFrames", 4)
+                .put("yuvDroppedFrames", 0)
+                .put("yuvCompletedResults", 0)
+                .put("yuvFirstWorkerFailureClass", "SyncFailedException")
+                .put("yuvFirstWorkerFailureMessage", "sync failed")
+                .put("yuvFirstWorkerFailureFrameIndex", 1)
+                .toString()
+        )
+        recorder.recordEvent(
+            CameraPipelineEvent.Terminal(
+                generation = 1L,
+                kind = CameraPipelineEvent.Terminal.Kind.FAILED,
+                counts = CameraPipelineProgressCounts(requestedFrames = 4)
+            )
+        )
+        assertTrue(recorder.awaitIdle())
+        val report = recorder.snapshot()!!
+        val summary = report.finalJob!!
+        assertEquals(4, summary.yuvReceivedFrames)
+        assertEquals(0, summary.yuvPersistedFrames)
+        assertEquals(4, summary.yuvFailedFrames)
+        assertEquals(0, summary.yuvDroppedFrames)
+        assertEquals(0, summary.yuvCompletedResults)
+        assertEquals("SyncFailedException", summary.yuvFirstWorkerFailureClass)
+        assertEquals("sync failed", summary.yuvFirstWorkerFailureMessage)
+        assertEquals(1, summary.yuvFirstWorkerFailureFrameIndex)
+        assertNull(summary.attemptedFrames)
+        assertNull(summary.receivedImages)
+        assertNull(summary.completedResults)
+        recorder.close()
+    }
+
     private fun successEvent() = CameraPipelineEvent.Terminal(
         generation = 1L,
         kind = CameraPipelineEvent.Terminal.Kind.COMPLETE,

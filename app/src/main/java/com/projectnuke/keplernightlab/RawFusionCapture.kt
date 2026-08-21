@@ -1176,6 +1176,7 @@ fun captureRawBurstForFusion(
                             DngCreator(characteristics, result).use { creator ->
                                 creator.writeImage(output, image)
                             }
+                            output.flush()
                             output.fd.sync()
                         }
                         val tempDigest = NoFollowFileSystem.digestVerified(dngTemp!!)
@@ -2910,29 +2911,45 @@ private fun writeCompactRaw16(image: Image, file: File) {
     val rowStride = plane.rowStride
     val pixelStride = plane.pixelStride
     val limit = buffer.limit()
-    val rowBytes = ByteArray(width * 2)
     FileOutputStream(file).use { rawOutput ->
-        BufferedOutputStream(rawOutput).use { output ->
-            for (y in 0 until height) {
-                val row = y * rowStride
-                var out = 0
-                for (x in 0 until width) {
-                    val index = row + x * pixelStride
-                    if (index + 1 < limit) {
-                        rowBytes[out++] = buffer.get(index)
-                        rowBytes[out++] = buffer.get(index + 1)
-                    } else {
-                        rowBytes[out++] = 0
-                        rowBytes[out++] = 0
-                    }
-                }
-                output.write(rowBytes)
-            }
-        }
+        writeRaw16Rows(width, height, rowStride, pixelStride, limit, buffer, rawOutput)
         rawOutput.fd.sync()
     }
     val expectedSize = width.toLong() * height.toLong() * 2L
     verifyRaw16Payload(file, expectedSize)
+}
+
+internal fun writeRaw16Rows(
+    width: Int,
+    height: Int,
+    rowStride: Int,
+    pixelStride: Int,
+    limit: Int,
+    buffer: ByteBuffer,
+    sink: OutputStream
+) {
+    val rowBytes = ByteArray(width * 2)
+    val output = BufferedOutputStream(sink)
+    try {
+        for (y in 0 until height) {
+            val row = y * rowStride
+            var out = 0
+            for (x in 0 until width) {
+                val index = row + x * pixelStride
+                if (index + 1 < limit) {
+                    rowBytes[out++] = buffer.get(index)
+                    rowBytes[out++] = buffer.get(index + 1)
+                } else {
+                    rowBytes[out++] = 0
+                    rowBytes[out++] = 0
+                }
+            }
+            output.write(rowBytes)
+        }
+        output.flush()
+    } finally {
+        // Caller owns sink lifetime; do not close output here.
+    }
 }
 
 /** Exact compact RAW16 payload contract: width * height packed 16-bit samples. */

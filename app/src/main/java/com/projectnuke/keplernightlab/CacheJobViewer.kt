@@ -1135,8 +1135,8 @@ internal fun buildHardwareE2ESnapshot(
                 put("eventCount", it.eventHistory.size)
                 put("requestedFrames", it.finalJob?.requestedFrames ?: 0)
                 put("savedFrames", it.finalJob?.savedFrames ?: 0)
-                put("receivedImages", it.finalJob?.receivedImages ?: 0)
-                put("completedResults", it.finalJob?.completedResults ?: 0)
+                put("receivedImages", it.finalJob?.yuvReceivedFrames ?: it.finalJob?.receivedImages ?: 0)
+                put("completedResults", it.finalJob?.yuvCompletedResults ?: it.finalJob?.completedResults ?: 0)
             })
         }
     }.toString(2)

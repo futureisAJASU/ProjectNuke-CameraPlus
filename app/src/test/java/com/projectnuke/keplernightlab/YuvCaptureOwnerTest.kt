@@ -196,7 +196,7 @@ class YuvCaptureOwnerTest {
                 if (!handler.post(runnable)) runnable.run()
                 true
             },
-            writeJobJson = { status, saved, manifest ->
+            writeJobJson = { status, saved, _, _, _, _, _, _, _, _, _ ->
                 if (metadataFailure) throw IllegalStateException("injected metadata failure")
                 handler.post {
                     persistedFrames.set(saved)
@@ -834,7 +834,7 @@ class YuvCaptureOwnerTest {
                 }
             ),
             dispatchCallback = CallbackDispatcher { false },
-            writeJobJson = { status, _, _ ->
+            writeJobJson = { status, _, _, _, _, _, _, _, _, _, _ ->
                 if (status in setOf("CAPTURE_COMPLETE", "CAPTURE_PARTIAL", "CAPTURE_FAILED", "CAPTURE_TIMEOUT", "CAPTURE_CANCELLED")) {
                     terminalLatch.countDown()
                 }
@@ -907,6 +907,50 @@ class YuvCaptureOwnerTest {
             harness.flushHandler()
             assertEquals(1, harness.onCaptureCompleteCount.get())
             assertEquals(0, harness.onCaptureErrorCount.get())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun yuvWorkerFailure_preservesOriginalCause() {
+        val harness = Harness(frameCount = 2, encodeFailure = true)
+        try {
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(2000L))
+            harness.flushHandler()
+            harness.session.boundedWorker.close()
+            assertTrue(harness.session.boundedWorker.awaitTermination(5_000L))
+            harness.flushHandler()
+            harness.session.owner.onDeadlineReached()
+            val status = harness.awaitTerminal()
+            assertEquals(CaptureTerminalStatus.TIMED_OUT, status)
+            harness.awaitCallback()
+            val snap = harness.session.owner.terminalSnapshotRef()
+            assertTrue("expected at least 1 failed frame but was ${snap.failedFrames}", snap.failedFrames >= 1)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun yuvDeadlineWithWorkerFailures_reportsFailureAccounting() {
+        val harness = Harness(frameCount = 2, encodeFailure = true)
+        try {
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(2000L))
+            harness.flushHandler()
+            harness.session.boundedWorker.close()
+            assertTrue(harness.session.boundedWorker.awaitTermination(5_000L))
+            harness.flushHandler()
+            harness.session.owner.onDeadlineReached()
+            val status = harness.awaitTerminal()
+            assertEquals(CaptureTerminalStatus.TIMED_OUT, status)
+            harness.awaitCallback()
+            val terminalRequest = harness.session.terminalRequestHandoff.awaitPublishedOrClosed(5)
+            assertNotNull(terminalRequest)
+            assertTrue(terminalRequest!!.reason!!.contains("firstWorkerFailure=IllegalStateException: forced encode failure"))
+            assertTrue("reason=${terminalRequest.reason}", terminalRequest.reason!!.contains("failed="))
         } finally {
             harness.shutdown()
         }

@@ -223,11 +223,19 @@ internal class YuvCaptureOwner(
 
     private var completedResults = 0
     private val discardedLateCompletions = mutableListOf<Int>()
+    private var firstWorkerFailure: FirstWorkerFailure? = null
 
     private val terminalSettlementPhaseRef = AtomicReference(TerminalSettlementPhase.ACTIVE)
     private val callbackStateRef = AtomicReference(CallbackState.NOT_REQUESTED)
     private val terminalReasonRef = AtomicReference<String?>(null)
     private val diagnostics = java.util.concurrent.CopyOnWriteArrayList<YuvCaptureDiagnostic>()
+
+    private data class FirstWorkerFailure(
+        val frameIndex: Int,
+        val exceptionClass: String,
+        val exceptionMessage: String?,
+        val cause: Throwable
+    )
 
     // Terminal operation outcomes — never hardcoded null after the operation has run.
     private val metadataWriteOutcomeRef = AtomicReference<TerminalOperationOutcome>(TerminalOperationOutcome.NotRequested)
@@ -584,8 +592,14 @@ internal class YuvCaptureOwner(
             is YuvWorkerCompletion.Success -> adoptSuccess(completion)
             is YuvWorkerCompletion.Failed -> {
                 Log.e("KeplerYuvOwner", "YUV worker failed for frame ${completion.frameIndex}", completion.cause)
-                // Partial candidates (encode failed after creating a file) are settled
-                // through the same candidate path as Success candidates.
+                if (firstWorkerFailure == null) {
+                    firstWorkerFailure = FirstWorkerFailure(
+                        frameIndex = completion.frameIndex,
+                        exceptionClass = completion.cause::class.java.simpleName,
+                        exceptionMessage = completion.cause.message,
+                        cause = completion.cause
+                    )
+                }
                 completion.candidateHandle?.let { handle ->
                     recordCandidateDebt(handle.discardOrQuarantine(candidateFilesystem), handle.frameIndex, handle.file)
                 }
@@ -765,8 +779,21 @@ internal class YuvCaptureOwner(
         val persistedFrames = accounting.snapshot().persistedFrames
         ignoreErrors("capturing status dispatch") { postStatus("YUV capture: saved $persistedFrames/$frameCount") }
         ignoreErrors("capturing metadata write") {
+            val snap = accounting.snapshot()
             sessionTerminal.requestTerminalMetadataWrite(
-                YuvTerminalMetadataRequest("CAPTURING", persistedFrames, accounting.snapshot().manifest)
+                YuvTerminalMetadataRequest(
+                    jobStatus = "CAPTURING",
+                    savedFrames = persistedFrames,
+                    manifest = snap.manifest,
+                    receivedFrames = snap.receivedFrames,
+                    persistedFrames = snap.persistedFrames,
+                    failedFrames = snap.failedFrames,
+                    droppedFrames = snap.droppedFrames,
+                    completedResults = completedResults,
+                    firstWorkerFailureClass = firstWorkerFailure?.exceptionClass,
+                    firstWorkerFailureMessage = firstWorkerFailure?.exceptionMessage,
+                    firstWorkerFailureFrameIndex = firstWorkerFailure?.frameIndex
+                )
             )
         }
     }
@@ -863,7 +890,7 @@ internal class YuvCaptureOwner(
                             settleTerminalByRequest(YuvTerminalRequest(
                                 status = CaptureTerminalStatus.TIMED_OUT,
                                 jobStatus = "CAPTURE_TIMEOUT",
-                                reason = "YUV timeout: saved=${snap.persistedFrames}/$frameCount",
+                                reason = timeoutReason(snap),
                                 completionKind = TerminalCompletionKind.ERROR,
                                 cause = null,
                                 saveMotion = false
@@ -944,7 +971,7 @@ internal class YuvCaptureOwner(
             else -> {
                 status = CaptureTerminalStatus.TIMED_OUT
                 completionKind = TerminalCompletionKind.ERROR
-                reason = "YUV timeout: saved=${snap.persistedFrames}/$frameCount"
+                reason = timeoutReason(snap)
                 saveMotion = false
             }
         }
@@ -966,6 +993,15 @@ internal class YuvCaptureOwner(
                 ),
                 emergency = true
             )
+        }
+    }
+
+    private fun timeoutReason(snap: YuvCaptureAccountingSnapshot): String {
+        val failure = firstWorkerFailure
+        return if (failure != null && snap.failedFrames > 0) {
+            "YUV timeout: saved=${snap.persistedFrames}/$frameCount, failed=${snap.failedFrames}, dropped=${snap.droppedFrames}; firstWorkerFailure=${failure.exceptionClass}: ${failure.exceptionMessage ?: "no message"}"
+        } else {
+            "YUV timeout: saved=${snap.persistedFrames}/$frameCount"
         }
     }
 
@@ -1094,7 +1130,19 @@ internal class YuvCaptureOwner(
             val snap = accounting.snapshot()
             val metadataOutcome = try {
                 sessionTerminal.requestTerminalMetadataWrite(
-                    YuvTerminalMetadataRequest(request.jobStatus, snap.persistedFrames, snap.manifest)
+                    YuvTerminalMetadataRequest(
+                        jobStatus = request.jobStatus,
+                        savedFrames = snap.persistedFrames,
+                        manifest = snap.manifest,
+                        receivedFrames = snap.receivedFrames,
+                        persistedFrames = snap.persistedFrames,
+                        failedFrames = snap.failedFrames,
+                        droppedFrames = snap.droppedFrames,
+                        completedResults = completedResults,
+                        firstWorkerFailureClass = firstWorkerFailure?.exceptionClass,
+                        firstWorkerFailureMessage = firstWorkerFailure?.exceptionMessage,
+                        firstWorkerFailureFrameIndex = firstWorkerFailure?.frameIndex
+                    )
                 )
                 TerminalOperationOutcome.Succeeded
             } catch (failure: java.util.concurrent.CancellationException) {

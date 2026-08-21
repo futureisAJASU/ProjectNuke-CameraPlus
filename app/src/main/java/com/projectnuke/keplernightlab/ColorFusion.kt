@@ -178,7 +178,19 @@ private class ProductionMetadataWriter(
     var templateFallbackUsed: Boolean? = null
     var templateFailures: List<String>? = null
 
-    fun write(status: String, savedFrames: Int, manifest: List<YuvFrameManifestEntry>) {
+    fun write(
+        status: String,
+        savedFrames: Int,
+        manifest: List<YuvFrameManifestEntry>,
+        receivedFrames: Int,
+        persistedFrames: Int,
+        failedFrames: Int,
+        droppedFrames: Int,
+        completedResults: Int,
+        firstWorkerFailureClass: String?,
+        firstWorkerFailureMessage: String?,
+        firstWorkerFailureFrameIndex: Int?
+    ) {
         val actualPhysicalId =
             if (actualRoute == PhysicalCaptureRoute.PHYSICAL.name) requestedPhysicalCameraId else null
         writeColorJobJson(
@@ -222,7 +234,15 @@ private class ProductionMetadataWriter(
             actualRoute = actualRoute,
             requestedPhysicalCameraId = requestedPhysicalCameraId,
             finalRequestZoom = finalRequestZoomSet,
-            requestedZoomRatio = requestedZoomRatio
+            requestedZoomRatio = requestedZoomRatio,
+            yuvReceivedFrames = receivedFrames,
+            yuvPersistedFrames = persistedFrames,
+            yuvFailedFrames = failedFrames,
+            yuvDroppedFrames = droppedFrames,
+            yuvCompletedResults = completedResults,
+            yuvFirstWorkerFailureClass = firstWorkerFailureClass,
+            yuvFirstWorkerFailureMessage = firstWorkerFailureMessage,
+            yuvFirstWorkerFailureFrameIndex = firstWorkerFailureFrameIndex
         )
     }
 }
@@ -617,7 +637,19 @@ fun captureYuvBurstColorWithMotion(
             postStatus = { msg -> productionSeam.statusDispatcher.dispatch(msg) },
                         dispatchCallback = productionSeam.callbackDispatcher,
             terminalMetadataWriter = YuvTerminalMetadataWriter { request ->
-                metadataWriter?.write(request.jobStatus, request.savedFrames, request.manifest)
+                metadataWriter?.write(
+                    status = request.jobStatus,
+                    savedFrames = request.savedFrames,
+                    manifest = request.manifest,
+                    receivedFrames = request.receivedFrames,
+                    persistedFrames = request.persistedFrames,
+                    failedFrames = request.failedFrames,
+                    droppedFrames = request.droppedFrames,
+                    completedResults = request.completedResults,
+                    firstWorkerFailureClass = request.firstWorkerFailureClass,
+                    firstWorkerFailureMessage = request.firstWorkerFailureMessage,
+                    firstWorkerFailureFrameIndex = request.firstWorkerFailureFrameIndex
+                )
             },
             verifiedFileReader = YuvVerifiedFileReader { file ->
                 NoFollowFileSystem.readBytesVerified(file)
@@ -872,7 +904,15 @@ fun captureYuvBurstColorWithMotion(
                                         metadataWriter?.write(
                                             "CAPTURING",
                                             yuvSession?.accounting?.snapshot()?.persistedFrames ?: 0,
-                                            yuvSession?.accounting?.snapshot()?.manifest ?: emptyList()
+                                            yuvSession?.accounting?.snapshot()?.manifest ?: emptyList(),
+                                            yuvSession?.accounting?.snapshot()?.receivedFrames ?: 0,
+                                            yuvSession?.accounting?.snapshot()?.persistedFrames ?: 0,
+                                            yuvSession?.accounting?.snapshot()?.failedFrames ?: 0,
+                                            yuvSession?.accounting?.snapshot()?.droppedFrames ?: 0,
+                                            yuvSession?.owner?.completedResultsCount() ?: 0,
+                                            null,
+                                            null,
+                                            null
                                         )
                                         val requests = List(frameCount) {
                                             val (builder, selectedTemplate) =
@@ -1100,16 +1140,21 @@ private fun writeBitmapToTempPng(bitmap: Bitmap, finalFile: File) {
         finalFile = finalFile,
         writeTemp = { temp ->
             FileOutputStream(temp).use { output ->
-                check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
-                    "Bitmap PNG compression returned false"
-                }
-                output.fd.sync()
+                writePngBitmapToSink(bitmap, output)
             }
         },
         verifyFinal = { committed ->
             verifyPngArtifact(committed)
         }
     )
+}
+
+internal fun writePngBitmapToSink(bitmap: Bitmap, sink: FileOutputStream) {
+    check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, sink)) {
+        "Bitmap PNG compression returned false"
+    }
+    sink.flush()
+    sink.fd.sync()
 }
 
     /*
@@ -1630,7 +1675,15 @@ internal fun writeColorJobJson(
     finalRequestZoom: Float = zoomRatio,
     requestedZoomRatio: Float = zoomRatio,
     activeOperationId: String? = null,
-    activeOperationKind: KeplerActiveOperationKind? = null
+    activeOperationKind: KeplerActiveOperationKind? = null,
+    yuvReceivedFrames: Int? = null,
+    yuvPersistedFrames: Int? = null,
+    yuvFailedFrames: Int? = null,
+    yuvDroppedFrames: Int? = null,
+    yuvCompletedResults: Int? = null,
+    yuvFirstWorkerFailureClass: String? = null,
+    yuvFirstWorkerFailureMessage: String? = null,
+    yuvFirstWorkerFailureFrameIndex: Int? = null
 ) {
     val actualPhysicalCameraId =
         if (actualRoute == PhysicalCaptureRoute.PHYSICAL.name) physicalCameraId else null
@@ -1766,6 +1819,14 @@ internal fun writeColorJobJson(
         .put("rotationDegrees", rotationDegrees)
         .put("requestedFrames", requestedFrames)
         .put("savedFrames", savedFrames)
+        .put("yuvReceivedFrames", yuvReceivedFrames ?: previousJob?.optInt("yuvReceivedFrames") ?: JSONObject.NULL)
+        .put("yuvPersistedFrames", yuvPersistedFrames ?: previousJob?.optInt("yuvPersistedFrames") ?: JSONObject.NULL)
+        .put("yuvFailedFrames", yuvFailedFrames ?: previousJob?.optInt("yuvFailedFrames") ?: JSONObject.NULL)
+        .put("yuvDroppedFrames", yuvDroppedFrames ?: previousJob?.optInt("yuvDroppedFrames") ?: JSONObject.NULL)
+        .put("yuvCompletedResults", yuvCompletedResults ?: previousJob?.optInt("yuvCompletedResults") ?: JSONObject.NULL)
+        .put("yuvFirstWorkerFailureClass", yuvFirstWorkerFailureClass ?: previousJob?.optString("yuvFirstWorkerFailureClass") ?: JSONObject.NULL)
+        .put("yuvFirstWorkerFailureMessage", yuvFirstWorkerFailureMessage ?: previousJob?.optString("yuvFirstWorkerFailureMessage") ?: JSONObject.NULL)
+        .put("yuvFirstWorkerFailureFrameIndex", yuvFirstWorkerFailureFrameIndex ?: previousJob?.optInt("yuvFirstWorkerFailureFrameIndex") ?: JSONObject.NULL)
         .put("yuvMemoryBufferUsed", yuvMemoryBufferUsed)
         .put("yuvMemoryBufferEstimatedBytes", yuvMemoryBufferEstimatedBytes)
         .put("yuvMemoryBufferFrameLimit", MAX_YUV_MEMORY_BUFFER_FRAMES)
