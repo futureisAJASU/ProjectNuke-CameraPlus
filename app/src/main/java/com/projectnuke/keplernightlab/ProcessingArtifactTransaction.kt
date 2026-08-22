@@ -675,16 +675,23 @@ internal fun copyVerifiedArtifact(
     )
 }
 
+internal val PNG_ARTIFACT_SIGNATURE = byteArrayOf(137.toByte(), 80, 78, 71, 13, 10, 26, 10)
+
+// Bounds-only verification contract: with `inJustDecodeBounds = true`,
+// BitmapFactory intentionally performs header parsing without allocating a
+// Bitmap, so a null return value is the EXPECTED result and is never evidence
+// of a decode failure. Failure is proven by the signature fence plus invalid
+// (non-positive) parsed dimensions; no full-size Bitmap is ever allocated.
 internal fun verifyPngArtifact(file: File, expectedWidth: Int? = null, expectedHeight: Int? = null) {
     val prefix = NoFollowFileSystem.digestVerified(file).prefix
-    check(prefix.size >= 8 && prefix.copyOf(8).contentEquals(
-        byteArrayOf(137.toByte(), 80, 78, 71, 13, 10, 26, 10)
-    )) { "Invalid PNG artifact ${file.name}" }
-    val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    check(NoFollowFileSystem.decodeBitmapVerified(file, bounds) != null) {
-        "PNG decode failed ${file.name}"
+    check(prefix.size >= 8 && prefix.copyOf(8).contentEquals(PNG_ARTIFACT_SIGNATURE)) {
+        "Invalid PNG artifact ${file.name}"
     }
-    check(bounds.outWidth > 0 && bounds.outHeight > 0) { "PNG dimensions are invalid" }
+    val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    NoFollowFileSystem.decodeBitmapVerified(file, bounds)
+    check(bounds.outWidth > 0 && bounds.outHeight > 0) {
+        "PNG dimensions are invalid ${file.name}"
+    }
     expectedWidth?.let { check(bounds.outWidth == it) { "PNG width mismatch" } }
     expectedHeight?.let { check(bounds.outHeight == it) { "PNG height mismatch" } }
 }
@@ -695,10 +702,10 @@ internal fun verifyJpegArtifact(file: File, expectedWidth: Int? = null, expected
         "Invalid JPEG artifact ${file.name}"
     }
     val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    check(NoFollowFileSystem.decodeBitmapVerified(file, bounds) != null) {
-        "JPEG decode failed ${file.name}"
+    NoFollowFileSystem.decodeBitmapVerified(file, bounds)
+    check(bounds.outWidth > 0 && bounds.outHeight > 0) {
+        "JPEG dimensions are invalid ${file.name}"
     }
-    check(bounds.outWidth > 0 && bounds.outHeight > 0) { "JPEG dimensions are invalid" }
     expectedWidth?.let { check(bounds.outWidth == it) { "JPEG width mismatch" } }
     expectedHeight?.let { check(bounds.outHeight == it) { "JPEG height mismatch" } }
 }
