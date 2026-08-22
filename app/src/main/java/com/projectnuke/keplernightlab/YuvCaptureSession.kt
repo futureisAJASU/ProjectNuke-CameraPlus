@@ -129,8 +129,14 @@ internal class YuvCaptureSession internal constructor(
                 completedResults: Int,
                 firstWorkerFailureClass: String?,
                 firstWorkerFailureMessage: String?,
-                firstWorkerFailureFrameIndex: Int?
-            ) -> Unit = { _, _, _, _, _, _, _, _, _, _, _ -> },
+                firstWorkerFailureFrameIndex: Int?,
+                firstWorkerFailureRootCauseClass: String?,
+                firstWorkerFailureRootCauseMessage: String?,
+                firstWorkerFailureStage: String?,
+                queuedWork: Int,
+                inFlightWork: Int,
+                pendingCandidateCount: Int
+            ) -> Unit = { _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ -> },
             saveMotionOnce: (File) -> Pair<String?, String?> = { _ -> null to null },
             onCaptureComplete: (File) -> Unit = {},
             onCaptureError: (message: String, cause: Throwable?) -> Unit = { _, _ -> },
@@ -150,7 +156,13 @@ internal class YuvCaptureSession internal constructor(
                         request.completedResults,
                         request.firstWorkerFailureClass,
                         request.firstWorkerFailureMessage,
-                        request.firstWorkerFailureFrameIndex
+                        request.firstWorkerFailureFrameIndex,
+                        request.firstWorkerFailureRootCauseClass,
+                        request.firstWorkerFailureRootCauseMessage,
+                        request.firstWorkerFailureStage,
+                        request.queuedWork,
+                        request.inFlightWork,
+                        request.pendingCandidateCount
                     )
                 },
             verifiedFileReader: YuvVerifiedFileReader =

@@ -644,11 +644,12 @@ if (reusable != null) {
                 role = MediaStoreExportRole.RAW_DNG_SIDECAR,
                 frameIndex = frame.frameIndex,
                 expectedSizeBytes = sourceDigest.size,
-                expectedSha256 = sourceDigest.sha256
-                ,ownerOperationId = ownerOperationId
-            ) { output ->
-                copiedDigest = NoFollowFileSystem.copyVerified(file, output)
-            } ?: run {
+                expectedSha256 = sourceDigest.sha256,
+                ownerOperationId = ownerOperationId,
+                writer = { output ->
+                    copiedDigest = NoFollowFileSystem.copyVerified(file, output)
+                }
+            ) ?: run {
                 cancellation.throwIfCancelled()
                 insertPublicFile(
                     context = context,
@@ -661,11 +662,12 @@ if (reusable != null) {
                     role = MediaStoreExportRole.RAW_DNG_SIDECAR,
                     frameIndex = frame.frameIndex,
                     expectedSizeBytes = sourceDigest.size,
-                    expectedSha256 = sourceDigest.sha256
-                    ,ownerOperationId = ownerOperationId
-                ) { output ->
-                    copiedDigest = NoFollowFileSystem.copyVerified(file, output)
-                }
+                    expectedSha256 = sourceDigest.sha256,
+                    ownerOperationId = ownerOperationId,
+                    writer = { output ->
+                        copiedDigest = NoFollowFileSystem.copyVerified(file, output)
+                    }
+                )
             }
 
 if (result == null) {
@@ -2109,6 +2111,7 @@ private fun writeGalleryBitmap(
     jobDir: File?,
     ownerOperationId: String? = null
 ): GalleryExportResult {
+    var insertFailure: Throwable? = null
     val inserted = insertPublicFile(
         context = context,
         displayName = displayName,
@@ -2120,24 +2123,44 @@ private fun writeGalleryBitmap(
         role = MediaStoreExportRole.MAIN_IMAGE,
         expectedWidth = bitmap.width,
         expectedHeight = bitmap.height,
-        ownerOperationId = ownerOperationId
-    ) { output ->
-        val ok = when (format) {
-            OutputFormat.HEIF -> writeHeifViaTempFile(context, bitmap, quality, output)
-            OutputFormat.JPEG -> bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)
-            OutputFormat.PNG -> bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+        ownerOperationId = ownerOperationId,
+        writer = { output ->
+            val ok = when (format) {
+                OutputFormat.HEIF -> writeHeifViaTempFile(context, bitmap, quality, output)
+                OutputFormat.JPEG -> bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)
+                OutputFormat.PNG -> bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+            }
+            if (!ok) error("${format.label} encode returned false")
+        },
+        onFailure = { insertFailure = it }
+    ).also { result ->
+        if (result == null) {
+            val failure = insertFailure
+            if (failure != null) {
+                Log.w("KeplerGalleryExporter", "MediaStore insert/write failed for $displayName: ${failure::class.java.simpleName}: ${failure.message}", failure)
+            }
         }
-        if (!ok) error("${format.label} encode returned false")
-    } ?: return GalleryExportResult(
-        success = false,
-        uriString = null,
-        displayName = displayName,
-        mimeType = format.mimeType,
-        fileSizeBytes = 0L,
-        formatUsed = format,
-        fallbackUsed = fallbackUsed,
-        errorMessage = "MediaStore insert/write failed"
-    )
+    }
+
+    if (inserted == null) {
+        val failure = insertFailure
+        val errorMessage = if (failure != null) {
+            "${failure::class.java.simpleName}: ${failure.message ?: "no message"}"
+        } else {
+            "MediaStore insert/write failed"
+        }
+        return GalleryExportResult(
+            success = false,
+            uriString = null,
+            displayName = displayName,
+            mimeType = format.mimeType,
+            fileSizeBytes = 0L,
+            formatUsed = format,
+            fallbackUsed = fallbackUsed,
+            errorMessage = errorMessage,
+            candidateFailureReasons = listOf(errorMessage)
+        )
+    }
 
     if (inserted.commitState == GalleryExportCommitState.UNKNOWN) {
         return GalleryExportResult(
@@ -2309,7 +2332,8 @@ private fun insertPublicFile(
     expectedWidth: Int? = null,
     expectedHeight: Int? = null,
     ownerOperationId: String? = null,
-    writer: (OutputStream) -> Unit
+    writer: (OutputStream) -> Unit,
+    onFailure: ((Throwable) -> Unit)? = null
 ): InsertedPublicFile? {
     val resolver = context.contentResolver
     val values = ContentValues().apply {
@@ -2486,6 +2510,7 @@ private fun insertPublicFile(
         }
         val combined = combineSettlementFailure(error, cleanupFailure)
         if (combined is Error || combined is CancellationException) throw requireNotNull(combined)
+        onFailure?.invoke(requireNotNull(combined))
         null
     }
 }

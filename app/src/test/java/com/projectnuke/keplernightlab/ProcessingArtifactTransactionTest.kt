@@ -4,6 +4,7 @@ import java.io.File
 import java.nio.file.Files
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -1056,6 +1057,126 @@ class ProcessingArtifactTransactionTest {
             assertEquals("prior", finalFile.readText())
         } finally {
             processingArtifactDeleteErrorForTest = null
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun writeTempFailureRecordsTempWriteStage() {
+        val dir = Files.createTempDirectory("processing-artifact-stage").toFile()
+        try {
+            val finalFile = File(dir, "result.bin")
+            var thrown: ProcessingArtifactException? = null
+            try {
+                commitProcessingArtifact(
+                    finalFile,
+                    writeTemp = { error("writer failed") },
+                    verifyFinal = {}
+                )
+            } catch (failure: ProcessingArtifactException) {
+                thrown = failure
+            }
+            assertNotNull(thrown)
+            assertEquals(ProcessingArtifactFailureStage.TEMP_WRITE, thrown!!.failureStage)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun verifyTempFailureRecordsTempVerifyStage() {
+        val dir = Files.createTempDirectory("processing-artifact-verify-stage").toFile()
+        try {
+            val finalFile = File(dir, "result.bin")
+            var thrown: ProcessingArtifactException? = null
+            try {
+                commitProcessingArtifact(
+                    finalFile,
+                    writeTemp = { it.writeBytes("ok".toByteArray()) },
+                    verifyFinal = { error("verify failed") }
+                )
+            } catch (failure: ProcessingArtifactException) {
+                thrown = failure
+            }
+            assertNotNull(thrown)
+            assertEquals(ProcessingArtifactFailureStage.TEMP_VERIFY, thrown!!.failureStage)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun verifyFinalFailureRecordsFinalVerifyStage() {
+        val dir = Files.createTempDirectory("processing-artifact-final-verify-stage").toFile()
+        try {
+            val finalFile = File(dir, "result.bin").apply { writeBytes("prior".toByteArray()) }
+            var thrown: ProcessingArtifactException? = null
+            try {
+                commitProcessingArtifact(
+                    finalFile,
+                    writeTemp = { it.writeBytes("new".toByteArray()) },
+                    verifyFinal = { committed ->
+                        if (committed == finalFile && committed.readText() == "new") error("final verify failed")
+                    }
+                )
+            } catch (failure: ProcessingArtifactException) {
+                thrown = failure
+            }
+            assertNotNull(thrown)
+            assertEquals(ProcessingArtifactFailureStage.FINAL_VERIFY, thrown!!.failureStage)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun adoptedCleanupFailurePropagatesAndPreservesFinalFile() {
+        val dir = Files.createTempDirectory("processing-artifact-adopt-cleanup").toFile()
+        try {
+            val finalFile = File(dir, "result.bin").apply { writeBytes("prior".toByteArray()) }
+            val fatal = AssertionError("adopted cleanup failed")
+            processingArtifactDeleteErrorForTest = fatal
+            var thrown: AssertionError? = null
+            try {
+                commitProcessingArtifact(
+                    finalFile,
+                    writeTemp = { it.writeBytes("new".toByteArray()) },
+                    verifyFinal = { committed ->
+                        check(committed.readText() == "new")
+                    }
+                )
+            } catch (failure: AssertionError) {
+                thrown = failure
+            } finally {
+                processingArtifactDeleteErrorForTest = null
+            }
+            assertNotNull(thrown)
+            assertSame(fatal, thrown)
+            assertEquals("new", finalFile.readText())
+            assertTrue(ProcessingArtifactJournal.list(dir).isNotEmpty())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun rollbackFailureRecordsRollbackStage() {
+        val dir = Files.createTempDirectory("processing-artifact-rollback-stage").toFile()
+        try {
+            val finalFile = File(dir, "result.bin").apply { writeBytes("prior".toByteArray()) }
+            var thrown: ProcessingArtifactException? = null
+            try {
+                commitProcessingArtifact(
+                    finalFile,
+                    writeTemp = { it.writeBytes("new".toByteArray()) },
+                    verifyFinal = { error("verify failed") }
+                )
+            } catch (failure: ProcessingArtifactException) {
+                thrown = failure
+            }
+            assertNotNull(thrown)
+            assertEquals(ProcessingArtifactFailureStage.TEMP_VERIFY, thrown!!.failureStage)
+        } finally {
             dir.deleteRecursively()
         }
     }

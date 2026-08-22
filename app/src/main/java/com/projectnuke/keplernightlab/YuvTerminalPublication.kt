@@ -143,7 +143,13 @@ internal data class YuvTerminalMetadataRequest(
     val completedResults: Int,
     val firstWorkerFailureClass: String?,
     val firstWorkerFailureMessage: String?,
-    val firstWorkerFailureFrameIndex: Int?
+    val firstWorkerFailureFrameIndex: Int?,
+    val firstWorkerFailureRootCauseClass: String? = null,
+    val firstWorkerFailureRootCauseMessage: String? = null,
+    val firstWorkerFailureStage: String? = null,
+    val queuedWork: Int = 0,
+    val inFlightWork: Int = 0,
+    val pendingCandidateCount: Int = 0
 )
 
 /**

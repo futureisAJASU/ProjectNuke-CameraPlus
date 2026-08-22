@@ -130,7 +130,7 @@ class YuvProductionLifecycleTest {
                 handler.post { runnable.run() }
                 true
             },
-            writeJobJson = { status, _, _, _, _, _, _, _, _, _, _ ->
+            writeJobJson = { status, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ ->
                 handler.post {
                     if (status in TERMINAL_JOB_STATUSES) terminalLatch.countDown()
                 }

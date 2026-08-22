@@ -196,7 +196,7 @@ class YuvCaptureOwnerTest {
                 if (!handler.post(runnable)) runnable.run()
                 true
             },
-            writeJobJson = { status, saved, _, _, _, _, _, _, _, _, _ ->
+            writeJobJson = { status, saved, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ ->
                 if (metadataFailure) throw IllegalStateException("injected metadata failure")
                 handler.post {
                     persistedFrames.set(saved)
@@ -834,7 +834,7 @@ class YuvCaptureOwnerTest {
                 }
             ),
             dispatchCallback = CallbackDispatcher { false },
-            writeJobJson = { status, _, _, _, _, _, _, _, _, _, _ ->
+            writeJobJson = { status, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ ->
                 if (status in setOf("CAPTURE_COMPLETE", "CAPTURE_PARTIAL", "CAPTURE_FAILED", "CAPTURE_TIMEOUT", "CAPTURE_CANCELLED")) {
                     terminalLatch.countDown()
                 }

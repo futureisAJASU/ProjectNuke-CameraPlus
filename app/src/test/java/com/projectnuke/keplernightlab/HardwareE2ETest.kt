@@ -419,7 +419,19 @@ class HardwareE2ETest {
             yuvCompletedResults = 4,
             yuvFirstWorkerFailureClass = null,
             yuvFirstWorkerFailureMessage = null,
-            yuvFirstWorkerFailureFrameIndex = null
+            yuvFirstWorkerFailureFrameIndex = null,
+            yuvFirstWorkerFailureRootCauseClass = "SyncFailedException",
+            yuvFirstWorkerFailureRootCauseMessage = "sync failed",
+            yuvFirstWorkerFailureStage = "TEMP_VERIFY",
+            yuvQueuedWork = 0,
+            yuvInFlightWork = 0,
+            yuvPendingCandidateCount = 0,
+            rawPublicExportAttemptStatus = "FAILED",
+            rawPublicExportAttemptError = "IllegalStateException: HEIF writer failed",
+            rawPublicExportAttemptAt = 1_000L,
+            processingArtifactJournalCount = 0,
+            processingArtifactJournalStates = emptyList(),
+            processingArtifactJournalFinalNames = emptyList()
         )
         val decoded = HardwareE2EJobSummary.fromJson(summary.toJson())
         assertEquals(summary, decoded)
@@ -468,6 +480,15 @@ class HardwareE2ETest {
             .put("yuvFirstWorkerFailureClass", JSONObject.NULL)
             .put("yuvFirstWorkerFailureMessage", JSONObject.NULL)
             .put("yuvFirstWorkerFailureFrameIndex", JSONObject.NULL)
+            .put("yuvFirstWorkerFailureRootCauseClass", JSONObject.NULL)
+            .put("yuvFirstWorkerFailureRootCauseMessage", JSONObject.NULL)
+            .put("yuvFirstWorkerFailureStage", JSONObject.NULL)
+            .put("yuvQueuedWork", JSONObject.NULL)
+            .put("yuvInFlightWork", JSONObject.NULL)
+            .put("yuvPendingCandidateCount", JSONObject.NULL)
+            .put("rawPublicExportAttemptStatus", JSONObject.NULL)
+            .put("rawPublicExportAttemptError", JSONObject.NULL)
+            .put("rawPublicExportAttemptAt", JSONObject.NULL)
 
         val summary = HardwareE2EJobSummary.fromJson(json)
         assertNull(summary.yuvReceivedFrames)
@@ -478,6 +499,15 @@ class HardwareE2ETest {
         assertNull(summary.yuvFirstWorkerFailureClass)
         assertNull(summary.yuvFirstWorkerFailureMessage)
         assertNull(summary.yuvFirstWorkerFailureFrameIndex)
+        assertNull(summary.yuvFirstWorkerFailureRootCauseClass)
+        assertNull(summary.yuvFirstWorkerFailureRootCauseMessage)
+        assertNull(summary.yuvFirstWorkerFailureStage)
+        assertNull(summary.yuvQueuedWork)
+        assertNull(summary.yuvInFlightWork)
+        assertNull(summary.yuvPendingCandidateCount)
+        assertNull(summary.rawPublicExportAttemptStatus)
+        assertNull(summary.rawPublicExportAttemptError)
+        assertNull(summary.rawPublicExportAttemptAt)
     }
 
     @Test
@@ -523,6 +553,15 @@ class HardwareE2ETest {
             .put("yuvFirstWorkerFailureClass", JSONObject.NULL)
             .put("yuvFirstWorkerFailureMessage", JSONObject.NULL)
             .put("yuvFirstWorkerFailureFrameIndex", 0)
+            .put("yuvFirstWorkerFailureRootCauseClass", JSONObject.NULL)
+            .put("yuvFirstWorkerFailureRootCauseMessage", JSONObject.NULL)
+            .put("yuvFirstWorkerFailureStage", JSONObject.NULL)
+            .put("yuvQueuedWork", 0)
+            .put("yuvInFlightWork", 0)
+            .put("yuvPendingCandidateCount", 0)
+            .put("rawPublicExportAttemptStatus", JSONObject.NULL)
+            .put("rawPublicExportAttemptError", JSONObject.NULL)
+            .put("rawPublicExportAttemptAt", JSONObject.NULL)
 
         val summary = HardwareE2EJobSummary.fromJson(json)
         assertEquals(0, summary.yuvReceivedFrames)
@@ -533,6 +572,15 @@ class HardwareE2ETest {
         assertNull(summary.yuvFirstWorkerFailureClass)
         assertNull(summary.yuvFirstWorkerFailureMessage)
         assertEquals(0, summary.yuvFirstWorkerFailureFrameIndex)
+        assertNull(summary.yuvFirstWorkerFailureRootCauseClass)
+        assertNull(summary.yuvFirstWorkerFailureRootCauseMessage)
+        assertNull(summary.yuvFirstWorkerFailureStage)
+        assertEquals(0, summary.yuvQueuedWork)
+        assertEquals(0, summary.yuvInFlightWork)
+        assertEquals(0, summary.yuvPendingCandidateCount)
+        assertNull(summary.rawPublicExportAttemptStatus)
+        assertNull(summary.rawPublicExportAttemptError)
+        assertNull(summary.rawPublicExportAttemptAt)
     }
 
     private fun successEvent() = CameraPipelineEvent.Terminal(

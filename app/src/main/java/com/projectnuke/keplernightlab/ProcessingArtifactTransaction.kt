@@ -18,6 +18,18 @@ internal var processingArtifactCrashAfterMoveIntentForTest: Boolean = false
 @Volatile
 internal var processingArtifactCrashAfterMoveForTest: Boolean = false
 
+internal enum class ProcessingArtifactFailureStage {
+    PLANNED,
+    TEMP_WRITE,
+    TEMP_VERIFY,
+    PRIOR_BACKUP,
+    FINAL_MOVE,
+    FINAL_VERIFY,
+    ADOPTION,
+    POST_ADOPT_CLEANUP,
+    ROLLBACK
+}
+
 internal enum class ProcessingArtifactState {
     PLANNED,
     TEMP_OWNED,
@@ -100,7 +112,8 @@ internal class ProcessingArtifactException(
     val cleanupFailure: Throwable?,
     cause: Throwable,
     val settlements: List<ProcessingArtifactSettlementRecord> = emptyList(),
-    val priorBackupFile: File? = null
+    val priorBackupFile: File? = null,
+    val failureStage: ProcessingArtifactFailureStage = ProcessingArtifactFailureStage.PLANNED
 ) : IllegalStateException("Processing artifact transaction failed for ${finalFile.absolutePath}", cause)
 
 private fun existingRegularArtifact(file: File): Boolean {
@@ -185,6 +198,7 @@ internal fun commitProcessingArtifact(
     var newFinalCommitted = false
     var priorRestored = false
     var finalAdopted = false
+    var failureStage = ProcessingArtifactFailureStage.PLANNED
     var journal = ProcessingArtifactJournal.create(
         jobDir = parent,
         transactionId = UUID.randomUUID().toString(),
@@ -234,9 +248,11 @@ internal fun commitProcessingArtifact(
         checkCancelled()
         check(!Files.exists(temp.toPath(), LinkOption.NOFOLLOW_LINKS)) { "Artifact temp already exists" }
         state = ProcessingArtifactState.TEMP_OWNED
+        failureStage = ProcessingArtifactFailureStage.TEMP_WRITE
         writeTemp(temp)
         journalTransition(ProcessingArtifactJournalState.TEMP_WRITTEN)
         check(Files.isRegularFile(temp.toPath(), LinkOption.NOFOLLOW_LINKS) && temp.length() > 0L) { "Artifact temp verification failed" }
+        failureStage = ProcessingArtifactFailureStage.TEMP_VERIFY
         verifyFinal(temp)
         val tempEvidence = NoFollowFileSystem.digestVerified(temp)
         state = ProcessingArtifactState.TEMP_VERIFIED
@@ -244,6 +260,7 @@ internal fun commitProcessingArtifact(
         checkCancelled()
 
         if (existingRegularArtifact(finalFile)) {
+            failureStage = ProcessingArtifactFailureStage.PRIOR_BACKUP
             val priorEvidence = NoFollowFileSystem.digestVerified(finalFile)
             val priorSemanticEvidence = try {
                 verifyFinal(finalFile)
@@ -266,6 +283,7 @@ internal fun commitProcessingArtifact(
         }
 
         checkCancelled()
+        failureStage = ProcessingArtifactFailureStage.FINAL_MOVE
         journalTransition(ProcessingArtifactJournalState.NEW_FINAL_MOVE_STARTED)
         if (processingArtifactCrashAfterMoveIntentForTest) throw ProcessingArtifactSimulatedCrashForTest()
         move(temp, finalFile)
@@ -276,6 +294,7 @@ internal fun commitProcessingArtifact(
 
         // Once commit begins, cancellation cannot interrupt ownership. Verify
         // the actual final pathname and either adopt it or roll back safely.
+        failureStage = ProcessingArtifactFailureStage.FINAL_VERIFY
         verifyFinal(finalFile)
         state = ProcessingArtifactState.FINAL_VERIFIED
         journalTransition(ProcessingArtifactJournalState.NEW_FINAL_VERIFIED)
@@ -286,6 +305,7 @@ internal fun commitProcessingArtifact(
         )
         state = ProcessingArtifactState.ADOPTED
         finalAdopted = true
+        failureStage = ProcessingArtifactFailureStage.ADOPTION
         journalTransition(ProcessingArtifactJournalState.ADOPTED, adoptedResult = "NEW_FINAL", claimKey = claimKey)
 
         if (priorBackedUp) {
@@ -324,10 +344,12 @@ internal fun commitProcessingArtifact(
         return result
     } catch (failure: Throwable) {
         if (failure is ProcessingArtifactSimulatedCrashForTest) throw failure
+        val capturedFailureStage = failureStage
         // ADOPTED is a durable ownership boundary.  Optional cleanup or
         // settlement failures after it must retain the current final and the
         // journal evidence; this is not a rollback cut.
         if (finalAdopted) {
+            failureStage = ProcessingArtifactFailureStage.POST_ADOPT_CLEANUP
             val adoptedCleanup = mutableListOf<ProcessingArtifactSettlementRecord>()
             var fatalAdoptedCleanupFailure: Error? = null
             var cancellationAdoptedCleanupFailure: CancellationException? = null
@@ -373,9 +395,11 @@ internal fun commitProcessingArtifact(
                 cleanupFailure = adoptedCleanupFailure,
                 cause = failure,
                 settlements = adoptedSettlements,
-                priorBackupFile = priorBackup.takeIf { priorBackedUp && it.exists() }
+                priorBackupFile = priorBackup.takeIf { priorBackedUp && it.exists() },
+                failureStage = capturedFailureStage
             )
         }
+        failureStage = ProcessingArtifactFailureStage.ROLLBACK
         var rollbackSecondaryFailure: Throwable? = null
         fun captureRollbackFailure(secondary: Throwable) {
             if (secondary === failure) return
@@ -501,7 +525,8 @@ internal fun commitProcessingArtifact(
             cleanupFailure = rollbackFailure,
             cause = failure,
             settlements = allSettlements,
-            priorBackupFile = priorBackup.takeIf { priorBackedUp && it.exists() }
+            priorBackupFile = priorBackup.takeIf { priorBackedUp && it.exists() },
+            failureStage = capturedFailureStage
         )
     }
 }

@@ -11,6 +11,17 @@ private inline fun ignoreErrors(label: String, block: () -> Unit) {
     try { block() } catch (_: Exception) { }
 }
 
+private fun rootCauseOf(throwable: Throwable): Throwable {
+    var current = throwable
+    val visited = mutableSetOf<Throwable>()
+    while (true) {
+        if (!visited.add(current)) break
+        val next = current.cause ?: break
+        current = next
+    }
+    return current
+}
+
 /**
  * Immutable worker completion result.  The worker never mutates owner state; it only
  * encodes a temporary candidate and returns this result for owner-side adoption.
@@ -234,6 +245,9 @@ internal class YuvCaptureOwner(
         val frameIndex: Int,
         val exceptionClass: String,
         val exceptionMessage: String?,
+        val rootCauseClass: String,
+        val rootCauseMessage: String?,
+        val failureStage: String? = null,
         val cause: Throwable
     )
 
@@ -593,10 +607,15 @@ internal class YuvCaptureOwner(
             is YuvWorkerCompletion.Failed -> {
                 Log.e("KeplerYuvOwner", "YUV worker failed for frame ${completion.frameIndex}", completion.cause)
                 if (firstWorkerFailure == null) {
+                    val rootCause = rootCauseOf(completion.cause)
+                    val artifactException = completion.cause as? ProcessingArtifactException
                     firstWorkerFailure = FirstWorkerFailure(
                         frameIndex = completion.frameIndex,
                         exceptionClass = completion.cause::class.java.simpleName,
                         exceptionMessage = completion.cause.message,
+                        rootCauseClass = rootCause::class.java.simpleName,
+                        rootCauseMessage = rootCause.message,
+                        failureStage = artifactException?.failureStage?.name,
                         cause = completion.cause
                     )
                 }
@@ -999,7 +1018,10 @@ internal class YuvCaptureOwner(
     private fun timeoutReason(snap: YuvCaptureAccountingSnapshot): String {
         val failure = firstWorkerFailure
         return if (failure != null && snap.failedFrames > 0) {
-            "YUV timeout: saved=${snap.persistedFrames}/$frameCount, failed=${snap.failedFrames}, dropped=${snap.droppedFrames}; firstWorkerFailure=${failure.exceptionClass}: ${failure.exceptionMessage ?: "no message"}"
+            val stage = failure.failureStage?.let { " stage=$it" } ?: ""
+            "YUV timeout: saved=${snap.persistedFrames}/$frameCount, failed=${snap.failedFrames}, dropped=${snap.droppedFrames}; " +
+                "firstWorkerFailure=${failure.exceptionClass}: ${failure.exceptionMessage ?: "no message"}; " +
+                "rootCause=${failure.rootCauseClass}: ${failure.rootCauseMessage ?: "no message"}$stage"
         } else {
             "YUV timeout: saved=${snap.persistedFrames}/$frameCount"
         }
@@ -1141,7 +1163,13 @@ internal class YuvCaptureOwner(
                         completedResults = completedResults,
                         firstWorkerFailureClass = firstWorkerFailure?.exceptionClass,
                         firstWorkerFailureMessage = firstWorkerFailure?.exceptionMessage,
-                        firstWorkerFailureFrameIndex = firstWorkerFailure?.frameIndex
+                        firstWorkerFailureFrameIndex = firstWorkerFailure?.frameIndex,
+                        firstWorkerFailureRootCauseClass = firstWorkerFailure?.rootCauseClass,
+                        firstWorkerFailureRootCauseMessage = firstWorkerFailure?.rootCauseMessage,
+                        firstWorkerFailureStage = firstWorkerFailure?.failureStage,
+                        queuedWork = boundedWorker.queuedCount(),
+                        inFlightWork = boundedWorker.activeCount(),
+                        pendingCandidateCount = snap.bufferedFrames
                     )
                 )
                 TerminalOperationOutcome.Succeeded

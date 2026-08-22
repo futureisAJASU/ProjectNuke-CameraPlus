@@ -189,7 +189,13 @@ private class ProductionMetadataWriter(
         completedResults: Int,
         firstWorkerFailureClass: String?,
         firstWorkerFailureMessage: String?,
-        firstWorkerFailureFrameIndex: Int?
+        firstWorkerFailureFrameIndex: Int?,
+        firstWorkerFailureRootCauseClass: String? = null,
+        firstWorkerFailureRootCauseMessage: String? = null,
+        firstWorkerFailureStage: String? = null,
+        queuedWork: Int = 0,
+        inFlightWork: Int = 0,
+        pendingCandidateCount: Int = 0
     ) {
         val actualPhysicalId =
             if (actualRoute == PhysicalCaptureRoute.PHYSICAL.name) requestedPhysicalCameraId else null
@@ -242,7 +248,13 @@ private class ProductionMetadataWriter(
             yuvCompletedResults = completedResults,
             yuvFirstWorkerFailureClass = firstWorkerFailureClass,
             yuvFirstWorkerFailureMessage = firstWorkerFailureMessage,
-            yuvFirstWorkerFailureFrameIndex = firstWorkerFailureFrameIndex
+            yuvFirstWorkerFailureFrameIndex = firstWorkerFailureFrameIndex,
+            yuvFirstWorkerFailureRootCauseClass = firstWorkerFailureRootCauseClass,
+            yuvFirstWorkerFailureRootCauseMessage = firstWorkerFailureRootCauseMessage,
+            yuvFirstWorkerFailureStage = firstWorkerFailureStage,
+            yuvQueuedWork = queuedWork,
+            yuvInFlightWork = inFlightWork,
+            yuvPendingCandidateCount = pendingCandidateCount
         )
     }
 }
@@ -648,7 +660,13 @@ fun captureYuvBurstColorWithMotion(
                     completedResults = request.completedResults,
                     firstWorkerFailureClass = request.firstWorkerFailureClass,
                     firstWorkerFailureMessage = request.firstWorkerFailureMessage,
-                    firstWorkerFailureFrameIndex = request.firstWorkerFailureFrameIndex
+                    firstWorkerFailureFrameIndex = request.firstWorkerFailureFrameIndex,
+                    firstWorkerFailureRootCauseClass = request.firstWorkerFailureRootCauseClass,
+                    firstWorkerFailureRootCauseMessage = request.firstWorkerFailureRootCauseMessage,
+                    firstWorkerFailureStage = request.firstWorkerFailureStage,
+                    queuedWork = request.queuedWork,
+                    inFlightWork = request.inFlightWork,
+                    pendingCandidateCount = request.pendingCandidateCount
                 )
             },
             verifiedFileReader = YuvVerifiedFileReader { file ->
@@ -1683,7 +1701,13 @@ internal fun writeColorJobJson(
     yuvCompletedResults: Int? = null,
     yuvFirstWorkerFailureClass: String? = null,
     yuvFirstWorkerFailureMessage: String? = null,
-    yuvFirstWorkerFailureFrameIndex: Int? = null
+    yuvFirstWorkerFailureFrameIndex: Int? = null,
+    yuvFirstWorkerFailureRootCauseClass: String? = null,
+    yuvFirstWorkerFailureRootCauseMessage: String? = null,
+    yuvFirstWorkerFailureStage: String? = null,
+    yuvQueuedWork: Int = 0,
+    yuvInFlightWork: Int = 0,
+    yuvPendingCandidateCount: Int = 0
 ) {
     val actualPhysicalCameraId =
         if (actualRoute == PhysicalCaptureRoute.PHYSICAL.name) physicalCameraId else null
@@ -1827,6 +1851,12 @@ internal fun writeColorJobJson(
         .put("yuvFirstWorkerFailureClass", yuvFirstWorkerFailureClass ?: previousJob?.optString("yuvFirstWorkerFailureClass") ?: JSONObject.NULL)
         .put("yuvFirstWorkerFailureMessage", yuvFirstWorkerFailureMessage ?: previousJob?.optString("yuvFirstWorkerFailureMessage") ?: JSONObject.NULL)
         .put("yuvFirstWorkerFailureFrameIndex", yuvFirstWorkerFailureFrameIndex ?: previousJob?.optInt("yuvFirstWorkerFailureFrameIndex") ?: JSONObject.NULL)
+        .put("yuvFirstWorkerFailureRootCauseClass", yuvFirstWorkerFailureRootCauseClass ?: previousJob?.optString("yuvFirstWorkerFailureRootCauseClass") ?: JSONObject.NULL)
+        .put("yuvFirstWorkerFailureRootCauseMessage", yuvFirstWorkerFailureRootCauseMessage ?: previousJob?.optString("yuvFirstWorkerFailureRootCauseMessage") ?: JSONObject.NULL)
+        .put("yuvFirstWorkerFailureStage", yuvFirstWorkerFailureStage ?: previousJob?.optString("yuvFirstWorkerFailureStage") ?: JSONObject.NULL)
+        .put("yuvQueuedWork", yuvQueuedWork)
+        .put("yuvInFlightWork", yuvInFlightWork)
+        .put("yuvPendingCandidateCount", yuvPendingCandidateCount)
         .put("yuvMemoryBufferUsed", yuvMemoryBufferUsed)
         .put("yuvMemoryBufferEstimatedBytes", yuvMemoryBufferEstimatedBytes)
         .put("yuvMemoryBufferFrameLimit", MAX_YUV_MEMORY_BUFFER_FRAMES)

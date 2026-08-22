@@ -167,7 +167,7 @@ class YuvAdoptionFilesystemTest {
                 }
             ),
             dispatchCallback = CallbackDispatcher { runnable -> if (!handler.post(runnable)) runnable.run(); true },
-            writeJobJson = { status, _, _, _, _, _, _, _, _, _, _ ->
+            writeJobJson = { status, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ ->
                 if (status in TERMINAL_JOB_STATUSES) terminalLatch.countDown()
             },
             onCaptureError = { msg, _ ->
