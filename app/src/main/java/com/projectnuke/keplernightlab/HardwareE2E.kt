@@ -573,19 +573,21 @@ internal class HardwareE2ERunRecorder private constructor(
     private val writer: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "KeplerHardwareE2ERecorder").apply { isDaemon = true }
     }
+
+    // Phase 7E: multiple pipeline lifetimes may overlap once capture admission
+    // frees at durable handoff. Runs are tracked individually; events route to
+    // their own run through the pipeline generation, and an exact job directory
+    // bound at CaptureStageComplete pins terminal correlation even when newer
+    // foreground captures have started.
     private var current: HardwareE2ERunReport? = null
+    private val runsByRunId = LinkedHashMap<String, HardwareE2ERunReport>()
+    private val runIdByGeneration = HashMap<Long, String>()
+    private val baselinesByRunId = HashMap<String, Set<String>>()
+    private val baselineFailuresByRunId = HashMap<String, String?>()
     private var startedAtNanos: Long = 0L
-    private var baselineJobPaths: Set<String> = emptySet()
-    private var baselineSnapshotFailure: String? = null
 
     fun start(scenario: HardwareE2ERunScenario): String? {
         if (!enabled) return null
-        synchronized(lock) {
-            current?.takeIf {
-                (it.terminalEvent == null && it.status == HardwareE2EClassification.INCOMPLETE) ||
-                    (it.terminalEvent != null && it.finalJob == null && it.failure == null)
-            }?.let { return null }
-        }
         val now = System.currentTimeMillis()
         val runId = UUID.randomUUID().toString()
         val baseline = runCatching { jobFinder().map(File::getAbsolutePath).toSet() }
@@ -617,10 +619,11 @@ internal class HardwareE2ERunRecorder private constructor(
             }
         )
         synchronized(lock) {
+            runsByRunId[runId] = report
+            baselinesByRunId[runId] = baseline.getOrDefault(emptySet())
+            baselineFailuresByRunId[runId] = baseline.exceptionOrNull()?.message
             current = report
             startedAtNanos = System.nanoTime()
-            baselineJobPaths = baseline.getOrDefault(emptySet())
-            baselineSnapshotFailure = baseline.exceptionOrNull()?.message
         }
         recordCheckpoint("RUN_STARTED", null, null)
         return runId
@@ -640,6 +643,13 @@ internal class HardwareE2ERunRecorder private constructor(
                 CameraPipelineEvent.Terminal.Kind.CANCELLED -> "TERMINAL_CANCELLED"
             }
         }
+        val targetRunId = synchronized(lock) {
+            when {
+                event.generation != 0L -> runIdByGeneration[event.generation]
+                    ?: current?.runId?.also { runIdByGeneration[event.generation] = it }
+                else -> current?.runId
+            }
+        } ?: return
         val record = HardwareE2EEventRecord(
             checkpoint = checkpoint,
             eventType = event.javaClass.simpleName,
@@ -657,7 +667,7 @@ internal class HardwareE2ERunRecorder private constructor(
             verified = (event as? CameraPipelineEvent.Terminal)?.verified == true,
             captureResourcesSettled = (event as? CameraPipelineEvent.Terminal)?.captureResourcesSettled ?: true
         )
-        mutate { report ->
+        mutateRun(targetRunId) { report ->
             val nextCounts = report.progressCounts.toMutableMap()
             nextCounts[checkpoint] = (nextCounts[checkpoint] ?: 0) + 1
             report.copy(
@@ -672,6 +682,8 @@ internal class HardwareE2ERunRecorder private constructor(
                         "captureResourcesSettled" to event.captureResourcesSettled
                     )
                 } else report.terminalFlags,
+                latestJobDirectory = (event as? CameraPipelineEvent.CaptureStageComplete)
+                    ?.jobDirectoryPath ?: report.latestJobDirectory,
                 runEndWallClockTimestamp = if (event is CameraPipelineEvent.Terminal) {
                     record.wallClockTimestamp
                 } else report.runEndWallClockTimestamp,
@@ -692,13 +704,13 @@ internal class HardwareE2ERunRecorder private constructor(
             if (event.captureResourcesSettled) {
                 recordCheckpoint("OWNER_SETTLED", null, null)
             }
-            finalizeAfterTerminal(currentRunId())
+            finalizeAfterTerminal(targetRunId)
         }
     }
 
     fun recordCheckpoint(checkpoint: String, jobDirectory: File?, message: String?) {
         mutate { report ->
-            val record = HardwareE2EEventRecord(
+        val record = HardwareE2EEventRecord(
                 checkpoint = checkpoint,
                 eventType = "checkpoint",
                 elapsedMs = elapsedMillis(),
@@ -735,6 +747,10 @@ internal class HardwareE2ERunRecorder private constructor(
 
     fun snapshot(): HardwareE2ERunReport? = synchronized(lock) { current }
 
+    /** Test/diagnostic accessor: every tracked run in start order. */
+    internal fun snapshotsForTest(): List<HardwareE2ERunReport> =
+        synchronized(lock) { runsByRunId.values.toList() }
+
     fun awaitIdle(timeoutMillis: Long = 5_000L): Boolean {
         val marker = writer.submit { Unit }
         return runCatching { marker.get(timeoutMillis, TimeUnit.MILLISECONDS); true }.getOrDefault(false)
@@ -746,22 +762,33 @@ internal class HardwareE2ERunRecorder private constructor(
 
     private fun mutate(transform: (HardwareE2ERunReport) -> HardwareE2ERunReport) {
         if (!enabled) return
+        val runId = synchronized(lock) { current?.runId } ?: return
+        mutateRun(runId, transform)
+    }
+
+    private fun mutateRun(
+        runId: String,
+        transform: (HardwareE2ERunReport) -> HardwareE2ERunReport
+    ) {
+        if (!enabled) return
         val snapshot = synchronized(lock) {
-            current = current?.let(transform)
-            current
-        } ?: return
+            val updated = runsByRunId[runId]?.let(transform) ?: return
+            runsByRunId[runId] = updated
+            if (current?.runId == runId) current = updated
+            updated
+        }
         enqueuePersist(snapshot)
     }
 
     private fun finalizeAfterTerminal(runId: String?) {
         if (runId == null) return
         writer.execute {
-            val reportBefore = synchronized(lock) { current?.takeIf { it.runId == runId } } ?: return@execute
-            val correlation = correlateJob(reportBefore)
+            val reportBefore = synchronized(lock) { runsByRunId[runId] } ?: return@execute
+            val correlation = correlateJob(reportBefore, runId)
             synchronized(lock) {
-                val report = current?.takeIf { it.runId == runId } ?: return@execute
+                val report = runsByRunId[runId] ?: return@execute
                 val decision = classify(report, correlation)
-                current = report.copy(
+                val updated = report.copy(
                     latestJobDirectory = correlation.summary?.jobDirectory ?: report.latestJobDirectory,
                     finalJob = correlation.summary,
                     status = decision.status,
@@ -775,7 +802,9 @@ internal class HardwareE2ERunRecorder private constructor(
                     jobCorrelationReason = correlation.detail,
                     jobCandidateCount = correlation.candidateCount
                 )
-                persistNow(current!!)
+                runsByRunId[runId] = updated
+                if (current?.runId == runId) current = updated
+                persistNow(updated)
             }
         }
     }
@@ -802,15 +831,45 @@ internal class HardwareE2ERunRecorder private constructor(
         val detail: String? = null
     )
 
-    private fun correlateJob(report: HardwareE2ERunReport): JobCorrelationResult {
-        baselineSnapshotFailure?.let {
-            return JobCorrelationResult(
-                HardwareE2EJobCorrelation.NONE,
-                null,
-                "baseline job snapshot failed: $it",
-                0
-            )
+    private fun correlateJob(report: HardwareE2ERunReport, runId: String): JobCorrelationResult {
+        // Exact binding wins: the foreground diagnostic run was associated with
+        // this exact job directory at its durable CaptureStageComplete, so a
+        // newer capture can never steal or be blamed for this run's terminal.
+        val boundPath = report.latestJobDirectory
+        if (boundPath != null) {
+            val boundDir = File(boundPath)
+            val job = runCatching {
+                JSONObject(NoFollowFileSystem.readTextVerified(File(boundDir, JOB_JSON_FILE_NAME)))
+            }.getOrNull()
+            if (job != null) {
+                return JobCorrelationResult(
+                    HardwareE2EJobCorrelation.EXACT,
+                    readJobSummary(boundDir),
+                    "exact job directory bound at capture handoff",
+                    1
+                )
+            }
         }
+        baselinesByRunId[runId]?.let { baselinePaths ->
+            if (baselineSnapshotFailureFor(runId) != null) {
+                return JobCorrelationResult(
+                    HardwareE2EJobCorrelation.NONE,
+                    null,
+                    "baseline job snapshot failed: ${baselineFailuresByRunId[runId]}",
+                    0
+                )
+            }
+            return correlateAgainstBaseline(report, baselinePaths)
+        }
+        return JobCorrelationResult(HardwareE2EJobCorrelation.NONE, null, "no baseline available", 0)
+    }
+
+    private fun baselineSnapshotFailureFor(runId: String): String? = baselineFailuresByRunId[runId]
+
+    private fun correlateAgainstBaseline(
+        report: HardwareE2ERunReport,
+        baselineJobPaths: Set<String>
+    ): JobCorrelationResult {
         val identities = runCatching {
             jobFinder()
                 .filter { it.isDirectory && it.absolutePath !in baselineJobPaths }

@@ -296,7 +296,13 @@ fun MainCameraScreen(
     val context = LocalContext.current
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val mainScheduler = remember { HandlerCameraUiScheduler(mainHandler) }
-    val pipelineSession = remember { CameraPipelineUiSession() }
+    val pipelineSession = remember {
+        CameraPipelineUiSession(
+            backgroundOccupancy = {
+                BackgroundProcessingCoordinator.of(context).snapshot().hasPendingWork
+            }
+        )
+    }
     val hardwareE2ERecorder = remember { HardwareE2ERunRecorder.forContext(context) }
 val savedSettings = remember { CameraSettingsStore.load(context) }
 
@@ -319,6 +325,37 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
     // Background fusion/export after durable handoff never blocks this.
     val canAdmitNewCapture = pipelineUiState.canAdmitNewCapture
     val captureProgress = pipelineUiState.captureProgress
+
+    // Phase 7C: non-blocking background backlog observability (active + queued).
+    var backgroundProcessing by remember {
+        mutableStateOf(
+            BackgroundProcessingSnapshot(
+                activeJobDirectory = null,
+                activeJobKind = null,
+                activeSequence = null,
+                queuedCount = 0,
+                queuedJobDirectories = emptyList()
+            )
+        )
+    }
+    LaunchedEffect(Unit) {
+        val coordinator = BackgroundProcessingCoordinator.of(context)
+        while (true) {
+            backgroundProcessing = coordinator.snapshot()
+            kotlinx.coroutines.delay(500)
+        }
+    }
+    val backgroundProcessingLabel = if (backgroundProcessing.hasPendingWork) {
+        buildString {
+            append("사진을 처리하고 있습니다.")
+            if (backgroundProcessing.activeJobDirectory != null) append(" 처리 중 1건")
+            if (backgroundProcessing.queuedCount > 0) {
+                append(" 처리 대기 ${backgroundProcessing.queuedCount}건")
+            }
+        }
+    } else {
+        null
+    }
 
     fun publishPipelineState() {
         pipelineUiState = pipelineSession.snapshot()
@@ -1063,6 +1100,7 @@ LaunchedEffect(Unit) {
                 isCapturing = isCapturing,
                 isPipelineBusy = !canAdmitNewCapture,
                 captureProgress = captureProgress,
+                backgroundProcessingLabel = backgroundProcessingLabel,
                 onHideFocusAeControls = {
                     showFocusAeControls = false
                     showZoomSlider = false
@@ -1564,6 +1602,7 @@ fun CameraBottomPanel(
     isCapturing: Boolean,
     isPipelineBusy: Boolean,
     captureProgress: CaptureProgressState,
+    backgroundProcessingLabel: String?,
     onHideFocusAeControls: () -> Unit,
     onCapture: () -> Unit,
     onAverage: () -> Unit,
@@ -1666,10 +1705,12 @@ fun CameraBottomPanel(
                 )
 
                 if (isPipelineBusy) {
-                    PipelineBusyShutterIndicator(
-                        captureProgress = captureProgress,
-                        modifier = Modifier.size(ShutterOuterSize)
-                    )
+                    Box(modifier = Modifier.testTag("kepler.capture.busy")) {
+                        PipelineBusyShutterIndicator(
+                            captureProgress = captureProgress,
+                            modifier = Modifier.size(ShutterOuterSize)
+                        )
+                    }
                 } else {
                     ShutterButton(
                         enabled = true,
@@ -1703,6 +1744,19 @@ fun CameraBottomPanel(
 
             if (isPipelineBusy) {
                 CaptureProgressRow(captureProgress = captureProgress)
+            }
+
+            // Phase 7A: background processing is visible but never blocking.
+            // The shutter above stays governed by capture ownership alone.
+            if (backgroundProcessingLabel != null) {
+                Text(
+                    text = backgroundProcessingLabel,
+                    color = Color.White.copy(alpha = 0.72f),
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier
+                        .align(Alignment.CenterHorizontally)
+                        .testTag("kepler.processing.busy")
+                )
             }
 
             ModeTabs()

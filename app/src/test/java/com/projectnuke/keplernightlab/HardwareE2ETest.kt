@@ -128,13 +128,17 @@ class HardwareE2ETest {
     }
 
     @Test
-    fun busyRejectedCapture_doesNotReplaceActiveHardwareRun() {
+    fun overlappingSecondStart_recordsSeparateRunWithoutReplacingFirst() {
         val recorder = HardwareE2ERunRecorder.forTest(createTempDir(), environment())
         val first = recorder.start(scenario(name = "active"))!!
-        val rejected = recorder.start(scenario(name = "busy-rejected"))
-        assertNull(rejected)
-        assertEquals(first, recorder.currentRunId())
-        assertEquals("active", recorder.snapshot()?.scenario?.requestedTestScenario)
+        // Phase 7E: overlapping runs are tracked individually; the second
+        // start never overwrites the first run's identity or scenario.
+        val second = recorder.start(scenario(name = "second"))!!
+        assertTrue(first != second)
+        val runs = recorder.snapshotsForTest()
+        assertEquals(2, runs.size)
+        assertEquals("active", runs.first { it.runId == first }.scenario.requestedTestScenario)
+        assertEquals("second", runs.first { it.runId == second }.scenario.requestedTestScenario)
         recorder.close()
     }
 
