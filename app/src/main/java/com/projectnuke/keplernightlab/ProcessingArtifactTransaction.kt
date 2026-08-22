@@ -403,6 +403,11 @@ internal fun commitProcessingArtifact(
             var fatalAdoptedCleanupFailure: Error? = null
             var cancellationAdoptedCleanupFailure: CancellationException? = null
             failurePoint = ProcessingArtifactFailurePoint.TEMP_CLEANUP
+            // Settlement evidence must reflect what actually happened to the
+            // temp resource: settleProcessingArtifactPath already reports
+            // ABSENT/DELETED/DELETE_FAILED truthfully, so no synthetic ABSENT
+            // may be appended after a failed settlement — that would claim
+            // proven absence without a second successful deletion.
             try {
                 adoptedCleanup += settleProcessingArtifactPath(temp, ProcessingArtifactResourceRole.TEMPORARY)
             } catch (secondary: Throwable) {
@@ -424,11 +429,6 @@ internal fun commitProcessingArtifact(
                     secondary
                 )
             }
-            adoptedCleanup += ProcessingArtifactSettlementRecord(
-                temp,
-                ProcessingArtifactResourceRole.TEMPORARY,
-                ProcessingArtifactSettlementStatus.ABSENT
-            )
             val adoptedSettlements = settlements + adoptedCleanup
             val adoptedCleanupFailure = adoptedSettlements.firstOrNull { it.failure != null }?.failure
             state = ProcessingArtifactState.CLEANUP_FAILED

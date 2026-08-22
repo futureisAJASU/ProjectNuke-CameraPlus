@@ -292,18 +292,18 @@ internal data class HardwareE2EJobSummary(
             yuvFailedFrames = json.optNullableInt("yuvFailedFrames"),
             yuvDroppedFrames = json.optNullableInt("yuvDroppedFrames"),
             yuvCompletedResults = json.optNullableInt("yuvCompletedResults"),
-            yuvFirstWorkerFailureClass = json.optNullableString("yuvFirstWorkerFailureClass"),
-            yuvFirstWorkerFailureMessage = json.optNullableString("yuvFirstWorkerFailureMessage"),
+            yuvFirstWorkerFailureClass = json.optNonBlankString("yuvFirstWorkerFailureClass"),
+            yuvFirstWorkerFailureMessage = json.optNonBlankString("yuvFirstWorkerFailureMessage"),
             yuvFirstWorkerFailureFrameIndex = json.optNullableInt("yuvFirstWorkerFailureFrameIndex"),
-            yuvFirstWorkerFailureRootCauseClass = json.optNullableString("yuvFirstWorkerFailureRootCauseClass"),
-            yuvFirstWorkerFailureRootCauseMessage = json.optNullableString("yuvFirstWorkerFailureRootCauseMessage"),
-            yuvFirstWorkerFailureStage = json.optNullableString("yuvFirstWorkerFailureStage"),
+            yuvFirstWorkerFailureRootCauseClass = json.optNonBlankString("yuvFirstWorkerFailureRootCauseClass"),
+            yuvFirstWorkerFailureRootCauseMessage = json.optNonBlankString("yuvFirstWorkerFailureRootCauseMessage"),
+            yuvFirstWorkerFailureStage = json.optNonBlankString("yuvFirstWorkerFailureStage"),
             yuvQueuedWork = json.optNullableInt("yuvQueuedWork"),
             yuvInFlightWork = json.optNullableInt("yuvInFlightWork"),
             yuvBufferedFrames = json.optNullableInt("yuvBufferedFrames"),
             yuvReservedAdoptionCount = json.optNullableInt("yuvReservedAdoptionCount"),
-            rawPublicExportAttemptStatus = json.optNullableString("rawPublicExportAttemptStatus"),
-            rawPublicExportAttemptError = json.optNullableString("rawPublicExportAttemptError"),
+            rawPublicExportAttemptStatus = json.optNonBlankString("rawPublicExportAttemptStatus"),
+            rawPublicExportAttemptError = json.optNonBlankString("rawPublicExportAttemptError"),
             rawPublicExportAttemptAt = json.optNullableLong("rawPublicExportAttemptAt"),
             exportAttemptedFormats = json.optJSONArray("exportAttemptedFormats").toStringList(),
             exportCandidateFailureReasons = json.optJSONArray("exportCandidateFailureReasons").toStringList(),
@@ -488,17 +488,13 @@ private fun JSONObject?.toLongMap(): Map<String, Long> {
     }
 }
 
-private fun JSONObject.optNullableInt(key: String): Int? =
-    if (!has(key) || isNull(key)) null else optInt(key)
-
 private fun JSONObject.optNullableBoolean(key: String): Boolean? =
     if (!has(key) || isNull(key)) null else optBoolean(key)
 
-private fun JSONObject.optNullableString(key: String): String? =
+// Diagnostics treat blank as unknown; the faithful shared optNullableString
+// preserves "" exactly, so report parsing uses this blank-normalized variant.
+private fun JSONObject.optNonBlankString(key: String): String? =
     if (!has(key) || isNull(key)) null else optString(key).takeIf { it.isNotBlank() }
-
-private fun JSONObject.optNullableLong(key: String): Long? =
-    if (!has(key) || isNull(key)) null else optLong(key)
 
 private fun JSONArray?.toStringList(): List<String> {
     if (this == null) return emptyList()
@@ -1121,18 +1117,18 @@ internal class HardwareE2ERunRecorder private constructor(
             yuvFailedFrames = job.optNullableInt("yuvFailedFrames"),
             yuvDroppedFrames = job.optNullableInt("yuvDroppedFrames"),
             yuvCompletedResults = job.optNullableInt("yuvCompletedResults"),
-            yuvFirstWorkerFailureClass = job.optNullableString("yuvFirstWorkerFailureClass"),
-            yuvFirstWorkerFailureMessage = job.optNullableString("yuvFirstWorkerFailureMessage"),
+            yuvFirstWorkerFailureClass = job.optNonBlankString("yuvFirstWorkerFailureClass"),
+            yuvFirstWorkerFailureMessage = job.optNonBlankString("yuvFirstWorkerFailureMessage"),
             yuvFirstWorkerFailureFrameIndex = job.optNullableInt("yuvFirstWorkerFailureFrameIndex"),
-            yuvFirstWorkerFailureRootCauseClass = job.optNullableString("yuvFirstWorkerFailureRootCauseClass"),
-            yuvFirstWorkerFailureRootCauseMessage = job.optNullableString("yuvFirstWorkerFailureRootCauseMessage"),
-            yuvFirstWorkerFailureStage = job.optNullableString("yuvFirstWorkerFailureStage"),
+            yuvFirstWorkerFailureRootCauseClass = job.optNonBlankString("yuvFirstWorkerFailureRootCauseClass"),
+            yuvFirstWorkerFailureRootCauseMessage = job.optNonBlankString("yuvFirstWorkerFailureRootCauseMessage"),
+            yuvFirstWorkerFailureStage = job.optNonBlankString("yuvFirstWorkerFailureStage"),
             yuvQueuedWork = job.optNullableInt("yuvQueuedWork"),
             yuvInFlightWork = job.optNullableInt("yuvInFlightWork"),
             yuvBufferedFrames = job.optNullableInt("yuvBufferedFrames"),
             yuvReservedAdoptionCount = job.optNullableInt("yuvReservedAdoptionCount"),
-            rawPublicExportAttemptStatus = job.optNullableString("rawPublicExportAttemptStatus"),
-            rawPublicExportAttemptError = job.optNullableString("rawPublicExportAttemptError"),
+            rawPublicExportAttemptStatus = job.optNonBlankString("rawPublicExportAttemptStatus"),
+            rawPublicExportAttemptError = job.optNonBlankString("rawPublicExportAttemptError"),
             rawPublicExportAttemptAt = job.optNullableLong("rawPublicExportAttemptAt"),
             exportAttemptedFormats = job.optJSONArray("exportAttemptedFormats").toStringList(),
             exportCandidateFailureReasons = job.optJSONArray("exportCandidateFailureReasons").toStringList(),
