@@ -1157,22 +1157,36 @@ LaunchedEffect(Unit) {
                     }
                 },
                 onAverage = average@{
-                    if (!canAdmitNewCapture) {
-                        status = "처리 중인 작업이 있어 재생성을 시작할 수 없습니다. 잠시 후 다시 시도해 주세요."
-                        Log.i("KeplerPipelineState", "average/reprocess ignored while busy status=$status")
+                    // 수동 재생성은 촬영 소유가 아니라 처리 작업입니다. 정확한 최근
+                    // 작업 디렉터리로 직렬화된 백그라운드 처리 lane에서 실행되며
+                    // 카메라 촬영 시작을 막지 않습니다.
+                    val latestJobDir = findLatestColorBurstJobDir(context)
+                    if (latestJobDir == null) {
+                        status = "재생성할 최근 촬영 결과가 없습니다."
                         return@average
                     }
-                    runCameraJob(
-                        "최근 촬영 컬러 합성 시작...",
-                        diagnosticScenario = "production_reprocess"
-                    ) { cancellation, _, callback, onEvent ->
-                        processLatestNightFusionV02(
-                            context,
-                            cancellation,
-                            onStatus = { callback(it) },
-                            onPipelineEvent = onEvent
+                    val enqueueOutcome = BackgroundProcessingCoordinator.of(context).enqueue(
+                        ExactJobRef(latestJobDir, KeplerActiveOperationKind.PROCESSING_YUV)
+                    ) { ref ->
+                        val run = reprocessYuvJob(
+                            context = context,
+                            jobDir = ref.jobDirectory,
+                            finalOutputFormat = finalOutputFormat,
+                            onStatus = { message -> mainHandler.post { status = message } }
                         )
+                        try {
+                            kotlinx.coroutines.runBlocking { run.terminal.await() }
+                        } catch (failure: Throwable) {
+                            Log.w("KeplerPipelineState", "reprocess terminal await failed", failure)
+                        }
                     }
+                    status = when (enqueueOutcome) {
+                        is BackgroundEnqueueResult.Duplicate ->
+                            "최근 촬영 결과가 이미 처리 대기열에 있습니다."
+                        else ->
+                            "최근 촬영 컬러 합성을 백그라운드에서 시작합니다..."
+                    }
+                    Log.i("KeplerPipelineState", "average/reprocess enqueued job=${latestJobDir.name} outcome=$enqueueOutcome")
                 },
                 onRaw = {
                     runCameraJob(

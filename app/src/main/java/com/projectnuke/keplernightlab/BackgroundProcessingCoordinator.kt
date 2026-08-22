@@ -157,7 +157,7 @@ internal class BackgroundProcessingCoordinator private constructor(
             try {
                 work?.execute(item)
                     ?: error("Background work missing for ${item.jobDirectory.absolutePath}")
-            } catch (failure: Exception) {
+            } catch (failure: Throwable) {
                 Log.e(
                     "KeplerBackground",
                     "background processing failed for ${item.jobDirectory.name}; continuing lane",

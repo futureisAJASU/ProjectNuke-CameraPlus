@@ -131,6 +131,27 @@ fun captureProcessExportNightFusion(
         processingParams = processingParams,
         captureCancellationHandle = captureCancellationHandle,
 onComplete = { jobDir ->
+            // Phase 6 boundary: at this point every frame is persisted and
+            // verified, the durable processing handoff is published, capture
+            // resources are settled, and the capture lease is released. The
+            // foreground slot ends here; fusion/export continue on the
+            // serialized background lane bound to this EXACT job directory.
+            onPipelineEvent(
+                CameraPipelineEvent.CaptureStageComplete(
+                    generation = 0L,
+                    counts = CameraPipelineProgressCounts(),
+                    message = "촬영???�료?�었?�니?? 결과�?처리?�고 ?�습?�다.",
+                    jobDirectoryPath = jobDir.absolutePath,
+                    captureResourcesSettled = true,
+                    processingHandoffDurable = true
+                )
+            )
+            val backgroundCancellation = KeplerPipelineCancellationToken()
+            val laneAccepted = BackgroundProcessingCoordinator.of(context).enqueue(
+                ExactJobRef(jobDir, KeplerActiveOperationKind.PROCESSING_YUV)
+            ) { ref ->
+            val jobDir = ref.jobDirectory
+            val cancellation = backgroundCancellation
             try {
                 cancellation.throwIfCancelled()
             } catch (_: CancellationException) {
@@ -151,7 +172,7 @@ onComplete = { jobDir ->
                 }
                 post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.CANCELLED, message = "Capture cancelled before processing started.")
-                return@captureYuvBurstColorWithMotion
+                return@enqueue
             }
             try {
                 KeplerJobMetadata.update(jobDir) { current ->
@@ -187,7 +208,7 @@ onComplete = { jobDir ->
                     CameraPipelineEvent.Terminal.Kind.FAILED,
                     message = "Capture metadata initialization failed; cache kept."
                 )
-                return@captureYuvBurstColorWithMotion
+                return@enqueue
             }
             val pipelineLease = try {
                 KeplerJobMetadata.acquireRecoveryCheckedOperation(
@@ -218,7 +239,7 @@ onComplete = { jobDir ->
                     CameraPipelineEvent.Terminal.Kind.FAILED,
                     message = "Capture processing ownership could not be reserved."
                 )
-                return@captureYuvBurstColorWithMotion
+                return@enqueue
             }
             var startedThread: HandlerThread? = null
             val workerThread: HandlerThread
@@ -308,7 +329,7 @@ KeplerJobMetadata.clearActiveOperation(jobDir, operationId, pipelineLease)
                     CameraPipelineEvent.Terminal.Kind.FAILED,
                     message = "YUV worker setup failed; cache kept."
                 )
-                return@captureYuvBurstColorWithMotion
+                return@enqueue
             }
             fun settleWorkerDispatchFailure(primary: Throwable, cancelled: Boolean): Throwable {
                 var secondaryFailure: Throwable? = null
@@ -789,6 +810,31 @@ terminal.publish(
                 }
                 post("PIPELINE_FAILED: Capture processing worker could not start; cache kept.")
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = "Capture processing worker could not start.")
+            }
+            }
+            if (laneAccepted !is BackgroundEnqueueResult.Accepted) {
+                // Phase 5F: scheduling failed AFTER the durable handoff. The
+                // job is never lost - retain handoff/reconciliation evidence so
+                // startup recovery can reprocess it, and surface a non-blocking
+                // failure without claiming processing success.
+                try {
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(jobDir)
+                } catch (settledError: Error) {
+                    throw settledError
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (settlementError: Exception) {
+                    android.util.Log.e(
+                        "KeplerYuvPipeline",
+                        "Failed to settle YUV processing handoff after lane scheduling failure: ${settlementError.message}",
+                        settlementError
+                    )
+                }
+                post("PIPELINE_FAILED: 백그라운드 처리 등록에 실패했습니다. 캐시를 보존했습니다. 나중에 복구할 수 있습니다.")
+                terminal.publish(
+                    CameraPipelineEvent.Terminal.Kind.FAILED,
+                    message = "Background processing scheduling failed; cache kept for recovery."
+                )
             }
         },
         onError = { error ->

@@ -709,6 +709,25 @@ fun captureProcessExportSuperResolutionFusion(
         processingParams = processingParams,
         captureCancellationHandle = captureCancellationHandle,
 onComplete = { sourceJobDir ->
+            // Phase 6 boundary: the source burst is durably settled and its
+            // processing handoff published. Super Resolution continues on the
+            // serialized background lane bound to this EXACT source job.
+            onPipelineEvent(
+                CameraPipelineEvent.CaptureStageComplete(
+                    generation = 0L,
+                    counts = CameraPipelineProgressCounts(),
+                    message = "ì´¬ì˜???„ë£Œ?˜ì—ˆ?µë‹ˆ?? ê²°ê³¼ë¥?ì²˜ë¦¬?˜ê³  ?ˆìŠµ?ˆë‹¤.",
+                    jobDirectoryPath = sourceJobDir.absolutePath,
+                    captureResourcesSettled = true,
+                    processingHandoffDurable = true
+                )
+            )
+            val backgroundCancellation = KeplerPipelineCancellationToken()
+            val laneAccepted = BackgroundProcessingCoordinator.of(context).enqueue(
+                ExactJobRef(sourceJobDir, KeplerActiveOperationKind.PROCESSING_YUV)
+            ) { ref ->
+            val sourceJobDir = ref.jobDirectory
+            val cancellation = backgroundCancellation
             try {
                 cancellation.throwIfCancelled()
             } catch (_: CancellationException) {
@@ -725,7 +744,7 @@ onComplete = { sourceJobDir ->
                 }
                 post("PIPELINE_CANCELLED: Capture timed out; background processing stopped.")
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.CANCELLED, message = "Capture cancelled before Super Resolution processing.")
-                return@captureYuvBurstColorWithMotion
+                return@enqueue
             }
             var startedWorkerThread: HandlerThread? = null
             val workerThread: HandlerThread
@@ -779,7 +798,7 @@ onComplete = { sourceJobDir ->
                     CameraPipelineEvent.Terminal.Kind.FAILED,
                     message = "Super Resolution worker setup failed."
                 )
-                return@captureYuvBurstColorWithMotion
+                return@enqueue
             }
             val workerPosted = try {
                 workerHandler.post {
@@ -1238,6 +1257,29 @@ post(
                 }
                 post("PIPELINE_FAILED: 24M Fusion worker could not start.")
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = "24M Fusion worker could not start.")
+            }
+            }
+            if (laneAccepted !is BackgroundEnqueueResult.Accepted) {
+                // Phase 5F: scheduling failed AFTER the durable handoff; the
+                // source job stays reprocessable through retained evidence.
+                try {
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(sourceJobDir)
+                } catch (settledError: Error) {
+                    throw settledError
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (settlementError: Exception) {
+                    Log.e(
+                        "KeplerSuperResolution",
+                        "Failed to settle source handoff after lane scheduling failure: ${settlementError.message}",
+                        settlementError
+                    )
+                }
+                post("PIPELINE_FAILED: ë°±ê·¸?¼ìš´??ì²˜ë¦¬ ?±ë¡???¤íŒ¨?ˆìŠµ?ˆë‹¤. ìºì‹œë¥?ë³´ì¡´?ˆìŠµ?ˆë‹¤. ?˜ì¤‘??ë³µêµ¬?????ˆìŠµ?ˆë‹¤.")
+                terminal.publish(
+                    CameraPipelineEvent.Terminal.Kind.FAILED,
+                    message = "Background processing scheduling failed; cache kept for recovery."
+                )
             }
         },
         onError = { error ->
