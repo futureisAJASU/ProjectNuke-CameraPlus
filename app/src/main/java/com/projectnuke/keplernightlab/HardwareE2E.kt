@@ -164,13 +164,17 @@ internal data class HardwareE2EJobSummary(
     val yuvFirstWorkerFailureStage: String? = null,
     val yuvQueuedWork: Int? = null,
     val yuvInFlightWork: Int? = null,
-    val yuvPendingCandidateCount: Int? = null,
+    val yuvBufferedFrames: Int? = null,
+    val yuvReservedAdoptionCount: Int? = null,
     val rawPublicExportAttemptStatus: String? = null,
     val rawPublicExportAttemptError: String? = null,
     val rawPublicExportAttemptAt: Long? = null,
+    val exportAttemptedFormats: List<String> = emptyList(),
+    val exportCandidateFailureReasons: List<String> = emptyList(),
     val processingArtifactJournalCount: Int = 0,
     val processingArtifactJournalStates: List<String> = emptyList(),
-    val processingArtifactJournalFinalNames: List<String> = emptyList()
+    val processingArtifactJournalFinalNames: List<String> = emptyList(),
+    val processingArtifactInvalidJournalCount: Int = 0
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("jobDirectory", jobDirectory)
@@ -222,14 +226,24 @@ internal data class HardwareE2EJobSummary(
         yuvFirstWorkerFailureStage?.let { put("yuvFirstWorkerFailureStage", it) }
         yuvQueuedWork?.let { put("yuvQueuedWork", it) }
         yuvInFlightWork?.let { put("yuvInFlightWork", it) }
-        yuvPendingCandidateCount?.let { put("yuvPendingCandidateCount", it) }
+        yuvBufferedFrames?.let { put("yuvBufferedFrames", it) }
+        yuvReservedAdoptionCount?.let { put("yuvReservedAdoptionCount", it) }
         rawPublicExportAttemptStatus?.let { put("rawPublicExportAttemptStatus", it) }
         rawPublicExportAttemptError?.let { put("rawPublicExportAttemptError", it) }
         rawPublicExportAttemptAt?.let { put("rawPublicExportAttemptAt", it) }
+        if (exportAttemptedFormats.isNotEmpty()) {
+            put("exportAttemptedFormats", JSONArray(exportAttemptedFormats))
+        }
+        if (exportCandidateFailureReasons.isNotEmpty()) {
+            put("exportCandidateFailureReasons", JSONArray(exportCandidateFailureReasons))
+        }
         if (processingArtifactJournalCount > 0) {
             put("processingArtifactJournalCount", processingArtifactJournalCount)
             put("processingArtifactJournalStates", JSONArray(processingArtifactJournalStates))
             put("processingArtifactJournalFinalNames", JSONArray(processingArtifactJournalFinalNames))
+        }
+        if (processingArtifactInvalidJournalCount > 0) {
+            put("processingArtifactInvalidJournalCount", processingArtifactInvalidJournalCount)
         }
         error?.let { put("error", it) }
     }
@@ -286,13 +300,17 @@ internal data class HardwareE2EJobSummary(
             yuvFirstWorkerFailureStage = json.optNullableString("yuvFirstWorkerFailureStage"),
             yuvQueuedWork = json.optNullableInt("yuvQueuedWork"),
             yuvInFlightWork = json.optNullableInt("yuvInFlightWork"),
-            yuvPendingCandidateCount = json.optNullableInt("yuvPendingCandidateCount"),
+            yuvBufferedFrames = json.optNullableInt("yuvBufferedFrames"),
+            yuvReservedAdoptionCount = json.optNullableInt("yuvReservedAdoptionCount"),
             rawPublicExportAttemptStatus = json.optNullableString("rawPublicExportAttemptStatus"),
             rawPublicExportAttemptError = json.optNullableString("rawPublicExportAttemptError"),
             rawPublicExportAttemptAt = json.optNullableLong("rawPublicExportAttemptAt"),
+            exportAttemptedFormats = json.optJSONArray("exportAttemptedFormats").toStringList(),
+            exportCandidateFailureReasons = json.optJSONArray("exportCandidateFailureReasons").toStringList(),
             processingArtifactJournalCount = json.optInt("processingArtifactJournalCount", 0),
             processingArtifactJournalStates = json.optJSONArray("processingArtifactJournalStates").toStringList(),
-            processingArtifactJournalFinalNames = json.optJSONArray("processingArtifactJournalFinalNames").toStringList()
+            processingArtifactJournalFinalNames = json.optJSONArray("processingArtifactJournalFinalNames").toStringList(),
+            processingArtifactInvalidJournalCount = json.optInt("processingArtifactInvalidJournalCount", 0)
         )
     }
 }
@@ -1111,13 +1129,17 @@ internal class HardwareE2ERunRecorder private constructor(
             yuvFirstWorkerFailureStage = job.optNullableString("yuvFirstWorkerFailureStage"),
             yuvQueuedWork = job.optNullableInt("yuvQueuedWork"),
             yuvInFlightWork = job.optNullableInt("yuvInFlightWork"),
-            yuvPendingCandidateCount = job.optNullableInt("yuvPendingCandidateCount"),
+            yuvBufferedFrames = job.optNullableInt("yuvBufferedFrames"),
+            yuvReservedAdoptionCount = job.optNullableInt("yuvReservedAdoptionCount"),
             rawPublicExportAttemptStatus = job.optNullableString("rawPublicExportAttemptStatus"),
             rawPublicExportAttemptError = job.optNullableString("rawPublicExportAttemptError"),
             rawPublicExportAttemptAt = job.optNullableLong("rawPublicExportAttemptAt"),
+            exportAttemptedFormats = job.optJSONArray("exportAttemptedFormats").toStringList(),
+            exportCandidateFailureReasons = job.optJSONArray("exportCandidateFailureReasons").toStringList(),
             processingArtifactJournalCount = journalScan?.validJournals?.size ?: 0,
             processingArtifactJournalStates = processingArtifactJournalStates,
-            processingArtifactJournalFinalNames = processingArtifactJournalFinalNames
+            processingArtifactJournalFinalNames = processingArtifactJournalFinalNames,
+            processingArtifactInvalidJournalCount = journalScan?.invalidFiles?.size ?: 0
         )
     }
 

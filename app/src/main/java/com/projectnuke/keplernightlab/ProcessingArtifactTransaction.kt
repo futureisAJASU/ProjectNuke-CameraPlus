@@ -18,16 +18,34 @@ internal var processingArtifactCrashAfterMoveIntentForTest: Boolean = false
 @Volatile
 internal var processingArtifactCrashAfterMoveForTest: Boolean = false
 
-internal enum class ProcessingArtifactFailureStage {
+internal enum class ProcessingArtifactFailurePoint {
     PLANNED,
+    JOURNAL_PREPARE,
     TEMP_WRITE,
+    JOURNAL_TEMP_WRITTEN,
     TEMP_VERIFY,
-    PRIOR_BACKUP,
+    TEMP_DIGEST,
+    JOURNAL_TEMP_VERIFIED,
+    PRIOR_DIGEST,
+    PRIOR_SEMANTIC_VERIFY,
+    JOURNAL_PRIOR_BACKED_UP,
+    PRIOR_MOVE,
+    JOURNAL_FINAL_MOVE_INTENT,
     FINAL_MOVE,
+    JOURNAL_FINAL_MOVED,
     FINAL_VERIFY,
-    ADOPTION,
-    POST_ADOPT_CLEANUP,
-    ROLLBACK
+    JOURNAL_FINAL_VERIFIED,
+    JOURNAL_ADOPTED,
+    PRIOR_BACKUP_CLEANUP,
+    TEMP_CLEANUP,
+    JOURNAL_SETTLED,
+    JOURNAL_DELETE,
+    ROLLBACK_JOURNAL_START,
+    ROLLBACK_NEW_FINAL_CLEANUP,
+    ROLLBACK_TEMP_CLEANUP,
+    ROLLBACK_PRIOR_RESTORE_MOVE,
+    ROLLBACK_PRIOR_VERIFY,
+    ROLLBACK_JOURNAL_SETTLEMENT
 }
 
 internal enum class ProcessingArtifactState {
@@ -113,7 +131,8 @@ internal class ProcessingArtifactException(
     cause: Throwable,
     val settlements: List<ProcessingArtifactSettlementRecord> = emptyList(),
     val priorBackupFile: File? = null,
-    val failureStage: ProcessingArtifactFailureStage = ProcessingArtifactFailureStage.PLANNED
+    val failurePoint: ProcessingArtifactFailurePoint = ProcessingArtifactFailurePoint.PLANNED,
+    val rollbackFailurePoint: ProcessingArtifactFailurePoint? = null
 ) : IllegalStateException("Processing artifact transaction failed for ${finalFile.absolutePath}", cause)
 
 private fun existingRegularArtifact(file: File): Boolean {
@@ -198,17 +217,36 @@ internal fun commitProcessingArtifact(
     var newFinalCommitted = false
     var priorRestored = false
     var finalAdopted = false
-    var failureStage = ProcessingArtifactFailureStage.PLANNED
-    var journal = ProcessingArtifactJournal.create(
-        jobDir = parent,
-        transactionId = UUID.randomUUID().toString(),
-        processingAttemptId = processingAttemptId,
-        artifactType = finalFile.extension.ifBlank { "UNKNOWN" },
-        finalName = finalFile.name,
-        tempName = temp.name,
-        priorName = priorBackup.name,
-        claimKey = claimKey
-    )
+    var failurePoint = ProcessingArtifactFailurePoint.PLANNED
+    var rollbackFailurePoint: ProcessingArtifactFailurePoint? = null
+
+    var journal: ProcessingArtifactJournal
+    try {
+        journal = ProcessingArtifactJournal.create(
+            jobDir = parent,
+            transactionId = UUID.randomUUID().toString(),
+            processingAttemptId = processingAttemptId,
+            artifactType = finalFile.extension.ifBlank { "UNKNOWN" },
+            finalName = finalFile.name,
+            tempName = temp.name,
+            priorName = priorBackup.name,
+            claimKey = claimKey
+        )
+    } catch (failure: Throwable) {
+        if (failure is ProcessingArtifactSimulatedCrashForTest) throw failure
+        if (failure is Error || failure is CancellationException) throw failure
+        if (failure is ProcessingArtifactClaimConflictException) throw failure
+        throw ProcessingArtifactException(
+            finalFile = finalFile,
+            tempFile = temp,
+            cleanupFailure = null,
+            cause = failure,
+            settlements = emptyList(),
+            priorBackupFile = null,
+            failurePoint = ProcessingArtifactFailurePoint.JOURNAL_PREPARE,
+            rollbackFailurePoint = null
+        )
+    }
 
     fun journalTransition(
         next: ProcessingArtifactJournalState,
@@ -248,20 +286,24 @@ internal fun commitProcessingArtifact(
         checkCancelled()
         check(!Files.exists(temp.toPath(), LinkOption.NOFOLLOW_LINKS)) { "Artifact temp already exists" }
         state = ProcessingArtifactState.TEMP_OWNED
-        failureStage = ProcessingArtifactFailureStage.TEMP_WRITE
+        failurePoint = ProcessingArtifactFailurePoint.TEMP_WRITE
         writeTemp(temp)
+        failurePoint = ProcessingArtifactFailurePoint.JOURNAL_TEMP_WRITTEN
         journalTransition(ProcessingArtifactJournalState.TEMP_WRITTEN)
         check(Files.isRegularFile(temp.toPath(), LinkOption.NOFOLLOW_LINKS) && temp.length() > 0L) { "Artifact temp verification failed" }
-        failureStage = ProcessingArtifactFailureStage.TEMP_VERIFY
+        failurePoint = ProcessingArtifactFailurePoint.TEMP_VERIFY
         verifyFinal(temp)
+        failurePoint = ProcessingArtifactFailurePoint.TEMP_DIGEST
         val tempEvidence = NoFollowFileSystem.digestVerified(temp)
         state = ProcessingArtifactState.TEMP_VERIFIED
+        failurePoint = ProcessingArtifactFailurePoint.JOURNAL_TEMP_VERIFIED
         journalTransition(ProcessingArtifactJournalState.TEMP_VERIFIED, tempEvidence)
         checkCancelled()
 
         if (existingRegularArtifact(finalFile)) {
-            failureStage = ProcessingArtifactFailureStage.PRIOR_BACKUP
+            failurePoint = ProcessingArtifactFailurePoint.PRIOR_DIGEST
             val priorEvidence = NoFollowFileSystem.digestVerified(finalFile)
+            failurePoint = ProcessingArtifactFailurePoint.PRIOR_SEMANTIC_VERIFY
             val priorSemanticEvidence = try {
                 verifyFinal(finalFile)
                 true
@@ -270,6 +312,7 @@ internal fun commitProcessingArtifact(
             } catch (_: Exception) {
                 false
             }
+            failurePoint = ProcessingArtifactFailurePoint.JOURNAL_PRIOR_BACKED_UP
             journal = journal.transition(
                 parent,
                 ProcessingArtifactJournalState.PRIOR_BACKED_UP,
@@ -277,26 +320,30 @@ internal fun commitProcessingArtifact(
                 priorExpectedSha256Override = priorEvidence.sha256,
                 priorSemanticVerifiedOverride = priorSemanticEvidence
             )
+            failurePoint = ProcessingArtifactFailurePoint.PRIOR_MOVE
             move(finalFile, priorBackup)
             priorBackedUp = true
             state = ProcessingArtifactState.PRIOR_FINAL_BACKED_UP
         }
 
         checkCancelled()
-        failureStage = ProcessingArtifactFailureStage.FINAL_MOVE
+        failurePoint = ProcessingArtifactFailurePoint.JOURNAL_FINAL_MOVE_INTENT
         journalTransition(ProcessingArtifactJournalState.NEW_FINAL_MOVE_STARTED)
         if (processingArtifactCrashAfterMoveIntentForTest) throw ProcessingArtifactSimulatedCrashForTest()
+        failurePoint = ProcessingArtifactFailurePoint.FINAL_MOVE
         move(temp, finalFile)
         newFinalCommitted = true
         state = ProcessingArtifactState.COMMITTED_FINAL
         if (processingArtifactCrashAfterMoveForTest) throw ProcessingArtifactSimulatedCrashForTest()
+        failurePoint = ProcessingArtifactFailurePoint.JOURNAL_FINAL_MOVED
         journalTransition(ProcessingArtifactJournalState.NEW_FINAL_MOVED)
 
         // Once commit begins, cancellation cannot interrupt ownership. Verify
         // the actual final pathname and either adopt it or roll back safely.
-        failureStage = ProcessingArtifactFailureStage.FINAL_VERIFY
+        failurePoint = ProcessingArtifactFailurePoint.FINAL_VERIFY
         verifyFinal(finalFile)
         state = ProcessingArtifactState.FINAL_VERIFIED
+        failurePoint = ProcessingArtifactFailurePoint.JOURNAL_FINAL_VERIFIED
         journalTransition(ProcessingArtifactJournalState.NEW_FINAL_VERIFIED)
         settlements += ProcessingArtifactSettlementRecord(
             finalFile,
@@ -305,10 +352,11 @@ internal fun commitProcessingArtifact(
         )
         state = ProcessingArtifactState.ADOPTED
         finalAdopted = true
-        failureStage = ProcessingArtifactFailureStage.ADOPTION
+        failurePoint = ProcessingArtifactFailurePoint.JOURNAL_ADOPTED
         journalTransition(ProcessingArtifactJournalState.ADOPTED, adoptedResult = "NEW_FINAL", claimKey = claimKey)
 
         if (priorBackedUp) {
+            failurePoint = ProcessingArtifactFailurePoint.PRIOR_BACKUP_CLEANUP
             val backupSettlement = settleProcessingArtifactPath(priorBackup, ProcessingArtifactResourceRole.PRIOR_BACKUP)
             settlements += backupSettlement
             if (backupSettlement.status == ProcessingArtifactSettlementStatus.DELETE_FAILED) {
@@ -329,7 +377,9 @@ internal fun commitProcessingArtifact(
             priorFinalRestored = false
         )
         if (claimKey == null) {
+            failurePoint = ProcessingArtifactFailurePoint.JOURNAL_SETTLED
             journalTransition(ProcessingArtifactJournalState.SETTLED, adoptedResult = "NEW_FINAL")
+            failurePoint = ProcessingArtifactFailurePoint.JOURNAL_DELETE
             journal.deleteIfOwned(parent)
         }
         notifySettlement(
@@ -344,15 +394,15 @@ internal fun commitProcessingArtifact(
         return result
     } catch (failure: Throwable) {
         if (failure is ProcessingArtifactSimulatedCrashForTest) throw failure
-        val capturedFailureStage = failureStage
+        val capturedFailurePoint = failurePoint
         // ADOPTED is a durable ownership boundary.  Optional cleanup or
         // settlement failures after it must retain the current final and the
         // journal evidence; this is not a rollback cut.
         if (finalAdopted) {
-            failureStage = ProcessingArtifactFailureStage.POST_ADOPT_CLEANUP
             val adoptedCleanup = mutableListOf<ProcessingArtifactSettlementRecord>()
             var fatalAdoptedCleanupFailure: Error? = null
             var cancellationAdoptedCleanupFailure: CancellationException? = null
+            failurePoint = ProcessingArtifactFailurePoint.TEMP_CLEANUP
             try {
                 adoptedCleanup += settleProcessingArtifactPath(temp, ProcessingArtifactResourceRole.TEMPORARY)
             } catch (secondary: Throwable) {
@@ -374,6 +424,11 @@ internal fun commitProcessingArtifact(
                     secondary
                 )
             }
+            adoptedCleanup += ProcessingArtifactSettlementRecord(
+                temp,
+                ProcessingArtifactResourceRole.TEMPORARY,
+                ProcessingArtifactSettlementStatus.ABSENT
+            )
             val adoptedSettlements = settlements + adoptedCleanup
             val adoptedCleanupFailure = adoptedSettlements.firstOrNull { it.failure != null }?.failure
             state = ProcessingArtifactState.CLEANUP_FAILED
@@ -387,7 +442,7 @@ internal fun commitProcessingArtifact(
                 )
             )
             fatalAdoptedCleanupFailure?.let { throw it }
-            if (failure is Error || failure is java.util.concurrent.CancellationException) throw failure
+            if (failure is Error || failure is CancellationException) throw failure
             cancellationAdoptedCleanupFailure?.let { throw it }
             throw ProcessingArtifactException(
                 finalFile = finalFile,
@@ -396,26 +451,31 @@ internal fun commitProcessingArtifact(
                 cause = failure,
                 settlements = adoptedSettlements,
                 priorBackupFile = priorBackup.takeIf { priorBackedUp && it.exists() },
-                failureStage = capturedFailureStage
+                failurePoint = capturedFailurePoint,
+                rollbackFailurePoint = null
             )
         }
-        failureStage = ProcessingArtifactFailureStage.ROLLBACK
+        failurePoint = ProcessingArtifactFailurePoint.ROLLBACK_JOURNAL_START
         var rollbackSecondaryFailure: Throwable? = null
-        fun captureRollbackFailure(secondary: Throwable) {
+        fun captureRollbackFailure(secondary: Throwable, point: ProcessingArtifactFailurePoint) {
             if (secondary === failure) return
+            if (rollbackFailurePoint == null) {
+                rollbackFailurePoint = point
+            }
             rollbackSecondaryFailure = combineSettlementFailure(rollbackSecondaryFailure, secondary)
         }
         try {
             journalTransition(ProcessingArtifactJournalState.ROLLBACK_STARTED)
         } catch (secondary: Throwable) {
-            captureRollbackFailure(secondary)
+            captureRollbackFailure(secondary, ProcessingArtifactFailurePoint.ROLLBACK_JOURNAL_START)
         }
         val cleanupRecords = mutableListOf<ProcessingArtifactSettlementRecord>()
         if (newFinalCommitted) {
+            failurePoint = ProcessingArtifactFailurePoint.ROLLBACK_NEW_FINAL_CLEANUP
             try {
                 cleanupRecords += settleProcessingArtifactPath(finalFile, ProcessingArtifactResourceRole.NEW_FINAL)
             } catch (secondary: Throwable) {
-                captureRollbackFailure(secondary)
+                captureRollbackFailure(secondary, ProcessingArtifactFailurePoint.ROLLBACK_NEW_FINAL_CLEANUP)
                 cleanupRecords += ProcessingArtifactSettlementRecord(
                     finalFile,
                     ProcessingArtifactResourceRole.NEW_FINAL,
@@ -430,10 +490,11 @@ internal fun commitProcessingArtifact(
                 ProcessingArtifactSettlementStatus.NOT_ATTEMPTED
             )
         }
+        failurePoint = ProcessingArtifactFailurePoint.ROLLBACK_TEMP_CLEANUP
         try {
             cleanupRecords += settleProcessingArtifactPath(temp, ProcessingArtifactResourceRole.TEMPORARY)
         } catch (secondary: Throwable) {
-            captureRollbackFailure(secondary)
+            captureRollbackFailure(secondary, ProcessingArtifactFailurePoint.ROLLBACK_TEMP_CLEANUP)
             cleanupRecords += ProcessingArtifactSettlementRecord(
                 temp,
                 ProcessingArtifactResourceRole.TEMPORARY,
@@ -444,11 +505,12 @@ internal fun commitProcessingArtifact(
 
         if (priorBackedUp) {
             var restoreMoveSucceeded = false
+            failurePoint = ProcessingArtifactFailurePoint.ROLLBACK_PRIOR_RESTORE_MOVE
             try {
                 move(priorBackup, finalFile)
                 restoreMoveSucceeded = true
             } catch (restoreMoveFailure: Throwable) {
-                captureRollbackFailure(restoreMoveFailure)
+                captureRollbackFailure(restoreMoveFailure, ProcessingArtifactFailurePoint.ROLLBACK_PRIOR_RESTORE_MOVE)
                 cleanupRecords += ProcessingArtifactSettlementRecord(
                     priorBackup,
                     ProcessingArtifactResourceRole.PRIOR_BACKUP,
@@ -457,6 +519,7 @@ internal fun commitProcessingArtifact(
                 )
             }
             if (restoreMoveSucceeded) {
+                failurePoint = ProcessingArtifactFailurePoint.ROLLBACK_PRIOR_VERIFY
                 try {
                     verifyFinal(finalFile)
                     priorRestored = true
@@ -465,20 +528,33 @@ internal fun commitProcessingArtifact(
                         ProcessingArtifactResourceRole.PRIOR_BACKUP,
                         ProcessingArtifactSettlementStatus.ABSENT
                     )
-                    journalTransition(ProcessingArtifactJournalState.PRIOR_RESTORED, adoptedResult = "PRIOR_FINAL")
-                    cleanupRecords += ProcessingArtifactSettlementRecord(
-                        finalFile,
-                        ProcessingArtifactResourceRole.RESTORED_PRIOR,
-                        ProcessingArtifactSettlementStatus.RESTORED
-                    )
                 } catch (restoreVerificationFailure: Throwable) {
-                    captureRollbackFailure(restoreVerificationFailure)
+                    captureRollbackFailure(restoreVerificationFailure, ProcessingArtifactFailurePoint.ROLLBACK_PRIOR_VERIFY)
                     cleanupRecords += ProcessingArtifactSettlementRecord(
                         finalFile,
                         ProcessingArtifactResourceRole.RESTORED_PRIOR,
                         ProcessingArtifactSettlementStatus.RESTORED_UNVERIFIED,
                         restoreVerificationFailure
                     )
+                }
+                if (priorRestored) {
+                    failurePoint = ProcessingArtifactFailurePoint.ROLLBACK_JOURNAL_SETTLEMENT
+                    try {
+                        journalTransition(ProcessingArtifactJournalState.PRIOR_RESTORED, adoptedResult = "PRIOR_FINAL")
+                        cleanupRecords += ProcessingArtifactSettlementRecord(
+                            finalFile,
+                            ProcessingArtifactResourceRole.RESTORED_PRIOR,
+                            ProcessingArtifactSettlementStatus.RESTORED
+                        )
+                    } catch (journalFailure: Throwable) {
+                        captureRollbackFailure(journalFailure, ProcessingArtifactFailurePoint.ROLLBACK_JOURNAL_SETTLEMENT)
+                        cleanupRecords += ProcessingArtifactSettlementRecord(
+                            finalFile,
+                            ProcessingArtifactResourceRole.RESTORED_PRIOR,
+                            ProcessingArtifactSettlementStatus.RESTORE_MOVE_FAILED,
+                            journalFailure
+                        )
+                    }
                 }
             }
         }
@@ -491,6 +567,7 @@ internal fun commitProcessingArtifact(
         } else {
             state = ProcessingArtifactState.ROLLED_BACK
             if (priorRestored || !priorBackedUp) {
+                failurePoint = ProcessingArtifactFailurePoint.ROLLBACK_JOURNAL_SETTLEMENT
                 try {
                     journalTransition(
                         if (priorRestored) ProcessingArtifactJournalState.PRIOR_RESTORED else ProcessingArtifactJournalState.SETTLED,
@@ -503,7 +580,7 @@ internal fun commitProcessingArtifact(
                     )
                     journal.deleteIfOwned(parent)
                 } catch (secondary: Throwable) {
-                    captureRollbackFailure(secondary)
+                    captureRollbackFailure(secondary, ProcessingArtifactFailurePoint.ROLLBACK_JOURNAL_SETTLEMENT)
                 }
             }
         }
@@ -526,7 +603,8 @@ internal fun commitProcessingArtifact(
             cause = failure,
             settlements = allSettlements,
             priorBackupFile = priorBackup.takeIf { priorBackedUp && it.exists() },
-            failureStage = capturedFailureStage
+            failurePoint = capturedFailurePoint,
+            rollbackFailurePoint = rollbackFailurePoint
         )
     }
 }

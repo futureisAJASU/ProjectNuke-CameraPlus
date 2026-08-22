@@ -195,7 +195,8 @@ private class ProductionMetadataWriter(
         firstWorkerFailureStage: String? = null,
         queuedWork: Int = 0,
         inFlightWork: Int = 0,
-        pendingCandidateCount: Int = 0
+        yuvBufferedFrames: Int = 0,
+        yuvReservedAdoptionCount: Int = 0
     ) {
         val actualPhysicalId =
             if (actualRoute == PhysicalCaptureRoute.PHYSICAL.name) requestedPhysicalCameraId else null
@@ -254,7 +255,8 @@ private class ProductionMetadataWriter(
             yuvFirstWorkerFailureStage = firstWorkerFailureStage,
             yuvQueuedWork = queuedWork,
             yuvInFlightWork = inFlightWork,
-            yuvPendingCandidateCount = pendingCandidateCount
+            yuvBufferedFrames = yuvBufferedFrames,
+            yuvReservedAdoptionCount = yuvReservedAdoptionCount
         )
     }
 }
@@ -666,7 +668,8 @@ fun captureYuvBurstColorWithMotion(
                     firstWorkerFailureStage = request.firstWorkerFailureStage,
                     queuedWork = request.queuedWork,
                     inFlightWork = request.inFlightWork,
-                    pendingCandidateCount = request.pendingCandidateCount
+                    yuvBufferedFrames = request.yuvBufferedFrames,
+                    yuvReservedAdoptionCount = request.yuvReservedAdoptionCount
                 )
             },
             verifiedFileReader = YuvVerifiedFileReader { file ->
@@ -1707,7 +1710,8 @@ internal fun writeColorJobJson(
     yuvFirstWorkerFailureStage: String? = null,
     yuvQueuedWork: Int = 0,
     yuvInFlightWork: Int = 0,
-    yuvPendingCandidateCount: Int = 0
+    yuvBufferedFrames: Int = 0,
+    yuvReservedAdoptionCount: Int = 0
 ) {
     val actualPhysicalCameraId =
         if (actualRoute == PhysicalCaptureRoute.PHYSICAL.name) physicalCameraId else null
@@ -1856,7 +1860,8 @@ internal fun writeColorJobJson(
         .put("yuvFirstWorkerFailureStage", yuvFirstWorkerFailureStage ?: previousJob?.optString("yuvFirstWorkerFailureStage") ?: JSONObject.NULL)
         .put("yuvQueuedWork", yuvQueuedWork)
         .put("yuvInFlightWork", yuvInFlightWork)
-        .put("yuvPendingCandidateCount", yuvPendingCandidateCount)
+        .put("yuvBufferedFrames", yuvBufferedFrames)
+        .put("yuvReservedAdoptionCount", yuvReservedAdoptionCount)
         .put("yuvMemoryBufferUsed", yuvMemoryBufferUsed)
         .put("yuvMemoryBufferEstimatedBytes", yuvMemoryBufferEstimatedBytes)
         .put("yuvMemoryBufferFrameLimit", MAX_YUV_MEMORY_BUFFER_FRAMES)

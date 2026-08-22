@@ -425,7 +425,8 @@ class HardwareE2ETest {
             yuvFirstWorkerFailureStage = "TEMP_VERIFY",
             yuvQueuedWork = 0,
             yuvInFlightWork = 0,
-            yuvPendingCandidateCount = 0,
+            yuvBufferedFrames = 0,
+            yuvReservedAdoptionCount = 0,
             rawPublicExportAttemptStatus = "FAILED",
             rawPublicExportAttemptError = "IllegalStateException: HEIF writer failed",
             rawPublicExportAttemptAt = 1_000L,
@@ -485,7 +486,8 @@ class HardwareE2ETest {
             .put("yuvFirstWorkerFailureStage", JSONObject.NULL)
             .put("yuvQueuedWork", JSONObject.NULL)
             .put("yuvInFlightWork", JSONObject.NULL)
-            .put("yuvPendingCandidateCount", JSONObject.NULL)
+            .put("yuvBufferedFrames", JSONObject.NULL)
+            .put("yuvReservedAdoptionCount", JSONObject.NULL)
             .put("rawPublicExportAttemptStatus", JSONObject.NULL)
             .put("rawPublicExportAttemptError", JSONObject.NULL)
             .put("rawPublicExportAttemptAt", JSONObject.NULL)
@@ -504,7 +506,8 @@ class HardwareE2ETest {
         assertNull(summary.yuvFirstWorkerFailureStage)
         assertNull(summary.yuvQueuedWork)
         assertNull(summary.yuvInFlightWork)
-        assertNull(summary.yuvPendingCandidateCount)
+        assertNull(summary.yuvBufferedFrames)
+        assertNull(summary.yuvReservedAdoptionCount)
         assertNull(summary.rawPublicExportAttemptStatus)
         assertNull(summary.rawPublicExportAttemptError)
         assertNull(summary.rawPublicExportAttemptAt)
@@ -558,7 +561,8 @@ class HardwareE2ETest {
             .put("yuvFirstWorkerFailureStage", JSONObject.NULL)
             .put("yuvQueuedWork", 0)
             .put("yuvInFlightWork", 0)
-            .put("yuvPendingCandidateCount", 0)
+            .put("yuvBufferedFrames", 0)
+            .put("yuvReservedAdoptionCount", 0)
             .put("rawPublicExportAttemptStatus", JSONObject.NULL)
             .put("rawPublicExportAttemptError", JSONObject.NULL)
             .put("rawPublicExportAttemptAt", JSONObject.NULL)
@@ -577,7 +581,8 @@ class HardwareE2ETest {
         assertNull(summary.yuvFirstWorkerFailureStage)
         assertEquals(0, summary.yuvQueuedWork)
         assertEquals(0, summary.yuvInFlightWork)
-        assertEquals(0, summary.yuvPendingCandidateCount)
+        assertEquals(0, summary.yuvBufferedFrames)
+        assertEquals(0, summary.yuvReservedAdoptionCount)
         assertNull(summary.rawPublicExportAttemptStatus)
         assertNull(summary.rawPublicExportAttemptError)
         assertNull(summary.rawPublicExportAttemptAt)

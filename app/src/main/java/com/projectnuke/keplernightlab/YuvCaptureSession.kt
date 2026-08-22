@@ -135,8 +135,9 @@ internal class YuvCaptureSession internal constructor(
                 firstWorkerFailureStage: String?,
                 queuedWork: Int,
                 inFlightWork: Int,
-                pendingCandidateCount: Int
-            ) -> Unit = { _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ -> },
+                yuvBufferedFrames: Int,
+                yuvReservedAdoptionCount: Int
+            ) -> Unit = { _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ -> },
             saveMotionOnce: (File) -> Pair<String?, String?> = { _ -> null to null },
             onCaptureComplete: (File) -> Unit = {},
             onCaptureError: (message: String, cause: Throwable?) -> Unit = { _, _ -> },
@@ -162,7 +163,8 @@ internal class YuvCaptureSession internal constructor(
                         request.firstWorkerFailureStage,
                         request.queuedWork,
                         request.inFlightWork,
-                        request.pendingCandidateCount
+                        request.yuvBufferedFrames,
+                        request.yuvReservedAdoptionCount
                     )
                 },
             verifiedFileReader: YuvVerifiedFileReader =

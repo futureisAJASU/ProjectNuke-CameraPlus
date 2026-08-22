@@ -1077,7 +1077,7 @@ class ProcessingArtifactTransactionTest {
                 thrown = failure
             }
             assertNotNull(thrown)
-            assertEquals(ProcessingArtifactFailureStage.TEMP_WRITE, thrown!!.failureStage)
+            assertEquals(ProcessingArtifactFailurePoint.TEMP_WRITE, thrown!!.failurePoint)
         } finally {
             dir.deleteRecursively()
         }
@@ -1099,7 +1099,7 @@ class ProcessingArtifactTransactionTest {
                 thrown = failure
             }
             assertNotNull(thrown)
-            assertEquals(ProcessingArtifactFailureStage.TEMP_VERIFY, thrown!!.failureStage)
+            assertEquals(ProcessingArtifactFailurePoint.TEMP_VERIFY, thrown!!.failurePoint)
         } finally {
             dir.deleteRecursively()
         }
@@ -1123,7 +1123,7 @@ class ProcessingArtifactTransactionTest {
                 thrown = failure
             }
             assertNotNull(thrown)
-            assertEquals(ProcessingArtifactFailureStage.FINAL_VERIFY, thrown!!.failureStage)
+            assertEquals(ProcessingArtifactFailurePoint.FINAL_VERIFY, thrown!!.failurePoint)
         } finally {
             dir.deleteRecursively()
         }
@@ -1175,7 +1175,7 @@ class ProcessingArtifactTransactionTest {
                 thrown = failure
             }
             assertNotNull(thrown)
-            assertEquals(ProcessingArtifactFailureStage.TEMP_VERIFY, thrown!!.failureStage)
+            assertEquals(ProcessingArtifactFailurePoint.TEMP_VERIFY, thrown!!.failurePoint)
         } finally {
             dir.deleteRecursively()
         }

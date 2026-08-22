@@ -134,7 +134,8 @@ class YuvCaptureOwnerTest {
         metadataFailure: Boolean = false,
         statusFailure: Boolean = false,
         callbackDispatchFailure: Boolean = false,
-        callbackBodyFailure: Boolean = false
+        callbackBodyFailure: Boolean = false,
+        processingArtifactFailurePoint: ProcessingArtifactFailurePoint? = null
     ) {
         val dir: File = Files.createTempDirectory("yuv-owner-test").toFile()
         val handlerThread = android.os.HandlerThread("yuv-test").apply { start() }
@@ -174,11 +175,33 @@ class YuvCaptureOwnerTest {
                     override fun encodeDirect(image: Image, candidate: File, rotationDegrees: Int) {
                         encodeLatch?.signalStartAndBlock()
                         if (encodeFailure) throw IllegalStateException("forced encode failure")
+                        processingArtifactFailurePoint?.let { point ->
+                            val temp = File(candidate.parentFile, "temp-${candidate.name}")
+                            val final = File(candidate.parentFile, "final-${candidate.name}")
+                            throw ProcessingArtifactException(
+                                finalFile = final,
+                                tempFile = temp,
+                                cleanupFailure = null,
+                                cause = java.io.IOException("simulated disk full"),
+                                failurePoint = point
+                            )
+                        }
                         Files.write(candidate.toPath(), PNG_1X1)
                     }
                     override fun encodeBuffered(frame: BufferedYuvFrame, candidate: File, rotationDegrees: Int) {
                         encodeLatch?.signalStartAndBlock()
                         if (encodeFailure) throw IllegalStateException("forced encode failure")
+                        processingArtifactFailurePoint?.let { point ->
+                            val temp = File(candidate.parentFile, "temp-${candidate.name}")
+                            val final = File(candidate.parentFile, "final-${candidate.name}")
+                            throw ProcessingArtifactException(
+                                finalFile = final,
+                                tempFile = temp,
+                                cleanupFailure = null,
+                                cause = java.io.IOException("simulated disk full"),
+                                failurePoint = point
+                            )
+                        }
                         Files.write(candidate.toPath(), PNG_1X1)
                     }
                 },
@@ -196,7 +219,7 @@ class YuvCaptureOwnerTest {
                 if (!handler.post(runnable)) runnable.run()
                 true
             },
-            writeJobJson = { status, saved, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ ->
+            writeJobJson = { status, saved, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ ->
                 if (metadataFailure) throw IllegalStateException("injected metadata failure")
                 handler.post {
                     persistedFrames.set(saved)
@@ -834,7 +857,7 @@ class YuvCaptureOwnerTest {
                 }
             ),
             dispatchCallback = CallbackDispatcher { false },
-            writeJobJson = { status, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ ->
+            writeJobJson = { status, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ ->
                 if (status in setOf("CAPTURE_COMPLETE", "CAPTURE_PARTIAL", "CAPTURE_FAILED", "CAPTURE_TIMEOUT", "CAPTURE_CANCELLED")) {
                     terminalLatch.countDown()
                 }
@@ -951,6 +974,34 @@ class YuvCaptureOwnerTest {
             assertNotNull(terminalRequest)
             assertTrue(terminalRequest!!.reason!!.contains("firstWorkerFailure=IllegalStateException: forced encode failure"))
             assertTrue("reason=${terminalRequest.reason}", terminalRequest.reason!!.contains("failed="))
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun yuvWorkerProcessingArtifactFailure_propagatesFailurePointAndRootCause() {
+        val harness = Harness(
+            frameCount = 2,
+            processingArtifactFailurePoint = ProcessingArtifactFailurePoint.TEMP_WRITE
+        )
+        try {
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(2000L))
+            harness.flushHandler()
+            harness.session.boundedWorker.close()
+            assertTrue(harness.session.boundedWorker.awaitTermination(5_000L))
+            harness.flushHandler()
+            harness.session.owner.onDeadlineReached()
+            val status = harness.awaitTerminal()
+            assertEquals(CaptureTerminalStatus.TIMED_OUT, status)
+            harness.awaitCallback()
+            val terminalRequest = harness.session.terminalRequestHandoff.awaitPublishedOrClosed(5)
+            assertNotNull(terminalRequest)
+            val reason = terminalRequest!!.reason!!
+            assertTrue("reason=$reason", reason.contains("firstWorkerFailure=ProcessingArtifactException:"))
+            assertTrue("reason=$reason", reason.contains("point=TEMP_WRITE"))
+            assertTrue("reason=$reason", reason.contains("rootCause=IOException: simulated disk full"))
         } finally {
             harness.shutdown()
         }

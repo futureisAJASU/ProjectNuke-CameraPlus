@@ -247,7 +247,7 @@ internal class YuvCaptureOwner(
         val exceptionMessage: String?,
         val rootCauseClass: String,
         val rootCauseMessage: String?,
-        val failureStage: String? = null,
+        val failurePoint: String? = null,
         val cause: Throwable
     )
 
@@ -615,7 +615,7 @@ internal class YuvCaptureOwner(
                         exceptionMessage = completion.cause.message,
                         rootCauseClass = rootCause::class.java.simpleName,
                         rootCauseMessage = rootCause.message,
-                        failureStage = artifactException?.failureStage?.name,
+                        failurePoint = artifactException?.failurePoint?.name,
                         cause = completion.cause
                     )
                 }
@@ -1018,7 +1018,7 @@ internal class YuvCaptureOwner(
     private fun timeoutReason(snap: YuvCaptureAccountingSnapshot): String {
         val failure = firstWorkerFailure
         return if (failure != null && snap.failedFrames > 0) {
-            val stage = failure.failureStage?.let { " stage=$it" } ?: ""
+            val stage = failure.failurePoint?.let { " point=$it" } ?: ""
             "YUV timeout: saved=${snap.persistedFrames}/$frameCount, failed=${snap.failedFrames}, dropped=${snap.droppedFrames}; " +
                 "firstWorkerFailure=${failure.exceptionClass}: ${failure.exceptionMessage ?: "no message"}; " +
                 "rootCause=${failure.rootCauseClass}: ${failure.rootCauseMessage ?: "no message"}$stage"
@@ -1166,10 +1166,11 @@ internal class YuvCaptureOwner(
                         firstWorkerFailureFrameIndex = firstWorkerFailure?.frameIndex,
                         firstWorkerFailureRootCauseClass = firstWorkerFailure?.rootCauseClass,
                         firstWorkerFailureRootCauseMessage = firstWorkerFailure?.rootCauseMessage,
-                        firstWorkerFailureStage = firstWorkerFailure?.failureStage,
+                        firstWorkerFailureStage = firstWorkerFailure?.failurePoint,
                         queuedWork = boundedWorker.queuedCount(),
                         inFlightWork = boundedWorker.activeCount(),
-                        pendingCandidateCount = snap.bufferedFrames
+                        yuvBufferedFrames = snap.bufferedFrames,
+                        yuvReservedAdoptionCount = snap.reservedCount
                     )
                 )
                 TerminalOperationOutcome.Succeeded

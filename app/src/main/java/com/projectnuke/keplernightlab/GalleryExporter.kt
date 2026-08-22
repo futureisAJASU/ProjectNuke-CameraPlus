@@ -21,6 +21,10 @@ internal var mediaStoreAbandonDeleteFailureForTest: Throwable? = null
  * public state (true = non-pending row, false = still pending/absent).
  */
 internal var mediaStorePublicCommitStateForTest: ((Uri) -> Boolean?)? = null
+internal var mediaStoreInsertNullForTest: Boolean = false
+internal var mediaStoreOpenOutputStreamFailureForTest: (() -> Throwable?)? = null
+internal var mediaStoreUpdateCountForTest: (() -> Int)? = null
+internal var galleryExportVerificationForTest: GalleryExportVerification? = null
 
 enum class GalleryExportCommitState {
     NOT_COMMITTED,
@@ -221,7 +225,7 @@ fun exportNightFusionBitmapToGallery(
         if (result.publicCommitState != GalleryExportCommitState.NOT_COMMITTED) {
             return result.copy(
                 attemptedFormats = attempts.takeWhile { it != format } + format,
-                candidateFailureReasons = errors.toList()
+                candidateFailureReasons = errors.toList() + result.candidateFailureReasons
             )
         }
         errors += "${format.label}: ${result.errorMessage}"
@@ -2099,7 +2103,7 @@ fun requestedOutputFormatForSetting(finalOutputFormat: FinalOutputFormat): Outpu
     else -> OutputFormat.PNG
 }
 
-private fun writeGalleryBitmap(
+internal fun writeGalleryBitmap(
     context: Context,
     bitmap: Bitmap,
     displayName: String,
@@ -2180,15 +2184,19 @@ private fun writeGalleryBitmap(
     }
 
     val committedUri = inserted.uri
-    val verification = verifyGalleryExportResult(
-        context = context,
-        uriString = committedUri.toString(),
-        expectation = GalleryExportExpectation(
-            format = format,
-            width = bitmap.width,
-            height = bitmap.height
+    val verification = if (galleryExportVerificationForTest != null) {
+        galleryExportVerificationForTest!!
+    } else {
+        verifyGalleryExportResult(
+            context = context,
+            uriString = committedUri.toString(),
+            expectation = GalleryExportExpectation(
+                format = format,
+                width = bitmap.width,
+                height = bitmap.height
+            )
         )
-    )
+    }
 
     if (verification !is GalleryExportVerification.Verified) {
         return GalleryExportResult(
@@ -2276,7 +2284,7 @@ internal fun deleteMediaStoreRowForAbandon(context: Context, uri: Uri): Boolean 
     }
 }
 
-private data class InsertedPublicFile(
+internal data class InsertedPublicFile(
     val uri: Uri,
     val size: Long,
     val journal: MediaStoreExportJournal?,
@@ -2317,7 +2325,7 @@ private fun inspectPublicCommitStatePreservingPrimary(
     throw requireNotNull(combineSettlementFailure(primary, secondary))
 }
 
-private fun insertPublicFile(
+internal fun insertPublicFile(
     context: Context,
     displayName: String,
     mimeType: String,
@@ -2402,35 +2410,40 @@ private fun insertPublicFile(
                 ,ownerOperationId = ownerOperationId
             )
         }
-        val insertedUri = resolver.insert(collectionUri, values)
+        val insertedUri = if (mediaStoreInsertNullForTest) {
+            null
+        } else {
+            resolver.insert(collectionUri, values)
+        }
         insertReturned = true
         if (insertedUri == null) {
             journal = journal?.transition(jobDir!!, MediaStoreExportState.INSERT_FAILED_NO_ROW)
+            val reason = IllegalStateException("ContentResolver.insert returned null for displayName=$displayName collection=$collectionUri")
+            try { onFailure?.invoke(reason) } catch (_: Exception) {}
             return null
         }
         uri = insertedUri
         journal = journal?.transition(jobDir!!, MediaStoreExportState.ROW_INSERTED, uri.toString())
         cancellation.throwIfCancelled()
-        resolver.openOutputStream(uri)?.use(writer) ?: error("openOutputStream returned null")
+        mediaStoreOpenOutputStreamFailureForTest?.invoke()?.let { throw it }
+        val outputStream = resolver.openOutputStream(uri)
+            ?: error("openOutputStream returned null")
+        outputStream.use(writer)
         journal = journal?.transition(jobDir!!, MediaStoreExportState.CONTENT_WRITTEN)
         cancellation.throwIfCancelled()
         publicCommitAttempted = true
-        val updateCount = try {
-            resolver.update(
+        val updateCount = mediaStoreUpdateCountForTest?.invoke()
+            ?: resolver.update(
                 uri,
                 ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) },
                 null,
                 null
             )
-        } catch (failure: Exception) {
-            preserveObservedPublicRow(
-                inspectPublicCommitStatePreservingPrimary(context, uri, failure), failure
-            )?.let { return it }
-            throw failure
-        }
         if (updateCount != 1) {
             preserveObservedPublicRow(inspectPublicCommitState(context, uri))?.let { return it }
             journal?.let { journal = abandonMediaStoreAttempt(context, jobDir!!, it, uri!!) }
+            val reason = IllegalStateException("MediaStore IS_PENDING clear updated $updateCount rows; expected 1; public row not committed")
+            try { onFailure?.invoke(reason) } catch (_: Exception) {}
             return null
         }
         try {
@@ -2510,7 +2523,7 @@ private fun insertPublicFile(
         }
         val combined = combineSettlementFailure(error, cleanupFailure)
         if (combined is Error || combined is CancellationException) throw requireNotNull(combined)
-        onFailure?.invoke(requireNotNull(combined))
+        try { onFailure?.invoke(requireNotNull(combined)) } catch (_: Exception) {}
         null
     }
 }
