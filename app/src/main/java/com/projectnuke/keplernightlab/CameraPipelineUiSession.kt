@@ -1,7 +1,16 @@
 package com.projectnuke.keplernightlab
 
 /** Explicit owner for one Compose-visible capture pipeline operation. */
-internal class CameraPipelineUiSession {
+internal class CameraPipelineUiSession(
+    /**
+     * Live background-processing occupancy probe. In this phase it only feeds
+     * observability and the (still conservative) admission check; routing
+     * production work through the coordinator happens in a later phase.
+     */
+    private val backgroundOccupancy: () -> Boolean = { false }
+) {
+    /** Foreground capture ownership truth, generation-guarded. */
+    val foreground = ForegroundCaptureSession()
     enum class Phase {
         IDLE,
         START_SCHEDULED,
@@ -22,13 +31,30 @@ internal class CameraPipelineUiSession {
         val captureProgress: CaptureProgressState = CaptureProgressState(),
         val previewAllowed: Boolean = true,
         val captureResourcesSettled: Boolean = true,
-        val requiredOutputCommitted: Boolean = false
+        val requiredOutputCommitted: Boolean = false,
+        val captureOwnerPhase: ForegroundCaptureSession.CaptureOwnershipPhase =
+            ForegroundCaptureSession.CaptureOwnershipPhase.IDLE,
+        val backgroundProcessingActive: Boolean = false,
+        val captureStatus: String? = null,
+        val backgroundStatus: String? = null
     ) {
         val isBusy: Boolean
             get() = phase != Phase.IDLE && phase != Phase.DISPOSED &&
                 (phase != Phase.TERMINAL || !captureResourcesSettled)
         val isCapturing: Boolean
             get() = phase == Phase.START_SCHEDULED || phase == Phase.CAPTURING
+
+        /**
+         * Foreground-only capture ownership truth. In this behavior-neutral
+         * phase the shutter still gates on [isBusy]; this split becomes the
+         * admission authority only when early release is enabled later.
+         */
+        val isCaptureBusy: Boolean
+            get() = captureOwnerPhase == ForegroundCaptureSession.CaptureOwnershipPhase.SCHEDULED ||
+                captureOwnerPhase == ForegroundCaptureSession.CaptureOwnershipPhase.CAPTURING
+
+        val isBackgroundProcessingBusy: Boolean
+            get() = backgroundProcessingActive
     }
 
     data class Operation(
@@ -60,7 +86,7 @@ internal class CameraPipelineUiSession {
     private var current = Snapshot()
 
     @Synchronized
-    fun snapshot(): Snapshot = current
+    fun snapshot(): Snapshot = current.copy(backgroundProcessingActive = backgroundOccupancy())
 
     @Synchronized
     fun acceptsDisplayUpdate(localGeneration: Long): Boolean =
@@ -78,7 +104,10 @@ internal class CameraPipelineUiSession {
 
     @Synchronized
     fun start(startMessage: String, requestedFrames: Int): StartResult {
-        if (disposed || current.isBusy) return StartResult.Rejected
+        // Behavior-neutral phase: admission still rejects whenever the whole
+        // pipeline (including post-capture processing) is occupied, and now
+        // also when the background lane holds work. Early release comes later.
+        if (disposed || current.isBusy || backgroundOccupancy()) return StartResult.Rejected
         val newOperation = Operation(
             generation = ++nextGeneration,
             cancellationToken = KeplerPipelineCancellationToken(),
@@ -86,6 +115,7 @@ internal class CameraPipelineUiSession {
         )
         operation = newOperation
         terminalClaimed = false
+        foreground.beginScheduled(newOperation.generation)
         current = Snapshot(
             generation = newOperation.generation,
             phase = Phase.START_SCHEDULED,
@@ -96,7 +126,10 @@ internal class CameraPipelineUiSession {
                 progressPercent = 0.05f
             ),
             previewAllowed = false,
-            captureResourcesSettled = false
+            captureResourcesSettled = false,
+            captureOwnerPhase = ForegroundCaptureSession.CaptureOwnershipPhase.SCHEDULED,
+            backgroundProcessingActive = backgroundOccupancy(),
+            captureStatus = startMessage
         )
         return StartResult.Accepted(newOperation)
     }
@@ -155,6 +188,7 @@ internal class CameraPipelineUiSession {
         if (!current.cancellationRequested) {
             active.cancellationToken.cancel()
             active.captureCancellation.cancelCapture(reason)
+            foreground.markCancellationRequested(localGeneration)
             current = current.copy(
                 phase = Phase.CANCELLATION_REQUESTED,
                 cancellationRequested = true,
@@ -179,6 +213,7 @@ internal class CameraPipelineUiSession {
         terminalClaimed = true
         operation?.cancellationToken?.cancel()
         operation?.captureCancellation?.cancelCapture("camera pipeline failed before capture start")
+        foreground.abandon(localGeneration)
         current = current.copy(
             phase = Phase.TERMINAL,
             terminal = terminal,
@@ -206,6 +241,7 @@ internal class CameraPipelineUiSession {
             message = message
         )
         terminalClaimed = true
+        foreground.abandon(localGeneration)
         current = current.copy(
             phase = Phase.TERMINAL,
             terminal = terminal,
@@ -259,6 +295,9 @@ internal class CameraPipelineUiSession {
                 return EventResult.DUPLICATE_TERMINAL
             }
             terminalClaimed = true
+            // The whole pipeline operation ended: foreground capture ownership
+            // is released regardless of which stage claimed the terminal.
+            foreground.abandon(event.generation)
             current = current.copy(
                 phase = Phase.TERMINAL,
                 terminal = event,
@@ -274,7 +313,9 @@ internal class CameraPipelineUiSession {
                 ),
                 previewAllowed = event.captureResourcesSettled,
                 captureResourcesSettled = event.captureResourcesSettled,
-                requiredOutputCommitted = event.requiredOutputCommitted
+                requiredOutputCommitted = event.requiredOutputCommitted,
+                captureOwnerPhase = ForegroundCaptureSession.CaptureOwnershipPhase.IDLE,
+                backgroundProcessingActive = backgroundOccupancy()
             )
             return EventResult.ACCEPTED
         }
@@ -297,10 +338,43 @@ internal class CameraPipelineUiSession {
             is CameraPipelineEvent.ExportStage -> event.stage
             is CameraPipelineEvent.Terminal -> error("handled above")
         }
+        // Foreground ownership transitions at the capture-stage boundary.
+        var ownerPhase = current.captureOwnerPhase
+        var nextCaptureStatus = current.captureStatus
+        var nextBackgroundStatus = current.backgroundStatus
+        when (event) {
+            is CameraPipelineEvent.Started -> {
+                foreground.beginCapturing(event.generation)
+                ownerPhase = ForegroundCaptureSession.CaptureOwnershipPhase.CAPTURING
+                nextCaptureStatus = event.message
+            }
+            is CameraPipelineEvent.CaptureProgress -> nextCaptureStatus = event.message
+            is CameraPipelineEvent.CaptureStageComplete -> {
+                foreground.settleHandoff(event.generation)
+                ownerPhase = ForegroundCaptureSession.CaptureOwnershipPhase.HANDOFF_SETTLED
+                nextCaptureStatus = event.message
+            }
+            is CameraPipelineEvent.ProcessingStage, is CameraPipelineEvent.ExportStage -> {
+                // After handoff settlement these belong to the background lane.
+                // The legacy `status` mirror below stays for compatibility;
+                // explicit channels let later phases arbitrate without parsing.
+                if (foreground.state().phase ==
+                    ForegroundCaptureSession.CaptureOwnershipPhase.HANDOFF_SETTLED
+                ) {
+                    nextBackgroundStatus = event.message
+                } else {
+                    nextCaptureStatus = event.message
+                }
+            }
+            is CameraPipelineEvent.Terminal -> error("handled above")
+        }
         current = current.copy(
             phase = if (current.cancellationRequested) Phase.WAITING_FOR_TERMINAL else nextPhase,
             captureProgress = event.counts.toCaptureProgress(current.captureProgress, stage, event.message),
-            previewAllowed = false
+            previewAllowed = false,
+            captureOwnerPhase = ownerPhase,
+            captureStatus = nextCaptureStatus,
+            backgroundStatus = nextBackgroundStatus
         )
         return EventResult.ACCEPTED
     }
@@ -330,6 +404,7 @@ internal class CameraPipelineUiSession {
             it.cancellationToken.cancel()
             it.captureCancellation.cancelCapture("camera screen disposed")
         }
+        foreground.abandon(current.generation)
         scheduledStart = null
         watchdog = null
         terminalFallback = null
