@@ -166,6 +166,15 @@ internal class CameraPipelineUiOrchestrator(
             when (session.accept(event)) {
                 CameraPipelineUiSession.EventResult.ACCEPTED -> {
                     notifyDiagnosticEvent(event)
+                    // The capture watchdog ends at durable capture settlement:
+                    // once handoff evidence is accepted, a slow background
+                    // fusion/export must not be cancelled by capture timing.
+                    if (event is CameraPipelineEvent.CaptureStageComplete &&
+                        event.handoffEvidenceComplete
+                    ) {
+                        session.clearWatchdog(generation)?.let(scheduler::remove)
+                        session.clearScheduledStart(generation)?.let(scheduler::remove)
+                    }
                     val terminal = event as? CameraPipelineEvent.Terminal ?: return
                     synchronized(this@CameraPipelineUiOrchestrator) {
                         pendingTerminal = terminal
@@ -223,6 +232,15 @@ internal class CameraPipelineUiOrchestrator(
                                     when (session.accept(event)) {
                                         CameraPipelineUiSession.EventResult.ACCEPTED -> {
                                             notifyDiagnosticEvent(event)
+                                            // The capture watchdog ends at durable
+                                            // capture settlement (shared rule with
+                                            // the synchronous acceptEvent path).
+                                            if (event is CameraPipelineEvent.CaptureStageComplete &&
+                                                event.handoffEvidenceComplete
+                                            ) {
+                                                session.clearWatchdog(generation)?.let(scheduler::remove)
+                                                session.clearScheduledStart(generation)?.let(scheduler::remove)
+                                            }
                                             notifyNonTerminal(event)
                                         }
                                         CameraPipelineUiSession.EventResult.DUPLICATE_TERMINAL,

@@ -55,6 +55,19 @@ internal class CameraPipelineUiSession(
 
         val isBackgroundProcessingBusy: Boolean
             get() = backgroundProcessingActive
+
+        /**
+         * Phase 5 safe shutter-release boundary: a new capture may be admitted
+         * exactly when no foreground generation owns capture resources and the
+         * previous operation left the camera in an admittable state. Active or
+         * queued BACKGROUND processing never appears here - fusion/export must
+         * not keep the shutter locked after durable handoff.
+         */
+        val canAdmitNewCapture: Boolean
+            get() = !isCaptureBusy &&
+                phase != Phase.UNRESOLVED &&
+                phase != Phase.DISPOSED &&
+                (phase != Phase.TERMINAL || captureResourcesSettled)
     }
 
     data class Operation(
@@ -104,10 +117,10 @@ internal class CameraPipelineUiSession(
 
     @Synchronized
     fun start(startMessage: String, requestedFrames: Int): StartResult {
-        // Behavior-neutral phase: admission still rejects whenever the whole
-        // pipeline (including post-capture processing) is occupied, and now
-        // also when the background lane holds work. Early release comes later.
-        if (disposed || current.isBusy || backgroundOccupancy()) return StartResult.Rejected
+        // Phase 5 admission: the shutter is gated only by foreground capture
+        // ownership and unresolved camera states. Durable-handoff completion
+        // frees admission even while heavy background processing continues.
+        if (disposed || !current.canAdmitNewCapture) return StartResult.Rejected
         val newOperation = Operation(
             generation = ++nextGeneration,
             cancellationToken = KeplerPipelineCancellationToken(),
@@ -185,6 +198,15 @@ internal class CameraPipelineUiSession(
         ) {
             return false
         }
+        // Cancellation split (Phase 5): after the durable handoff boundary the
+        // foreground owns nothing cancellable. Cancelling here would kill
+        // background processing that no longer gates the shutter.
+        val ownerState = foreground.state()
+        if (ownerState.generation == localGeneration &&
+            ownerState.phase == ForegroundCaptureSession.CaptureOwnershipPhase.HANDOFF_SETTLED
+        ) {
+            return false
+        }
         if (!current.cancellationRequested) {
             active.cancellationToken.cancel()
             active.captureCancellation.cancelCapture(reason)
@@ -223,7 +245,8 @@ internal class CameraPipelineUiSession(
                 progressPercent = 1f
             ),
             previewAllowed = true,
-            captureResourcesSettled = true
+            captureResourcesSettled = true,
+            captureOwnerPhase = ForegroundCaptureSession.CaptureOwnershipPhase.IDLE
         )
         return true
     }
@@ -251,7 +274,8 @@ internal class CameraPipelineUiSession(
                 progressPercent = 1f
             ),
             previewAllowed = true,
-            captureResourcesSettled = true
+            captureResourcesSettled = true,
+            captureOwnerPhase = ForegroundCaptureSession.CaptureOwnershipPhase.IDLE
         )
         return true
     }
@@ -342,6 +366,8 @@ internal class CameraPipelineUiSession(
         var ownerPhase = current.captureOwnerPhase
         var nextCaptureStatus = current.captureStatus
         var nextBackgroundStatus = current.backgroundStatus
+        var handoffSettled = false
+        var backgroundStageEvent = false
         when (event) {
             is CameraPipelineEvent.Started -> {
                 foreground.beginCapturing(event.generation)
@@ -350,14 +376,21 @@ internal class CameraPipelineUiSession(
             }
             is CameraPipelineEvent.CaptureProgress -> nextCaptureStatus = event.message
             is CameraPipelineEvent.CaptureStageComplete -> {
-                foreground.settleHandoff(event.generation)
-                ownerPhase = ForegroundCaptureSession.CaptureOwnershipPhase.HANDOFF_SETTLED
+                // Only complete authoritative evidence releases the foreground
+                // slot. A bare stage marker keeps capture ownership until
+                // terminal so an unproven handoff can never unlock the shutter.
+                if (event.handoffEvidenceComplete &&
+                    foreground.settleHandoff(event.generation)
+                ) {
+                    ownerPhase = ForegroundCaptureSession.CaptureOwnershipPhase.HANDOFF_SETTLED
+                    handoffSettled = true
+                }
                 nextCaptureStatus = event.message
             }
             is CameraPipelineEvent.ProcessingStage, is CameraPipelineEvent.ExportStage -> {
-                // After handoff settlement these belong to the background lane.
-                // The legacy `status` mirror below stays for compatibility;
-                // explicit channels let later phases arbitrate without parsing.
+                backgroundStageEvent = true
+                // After handoff settlement these belong to the background lane;
+                // they must not re-suppress preview or re-lock the shutter.
                 if (foreground.state().phase ==
                     ForegroundCaptureSession.CaptureOwnershipPhase.HANDOFF_SETTLED
                 ) {
@@ -368,10 +401,16 @@ internal class CameraPipelineUiSession(
             }
             is CameraPipelineEvent.Terminal -> error("handled above")
         }
+        val nextPreviewAllowed = when {
+            handoffSettled -> true
+            backgroundStageEvent -> current.previewAllowed
+            else -> false
+        }
         current = current.copy(
             phase = if (current.cancellationRequested) Phase.WAITING_FOR_TERMINAL else nextPhase,
             captureProgress = event.counts.toCaptureProgress(current.captureProgress, stage, event.message),
-            previewAllowed = false,
+            previewAllowed = nextPreviewAllowed,
+            captureResourcesSettled = current.captureResourcesSettled || handoffSettled,
             captureOwnerPhase = ownerPhase,
             captureStatus = nextCaptureStatus,
             backgroundStatus = nextBackgroundStatus
@@ -400,9 +439,16 @@ internal class CameraPipelineUiSession(
     fun dispose(): Boolean {
         if (disposed) return false
         disposed = true
+        val handedOff = current.captureOwnerPhase ==
+            ForegroundCaptureSession.CaptureOwnershipPhase.HANDOFF_SETTLED
         operation?.let {
-            it.cancellationToken.cancel()
-            it.captureCancellation.cancelCapture("camera screen disposed")
+            if (!handedOff) {
+                // Disposal may cancel an ACTIVE foreground capture per the
+                // existing policy, but must never cancel work that was already
+                // durably handed off to background processing.
+                it.cancellationToken.cancel()
+                it.captureCancellation.cancelCapture("camera screen disposed")
+            }
         }
         foreground.abandon(current.generation)
         scheduledStart = null

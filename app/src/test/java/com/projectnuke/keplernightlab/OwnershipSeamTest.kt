@@ -238,7 +238,16 @@ class OwnershipSeamTest {
         assertEquals(CameraPipelineUiSession.EventResult.ACCEPTED, session.accept(CameraPipelineEvent.Started(generation, "capturing")))
         assertEquals(
             CameraPipelineUiSession.EventResult.ACCEPTED,
-            session.accept(CameraPipelineEvent.CaptureStageComplete(generation, CameraPipelineProgressCounts(), "handoff"))
+            session.accept(
+                CameraPipelineEvent.CaptureStageComplete(
+                    generation,
+                    CameraPipelineProgressCounts(),
+                    "handoff",
+                    jobDirectoryPath = "/data/kepler/KPL_JOB_1",
+                    captureResourcesSettled = true,
+                    processingHandoffDurable = true
+                )
+            )
         )
         assertEquals(
             CameraPipelineUiSession.EventResult.ACCEPTED,
@@ -251,19 +260,22 @@ class OwnershipSeamTest {
 
     @Test
     fun behaviorNeutralPhase_stillRejectsSecondCaptureUntilExplicitEnablement() {
-        // Background occupancy alone rejects an otherwise idle start.
-        val blockedByBackground = CameraPipelineUiSession(backgroundOccupancy = { true })
-        assertTrue(blockedByBackground.snapshot().isBackgroundProcessingBusy)
-        assertTrue(blockedByBackground.start("capture", requestedFrames = 4) is
-            CameraPipelineUiSession.StartResult.Rejected)
+        // Phase 5 explicitly enabled early release: background occupancy is
+        // observability only and must NOT gate an otherwise idle start.
+        val withBackgroundWork = CameraPipelineUiSession(backgroundOccupancy = { true })
+        assertTrue(withBackgroundWork.snapshot().isBackgroundProcessingBusy)
+        assertTrue(
+            withBackgroundWork.start("capture", requestedFrames = 4) is
+                CameraPipelineUiSession.StartResult.Accepted
+        )
 
-        // While a pipeline operation occupies the single slot, another start
-        // is still rejected - the seam did not change admission behavior.
+        // While a pipeline operation occupies the foreground slot, another
+        // start is still rejected.
         val neutral = CameraPipelineUiSession()
         assertTrue(neutral.start("first", requestedFrames = 4) is CameraPipelineUiSession.StartResult.Accepted)
         assertTrue(neutral.start("second", requestedFrames = 4) is CameraPipelineUiSession.StartResult.Rejected)
 
-        // Processing-stage events keep the whole-pipeline busy state (neutral).
+        // Legacy unevidenced processing keeps the whole-pipeline busy state.
         assertNull(neutral.start("third", requestedFrames = 4) as? CameraPipelineUiSession.StartResult.Accepted)
         val currentGeneration = neutral.snapshot().generation
         neutral.accept(CameraPipelineEvent.Started(currentGeneration, "capturing"))
@@ -271,7 +283,7 @@ class OwnershipSeamTest {
             CameraPipelineEvent.CaptureStageComplete(
                 currentGeneration,
                 CameraPipelineProgressCounts(),
-                "handoff durable"
+                "stage complete without handoff evidence"
             )
         )
         neutral.accept(
@@ -284,7 +296,8 @@ class OwnershipSeamTest {
         )
         val busyDuringProcessing = neutral.snapshot()
         assertTrue(busyDuringProcessing.isBusy)
-        assertFalse(busyDuringProcessing.isCaptureBusy)
+        assertTrue(busyDuringProcessing.isCaptureBusy)
+        assertFalse(busyDuringProcessing.canAdmitNewCapture)
         assertTrue(neutral.start("fourth", requestedFrames = 4) is CameraPipelineUiSession.StartResult.Rejected)
 
         // Only after terminal settlement does admission open again.

@@ -23,8 +23,21 @@ sealed interface CameraPipelineEvent {
     data class CaptureStageComplete(
         override val generation: Long,
         override val counts: CameraPipelineProgressCounts,
-        override val message: String? = null
-    ) : CameraPipelineEvent
+        override val message: String? = null,
+        /**
+         * Authoritative durable-handoff evidence (Phase 5 boundary). A
+         * CaptureStageComplete without complete evidence is treated as a
+         * legacy in-pipeline stage marker: foreground capture ownership is
+         * NOT released and the shutter stays gated until terminal.
+         */
+        val jobDirectoryPath: String? = null,
+        val captureResourcesSettled: Boolean = false,
+        val processingHandoffDurable: Boolean = false
+    ) : CameraPipelineEvent {
+        /** True only when the event proves the exact durable handoff boundary. */
+        val handoffEvidenceComplete: Boolean
+            get() = jobDirectoryPath != null && captureResourcesSettled && processingHandoffDurable
+    }
 
     data class ProcessingStage(
         override val generation: Long,

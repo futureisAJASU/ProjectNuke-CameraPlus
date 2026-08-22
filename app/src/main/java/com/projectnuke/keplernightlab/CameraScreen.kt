@@ -315,6 +315,9 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
     )
     val isCapturing = pipelineUiState.isCapturing
     val isPipelineBusy = pipelineUiState.isBusy
+    // Phase 5 shutter admission: gated by foreground capture ownership only.
+    // Background fusion/export after durable handoff never blocks this.
+    val canAdmitNewCapture = pipelineUiState.canAdmitNewCapture
     val captureProgress = pipelineUiState.captureProgress
 
     fun publishPipelineState() {
@@ -496,9 +499,7 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
                     lifecyclePreviewAllowed = false
                     settingsPersistence.flush()
                     val snapshot = pipelineSession.snapshot()
-                    if (snapshot.phase == CameraPipelineUiSession.Phase.START_SCHEDULED ||
-                        snapshot.phase == CameraPipelineUiSession.Phase.CAPTURING
-                    ) {
+                    if (snapshot.isCaptureBusy) {
                         pipelineSession.requestCancellation(snapshot.generation, "activity stopped")
                         publishPipelineState()
                     }
@@ -1060,16 +1061,16 @@ LaunchedEffect(Unit) {
                     applyZoomRatio(it)
                 },
                 isCapturing = isCapturing,
-                isPipelineBusy = isPipelineBusy,
+                isPipelineBusy = !canAdmitNewCapture,
                 captureProgress = captureProgress,
                 onHideFocusAeControls = {
                     showFocusAeControls = false
                     showZoomSlider = false
                 },
                 onCapture = captureClick@{
-                    if (isPipelineBusy) {
-                        status = "Pipeline busy: current fusion/export is still running."
-                        Log.i("KeplerPipelineState", "click ignored while busy status=$status")
+                    if (!canAdmitNewCapture) {
+                        status = "촬영 자원을 정리하는 중입니다. 잠시 후 다시 시도해 주세요."
+                        Log.i("KeplerPipelineState", "click ignored while capture resources owned status=$status")
                         return@captureClick
                     }
                     val clickResult = handleCaptureClick(
@@ -1156,8 +1157,8 @@ LaunchedEffect(Unit) {
                     }
                 },
                 onAverage = average@{
-                    if (isPipelineBusy) {
-                        status = "Pipeline busy: current fusion/export is still running."
+                    if (!canAdmitNewCapture) {
+                        status = "처리 중인 작업이 있어 재생성을 시작할 수 없습니다. 잠시 후 다시 시도해 주세요."
                         Log.i("KeplerPipelineState", "average/reprocess ignored while busy status=$status")
                         return@average
                     }
