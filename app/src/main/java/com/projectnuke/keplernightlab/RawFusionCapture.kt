@@ -3194,48 +3194,64 @@ private fun saveRawFusionPng(bitmap: Bitmap, file: File) {
     }
 }
 
-private class NativeRgbaBitmapSink(
+/**
+ * Streams a raw RGBA file into a Bitmap row by row. OutputStream write()
+ * boundaries are arbitrary (NoFollowFileSystem.copyVerified emits
+ * DEFAULT_BUFFER_SIZE-sized chunks, which can be far smaller than one RGBA
+ * row), so partial input MUST persist across write() calls; the end of one
+ * write() invocation is never treated as EOF. [finish] is the explicit
+ * completion proof because NoFollowFileSystem.copyVerified does not own or
+ * close the supplied sink.
+ */
+internal class NativeRgbaBitmapSink(
     private val bitmap: Bitmap,
     private val width: Int,
     private val height: Int
 ) : OutputStream() {
-    private val byteBuffer = ByteBuffer.allocate(width * 16 * 4).order(ByteOrder.LITTLE_ENDIAN)
-    private val pixels = IntArray(width * 16)
+    private val rowBuffer = ByteArray(width * 4)
+    private val pixels = IntArray(width)
+    private var rowFill = 0
     private var y = 0
 
     override fun write(b: Int) {
-        write(byteArrayOf(b.toByte()), 0, 1)
+        if (y >= height) error("Unexpected trailing bytes in native RGBA output")
+        rowBuffer[rowFill++] = b.toByte()
+        if (rowFill == rowBuffer.size) emitRow()
     }
 
     override fun write(buffer: ByteArray, offset: Int, length: Int) {
         var off = offset
-        var len = length
-        while (len > 0) {
+        var remaining = length
+        while (remaining > 0) {
             if (y >= height) error("Unexpected trailing bytes in native RGBA output")
-            val rows = min(16, height - y)
-            val bytesNeeded = width * rows * 4
-            byteBuffer.clear()
-            var filled = 0
-            while (filled < bytesNeeded && len > 0) {
-                val take = min(len, bytesNeeded - filled)
-                byteBuffer.put(buffer, off, take)
-                off += take
-                len -= take
-                filled += take
-            }
-            if (filled < bytesNeeded) error("Unexpected EOF in native RGBA output")
-            var p = 0
-            var b = 0
-            while (p < width * rows) {
-                val r = byteBuffer.array()[b++].toInt() and 0xFF
-                val g = byteBuffer.array()[b++].toInt() and 0xFF
-                val blue = byteBuffer.array()[b++].toInt() and 0xFF
-                val a = byteBuffer.array()[b++].toInt() and 0xFF
-                pixels[p++] = Color.argb(a, r, g, blue)
-            }
-            bitmap.setPixels(pixels, 0, width, 0, y, width, rows)
-            y += rows
+            val take = min(remaining, rowBuffer.size - rowFill)
+            System.arraycopy(buffer, off, rowBuffer, rowFill, take)
+            off += take
+            rowFill += take
+            remaining -= take
+            if (rowFill == rowBuffer.size) emitRow()
         }
+    }
+
+    /** Proves exactly `height` complete rows arrived with no missing/partial/extra bytes. */
+    fun finish() {
+        check(y == height && rowFill == 0) {
+            "Native RGBA output incomplete: rows=$y expected=$height pendingBytes=$rowFill"
+        }
+    }
+
+    private fun emitRow() {
+        var b = 0
+        for (x in 0 until width) {
+            val r = rowBuffer[b++].toInt() and 0xFF
+            val g = rowBuffer[b++].toInt() and 0xFF
+            val blue = rowBuffer[b++].toInt() and 0xFF
+            val a = rowBuffer[b++].toInt() and 0xFF
+            pixels[x] = Color.argb(a, r, g, blue)
+        }
+        bitmap.setPixels(pixels, 0, width, 0, y, width, 1)
+        y++
+        rowFill = 0
     }
 }
 
@@ -3245,8 +3261,10 @@ internal fun loadRawRgbaBitmap(file: File, width: Int, height: Int): Bitmap {
         "Native RGBA size mismatch: expected=$expectedBytes actual=${file.length()}"
     }
     val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    val sink = NativeRgbaBitmapSink(bitmap, width, height)
     try {
-        NoFollowFileSystem.copyVerified(file, NativeRgbaBitmapSink(bitmap, width, height))
+        NoFollowFileSystem.copyVerified(file, sink)
+        sink.finish()
         return bitmap
     } catch (failure: Throwable) {
         var cleanupFailure: Throwable? = null
