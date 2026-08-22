@@ -119,6 +119,11 @@ internal object KeplerRecoveryCoordinator {
             }
             children
                 .filter { NoFollowFileSystem.isRealDirectory(it.toPath()) && matchesJobPrefix(root, it.name) }
+                // Deterministic, oldest-first settlement: job directory names are
+                // timestamp-prefixed, so lexicographic order is a stable durable
+                // fallback that never depends on filesystem listing order and
+                // never lets newest-job discovery skip older exact handoffs.
+                .sortedBy { it.name }
                 .forEach { jobDir ->
                     try {
                         results += recoverOne(jobDir, exportAccess)
