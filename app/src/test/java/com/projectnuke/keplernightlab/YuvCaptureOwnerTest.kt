@@ -581,16 +581,37 @@ class YuvCaptureOwnerTest {
     }
 
     @Test
-    fun deadlineReachedBeforeAnyPersistedFrameReachesTimedOut() {
+    fun deadlineReachedWithAcceptedPersistenceEntersDrainingThenPublishesPartial() {
         val encodeLatch = EncodeLatch()
         val harness = Harness(frameCount = 2, workerCapacity = 1, encodeLatch = encodeLatch)
         try {
             harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
             encodeLatch.awaitStart()
             harness.session.owner.onDeadlineReached()
-            // The blocked encode is released after deadline; let the post-deadline
-            // completion flow through.
+            // The accepted persistence task is still in flight: the durable handoff
+            // invariant forbids ANY terminal publication here — the owner drains.
+            assertEquals(CaptureTerminalStatus.ACTIVE, harness.session.terminalState.status())
+            assertNull(harness.session.terminalRequestHandoff.request())
+            // The delivered frame's persistence completes after the deadline; only
+            // then may the genuine partial capture be published.
             encodeLatch.release()
+            val status = harness.awaitTerminal()
+            assertEquals(CaptureTerminalStatus.PARTIAL_SUCCESS, status)
+            harness.awaitCallback()
+            assertEquals(1, harness.session.accounting.snapshot().persistedFrames)
+            assertEquals(1, harness.onCaptureCompleteCount.get())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun deadlineReachedWithZeroDeliveredZeroAcceptedTimesOut() {
+        val harness = Harness(frameCount = 2)
+        try {
+            // No frames ever delivered and no accepted persistence work: a pure
+            // camera-acquisition timeout.
+            harness.session.owner.onDeadlineReached()
             val status = harness.awaitTerminal()
             assertEquals(CaptureTerminalStatus.TIMED_OUT, status)
             harness.awaitCallback()
@@ -622,16 +643,21 @@ class YuvCaptureOwnerTest {
 
     @Test
     fun lateBufferedCompletionAfterTimeoutIsDiscarded() {
-        // Genuine camera-acquisition timeout: 2 requested, only 1 ever delivered.
-        // The late completion of the delivered frame must be discarded after the
-        // terminal was claimed.  (A fully-delivered burst with pending persistence
-        // is a DRAINING case, not a timeout — covered by YuvCaptureOwnerDrainTest.)
+        // Genuine timeout with accepted persistence outstanding: the acquisition
+        // deadline first enters DRAINING (the delivered frame's persistence must
+        // settle before any terminal), then the bounded drain deadline expires and
+        // claims the actual persistence TIMEOUT.  The late completion of the
+        // blocked encode must be discarded after the terminal was claimed.
         val encodeLatch = EncodeLatch()
         val harness = Harness(frameCount = 2, workerCapacity = 1, encodeLatch = encodeLatch)
         try {
             harness.session.owner.acceptBuffered(FakeBufferedAccess(1234L))
             encodeLatch.awaitStart()
             harness.session.owner.onDeadlineReached()
+            // Accepted work outstanding -> draining, no publication yet.
+            assertEquals(CaptureTerminalStatus.ACTIVE, harness.session.terminalState.status())
+            // Bounded persistence-drain deadline expires while work is outstanding.
+            harness.session.owner.onPersistenceDrainDeadlineReached()
             // Wait for the TIMEOUT terminal status to be claimed before releasing.
             // The blocked encode now completes; the owner must discard it.
             encodeLatch.release()

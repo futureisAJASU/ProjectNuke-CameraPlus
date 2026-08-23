@@ -365,23 +365,26 @@ class ProductionYuvCaptureBridgeTest {
     // ------------------------------------------------------------------
 
     @Test
-    fun productionDeadlineBeforeBufferedEncoderCompletionReachesTimedOut() {
+    fun productionDeadlineBeforeBufferedEncoderCompletionEntersDrainingThenPartial() {
         val encodeLatch = EncodeLatch()
         val harness = Harness(frameCount = 2, workerCapacity = 1, encodeLatch = encodeLatch)
         try {
             harness.session.owner.acceptBuffered(Camera2YuvImageAccess(FakeYuvImage(1000L)))
             encodeLatch.awaitStart()
-            // Deadline fires while encoder is still running.
+            // Deadline fires while encoder is still running: accepted persistence
+            // work outstanding -> DRAINING, never an immediate terminal.
             harness.session.owner.onDeadlineReached()
+            assertEquals(CaptureTerminalStatus.ACTIVE, harness.session.terminalState.status())
             encodeLatch.release()
 
             val status = harness.awaitTerminal()
-            assertEquals(CaptureTerminalStatus.TIMED_OUT, status)
+            assertEquals(CaptureTerminalStatus.PARTIAL_SUCCESS, status)
             harness.awaitCallback()
             val snap = harness.session.accounting.snapshot()
-            assertEquals(0, snap.persistedFrames)
-            assertTrue(snap.manifest.isEmpty())
-            assertTrue(harness.errorCount.get() >= 1)
+            assertEquals(1, snap.persistedFrames)
+            assertEquals(1, snap.manifest.size)
+            assertEquals(0, harness.errorCount.get())
+            assertEquals(1, harness.completeCount.get())
         } finally {
             harness.shutdown()
         }
@@ -408,10 +411,11 @@ class ProductionYuvCaptureBridgeTest {
 
     @Test
     fun productionBufferedSettlingDuringDeadlineCleanupIsIdempotent() {
-        // Genuine acquisition timeout fixture: 2 requested, only 1 delivered.
-        // (A fully-delivered burst with pending persistence now DRAINS to success —
-        // covered by YuvCaptureOwnerDrainTest.)  The deadline-cleanup race must
-        // still settle idempotently: exactly-once accounting, reservations, lifecycle.
+        // Partial-acquisition fixture: 2 requested, only 1 delivered.  The deadline
+        // first enters DRAINING (accepted persistence outstanding); after the
+        // delivered frame settles, the genuine partial publishes.  The
+        // deadline-cleanup race must still settle idempotently: exactly-once
+        // accounting, reservations, lifecycle.
         val encodeLatch = EncodeLatch()
         val harness = Harness(frameCount = 2, workerCapacity = 1, encodeLatch = encodeLatch)
         try {
@@ -425,7 +429,7 @@ class ProductionYuvCaptureBridgeTest {
             assertTrue(harness.session.boundedWorker.awaitTermination(5_000L))
             // Settlement attempts must not double-count or alter accounting.
             val snap = harness.session.accounting.snapshot()
-            assertEquals(0, snap.persistedFrames)
+            assertEquals(1, snap.persistedFrames)
             assertEquals(0, snap.failedFrames)
             // Reservations released once after worker task completes.
             assertEquals(0L, harness.session.reservations.currentBytes())
@@ -729,16 +733,22 @@ class ProductionYuvCaptureBridgeTest {
         try {
             harness.session.owner.acceptBuffered(Camera2YuvImageAccess(FakeYuvImage(1000L)))
             encodeLatch.awaitStart()
+            // Accepted persistence outstanding -> draining first...
             harness.session.owner.onDeadlineReached()
-            encodeLatch.release()
+            assertEquals(CaptureTerminalStatus.ACTIVE, harness.session.terminalState.status())
+            // ...then the bounded drain deadline expires with work outstanding:
+            // an actual persistence TIMEOUT.
+            harness.session.owner.onPersistenceDrainDeadlineReached()
             assertEquals(CaptureTerminalStatus.TIMED_OUT, harness.awaitTerminal())
             // Wait for the worker to drain.
             harness.session.boundedWorker.close()
             assertTrue(harness.session.boundedWorker.awaitTermination(5_000L))
+            harness.flushHandler()
 
             val snap = harness.session.accounting.snapshot()
             assertEquals(snap.persistedFrames, snap.manifest.size)
             assertEquals(0L, harness.session.reservations.currentBytes())
+            // The late completion can never retroactively change the terminal.
             assertEquals(CaptureTerminalStatus.TIMED_OUT, harness.session.terminalState.status())
             assertTrue(harness.errorCount.get() >= 1)
             assertEquals(0, harness.completeCount.get())

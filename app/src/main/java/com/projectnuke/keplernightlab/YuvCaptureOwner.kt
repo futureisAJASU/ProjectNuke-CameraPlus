@@ -80,6 +80,14 @@ internal sealed interface YuvWorkerCompletion {
  * inconsistent with this task's own settlement, and surfacing them is the only way
  * a lost release can be detected.
  *
+ * Pending-ledger honesty: the owner tracks every submitted task in its pending-
+ * persistence ledger until the completion event is processed (execute OR
+ * disposeWithoutMutation).  A task drained/disposed WITHOUT ever attempting its
+ * completion post (e.g. removed from the worker queue by shutdown) can never deliver
+ * that event, so [onPendingWorkAbandoned] releases the ledger entry exactly once —
+ * decided by the single-winner [pendingPostClaim] CAS shared between the post attempt
+ * and the abandonment path.
+ *
  * Task publication state: [taskState] and [settledOutcome] expose the settlement
  * state machine and the published outcome so observers (cleanup coordinator, tests)
  * can check whether the task is NOT_STARTED / SETTLING / SETTLED without racing.
@@ -95,13 +103,26 @@ internal class BufferedEncodeTask(
     private val onSettlementIssue: ((YuvPngWorkItem, YuvBufferedLifecycle.EncodingSettlementOutcome) -> Unit)? = null,
     private val onWorkDisposalDebt: ((YuvPngWorkItem, YuvWorkDisposalOutcome) -> Unit)? = null,
     /** Invoked exactly once after the task fully settled (or was disposed). */
-    private val onSettled: (() -> Unit)? = null
+    private val onSettled: (() -> Unit)? = null,
+    /**
+     * Invoked EXACTLY ONCE when the task settled without ever attempting its
+     * completion post (shutdown-drained queue task): releases the owner's
+     * pending-persistence ledger entry this task owned.
+     */
+    private val onPendingWorkAbandoned: (() -> Unit)? = null
 ) : OutcomeDisposableCaptureTask {
 
     internal enum class TaskSettlementState { NOT_STARTED, SETTLING, SETTLED }
 
     private val settlementState = AtomicReference(TaskSettlementState.NOT_STARTED)
     private val settledOutcome = AtomicReference<CaptureTaskDisposalOutcome?>(null)
+
+    /**
+     * Single-winner claim deciding WHO owns the pending-ledger release: the
+     * completion-post attempt (owner envelope handles it) or the abandonment path
+     * (this task releases it directly).  Exactly one side wins the CAS.
+     */
+    private val pendingPostClaim = AtomicBoolean(false)
 
     /** Publicly observable task publication state. */
     fun taskState(): TaskSettlementState = settlementState.get()
@@ -121,7 +142,17 @@ internal class BufferedEncodeTask(
         }
         try {
             try {
+                // Claim pending-ledger ownership FOR the owner envelope first: any
+                // non-throwing post outcome (accepted OR rejected envelope) releases
+                // the ledger entry through execute/disposeWithoutMutation.
+                pendingPostClaim.compareAndSet(false, true)
                 postCompletion(completion)
+            } catch (t: Throwable) {
+                if (pendingPostClaim.compareAndSet(true, false)) {
+                    // The post threw before the envelope could take ownership:
+                    // revert the claim so the settlement path releases the entry.
+                }
+                throw t
             } finally {
                 attemptSettle()
             }
@@ -156,6 +187,13 @@ internal class BufferedEncodeTask(
 
     private fun settleItemAndReport(): CaptureTaskDisposalOutcome {
         val outcome = lifecycle.settleEncoding(item, accounting)
+        // A task settled WITHOUT any post attempt can never deliver a completion
+        // event: release its pending-persistence ledger entry exactly once.
+        if (!pendingPostClaim.compareAndSet(false, true)) {
+            // Post was attempted (or is about to be): the owner envelope owns release.
+        } else {
+            onPendingWorkAbandoned?.invoke()
+        }
         val settledCleanly = outcome.status == YuvBufferedLifecycle.EncodingSettlementStatus.SETTLED &&
             outcome.failure == null && outcome.lifecycleReleaseFailure == null
         val taskOutcome = if (settledCleanly) {
@@ -223,17 +261,17 @@ internal class BufferedEncodeTask(
  * Persistence settlement phases (orthogonal to the terminal status):
  *  CAPTURING -> DRAINING -> (terminal)
  *
- *  The camera-acquisition deadline ([onDeadlineReached]) and the bounded
- *  persistence-drain deadline ([onPersistenceDrainDeadlineReached]) are SEPARATE
- *  authorities.  A deadline on acquisition is NOT proof that accepted persistence
- *  work failed: when every requested frame was acquired with no loss but accepted
- *  worker work is still queued/in-flight/buffered, the owner transitions to
- *  DRAINING, publishes NOTHING, lets already-accepted tasks finish, and settles
- *  only by drain truth:
- *   - persisted == requested && manifest complete && buffered/reserved/queued/
- *     in-flight all zero && final verification succeeded -> SUCCESS;
- *   - a concrete persistence failure -> FAILED/PARTIAL truth per the real failure;
- *   - the bounded drain deadline expiring -> an actual persistence timeout.
+ *  Durable-handoff invariant: NO terminal — full OR partial — may be published while
+ *  accepted persistence work remains.  Therefore the FIRST deadline question is
+ *  "does accepted persistence work remain?"; if yes, the owner enters/continues
+ *  DRAINING regardless of whether acquisition ended FULL or PARTIAL, publishes
+ *  NOTHING, lets already-accepted tasks finish, and settles only by drain truth:
+ *   - persisted == requested && manifest complete && buffered/reserved/pending/
+ *     queued/in-flight all zero && final verification succeeded -> SUCCESS;
+ *   - every delivered frame settled but persisted < requested -> PARTIAL_SUCCESS;
+ *   - a concrete persistence failure -> concrete FAILED truth;
+ *   - the bounded drain deadline expiring with work outstanding -> an actual
+ *     persistence timeout.
  */
 internal enum class YuvPersistencePhase { CAPTURING, DRAINING }
 
@@ -287,9 +325,11 @@ internal class YuvCaptureOwner(
      * incremented when a worker accepts a task, decremented when its completion is
      * processed (or its completion event is rejected).  Unlike executor counters,
      * this never races with worker-thread exit, so a successful handoff can never
-     * be claimed while accepted source persistence work remains.
+     * be claimed while accepted source persistence work remains.  Backed by an
+     * atomic so the OFF-DISPATCHER emergency settlement path can observe it live
+     * (never a stale owner publication).
      */
-    private var pendingPersistenceTasks = 0
+    private val pendingPersistenceTasks = java.util.concurrent.atomic.AtomicInteger(0)
     private var settlementDeferralCount = 0
     private val drainDeadlineArmed = AtomicBoolean(false)
 
@@ -471,6 +511,11 @@ internal class YuvCaptureOwner(
                         val item = creation.item
                         val fileName = "frame_${item.frameIndex.toString().padStart(2, '0')}_color.png"
                         val candidate = File(outputDir, ".${fileName}.${System.nanoTime()}.tmp")
+                        // Single-winner claim for THIS task's pending-ledger release:
+                        // a non-throwing completion post hands ownership to the owner
+                        // envelope; a never-attempted/throwing post leaves the task
+                        // itself responsible (see disposeWithOutcome below).
+                        val pendingPostClaim = AtomicBoolean(false)
                         val task = object : OutcomeDisposableCaptureTask {
                             override fun run() {
                                 val completion = try {
@@ -492,6 +537,7 @@ internal class YuvCaptureOwner(
                                     )
                                 }
                                 try {
+                                    pendingPostClaim.compareAndSet(false, true)
                                     captureStateOwner.post(object : CaptureOwnerEvent {
                                         override fun execute() {
                                             releasePendingPersistenceTask()
@@ -509,6 +555,11 @@ internal class YuvCaptureOwner(
                                             }
                                         }
                                     })
+                                } catch (t: Throwable) {
+                                    if (pendingPostClaim.compareAndSet(true, false)) {
+                                        // Post threw before the envelope took ownership.
+                                    }
+                                    throw t
                                 } finally {
                                     disposeWithOutcome()
                                     postWorkerSettledEvent()
@@ -516,6 +567,11 @@ internal class YuvCaptureOwner(
                             }
                             override fun dispose() { disposeWithOutcome() }
                             override fun disposeWithOutcome(): CaptureTaskDisposalOutcome {
+                                // A task disposed without any completion-post attempt
+                                // can never deliver its event: release its ledger entry.
+                                if (pendingPostClaim.compareAndSet(false, true)) {
+                                    releasePendingPersistenceTask()
+                                }
                                 val outcome = item.dispose()
                                 return if (outcome.isClean) {
                                     CaptureTaskDisposalOutcome.Clean
@@ -670,7 +726,8 @@ internal class YuvCaptureOwner(
             onWorkDisposalDebt = { workItem, outcome ->
                 recordDisposalIfUnclean(workItem, outcome)
             },
-            onSettled = ::postWorkerSettledEvent
+            onSettled = ::postWorkerSettledEvent,
+            onPendingWorkAbandoned = ::releasePendingPersistenceTask
         )
         if (!boundedWorker.submit(task)) {
             // Worker already called task.dispose() which calls lifecycle.settleEncoding.
@@ -722,13 +779,11 @@ internal class YuvCaptureOwner(
     // ------------------------------------------------------------------
 
     private fun trackPendingPersistenceTask() {
-        pendingPersistenceTasks++
+        pendingPersistenceTasks.incrementAndGet()
     }
 
     private fun releasePendingPersistenceTask() {
-        if (pendingPersistenceTasks > 0) {
-            pendingPersistenceTasks--
-        }
+        pendingPersistenceTasks.updateAndGet { current -> if (current > 0) current - 1 else current }
     }
 
     /**
@@ -792,10 +847,15 @@ internal class YuvCaptureOwner(
     }
 
     /**
-     * Drain-phase settlement: a concrete persistence failure publishes concrete
-     * FAILED truth; otherwise the strict success predicate decides.
+     * Drain-phase settlement.  The FIRST question is whether accepted persistence
+     * work remains: while it does, the drain continues and NO terminal is decided.
+     * Only after every accepted task settles does terminal classification run:
+     * concrete failure truth -> FAILED; strict full predicate -> SUCCESS;
+     * everything delivered but fewer than requested persisted -> PARTIAL_SUCCESS;
+     * nothing persisted -> timeout by drain truth.
      */
     private fun checkDrainCompletion(snap: YuvCaptureAccountingSnapshot) {
+        if (acceptedPersistenceWorkRemains(snap)) return
         if (snap.failedFrames > 0 || snap.droppedFrames > 0) {
             val detail = buildString {
                 append("YUV persistence failed during drain: saved=${snap.persistedFrames}/$frameCount")
@@ -809,7 +869,37 @@ internal class YuvCaptureOwner(
             finishError(detail)
             return
         }
-        checkTerminal(snap)
+        if (isStrictSuccessState(snap)) {
+            checkTerminal(snap)
+            return
+        }
+        if (snap.persistedFrames > 0) {
+            // Every delivered/accepted frame has fully settled: a genuine partial
+            // capture may now be published.
+            if (terminalState.claim(CaptureTerminalStatus.PARTIAL_SUCCESS)) {
+                settleTerminalByRequest(YuvTerminalRequest(
+                    status = CaptureTerminalStatus.PARTIAL_SUCCESS,
+                    jobStatus = "CAPTURE_PARTIAL",
+                    reason = "Partial success: ${snap.persistedFrames}/$frameCount persisted",
+                    completionKind = TerminalCompletionKind.SUCCESS,
+                    cause = null,
+                    saveMotion = true
+                ))
+            }
+            return
+        }
+        // Nothing persisted, nothing outstanding, no failures: acquisition never
+        // produced usable evidence — settle as an actual timeout by drain truth.
+        if (terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) {
+            settleTerminalByRequest(YuvTerminalRequest(
+                status = CaptureTerminalStatus.TIMED_OUT,
+                jobStatus = "CAPTURE_TIMEOUT",
+                reason = timeoutReason(snap),
+                completionKind = TerminalCompletionKind.ERROR,
+                cause = null,
+                saveMotion = false
+            ))
+        }
     }
 
     /**
@@ -1051,13 +1141,17 @@ internal class YuvCaptureOwner(
      * reserved, pending completions, queued or in-flight worker work).  Final-file
      * verification already succeeded per adopted frame inside [adoptSuccess].
      */
-    private fun checkTerminal(snap: YuvCaptureAccountingSnapshot = accounting.snapshot()) {
-        if (snap.persistedFrames >= frameCount &&
+    private fun isStrictSuccessState(snap: YuvCaptureAccountingSnapshot): Boolean =
+        snap.persistedFrames >= frameCount &&
             snap.manifest.size >= frameCount &&
             snap.bufferedFrames == 0 &&
             snap.reservedCount == 0 &&
-            pendingPersistenceTasks == 0 &&
+            pendingPersistenceTasks.get() == 0 &&
             boundedWorker.queuedCount() == 0 &&
+            boundedWorker.activeCount() == 0
+
+    private fun checkTerminal(snap: YuvCaptureAccountingSnapshot = accounting.snapshot()) {
+        if (isStrictSuccessState(snap) &&
             terminalState.claim(CaptureTerminalStatus.SUCCESS)
         ) {
             settleTerminalByRequest(YuvTerminalRequest(
@@ -1071,13 +1165,6 @@ internal class YuvCaptureOwner(
         }
     }
 
-    /** True when every requested frame was acquired cleanly but persistence is still draining. */
-    private fun isCleanAcquisitionDrainingCandidate(snap: YuvCaptureAccountingSnapshot): Boolean =
-        (snap.receivedFrames >= frameCount || completedResults >= frameCount) &&
-            snap.failedFrames == 0 &&
-            snap.droppedFrames == 0 &&
-            acceptedPersistenceWorkRemains(snap)
-
     /**
      * Accepted-but-unfinished source persistence work.  Uses the owner-authoritative
      * pending-completion ledger plus accounting and executor observations.
@@ -1085,24 +1172,33 @@ internal class YuvCaptureOwner(
     private fun acceptedPersistenceWorkRemains(snap: YuvCaptureAccountingSnapshot): Boolean =
         snap.bufferedFrames > 0 ||
             snap.reservedCount > 0 ||
-            pendingPersistenceTasks > 0 ||
+            pendingPersistenceTasks.get() > 0 ||
             boundedWorker.queuedCount() > 0 ||
             boundedWorker.activeCount() > 0
 
     /**
-     * Camera-acquisition deadline.  When all requested frames arrived cleanly and
-     * accepted persistence work is still draining, this is NOT a partial capture:
-     * the owner enters DRAINING, publishes no terminal, and lets the drain settle
-     * by truth ([checkDrainCompletion] / [onPersistenceDrainDeadlineReached]).
-     * A genuine camera partial (frames never acquired / dropped / failed) retains
-     * the existing partial-capture policy.
+     * Camera-acquisition deadline.  The FIRST classification question is whether
+     * accepted persistence work remains — regardless of whether acquisition ended
+     * FULL or PARTIAL:
+     *
+     *  - accepted work outstanding -> enter/continue DRAINING, publish nothing;
+     *  - otherwise terminal classification decides by truth, and SUCCESS still
+     *    requires the strict terminal predicate (persisted == requested,
+     *    manifest == requested, buffered/reserved/pending/queued/in-flight zero).
+     *
+     * A genuine camera partial (frames never acquired / dropped / failed) may be
+     * published as PARTIAL_SUCCESS only after every delivered/accepted frame has
+     * fully settled (drain completion path).
      */
     fun onDeadlineReached() {
         val event = object : CaptureOwnerEvent {
             override fun execute() {
                 val snap = accounting.snapshot()
                 when {
-                    snap.persistedFrames >= frameCount -> {
+                    // Durable handoff invariant first: accepted persistence work
+                    // outstanding means drain, never an immediate publication.
+                    acceptedPersistenceWorkRemains(snap) -> enterPersistenceDraining()
+                    isStrictSuccessState(snap) -> {
                         if (terminalState.claim(CaptureTerminalStatus.SUCCESS)) {
                             settleTerminalByRequest(YuvTerminalRequest(
                                 status = CaptureTerminalStatus.SUCCESS,
@@ -1114,7 +1210,6 @@ internal class YuvCaptureOwner(
                             ))
                         }
                     }
-                    isCleanAcquisitionDrainingCandidate(snap) -> enterPersistenceDraining()
                     snap.persistedFrames > 0 -> {
                         if (terminalState.claim(CaptureTerminalStatus.PARTIAL_SUCCESS)) {
                             settleTerminalByRequest(YuvTerminalRequest(
@@ -1223,7 +1318,7 @@ internal class YuvCaptureOwner(
             ", received=${snap.receivedFrames}, completedResults=$completedResults" +
             ", queued=${boundedWorker.queuedCount()}, inFlight=${boundedWorker.activeCount()}" +
             ", buffered=${snap.bufferedFrames}, reserved=${snap.reservedCount}" +
-            ", pendingCompletions=$pendingPersistenceTasks"
+            ", pendingCompletions=${pendingPersistenceTasks.get()}"
 
     private fun emergencySettlePersistenceDrainTimeout() {
         if (terminalState.claim(CaptureTerminalStatus.TIMED_OUT)) {
@@ -1286,23 +1381,35 @@ internal class YuvCaptureOwner(
     // ColorFusion terminal gate always unparks.
     // ------------------------------------------------------------------
 
+    /**
+     * Emergency settlement for a rejected deadline owner event (runs off-dispatcher
+     * against the last immutable owner publication).  FAIL-CLOSED: while ANY
+     * observable accepted persistence work may remain (draining flag, buffered,
+     * reserved, pending completions, queued or in-flight worker work), this path
+     * must NEVER publish SUCCESS or PARTIAL_SUCCESS — it settles as an actual
+     * timeout.  Only a quiescent state may classify by persisted-count truth, and
+     * SUCCESS still requires the full manifest.
+     */
     private fun emergencySettleDeadline() {
         val snap = accounting.snapshot()
+        val acceptedWorkMayRemain = ownerPublishedStateRef.get().persistenceDraining ||
+            snap.bufferedFrames > 0 ||
+            snap.reservedCount > 0 ||
+            pendingPersistenceTasks.get() > 0 ||
+            boundedWorker.queuedCount() > 0 ||
+            boundedWorker.activeCount() > 0
         val status: CaptureTerminalStatus
         val completionKind: TerminalCompletionKind
         val reason: String
         val saveMotion: Boolean
         when {
-            // Draining state survives only via the last immutable publication on the
-            // emergency path; an unconfirmable drain settles as a persistence timeout,
-            // never as a success or a camera partial.
-            ownerPublishedStateRef.get().persistenceDraining -> {
+            acceptedWorkMayRemain -> {
                 status = CaptureTerminalStatus.TIMED_OUT
                 completionKind = TerminalCompletionKind.ERROR
                 reason = persistenceDrainTimeoutReason(snap)
                 saveMotion = false
             }
-            snap.persistedFrames >= frameCount -> {
+            snap.persistedFrames >= frameCount && snap.manifest.size >= frameCount -> {
                 status = CaptureTerminalStatus.SUCCESS
                 completionKind = TerminalCompletionKind.SUCCESS
                 reason = "All $frameCount frames persisted"
