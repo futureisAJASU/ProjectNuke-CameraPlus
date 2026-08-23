@@ -38,7 +38,14 @@ internal data class KeplerRecoveryReport(
     val completedAt: Long = System.currentTimeMillis()
 )
 
-/** One process-wide, single-flight restart reconciliation owner. */
+/**
+ * One process-wide, single-flight restart reconciliation owner.
+ *
+ * Recovery is reconciliation-only: it classifies and settles durable job
+ * metadata and export journals, but does NOT automatically resume or requeue
+ * heavy processing work. Processing only resumes via explicit user-triggered
+ * reprocess or the next fresh capture pipeline.
+ */
 internal object KeplerRecoveryCoordinator {
     private val executor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "KeplerRecoveryCoordinator").apply { isDaemon = true }
