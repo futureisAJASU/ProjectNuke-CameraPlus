@@ -1954,7 +1954,7 @@ private fun writeSuperResolutionJob(
     }
 }
 
-private fun readColorBurstFrameFiles(jobDir: File): List<File> {
+internal fun readColorBurstFrameFiles(jobDir: File): List<File> {
     val jobFile = NoFollowFileSystem.requireDirectChildFile(jobDir, SUPER_RES_JOB_FILE)
         val frames = JSONObject(NoFollowFileSystem.readTextVerified(jobFile)).optJSONArray("frames") ?: JSONArray()
     return buildList {
@@ -1967,7 +1967,7 @@ private fun readColorBurstFrameFiles(jobDir: File): List<File> {
     }
 }
 
-private fun createSuperResolutionJobDirectory(context: Context): File {
+internal fun createSuperResolutionJobDirectory(context: Context): File {
     val picturesDir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
         ?: error("Pictures directory unavailable.")
     val root = File(picturesDir, "KeplerSuperRes")
@@ -2085,7 +2085,7 @@ private fun canAllocateOutputBitmap(outputWidth: Int, outputHeight: Int): Boolea
     return availableHeapBytes() >= required
 }
 
-private fun megapixelLabel(megapixels: Double): String =
+internal fun megapixelLabel(megapixels: Double): String =
     if (megapixels % 1.0 == 0.0) {
         megapixels.roundToInt().toString()
     } else {
