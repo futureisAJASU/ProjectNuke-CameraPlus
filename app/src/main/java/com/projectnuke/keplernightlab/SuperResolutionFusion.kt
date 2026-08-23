@@ -86,6 +86,13 @@ data class SuperResolutionFusionRequest(
     val context: Context,
     val inputFrameFiles: List<File>,
     val outputDir: File,
+    /**
+     * Dual identity: the SOURCE capture job directory this SR run was enqueued
+     * under (the routing/request identity). When set, it is persisted durably
+     * into the RESULT output directory's job.json as
+     * "superResolutionSourceJobDirectory" before terminal publication.
+     */
+    val sourceJobDirectory: File? = null,
     val sourceMode: SuperResolutionSourceMode = SuperResolutionSourceMode.BINNED_12MP_YUV,
     val targetPolicy: SuperResolutionTargetPolicy = superResolutionTargetPolicy(sourceMode),
     val targetMegapixels: Double = targetPolicy.defaultTargetMegapixels,
@@ -1970,6 +1977,12 @@ private fun writeSuperResolutionJob(
         .put("reason", reason ?: JSONObject.NULL)
         .put("failureMessage", if (status != "COMPLETE") result.message else JSONObject.NULL)
         .put("message", result.message)
+    // Dual-identity durability: the request (source capture) job directory is
+    // re-asserted on every full SR metadata write so the relationship survives
+    // the wholesale rewrite of this job object.
+    request.sourceJobDirectory?.let { source ->
+        job.put("superResolutionSourceJobDirectory", source.absolutePath)
+    }
     priorAttempt?.optString("processingAttemptId")?.takeIf { it.isNotBlank() }?.let {
         job.put("processingAttemptId", it)
             .put("processingStartedAt", priorAttempt.optLong("processingStartedAt"))

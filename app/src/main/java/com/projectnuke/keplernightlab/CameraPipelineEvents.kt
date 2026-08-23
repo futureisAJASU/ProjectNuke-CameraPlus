@@ -62,7 +62,20 @@ sealed interface CameraPipelineEvent {
         val captureResourcesSettled: Boolean = true,
         override val counts: CameraPipelineProgressCounts = CameraPipelineProgressCounts(),
         override val message: String? = null,
-        val jobDirectoryPath: String? = null
+        /**
+         * REQUEST/routing identity: the job directory the work was enqueued
+         * under (for SR the source capture job). Never null for background
+         * terminals that completed durable handoff.
+         */
+        val jobDirectoryPath: String? = null,
+        /**
+         * RESULT identity: the directory holding the final durable output.
+         * Null when it equals [jobDirectoryPath] (YUV/RAW); for Super
+         * Resolution this is the newly created SR output directory. Result
+         * finalization and UI result refresh must read THIS identity, never
+         * infer it from "latest job" lookups.
+         */
+        val resultJobDirectoryPath: String? = null
     ) : CameraPipelineEvent {
         enum class Kind { COMPLETE, COMPLETE_PARTIAL, FAILED, CANCELLED }
     }
@@ -90,7 +103,8 @@ internal class CameraPipelineTerminalPublisher(
         captureResourcesSettled: Boolean = true,
         counts: CameraPipelineProgressCounts = CameraPipelineProgressCounts(),
         message: String? = null,
-        jobDirectoryPath: String? = null
+        jobDirectoryPath: String? = null,
+        resultJobDirectoryPath: String? = null
     ): Boolean {
         if (!published.compareAndSet(false, true)) return false
         sink(
@@ -103,7 +117,8 @@ internal class CameraPipelineTerminalPublisher(
                 captureResourcesSettled = captureResourcesSettled,
                 counts = counts,
                 message = message,
-                jobDirectoryPath = jobDirectoryPath
+                jobDirectoryPath = jobDirectoryPath,
+                resultJobDirectoryPath = resultJobDirectoryPath
             )
         )
         return true

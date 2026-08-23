@@ -692,29 +692,24 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
     // Process-scoped background event surface. The subscription lifetime
     // follows this screen; dispose removes it from the hub so nothing retains
     // this Composable. Two separate responsibilities per event:
-    //  1. passive diagnostics - HardwareE2E always receives the envelope;
-    //  2. UI refresh for terminal events of the EXACT completed job only,
-    //     never mutating a newer foreground capture's status/progress.
+    //  1. passive diagnostics - HardwareE2E receives the envelope immediately,
+    //     on the worker thread, without waiting for UI dispatch;
+    //  2. UI refresh for terminal events of the EXACT result job only - ALL
+    //     Compose mutation is dispatched onto the camera-owned main scope and
+    //     re-queries CURRENT foreground truth from the synchronized session
+    //     snapshot at delivery time (a terminal for job A while capture B owns
+    //     the foreground never pops a preview over B).
     DisposableEffect(hardwareE2ERecorder) {
+        val uiDispatcher = BackgroundTerminalUiDispatcher(
+            session = pipelineSession,
+            scheduler = mainScheduler,
+            recordDiagnostic = hardwareE2ERecorder::recordBackgroundEvent,
+            refreshResult = { showPreview, exactJobDir ->
+                refreshLatestResult(showPreview = showPreview, exactJobDir = exactJobDir)
+            }
+        )
         val subscription = BackgroundPipelineEventHub.subscribe { background ->
-            val terminal = background.event as? CameraPipelineEvent.Terminal
-            if (terminal == null) {
-                hardwareE2ERecorder.recordBackgroundEvent(background)
-                return@subscribe
-            }
-            hardwareE2ERecorder.recordBackgroundEvent(background)
-            val success = terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE ||
-                terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
-            val exactDir = background.exactJobDirectory.takeIf { it.isDirectory }
-            if (exactDir != null) {
-                // A foreground capture in progress keeps its viewfinder: an old
-                // job's completion may refresh data but not pop preview over it.
-                val foregroundIdle = !pipelineUiState.isCapturing && pipelineUiState.canAdmitNewCapture
-                refreshLatestResult(
-                    showPreview = success && terminal.requiredOutputCommitted && foregroundIdle,
-                    exactJobDir = exactDir
-                )
-            }
+            uiDispatcher.onBackgroundEvent(background)
         }
         onDispose { subscription.dispose() }
     }

@@ -6,17 +6,32 @@ import java.util.ArrayDeque
 
 /**
  * Immutable envelope binding a background pipeline event to its EXACT durable
- * job directory. After foreground generation ownership is released at the
+ * job identities. After foreground generation ownership is released at the
  * capture handoff, exact job identity is the only correlation key: background
  * events must never be correlated through "latest job" or mutable foreground
  * generation state. [event] keeps [CameraPipelineEvent] unchanged; terminal
- * events additionally carry jobDirectoryPath inside the record itself.
+ * events additionally carry jobDirectoryPath/resultJobDirectoryPath inside the
+ * record itself.
+ *
+ * Dual identity model:
+ *  - [requestJobDirectory] is the ROUTING identity: the job directory the work
+ *    was enqueued under (for Super Resolution this is the SOURCE capture job).
+ *  - [resultJobDirectory] is the RESULT identity: the directory holding the
+ *    final durable output (for YUV/RAW it equals the request identity; for SR
+ *    it is the newly created Super Resolution output directory).
+ * The two identities are never conflated: routing/diagnostics use the request
+ * identity, result finalization and UI result refresh use the result identity.
  */
 internal data class BackgroundPipelineEvent(
-    val exactJobDirectory: File,
+    val requestJobDirectory: File,
     val jobKind: KeplerActiveOperationKind,
-    val event: CameraPipelineEvent
-)
+    val event: CameraPipelineEvent,
+    val resultJobDirectory: File = requestJobDirectory
+) {
+    /** True when the durable result identity differs from the routing identity. */
+    val hasDistinctResultIdentity: Boolean
+        get() = requestJobDirectory != resultJobDirectory
+}
 
 internal fun interface BackgroundPipelineEventSubscriber {
     fun onBackgroundEvent(event: BackgroundPipelineEvent)
@@ -98,7 +113,7 @@ internal object BackgroundPipelineEventHub {
                 subscriber.onBackgroundEvent(event)
             } catch (failure: Throwable) {
                 try {
-                    Log.w(TAG, "background event observer failed for ${event.exactJobDirectory.name}", failure)
+                    Log.w(TAG, "background event observer failed for ${event.requestJobDirectory.name}", failure)
                 } catch (_: Throwable) {
                 }
             }

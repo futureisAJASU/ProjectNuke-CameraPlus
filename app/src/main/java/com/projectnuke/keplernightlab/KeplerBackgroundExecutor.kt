@@ -99,7 +99,7 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
         try {
             BackgroundPipelineEventHub.publish(
                 BackgroundPipelineEvent(
-                    exactJobDirectory = request.exactJobDirectory,
+                    requestJobDirectory = request.exactJobDirectory,
                     jobKind = request.jobKind,
                     event = CameraPipelineEvent.Terminal(
                         generation = 0L,
@@ -120,10 +120,21 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
             savedFrames = jobJson.optInt("savedFrames", 0)
         )
 
-    private fun backgroundEventSink(request: BackgroundProcessingRequest): (CameraPipelineEvent) -> Unit = { event ->
+    /**
+     * Observational event sink carrying BOTH durable identities. [request] is
+     * the routing identity; [resultIdentity] supplies the result identity at
+     * publish time (for Super Resolution this switches to the newly created
+     * output directory as soon as it exists; before that it equals the request
+     * identity, since no result directory exists yet).
+     */
+    private fun backgroundEventSink(
+        request: BackgroundProcessingRequest,
+        resultIdentity: () -> File = { request.exactJobDirectory }
+    ): (CameraPipelineEvent) -> Unit = { event ->
         BackgroundPipelineEventHub.publish(
             BackgroundPipelineEvent(
-                exactJobDirectory = request.exactJobDirectory,
+                requestJobDirectory = request.exactJobDirectory,
+                resultJobDirectory = resultIdentity(),
                 jobKind = request.jobKind,
                 event = event
             )
@@ -172,6 +183,12 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
     /**
      * Publishes the exact deferred outcome once, after lease settlement. An
      * ordinary failure settles durable FAILED truth first, then publishes.
+     *
+     * [leaseBoundaryReached] is the truthful release/retain-for-reconciliation
+     * boundary observation: only a boundary that was actually reached supports
+     * an ownership-settled claim ([captureResourcesSettled] = true). A lease
+     * settlement that failed ordinarily publishes settled=false — never a claim
+     * unsupported by reality.
      */
     private fun settleTerminal(
         terminal: CameraPipelineTerminalPublisher,
@@ -180,7 +197,9 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
         pendingOutcome: BackgroundTerminalSpec?,
         ordinaryFailure: Exception?,
         truthDir: File,
-        lease: JobOperationLease?
+        lease: JobOperationLease?,
+        leaseBoundaryReached: Boolean = true,
+        resultJobDirectoryPath: String? = null
     ) {
         val failure = ordinaryFailure
         if (failure != null && !terminal.isPublished()) {
@@ -190,10 +209,11 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
                 requiredOutputCommitted = false,
                 publicExportCommitted = false,
                 verified = false,
-                captureResourcesSettled = true,
+                captureResourcesSettled = leaseBoundaryReached,
                 counts = counts,
                 message = "Background processing failed: ${failure.message ?: failure.javaClass.simpleName}",
-                jobDirectoryPath = jobDir.absolutePath
+                jobDirectoryPath = jobDir.absolutePath,
+                resultJobDirectoryPath = resultJobDirectoryPath
             )
             return
         }
@@ -203,11 +223,65 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
             requiredOutputCommitted = spec.requiredOutputCommitted,
             publicExportCommitted = spec.publicExportCommitted,
             verified = spec.verified,
-            captureResourcesSettled = true,
+            captureResourcesSettled = leaseBoundaryReached,
             counts = counts,
             message = spec.message,
-            jobDirectoryPath = jobDir.absolutePath
+            jobDirectoryPath = jobDir.absolutePath,
+            resultJobDirectoryPath = resultJobDirectoryPath
         )
+    }
+
+    /**
+     * Fatal-settlement precedence for the lane finally block (shared by the
+     * YUV/RAW/SR lanes):
+     *
+     *  1. [Error]: required local bookkeeping (log + boundary marked unreached),
+     *     then RETHROW — never swallowed as an ordinary Throwable. The original
+     *     in-flight throwable, if any, is attached as suppressed first.
+     *  2. CancellationException: cancellation semantics preserved (rethrown).
+     *  3. Exception: the lease retains reconciliation debt explicitly; the
+     *     boundary is reported UNREACHED and the terminal publisher still runs
+     *     with captureResourcesSettled=false (no ownership-settled claim
+     *     unsupported by reality).
+     *
+     * The terminal publication runs in a nested finally so even a fatal Error /
+     * cancellation during lease release still attempts the exactly-once
+     * publication before propagating.
+     */
+    internal fun finalizeLaneAfterExecution(
+        releaseLease: (() -> Boolean)?,
+        jobDirName: String,
+        inFlight: Throwable?,
+        publishTerminal: (captureResourcesSettled: Boolean) -> Unit
+    ) {
+        var boundaryReached = releaseLease == null
+        try {
+            val release = releaseLease ?: return
+            try {
+                if (release()) {
+                    boundaryReached = true
+                } else {
+                    // Explicit retain-for-reconciliation IS the documented owner
+                    // boundary: debt stays observable and reconciliation-ready.
+                    Log.w("KeplerBackgroundExecutor", "retaining lease for reconciliation $jobDirName")
+                    boundaryReached = true
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                Log.e("KeplerBackgroundExecutor", "lease release cancelled $jobDirName", cancelled)
+                throw cancelled
+            } catch (fatal: Error) {
+                Log.e("KeplerBackgroundExecutor", "lease release failed fatally $jobDirName", fatal)
+                throw fatal
+            } catch (releaseFailure: Exception) {
+                Log.e("KeplerBackgroundExecutor", "lease release failed $jobDirName", releaseFailure)
+                boundaryReached = false
+            }
+        } catch (propagated: Throwable) {
+            inFlight?.let { if (it !== propagated) propagated.addSuppressed(it) }
+            throw propagated
+        } finally {
+            publishTerminal(boundaryReached)
+        }
     }
 
     private fun executeYuv(
@@ -224,6 +298,7 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
         var lease: JobOperationLease? = null
         var ordinaryFailure: Exception? = null
         var pendingOutcome: BackgroundTerminalSpec? = null
+        var inFlight: Throwable? = null
         try {
             val cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
             lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
@@ -354,6 +429,7 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
             )
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             ordinaryFailure = null
+            inFlight = cancelled
             pendingOutcome = BackgroundTerminalSpec(
                 kind = CameraPipelineEvent.Terminal.Kind.CANCELLED,
                 requiredOutputCommitted = false,
@@ -362,20 +438,25 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
                 message = "Background YUV processing cancelled."
             )
             throw cancelled
+        } catch (fatal: Error) {
+            // Fatal settlement precedence: record, never swallow — rethrow after
+            // the finally bookkeeping. No terminal is synthesized for a fatal Error.
+            inFlight = fatal
+            throw fatal
         } catch (failure: Exception) {
             Log.e("KeplerBackgroundExecutor", "YUV background job failed ${jobDir.name}", failure)
             ordinaryFailure = failure
         } finally {
-            lease?.let { lease ->
-                try {
-                    if (!lease.releaseOrRetainForReconciliation()) {
-                        Log.w("KeplerBackgroundExecutor", "retaining lease for reconciliation ${jobDir.name}")
-                    }
-                } catch (releaseFailure: Throwable) {
-                    Log.e("KeplerBackgroundExecutor", "lease release failed ${jobDir.name}", releaseFailure)
-                }
+            finalizeLaneAfterExecution(
+                releaseLease = lease?.let { l -> ({ l.releaseOrRetainForReconciliation() }) },
+                jobDirName = jobDir.name,
+                inFlight = inFlight
+            ) { leaseBoundaryReached ->
+                settleTerminal(
+                    terminal, counts, jobDir, pendingOutcome, ordinaryFailure,
+                    jobDir, lease, leaseBoundaryReached
+                )
             }
-            settleTerminal(terminal, counts, jobDir, pendingOutcome, ordinaryFailure, jobDir, lease)
         }
     }
 
@@ -412,6 +493,7 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
         var lease: JobOperationLease? = null
         var ordinaryFailure: Exception? = null
         var pendingOutcome: BackgroundTerminalSpec? = null
+        var inFlight: Throwable? = null
         try {
             val cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
             lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
@@ -476,6 +558,7 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
             )
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             ordinaryFailure = null
+            inFlight = cancelled
             pendingOutcome = BackgroundTerminalSpec(
                 kind = CameraPipelineEvent.Terminal.Kind.CANCELLED,
                 requiredOutputCommitted = false,
@@ -484,20 +567,23 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
                 message = "Background RAW processing cancelled."
             )
             throw cancelled
+        } catch (fatal: Error) {
+            inFlight = fatal
+            throw fatal
         } catch (failure: Exception) {
             Log.e("KeplerBackgroundExecutor", "RAW background job failed ${jobDir.name}", failure)
             ordinaryFailure = failure
         } finally {
-            lease?.let { lease ->
-                try {
-                    if (!lease.releaseOrRetainForReconciliation()) {
-                        Log.w("KeplerBackgroundExecutor", "retaining lease for reconciliation ${jobDir.name}")
-                    }
-                } catch (releaseFailure: Throwable) {
-                    Log.e("KeplerBackgroundExecutor", "lease release failed ${jobDir.name}", releaseFailure)
-                }
+            finalizeLaneAfterExecution(
+                releaseLease = lease?.let { l -> ({ l.releaseOrRetainForReconciliation() }) },
+                jobDirName = jobDir.name,
+                inFlight = inFlight
+            ) { leaseBoundaryReached ->
+                settleTerminal(
+                    terminal, counts, jobDir, pendingOutcome, ordinaryFailure,
+                    jobDir, lease, leaseBoundaryReached
+                )
             }
-            settleTerminal(terminal, counts, jobDir, pendingOutcome, ordinaryFailure, jobDir, lease)
         }
     }
 
@@ -617,13 +703,18 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
     ) {
         val sourceJobDir = request.exactJobDirectory
         val post = statusLogger(sourceJobDir)
-        val emit = backgroundEventSink(request)
+        // Dual identity: routing stays on the SOURCE capture job; as soon as the
+        // SR output directory exists it becomes the RESULT identity for every
+        // subsequently published event (including the terminal).
+        var resultIdentity: File = sourceJobDir
+        val emit = backgroundEventSink(request) { resultIdentity }
         val terminal = CameraPipelineTerminalPublisher(emit)
         val counts = eventCounts(jobJson)
         var lease: JobOperationLease? = null
         var ordinaryFailure: Exception? = null
         var pendingOutcome: BackgroundTerminalSpec? = null
         var srOutputDir: File? = null
+        var inFlight: Throwable? = null
         try {
             val cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
             val sourceFrames = readColorBurstFrameFiles(sourceJobDir)
@@ -640,9 +731,14 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
             }
             val outputDir = createSuperResolutionJobDirectory(appContext)
             srOutputDir = outputDir
+            resultIdentity = outputDir
             lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 outputDir, JobRecoveryMutationIntent.PROCESSING_START
             )
+            // Persist the source/result relationship durably BEFORE any terminal
+            // can be published: result side first (stub if fusion metadata does
+            // not exist yet), then the reverse link on the source capture job.
+            linkSuperResolutionIdentities(sourceJobDir, outputDir)
             post("Processing 24M Fusion...")
             emit(
                 CameraPipelineEvent.ProcessingStage(
@@ -657,6 +753,7 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
                     context = appContext,
                     inputFrameFiles = sourceFrames,
                     outputDir = outputDir,
+                    sourceJobDirectory = sourceJobDir,
                     sourceMode = SuperResolutionSourceMode.BINNED_12MP_YUV,
                     maxFrames = jobJson.optInt("requestedFrames", sourceFrames.size),
                     processingParams = loadClassicYuvFusionParams(jobJson),
@@ -774,6 +871,7 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
             )
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             ordinaryFailure = null
+            inFlight = cancelled
             pendingOutcome = BackgroundTerminalSpec(
                 kind = CameraPipelineEvent.Terminal.Kind.CANCELLED,
                 requiredOutputCommitted = false,
@@ -782,23 +880,79 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
                 message = "Background 24M Fusion cancelled."
             )
             throw cancelled
+        } catch (fatal: Error) {
+            inFlight = fatal
+            throw fatal
         } catch (failure: Exception) {
             Log.e("KeplerBackgroundExecutor", "SR background job failed ${sourceJobDir.name}", failure)
             ordinaryFailure = failure
         } finally {
-            lease?.let { lease ->
-                try {
-                    if (!lease.releaseOrRetainForReconciliation()) {
-                        Log.w("KeplerBackgroundExecutor", "retaining lease for reconciliation ${sourceJobDir.name}")
-                    }
-                } catch (releaseFailure: Throwable) {
-                    Log.e("KeplerBackgroundExecutor", "lease release failed ${sourceJobDir.name}", releaseFailure)
-                }
+            finalizeLaneAfterExecution(
+                releaseLease = lease?.let { l -> ({ l.releaseOrRetainForReconciliation() }) },
+                jobDirName = sourceJobDir.name,
+                inFlight = inFlight
+            ) { leaseBoundaryReached ->
+                settleTerminal(
+                    terminal, counts, sourceJobDir, pendingOutcome, ordinaryFailure,
+                    srOutputDir ?: sourceJobDir, lease, leaseBoundaryReached,
+                    resultJobDirectoryPath = srOutputDir?.absolutePath
+                )
             }
-            settleTerminal(
-                terminal, counts, sourceJobDir, pendingOutcome, ordinaryFailure,
-                srOutputDir ?: sourceJobDir, lease
-            )
         }
     }
+
+    /**
+     * Dual-identity durability for Super Resolution. Writes the explicit
+     * request/result relationship into BOTH job directories BEFORE any terminal
+     * publication:
+     *  - RESULT side (SR output dir): "superResolutionSourceJobDirectory".
+     *    If fusion metadata does not exist yet, a minimal stub job.json is
+     *    created carrying the link; the later full SR metadata write merges
+     *    over it and re-asserts the key.
+     *  - REQUEST side (source capture dir): "superResolutionResultJobDirectory".
+     *
+     * Best-effort by contract: an identity-link write failure is logged and
+     * never fails the lane — the executor-level event envelope still carries
+     * both identities explicitly for every published event.
+     */
+    internal fun linkSuperResolutionIdentities(sourceJobDir: File, resultJobDir: File) {
+        try {
+            val existingResultJob = try {
+                KeplerJobMetadata.read(resultJobDir)
+            } catch (_: Exception) {
+                null
+            }
+            if (existingResultJob != null) {
+                KeplerJobMetadata.update(resultJobDir) { job ->
+                    job.put(SUPER_RESOLUTION_SOURCE_JOB_KEY, sourceJobDir.absolutePath)
+                }
+            } else {
+                KeplerJobMetadata.write(
+                    resultJobDir,
+                    org.json.JSONObject()
+                        .put("jobType", "SUPER_RESOLUTION_FUSION")
+                        .put("status", "PROCESSING")
+                        .put("createdAt", System.currentTimeMillis())
+                        .put(SUPER_RESOLUTION_SOURCE_JOB_KEY, sourceJobDir.absolutePath)
+                )
+            }
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (linkFailure: Exception) {
+            Log.e("KeplerBackgroundExecutor", "SR result-side identity link failed ${resultJobDir.name}", linkFailure)
+        }
+        try {
+            KeplerJobMetadata.update(sourceJobDir) { job ->
+                job.put(SUPER_RESOLUTION_RESULT_JOB_KEY, resultJobDir.absolutePath)
+            }
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (linkFailure: Exception) {
+            Log.e("KeplerBackgroundExecutor", "SR source-side identity link failed ${sourceJobDir.name}", linkFailure)
+        }
+    }
+
+    // Durable dual-identity keys (see [linkSuperResolutionIdentities]).
+    private const val SUPER_RESOLUTION_SOURCE_JOB_KEY = "superResolutionSourceJobDirectory"
+    private const val SUPER_RESOLUTION_RESULT_JOB_KEY = "superResolutionResultJobDirectory"
 }

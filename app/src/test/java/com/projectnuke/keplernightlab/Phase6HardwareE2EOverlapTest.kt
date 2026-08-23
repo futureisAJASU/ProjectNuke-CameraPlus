@@ -98,7 +98,7 @@ class Phase6HardwareE2EOverlapTest {
         job: File,
         kind: CameraPipelineEvent.Terminal.Kind = CameraPipelineEvent.Terminal.Kind.COMPLETE
     ) = BackgroundPipelineEvent(
-        exactJobDirectory = job,
+        requestJobDirectory = job,
         jobKind = KeplerActiveOperationKind.PROCESSING_YUV,
         event = CameraPipelineEvent.Terminal(
             generation = 0L,
@@ -166,7 +166,7 @@ class Phase6HardwareE2EOverlapTest {
 
         recorder.recordBackgroundEvent(
             BackgroundPipelineEvent(
-                exactJobDirectory = jobA,
+                requestJobDirectory = jobA,
                 jobKind = KeplerActiveOperationKind.PROCESSING_YUV,
                 event = CameraPipelineEvent.ProcessingStage(
                     generation = 0L,
@@ -197,7 +197,7 @@ class Phase6HardwareE2EOverlapTest {
 
         recorder.recordBackgroundEvent(
             BackgroundPipelineEvent(
-                exactJobDirectory = jobA,
+                requestJobDirectory = jobA,
                 jobKind = KeplerActiveOperationKind.PROCESSING_YUV,
                 event = CameraPipelineEvent.ExportStage(
                     generation = 0L,
@@ -364,7 +364,7 @@ class Phase6HardwareE2EOverlapTest {
         recorder.recordEvent(captureStageComplete(job).copy(generation = 1L))
         recorder.recordBackgroundEvent(
             BackgroundPipelineEvent(
-                exactJobDirectory = job,
+                requestJobDirectory = job,
                 jobKind = KeplerActiveOperationKind.PROCESSING_YUV,
                 event = CameraPipelineEvent.ProcessingStage(
                     generation = 0L,
@@ -375,7 +375,7 @@ class Phase6HardwareE2EOverlapTest {
         )
         recorder.recordBackgroundEvent(
             BackgroundPipelineEvent(
-                exactJobDirectory = job,
+                requestJobDirectory = job,
                 jobKind = KeplerActiveOperationKind.PROCESSING_YUV,
                 event = CameraPipelineEvent.ExportStage(
                     generation = 0L,

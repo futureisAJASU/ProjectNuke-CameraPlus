@@ -335,6 +335,13 @@ internal data class HardwareE2ERunReport(
     val terminalEvent: String?,
     val terminalFlags: Map<String, Boolean>,
     val latestJobDirectory: String?,
+    /**
+     * RESULT identity captured from the terminal event (SR output directory).
+     * Null for YUV/RAW where result == request identity. Finalization reads
+     * THIS directory's durable metadata when present; routing keeps using
+     * [latestJobDirectory] (the request identity).
+     */
+    val resultJobDirectoryPath: String? = null,
     val finalJob: HardwareE2EJobSummary?,
     val status: HardwareE2EClassification,
     val failure: String? = null,
@@ -363,6 +370,7 @@ internal data class HardwareE2ERunReport(
         terminalEvent?.let { put("terminalEvent", it) }
         put("terminalFlags", JSONObject(terminalFlags))
         latestJobDirectory?.let { put("latestJobDirectory", it) }
+        resultJobDirectoryPath?.let { put("resultJobDirectoryPath", it) }
         finalJob?.let { put("finalJob", it.toJson()) }
         put("status", status.name)
         put("classificationReason", classificationReason.name)
@@ -448,6 +456,7 @@ internal data class HardwareE2ERunReport(
                     }
                 },
                 latestJobDirectory = json.optString("latestJobDirectory").takeIf { it.isNotBlank() },
+                resultJobDirectoryPath = json.optString("resultJobDirectoryPath").takeIf { it.isNotBlank() },
                 finalJob = json.optJSONObject("finalJob")?.let(HardwareE2EJobSummary::fromJson),
                 status = runCatching {
                     HardwareE2EClassification.valueOf(json.optString("status"))
@@ -646,16 +655,17 @@ internal class HardwareE2ERunRecorder private constructor(
     }
 
     /**
-     * Records one process-scoped background event envelope. Routing uses ONLY
-     * the exact job-directory binding: a background event with an exact job
-     * that has no bound run is dropped rather than being attributed to the
-     * current run. Generation 0 must never fall back to "current" here.
+     * Records one process-scoped background event envelope. ROUTING uses ONLY
+     * the exact REQUEST job-directory binding (for SR the source capture job):
+     * a background event with an exact request job that has no bound run is
+     * dropped rather than being attributed to the current run. Generation 0
+     * must never fall back to "current" here.
      */
     fun recordBackgroundEvent(background: BackgroundPipelineEvent) {
         val event = background.event
         val checkpoint = checkpointFor(event)
         val targetRunId = synchronized(lock) {
-            runIdByJobDirectory[background.exactJobDirectory.absolutePath]
+            runIdByJobDirectory[background.requestJobDirectory.absolutePath]
         } ?: return
         recordToRun(event, checkpoint, targetRunId)
     }
@@ -738,6 +748,8 @@ internal class HardwareE2ERunRecorder private constructor(
                 } else report.terminalFlags,
                 latestJobDirectory = (event as? CameraPipelineEvent.CaptureStageComplete)
                     ?.jobDirectoryPath ?: report.latestJobDirectory,
+                resultJobDirectoryPath = (event as? CameraPipelineEvent.Terminal)
+                    ?.resultJobDirectoryPath ?: report.resultJobDirectoryPath,
                 runEndWallClockTimestamp = if (event is CameraPipelineEvent.Terminal) {
                     record.wallClockTimestamp
                 } else report.runEndWallClockTimestamp,
@@ -891,9 +903,29 @@ internal class HardwareE2ERunRecorder private constructor(
     )
 
     private fun correlateJob(report: HardwareE2ERunReport, runId: String): JobCorrelationResult {
-        // Exact binding wins: the foreground diagnostic run was associated with
-        // this exact job directory at its durable CaptureStageComplete, so a
-        // newer capture can never steal or be blamed for this run's terminal.
+        // RESULT identity wins for FINALIZATION: when the terminal event carried
+        // an explicit result job directory (SR output), the durable metadata of
+        // THAT directory is what this run's artifacts live in. Never inferred
+        // through a "latest job" lookup — it is exact terminal-carried evidence.
+        val resultPath = report.resultJobDirectoryPath
+        if (resultPath != null) {
+            val resultDir = File(resultPath)
+            val resultJob = runCatching {
+                JSONObject(NoFollowFileSystem.readTextVerified(File(resultDir, JOB_JSON_FILE_NAME)))
+            }.getOrNull()
+            if (resultJob != null && resultDir.isDirectory) {
+                return JobCorrelationResult(
+                    HardwareE2EJobCorrelation.EXACT,
+                    readJobSummary(resultDir),
+                    "exact result identity captured from terminal event",
+                    1
+                )
+            }
+        }
+        // Exact REQUEST binding wins otherwise: the foreground diagnostic run was
+        // associated with this exact job directory at its durable
+        // CaptureStageComplete, so a newer capture can never steal or be blamed
+        // for this run's terminal.
         val boundPath = report.latestJobDirectory
         if (boundPath != null) {
             val boundDir = File(boundPath)

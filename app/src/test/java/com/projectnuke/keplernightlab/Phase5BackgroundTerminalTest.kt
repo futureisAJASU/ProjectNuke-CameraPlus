@@ -90,7 +90,7 @@ class Phase5BackgroundTerminalTest {
         override fun onBackgroundEvent(event: BackgroundPipelineEvent) {
             envelopes.add(event)
             if (event.event is CameraPipelineEvent.Terminal) {
-                val dir = event.exactJobDirectory
+                val dir = event.requestJobDirectory
                 leasePresentAtTerminalDelivery = runCatching {
                     KeplerJobMetadata.findOperationLease(dir) != null
                 }.getOrDefault(true)
@@ -173,7 +173,7 @@ class Phase5BackgroundTerminalTest {
         val terminal = terminals.single()
         assertEquals(CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL, terminal.kind)
         assertEquals(jobDir.absolutePath, terminal.jobDirectoryPath)
-        assertTrue(collector.envelopes.all { it.exactJobDirectory.absolutePath == jobDir.absolutePath })
+        assertTrue(collector.envelopes.all { it.requestJobDirectory.absolutePath == jobDir.absolutePath })
         assertEquals(KeplerActiveOperationKind.PROCESSING_YUV, collector.envelopes.first().jobKind)
     }
 
@@ -201,7 +201,7 @@ class Phase5BackgroundTerminalTest {
         assertEquals(1, terminals.size)
         assertEquals(CameraPipelineEvent.Terminal.Kind.FAILED, terminals.single().kind)
         assertEquals(jobDir.absolutePath, terminals.single().jobDirectoryPath)
-        assertTrue(collector.envelopes.all { it.exactJobDirectory.absolutePath == jobDir.absolutePath })
+        assertTrue(collector.envelopes.all { it.requestJobDirectory.absolutePath == jobDir.absolutePath })
     }
 
     @Test
@@ -224,7 +224,7 @@ class Phase5BackgroundTerminalTest {
         assertEquals(CameraPipelineEvent.Terminal.Kind.FAILED, terminals.single().kind)
         assertEquals(sourceJobDir.absolutePath, terminals.single().jobDirectoryPath)
         assertTrue(terminals.single().message.orEmpty().contains("no source frames"))
-        assertTrue(collector.envelopes.all { it.exactJobDirectory.absolutePath == sourceJobDir.absolutePath })
+        assertTrue(collector.envelopes.all { it.requestJobDirectory.absolutePath == sourceJobDir.absolutePath })
     }
 
     @Test
@@ -381,7 +381,7 @@ class Phase5BackgroundTerminalTest {
 
         BackgroundPipelineEventHub.publish(
             BackgroundPipelineEvent(
-                exactJobDirectory = newJobDir("probe"),
+                requestJobDirectory = newJobDir("probe"),
                 jobKind = KeplerActiveOperationKind.PROCESSING_YUV,
                 event = CameraPipelineEvent.ProcessingStage(
                     generation = 0L,
