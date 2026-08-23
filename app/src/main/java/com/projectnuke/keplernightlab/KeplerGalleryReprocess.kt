@@ -3291,7 +3291,7 @@ private fun finalOutputCandidates(jobDir: File, job: JSONObject): List<File> {
         SINGLE_FRAME_OUTPUT_FILE_NAME
     ).filter { it.isNotBlank() && it != "null" }.distinct()
     return names.map { File(jobDir, it) }
-        .filter { it.extension.lowercase(Locale.US) in setOf("png", "jpg", "jpeg", "heic", "webp") }
+        .filter { it.extension.lowercase(Locale.US) in setOf("png", "jpg", "jpeg", "heic", "heif", "webp") }
 }
 
 private fun resolveReprocessFinalOutput(jobDir: File, job: JSONObject): File? =

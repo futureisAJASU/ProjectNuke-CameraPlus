@@ -103,7 +103,7 @@ import kotlin.math.roundToInt
 
 fun isAllowedPreviewExtension(fileName: String): Boolean {
     return when (val ext = fileName.substringAfterLast('.', "").lowercase()) {
-        "png", "jpg", "jpeg", "heic", "webp" -> true
+        "png", "jpg", "jpeg", "heic", "heif", "webp" -> true
         else -> false
     }
 }
@@ -3435,10 +3435,10 @@ private fun chooseLatestResultFile(jobDir: File, job: JSONObject): File? {
         .asSequence()
         .filter { it.isNotBlank() && it != "null" }
         .mapNotNull { NoFollowFileSystem.resolveDirectChild(jobDir, it, requireFile = true) }
-        .filter { it.extension.lowercase() in setOf("png", "jpg", "jpeg", "heic", "webp") }
+        .filter { it.extension.lowercase() in setOf("png", "jpg", "jpeg", "heic", "heif", "webp") }
         .firstOrNull {
             isCurrentPreviewFile(it) &&
-                it.extension.lowercase() in setOf("jpg", "jpeg", "png", "heic", "webp") &&
+                it.extension.lowercase() in setOf("jpg", "jpeg", "png", "heic", "heif", "webp") &&
                 !it.name.contains("compare", ignoreCase = true) &&
                 !it.name.contains("debug", ignoreCase = true)
         }
@@ -3449,7 +3449,7 @@ private fun isCurrentPreviewFile(file: File): Boolean =
         is NoFollowInspection.Present -> inspection.value.isRegularFile &&
             !inspection.value.isSymbolicLink() && inspection.value.size() > 0L
         else -> false
-    } && file.extension.lowercase() in setOf("jpg", "jpeg", "png", "heic", "webp") &&
+    } && file.extension.lowercase() in setOf("jpg", "jpeg", "png", "heic", "heif", "webp") &&
         !file.name.contains("compare", ignoreCase = true) &&
         !file.name.contains("debug", ignoreCase = true)
 

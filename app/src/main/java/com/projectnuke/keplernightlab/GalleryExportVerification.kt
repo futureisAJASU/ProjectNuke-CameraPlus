@@ -204,10 +204,21 @@ private fun verifyOnce(
             "MediaStore MIME mismatch: expected ${expectedFormat.mimeType}, actual ${columns.mimeType ?: "missing"}"
         )
     }
-    val expectedExtension = ".${expectedFormat.extension}"
-    if (columns.displayName.isNullOrBlank() || !columns.displayName.lowercase(Locale.US).endsWith(expectedExtension)) {
+    val displayName = columns.displayName
+    val nameLower = displayName?.lowercase(Locale.US)
+    if (nameLower.isNullOrBlank()) {
         return GalleryExportVerification.PermanentFailure(
-            "Display-name extension mismatch: expected $expectedExtension, actual ${columns.displayName ?: "missing"}"
+            "Display-name extension mismatch: expected ${expectedExtensionLabel(expectedFormat)}, actual ${displayName ?: "missing"}"
+        )
+    }
+    if (isDuplicatedHeifGeneratedName(nameLower)) {
+        return GalleryExportVerification.PermanentFailure(
+            "Display-name is a duplicated malformed generated name: actual $displayName"
+        )
+    }
+    if (!acceptsDisplayNameExtension(expectedFormat, nameLower)) {
+        return GalleryExportVerification.PermanentFailure(
+            "Display-name extension mismatch: expected ${expectedExtensionLabel(expectedFormat)}, actual $displayName"
         )
     }
     if (expected.width != null && expected.height != null &&
@@ -223,6 +234,30 @@ private fun verifyOnce(
 }
 
 private data class ImageProbe(val format: OutputFormat?, val complete: Boolean, val size: Long)
+
+/**
+ * Display-name policy for committed public rows.
+ *
+ * Newly created rows use the canonical MIME-consistent pair (image/heif + .heif).
+ * Verification accepts legitimate terminal HEIF aliases — .heif (canonical) and
+ * .heic (legacy) — because HEIF truth is the payload signature/container, never
+ * the name.  Duplicated malformed generated names (.heic.heif / .heif.heic, as
+ * produced by platform canonicalization stacking an extension on a mismatched
+ * supplied name) are rejected: they are evidence of a broken generation path,
+ * not of a legitimate legacy row.
+ */
+private fun isDuplicatedHeifGeneratedName(nameLower: String): Boolean =
+    nameLower.endsWith(".heic.heif") || nameLower.endsWith(".heif.heic")
+
+private fun acceptsDisplayNameExtension(format: OutputFormat, nameLower: String): Boolean = when (format) {
+    OutputFormat.HEIF -> nameLower.endsWith(".heif") || nameLower.endsWith(".heic")
+    else -> nameLower.endsWith(".${format.extension}")
+}
+
+private fun expectedExtensionLabel(format: OutputFormat): String = when (format) {
+    OutputFormat.HEIF -> ".heif (or legacy .heic)"
+    else -> ".${format.extension}"
+}
 
 private fun probeImageStream(input: InputStream): ImageProbe {
     // ISO-BMFF compatible brands live in the ftyp box. Keep this bounded but large enough for

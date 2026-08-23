@@ -35,7 +35,15 @@ enum class OutputFormat(
     val mimeType: String,
     val extension: String
 ) {
-    HEIF("HEIF", "image/heif", "heic"),
+    /**
+     * Canonical MIME/extension pair for newly created public MediaStore rows.
+     * The previous pair (image/heif + .heic) is inconsistent with the platform's
+     * MIME-to-extension canonicalization: Samsung/Android MediaStore appends
+     * .heif to a supplied .heic name, producing malformed duplicated names like
+     * Keplertime.heic.heif.  HEIF truth remains payload/container based; legacy
+     * .heic rows are still accepted as terminal aliases by verification.
+     */
+    HEIF("HEIF", "image/heif", "heif"),
     JPEG("JPEG", "image/jpeg", "jpg"),
     PNG("PNG", "image/png", "png")
 }

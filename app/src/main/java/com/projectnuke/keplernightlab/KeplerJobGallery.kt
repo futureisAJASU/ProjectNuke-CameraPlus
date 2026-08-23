@@ -835,7 +835,7 @@ private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
             name.isNotBlank() &&
                 isDisplayImageFile(it) &&
                 !isDebugPreviewFinalBlocked(it.name) &&
-                (it.extension.equals("png", true) || it.extension.equals("jpg", true) || it.extension.equals("jpeg", true) || it.extension.equals("heic", true) || it.extension.equals("webp", true))
+                (it.extension.equals("png", true) || it.extension.equals("jpg", true) || it.extension.equals("jpeg", true) || it.extension.equals("heic", true) || it.extension.equals("heif", true) || it.extension.equals("webp", true))
         }
             ?.let { return it }
     }
@@ -850,7 +850,7 @@ private fun resolveFinalPreview(directory: File, job: JSONObject?): File? {
 }
 
 private fun isDisplayImageFile(file: File): Boolean =
-    file.extension.lowercase() in setOf("png", "jpg", "jpeg", "heic", "webp")
+    file.extension.lowercase() in setOf("png", "jpg", "jpeg", "heic", "heif", "webp")
 
 private fun isDebugPreviewFinalBlocked(name: String): Boolean {
     val lower = name.lowercase()
