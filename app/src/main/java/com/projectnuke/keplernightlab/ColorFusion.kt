@@ -530,6 +530,9 @@ fun captureYuvBurstColorWithMotion(
         val estimatedBufferBytes =
             estimateYuvBufferBytes(yuvSize.width, yuvSize.height) * frameCount
         val captureTimeoutMs = computeYuvCaptureTimeoutMs(frameCount, resolutionMode)
+        // Phase 5: bounded capture-latency instrumentation.  Atomic, non-blocking
+        // recorders only; persisted once at terminal settlement.
+        val captureTimingLedger = CaptureTimingLedger(frameCount)
 
         val currentJobFile = File(currentBurstDir, "job.json")
         jobFile = currentJobFile
@@ -641,6 +644,10 @@ fun captureYuvBurstColorWithMotion(
             }
         )
 
+        var prevTimingReceived = 0
+        var prevTimingCompleted = 0
+        var prevTimingPersisted = 0
+
         yuvSession = YuvCaptureSession.create(
             dispatch = { event -> backgroundHandler.post { event.execute() } },
             outputDir = currentBurstDir,
@@ -686,6 +693,7 @@ fun captureYuvBurstColorWithMotion(
                 // result from counters or elapsed time.
                 when (request.completionKind) {
                     TerminalCompletionKind.SUCCESS -> {
+                        captureTimingLedger.recordProcessingHandoffPublished()
                         durableCaptureOperationId?.let { operationId ->
                             val handoffPublished = KeplerJobMetadata.publishProcessingHandoff(
                                     currentBurstDir,
@@ -706,6 +714,9 @@ fun captureYuvBurstColorWithMotion(
                                  )
                              }
                              if (ownerSettled) {
+                                 captureTimingLedger.recordCaptureResourcesSettled()
+                                 captureTimingLedger.recordCaptureStageComplete()
+                                 CaptureTimingLedger.persist(currentBurstDir, captureTimingLedger)
                                  durableCaptureLease?.release()
                                  onComplete(currentBurstDir)
                              } else {
@@ -720,6 +731,7 @@ fun captureYuvBurstColorWithMotion(
                         } ?: onComplete(currentBurstDir)
                     }
                     TerminalCompletionKind.ERROR -> {
+                        CaptureTimingLedger.persist(currentBurstDir, captureTimingLedger)
                         val ownerSettled = durableCaptureOperationId?.let { operationId ->
                             durableCaptureLease?.let { lease ->
                                 KeplerJobMetadata.settleCaptureOwnerAfterHandoffFailure(
@@ -758,6 +770,23 @@ fun captureYuvBurstColorWithMotion(
                 // Typed acquisition progress from the authoritative owner ledger:
                 // paired Camera2 evidence drives the capture bar; persistence is
                 // reported for the settling state only. Never parsed from text.
+                if (received > prevTimingReceived) {
+                    repeat(received - prevTimingReceived) { captureTimingLedger.recordImageReceived() }
+                    prevTimingReceived = received
+                }
+                if (completed > prevTimingCompleted) {
+                    repeat(completed - prevTimingCompleted) { captureTimingLedger.recordResultReceived() }
+                    prevTimingCompleted = completed
+                }
+                if (persisted > prevTimingPersisted) {
+                    for (frameIndex in prevTimingPersisted until persisted) {
+                        captureTimingLedger.recordCommitted(frameIndex)
+                    }
+                    prevTimingPersisted = persisted
+                    if (persisted >= frameCount) {
+                        captureTimingLedger.recordPersistenceDrainComplete()
+                    }
+                }
                 val pairCount = cameraAcquisitionPairCount(received, completed)
                 onTypedCaptureProgress(
                     CameraPipelineEvent.CaptureProgress(
@@ -1029,6 +1058,7 @@ fun captureYuvBurstColorWithMotion(
                                             handler = backgroundHandler,
                                             frameCount = frameCount
                                         )
+                                        captureTimingLedger.recordCaptureRequestSubmitted()
                                         timeoutScheduler.schedule({
                                             yuvSession?.owner?.onDeadlineReached()
                                         }, captureTimeoutMs, TimeUnit.MILLISECONDS)

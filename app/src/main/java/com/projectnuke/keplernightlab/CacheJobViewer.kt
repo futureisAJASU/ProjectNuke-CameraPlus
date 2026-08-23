@@ -1108,6 +1108,10 @@ internal fun buildHardwareE2ESnapshot(
                 "totalDurationMs", "memoryRiskLevel", "estimatedRawFusionMemoryMb", "estimatedMemoryMb"
             ).forEach { put(it, job.value(it)) }
         })
+        // Phase 5: bounded capture-latency metrics recorded by the capture
+        // timing ledger (camera acquisition / persistence drain / handoff
+        // settlement / capture-stage total).  Diagnostic only.
+        put("captureTiming", job.value("captureTiming"))
         put("export", JSONObject().apply {
             listOf("exportStatus", "exportVerified", "publicExportCommitted", "requiredOutputCommitted", "cleanupType")
                 .forEach { put(it, job.value(it)) }

@@ -383,6 +383,8 @@ fun captureRawBurstForFusion(
     var maxResolutionPixelModeFailure: String? = null
     var sensorPixelModeUsed = false
     val rawCaptureStartedAt = System.currentTimeMillis()
+    // Phase 5: bounded capture-latency instrumentation (atomic, non-blocking).
+    val captureTimingLedger = CaptureTimingLedger(requestedFrames)
     fun frameObjectsSnapshot(): JSONArray = ledger.value.frameObjectsSnapshot()
     fun postCaptureProgress() {
         val snapshot = progressSnapshot.get()
@@ -1113,16 +1115,21 @@ fun captureRawBurstForFusion(
             )
         )
 
-        fun finishSuccess(partial: Boolean = false, reason: String? = null) = submitTerminal(
-            RawTerminalRequest(
-                status = if (partial) CaptureTerminalStatus.PARTIAL_SUCCESS else CaptureTerminalStatus.SUCCESS,
-                jobStatus = if (partial) "CAPTURE_COMPLETE_PARTIAL" else "CAPTURE_COMPLETE",
-                reason = reason,
-                completionKind = RawTerminalCompletionKind.SUCCESS,
-                cause = null,
-                saveMotion = true
+        fun finishSuccess(partial: Boolean = false, reason: String? = null): Unit {
+            captureTimingLedger.recordPersistenceDrainComplete()
+            captureTimingLedger.recordCaptureStageComplete()
+            CaptureTimingLedger.persist(jobDir, captureTimingLedger)
+            return submitTerminal(
+                RawTerminalRequest(
+                    status = if (partial) CaptureTerminalStatus.PARTIAL_SUCCESS else CaptureTerminalStatus.SUCCESS,
+                    jobStatus = if (partial) "CAPTURE_COMPLETE_PARTIAL" else "CAPTURE_COMPLETE",
+                    reason = reason,
+                    completionKind = RawTerminalCompletionKind.SUCCESS,
+                    cause = null,
+                    saveMotion = true
+                )
             )
-        )
+        }
 
         fun finishCancelled() = submitTerminal(
             RawTerminalRequest(
@@ -1552,6 +1559,7 @@ fun captureRawBurstForFusion(
                     }
                     ledger.value.evictEmergencyUnmatchedImages(readerCapacity)
                     ledger.value.recordImage(timestampNs, image, System.currentTimeMillis())
+                    captureTimingLedger.recordImageReceived()
                     if (ledger.value.rawFirstImageDelayMs == null) {
                         ledger.value.rawFirstImageDelayMs = System.currentTimeMillis() - rawCaptureStartedAt
                         post("RAW first image delay: ${ledger.value.rawFirstImageDelayMs}ms")
@@ -1575,6 +1583,7 @@ fun captureRawBurstForFusion(
                     activePhysicalId = activePhysicalIdValue
                     baseJob.put("activePhysicalId", activePhysicalIdValue ?: JSONObject.NULL)
                     ledger.value.recordResult(timestampNs, result)
+                    captureTimingLedger.recordResultReceived()
                     publishProgress()
                     postCaptureProgress()
                     dispatchReadyFrames()
@@ -1610,6 +1619,7 @@ fun captureRawBurstForFusion(
                 override fun execute() {
                     if (captureStateOwner.isClosed()) return
                     ledger.value.setAttemptedFrames(value)
+                    captureTimingLedger.recordCaptureRequestSubmitted()
                     publishProgress()
                 }
                 override fun disposeWithoutMutation() {}
