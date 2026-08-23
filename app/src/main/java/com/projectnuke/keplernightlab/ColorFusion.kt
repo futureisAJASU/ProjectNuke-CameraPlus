@@ -284,7 +284,8 @@ fun captureYuvBurstColorWithMotion(
     captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     onComplete: (File) -> Unit = {},
     onError: (String) -> Unit = {},
-    onStatus: (String) -> Unit
+    onStatus: (String) -> Unit,
+    onTypedCaptureProgress: CameraPipelineEventSink = {}
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
 
@@ -753,6 +754,28 @@ fun captureYuvBurstColorWithMotion(
             saveMotionOnce = { dir -> saveMotionOnce(dir) },
             productionResourceCoordinator = productionSeam.productionResourceCoordinator,
             finished = finished,
+            onAcquisitionUpdate = { received, completed, persisted ->
+                // Typed acquisition progress from the authoritative owner ledger:
+                // paired Camera2 evidence drives the capture bar; persistence is
+                // reported for the settling state only. Never parsed from text.
+                val pairCount = cameraAcquisitionPairCount(received, completed)
+                onTypedCaptureProgress(
+                    CameraPipelineEvent.CaptureProgress(
+                        generation = 0L,
+                        counts = CameraPipelineProgressCounts(
+                            requestedFrames = frameCount,
+                            savedFrames = persisted,
+                            receivedImages = received,
+                            completedResults = completed
+                        ),
+                        message = if (pairCount >= frameCount && persisted < frameCount) {
+                            CAPTURE_SETTLING_MESSAGE
+                        } else {
+                            null
+                        }
+                    )
+                )
+            },
             schedulePersistenceDrainDeadline = { runnable ->
                 timeoutScheduler.schedule(
                     runnable,

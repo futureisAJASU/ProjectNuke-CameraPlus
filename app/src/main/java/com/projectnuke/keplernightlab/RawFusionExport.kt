@@ -926,6 +926,7 @@ fun captureProcessExportRawNightFusion(
         saveDngSidecars = finalOutputFormat.shouldExportRawSidecar,
         captureCancellationHandle = captureCancellationHandle,
         onStatus = { post(it) },
+        onTypedCaptureProgress = onPipelineEvent,
         onComplete = { jobDir ->
             // Durable handoff ordering invariant: ALL post-handoff processing
             // parameters must be durably present BEFORE the evidenced

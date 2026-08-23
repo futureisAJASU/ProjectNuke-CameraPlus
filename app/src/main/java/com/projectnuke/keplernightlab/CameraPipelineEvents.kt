@@ -127,10 +127,15 @@ internal fun CameraPipelineProgressCounts.toCaptureProgress(
     stage: CaptureStage,
     message: String?
 ): CaptureProgressState {
-    val progress = when (stage) {
+    val stageProgress = when (stage) {
         CaptureStage.IDLE -> 0f
         CaptureStage.PREPARING -> 0.05f
-        CaptureStage.CAPTURING -> if (requestedFrames > 0) savedFrames.toFloat() / requestedFrames else previous.progressPercent
+        // The capture bar represents CAMERA ACQUISITION ONLY: paired Camera2
+        // evidence min(receivedImages, completedResults) over requestedFrames.
+        // Persisted frames are durability truth, never sensor-capture progress.
+        CaptureStage.CAPTURING -> cameraAcquisitionProgressFraction(
+            requestedFrames, receivedImages, completedResults
+        )
         CaptureStage.PROCESSING -> 0.65f
         CaptureStage.DEMOSAICING -> 0.75f
         CaptureStage.EXPORTING -> 0.85f
@@ -141,6 +146,9 @@ internal fun CameraPipelineProgressCounts.toCaptureProgress(
         CaptureStage.CANCELLED,
         CaptureStage.TIMEOUT -> 1f
     }
+    // Monotonic: once true acquisition reached a fraction (e.g. 100%), no later
+    // stage transition may pull the bar back below it during this operation.
+    val progress = maxOf(previous.progressPercent, stageProgress)
     return previous.copy(
         stage = stage,
         message = message ?: previous.message,

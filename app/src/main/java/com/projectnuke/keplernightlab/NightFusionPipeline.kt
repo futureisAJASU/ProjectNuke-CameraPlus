@@ -229,7 +229,8 @@ onComplete = { jobDir ->
         },
         onStatus = { message ->
             post(message)
-        }
+        },
+        onTypedCaptureProgress = onPipelineEvent
     )
 }
 

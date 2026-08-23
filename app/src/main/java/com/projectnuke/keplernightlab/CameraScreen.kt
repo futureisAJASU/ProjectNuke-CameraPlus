@@ -1995,10 +1995,23 @@ fun PipelineBusyShutterIndicator(
 fun CaptureProgressRow(
     captureProgress: CaptureProgressState
 ) {
+    // The lower capture progress surface represents CAMERA ACQUISITION ONLY:
+    // the paired Camera2 evidence count, never persisted frames and never
+    // fusion/export stages.
+    val acquiredFrames = cameraAcquisitionPairCount(
+        captureProgress.receivedImages,
+        captureProgress.completedResults
+    )
+    val captureComplete = captureProgress.requestedFrames > 0 &&
+        acquiredFrames >= captureProgress.requestedFrames
     val stageText = when (captureProgress.stage) {
         CaptureStage.IDLE -> "Ready"
         CaptureStage.PREPARING -> "Preparing"
-        CaptureStage.CAPTURING -> "RAW 캡처 중입니다."
+        // After true acquisition reaches 100% but durable source settlement is
+        // still running, hold a distinct short settling state. The bar never
+        // drops back below 100% during settlement.
+        CaptureStage.CAPTURING ->
+            if (captureComplete) CAPTURE_SETTLING_MESSAGE else "카메라 캡처 중입니다."
         CaptureStage.PROCESSING -> "RAW 합성 처리 중입니다."
         CaptureStage.DEMOSAICING -> "Native RAW ISP 렌더링 중입니다."
         CaptureStage.EXPORTING -> "결과 미리보기를 준비하는 중입니다."
@@ -2010,13 +2023,17 @@ fun CaptureProgressRow(
         CaptureStage.TIMEOUT -> "처리 시간이 초과되었습니다."
     }
     val frameText = if (captureProgress.requestedFrames > 0) {
-        "${captureProgress.savedFrames} / ${captureProgress.requestedFrames}"
+        "$acquiredFrames / ${captureProgress.requestedFrames}"
     } else {
         ""
     }
     val detailText = buildString {
         if (captureProgress.stage == CaptureStage.CAPTURING) {
-            append("촬영 중입니다. 기기를 움직이지 마세요.")
+            if (captureComplete) {
+                append(CAPTURE_SETTLING_MESSAGE)
+            } else {
+                append("촬영 중입니다. 기기를 움직이지 마세요.")
+            }
         } else if (
             captureProgress.stage == CaptureStage.PROCESSING ||
             captureProgress.stage == CaptureStage.DEMOSAICING ||

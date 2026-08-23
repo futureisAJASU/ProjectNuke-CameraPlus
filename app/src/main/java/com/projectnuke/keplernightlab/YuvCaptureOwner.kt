@@ -264,7 +264,15 @@ internal class YuvCaptureOwner(
      * drain budget; tests pass null and trigger [onPersistenceDrainDeadlineReached]
      * manually.  When null, no bounded drain deadline exists (tests only).
      */
-    private val schedulePersistenceDrainDeadline: ((Runnable) -> Unit)? = null
+    private val schedulePersistenceDrainDeadline: ((Runnable) -> Unit)? = null,
+    /**
+     * Typed acquisition-progress hook, invoked on the owner dispatcher whenever
+     * an authoritative Camera2 acquisition counter changes (image received,
+     * capture result completed, frame persisted).  The production adapter turns
+     * this into a typed [CameraPipelineEvent.CaptureProgress]; English/Korean
+     * status strings are never parsed for progress.
+     */
+    private val onAcquisitionUpdate: ((receivedImages: Int, completedResults: Int, persistedFrames: Int) -> Unit)? = null
 ) {
 
     private var completedResults = 0
@@ -406,6 +414,7 @@ internal class YuvCaptureOwner(
                 // receivedFrames counts the acquired access as soon as owner processing
                 // begins — even when no frame identity remains (then dropped++ too).
                 accounting.receivedFrame()
+                emitAcquisitionUpdate()
                 val frameIndex = identityOwner.nextIdentity()
                 if (frameIndex == null) { accounting.droppedFrame(); guard.releaseSafely(); return }
                 when (val c = createBufferedYuvWork(
@@ -454,6 +463,7 @@ internal class YuvCaptureOwner(
                 // receivedFrames counts the acquired access as soon as owner processing
                 // begins — even when no frame identity remains (then dropped++ too).
                 accounting.receivedFrame()
+                emitAcquisitionUpdate()
                 val frameIndex = identityOwner.nextIdentity()
                 if (frameIndex == null) { accounting.droppedFrame(); guard.releaseSafely(); return }
                 when (val creation = createDirectYuvWork(frameIndex, access, accounting)) {
@@ -549,9 +559,21 @@ internal class YuvCaptureOwner(
 
     fun onCaptureCompletedResult() {
         captureStateOwner.post(object : CaptureOwnerEvent {
-            override fun execute() { completedResults++ }
+            override fun execute() {
+                completedResults++
+                emitAcquisitionUpdate()
+            }
             override fun disposeWithoutMutation() {}
         })
+    }
+
+    /** Typed acquisition-progress emission (owner-dispatcher only). */
+    private fun emitAcquisitionUpdate() {
+        val hook = onAcquisitionUpdate ?: return
+        ignoreErrors("acquisition update dispatch") {
+            val snap = accounting.snapshot()
+            hook(snap.receivedFrames, completedResults, snap.persistedFrames)
+        }
     }
 
     fun onCaptureFailed(cause: Throwable, detail: String) {
@@ -957,6 +979,7 @@ internal class YuvCaptureOwner(
             return
         }
         val persistedFrames = accounting.snapshot().persistedFrames
+        emitAcquisitionUpdate()
         ignoreErrors("capturing status dispatch") { postStatus("YUV capture: saved $persistedFrames/$frameCount") }
         ignoreErrors("capturing metadata write") {
             val snap = accounting.snapshot()

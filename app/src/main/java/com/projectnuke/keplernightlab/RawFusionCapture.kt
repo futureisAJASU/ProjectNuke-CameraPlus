@@ -206,7 +206,8 @@ fun captureRawBurstForFusion(
     captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     onStatus: (String) -> Unit,
     onComplete: (File) -> Unit,
-    onError: (String) -> Unit
+    onError: (String) -> Unit,
+    onTypedCaptureProgress: CameraPipelineEventSink = {}
 ) {
     val mainHandler = Handler(Looper.getMainLooper())
     fun post(message: String): Boolean =
@@ -386,6 +387,28 @@ fun captureRawBurstForFusion(
     fun postCaptureProgress() {
         val snapshot = progressSnapshot.get()
         post("RAW 캡처 중입니다. 기기를 움직이지 마세요. saved ${snapshot.savedFrames}/${snapshot.requestedFrames}, images ${snapshot.receivedImages}/${snapshot.requestedFrames}, results ${snapshot.completedResults}/${snapshot.requestedFrames}, failed ${snapshot.failedCaptures}")
+        // Typed acquisition progress from the authoritative RAW capture ledger:
+        // paired Camera2 evidence drives the capture bar; persistence is
+        // reported for the settling state only. Never parsed from text.
+        val pairCount = cameraAcquisitionPairCount(snapshot.receivedImages, snapshot.completedResults)
+        onTypedCaptureProgress(
+            CameraPipelineEvent.CaptureProgress(
+                generation = 0L,
+                counts = CameraPipelineProgressCounts(
+                    requestedFrames = snapshot.requestedFrames,
+                    savedFrames = snapshot.savedFrames,
+                    receivedImages = snapshot.receivedImages,
+                    completedResults = snapshot.completedResults
+                ),
+                message = if (pairCount >= snapshot.requestedFrames && snapshot.requestedFrames > 0 &&
+                    snapshot.savedFrames < snapshot.requestedFrames
+                ) {
+                    CAPTURE_SETTLING_MESSAGE
+                } else {
+                    null
+                }
+            )
+        )
     }
 
     fun cleanup() {

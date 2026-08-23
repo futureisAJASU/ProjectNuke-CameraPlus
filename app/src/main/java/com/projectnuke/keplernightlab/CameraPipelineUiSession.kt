@@ -356,7 +356,16 @@ internal class CameraPipelineUiSession(
         }
         val stage = when (event) {
             is CameraPipelineEvent.Started -> CaptureStage.PREPARING
-            is CameraPipelineEvent.CaptureProgress -> current.captureProgress.stage
+            // Typed acquisition progress means real camera capture has begun:
+            // leave the conservative preparing state for CAPTURING.
+            is CameraPipelineEvent.CaptureProgress ->
+                if (current.captureProgress.stage == CaptureStage.IDLE ||
+                    current.captureProgress.stage == CaptureStage.PREPARING
+                ) {
+                    CaptureStage.CAPTURING
+                } else {
+                    current.captureProgress.stage
+                }
             is CameraPipelineEvent.CaptureStageComplete,
             is CameraPipelineEvent.ProcessingStage -> if (event is CameraPipelineEvent.ProcessingStage) event.stage else CaptureStage.PROCESSING
             is CameraPipelineEvent.ExportStage -> event.stage
@@ -368,6 +377,7 @@ internal class CameraPipelineUiSession(
         var nextBackgroundStatus = current.backgroundStatus
         var handoffSettled = false
         var backgroundStageEvent = false
+        var routedToBackgroundSurface = false
         when (event) {
             is CameraPipelineEvent.Started -> {
                 foreground.beginCapturing(event.generation)
@@ -390,11 +400,13 @@ internal class CameraPipelineUiSession(
             is CameraPipelineEvent.ProcessingStage, is CameraPipelineEvent.ExportStage -> {
                 backgroundStageEvent = true
                 // After handoff settlement these belong to the background lane;
-                // they must not re-suppress preview or re-lock the shutter.
+                // they must not re-suppress preview, re-lock the shutter, OR
+                // reuse/mutate the capture progress surface.
                 if (foreground.state().phase ==
                     ForegroundCaptureSession.CaptureOwnershipPhase.HANDOFF_SETTLED
                 ) {
                     nextBackgroundStatus = event.message
+                    routedToBackgroundSurface = true
                 } else {
                     nextCaptureStatus = event.message
                 }
@@ -406,9 +418,16 @@ internal class CameraPipelineUiSession(
             backgroundStageEvent -> current.previewAllowed
             else -> false
         }
+        val nextCaptureProgress = if (routedToBackgroundSurface) {
+            // The capture bar represents camera acquisition only; background
+            // fusion/export stages have their own non-blocking status surface.
+            current.captureProgress
+        } else {
+            event.counts.toCaptureProgress(current.captureProgress, stage, event.message)
+        }
         current = current.copy(
             phase = if (current.cancellationRequested) Phase.WAITING_FOR_TERMINAL else nextPhase,
-            captureProgress = event.counts.toCaptureProgress(current.captureProgress, stage, event.message),
+            captureProgress = nextCaptureProgress,
             previewAllowed = nextPreviewAllowed,
             captureResourcesSettled = current.captureResourcesSettled || handoffSettled,
             captureOwnerPhase = ownerPhase,
