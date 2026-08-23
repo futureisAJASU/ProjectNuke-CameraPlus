@@ -408,8 +408,12 @@ class ProductionYuvCaptureBridgeTest {
 
     @Test
     fun productionBufferedSettlingDuringDeadlineCleanupIsIdempotent() {
+        // Genuine acquisition timeout fixture: 2 requested, only 1 delivered.
+        // (A fully-delivered burst with pending persistence now DRAINS to success —
+        // covered by YuvCaptureOwnerDrainTest.)  The deadline-cleanup race must
+        // still settle idempotently: exactly-once accounting, reservations, lifecycle.
         val encodeLatch = EncodeLatch()
-        val harness = Harness(frameCount = 1, workerCapacity = 1, encodeLatch = encodeLatch)
+        val harness = Harness(frameCount = 2, workerCapacity = 1, encodeLatch = encodeLatch)
         try {
             harness.session.owner.acceptBuffered(Camera2YuvImageAccess(FakeYuvImage(1234L)))
             encodeLatch.awaitStart()

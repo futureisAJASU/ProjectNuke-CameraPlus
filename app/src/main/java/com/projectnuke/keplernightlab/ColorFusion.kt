@@ -753,6 +753,13 @@ fun captureYuvBurstColorWithMotion(
             saveMotionOnce = { dir -> saveMotionOnce(dir) },
             productionResourceCoordinator = productionSeam.productionResourceCoordinator,
             finished = finished,
+            schedulePersistenceDrainDeadline = { runnable ->
+                timeoutScheduler.schedule(
+                    runnable,
+                    computeYuvPersistenceDrainBudgetMs(captureTimeoutMs, frameCount),
+                    TimeUnit.MILLISECONDS
+                )
+            },
             // ColorFusion starts the real terminal consumer only after the finite
             // captureBurst operation is accepted below.
             // Terminal consumption starts with session authority, before any
@@ -1120,6 +1127,22 @@ fun captureYuvBurstColorWithMotion(
  */
 /** Defensive bound for the terminal gate: capture timeout plus a generous settlement margin. */
 private const val YUV_TERMINAL_SETTLE_MARGIN_MS = 15_000L
+
+/**
+ * Bounded persistence-drain budget: after the camera-acquisition deadline fires
+ * with all frames cleanly acquired, accepted persistence work gets this much
+ * additional time per requested frame to settle before the capture settles as an
+ * actual persistence timeout.  Physical S24 evidence measured up to ~12s per
+ * 12MP PNG encode; 20s/frame with a hard cap keeps the bound honest without
+ * misclassifying a healthy drain.
+ */
+private const val YUV_PERSISTENCE_DRAIN_PER_FRAME_MARGIN_MS = 20_000L
+
+private const val MAX_YUV_PERSISTENCE_DRAIN_BUDGET_MS = 180_000L
+
+private fun computeYuvPersistenceDrainBudgetMs(captureTimeoutMs: Long, frameCount: Int): Long =
+    (captureTimeoutMs + frameCount.toLong() * YUV_PERSISTENCE_DRAIN_PER_FRAME_MARGIN_MS)
+        .coerceAtMost(MAX_YUV_PERSISTENCE_DRAIN_BUDGET_MS)
 
 private fun computeYuvCaptureTimeoutMs(
     frameCount: Int,

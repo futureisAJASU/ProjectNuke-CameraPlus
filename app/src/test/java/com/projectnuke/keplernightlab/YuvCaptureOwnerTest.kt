@@ -622,8 +622,12 @@ class YuvCaptureOwnerTest {
 
     @Test
     fun lateBufferedCompletionAfterTimeoutIsDiscarded() {
+        // Genuine camera-acquisition timeout: 2 requested, only 1 ever delivered.
+        // The late completion of the delivered frame must be discarded after the
+        // terminal was claimed.  (A fully-delivered burst with pending persistence
+        // is a DRAINING case, not a timeout — covered by YuvCaptureOwnerDrainTest.)
         val encodeLatch = EncodeLatch()
-        val harness = Harness(frameCount = 1, workerCapacity = 1, encodeLatch = encodeLatch)
+        val harness = Harness(frameCount = 2, workerCapacity = 1, encodeLatch = encodeLatch)
         try {
             harness.session.owner.acceptBuffered(FakeBufferedAccess(1234L))
             encodeLatch.awaitStart()

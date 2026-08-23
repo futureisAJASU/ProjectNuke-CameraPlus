@@ -61,13 +61,14 @@ internal sealed interface CaptureTaskDisposalOutcome {
 }
 
 internal open class BoundedCaptureWorker(
-    name: String,
+    threadName: String,
     capacity: Int,
     private val onTaskDisposalFailure: (Runnable, Throwable) -> Unit = { _, _ -> },
     private val onRejectionNotificationFailure: (Runnable, Throwable) -> Unit = { _, _ -> },
     onRejected: (Runnable) -> Unit = {}
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
+    private val workerThreadName = threadName
 
     /** Thread-safe internal failure ledger — observable even with default no-op hooks. */
     private val _ledger = java.util.concurrent.CopyOnWriteArrayList<WorkerFailure>()
@@ -76,7 +77,7 @@ internal open class BoundedCaptureWorker(
     private val executor = ThreadPoolExecutor(
         1, 1, 0L, TimeUnit.MILLISECONDS,
         queue,
-        { runnable -> Thread(runnable, name).apply { isDaemon = true } },
+        { runnable -> Thread(runnable, workerThreadName).apply { isDaemon = true } },
         ThreadPoolExecutor.AbortPolicy()
     )
     private val notificationHook = onRejected
@@ -250,6 +251,14 @@ internal open class BoundedCaptureWorker(
     fun queuedCount(): Int = queue.size
 
     fun activeCount(): Int = executor.activeCount
+
+    /**
+     * True when the CALLER itself runs on this worker's execution thread.  Under
+     * synchronous-dispatch test seams, owner events may execute inline on the
+     * worker thread; the settlement gate must never attempt deferral reposts from
+     * there (it could only recurse onto itself).
+     */
+    fun executingOnWorkerThread(): Boolean = Thread.currentThread().name == workerThreadName
 
     fun awaitTermination(timeoutMs: Long): Boolean = try {
         executor.awaitTermination(timeoutMs.coerceAtLeast(0L), TimeUnit.MILLISECONDS)
