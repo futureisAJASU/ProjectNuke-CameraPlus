@@ -25,8 +25,17 @@ internal fun backgroundTerminalKind(
     else -> CameraPipelineEvent.Terminal.Kind.FAILED
 }
 
+/**
+ * The RAW background failure gate.  Delegates source truth ENTIRELY to the
+ * established export-source abstraction ([RawFusionProcessResult.hasExportableBitmapSource]):
+ * a successful standard RAW run returns a native-RGBA-only result, which is the
+ * exportable success shape — never a fusion failure.
+ */
+internal fun rawBackgroundFusionFailed(result: RawFusionProcessResult): Boolean =
+    !result.success || !result.hasExportableBitmapSource()
+
 /** One deferred exact terminal outcome, published after lease settlement. */
-private data class BackgroundTerminalSpec(
+internal data class BackgroundTerminalSpec(
     val kind: CameraPipelineEvent.Terminal.Kind,
     val requiredOutputCommitted: Boolean,
     val publicExportCommitted: Boolean,
@@ -400,8 +409,10 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
                 operationLease = lease,
                 onStatus = post
             )
-            val source = result.finalPngFile ?: result.previewPngFile
-            if (!result.success || source == null || !source.isFile) {
+            // The established export-source abstraction decides failure truth:
+            // a successful standard RAW run returns a native-RGBA-only result
+            // (finalPngFile == null), which IS exportable — never "RAW fusion failed".
+            if (rawBackgroundFusionFailed(result)) {
                 val message = result.errorMessage ?: "RAW fusion failed"
                 post("PIPELINE_FAILED: RAW fusion failed. $message")
                 markOrdinaryFailureTruth(jobDir, lease, IllegalStateException(message))
@@ -418,87 +429,15 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
                 )
                 return
             }
-            emit(
-                CameraPipelineEvent.ExportStage(
-                    generation = 0L,
-                    stage = CaptureStage.EXPORTING,
-                    counts = counts,
-                    message = "Saving RAW fusion to Gallery..."
-                )
-            )
-            val bitmap = NoFollowFileSystem.decodeBitmapVerified(source)
-                ?: error("Could not decode RAW fusion output.")
-            val displayNameBase = "Kepler_RAW_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}"
-            val export = withSettlementPrecedence(
-                block = {
-                    exportNightFusionBitmapToGallery(
-                        context = appContext,
-                        bitmap = bitmap,
-                        displayNameBase = displayNameBase,
-                        requestedFormat = requestedOutputFormatForSetting(finalOutputFormat),
-                        cancellation = cancellation,
-                        jobDir = jobDir,
-                        ownerLease = lease
-                    )
-                },
-                cleanup = { bitmap.recycle() }
-            )
-            if (!export.publicCommitted || export.uriString.isNullOrBlank()) {
-                updateExportFailure(
-                    jobDir = jobDir,
-                    error = export.errorMessage ?: "Unknown RAW export failure",
-                    finalOutputFormat = finalOutputFormat,
-                    rawSidecarIgnored = false,
-                    export = export,
-                    requiredOutputCommitted = result.outputCommitted,
-                    operationLease = lease
-                )
-                val localCommitted = result.outputCommitted ||
-                    currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, lease)
-                post(
-                    if (localCommitted) {
-                        "PIPELINE_COMPLETE_PARTIAL: RAW local result kept; Gallery export failed."
-                    } else {
-                        "PIPELINE_FAILED: RAW Gallery export failed. ${export.errorMessage ?: ""}"
-                    }
-                )
-                pendingOutcome = BackgroundTerminalSpec(
-                    kind = backgroundTerminalKind(
-                        requiredOutputCommitted = localCommitted,
-                        publicExportCommitted = false,
-                        verified = false
-                    ),
-                    requiredOutputCommitted = localCommitted,
-                    publicExportCommitted = false,
-                    verified = false,
-                    message = export.errorMessage ?: "RAW Gallery export failed"
-                )
-                return
-            }
-            val verified = verifyCommittedGalleryExport(appContext, export) is GalleryExportVerification.Verified
-            updateExportMetadata(
+            pendingOutcome = runRawBackgroundExportStage(
+                appContext = appContext,
                 jobDir = jobDir,
-                export = export,
-                verified = verified,
+                lease = lease,
                 finalOutputFormat = finalOutputFormat,
-                rawSidecarIgnored = false,
-                operationLease = lease
-            )
-            post(if (verified) "PIPELINE_COMPLETE: RAW saved to Gallery." else "PIPELINE_COMPLETE_PARTIAL: RAW verification not proven; cache kept.")
-            pendingOutcome = BackgroundTerminalSpec(
-                kind = backgroundTerminalKind(
-                    requiredOutputCommitted = true,
-                    publicExportCommitted = true,
-                    verified = verified
-                ),
-                requiredOutputCommitted = true,
-                publicExportCommitted = true,
-                verified = verified,
-                message = if (verified) {
-                    "PIPELINE_COMPLETE: RAW saved to Gallery."
-                } else {
-                    "PIPELINE_COMPLETE_PARTIAL: RAW verification not proven; cache kept."
-                }
+                result = result,
+                counts = counts,
+                emit = emit,
+                post = post
             )
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             ordinaryFailure = null
@@ -525,6 +464,106 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
             }
             settleTerminal(terminal, counts, jobDir, pendingOutcome, ordinaryFailure, jobDir, lease)
         }
+    }
+
+    /**
+     * The RAW background export stage.  Uses the SAME established export-source
+     * semantics as the mature RAW reprocess/export path:
+     * [RawFusionProcessResult.hasExportableBitmapSource] /
+     * [RawFusionProcessResult.loadExportBitmap] understand native RGBA direct
+     * loading, final-PNG fallback, rotation metadata, and recycle precedence.
+     * The caller owns lease settlement and terminal publication.
+     */
+    internal fun runRawBackgroundExportStage(
+        appContext: Context,
+        jobDir: File,
+        lease: JobOperationLease?,
+        finalOutputFormat: FinalOutputFormat,
+        result: RawFusionProcessResult,
+        counts: CameraPipelineProgressCounts,
+        emit: (CameraPipelineEvent) -> Unit,
+        post: (String) -> Unit
+    ): BackgroundTerminalSpec {
+        emit(
+            CameraPipelineEvent.ExportStage(
+                generation = 0L,
+                stage = CaptureStage.EXPORTING,
+                counts = counts,
+                message = "Saving RAW fusion to Gallery..."
+            )
+        )
+        val loaded = result.loadExportBitmap(jobDir)
+        val displayNameBase = "Kepler_RAW_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}"
+        val export = withSettlementPrecedence(
+            block = {
+                exportNightFusionBitmapToGallery(
+                    context = appContext,
+                    bitmap = loaded.bitmap,
+                    displayNameBase = displayNameBase,
+                    requestedFormat = requestedOutputFormatForSetting(finalOutputFormat),
+                    cancellation = NoOpKeplerPipelineCancellation,
+                    jobDir = jobDir,
+                    ownerLease = lease
+                )
+            },
+            cleanup = { loaded.bitmap.recycle() }
+        )
+        if (!export.publicCommitted || export.uriString.isNullOrBlank()) {
+            updateExportFailure(
+                jobDir = jobDir,
+                error = export.errorMessage ?: "Unknown RAW export failure",
+                finalOutputFormat = finalOutputFormat,
+                rawSidecarIgnored = false,
+                export = export,
+                requiredOutputCommitted = result.outputCommitted,
+                operationLease = lease
+            )
+            val localCommitted = result.outputCommitted ||
+                currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, lease)
+            post(
+                if (localCommitted) {
+                    "PIPELINE_COMPLETE_PARTIAL: RAW local result kept; Gallery export failed."
+                } else {
+                    "PIPELINE_FAILED: RAW Gallery export failed. ${export.errorMessage ?: ""}"
+                }
+            )
+            return BackgroundTerminalSpec(
+                kind = backgroundTerminalKind(
+                    requiredOutputCommitted = localCommitted,
+                    publicExportCommitted = false,
+                    verified = false
+                ),
+                requiredOutputCommitted = localCommitted,
+                publicExportCommitted = false,
+                verified = false,
+                message = export.errorMessage ?: "RAW Gallery export failed"
+            )
+        }
+        val verified = verifyCommittedGalleryExport(appContext, export) is GalleryExportVerification.Verified
+        updateExportMetadata(
+            jobDir = jobDir,
+            export = export,
+            verified = verified,
+            finalOutputFormat = finalOutputFormat,
+            rawSidecarIgnored = false,
+            operationLease = lease
+        )
+        post(if (verified) "PIPELINE_COMPLETE: RAW saved to Gallery." else "PIPELINE_COMPLETE_PARTIAL: RAW verification not proven; cache kept.")
+        return BackgroundTerminalSpec(
+            kind = backgroundTerminalKind(
+                requiredOutputCommitted = true,
+                publicExportCommitted = true,
+                verified = verified
+            ),
+            requiredOutputCommitted = true,
+            publicExportCommitted = true,
+            verified = verified,
+            message = if (verified) {
+                "PIPELINE_COMPLETE: RAW saved to Gallery."
+            } else {
+                "PIPELINE_COMPLETE_PARTIAL: RAW verification not proven; cache kept."
+            }
+        )
     }
 
     private fun executeSuperResolution(

@@ -655,7 +655,7 @@ internal sealed class RawFusionPublicExportOutcome {
     }
 }
 
-private data class RawFusionExportBitmap(
+internal data class RawFusionExportBitmap(
     val bitmap: Bitmap,
     val source: String,
     val nativeRgbaDirect: Boolean,
@@ -678,7 +678,14 @@ private fun RawFusionProcessResult.validNativeRgbaFile(): File? {
     return file.takeIf { actualBytes == expectedBytes }
 }
 
-private fun RawFusionProcessResult.hasExportableBitmapSource(): Boolean {
+/**
+ * The established RAW export-source abstraction: a result is exportable when it
+ * carries either a dimension/size-verified native RGBA file or a positive-size
+ * final PNG.  A successful standard RAW run intentionally returns nativeRgbaFile
+ * with finalPngFile == null and previewPngFile == null — that shape IS the
+ * exportable success, never a fusion failure.
+ */
+internal fun RawFusionProcessResult.hasExportableBitmapSource(): Boolean {
     fun File.hasPositiveVerifiedSize(): Boolean = try {
         NoFollowFileSystem.isRealFile(toPath()) && NoFollowFileSystem.requireSize(this) > 0L
     } catch (failure: Error) {
@@ -701,7 +708,13 @@ private fun RawFusionProcessResult.currentLocalResultForOutcome(): File? =
         // fails before producing a bitmap/RGBA candidate.
         ?: mergedRawFile?.takeIf { outputCommitted && it.isFile && it.length() > 0L }
 
-private fun RawFusionProcessResult.loadExportBitmap(jobDir: File): RawFusionExportBitmap {
+/**
+ * Loads the export bitmap using the established production policy shared with the
+ * mature RAW reprocess/export path: native RGBA direct load first (dimension- and
+ * size-verified), final-PNG fallback only on native decode failure, rotation
+ * metadata applied from job.json, original bitmap recycled when rotated.
+ */
+internal fun RawFusionProcessResult.loadExportBitmap(jobDir: File): RawFusionExportBitmap {
     fun orient(bitmap: Bitmap, source: String, native: Boolean): RawFusionExportBitmap {
         val rotation = resolveRawExportRotation(jobDir)
         val degrees = (rotation as? ExportOrientationResolution.Resolved)?.degrees
