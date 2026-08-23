@@ -1001,11 +1001,17 @@ private fun writeRawFusionDebugPreviews(
     var referenceBitmap: Bitmap? = null
     var compare: Bitmap? = null
     var primaryFailure: Throwable? = null
+    // Phase 7: heavy diagnostic images (reference preview + comparison sheet)
+    // require explicit debug/diagnostic intent.  The bounded fused preview is a
+    // reprocess candidate and stays required production output.
+    val diagnosticImagesEnabled = DebugArtifactPolicy.imageArtifactsEnabled(job)
     try {
         cancellation.throwIfCancelled()
         val refProxy = requireNotNull(reference.proxy)
         refBitmap = rawProxyToBitmap(refProxy)
-        saveClassicRawPng(refBitmap!!, File(jobDir, "raw_reference_preview.png"))
+        if (diagnosticImagesEnabled) {
+            saveClassicRawPng(refBitmap!!, File(jobDir, "raw_reference_preview.png"))
+        }
         val mergedProxy = buildRawProxy(
             mergedRawFile,
             sensor,
@@ -1015,19 +1021,26 @@ private fun writeRawFusionDebugPreviews(
         cancellation.throwIfCancelled()
         fusedBitmap = rawProxyToBitmap(mergedProxy)
         saveClassicRawPng(fusedBitmap!!, File(jobDir, "raw_fused_classic_v1_preview.png"))
+        if (diagnosticImagesEnabled) {
+            cancellation.throwIfCancelled()
+            compare = Bitmap.createBitmap(fusedBitmap.width * 2, fusedBitmap.height, Bitmap.Config.ARGB_8888)
+            referenceBitmap = rawProxyToBitmap(refProxy)
+            val canvas = android.graphics.Canvas(compare!!)
+            canvas.drawBitmap(referenceBitmap!!, 0f, 0f, null)
+            canvas.drawBitmap(fusedBitmap!!, fusedBitmap!!.width.toFloat(), 0f, null)
+            saveClassicRawPng(compare!!, File(jobDir, "raw_compare_reference_vs_fused.png"))
+        }
         cancellation.throwIfCancelled()
-        compare = Bitmap.createBitmap(fusedBitmap.width * 2, fusedBitmap.height, Bitmap.Config.ARGB_8888)
-        referenceBitmap = rawProxyToBitmap(refProxy)
-        val canvas = android.graphics.Canvas(compare!!)
-        canvas.drawBitmap(referenceBitmap!!, 0f, 0f, null)
-        canvas.drawBitmap(fusedBitmap!!, fusedBitmap!!.width.toFloat(), 0f, null)
-        saveClassicRawPng(compare!!, File(jobDir, "raw_compare_reference_vs_fused.png"))
-        cancellation.throwIfCancelled()
-        job.put("rawReferencePreviewFile", "raw_reference_preview.png")
-            .put("rawFusedPreviewFile", "raw_fused_classic_v1_preview.png")
-            .put("rawComparePreviewFile", "raw_compare_reference_vs_fused.png")
-            .put("rawDebugArtifactStatus", "COMPLETE")
-            .remove("rawDebugArtifactError")
+        job.put("rawFusedPreviewFile", "raw_fused_classic_v1_preview.png")
+        if (diagnosticImagesEnabled) {
+            job.put("rawReferencePreviewFile", "raw_reference_preview.png")
+                .put("rawComparePreviewFile", "raw_compare_reference_vs_fused.png")
+                .put("rawDebugArtifactStatus", "COMPLETE")
+        } else {
+            job.put("rawDebugArtifactStatus", DebugArtifactPolicy.STATUS_DISABLED)
+                .put("debugArtifactImagesEnabled", false)
+        }
+        job.remove("rawDebugArtifactError")
     } catch (ce: CancellationException) {
         primaryFailure = ce
         throw ce

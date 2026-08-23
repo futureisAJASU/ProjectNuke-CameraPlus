@@ -107,7 +107,12 @@ fun writeFusionQualityDiagnostics(
         .put("diagnosticCropPrefix", cropPrefix)
     job.putAll(metrics)
 
-    if (reference != null && finalImage != null) {
+    // Quality METRICS are diagnostically necessary HardwareE2E evidence and are
+    // always computed and merged into the job.  The heavy compare/crop SHEET
+    // images are optional diagnostics gated by DebugArtifactPolicy.
+    if (reference != null && finalImage != null &&
+        DebugArtifactPolicy.imageArtifactsEnabled(job)
+    ) {
         saveCompareSheet(reference, finalImage, File(jobDir, compareFileName))
         saveDiagnosticCropSheet(reference, fused ?: finalImage, finalImage, File(jobDir, "${cropPrefix}_sheet.png"))
     }

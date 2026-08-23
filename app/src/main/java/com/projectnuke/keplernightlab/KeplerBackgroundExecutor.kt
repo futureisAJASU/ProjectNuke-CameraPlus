@@ -233,7 +233,7 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
             )
             val singleFrame = isSingleFrameJob(jobJson)
             val requestedParams = loadClassicYuvFusionParams(jobJson)
-            post(if (singleFrame) "Processing single photo..." else "Processing Night Fusion...")
+            post("Processing Night Fusion...")
             emit(
                 CameraPipelineEvent.ProcessingStage(
                     generation = 0L,
@@ -242,6 +242,7 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
                     message = if (singleFrame) "Processing single photo..." else "Processing Night Fusion..."
                 )
             )
+            val yuvProcessingStartedAt = android.os.SystemClock.elapsedRealtime()
             val finalFile = if (singleFrame) {
                 processSingleFrameJobSync(
                     jobDir = jobDir,
@@ -260,6 +261,13 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
                 )
             }
             var requiredOutputCommitted = requiredOutputCommittedAfterProcessing(jobDir, lease)
+            persistBackgroundStageTiming(
+                jobDir,
+                org.json.JSONObject().put(
+                    "processingMs",
+                    android.os.SystemClock.elapsedRealtime() - yuvProcessingStartedAt
+                )
+            )
             emit(
                 CameraPipelineEvent.ExportStage(
                     generation = 0L,
@@ -371,6 +379,25 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
         }
     }
 
+    /**
+     * Phase 7 stage instrumentation: persists bounded background-lane stage
+     * durations into job.json under "backgroundStageTimings".  Best-effort:
+     * diagnostics never fail the lane.
+     */
+    private fun persistBackgroundStageTiming(jobDir: File, stage: org.json.JSONObject) {
+        try {
+            KeplerJobMetadata.update(jobDir) { job ->
+                val timings = job.optJSONObject("backgroundStageTimings") ?: org.json.JSONObject()
+                stage.keys().forEach { key -> timings.put(key, stage.get(key)) }
+                job.put("backgroundStageTimings", timings)
+            }
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            Log.w("KeplerBackgroundExecutor", "background stage timing persistence failed ${jobDir.name}")
+        }
+    }
+
     private fun executeRaw(
         request: BackgroundProcessingRequest,
         appContext: Context,
@@ -401,6 +428,7 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
                     message = "Processing RAW fusion..."
                 )
             )
+            val rawProcessingStartedAt = android.os.SystemClock.elapsedRealtime()
             val result = processRawFusionJob(
                 context = appContext,
                 jobDir = jobDir,
@@ -408,6 +436,13 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
                 metadataPolicy = ReprocessMetadataPolicy.NORMAL,
                 operationLease = lease,
                 onStatus = post
+            )
+            persistBackgroundStageTiming(
+                jobDir,
+                org.json.JSONObject().put(
+                    "processingMs",
+                    android.os.SystemClock.elapsedRealtime() - rawProcessingStartedAt
+                )
             )
             // The established export-source abstraction decides failure truth:
             // a successful standard RAW run returns a native-RGBA-only result
@@ -484,6 +519,7 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
         emit: (CameraPipelineEvent) -> Unit,
         post: (String) -> Unit
     ): BackgroundTerminalSpec {
+        val exportStartedAt = android.os.SystemClock.elapsedRealtime()
         emit(
             CameraPipelineEvent.ExportStage(
                 generation = 0L,
@@ -547,6 +583,13 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
             finalOutputFormat = finalOutputFormat,
             rawSidecarIgnored = false,
             operationLease = lease
+        )
+        persistBackgroundStageTiming(
+            jobDir,
+            org.json.JSONObject().put(
+                "exportMs",
+                android.os.SystemClock.elapsedRealtime() - exportStartedAt
+            )
         )
         post(if (verified) "PIPELINE_COMPLETE: RAW saved to Gallery." else "PIPELINE_COMPLETE_PARTIAL: RAW verification not proven; cache kept.")
         return BackgroundTerminalSpec(

@@ -1601,6 +1601,16 @@ private fun generateFusionDebugArtifacts(
     params: ClassicYuvFusionParams
 ) {
     try {
+        // Phase 7: heavy diagnostic IMAGES require explicit debug/diagnostic
+        // intent.  Without it only the required bounded production preview is
+        // written; all fusion debug JSON evidence is still produced elsewhere.
+        if (!DebugArtifactPolicy.imageArtifactsEnabled(job)) {
+            saveBoundedDiagnosticPreview(fusedBitmap, File(jobDir, "yuv_final_preview.png"))
+            job.put("debugArtifactStatus", DebugArtifactPolicy.STATUS_DISABLED)
+                .put("debugArtifactImagesEnabled", false)
+                .put("yuvFinalPreviewFile", "yuv_final_preview.png")
+            return
+        }
         val referenceOutput = File(jobDir, "reference_frame.png")
         copyVerifiedArtifact(referenceFile, referenceOutput)
         val yuvReferenceOutput = File(jobDir, "yuv_reference_preview.png")
