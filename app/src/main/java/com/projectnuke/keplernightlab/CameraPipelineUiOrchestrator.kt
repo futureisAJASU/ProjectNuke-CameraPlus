@@ -22,7 +22,8 @@ internal class CameraPipelineUiOrchestrator(
         val onStatus: (String) -> Unit,
         val onStateChanged: () -> Unit,
         val onTerminal: (CameraPipelineEvent.Terminal) -> Unit,
-        val onDiagnosticEvent: ((CameraPipelineEvent) -> Unit)? = null
+        val onDiagnosticEvent: ((CameraPipelineEvent) -> Unit)? = null,
+        val onBackgroundTerminal: ((CameraPipelineEvent.Terminal) -> Unit)? = null
     )
 
     private var pendingTerminal: CameraPipelineEvent.Terminal? = null
@@ -31,6 +32,7 @@ internal class CameraPipelineUiOrchestrator(
     private val staleTerminalUiNotifications = ArrayDeque<Long>()
     private var launcherFailureValue: Throwable? = null
     private var terminalFallbackDispatchFailureValue: Throwable? = null
+    private val jobDirectoryByGeneration = HashMap<Long, String>()
 
     private fun notifyDiagnosticEvent(event: CameraPipelineEvent) {
         try {
@@ -42,6 +44,20 @@ internal class CameraPipelineUiOrchestrator(
                 Log.w(TAG, "passive pipeline diagnostic observer failed", error)
             }
         }
+    }
+
+    private fun rememberHandoffJobDirectory(event: CameraPipelineEvent) {
+        if (event is CameraPipelineEvent.CaptureStageComplete && event.handoffEvidenceComplete) {
+            event.jobDirectoryPath?.let { path ->
+                synchronized(this) { jobDirectoryByGeneration[event.generation] = path }
+            }
+        }
+    }
+
+    private fun enrichTerminalWithJobDirectory(terminal: CameraPipelineEvent.Terminal): CameraPipelineEvent.Terminal {
+        if (terminal.jobDirectoryPath != null) return terminal
+        val remembered = synchronized(this) { jobDirectoryByGeneration[terminal.generation] }
+        return if (remembered != null) terminal.copy(jobDirectoryPath = remembered) else terminal
     }
 
     fun updateCallbacks(callbacks: Callbacks) {
@@ -163,9 +179,13 @@ internal class CameraPipelineUiOrchestrator(
         }
 
         fun acceptEvent(event: CameraPipelineEvent) {
+            // Phase D: split concerns - route diagnostics/background identity always,
+            // then independently decide if event mutates CURRENT foreground UI session.
+            // An old background terminal may be STALE_FOR_FOREGROUND but VALID_FOR_BACKGROUND_JOB_A.
+            notifyDiagnosticEvent(event)
+            rememberHandoffJobDirectory(event)
             when (session.accept(event)) {
                 CameraPipelineUiSession.EventResult.ACCEPTED -> {
-                    notifyDiagnosticEvent(event)
                     // The capture watchdog ends at durable capture settlement:
                     // once handoff evidence is accepted, a slow background
                     // fusion/export must not be cancelled by capture timing.
@@ -176,16 +196,28 @@ internal class CameraPipelineUiOrchestrator(
                         session.clearScheduledStart(generation)?.let(scheduler::remove)
                     }
                     val terminal = event as? CameraPipelineEvent.Terminal ?: return
+                    val enriched = enrichTerminalWithJobDirectory(terminal)
                     synchronized(this@CameraPipelineUiOrchestrator) {
-                        pendingTerminal = terminal
+                        pendingTerminal = enriched
                     }
                     clearScheduledWork(generation)
-                    dispatchTerminalNotification(terminal)
+                    dispatchTerminalNotification(enriched)
                 }
                 CameraPipelineUiSession.EventResult.DUPLICATE_TERMINAL -> Unit
                 CameraPipelineUiSession.EventResult.LATE_AFTER_TERMINAL -> Unit
                 CameraPipelineUiSession.EventResult.STALE,
-                CameraPipelineUiSession.EventResult.DISPOSED -> Log.i(TAG, "stale pipeline event ignored generation=$generation")
+                CameraPipelineUiSession.EventResult.DISPOSED -> {
+                    Log.i(TAG, "stale pipeline event ignored for foreground generation=$generation background generation=${event.generation}")
+                    val terminal = event as? CameraPipelineEvent.Terminal
+                    if (terminal != null) {
+                        val enriched = enrichTerminalWithJobDirectory(terminal)
+                        try {
+                            callbacks.onBackgroundTerminal?.invoke(enriched)
+                        } catch (error: Throwable) {
+                            runCatching { Log.w(TAG, "background terminal callback failed", error) }
+                        }
+                    }
+                }
             }
         }
 
@@ -227,27 +259,33 @@ internal class CameraPipelineUiOrchestrator(
                             // Terminal evidence is authoritative before any UI dispatch attempt.
                             acceptEvent(event)
                         } else {
+                            // Phase D: route diagnostics/background identity to correct run/job always,
+                            // independently of whether it mutates CURRENT foreground UI session.
+                            // Do NOT gate diagnostic on session.accept or generation check.
+                            notifyDiagnosticEvent(event)
+                            rememberHandoffJobDirectory(event)
                             when (postSafely(0L, Runnable {
-                                if (session.snapshot().generation == generation) {
-                                    when (session.accept(event)) {
-                                        CameraPipelineUiSession.EventResult.ACCEPTED -> {
-                                            notifyDiagnosticEvent(event)
-                                            // The capture watchdog ends at durable
-                                            // capture settlement (shared rule with
-                                            // the synchronous acceptEvent path).
-                                            if (event is CameraPipelineEvent.CaptureStageComplete &&
-                                                event.handoffEvidenceComplete
-                                            ) {
-                                                session.clearWatchdog(generation)?.let(scheduler::remove)
-                                                session.clearScheduledStart(generation)?.let(scheduler::remove)
-                                            }
-                                            notifyNonTerminal(event)
+                                if (session.snapshot().generation != generation) {
+                                    // STALE_FOR_FOREGROUND but VALID_FOR_BACKGROUND - diagnostic already routed.
+                                    return@Runnable
+                                }
+                                when (session.accept(event)) {
+                                    CameraPipelineUiSession.EventResult.ACCEPTED -> {
+                                        // The capture watchdog ends at durable
+                                        // capture settlement (shared rule with
+                                        // the synchronous acceptEvent path).
+                                        if (event is CameraPipelineEvent.CaptureStageComplete &&
+                                            event.handoffEvidenceComplete
+                                        ) {
+                                            session.clearWatchdog(generation)?.let(scheduler::remove)
+                                            session.clearScheduledStart(generation)?.let(scheduler::remove)
                                         }
-                                        CameraPipelineUiSession.EventResult.DUPLICATE_TERMINAL,
-                                        CameraPipelineUiSession.EventResult.LATE_AFTER_TERMINAL -> Unit
-                                        CameraPipelineUiSession.EventResult.STALE,
-                                        CameraPipelineUiSession.EventResult.DISPOSED -> Unit
+                                        notifyNonTerminal(event)
                                     }
+                                    CameraPipelineUiSession.EventResult.DUPLICATE_TERMINAL,
+                                    CameraPipelineUiSession.EventResult.LATE_AFTER_TERMINAL -> Unit
+                                    CameraPipelineUiSession.EventResult.STALE,
+                                    CameraPipelineUiSession.EventResult.DISPOSED -> Unit
                                 }
                             })) {
                                 CameraUiDispatchOutcome.ACCEPTED -> Unit

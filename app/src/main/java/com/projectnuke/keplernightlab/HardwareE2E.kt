@@ -584,7 +584,10 @@ internal class HardwareE2ERunRecorder private constructor(
     private val runIdByGeneration = HashMap<Long, String>()
     private val baselinesByRunId = HashMap<String, Set<String>>()
     private val baselineFailuresByRunId = HashMap<String, String?>()
-    private var startedAtNanos: Long = 0L
+    private val startedAtNanosByRunId = HashMap<String, Long>()
+    private var latestRunSequence = 0L
+    private val sequenceByRunId = HashMap<String, Long>()
+    private var latestRunId: String? = null
 
     fun start(scenario: HardwareE2ERunScenario): String? {
         if (!enabled) return null
@@ -623,9 +626,11 @@ internal class HardwareE2ERunRecorder private constructor(
             baselinesByRunId[runId] = baseline.getOrDefault(emptySet())
             baselineFailuresByRunId[runId] = baseline.exceptionOrNull()?.message
             current = report
-            startedAtNanos = System.nanoTime()
+            startedAtNanosByRunId[runId] = System.nanoTime()
+            sequenceByRunId[runId] = ++latestRunSequence
+            latestRunId = runId
         }
-        recordCheckpoint("RUN_STARTED", null, null)
+        recordCheckpoint("RUN_STARTED", null, null, runId)
         return runId
     }
 
@@ -653,7 +658,7 @@ internal class HardwareE2ERunRecorder private constructor(
         val record = HardwareE2EEventRecord(
             checkpoint = checkpoint,
             eventType = event.javaClass.simpleName,
-            elapsedMs = elapsedMillis(),
+            elapsedMs = elapsedMillis(targetRunId),
             wallClockTimestamp = System.currentTimeMillis(),
             generation = event.generation,
             requestedFrames = event.counts.requestedFrames,
@@ -699,21 +704,25 @@ internal class HardwareE2ERunRecorder private constructor(
         }
         if (event is CameraPipelineEvent.Terminal) {
             if (event.publicExportCommitted) {
-                recordCheckpoint("PUBLIC_OUTPUT_COMMITTED", null, null)
+                recordCheckpoint("PUBLIC_OUTPUT_COMMITTED", null, null, targetRunId)
             }
             if (event.captureResourcesSettled) {
-                recordCheckpoint("OWNER_SETTLED", null, null)
+                recordCheckpoint("OWNER_SETTLED", null, null, targetRunId)
             }
             finalizeAfterTerminal(targetRunId)
         }
     }
 
     fun recordCheckpoint(checkpoint: String, jobDirectory: File?, message: String?) {
-        mutate { report ->
+        recordCheckpoint(checkpoint, jobDirectory, message, null)
+    }
+
+    fun recordCheckpoint(checkpoint: String, jobDirectory: File?, message: String?, targetRunId: String?) {
+        val effectiveRunId = targetRunId ?: synchronized(lock) { current?.runId } ?: return
         val record = HardwareE2EEventRecord(
                 checkpoint = checkpoint,
                 eventType = "checkpoint",
-                elapsedMs = elapsedMillis(),
+                elapsedMs = elapsedMillis(effectiveRunId),
                 wallClockTimestamp = System.currentTimeMillis(),
                 generation = 0L,
                 requestedFrames = 0,
@@ -722,6 +731,7 @@ internal class HardwareE2ERunRecorder private constructor(
                 completedResults = 0,
                 message = message
             )
+        mutateRun(effectiveRunId) { report ->
             val nextCounts = report.progressCounts.toMutableMap()
             nextCounts[checkpoint] = (nextCounts[checkpoint] ?: 0) + 1
             report.copy(
@@ -1026,12 +1036,36 @@ internal class HardwareE2ERunRecorder private constructor(
                 reportFile.delete()
                 check(temp.renameTo(reportFile)) { "could not publish hardware report" }
             }
-            val latest = File(reportDirectory, "latest.json")
-            val latestTemp = File(reportDirectory, "latest.json.tmp")
-            latestTemp.writeText(HardwareE2EReportCodec.encode(report))
-            if (!latestTemp.renameTo(latest)) {
-                latest.delete()
-                check(latestTemp.renameTo(latest)) { "could not publish latest hardware report" }
+            // Only update latest.json when this report is still the latest-started run.
+            // Older terminal must not overwrite latest.json (monotonic sequence/start timestamp guard).
+            val shouldUpdateLatest = synchronized(lock) {
+                val seq = sequenceByRunId[report.runId]
+                if (seq != null) {
+                    seq == latestRunSequence
+                } else {
+                    // Fallback to timestamp for reports without sequence (e.g., after restart)
+                    val latestId = latestRunId
+                    val latestReport = latestId?.let { runsByRunId[it] }
+                    if (latestReport != null) {
+                        report.runStartWallClockTimestamp >= latestReport.runStartWallClockTimestamp
+                    } else {
+                        // Check filesystem latest.json timestamp as last resort
+                        val latestFile = File(reportDirectory, "latest.json")
+                        if (!latestFile.isFile) true else {
+                            val latestDecoded = runCatching { HardwareE2EReportCodec.decode(latestFile.readText()) }.getOrNull()
+                            if (latestDecoded != null) report.runStartWallClockTimestamp >= latestDecoded.runStartWallClockTimestamp else true
+                        }
+                    }
+                }
+            }
+            if (shouldUpdateLatest) {
+                val latest = File(reportDirectory, "latest.json")
+                val latestTemp = File(reportDirectory, "latest.json.tmp")
+                latestTemp.writeText(HardwareE2EReportCodec.encode(report))
+                if (!latestTemp.renameTo(latest)) {
+                    latest.delete()
+                    check(latestTemp.renameTo(latest)) { "could not publish latest hardware report" }
+                }
             }
             reportDirectory.listFiles()
                 ?.filter { it.extension == "json" && it.name != "latest.json" }
@@ -1047,8 +1081,13 @@ internal class HardwareE2ERunRecorder private constructor(
         }
     }
 
-    private fun elapsedMillis(): Long =
-        if (startedAtNanos == 0L) 0L else ((System.nanoTime() - startedAtNanos) / 1_000_000L).coerceAtLeast(0L)
+    private fun elapsedMillis(targetRunId: String): Long {
+        val started = synchronized(lock) { startedAtNanosByRunId[targetRunId] } ?: return 0L
+        return ((System.nanoTime() - started) / 1_000_000L).coerceAtLeast(0L)
+    }
+
+    @Suppress("unused")
+    private fun elapsedMillis(): Long = 0L
 
     private fun readJobSummary(jobDir: File): HardwareE2EJobSummary {
         val jobFile = File(jobDir, JOB_JSON_FILE_NAME)

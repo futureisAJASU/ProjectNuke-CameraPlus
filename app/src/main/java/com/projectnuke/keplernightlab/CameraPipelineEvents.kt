@@ -61,7 +61,8 @@ sealed interface CameraPipelineEvent {
         val verified: Boolean = false,
         val captureResourcesSettled: Boolean = true,
         override val counts: CameraPipelineProgressCounts = CameraPipelineProgressCounts(),
-        override val message: String? = null
+        override val message: String? = null,
+        val jobDirectoryPath: String? = null
     ) : CameraPipelineEvent {
         enum class Kind { COMPLETE, COMPLETE_PARTIAL, FAILED, CANCELLED }
     }
@@ -88,7 +89,8 @@ internal class CameraPipelineTerminalPublisher(
         verified: Boolean = false,
         captureResourcesSettled: Boolean = true,
         counts: CameraPipelineProgressCounts = CameraPipelineProgressCounts(),
-        message: String? = null
+        message: String? = null,
+        jobDirectoryPath: String? = null
     ): Boolean {
         if (!published.compareAndSet(false, true)) return false
         sink(
@@ -100,7 +102,8 @@ internal class CameraPipelineTerminalPublisher(
                 verified = verified,
                 captureResourcesSettled = captureResourcesSettled,
                 counts = counts,
-                message = message
+                message = message,
+                jobDirectoryPath = jobDirectoryPath
             )
         )
         return true

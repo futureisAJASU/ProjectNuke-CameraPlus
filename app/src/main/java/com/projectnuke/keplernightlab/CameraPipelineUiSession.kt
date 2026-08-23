@@ -460,4 +460,13 @@ internal class CameraPipelineUiSession(
 
     private fun isCurrentLocked(localGeneration: Long): Boolean =
         !disposed && operation?.generation == localGeneration
+
+    /**
+     * Phase D: foreground-only staleness check. An old background terminal may be
+     * STALE_FOR_FOREGROUND but still VALID_FOR_BACKGROUND_JOB. Callers must NOT
+     * use [accept] to decide if the background job exists - route diagnostics
+     * by generation/runId first, then independently decide foreground mutation.
+     */
+    @Synchronized
+    internal fun isCurrentGeneration(localGeneration: Long): Boolean = isCurrentLocked(localGeneration)
 }
