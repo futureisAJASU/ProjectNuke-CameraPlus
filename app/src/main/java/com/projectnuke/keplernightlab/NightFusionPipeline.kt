@@ -131,22 +131,14 @@ fun captureProcessExportNightFusion(
         processingParams = processingParams,
         captureCancellationHandle = captureCancellationHandle,
 onComplete = { jobDir ->
-            // Phase 6 boundary: at this point every frame is persisted and
-            // verified, the durable processing handoff is published, capture
-            // resources are settled, and the capture lease is released. The
-            // foreground slot ends here; fusion/export continue on the
-            // serialized background lane bound to this EXACT job directory.
-            onPipelineEvent(
-                CameraPipelineEvent.CaptureStageComplete(
-                    generation = 0L,
-                    counts = CameraPipelineProgressCounts(),
-                    message = "촬영이 완료되었습니다. 결과를 처리하고 있습니다.",
-                    jobDirectoryPath = jobDir.absolutePath,
-                    captureResourcesSettled = true,
-                    processingHandoffDurable = true
-                )
-            )
-            try {
+            // Durable handoff ordering invariant: immediately after an
+            // evidenced CaptureStageComplete, process death may occur, so the
+            // exact job must already contain every post-handoff processing
+            // parameter. Metadata persistence therefore happens BEFORE the
+            // evidenced event; a persistence failure never emits handoff
+            // evidence, never unlocks the shutter via handoff, and never
+            // enqueues an incomplete background request.
+            val metadataDurable = try {
                 KeplerJobMetadata.update(jobDir) { current ->
                     current.put("captureMode", captureMode.name)
                         .put("processingPresetName", processingParams.presetName)
@@ -158,9 +150,52 @@ onComplete = { jobDir ->
                             .put("savedFrames", 1)
                     }
                 }
-            } catch (_: Exception) {
-                android.util.Log.w("KeplerYuvPipeline", "Failed to persist YUV handoff metadata")
+                true
+            } catch (metadataFailure: Exception) {
+                android.util.Log.e(
+                    "KeplerYuvPipeline",
+                    "Failed to persist YUV handoff metadata: ${metadataFailure.message}",
+                    metadataFailure
+                )
+                false
             }
+            if (!metadataDurable) {
+                try {
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(jobDir)
+                } catch (settledError: Error) {
+                    throw settledError
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (settlementError: Exception) {
+                    android.util.Log.e(
+                        "KeplerYuvPipeline",
+                        "Failed to settle YUV processing handoff after metadata persistence failure: ${settlementError.message}",
+                        settlementError
+                    )
+                }
+                post("처리 요청 정보를 저장하지 못했습니다. 캐시를 보존했습니다. 나중에 다시 처리할 수 있습니다.")
+                terminal.publish(
+                    CameraPipelineEvent.Terminal.Kind.FAILED,
+                    message = "Handoff metadata persistence failed; cache kept for recovery."
+                )
+                return@captureYuvBurstColorWithMotion
+            }
+            // Phase 6 boundary: at this point every frame is persisted and
+            // verified, ALL post-handoff processing parameters are durable,
+            // the durable processing handoff is published, capture resources
+            // are settled, and the capture lease is released. The foreground
+            // slot ends here; fusion/export continue on the serialized
+            // background lane bound to this EXACT job directory.
+            onPipelineEvent(
+                CameraPipelineEvent.CaptureStageComplete(
+                    generation = 0L,
+                    counts = CameraPipelineProgressCounts(),
+                    message = "촬영이 완료되었습니다. 결과를 처리하고 있습니다.",
+                    jobDirectoryPath = jobDir.absolutePath,
+                    captureResourcesSettled = true,
+                    processingHandoffDurable = true
+                )
+            )
             val request = BackgroundProcessingRequest(exactJobDirectory = jobDir, jobKind = KeplerActiveOperationKind.PROCESSING_YUV)
             val laneAccepted = BackgroundProcessingCoordinator.of(context.applicationContext).enqueue(request)
             if (laneAccepted !is BackgroundEnqueueResult.Accepted) {

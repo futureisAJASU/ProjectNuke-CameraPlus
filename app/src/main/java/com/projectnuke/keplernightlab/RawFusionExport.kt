@@ -914,10 +914,55 @@ fun captureProcessExportRawNightFusion(
         captureCancellationHandle = captureCancellationHandle,
         onStatus = { post(it) },
         onComplete = { jobDir ->
-            // Phase 6 boundary: raw16 frames persisted and verified, durable
-            // processing handoff published, capture resources settled, capture
-            // lease released. Fusion/export continue on the serialized
-            // background lane bound to this EXACT job directory.
+            // Durable handoff ordering invariant: ALL post-handoff processing
+            // parameters must be durably present BEFORE the evidenced
+            // CaptureStageComplete. A persistence failure never emits handoff
+            // evidence and never enqueues an incomplete background request.
+            val metadataDurable = try {
+                KeplerJobMetadata.update(jobDir) { current ->
+                    current.put("captureMode", CaptureMode.MULTI_FRAME.name)
+                        .put("processingPresetName", processingParams.presetName)
+                        .put("processingParams", processingParams.clamped().toJson())
+                        .put("finalOutputFormatSetting", finalOutputFormat.name)
+                        .put("displayRotation", displayRotation)
+                        .put("displayRotationAtCapture", displayRotation)
+                        .put("rawSpeedMode", rawSpeedMode.name)
+                }
+                true
+            } catch (metadataFailure: Exception) {
+                Log.e(
+                    "KeplerRawPipeline",
+                    "Failed to persist RAW handoff metadata: ${metadataFailure.message}",
+                    metadataFailure
+                )
+                false
+            }
+            if (!metadataDurable) {
+                try {
+                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(jobDir)
+                } catch (settledError: Error) {
+                    throw settledError
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (settlementError: Exception) {
+                    Log.e(
+                        "KeplerRawPipeline",
+                        "Failed to settle RAW processing handoff after metadata persistence failure: ${settlementError.message}",
+                        settlementError
+                    )
+                }
+                post("처리 요청 정보를 저장하지 못했습니다. 캐시를 보존했습니다. 나중에 다시 처리할 수 있습니다.")
+                terminal.publish(
+                    CameraPipelineEvent.Terminal.Kind.FAILED,
+                    message = "Handoff metadata persistence failed; RAW cache kept for recovery."
+                )
+                return@captureRawBurstForFusion
+            }
+            // Phase 6 boundary: raw16 frames persisted and verified, ALL
+            // post-handoff parameters durable, processing handoff published,
+            // capture resources settled, capture lease released. Fusion/export
+            // continue on the serialized background lane bound to this EXACT
+            // job directory.
             onPipelineEvent(
                 CameraPipelineEvent.CaptureStageComplete(
                     generation = 0L,
@@ -928,19 +973,6 @@ fun captureProcessExportRawNightFusion(
                     processingHandoffDurable = true
                 )
             )
-            try {
-                KeplerJobMetadata.update(jobDir) { current ->
-                    current.put("captureMode", CaptureMode.MULTI_FRAME.name)
-                        .put("processingPresetName", processingParams.presetName)
-                        .put("processingParams", processingParams.clamped().toJson())
-                        .put("finalOutputFormatSetting", finalOutputFormat.name)
-                        .put("displayRotation", displayRotation)
-                        .put("displayRotationAtCapture", displayRotation)
-                        .put("rawSpeedMode", rawSpeedMode.name)
-                }
-            } catch (_: Exception) {
-                Log.w("KeplerRawPipeline", "Failed to persist RAW handoff metadata")
-            }
             val request = BackgroundProcessingRequest(exactJobDirectory = jobDir, jobKind = KeplerActiveOperationKind.PROCESSING_RAW)
             val laneAccepted = BackgroundProcessingCoordinator.of(context.applicationContext).enqueue(request)
             if (laneAccepted !is BackgroundEnqueueResult.Accepted) {

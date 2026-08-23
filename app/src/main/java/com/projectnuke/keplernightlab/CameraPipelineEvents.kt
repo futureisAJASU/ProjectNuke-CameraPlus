@@ -108,6 +108,9 @@ internal class CameraPipelineTerminalPublisher(
         )
         return true
     }
+
+    /** True once this publisher emitted its single terminal (or claimed it). */
+    fun isPublished(): Boolean = published.get()
 }
 
 internal fun CameraPipelineEvent.withGeneration(generation: Long): CameraPipelineEvent = when (this) {

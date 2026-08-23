@@ -582,6 +582,13 @@ internal class HardwareE2ERunRecorder private constructor(
     private var current: HardwareE2ERunReport? = null
     private val runsByRunId = LinkedHashMap<String, HardwareE2ERunReport>()
     private val runIdByGeneration = HashMap<Long, String>()
+    // Exact job-directory -> run binding. Established at the evidenced
+    // CaptureStageComplete of a run and used as the FIRST routing priority for
+    // background events whose generation is 0 (the foreground generation is no
+    // longer authoritative after durable handoff). Entries are intentionally
+    // retained for the recorder lifetime: a late terminal/finalization for an
+    // old job must still resolve its own run even after newer captures started.
+    private val runIdByJobDirectory = HashMap<String, String>()
     private val baselinesByRunId = HashMap<String, Set<String>>()
     private val baselineFailuresByRunId = HashMap<String, String?>()
     private val startedAtNanosByRunId = HashMap<String, Long>()
@@ -635,26 +642,68 @@ internal class HardwareE2ERunRecorder private constructor(
     }
 
     fun recordEvent(event: CameraPipelineEvent) {
-        val checkpoint = when (event) {
-            is CameraPipelineEvent.Started -> "CAPTURE_STARTED"
-            is CameraPipelineEvent.CaptureProgress -> "CAPTURE_PROGRESS"
-            is CameraPipelineEvent.CaptureStageComplete -> "CAPTURE_STAGE_COMPLETE"
-            is CameraPipelineEvent.ProcessingStage -> "PROCESSING_STARTED"
-            is CameraPipelineEvent.ExportStage -> "EXPORT_STARTED"
-            is CameraPipelineEvent.Terminal -> when (event.kind) {
-                CameraPipelineEvent.Terminal.Kind.COMPLETE,
-                CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL -> "TERMINAL_COMPLETE"
-                CameraPipelineEvent.Terminal.Kind.FAILED -> "TERMINAL_FAILED"
-                CameraPipelineEvent.Terminal.Kind.CANCELLED -> "TERMINAL_CANCELLED"
-            }
-        }
+        recordRouted(event, exactJobDirectory = null)
+    }
+
+    /**
+     * Records one process-scoped background event envelope. Routing uses ONLY
+     * the exact job-directory binding: a background event with an exact job
+     * that has no bound run is dropped rather than being attributed to the
+     * current run. Generation 0 must never fall back to "current" here.
+     */
+    fun recordBackgroundEvent(background: BackgroundPipelineEvent) {
+        val event = background.event
+        val checkpoint = checkpointFor(event)
         val targetRunId = synchronized(lock) {
+            runIdByJobDirectory[background.exactJobDirectory.absolutePath]
+        } ?: return
+        recordToRun(event, checkpoint, targetRunId)
+    }
+
+    private fun checkpointFor(event: CameraPipelineEvent): String = when (event) {
+        is CameraPipelineEvent.Started -> "CAPTURE_STARTED"
+        is CameraPipelineEvent.CaptureProgress -> "CAPTURE_PROGRESS"
+        is CameraPipelineEvent.CaptureStageComplete -> "CAPTURE_STAGE_COMPLETE"
+        is CameraPipelineEvent.ProcessingStage -> "PROCESSING_STARTED"
+        is CameraPipelineEvent.ExportStage -> "EXPORT_STARTED"
+        is CameraPipelineEvent.Terminal -> when (event.kind) {
+            CameraPipelineEvent.Terminal.Kind.COMPLETE,
+            CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL -> "TERMINAL_COMPLETE"
+            CameraPipelineEvent.Terminal.Kind.FAILED -> "TERMINAL_FAILED"
+            CameraPipelineEvent.Terminal.Kind.CANCELLED -> "TERMINAL_CANCELLED"
+        }
+    }
+
+    /**
+     * Routing priority: (1) exact job-directory mapping, (2) foreground
+     * generation mapping, (3) current run only for truly unbound foreground
+     * events before an exact job exists.
+     */
+    private fun recordRouted(event: CameraPipelineEvent, exactJobDirectory: File?) {
+        val checkpoint = checkpointFor(event)
+        val targetRunId = synchronized(lock) {
+            val boundByJob = exactJobDirectory?.absolutePath?.let { runIdByJobDirectory[it] }
             when {
+                boundByJob != null -> boundByJob
                 event.generation != 0L -> runIdByGeneration[event.generation]
                     ?: current?.runId?.also { runIdByGeneration[event.generation] = it }
                 else -> current?.runId
             }
         } ?: return
+        if (event is CameraPipelineEvent.CaptureStageComplete &&
+            event.handoffEvidenceComplete &&
+            event.jobDirectoryPath != null
+        ) {
+            synchronized(lock) { runIdByJobDirectory[event.jobDirectoryPath] = targetRunId }
+        }
+        recordToRun(event, checkpoint, targetRunId)
+    }
+
+    private fun recordToRun(
+        event: CameraPipelineEvent,
+        checkpoint: String,
+        targetRunId: String
+    ) {
         val record = HardwareE2EEventRecord(
             checkpoint = checkpoint,
             eventType = event.javaClass.simpleName,

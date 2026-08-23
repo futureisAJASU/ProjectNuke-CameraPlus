@@ -689,6 +689,36 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
         onDispose { pipelineOrchestrator.dispose() }
     }
 
+    // Process-scoped background event surface. The subscription lifetime
+    // follows this screen; dispose removes it from the hub so nothing retains
+    // this Composable. Two separate responsibilities per event:
+    //  1. passive diagnostics - HardwareE2E always receives the envelope;
+    //  2. UI refresh for terminal events of the EXACT completed job only,
+    //     never mutating a newer foreground capture's status/progress.
+    DisposableEffect(hardwareE2ERecorder) {
+        val subscription = BackgroundPipelineEventHub.subscribe { background ->
+            val terminal = background.event as? CameraPipelineEvent.Terminal
+            if (terminal == null) {
+                hardwareE2ERecorder.recordBackgroundEvent(background)
+                return@subscribe
+            }
+            hardwareE2ERecorder.recordBackgroundEvent(background)
+            val success = terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE ||
+                terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+            val exactDir = background.exactJobDirectory.takeIf { it.isDirectory }
+            if (exactDir != null) {
+                // A foreground capture in progress keeps its viewfinder: an old
+                // job's completion may refresh data but not pop preview over it.
+                val foregroundIdle = !pipelineUiState.isCapturing && pipelineUiState.canAdmitNewCapture
+                refreshLatestResult(
+                    showPreview = success && terminal.requiredOutputCommitted && foregroundIdle,
+                    exactJobDir = exactDir
+                )
+            }
+        }
+        onDispose { subscription.dispose() }
+    }
+
     DisposableEffect(Unit) {
         onDispose {
             settingsPersistence.close()

@@ -1,0 +1,113 @@
+package com.projectnuke.keplernightlab
+
+import android.util.Log
+import java.io.File
+import java.util.ArrayDeque
+
+/**
+ * Immutable envelope binding a background pipeline event to its EXACT durable
+ * job directory. After foreground generation ownership is released at the
+ * capture handoff, exact job identity is the only correlation key: background
+ * events must never be correlated through "latest job" or mutable foreground
+ * generation state. [event] keeps [CameraPipelineEvent] unchanged; terminal
+ * events additionally carry jobDirectoryPath inside the record itself.
+ */
+internal data class BackgroundPipelineEvent(
+    val exactJobDirectory: File,
+    val jobKind: KeplerActiveOperationKind,
+    val event: CameraPipelineEvent
+)
+
+internal fun interface BackgroundPipelineEventSubscriber {
+    fun onBackgroundEvent(event: BackgroundPipelineEvent)
+}
+
+/**
+ * Explicit registration token; disposing removes the subscriber from the hub
+ * so a disposed screen/recorder is never retained.
+ */
+internal class BackgroundPipelineEventSubscription private constructor(
+    private val hub: BackgroundPipelineEventHub,
+    private val subscriber: BackgroundPipelineEventSubscriber
+) {
+    @Volatile
+    private var disposed = false
+
+    fun dispose() {
+        if (disposed) return
+        disposed = true
+        hub.remove(subscriber)
+    }
+
+    internal fun isDisposed(): Boolean = disposed
+
+    internal companion object {
+        internal fun create(
+            hub: BackgroundPipelineEventHub,
+            subscriber: BackgroundPipelineEventSubscriber
+        ): BackgroundPipelineEventSubscription = BackgroundPipelineEventSubscription(hub, subscriber)
+    }
+}
+
+/**
+ * Process-scoped observational event surface for background pipeline jobs.
+ *
+ * Contract:
+ *  - The hub NEVER owns production truth. Durable job metadata and
+ *    JobOperationLease settlement remain authoritative; publishing must not
+ *    depend on any subscriber being present.
+ *  - Delivery is strictly observational: a throwing subscriber can never alter
+ *    production processing, terminal truth, or other subscribers.
+ *  - Subscribers are bounded and removed exactly on dispose; the hub holds no
+ *    Activity/Composable/callback closures beyond registered lambdas and
+ *    retains nothing after disposal.
+ */
+internal object BackgroundPipelineEventHub {
+    private const val TAG = "KeplerBackgroundEvents"
+    private const val MAX_SUBSCRIBERS = 16
+
+    private val lock = Any()
+    private val subscribers = ArrayDeque<BackgroundPipelineEventSubscriber>()
+
+    fun subscribe(subscriber: BackgroundPipelineEventSubscriber): BackgroundPipelineEventSubscription {
+        synchronized(lock) {
+            if (subscribers.size >= MAX_SUBSCRIBERS) {
+                Log.w(TAG, "subscriber limit reached; rejecting subscription")
+            } else {
+                subscribers.addLast(subscriber)
+            }
+        }
+        return BackgroundPipelineEventSubscription.create(this, subscriber)
+    }
+
+    internal fun remove(subscriber: BackgroundPipelineEventSubscriber) {
+        synchronized(lock) { subscribers.remove(subscriber) }
+    }
+
+    /**
+     * Publishes one exact-job background event to current subscribers.
+     * Never throws to the producer; delivery failures are logged and ignored.
+     * Safe with zero subscribers - production completion is independent of this.
+     */
+    fun publish(event: BackgroundPipelineEvent) {
+        val targets: List<BackgroundPipelineEventSubscriber> = synchronized(lock) {
+            subscribers.toList()
+        }
+        targets.forEach { subscriber ->
+            try {
+                subscriber.onBackgroundEvent(event)
+            } catch (failure: Throwable) {
+                try {
+                    Log.w(TAG, "background event observer failed for ${event.exactJobDirectory.name}", failure)
+                } catch (_: Throwable) {
+                }
+            }
+        }
+    }
+
+    internal fun subscriberCountForTest(): Int = synchronized(lock) { subscribers.size }
+
+    internal fun resetForTest() {
+        synchronized(lock) { subscribers.clear() }
+    }
+}
