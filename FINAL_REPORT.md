@@ -121,3 +121,160 @@ Remaining known limitation (MEDIUM, disclosed): physical-device Stage A/B valida
 - No new HIGH/MEDIUM in this bounded owner-vs-retained classification family.
 
 END-TO-END PRODUCTION INTEGRATION AUDIT: CLOSED
+
+---
+
+# CLOSURE ADDENDUM — Background Terminal Delivery + True Durable Handoff
+
+Baseline HEAD: `f8d603f21a0b82b1df616c78a3baa2d3c3884442`
+Final HEAD (report commit): see `git log -1`; correction commit: `9a368c9` (§A9 contents).
+
+## A1. Root cause of the physical 180 s timeout
+
+`KeplerBackgroundExecutor` performed real YUV/RAW/SR work, but its only status sink was
+`Log.i("KeplerBackgroundExecutor", ...)`. No process-safe producer published
+`ProcessingStage` / `ExportStage` / `Terminal`, so every background job after
+`CAPTURE_STAGE_COMPLETE` was invisible to `CameraPipelineUiOrchestrator`,
+`HardwareE2ERunRecorder`, and result UI. HardwareE2E saw no terminal within 180 s →
+INCOMPLETE with only `CAPTURE_STAGE_COMPLETE`. This was NOT a Camera2 capture hang.
+
+Two further latent defects found during the audit and fixed in this closure:
+- **Handoff gate deadlock**: real captured jobs carry a `processingHandoffKind` marker
+  published by the capture owner. The executor acquired its lease WITHOUT
+  `consumesProcessingHandoff = true`, so `inspectRecoveryMutationGate` returned
+  `BLOCKED_HANDOFF` for EVERY real captured job (synthetic test jobs without the marker
+  masked this).
+- **SR misrouting**: SR capture handoff enqueues `jobKind = PROCESSING_YUV`; dispatch sent
+  those jobs to classic YUV fusion instead of super resolution.
+
+## A2. Background event architecture
+
+New `BackgroundPipelineEventHub.kt`:
+- `BackgroundPipelineEvent(exactJobDirectory, jobKind, event)` — immutable envelope keyed
+  by the EXACT request job directory (Option B: `CameraPipelineEvent` unchanged; terminal
+  events additionally carry `jobDirectoryPath` in-record).
+- Process-scoped singleton hub; bounded (16) subscribers via explicit disposable
+  registration tokens; dispose removes the subscriber (no Activity/Composable retention);
+  delivery is strictly observational (`catch Throwable` per subscriber); publishing with
+  zero subscribers is a no-op. Durable job metadata + `JobOperationLease` remain the only
+  production authority.
+
+## A3. Terminal truth and error policy (executor)
+
+- Exactly one terminal per accepted request via `CameraPipelineTerminalPublisher`,
+  published in `finally` AFTER `releaseOrRetainForReconciliation()` (lease settlement
+  boundary). Kind derived by pure `backgroundTerminalKind(required, publicExport,
+  verified)` from structured production results — no log-string parsing.
+  verified+public → `COMPLETE`; local-or-public commit without verification →
+  `COMPLETE_PARTIAL` with exact flags; otherwise `FAILED`.
+- Ordinary `Exception`: best-effort durable FAILED truth written to `job.json`
+  (`processStatus=PIPELINE_FAILED`, `pipelineFailed=true`, failure source/type/message;
+  skipped when a current-attempt output claim exists so committed exports are never
+  contradicted), then exact `FAILED` terminal after settlement.
+- `CancellationException`: `CANCELLED` terminal, precedence preserved (rethrow).
+- Fatal `Error`: never downgraded; propagates while the lease retains reconciliation debt.
+- Non-terminal `ProcessingStage(PROCESSING/DEMOSAICING)` → `ExportStage(EXPORTING)` →
+  Terminal published when semantically reached; observer failures cannot affect them.
+
+## A4. Exact job identity routing
+
+- `HardwareE2ERunRecorder.runIdByJobDirectory`: bound at evidenced
+  `CaptureStageComplete` (`handoffEvidenceComplete` + `jobDirectoryPath`) to the resolved
+  run; retained for recorder lifetime so late terminals still resolve their own run.
+- Routing priority: (1) exact job-directory mapping, (2) foreground generation mapping,
+  (3) current run only for truly unbound foreground events. Generation 0 never falls back
+  to current.
+- New `recordBackgroundEvent(BackgroundPipelineEvent)`: routes ONLY through the exact-job
+  mapping; an unbound envelope is dropped rather than attributed to the current run.
+- Finalization: routed background terminal triggers `finalizeAfterTerminal(exactRun)` →
+  EXACT correlation on the pinned job → strict classification with
+  `allowPartialCompletion=false` / `requiresExport=true` preserved.
+
+## A5. Durable handoff ordering (Phase 4)
+
+All three pipelines (`NightFusionPipeline.kt`, `RawFusionExport.kt`,
+`SuperResolutionFusion.kt`) now order the handoff boundary:
+1. frames/artifacts persisted + manifest durable (capture owner, before `onComplete`);
+2. ALL post-handoff processing parameters persisted (`captureMode`, `processingPresetName`,
+   `processingParams`, `finalOutputFormatSetting`, plus `displayRotation`,
+   `displayRotationAtCapture`, `rawSpeedMode` for RAW, plus `backgroundWorkerKind=
+   SUPER_RESOLUTION` marker for SR);
+3. processing handoff already durably published by the capture owner;
+4. ONLY NOW emit evidenced `CaptureStageComplete` (shutter unlock follows from evidence);
+5. enqueue the immutable exact-job request.
+
+Metadata persistence failure (Phase 4A): no evidenced event, no
+`processingHandoffDurable=true`, no enqueue; `settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure`
+keeps the job reprocessable; formal Korean status + FAILED terminal published. Applies to
+YUV, RAW, SR paths.
+
+## A6. UI connection without retention (Phase 2)
+
+`CameraScreen.kt` subscribes once per screen via `DisposableEffect(hardwareE2ERecorder)`;
+dispose removes the subscription. Per background envelope: (1) passive diagnostics —
+recorder ALWAYS receives it; (2) UI — terminal events refresh latest-result data for the
+exact completed job only; preview pop suppressed while a foreground capture owns the
+viewfinder; newer foreground capture status/progress/session never mutated; nothing routed
+through `session.accept()` as an existence test.
+
+## A7. Tests added
+
+`Phase5BackgroundTerminalTest` (real lane + executor + metadata + lease + hub):
+yuv/raw/sr accepted-request terminal sequences, ordinary-failure FAILED truth, partial-
+export flags, verified-flag kind matrix, terminal-after-settlement ordering proof
+(delivery-time lease/metadata snapshot), observer-failure isolation, disposed-subscriber
+non-blocking, disposed-subscriber non-retention.
+
+`Phase6HardwareE2EOverlapTest` (real recorder integration): captureA binds jobA→runA;
+runB-current background terminal/stage/export routing to runA; exact-job finalization
+while B current; runB isolation; latest.json monotonicity; generation-0 never falls back
+when exact job known; unbound envelope dropped; strict single YUV/RUN full-checkpoint
+reports (`RUN_STARTED…TERMINAL_COMPLETE, PUBLIC_OUTPUT_COMMITTED, OWNER_SETTLED`) with
+PASS/EXACT under strict flags.
+
+## A8. Static audit findings (Phase 7)
+
+- Every evidenced `CaptureStageComplete(processingHandoffDurable = true)` site (3 total)
+  is preceded by a successful required-metadata write with fail-closed early return.
+- `PIPELINE_COMPLETE*` strings exist only as status text/durable metadata; no terminal
+  kind derives from any log string.
+- Routing greps confirm exact-job priority precedes generation precedes current; the
+  remaining `current?.runId` uses are foreground checkpoints/API only.
+- Queue/executor/hub contain no `Activity` / `LocalContext.current` / UI callback
+  captures (only contract KDoc mentions).
+- Strict UTF-8 hygiene re-verified over all touched sources (`Utf8HygieneTest` green;
+  a PowerShell round-trip encoding incident during development was fully reverted and
+  redone via tooling before commit).
+
+## A9. Correction commit `9a368c9` (code + tests)
+
+`BackgroundPipelineEventHub.kt` (new), `KeplerBackgroundExecutor.kt` (event surface,
+terminal truth, error policy, handoff consumption, SR routing), `CameraPipelineEvents.kt`
+(`isPublished()`), `HardwareE2E.kt` (exact-job map + `recordBackgroundEvent`),
+`CameraScreen.kt` (hub subscription), `NightFusionPipeline.kt` / `RawFusionExport.kt` /
+`SuperResolutionFusion.kt` (durable handoff ordering + metadata failure policy),
+`Phase5BackgroundTerminalTest.kt`, `Phase6HardwareE2EOverlapTest.kt`.
+
+## A10. Validation results (addendum)
+
+| Command | Result |
+|---|---|
+| `compileDebugKotlin` | SUCCESS |
+| `compileDebugUnitTestKotlin` | SUCCESS |
+| `compileDebugAndroidTestKotlin` | SUCCESS |
+| `testDebugUnitTest` (full suite, 1260 tests) | SUCCESS |
+| New groups ×2 (Phase5 + Phase6) | SUCCESS ×2 |
+| `assembleDebug` | SUCCESS |
+| `assembleDebugAndroidTest` | SUCCESS |
+| `lintDebug` | SUCCESS |
+| `git diff --check` / `git show --check` | PASS |
+
+Remaining known limitation (MEDIUM, disclosed): physical-device instrumentation rerun
+(`adb shell am instrument -w -r -e timeout_msec 240000 -e kepler.hardwareE2E true
+com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner`) must show
+YUV/RAW progressing beyond `CAPTURE_STAGE_COMPLETE` to
+`PROCESSING_STARTED → EXPORT_STARTED → TERMINAL_COMPLETE` (or concrete
+`TERMINAL_FAILED`); a 180-second INCOMPLETE with only CAPTURE_STAGE_COMPLETE remains a
+regression signal.
+
+ADDENDUM VERDICT: BACKGROUND TERMINAL DELIVERY + TRUE DURABLE HANDOFF — CLOSED (JVM gates)
