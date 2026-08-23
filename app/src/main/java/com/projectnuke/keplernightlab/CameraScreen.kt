@@ -573,7 +573,7 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
         processingPreviewStatus = "최근 결과를 촬영하면 설정 미리보기가 표시됩니다."
     }
 
-    fun refreshLatestResult(showPreview: Boolean = false) {
+    fun refreshLatestResult(showPreview: Boolean = false, exactJobDir: File? = null) {
         val generation = ++refreshGeneration
         refreshJob?.cancel()
         refreshJob = cameraScope.launch {
@@ -584,7 +584,11 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
                 var adopted = false
                 try {
                     val loaded = withContext(Dispatchers.IO) {
-                        val r = loadLatestKeplerResultV2(context)
+                        val r = if (exactJobDir != null && exactJobDir.isDirectory) {
+                            loadKeplerResultForDirectory(context, exactJobDir)
+                        } else {
+                            loadLatestKeplerResultV2(context)
+                        }
                         val isAllowed = isAllowedPreviewExtension(r.fileName) && !isDebugPreviewFinalBlocked(r.fileName)
                         if (r.bitmap != null && !r.bitmap!!.isRecycled && isAllowed) {
                             ownedBitmap = r.bitmap
@@ -641,9 +645,20 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
                 onTerminal = { terminal ->
                     val success = terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE ||
                         terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
-                    refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted)
+                    val exactDir = terminal.jobDirectoryPath?.let { java.io.File(it) }?.takeIf { it.isDirectory }
+                    refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted, exactJobDir = exactDir)
                 },
-                onDiagnosticEvent = hardwareE2ERecorder::recordEvent
+                onDiagnosticEvent = hardwareE2ERecorder::recordEvent,
+                onBackgroundTerminal = { terminal ->
+                    val success = terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE ||
+                        terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+                    val exactDir = terminal.jobDirectoryPath?.let { java.io.File(it) }?.takeIf { it.isDirectory }
+                    if (exactDir != null) {
+                        refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted, exactJobDir = exactDir)
+                    } else {
+                        refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted)
+                    }
+                }
             )
         )
     }
@@ -654,9 +669,20 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
             onTerminal = { terminal ->
                 val success = terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE ||
                     terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
-                refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted)
+                val exactDir = terminal.jobDirectoryPath?.let { java.io.File(it) }?.takeIf { it.isDirectory }
+                refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted, exactJobDir = exactDir)
             },
-            onDiagnosticEvent = hardwareE2ERecorder::recordEvent
+            onDiagnosticEvent = hardwareE2ERecorder::recordEvent,
+            onBackgroundTerminal = { terminal ->
+                val success = terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE ||
+                    terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
+                val exactDir = terminal.jobDirectoryPath?.let { java.io.File(it) }?.takeIf { it.isDirectory }
+                if (exactDir != null) {
+                    refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted, exactJobDir = exactDir)
+                } else {
+                    refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted)
+                }
+            }
         )
     )
     DisposableEffect(pipelineOrchestrator) {
@@ -1203,21 +1229,15 @@ LaunchedEffect(Unit) {
                         status = "재생성할 최근 촬영 결과가 없습니다."
                         return@average
                     }
-                    val enqueueOutcome = BackgroundProcessingCoordinator.of(context).enqueue(
-                        ExactJobRef(latestJobDir, KeplerActiveOperationKind.PROCESSING_YUV)
-                    ) { ref ->
-                        val run = reprocessYuvJob(
-                            context = context,
-                            jobDir = ref.jobDirectory,
-                            finalOutputFormat = finalOutputFormat,
-                            onStatus = { message -> mainHandler.post { status = message } }
-                        )
-                        try {
-                            kotlinx.coroutines.runBlocking { run.terminal.await() }
-                        } catch (failure: Throwable) {
-                            Log.w("KeplerPipelineState", "reprocess terminal await failed", failure)
+                    try {
+                        KeplerJobMetadata.update(latestJobDir) { current ->
+                            current.put("finalOutputFormatSetting", finalOutputFormat.name)
                         }
+                    } catch (_: Exception) {
+                        Log.w("KeplerPipelineState", "Failed to persist reprocess handoff metadata")
                     }
+                    val request = BackgroundProcessingRequest(exactJobDirectory = latestJobDir, jobKind = KeplerActiveOperationKind.PROCESSING_YUV)
+                    val enqueueOutcome = BackgroundProcessingCoordinator.of(context.applicationContext).enqueue(request)
                     status = when (enqueueOutcome) {
                         is BackgroundEnqueueResult.Duplicate ->
                             "최근 촬영 결과가 이미 처리 대기열에 있습니다."
@@ -3226,6 +3246,128 @@ fun loadLatestKeplerResultV2(context: Context): LatestKeplerResult {
         }
     } catch (e: Exception) {
         LatestKeplerResult(null, "Latest result load failed: ${e.javaClass.simpleName}")
+    }
+}
+
+fun loadKeplerResultForDirectory(context: Context, jobDir: File): LatestKeplerResult {
+    return try {
+        if (!jobDir.isDirectory) return LatestKeplerResult(null, "Exact job directory unavailable")
+        if (isReprocessQuarantined(jobDir)) return LatestKeplerResult(null, "Exact job quarantined")
+        val jobFile = NoFollowFileSystem.resolveDirectChild(jobDir, "job.json", requireFile = true)
+            ?: return LatestKeplerResult(null, "Exact job missing job.json")
+        val job = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
+        // Exact identity - do not skip active jobs via generic scan; caller already knows this is the completed job.
+        // But still verify the file is a real directory and not quarantined above.
+        val previewFile = chooseLatestResultFile(jobDir, job)
+        val outputWidth = job.optInt("outputWidth", 0).takeIf { it > 0 }
+        val outputHeight = job.optInt("outputHeight", 0).takeIf { it > 0 }
+        val jobType = job.optString("jobType", jobDir.parentFile?.name.orEmpty())
+        val fusionEngine = listOf(
+            job.optString("fusionEngine", ""),
+            job.optString("rawFusionEngine", ""),
+            job.optString("fusionVersion", ""),
+            job.optString("rawFusionVersion", "")
+        ).firstOrNull { it.isNotBlank() }.orEmpty()
+        val usedFrames = job.optInt("usedFrameCount", job.optInt("savedFrames", 0))
+        val requestedFrames = job.optInt("requestedFrames", 0)
+        if (previewFile == null) {
+            val summary = buildString {
+                append("status=")
+                append(job.optString("status", "unknown"))
+                append(", frames=")
+                append(job.optInt("savedFrames", 0))
+                append(", export=")
+                append(job.optString("exportStatus", "not_exported"))
+                append(" ")
+                append(job.optString("exportFormatUsed", ""))
+                append(" verified=")
+                append(job.optBoolean("exportVerified", false))
+                append(", output=")
+                append(job.optString("finalOutputFormatSetting", ""))
+                append(", public=")
+                append(job.optString("exportDisplayName", "").ifBlank { "none" })
+                append(", rawSidecar=")
+                append(job.optString("rawSidecarExportStatus", "NOT_REQUESTED"))
+                append(", cleanup=")
+                append(job.optString("cleanupStatus", "none"))
+                append(", job=")
+                append(jobDir.name)
+                append(", file=none, source=")
+                append(job.optString("finalOutputSource", "bitmap"))
+            }
+            return LatestKeplerResult(
+                bitmap = null,
+                summary = summary,
+                jobType = jobType,
+                fusionEngine = fusionEngine,
+                usedFrames = usedFrames,
+                requestedFrames = requestedFrames,
+                outputWidth = outputWidth,
+                outputHeight = outputHeight,
+                fileName = "",
+                jobName = jobDir.name,
+                filePath = ""
+            )
+        }
+        var decoded: Bitmap? = null
+        try {
+            decoded = if (
+                previewFile.extension.equals("rgba", ignoreCase = true) &&
+                outputWidth != null &&
+                outputHeight != null
+            ) {
+                decodeNativeRgbaPreview(previewFile, outputWidth, outputHeight)
+            } else {
+                decodeLatestResultPreview(previewFile)
+            }
+            val bitmap = decoded
+            val summary = buildString {
+                append("status=")
+                append(job.optString("status", "unknown"))
+                append(", frames=")
+                append(job.optInt("savedFrames", 0))
+                append(", export=")
+                append(job.optString("exportStatus", "not_exported"))
+                append(" ")
+                append(job.optString("exportFormatUsed", ""))
+                append(" verified=")
+                append(job.optBoolean("exportVerified", false))
+                append(", output=")
+                append(job.optString("finalOutputFormatSetting", ""))
+                append(", public=")
+                append(job.optString("exportDisplayName", "").ifBlank { "none" })
+                append(", rawSidecar=")
+                append(job.optString("rawSidecarExportStatus", "NOT_REQUESTED"))
+                append(", cleanup=")
+                append(job.optString("cleanupStatus", "none"))
+                append(", job=")
+                append(jobDir.name)
+                append(", file=")
+                append(previewFile.name)
+                append(", source=")
+                append(job.optString("finalOutputSource", "bitmap"))
+            }
+            val result = LatestKeplerResult(
+                bitmap = bitmap,
+                summary = summary,
+                jobType = jobType,
+                fusionEngine = fusionEngine,
+                usedFrames = usedFrames,
+                requestedFrames = requestedFrames,
+                outputWidth = outputWidth,
+                outputHeight = outputHeight,
+                fileName = previewFile.name,
+                jobName = jobDir.name,
+                filePath = previewFile.absolutePath
+            )
+            decoded = null
+            result
+        } catch (e: Exception) {
+            decoded?.takeIf { !it.isRecycled }?.recycle()
+            LatestKeplerResult(null, "Exact result load failed: ${e.javaClass.simpleName}")
+        }
+    } catch (e: Exception) {
+        LatestKeplerResult(null, "Exact result load failed: ${e.javaClass.simpleName}")
     }
 }
 
