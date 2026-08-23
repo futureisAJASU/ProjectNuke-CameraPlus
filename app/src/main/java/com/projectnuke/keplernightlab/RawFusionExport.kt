@@ -343,7 +343,7 @@ internal fun rawFusionOutcomeTerminalKind(
 
 /**
  * Explicit RAW public-export outcome model. Captures precisely what happened during the
- * public MediaStore commit, verification, sidecar pass, and any post-commit cancellation ??
+ * public MediaStore commit, verification, sidecar pass, and any post-commit cancellation —
  * never collapsing a verified export, a verification failure after commit, or a sidecar
  * failure into a single ambiguous value.
  *
@@ -354,16 +354,16 @@ internal fun rawFusionOutcomeTerminalKind(
  *
  * Each variant exposes:
  *
- * - `committed: Boolean` ??whether the public URI crossed the MediaStore commit point (i.e. a
+ * - `committed: Boolean` —whether the public URI crossed the MediaStore commit point (i.e. a
  *   successful `IS_PENDING=0`).
- * - `verified: Boolean` ??whether the committed URI was verified via [verifyGalleryExport].
- * - `export: GalleryExportResult?` ??the committed export value, when present.
- * - `sidecar: RawSidecarExportResult?` ??the sidecar outcome, when sidecars were attempted.
- * - `postExportCancellationRequested: Boolean` ??true if cancellation was requested after
+ * - `verified: Boolean` —whether the committed URI was verified via [verifyGalleryExport].
+ * - `export: GalleryExportResult?` —the committed export value, when present.
+ * - `sidecar: RawSidecarExportResult?` —the sidecar outcome, when sidecars were attempted.
+ * - `postExportCancellationRequested: Boolean` —true if cancellation was requested after
  *   commit. Diagnostics only; never causes the outcome to be classified as failure.
- * - `currentLocalPreview`, `currentLocalOutput`, `currentError`, `currentWarning` ??local
+ * - `currentLocalPreview`, `currentLocalOutput`, `currentError`, `currentWarning` —local
  *   preview/output and current error/warning fields.
- * - `disposition: ReprocessTerminalDisposition` ??the corresponding reprocess terminal
+ * - `disposition: ReprocessTerminalDisposition` —the corresponding reprocess terminal
  *   disposition used when the same job reaches this state through [reprocessRawJob].
  */
 internal sealed class RawFusionPublicExportOutcome {
@@ -385,7 +385,7 @@ internal sealed class RawFusionPublicExportOutcome {
     abstract val rawPublicExportAttemptAt: Long
 
     /**
-     * Failure that occurred before any public MediaStore commit ??local render failure, bitmap
+     * Failure that occurred before any public MediaStore commit —local render failure, bitmap
      * preparation failure, or MediaStore insert failure with no Media commit.
      *
      * `committed=false`, `verified=false`. A current local output may still be committed by the
@@ -478,7 +478,7 @@ internal sealed class RawFusionPublicExportOutcome {
 
     /**
      * MediaStore commit succeeded but cancellation was requested before verification could
-     * complete. Distinct from [CommittedVerificationFailure] ??this is an intentional
+     * complete. Distinct from [CommittedVerificationFailure] —this is an intentional
      * cancellation, not a verification failure. The committed URI is retained;
      * `galleryExportCommitted=true`, `exportVerified=false`.
      *
@@ -592,7 +592,7 @@ internal sealed class RawFusionPublicExportOutcome {
 
     /**
      * Verified committed public export. Optional sidecar work may have completed, partially
-     * completed, failed, been skipped, or been unavailable ??see [sidecar]. Image success is
+     * completed, failed, been skipped, or been unavailable —see [sidecar]. Image success is
      * preserved in every sidecar outcome; sidecar failure does NOT downgrade the image outcome.
      */
     internal data class VerifiedSuccess(
@@ -893,7 +893,7 @@ fun captureProcessExportRawNightFusion(
     }
     val terminal = CameraPipelineTerminalPublisher(onPipelineEvent)
     cancellation.throwIfCancelled()
-    post("RAW 캡처 중입?�다. 기기�??�직이지 마세?? saved 0/$frameCount, images 0/$frameCount, results 0/$frameCount")
+    post("RAW 캡처 중입니다. 기기를 움직이지 마세요. saved 0/$frameCount, images 0/$frameCount, results 0/$frameCount")
     captureRawBurstForFusion(
         context = context,
         cameraId = cameraId,
@@ -922,7 +922,7 @@ fun captureProcessExportRawNightFusion(
                 CameraPipelineEvent.CaptureStageComplete(
                     generation = 0L,
                     counts = CameraPipelineProgressCounts(),
-                    message = "촬영???�료?�었?�니?? 결과�?처리?�고 ?�습?�다.",
+                    message = "촬영이 완료되었습니다. 결과를 처리하고 있습니다.",
                     jobDirectoryPath = jobDir.absolutePath,
                     captureResourcesSettled = true,
                     processingHandoffDurable = true
@@ -1201,7 +1201,7 @@ try {
                         usedFrameCount < requestedFrames
                     )
                     val requestedOutputFormat = requestedOutputFormatForSetting(finalOutputFormat)
-                    post("결과 미리보기�?준비하??중입?�다.")
+                    post("결과 미리보기를 준비하는 중입니다.")
                     val previewPrepareStartedAt = System.currentTimeMillis()
                     try {
                         resetRawExportAttemptDiagnostics(jobDir)
@@ -1256,7 +1256,7 @@ try {
                             nativePreviewPrepareMs = nativePreviewPrepareMs
                         )
                         recordRawExportRotationEstimate(jobDir, loaded.appliedRotationDegrees)
-                        post("결과�??�?�하??중입?�다.")
+                        post("결과를 저장하는 중입니다.")
                         updateRawNativeQualityDiagnostics(jobDir, loaded.bitmap)
                         cancellation.throwIfCancelled()
                         exportNightFusionBitmapToGallery(
@@ -1568,7 +1568,7 @@ try {
                     val rawSidecarCount = sidecarResult?.exportedFiles?.size ?: 0
                     val rawSidecarError = sidecarResult?.errorMessage?.takeIf { it.isNotBlank() }
                     if (warning != null) {
-                        post("처리가 ?�료?�었?�니??")
+                        post("처리가 완료되었습니다.")
                         post(
                             "PIPELINE_COMPLETE_PARTIAL: Saved ${committedExport!!.formatUsed.label}$rawSuffix. " +
                                 "Used $usedFrameCount/$requestedFrames frames. " +
@@ -1577,7 +1577,7 @@ try {
                                 "RAW cache kept for reprocessing."
                         )
                     } else {
-                        post("처리가 ?�료?�었?�니??")
+                        post("처리가 완료되었습니다.")
                         post(
                             "PIPELINE_COMPLETE: Saved ${committedExport!!.formatUsed.label}$rawSuffix. " +
                                 "Used $usedFrameCount/$requestedFrames frames.\n" +
@@ -2051,7 +2051,7 @@ try {
                         settlementError
                     )
                 }
-                post("PIPELINE_FAILED: 백그?�운??처리 ?�록???�패?�습?�다. RAW 캐시�?보존?�습?�다. ?�중??복구?????�습?�다.")
+                post("백그라운드 처리 등록에 실패했습니다. 캐시를 보존했습니다. 나중에 다시 처리할 수 있습니다.")
                 terminal.publish(
                     CameraPipelineEvent.Terminal.Kind.FAILED,
                     message = "Background processing scheduling failed; RAW cache kept for recovery."
@@ -2673,7 +2673,7 @@ private fun recordRawPublicExportAttempt(jobDir: File, status: String, error: St
  * Persist a NORMAL pre-commit failure or cancellation state in a single [KeplerJobMetadata.update]
  * call. Writes only the narrow attempt-status/error/timestamp keys, the terminal pipeline
  * stage, process status, and `userCanMoveDevice=true`. Does NOT touch export URI, verification,
- * format, timestamp, linkage, sidecar, or warning fields ??so a pre-commit failure can never
+ * format, timestamp, linkage, sidecar, or warning fields —so a pre-commit failure can never
  * overwrite an earlier verified public export.
  *
  * Propagates metadata persistence failure to the caller. Callers must handle the exception,

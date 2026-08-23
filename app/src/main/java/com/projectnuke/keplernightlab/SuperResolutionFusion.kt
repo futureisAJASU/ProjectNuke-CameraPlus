@@ -716,7 +716,7 @@ onComplete = { sourceJobDir ->
                 CameraPipelineEvent.CaptureStageComplete(
                     generation = 0L,
                     counts = CameraPipelineProgressCounts(),
-                    message = "촬영???�료?�었?�니?? 결과�?처리?�고 ?�습?�다.",
+                    message = "촬영이 완료되었습니다. 결과를 처리하고 있습니다.",
                     jobDirectoryPath = sourceJobDir.absolutePath,
                     captureResourcesSettled = true,
                     processingHandoffDurable = true
@@ -1275,7 +1275,7 @@ post(
                         settlementError
                     )
                 }
-                post("PIPELINE_FAILED: 백그?�운??처리 ?�록???�패?�습?�다. 캐시�?보존?�습?�다. ?�중??복구?????�습?�다.")
+                post("백그라운드 처리 등록에 실패했습니다. 캐시를 보존했습니다. 나중에 다시 처리할 수 있습니다.")
                 terminal.publish(
                     CameraPipelineEvent.Terminal.Kind.FAILED,
                     message = "Background processing scheduling failed; cache kept for recovery."

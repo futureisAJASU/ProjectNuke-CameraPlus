@@ -87,7 +87,7 @@ internal class CameraPipelineUiOrchestrator(
     ): Boolean {
         val started = session.start(startMessage, requestedFrames)
         if (started is CameraPipelineUiSession.StartResult.Rejected) {
-            callbacks.onStatus("Pipeline busy: current fusion/export is still running.")
+            callbacks.onStatus("촬영 리소스가 사용 중입니다. 현재 처리 중인 작업이 완료된 후 다시 시도해 주세요.")
             return false
         }
         val operation = (started as CameraPipelineUiSession.StartResult.Accepted).operation
