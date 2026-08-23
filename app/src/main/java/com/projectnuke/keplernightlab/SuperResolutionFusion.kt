@@ -746,62 +746,6 @@ onComplete = { sourceJobDir ->
                 terminal.publish(CameraPipelineEvent.Terminal.Kind.CANCELLED, message = "Capture cancelled before Super Resolution processing.")
                 return@enqueue
             }
-            var startedWorkerThread: HandlerThread? = null
-            val workerThread: HandlerThread
-            val workerHandler: Handler
-            try {
-                val candidate = HandlerThread("KeplerSuperResolutionThread")
-                startedWorkerThread = candidate
-                candidate.start()
-                workerThread = candidate
-                workerHandler = Handler(workerThread.looper)
-            } catch (cancelled: CancellationException) {
-                var cleanupFailure: Throwable? = null
-                try { startedWorkerThread?.quitSafely() } catch (failure: Throwable) {
-                    cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
-                }
-                try {
-                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(sourceJobDir)
-                } catch (failure: Throwable) {
-                    cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
-                }
-                throw requireNotNull(combineSettlementFailure(cancelled, cleanupFailure))
-            } catch (failure: Error) {
-                var cleanupFailure: Throwable? = null
-                try { startedWorkerThread?.quitSafely() } catch (secondary: Throwable) {
-                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
-                }
-                try {
-                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(sourceJobDir)
-                } catch (secondary: Throwable) {
-                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
-                }
-                throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
-            } catch (failure: Exception) {
-                var cleanupFailure: Throwable? = null
-                try {
-                    startedWorkerThread?.quitSafely()
-                } catch (secondary: Throwable) {
-                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
-                }
-                try {
-                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(sourceJobDir)
-                } catch (secondary: Throwable) {
-                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
-                }
-                val combined = combineSettlementFailure(failure, cleanupFailure)
-                if (combined !== failure) {
-                    throw requireNotNull(combined)
-                }
-                post("PIPELINE_FAILED: Super Resolution worker setup failed.")
-                terminal.publish(
-                    CameraPipelineEvent.Terminal.Kind.FAILED,
-                    message = "Super Resolution worker setup failed."
-                )
-                return@enqueue
-            }
-            val workerPosted = try {
-                workerHandler.post {
                 var requiredOutputCommitted = false
                 var publicExportCommitted = false
                 var verified = false
@@ -889,7 +833,7 @@ try {
                             requiredOutputCommitted = requiredOutputCommitted,
                             message = error
                         )
-                        return@post
+                        return@enqueue
                     }
                     val sourceFrames = readColorBurstFrameFiles(sourceJobDir)
                     cancellation.throwIfCancelled()
@@ -928,7 +872,7 @@ try {
                             requiredOutputCommitted = requiredOutputCommitted,
                             message = result.message
                         )
-                        return@post
+                        return@enqueue
                     }
 
                     requiredOutputCommitted = requiredOutputCommittedAfterProcessing(outputDirForSettlement ?: error("Super Resolution output directory missing"), outputLease)
@@ -980,7 +924,7 @@ try {
                             publicExportCommitted = currentPublicCommit,
                             message = export.errorMessage
                         )
-                        return@post
+                        return@enqueue
                     }
 
                     verified = verifyCommittedGalleryExport(context, export) is GalleryExportVerification.Verified
@@ -1016,7 +960,7 @@ if (!verified) {
                                 verified = false,
                                 message = error
                             )
-                            return@post
+                            return@enqueue
                         }
                         post("PIPELINE_COMPLETE_PARTIAL: 24M Fusion export verification was not proven.")
                         terminal.publish(
@@ -1030,7 +974,7 @@ if (!verified) {
                             verified = false,
                             message = "24M Fusion export verification failed."
                         )
-                        return@post
+                        return@enqueue
                     }
 
                     if (cancellation.isCancelled) {
@@ -1045,7 +989,7 @@ if (!verified) {
                                 verified = verified,
                                 message = error
                             )
-                            return@post
+                            return@enqueue
                         }
                         updateExportMetadata(outputDir, export, true, finalOutputFormat,
                             rawSidecarIgnored = finalOutputFormat.shouldExportRawSidecar,
@@ -1059,7 +1003,7 @@ if (!verified) {
                             verified = verified,
                             message = "24M Fusion export committed; optional work cancelled."
                         )
-                        return@post
+                        return@enqueue
                     }
 post(
                         "PIPELINE_COMPLETE: 24M Fusion complete " +
@@ -1078,7 +1022,7 @@ post(
                             verified = true,
                             message = error
                         )
-                        return@post
+                        return@enqueue
                     }
                     terminal.publish(
                         CameraPipelineEvent.Terminal.Kind.COMPLETE,
@@ -1201,64 +1145,10 @@ post(
                             cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
                         }
                     }
-                    try {
-                        workerThread.quitSafely()
-                    } catch (failure: Throwable) {
-                        cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
-                    }
                     val combined = combineSettlementFailure(primaryFailure, cleanupFailure)
                     if (combined !== primaryFailure) throw requireNotNull(combined)
-                }
-            } } catch (failure: Error) {
-                var cleanupFailure: Throwable? = null
-                try {
-                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
-                        sourceJobDir, settleOnlyIfPresent = true
-                    )
-                } catch (handoffFailure: Throwable) {
-                    cleanupFailure = combineSettlementFailure(cleanupFailure, handoffFailure)
-                }
-                throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
-            } catch (cancelled: CancellationException) {
-                var cleanupFailure: Throwable? = null
-                try {
-                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(
-                        sourceJobDir, settleOnlyIfPresent = true
-                    )
-                } catch (handoffFailure: Throwable) {
-                    cleanupFailure = combineSettlementFailure(cleanupFailure, handoffFailure)
-                }
-                throw requireNotNull(combineSettlementFailure(cancelled, cleanupFailure))
-            } catch (failure: Exception) {
-                Log.e("KeplerSuperResolution", "worker dispatch failed", failure)
-                false
-            }
-            if (!workerPosted) {
-                // The worker never reached its finally block.
-                val handoffSettled = try {
-                    KeplerJobMetadata.settleUnconsumedProcessingHandoffAfterWorkerDispatchFailure(sourceJobDir)
-                } catch (failure: Error) {
-                    throw failure
-                } catch (failure: Exception) {
-                    Log.e("KeplerSuperResolution", "processing handoff settlement failed", failure)
-                    false
-                }
-                if (!handoffSettled) {
-                    Log.e("KeplerSuperResolution", "processing handoff remains protected after dispatch failure")
-                }
-                try {
-                    workerThread.quitSafely()
-                } catch (failure: Error) {
-                    throw failure
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (failure: Exception) {
-                    Log.e("KeplerSuperResolution", "worker shutdown after dispatch failure failed", failure)
-                }
-                post("PIPELINE_FAILED: 24M Fusion worker could not start.")
-                terminal.publish(CameraPipelineEvent.Terminal.Kind.FAILED, message = "24M Fusion worker could not start.")
-            }
-            }
+
+            }            }
             if (laneAccepted !is BackgroundEnqueueResult.Accepted) {
                 // Phase 5F: scheduling failed AFTER the durable handoff; the
                 // source job stays reprocessable through retained evidence.

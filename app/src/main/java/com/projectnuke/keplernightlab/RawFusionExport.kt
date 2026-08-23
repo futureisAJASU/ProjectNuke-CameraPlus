@@ -1090,53 +1090,6 @@ try {
             }
             Log.i("KeplerRawPipeline", "PROCESSING_STARTED jobDirAbsolutePath=${jobDir.absolutePath}")
             post("PROCESSING_STARTED: RAW capture complete; processing started.")
-            val thread = try {
-                HandlerThread("KeplerRawFusionPipelineThread").apply { start() }
-            } catch (cancelled: CancellationException) {
-                var cleanupFailure: Throwable? = null
-                try {
-                    processingOperation.release()
-                } catch (failure: Throwable) {
-                    cleanupFailure = failure
-                }
-                throw requireNotNull(combineSettlementFailure(cancelled, cleanupFailure))
-            } catch (failure: Throwable) {
-                if (failure is Error) {
-                    var cleanupFailure: Throwable? = null
-                    try {
-                        processingOperation.release()
-                    } catch (secondary: Throwable) {
-                        cleanupFailure = secondary
-                    }
-                    throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
-                }
-                Log.e("KeplerRawPipeline", "RAW processing worker thread could not start", failure)
-                var settlementPrimary: Throwable? = failure
-                try {
-                    recordRawOuterTerminalFailureWhileOwned(
-                        jobDir,
-                        processingOperation,
-                        "RAW processing worker could not start"
-                    ) {
-                        post("PIPELINE_FAILED: RAW processing worker could not start; RAW cache kept.")
-                    }
-                } catch (secondary: Throwable) {
-                    settlementPrimary = combineSettlementFailure(settlementPrimary, secondary)
-                    throw requireNotNull(settlementPrimary)
-                } finally {
-                    var cleanupFailure: Throwable? = null
-                    try {
-                        processingOperation.release()
-                    } catch (secondary: Throwable) {
-                        cleanupFailure = secondary
-                    }
-                    val combined = combineSettlementFailure(settlementPrimary, cleanupFailure)
-                    if (combined !== settlementPrimary) throw requireNotNull(combined)
-                }
-                return@enqueue
-            }
-            val workerPosted = try {
-                Handler(thread.looper).post {
                 var capturedProcess: RawFusionProcessResult? = null
                 var committedExport: GalleryExportResult? = null
                 var exportVerified = false
@@ -1187,7 +1140,7 @@ try {
                         post(
                             "PIPELINE_FAILED: RAW Night Fusion failed; keeping RAW cache. $reason"
                         )
-                        return@post
+                        return@enqueue
                     }
                     val processedJobFile = File(jobDir, JOB_JSON_FILE_NAME)
                     val processedJob = JSONObject(NoFollowFileSystem.readTextVerified(processedJobFile))
@@ -1234,7 +1187,7 @@ try {
                             )
                         }
                         post("PIPELINE_FAILED: RAW export diagnostics reset failed; keeping RAW cache. ${resetError.message}")
-                        return@post
+                        return@enqueue
                     }
                     var exportBitmap: Bitmap? = null
                     var exportRotationDegrees: Int? = null
@@ -1323,7 +1276,7 @@ try {
                                 )
                             }
                             post("PIPELINE_FAILED: Commit checkpoint persistence failed; committed URI retained. ${metadataError.message}")
-                            return@post
+                            return@enqueue
                         }
                     }
                     if (committedExport == null) {
@@ -1360,7 +1313,7 @@ try {
                                 )
                             }
                             post("PIPELINE_CANCELLED: Export cancelled before MediaStore commit. RAW cache kept.")
-                            return@post
+                            return@enqueue
                         }
                         val error = result.errorMessage ?: "Export failed"
                         primaryWorkerFailure = IllegalStateException(error)
@@ -1396,7 +1349,7 @@ try {
                         post(
                             "PIPELINE_FAILED: RAW export failed; keeping RAW cache. $error"
                         )
-                        return@post
+                        return@enqueue
                     }
                     if (cancellation.isCancelled) {
                         val proc = capturedProcess
@@ -1413,7 +1366,7 @@ try {
                         publicOutcome = partial
                         updateRawPublicExportOutcome(jobDir, partial, processingOperation.lease)
                         post("PIPELINE_CANCELLED: Export cancelled after MediaStore commit, before verification. RAW cache kept.")
-                        return@post
+                        return@enqueue
                     }
                     val committedExportUri = committedExport!!.uriString ?: ""
                     val verified = verifyCommittedGalleryExport(context, committedExport!!) is GalleryExportVerification.Verified
@@ -1431,7 +1384,7 @@ try {
                         publicOutcome = outcome
                         updateRawPublicExportOutcome(jobDir, outcome, processingOperation.lease)
                         post("PIPELINE_FAILED: RAW export verification failed; keeping RAW cache.")
-                        return@post
+                        return@enqueue
                     }
                     recordRawExportRotationApplied(jobDir, exportRotationDegrees ?: 0)
                     val verifiedPendingOutcome = RawFusionPublicExportOutcome.VerifiedPendingPostWork(
@@ -1491,7 +1444,7 @@ try {
                             )
                         }
                         post("PIPELINE_COMPLETE_PARTIAL: Verified-pending checkpoint persistence failed; committed image preserved. ${checkpointError.message}")
-                        return@post
+                        return@enqueue
                     }
                     if (cancellation.isCancelled) {
                         postExportCancellationRequested = true
@@ -1510,7 +1463,7 @@ try {
                         )
                         updateRawPublicExportOutcome(jobDir, outcome, processingOperation.lease)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. RAW cache kept.")
-                        return@post
+                        return@enqueue
                     }
                     sidecarResult = if (finalOutputFormat.shouldExportRawSidecar) {
                         val sidecars = exportRawSidecarsToPublicStorage(
@@ -1544,7 +1497,7 @@ try {
                         )
                         updateRawPublicExportOutcome(jobDir, outcome, processingOperation.lease)
                         post("PIPELINE_COMPLETE_PARTIAL: Image was saved, but optional post-export work was cancelled. RAW cache kept.")
-                        return@post
+                        return@enqueue
                     }
                     val warning: String? = when {
                         partialCapture -> "Used fewer frames than requested."
@@ -1934,11 +1887,6 @@ try {
                     } catch (failure: Throwable) {
                         cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
                     }
-                    try {
-                        thread.quitSafely()
-                    } catch (failure: Throwable) {
-                        cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
-                    }
                     val combinedFailure = combineSettlementFailure(
                         terminalTruthFailure ?: primaryWorkerFailure,
                         cleanupFailure
@@ -1947,91 +1895,6 @@ try {
                         throw combinedFailure
                     }
                 }
-                }
-            } catch (failure: Error) {
-                var cleanupFailure: Throwable? = null
-                try {
-                    recordRawOuterTerminalFailureWhileOwned(
-                        jobDir,
-                        processingOperation,
-                        "RAW processing worker dispatch failed: ${failure.message}",
-                        onStatus = {}
-                    )
-                } catch (secondary: Throwable) {
-                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
-                }
-                try {
-                    processingOperation.release()
-                } catch (secondary: Throwable) {
-                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
-                }
-                try {
-                    thread.quitSafely()
-                } catch (secondary: Throwable) {
-                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
-                }
-                throw requireNotNull(combineSettlementFailure(failure, cleanupFailure))
-            } catch (cancelled: CancellationException) {
-                var cleanupFailure: Throwable? = null
-                try {
-                    recordNormalPreCommitTerminal(
-                        jobDir = jobDir,
-                        attemptStatus = "CANCELLED",
-                        pipelineStage = "CANCELLED",
-                        processStatus = "EXPORT_CANCELLED_BEFORE_COMMIT",
-                        reason = "RAW processing worker dispatch cancelled.",
-                        operationId = processingOperation.operationId,
-                        operationLease = processingOperation.lease
-                    )
-                } catch (secondary: Throwable) {
-                    cleanupFailure = secondary
-                }
-                try {
-                    processingOperation.release()
-                } catch (secondary: Throwable) {
-                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
-                }
-                try {
-                    thread.quitSafely()
-                } catch (secondary: Throwable) {
-                    cleanupFailure = combineSettlementFailure(cleanupFailure, secondary)
-                }
-                throw requireNotNull(combineSettlementFailure(cancelled, cleanupFailure))
-            } catch (failure: Exception) {
-                Log.e("KeplerRawPipeline", "RAW processing worker dispatch failed", failure)
-                false
-            }
-            if (!workerPosted) {
-                var settlementFailure: Throwable? = null
-                try {
-                    recordRawOuterTerminalFailureWhileOwned(
-                        jobDir,
-                        processingOperation,
-                        "RAW processing worker could not start"
-                    ) {
-                        post("PIPELINE_FAILED: RAW processing worker could not start; RAW cache kept.")
-                    }
-                } catch (failure: Throwable) {
-                    settlementFailure = failure
-                }
-                try {
-                    processingOperation.release()
-                } catch (failure: Throwable) {
-                    settlementFailure = combineSettlementFailure(settlementFailure, failure)
-                }
-                try {
-                    thread.quitSafely()
-                } catch (failure: Throwable) {
-                    settlementFailure = combineSettlementFailure(settlementFailure, failure)
-                }
-                if (settlementFailure != null) {
-                    throw settlementFailure!!
-                }
-                terminal.publish(
-                    CameraPipelineEvent.Terminal.Kind.FAILED,
-                    message = "RAW processing worker could not start; RAW cache kept."
-                )
-            }
             }
             if (laneAccepted !is BackgroundEnqueueResult.Accepted) {
                 // Phase 5F: scheduling failed AFTER the durable handoff. Keep
@@ -2147,7 +2010,7 @@ internal fun reprocessRawJob(
         )
     }
     val thread = try {
-        HandlerThread("KeplerRawReprocessThread").apply { start() }
+        HandlerThread("KeplerRawReprocessThread", android.os.Process.THREAD_PRIORITY_BACKGROUND).apply { start() }
     } catch (cancelled: CancellationException) {
         var cleanupFailure: Throwable? = null
         try {

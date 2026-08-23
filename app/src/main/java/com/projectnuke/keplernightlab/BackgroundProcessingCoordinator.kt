@@ -44,6 +44,7 @@ internal data class BackgroundProcessingSnapshot(
 internal sealed interface BackgroundEnqueueResult {
     data object Accepted : BackgroundEnqueueResult
     data class Duplicate(val existingSequence: Long) : BackgroundEnqueueResult
+    data object Unavailable : BackgroundEnqueueResult
     data object Shutdown : BackgroundEnqueueResult
 }
 
@@ -80,7 +81,21 @@ internal class BackgroundProcessingCoordinator private constructor(
             }
 
         internal fun resetForTest() {
-            synchronized(this) { instance = null }
+            synchronized(this) {
+                instance?.let { coordinator ->
+                    synchronized(coordinator.lock) {
+                        coordinator.worker?.quitSafely()
+                        coordinator.worker = null
+                        coordinator.testWorkerFactory = null
+                        coordinator.queue.clear()
+                        coordinator.workByPath.clear()
+                        coordinator.sequenceByPath.clear()
+                        coordinator.running = null
+                        coordinator.runningSequence = null
+                    }
+                }
+                instance = null
+            }
         }
     }
 
@@ -93,18 +108,46 @@ internal class BackgroundProcessingCoordinator private constructor(
     private var nextSequence = 0L
     private var worker: HandlerThread? = null
 
+    @Volatile
+    internal var testWorkerFactory: (() -> HandlerThread)? = null
+
     fun enqueue(ref: ExactJobRef, work: HeavyProcessingWork): BackgroundEnqueueResult {
-        val shouldStart = synchronized(lock) {
+        val shouldStart: Boolean
+        val dispatchOk: Boolean
+        synchronized(lock) {
             val pathKey = ref.jobDirectory.absolutePath
             sequenceByPath[pathKey]?.let { return BackgroundEnqueueResult.Duplicate(it) }
             val sequence = ++nextSequence
             queue.addLast(ref)
             workByPath[pathKey] = work
             sequenceByPath[pathKey] = sequence
-            ensureWorkerLocked()
-            running == null && queue.size == 1
+            val workerReady = ensureWorkerLocked()
+            if (!workerReady) {
+                // Roll back in-memory registration; durable handoff remains for recovery.
+                queue.removeLastOccurrence(ref)
+                workByPath.remove(pathKey)
+                sequenceByPath.remove(pathKey)
+                return BackgroundEnqueueResult.Unavailable
+            }
+            shouldStart = running == null && queue.size == 1
+            dispatchOk = if (shouldStart) {
+                // Try to dispatch drain; if Handler.post fails, treat as unavailable.
+                val ok = postDrainLocked()
+                if (!ok) {
+                    queue.remove(ref)
+                    workByPath.remove(pathKey)
+                    sequenceByPath.remove(pathKey)
+                }
+                ok
+            } else {
+                true
+            }
         }
-        if (shouldStart) drain()
+        if (shouldStart && dispatchOk) {
+            // drainLoop will be invoked via Handler; if we already posted inside lock, no need to post again.
+            // However we posted inside lock via postDrainLocked, so nothing to do.
+        }
+        if (!dispatchOk) return BackgroundEnqueueResult.Unavailable
         return BackgroundEnqueueResult.Accepted
     }
 
@@ -121,23 +164,47 @@ internal class BackgroundProcessingCoordinator private constructor(
     /** Diagnostic/testing hook: current FIFO order as exact job paths. */
     fun queuedOrder(): List<String> = snapshot().queuedJobDirectories
 
-    private fun ensureWorkerLocked() {
-        if (worker != null) return
-        val thread = HandlerThread("KeplerBackgroundProcessing", Process.THREAD_PRIORITY_BACKGROUND)
+    private fun ensureWorkerLocked(): Boolean {
+        val existing = worker
+        if (existing != null && existing.isAlive && existing.looper != null) return true
+        if (existing != null) {
+            try { existing.quitSafely() } catch (_: Throwable) {}
+            worker = null
+        }
+        val thread = try {
+            testWorkerFactory?.invoke() ?: HandlerThread("KeplerBackgroundProcessing", Process.THREAD_PRIORITY_BACKGROUND)
+        } catch (e: Throwable) {
+            Log.e("KeplerBackground", "background worker factory failed", e)
+            return false
+        }
         try {
             thread.start()
-        } catch (failure: IllegalStateException) {
-            // Thread.start can race VM teardown; leave the lane idle and let
-            // recovery reconcile the durable handoffs instead of crashing.
-            return
+        } catch (e: Throwable) {
+            Log.e("KeplerBackground", "background worker start failed", e)
+            return false
         }
         worker = thread
-        Handler(thread.looper).post { drainLoop() }
+        // Initial dispatch for the first item will be done via postDrainLocked; we don't need to post here.
+        return true
+    }
+
+    private fun postDrainLocked(): Boolean {
+        val handlerThread = worker ?: return false
+        if (!handlerThread.isAlive) return false
+        val looper = handlerThread.looper ?: return false
+        return try {
+            Handler(looper).post { drainLoop() }
+        } catch (e: Throwable) {
+            Log.e("KeplerBackground", "background drain post failed", e)
+            false
+        }
     }
 
     private fun drain() {
-        val handlerThread = synchronized(lock) { worker } ?: return
-        Handler(handlerThread.looper).post { drainLoop() }
+        val ok = synchronized(lock) { postDrainLocked() }
+        if (!ok) {
+            Log.e("KeplerBackground", "drain post failed - lane may be stalled until next enqueue")
+        }
     }
 
     private fun drainLoop() {
@@ -154,10 +221,25 @@ internal class BackgroundProcessingCoordinator private constructor(
                 head to workByPath.remove(pathKey)
             }
             val (item, work) = next
+            var executedOk = false
             try {
                 work?.execute(item)
                     ?: error("Background work missing for ${item.jobDirectory.absolutePath}")
-            } catch (failure: Throwable) {
+                executedOk = true
+            } catch (cancelled: java.util.concurrent.CancellationException) {
+                // Preserve cancellation semantics: treat as ordinary job termination, not fatal.
+                Log.i(
+                    "KeplerBackground",
+                    "background job cancelled for ${item.jobDirectory.name}",
+                    cancelled
+                )
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                Log.i(
+                    "KeplerBackground",
+                    "background job cancelled for ${item.jobDirectory.name}",
+                    cancelled
+                )
+            } catch (failure: Exception) {
                 Log.e(
                     "KeplerBackground",
                     "background processing failed for ${item.jobDirectory.name}; continuing lane",
@@ -166,8 +248,26 @@ internal class BackgroundProcessingCoordinator private constructor(
                 // One failed job must not poison the serialized lane. The exact
                 // job keeps its durable failure/reconciliation evidence because
                 // the worker owns that settlement; nothing is erased here.
+            } catch (error: Error) {
+                Log.e(
+                    "KeplerBackground",
+                    "fatal error in background job ${item.jobDirectory.name}; lane will terminate",
+                    error
+                )
+                // Do required local bookkeeping in finally, then rethrow.
+                // The finally below will clear running/sequence.
+                synchronized(lock) {
+                    sequenceByPath.remove(item.jobDirectory.absolutePath)
+                    if (running?.jobDirectory?.absolutePath == item.jobDirectory.absolutePath) {
+                        running = null
+                        runningSequence = null
+                    }
+                }
+                throw error
             } finally {
                 synchronized(lock) {
+                    // For normal completion (including Exception/Cancellation), clear.
+                    // For Error we already cleared above, but clearing again is idempotent.
                     sequenceByPath.remove(item.jobDirectory.absolutePath)
                     if (running?.jobDirectory?.absolutePath == item.jobDirectory.absolutePath) {
                         running = null

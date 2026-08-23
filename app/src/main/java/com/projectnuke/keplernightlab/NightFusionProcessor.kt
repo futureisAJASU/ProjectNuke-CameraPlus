@@ -197,7 +197,7 @@ fun processLatestNightFusionV02(
     val workerThread: HandlerThread
     val workerHandler: Handler
     try {
-        val candidate = HandlerThread("KeplerNightFusionV02Thread")
+        val candidate = HandlerThread("KeplerNightFusionV02Thread", android.os.Process.THREAD_PRIORITY_BACKGROUND)
         startedThread = candidate
         candidate.start()
         workerThread = candidate
