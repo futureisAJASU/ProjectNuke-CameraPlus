@@ -609,6 +609,18 @@ fun captureYuvBurstColorWithMotion(
             throw failure
         }
 
+        // Phase-7 A/B seam: resolve the YUV source strategy ONCE at capture
+        // creation (debug settings key, production default PNG) and stamp it as
+        // DURABLE job metadata. Every later stage - foreground naming, packed
+        // background conversion, recovery - reads this stamped key.
+        val yuvPersistenceStrategy = YuvPersistenceStrategy.fromNameOrDefault(
+            context.getSharedPreferences("kepler_camera_settings", Context.MODE_PRIVATE)
+                .getString("yuvPersistenceStrategy", YuvPersistenceStrategy.PNG.name)
+        )
+        KeplerJobMetadata.update(currentBurstDir) { job ->
+            job.put(YuvPersistenceStrategy.JOB_KEY, yuvPersistenceStrategy.name)
+        }
+
         metadataWriter = ProductionMetadataWriter(
             jobFileHolder = jobFileHolder!!,
             cameraId = cameraId,
@@ -641,10 +653,20 @@ fun captureYuvBurstColorWithMotion(
                 override fun encodeDirect(image: Image, candidate: File, rotationDegrees: Int) {
                     // Direct path: conversion+PNG+candidate fsync occur inside one
                     // existing call; the bounded encode span (owner hook) covers it.
+                    // Phase-7 A/B scope: PACKED_YUV_V1 is supported on the buffered
+                    // pipeline only; direct-mode captures keep PNG sources.
                     saveRotatedColorPngFromYuv(image, candidate, rotationDegrees)
                 }
 
                 override fun encodeBuffered(frame: BufferedYuvFrame, candidate: File, rotationDegrees: Int) {
+                    // Phase-7 A/B: the packed strategy skips RGB conversion and
+                    // PNG compression entirely - planes are durably packed and
+                    // converted back on the background lane instead.
+                    if (yuvPersistenceStrategy == YuvPersistenceStrategy.PACKED_YUV_V1) {
+                        captureTimingLedger.recordConversionCompleted(frame.index)
+                        PackedYuvFrameStore.pack(frame, rotationDegrees, candidate)
+                        return
+                    }
                     // Buffered path records REAL sub-boundaries: conversion and
                     // the durable PNG sink sync are separately observable.
                     val bitmap = yuv420BufferToBitmap(frame)
@@ -698,6 +720,7 @@ fun captureYuvBurstColorWithMotion(
             workerCapacity = maxOf(2, minOf(frameCount, MAX_YUV_MEMORY_BUFFER_FRAMES)),
             maxRetainedBytes = MAX_YUV_MEMORY_BUFFER_BYTES,
             workProcessor = yuvWorkProcessor,
+            sourceFrameExtension = yuvPersistenceStrategy.name,
             postStatus = { msg -> productionSeam.statusDispatcher.dispatch(msg) },
                         dispatchCallback = productionSeam.callbackDispatcher,
             terminalMetadataWriter = YuvTerminalMetadataWriter { request ->

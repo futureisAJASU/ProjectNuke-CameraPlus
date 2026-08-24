@@ -192,7 +192,9 @@ internal class YuvCaptureSession internal constructor(
              * seams can execute/dispose/reject submissions synchronously inside
              * submit().  Production callers must leave this null.
              */
-            boundedWorkerOverride: BoundedCaptureWorker? = null
+            boundedWorkerOverride: BoundedCaptureWorker? = null,
+            /** Phase-7 A/B seam: durable source strategy name (PNG default). */
+            sourceFrameExtension: String = YuvPersistenceStrategy.PNG.name
         ): YuvCaptureSession {
             val captureStateOwner = CaptureStateOwner(dispatch)
             val boundedWorker = boundedWorkerOverride ?: BoundedCaptureWorker(workerName, workerCapacity)
@@ -255,7 +257,8 @@ internal class YuvCaptureSession internal constructor(
                 candidateVerifier = candidateVerifier,
                 schedulePersistenceDrainDeadline = schedulePersistenceDrainDeadline,
                 onAcquisitionUpdate = onAcquisitionUpdate,
-                timingHooks = timingHooks
+                timingHooks = timingHooks,
+                sourceFrameExtension = sourceFrameExtension
             )
             return YuvCaptureSession(
                 captureStateOwner,

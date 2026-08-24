@@ -389,7 +389,12 @@ internal class YuvCaptureOwner(
      * write finished (candidate->final atomic replace returned), verified
      * (final-file verification succeeded).  Never blocks Camera2 callbacks.
      */
-    private val timingHooks: YuvCaptureTimingHooks? = null
+    private val timingHooks: YuvCaptureTimingHooks? = null,
+    /**
+     * Phase-7 A/B seam: persisted strategy NAME (from job.json stamp) deciding
+     * durable source filenames. Only PNG (default) or PACKED_YUV_V1.
+     */
+    private val sourceFrameExtension: String = YuvPersistenceStrategy.PNG.name
 ) {
 
     private var completedResults = 0
@@ -590,7 +595,10 @@ internal class YuvCaptureOwner(
                 when (val creation = createDirectYuvWork(frameIndex, access, accounting)) {
                     is DirectYuvWorkCreation.Accepted -> {
                         val item = creation.item
-                        val fileName = "frame_${item.frameIndex.toString().padStart(2, '0')}_color.png"
+                        val fileName = yuvFrameFileName(
+                            item.frameIndex,
+                            YuvPersistenceStrategy.fromNameOrDefault(sourceFrameExtension)
+                        )
                         val candidate = File(outputDir, ".${fileName}.${System.nanoTime()}.tmp")
                         // PRE-ACQUIRED pending ownership claim: the ledger carries this
                         // task's debt BEFORE publication, so a worker that executes or
@@ -787,7 +795,10 @@ internal class YuvCaptureOwner(
         val frame = lifecycle.snapshotRetainedByFrameIndex().firstOrNull() ?: return
         if (!lifecycle.beginEncoding(frame)) return
 
-        val fileName = "frame_${frame.frameIndex.toString().padStart(2, '0')}_color.png"
+        val fileName = yuvFrameFileName(
+            frame.frameIndex,
+            YuvPersistenceStrategy.fromNameOrDefault(sourceFrameExtension)
+        )
         val candidate = File(outputDir, ".${fileName}.${System.nanoTime()}.tmp")
         // PRE-ACQUIRED pending ownership claim: the ledger carries this task's
         // debt BEFORE publication, so a worker that executes or disposes the task

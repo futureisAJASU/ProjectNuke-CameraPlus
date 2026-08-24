@@ -350,6 +350,14 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
         var inFlight: Throwable? = null
         try {
             val cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
+            // Phase-7 A/B: packed jobs are converted into the exact PNG inputs
+            // the fusion pipeline already consumes. Conversion runs here, on the
+            // serialized background lane; any verification failure throws and
+            // fails the job closed.
+            if (PackedYuvBackgroundConverter.isSelected(jobJson)) {
+                PackedYuvBackgroundConverter.convertJob(jobDir, jobJson)
+                post("Packed YUV sources converted for fusion")
+            }
             lease = KeplerJobMetadata.acquireRecoveryCheckedOperation(
                 jobDir,
                 JobRecoveryMutationIntent.PROCESSING_START,
