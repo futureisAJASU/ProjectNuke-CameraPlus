@@ -133,9 +133,29 @@ internal object PackedYuvFrameStore {
     }
 
     /**
+     * Test-only durability-order observer (never set in production).  Emits the
+     * exact boundary sequence of one pack operation:
+     * "payloadSynced" -> "headerSynced" -> "published".  The publication MUST be
+     * observed only AFTER the final header-metadata durability point.
+     */
+    internal var packDurabilityObserver: ((boundary: String, file: File) -> Unit)? = null
+
+    private fun observeDurability(boundary: String, file: File) {
+        try {
+            packDurabilityObserver?.invoke(boundary, file)
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
      * Packs the buffered YUV planes into [outFile]: sequential durable write
-     * (flush + fsync) with streaming SHA-256 over the payload.  Bounded memory:
-     * fixed 256KB copy buffer; no full-frame RGB allocation ever happens.
+     * (flush + fsync) with streaming SHA-256 over the payload, THEN the final
+     * header digest is patched and ITS update is explicitly synced BEFORE the
+     * atomic publication.  A file whose final header metadata has not been
+     * durably synced is never published.
+     *
+     * Bounded memory: fixed 256KB copy buffer; no full-frame RGB allocation
+     * ever happens.
      */
     fun pack(frame: BufferedYuvFrame, rotationDegrees: Int, outFile: File) {
         require(frame.y.isNotEmpty() || frame.u.isNotEmpty() || frame.v.isNotEmpty()) {
@@ -180,9 +200,11 @@ internal object PackedYuvFrameStore {
 
                 val digestHex = out.digest.digest().toHex()
                 check(digestHex.length == DIGEST_HEX_LENGTH)
+                observeDurability("payloadSynced", temp)
                 patchHeaderDigest(temp, digestHex)
             }
             KeplerJobMetadata.atomicReplace(temp, outFile)
+            observeDurability("published", outFile)
         } catch (t: Throwable) {
             temp.delete()
             throw t
@@ -219,11 +241,21 @@ internal object PackedYuvFrameStore {
             val digestStart = FIXED_PREFIX_BYTES.toLong() + headerLength - DIGEST_HEX_LENGTH - 2L
             raf.seek(digestStart)
             raf.write(digestHex.toByteArray(Charsets.US_ASCII))
+            // DURABILITY: the patched final header metadata must be explicitly
+            // synced BEFORE the file is published; a crash after the atomic
+            // replace must never expose a header whose digest claim was still
+            // sitting in the page cache.
+            raf.fd.sync()
         }
+        observeDurability("headerSynced", file)
     }
 
     private const val DIGEST_HEX_LENGTH = 64
     private val PLACEHOLDER_DIGEST = "0".repeat(DIGEST_HEX_LENGTH)
+
+    /** Sane camera-era bounds for structural sanity checks (not format limits). */
+    private const val MAX_SANE_DIMENSION = 16384
+    private const val MAX_SANE_STRIDE = 1 shl 20
 
     private fun readHeaderLength(raf: RandomAccessFile): Int {
         val prefix = ByteArray(FIXED_PREFIX_BYTES)
@@ -247,7 +279,11 @@ internal object PackedYuvFrameStore {
             }
             val headerBytes = ByteArray(headerLength)
             raf.readFully(headerBytes)
-            return Header.fromJson(JSONObject(String(headerBytes, Charsets.UTF_8)))
+            val header = Header.fromJson(JSONObject(String(headerBytes, Charsets.UTF_8)))
+            // Full structural validation INCLUDING the exact file length (a
+            // cheap metadata read - the payload is never streamed here).
+            validateStructure(header, headerLength, raf.length())
+            return header
         }
     }
 
@@ -260,8 +296,94 @@ internal object PackedYuvFrameStore {
     }
 
     /**
-     * Reads and fully verifies a packed frame: magic/version, exact total
-     * length, exact payload length, and SHA-256 digest.  Any mismatch throws -
+     * Structural invariants for a parsed header.  When [actualFileLength] is
+     * non-null it must equal EXACTLY prefix + header + declared payload: a
+     * complete valid header over a truncated (or padded) payload is rejected.
+     */
+    private fun validateStructure(header: Header, headerLength: Int, actualFileLength: Long?) {
+        // Positive, sane dimensions.
+        require(header.width > 0 && header.height > 0) {
+            "packed YUV dimensions must be positive: ${header.width}x${header.height}"
+        }
+        require(
+            header.width <= MAX_SANE_DIMENSION && header.height <= MAX_SANE_DIMENSION &&
+                header.yRowStride <= MAX_SANE_STRIDE && header.uRowStride <= MAX_SANE_STRIDE &&
+                header.vRowStride <= MAX_SANE_STRIDE
+        ) { "packed YUV dimensions/strides exceed sane bounds" }
+        // Positive pixel strides; row strides cover at least one row of pixels.
+        require(header.yPixelStride > 0 && header.uPixelStride > 0 && header.vPixelStride > 0) {
+            "packed YUV pixel strides must be positive"
+        }
+        require(header.yRowStride >= header.width.toLong() * header.yPixelStride) {
+            "packed YUV yRowStride too small for width"
+        }
+        val chromaWidth = (header.width + 1) / 2
+        val chromaHeight = (header.height + 1) / 2
+        require(header.uRowStride >= chromaWidth * header.uPixelStride.toLong()) {
+            "packed YUV uRowStride too small for subsampled width"
+        }
+        require(header.vRowStride >= chromaWidth * header.vPixelStride.toLong()) {
+            "packed YUV vRowStride too small for subsampled width"
+        }
+        // Plane lengths consistent with strides and 4:2:0 layout (minimum one
+        // full trailing pixel per plane).
+        require(header.yBytes >= header.yRowStride * (header.height - 1L) + header.yPixelStride) {
+            "packed YUV yBytes smaller than stride*height invariant"
+        }
+        require(header.uBytes >= header.uRowStride * (chromaHeight - 1L) + header.uPixelStride) {
+            "packed YUV uBytes smaller than stride*height invariant"
+        }
+        require(header.vBytes >= header.vRowStride * (chromaHeight - 1L) + header.vPixelStride) {
+            "packed YUV vBytes smaller than stride*height invariant"
+        }
+        // Declared payload must decompose exactly into its three planes.
+        require(header.payloadLength == header.yBytes + header.uBytes + header.vBytes) {
+            "packed YUV payloadLength != y+u+v bytes"
+        }
+        require(header.payloadDigest.length == DIGEST_HEX_LENGTH) {
+            "packed YUV digest field malformed"
+        }
+        // Exact total length when the container size is observable.
+        if (actualFileLength != null) {
+            val expectedTotal = FIXED_PREFIX_BYTES.toLong() + headerLength + header.payloadLength
+            require(actualFileLength == expectedTotal) {
+                "packed YUV truncated or padded: expected=$expectedTotal actual=$actualFileLength"
+            }
+        }
+    }
+
+    /**
+     * Structural-only verification used on fast paths.  Validates magic/version,
+     * sane dimensions, stride/plane invariants, payload decomposition AND the
+     * exact file length - a complete valid header over a truncated payload FAILS.
+     *
+     * CONTRACT: this does NOT stream the payload and therefore does NOT verify
+     * the SHA-256 digest.  Digest verification lives exclusively in the full
+     * durable verifier [verifyFull] (alias of [unpack]), which streams the whole
+     * payload once.  Before a packed frame is used as an authoritative capture
+     * artifact, [verifyFull] MUST have succeeded.
+     */
+    fun verifyStructure(file: File): Boolean = try {
+        readHeader(file)
+        true
+    } catch (failure: Error) {
+        throw failure
+    } catch (_: Exception) {
+        false
+    }
+
+    /**
+     * FULL DURABLE VERIFICATION: structural checks plus a complete streaming
+     * pass over the payload validating the SHA-256 digest.  Required before any
+     * packed frame is used as an authoritative capture artifact.
+     */
+    fun verifyFull(file: File): PackedFrame = unpack(file)
+
+    /**
+     * Reads and fully verifies a packed frame: magic/version, sane dimensions,
+     * stride/plane invariants, payload decomposition, exact total length
+     * (truncation rejected), and streaming SHA-256 digest over the payload.
+     * Fails closed on malformed plane lengths/strides and any truncation -
      * callers treat an unreadable packed frame like a missing source frame.
      */
     fun unpack(file: File): PackedFrame {
@@ -276,11 +398,9 @@ internal object PackedYuvFrameStore {
             val headerBytes = ByteArray(headerLength)
             raf.readFully(headerBytes)
             val header = Header.fromJson(JSONObject(String(headerBytes, Charsets.UTF_8)))
-
-            val expectedTotal = FIXED_PREFIX_BYTES.toLong() + headerLength + header.payloadLength
-            require(raf.length() == expectedTotal) {
-                "packed YUV truncated: expected=$expectedTotal actual=${raf.length()}"
-            }
+            // Full structural validation BEFORE allocating any plane buffers:
+            // malformed strides/lengths can never drive an allocation.
+            validateStructure(header, headerLength, raf.length())
 
             // Stream the payload once: verify the digest while buffering planes.
             val digest = MessageDigest.getInstance("SHA-256")
@@ -315,15 +435,5 @@ internal object PackedYuvFrameStore {
             offset += chunk
         }
         return bytes
-    }
-
-    /** Structural-only verification used on fast paths (no payload load). */
-    fun verifyStructure(file: File): Boolean = try {
-        readHeader(file)
-        true
-    } catch (failure: Error) {
-        throw failure
-    } catch (_: Exception) {
-        false
     }
 }
