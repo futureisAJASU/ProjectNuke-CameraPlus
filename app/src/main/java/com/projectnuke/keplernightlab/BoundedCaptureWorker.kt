@@ -82,7 +82,12 @@ internal open class BoundedCaptureWorker(
     )
     private val notificationHook = onRejected
 
-    fun submit(task: Runnable): Boolean {
+    /**
+     * Open for deterministic race-seam injection in tests (e.g. a stub that
+     * executes or disposes the task synchronously BEFORE returning, proving the
+     * pre-acquired pending-persistence claim survives submit-return races).
+     */
+    open fun submit(task: Runnable): Boolean {
         if (closed.get()) {
             reject(task)
             return false

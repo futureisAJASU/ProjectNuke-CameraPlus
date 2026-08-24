@@ -397,6 +397,7 @@ class YuvBufferedLifecycleSettlingTest {
                 )
             },
             postCompletion = { _ -> },
+            pendingClaim = testPendingClaim(),
             onSettlementIssue = { _, outcome -> issues.add(outcome) },
             onWorkDisposalDebt = { workItem, outcome -> debts.add(workItem to outcome) }
         ).run()
@@ -436,6 +437,7 @@ class YuvBufferedLifecycleSettlingTest {
                 )
             },
             postCompletion = { _ -> },
+            pendingClaim = testPendingClaim(),
             onWorkDisposalDebt = { _, _ -> debtCount.incrementAndGet() }
         )
 
@@ -802,6 +804,10 @@ class YuvBufferedLifecycleSettlingTest {
 
     // ── BufferedEncodeTask consumes every settlement outcome ───────────
 
+    /** Fresh pre-acquired claim backed by a throwaway ledger for task-level tests. */
+    private fun testPendingClaim(): PendingPersistenceClaim =
+        PendingPersistenceClaim.acquire(java.util.concurrent.atomic.AtomicInteger(0))
+
     private fun encodeTask(
         item: YuvPngWorkItem,
         lifecycle: YuvBufferedLifecycle,
@@ -821,6 +827,7 @@ class YuvBufferedLifecycleSettlingTest {
                 )
             },
             postCompletion = { _ -> },
+            pendingClaim = testPendingClaim(),
             onSettlementIssue = { _, outcome -> issues.add(outcome) }
         )
     }
@@ -993,6 +1000,7 @@ class YuvBufferedLifecycleSettlingTest {
                 )
             },
             postCompletion = { _ -> },
+            pendingClaim = testPendingClaim(),
             onSettlementIssue = { _, outcome -> issues.add(outcome) },
             onWorkDisposalDebt = { workItem, outcome ->
                 debtDescriptions.add(disposalDescription(outcome, workItem.frameIndex))
@@ -1036,6 +1044,7 @@ class YuvBufferedLifecycleSettlingTest {
                 )
             },
             postCompletion = { _ -> },
+            pendingClaim = testPendingClaim(),
             onSettlementIssue = { _, _ ->
                 hookCalls.incrementAndGet()
                 error("issue hook threw")
@@ -1099,6 +1108,7 @@ class YuvBufferedLifecycleSettlingTest {
                 )
             },
             postCompletion = { _ -> },
+            pendingClaim = testPendingClaim(),
             onWorkDisposalDebt = { _, _ -> }
         )
 
@@ -1139,6 +1149,7 @@ class YuvBufferedLifecycleSettlingTest {
                 )
             },
             postCompletion = { _ -> },
+            pendingClaim = testPendingClaim(),
             onSettlementIssue = { _, outcome ->
                 issues.add(outcome)
                 // Step 4: onSettlementIssue always records debt for non-clean.
@@ -1196,6 +1207,7 @@ class YuvBufferedLifecycleSettlingTest {
                 )
             },
             postCompletion = { _ -> },
+            pendingClaim = testPendingClaim(),
             onSettlementIssue = { _, _ ->
                 settlementStarted.countDown()
                 settlementBlock.await(5, TimeUnit.SECONDS)

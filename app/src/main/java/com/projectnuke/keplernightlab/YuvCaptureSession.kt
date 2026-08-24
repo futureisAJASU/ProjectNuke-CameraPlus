@@ -186,10 +186,16 @@ internal class YuvCaptureSession internal constructor(
             startTerminalObserverOnCreate: Boolean = true,
             schedulePersistenceDrainDeadline: ((Runnable) -> Unit)? = null,
             onAcquisitionUpdate: ((receivedImages: Int, completedResults: Int, persistedFrames: Int) -> Unit)? = null,
-            timingHooks: YuvCaptureTimingHooks? = null
+            timingHooks: YuvCaptureTimingHooks? = null,
+            /**
+             * Test-only seam: replaces the default [BoundedCaptureWorker] so race
+             * seams can execute/dispose/reject submissions synchronously inside
+             * submit().  Production callers must leave this null.
+             */
+            boundedWorkerOverride: BoundedCaptureWorker? = null
         ): YuvCaptureSession {
             val captureStateOwner = CaptureStateOwner(dispatch)
-            val boundedWorker = BoundedCaptureWorker(workerName, workerCapacity)
+            val boundedWorker = boundedWorkerOverride ?: BoundedCaptureWorker(workerName, workerCapacity)
             val finishedState = finished ?: AtomicBoolean(false)
             val reservations = YuvBufferReservations(maxRetainedBytes)
             val accounting = accounting ?: YuvCaptureAccounting()

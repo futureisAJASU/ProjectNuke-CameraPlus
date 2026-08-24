@@ -80,13 +80,17 @@ internal sealed interface YuvWorkerCompletion {
  * inconsistent with this task's own settlement, and surfacing them is the only way
  * a lost release can be detected.
  *
- * Pending-ledger honesty: the owner tracks every submitted task in its pending-
- * persistence ledger until the completion event is processed (execute OR
- * disposeWithoutMutation).  A task drained/disposed WITHOUT ever attempting its
- * completion post (e.g. removed from the worker queue by shutdown) can never deliver
- * that event, so [onPendingWorkAbandoned] releases the ledger entry exactly once —
- * decided by the single-winner [pendingPostClaim] CAS shared between the post attempt
- * and the abandonment path.
+ * Pending-ledger honesty: the owner PRE-ACQUIRES a [PendingPersistenceClaim]
+ * for every task BEFORE publication, so the pending debt is already on the
+ * ledger while the task is queued/running/disposed — no submit-return ordering
+ * can race it.  The single-winner [pendingPostClaim] CAS defines the ownership
+ * TRANSITION: submission claim -> completion-envelope ownership -> final
+ * release.  A task settled WITHOUT ever attempting its completion post (e.g.
+ * removed from the worker queue by shutdown) can never deliver that event, so
+ * the settlement path releases the pre-acquired claim exactly once; once the
+ * post was attempted, the posted envelope's execute/disposeWithoutMutation own
+ * the release.  All release paths converge on the idempotent claim, so
+ * disposal racing completion releases EXACTLY once.
  *
  * Task publication state: [taskState] and [settledOutcome] expose the settlement
  * state machine and the published outcome so observers (cleanup coordinator, tests)
@@ -100,18 +104,14 @@ internal class BufferedEncodeTask(
     private val candidateFilesystem: YuvCandidateFilesystem,
     private val encode: () -> YuvWorkerCompletion,
     private val postCompletion: (YuvWorkerCompletion) -> Unit,
+    /** Pre-acquired pending-persistence ownership claim for THIS task. */
+    private val pendingClaim: PendingPersistenceClaim,
     private val onSettlementIssue: ((YuvPngWorkItem, YuvBufferedLifecycle.EncodingSettlementOutcome) -> Unit)? = null,
     private val onWorkDisposalDebt: ((YuvPngWorkItem, YuvWorkDisposalOutcome) -> Unit)? = null,
     /** Invoked exactly once after the task fully settled (or was disposed). */
     private val onSettled: (() -> Unit)? = null,
     /** Invoked exactly once when the persistence worker begins executing this task. */
-    private val onTaskStarted: (() -> Unit)? = null,
-    /**
-     * Invoked EXACTLY ONCE when the task settled without ever attempting its
-     * completion post (shutdown-drained queue task): releases the owner's
-     * pending-persistence ledger entry this task owned.
-     */
-    private val onPendingWorkAbandoned: (() -> Unit)? = null
+    private val onTaskStarted: (() -> Unit)? = null
 ) : OutcomeDisposableCaptureTask {
 
     internal enum class TaskSettlementState { NOT_STARTED, SETTLING, SETTLED }
@@ -120,9 +120,10 @@ internal class BufferedEncodeTask(
     private val settledOutcome = AtomicReference<CaptureTaskDisposalOutcome?>(null)
 
     /**
-     * Single-winner claim deciding WHO owns the pending-ledger release: the
-     * completion-post attempt (owner envelope handles it) or the abandonment path
-     * (this task releases it directly).  Exactly one side wins the CAS.
+     * Single-winner marker defining WHO owns the pre-acquired [pendingClaim]
+     * release: the completion-post attempt (owner envelope handles it) or the
+     * abandonment/settlement path (this task releases it directly).  Exactly one
+     * side wins the CAS; the claim itself makes the final release idempotent.
      */
     private val pendingPostClaim = AtomicBoolean(false)
 
@@ -133,36 +134,47 @@ internal class BufferedEncodeTask(
     fun settledOutcome(): CaptureTaskDisposalOutcome? = settledOutcome.get()
 
     override fun run() {
-        onTaskStarted?.invoke()
-        val completion = try {
-            encode()
+        try {
+            onTaskStarted?.invoke()
+            val completion = try {
+                encode()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (fatal: Error) {
+                throw fatal
+            } catch (t: Exception) {
+                YuvWorkerCompletion.Failed(item.frameIndex, item.timestampNs, null, t)
+            }
+            try {
+                try {
+                    // Claim pending-ledger ownership FOR the owner envelope first: any
+                    // non-throwing post outcome (accepted OR rejected envelope) releases
+                    // the claim through execute/disposeWithoutMutation.
+                    pendingPostClaim.compareAndSet(false, true)
+                    postCompletion(completion)
+                } catch (t: Throwable) {
+                    if (pendingPostClaim.compareAndSet(true, false)) {
+                        // The post threw before the envelope could take ownership:
+                        // revert the transition so the settlement path releases.
+                    }
+                    throw t
+                } finally {
+                    attemptSettle()
+                }
+            } finally {
+                // The settled notification must fire even when completion posting or
+                // settlement threw: the owner's settlement gate re-evaluates on it.
+                onSettled?.invoke()
+            }
         } catch (cancelled: CancellationException) {
+            // Fatal/cancellation task exit that can never produce its normal
+            // completion envelope: settle the pre-acquired claim first, then
+            // PRESERVE the cancellation semantics.
+            if (pendingPostClaim.compareAndSet(false, true)) pendingClaim.release()
             throw cancelled
         } catch (fatal: Error) {
+            if (pendingPostClaim.compareAndSet(false, true)) pendingClaim.release()
             throw fatal
-        } catch (t: Exception) {
-            YuvWorkerCompletion.Failed(item.frameIndex, item.timestampNs, null, t)
-        }
-        try {
-            try {
-                // Claim pending-ledger ownership FOR the owner envelope first: any
-                // non-throwing post outcome (accepted OR rejected envelope) releases
-                // the ledger entry through execute/disposeWithoutMutation.
-                pendingPostClaim.compareAndSet(false, true)
-                postCompletion(completion)
-            } catch (t: Throwable) {
-                if (pendingPostClaim.compareAndSet(true, false)) {
-                    // The post threw before the envelope could take ownership:
-                    // revert the claim so the settlement path releases the entry.
-                }
-                throw t
-            } finally {
-                attemptSettle()
-            }
-        } finally {
-            // The settled notification must fire even when completion posting or
-            // settlement threw: the owner's settlement gate re-evaluates on it.
-            onSettled?.invoke()
         }
     }
 
@@ -191,11 +203,11 @@ internal class BufferedEncodeTask(
     private fun settleItemAndReport(): CaptureTaskDisposalOutcome {
         val outcome = lifecycle.settleEncoding(item, accounting)
         // A task settled WITHOUT any post attempt can never deliver a completion
-        // event: release its pending-persistence ledger entry exactly once.
-        if (!pendingPostClaim.compareAndSet(false, true)) {
-            // Post was attempted (or is about to be): the owner envelope owns release.
-        } else {
-            onPendingWorkAbandoned?.invoke()
+        // event: release its pre-acquired pending claim exactly once.  When the
+        // post WAS attempted, the completion envelope owns (and idempotently
+        // performs) the release instead.
+        if (pendingPostClaim.compareAndSet(false, true)) {
+            pendingClaim.release()
         }
         val settledCleanly = outcome.status == YuvBufferedLifecycle.EncodingSettlementStatus.SETTLED &&
             outcome.failure == null && outcome.lifecycleReleaseFailure == null
@@ -278,6 +290,56 @@ internal class BufferedEncodeTask(
  */
 internal enum class YuvPersistencePhase { CAPTURING, DRAINING }
 
+/**
+ * Exactly-once ownership token for ONE accepted-but-unsettled persistence task.
+ *
+ * The claim is ACQUIRED — incrementing the authoritative pending-persistence
+ * ledger — BEFORE the task is published to the worker, so no interleaving of
+ * worker execution, task disposal, or executor shutdown can ever observe a
+ * published task without its pending debt already on the ledger.
+ *
+ * EXACTLY-ONCE release: whichever terminal ownership path reaches the claim
+ * first releases it; every other path's release is an idempotent no-op:
+ *  1. normal completion (the owner completion envelope executes);
+ *  2. completion-envelope rejection/disposal ([CaptureOwnerEvent.disposeWithoutMutation]);
+ *  3. shutdown-drained / rejected-task disposal;
+ *  4. worker submission rejection (caller-side defensive release);
+ *  5. submit throwing before worker ownership is established;
+ *  6. fatal/cancellation task exit that can never produce a completion envelope.
+ *
+ * The shared ledger is decremented with a plain decrement — there is
+ * deliberately NO floor/clamping: with per-task CAS ownership, a double release
+ * or pre-acquired release can never reach the counter at all, and any future
+ * misbalance must surface as an accounting anomaly instead of being silently
+ * clamped away.
+ */
+internal class PendingPersistenceClaim private constructor(
+    private val ledger: java.util.concurrent.atomic.AtomicInteger
+) {
+    private val released = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Releases this claim's pending-ledger entry exactly once; true only for the first releaser. */
+    fun release(): Boolean {
+        if (!released.compareAndSet(false, true)) return false
+        ledger.decrementAndGet()
+        return true
+    }
+
+    /** True once this claim reached exactly one terminal settlement. */
+    fun isReleased(): Boolean = released.get()
+
+    internal companion object {
+        /**
+         * Acquires one unit of pending-persistence debt. MUST be called before
+         * the corresponding task is published to the worker.
+         */
+        internal fun acquire(ledger: java.util.concurrent.atomic.AtomicInteger): PendingPersistenceClaim {
+            ledger.incrementAndGet()
+            return PendingPersistenceClaim(ledger)
+        }
+    }
+}
+
 internal class YuvCaptureOwner(
     private val captureStateOwner: CaptureStateOwner,
     private val outputDir: File,
@@ -334,12 +396,14 @@ internal class YuvCaptureOwner(
 
     /**
      * Owner-authoritative ledger of accepted-but-not-yet-settled persistence tasks:
-     * incremented when a worker accepts a task, decremented when its completion is
-     * processed (or its completion event is rejected).  Unlike executor counters,
-     * this never races with worker-thread exit, so a successful handoff can never
-     * be claimed while accepted source persistence work remains.  Backed by an
-     * atomic so the OFF-DISPATCHER emergency settlement path can observe it live
-     * (never a stale owner publication).
+     * one unit is added by each PRE-ACQUIRED [PendingPersistenceClaim] BEFORE its
+     * task is published to the worker, and removed exactly once when that claim
+     * reaches exactly one terminal ownership settlement (completion, envelope
+     * rejection, or disposal).  Unlike executor counters, this never races with
+     * worker-thread exit, so a successful handoff can never be claimed while
+     * accepted source persistence work remains.  Backed by an atomic so the
+     * OFF-DISPATCHER emergency settlement path can observe it live (never a stale
+     * owner publication).
      */
     private val pendingPersistenceTasks = java.util.concurrent.atomic.AtomicInteger(0)
     private var settlementDeferralCount = 0
@@ -523,68 +587,91 @@ internal class YuvCaptureOwner(
                         val item = creation.item
                         val fileName = "frame_${item.frameIndex.toString().padStart(2, '0')}_color.png"
                         val candidate = File(outputDir, ".${fileName}.${System.nanoTime()}.tmp")
-                        // Single-winner claim for THIS task's pending-ledger release:
-                        // a non-throwing completion post hands ownership to the owner
-                        // envelope; a never-attempted/throwing post leaves the task
-                        // itself responsible (see disposeWithOutcome below).
+                        // PRE-ACQUIRED pending ownership claim: the ledger carries this
+                        // task's debt BEFORE publication, so a worker that executes or
+                        // disposes the task before submit() even returns can never race
+                        // the accounting.  Exactly one terminal path releases it.
+                        val claim = acquirePendingPersistenceClaim()
+                        // Single-winner post-attempt marker defining the ownership
+                        // TRANSITION: FALSE = this task still owns the claim (settle /
+                        // abandonment paths release); TRUE = the posted completion
+                        // envelope owns it (its execute/disposeWithoutMutation release).
                         val pendingPostClaim = AtomicBoolean(false)
                         val task = object : OutcomeDisposableCaptureTask {
                             override fun run() {
-                                timingHooks?.onWorkerStarted(item.frameIndex)
-                                val completion = try {
-                                    workProcessor.encode(item, candidate, rotationDegrees)
-                                    timingHooks?.onEncodeFinished(item.frameIndex)
-                                    YuvWorkerCompletion.Success(
-                                        item.frameIndex, item.timestampNs,
-                                        YuvCandidateHandle(item.frameIndex, candidate),
-                                        fileName, 0L
-                                    )
+                                try {
+                                    timingHooks?.onWorkerStarted(item.frameIndex)
+                                    val completion = try {
+                                        workProcessor.encode(item, candidate, rotationDegrees)
+                                        timingHooks?.onEncodeFinished(item.frameIndex)
+                                        YuvWorkerCompletion.Success(
+                                            item.frameIndex, item.timestampNs,
+                                            YuvCandidateHandle(item.frameIndex, candidate),
+                                            fileName, 0L
+                                        )
+                                    } catch (cancelled: CancellationException) {
+                                        throw cancelled
+                                    } catch (fatal: Error) {
+                                        throw fatal
+                                    } catch (t: Exception) {
+                                        YuvWorkerCompletion.Failed(
+                                            item.frameIndex, item.timestampNs,
+                                            if (candidate.exists()) YuvCandidateHandle(item.frameIndex, candidate) else null,
+                                            t
+                                        )
+                                    }
+                                    try {
+                                        // Transition to envelope ownership; any non-throwing
+                                        // post outcome (accepted OR rejected envelope) is
+                                        // released through execute/disposeWithoutMutation.
+                                        pendingPostClaim.compareAndSet(false, true)
+                                        captureStateOwner.post(object : CaptureOwnerEvent {
+                                            override fun execute() {
+                                                claim.release()
+                                                adoptCompletion(completion)
+                                            }
+                                            override fun disposeWithoutMutation() {
+                                                claim.release()
+                                                val settlement = completion.settleForOwnerRejection(candidateFilesystem)
+                                                if (settlement != null) {
+                                                    val handle = when (completion) {
+                                                        is YuvWorkerCompletion.Success -> completion.candidateHandle
+                                                        is YuvWorkerCompletion.Failed -> completion.candidateHandle
+                                                    }
+                                                    if (handle != null) recordCandidateDebt(settlement, handle.frameIndex, handle.file)
+                                                }
+                                            }
+                                        })
+                                    } catch (t: Throwable) {
+                                        if (pendingPostClaim.compareAndSet(true, false)) {
+                                            // Post failed before the envelope could take
+                                            // ownership: revert the transition so the
+                                            // settlement path below releases the claim.
+                                        }
+                                        throw t
+                                    } finally {
+                                        disposeWithOutcome()
+                                        postWorkerSettledEvent()
+                                    }
                                 } catch (cancelled: CancellationException) {
+                                    // Fatal/cancellation task exit that can never produce
+                                    // its normal completion envelope: settle the
+                                    // pre-acquired claim first, then PRESERVE semantics.
+                                    if (pendingPostClaim.compareAndSet(false, true)) claim.release()
                                     throw cancelled
                                 } catch (fatal: Error) {
+                                    if (pendingPostClaim.compareAndSet(false, true)) claim.release()
                                     throw fatal
-                                } catch (t: Exception) {
-                                    YuvWorkerCompletion.Failed(
-                                        item.frameIndex, item.timestampNs,
-                                        if (candidate.exists()) YuvCandidateHandle(item.frameIndex, candidate) else null,
-                                        t
-                                    )
-                                }
-                                try {
-                                    pendingPostClaim.compareAndSet(false, true)
-                                    captureStateOwner.post(object : CaptureOwnerEvent {
-                                        override fun execute() {
-                                            releasePendingPersistenceTask()
-                                            adoptCompletion(completion)
-                                        }
-                                        override fun disposeWithoutMutation() {
-                                            releasePendingPersistenceTask()
-                                            val settlement = completion.settleForOwnerRejection(candidateFilesystem)
-                                            if (settlement != null) {
-                                                val handle = when (completion) {
-                                                    is YuvWorkerCompletion.Success -> completion.candidateHandle
-                                                    is YuvWorkerCompletion.Failed -> completion.candidateHandle
-                                                }
-                                                if (handle != null) recordCandidateDebt(settlement, handle.frameIndex, handle.file)
-                                            }
-                                        }
-                                    })
-                                } catch (t: Throwable) {
-                                    if (pendingPostClaim.compareAndSet(true, false)) {
-                                        // Post threw before the envelope took ownership.
-                                    }
-                                    throw t
-                                } finally {
-                                    disposeWithOutcome()
-                                    postWorkerSettledEvent()
                                 }
                             }
                             override fun dispose() { disposeWithOutcome() }
                             override fun disposeWithOutcome(): CaptureTaskDisposalOutcome {
                                 // A task disposed without any completion-post attempt
-                                // can never deliver its event: release its ledger entry.
+                                // can never deliver its event: release its claim exactly
+                                // once (the CAS loses when the envelope already owns
+                                // and released it — idempotent either way).
                                 if (pendingPostClaim.compareAndSet(false, true)) {
-                                    releasePendingPersistenceTask()
+                                    claim.release()
                                 }
                                 val outcome = item.dispose()
                                 return if (outcome.isClean) {
@@ -597,13 +684,32 @@ internal class YuvCaptureOwner(
                                 }
                             }
                         }
-                        if (!boundedWorker.submit(task)) {
+                        val accepted = try {
+                            boundedWorker.submit(task)
+                        } catch (cancelled: CancellationException) {
+                            // Submit threw before worker ownership was established:
+                            // release the pre-acquired claim, preserve semantics.
+                            claim.release()
+                            throw cancelled
+                        } catch (fatal: Error) {
+                            claim.release()
+                            throw fatal
+                        } catch (failure: Exception) {
+                            claim.release()
+                            throw failure
+                        }
+                        if (!accepted) {
+                            // Rejection disposed the task (its settlement released the
+                            // claim); this defensive release is an idempotent no-op in
+                            // that case and the only release if disposal never ran.
+                            claim.release()
                             // Worker already disposed the rejected task (disposeWithOutcome);
                             // the drop is recorded here exactly once.
                             accounting.droppedFrame()
                             ignoreErrors("direct backpressure status dispatch") { postStatus("YUV direct backpressure: frame ${item.frameIndex + 1} dropped") }
                         } else {
-                            trackPendingPersistenceTask()
+                            // Claim already on the ledger since BEFORE publication:
+                            // never increment after submit returns.
                             timingHooks?.onPersistenceQueued(item.frameIndex)
                         }
                     }
@@ -671,6 +777,10 @@ internal class YuvCaptureOwner(
 
         val fileName = "frame_${frame.frameIndex.toString().padStart(2, '0')}_color.png"
         val candidate = File(outputDir, ".${fileName}.${System.nanoTime()}.tmp")
+        // PRE-ACQUIRED pending ownership claim: the ledger carries this task's
+        // debt BEFORE publication, so a worker that executes or disposes the task
+        // before submit() even returns can never race the accounting.
+        val claim = acquirePendingPersistenceClaim()
             val task = BufferedEncodeTask(
                 item = frame,
                 accounting = accounting,
@@ -700,11 +810,11 @@ internal class YuvCaptureOwner(
             postCompletion = { completion ->
                 captureStateOwner.post(object : CaptureOwnerEvent {
                     override fun execute() {
-                        releasePendingPersistenceTask()
+                        claim.release()
                         adoptCompletion(completion)
                     }
                     override fun disposeWithoutMutation() {
-                        releasePendingPersistenceTask()
+                        claim.release()
                         val settlement = completion.settleForOwnerRejection(candidateFilesystem)
                         if (settlement != null) {
                             val handle = when (completion) {
@@ -716,6 +826,7 @@ internal class YuvCaptureOwner(
                     }
                 })
             },
+            pendingClaim = claim,
             onSettlementIssue = { issueItem, outcome ->
                 val cause: Throwable? = outcome.failure ?: outcome.lifecycleReleaseFailure
                 if (cause != null) {
@@ -743,16 +854,34 @@ internal class YuvCaptureOwner(
                 recordDisposalIfUnclean(workItem, outcome)
             },
             onSettled = ::postWorkerSettledEvent,
-            onPendingWorkAbandoned = ::releasePendingPersistenceTask,
             onTaskStarted = { timingHooks?.onWorkerStarted(frame.frameIndex) }
         )
-        if (!boundedWorker.submit(task)) {
+        val accepted = try {
+            boundedWorker.submit(task)
+        } catch (cancelled: CancellationException) {
+            // Submit threw before worker ownership was established: release the
+            // pre-acquired claim, preserve cancellation semantics.
+            claim.release()
+            throw cancelled
+        } catch (fatal: Error) {
+            claim.release()
+            throw fatal
+        } catch (failure: Exception) {
+            claim.release()
+            throw failure
+        }
+        if (!accepted) {
+            // Rejection disposed the task (its settlement released the claim);
+            // this defensive release is an idempotent no-op in that case and the
+            // only release if the rejection disposal never ran.
+            claim.release()
             // Worker already called task.dispose() which calls lifecycle.settleEncoding.
             // Do NOT double-settle or double-dispose the item.
             accounting.droppedFrame()
             ignoreErrors("buffered backpressure status dispatch") { postStatus("YUV backpressure: buffered frame ${frame.frameIndex + 1} dropped") }
         } else {
-            trackPendingPersistenceTask()
+            // Claim already on the ledger since BEFORE publication:
+            // never increment after submit returns.
             timingHooks?.onPersistenceQueued(frame.frameIndex)
         }
     }
@@ -796,13 +925,18 @@ internal class YuvCaptureOwner(
     // Pending-persistence ledger and settlement gate
     // ------------------------------------------------------------------
 
-    private fun trackPendingPersistenceTask() {
-        pendingPersistenceTasks.incrementAndGet()
-    }
+    /**
+     * PRE-ACQUIRES the pending-persistence ownership claim for ONE persistence
+     * task.  The ledger increment happens HERE — before the task is published to
+     * the worker — so worker execution, disposal, or shutdown draining can never
+     * outrun the pending accounting.  The returned claim must reach exactly one
+     * terminal release (see [PendingPersistenceClaim]).
+     */
+    private fun acquirePendingPersistenceClaim(): PendingPersistenceClaim =
+        PendingPersistenceClaim.acquire(pendingPersistenceTasks)
 
-    private fun releasePendingPersistenceTask() {
-        pendingPersistenceTasks.updateAndGet { current -> if (current > 0) current - 1 else current }
-    }
+    /** Test-only observation of the authoritative pending-persistence ledger. */
+    internal fun pendingPersistenceTasksForTest(): Int = pendingPersistenceTasks.get()
 
     /**
      * Posts the worker-settled notification: after a task fully settled (its

@@ -1108,6 +1108,376 @@ class YuvCaptureOwnerTest {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Pending-persistence submission race closure (deterministic seams)
+    // ------------------------------------------------------------------
+
+    /**
+     * Deterministic worker race seam. [behavior] runs INSIDE submit() BEFORE it
+     * returns, so tests can force the exact interleavings that used to corrupt
+     * the pending-persistence ledger:
+     *  A. synchronously EXECUTE the task before submit() returns;
+     *  B. synchronously DISPOSE the task before submit() returns;
+     *  C. reject the submission;
+     *  - throw from submit before worker ownership is established.
+     */
+    private class StubWorker(
+        private val behavior: (Runnable) -> Boolean
+    ) : BoundedCaptureWorker("stub-yuv-worker", 4) {
+        val submitted = java.util.Collections.synchronizedList(mutableListOf<Runnable>())
+        override fun submit(task: Runnable): Boolean {
+            submitted.add(task)
+            return behavior(task)
+        }
+    }
+
+    private class RaceSession(
+        val session: YuvCaptureSession,
+        private val handlerThread: android.os.HandlerThread,
+        private val handler: android.os.Handler,
+        private val terminalLatch: CountDownLatch
+    ) {
+        fun flush() {
+            val latch = CountDownLatch(1)
+            assertTrue("handler flush failed", handler.post { latch.countDown() })
+            assertTrue(latch.await(5, TimeUnit.SECONDS))
+        }
+
+        fun awaitTerminal(timeoutSec: Long = 10): CaptureTerminalStatus {
+            assertTrue("terminal not reached", terminalLatch.await(timeoutSec, TimeUnit.SECONDS))
+            flush()
+            return session.terminalState.status()
+        }
+
+        fun shutdown() {
+            session.close()
+            handlerThread.quitSafely()
+        }
+    }
+
+    private fun createRaceSession(
+        frameCount: Int,
+        worker: BoundedCaptureWorker,
+        rejectAllEvents: java.util.concurrent.atomic.AtomicBoolean =
+            java.util.concurrent.atomic.AtomicBoolean(false),
+        encodeHook: (() -> Unit)? = null
+    ): RaceSession {
+        val dir: File = Files.createTempDirectory("yuv-race-test").toFile()
+        val handlerThread = android.os.HandlerThread("yuv-race").apply { start() }
+        val handler = android.os.Handler(handlerThread.looper)
+        val terminalLatch = CountDownLatch(1)
+        val session = YuvCaptureSession.create(
+            dispatch = { event ->
+                if (rejectAllEvents.get()) {
+                    event.disposeWithoutMutation()
+                    false
+                } else {
+                    handler.post { event.execute() }
+                    true
+                }
+            },
+            outputDir = dir,
+            frameCount = frameCount,
+            rotationDegrees = 0,
+            workerCapacity = 4,
+            maxRetainedBytes = 16L * 1024 * 1024,
+            workProcessor = YuvPngWorkProcessor(
+                encoder = object : YuvPngEncoder {
+                    override fun encodeDirect(image: Image, candidate: File, rotationDegrees: Int) {
+                        encodeHook?.invoke()
+                        Files.write(candidate.toPath(), PNG_1X1)
+                    }
+                    override fun encodeBuffered(frame: BufferedYuvFrame, candidate: File, rotationDegrees: Int) {
+                        encodeHook?.invoke()
+                        Files.write(candidate.toPath(), PNG_1X1)
+                    }
+                },
+                committer = YuvCandidateCommitter { candidate, final ->
+                    Files.move(candidate.toPath(), final.toPath(), StandardCopyOption.ATOMIC_MOVE)
+                }
+            ),
+            postStatus = { true },
+            dispatchCallback = CallbackDispatcher { runnable ->
+                if (!handler.post(runnable)) runnable.run()
+                true
+            },
+            writeJobJson = { status, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ ->
+                if (status in setOf(
+                        "CAPTURE_COMPLETE", "CAPTURE_PARTIAL", "CAPTURE_FAILED", "CAPTURE_TIMEOUT", "CAPTURE_CANCELLED"
+                    )
+                ) {
+                    terminalLatch.countDown()
+                }
+            },
+            saveMotionOnce = { _ -> null to null },
+            productionResourceCoordinator = YuvProductionResourceCoordinator(
+                timeoutScheduler = null,
+                backgroundHandler = null,
+                backgroundThread = null
+            ),
+            boundedWorkerOverride = worker
+        )
+        return RaceSession(session, handlerThread, handler, terminalLatch)
+    }
+
+    /** Authoritative settled-state assertion after a terminal case. */
+    private fun assertSettledState(harness: RaceSession, expectedPersisted: Int) {
+        val snap = harness.session.accounting.snapshot()
+        assertEquals(expectedPersisted, snap.persistedFrames)
+        assertEquals(expectedPersisted, snap.manifest.size)
+        assertEquals(0, snap.bufferedFrames)
+        assertEquals(0, snap.reservedIndexCount)
+        assertEquals(0, snap.reservedFilenameCount)
+        assertEquals(0, harness.session.owner.pendingPersistenceTasksForTest())
+        assertEquals(0, harness.session.boundedWorker.queuedCount())
+        assertEquals(0, harness.session.boundedWorker.activeCount())
+    }
+
+    /** Bounded wait until the pre-acquired claims all reached exactly one release. */
+    private fun awaitPendingLedgerZero(harness: RaceSession, timeoutMs: Long = 5_000) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (harness.session.owner.pendingPersistenceTasksForTest() != 0) {
+            check(System.currentTimeMillis() < deadline) { "pending persistence ledger never drained" }
+            Thread.sleep(10)
+        }
+    }
+
+    @Test
+    fun workerCompletesBeforeSubmitReturns_noPhantomPendingDebt() {
+        // Seam A: the worker executes the WHOLE task synchronously before submit()
+        // returns.  The old submit->increment ordering could observe the task's
+        // release first; the pre-acquired claim makes that impossible.
+        val worker = StubWorker { task -> task.run(); true }
+        val harness = createRaceSession(frameCount = 1, worker = worker)
+        try {
+            harness.session.owner.acceptDirect(FakeDirectAccess())
+            harness.flush()
+
+            assertEquals(CaptureTerminalStatus.SUCCESS, harness.awaitTerminal())
+            assertSettledState(harness, expectedPersisted = 1)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun workerDisposedByShutdownBeforeSubmitReturns_noPhantomPendingDebt() {
+        // Seam B: shutdown-style disposal drains the task BEFORE submit() returns,
+        // yet submit reports ACCEPTED.  The old ordering released the (clamped-at-
+        // zero) counter during disposal and THEN incremented -> permanent phantom
+        // debt -> DRAINING -> false persistence-drain failure/hang.  The claim is
+        // pre-acquired, so the disposal releases it and acceptance adds nothing.
+        val worker = StubWorker { task -> (task as DisposableCaptureTask).dispose(); true }
+        val harness = createRaceSession(frameCount = 1, worker = worker)
+        try {
+            harness.session.owner.acceptDirect(FakeDirectAccess())
+            harness.flush()
+
+            assertEquals(0, harness.session.owner.pendingPersistenceTasksForTest())
+            assertEquals(1, harness.session.accounting.snapshot().receivedFrames)
+
+            // No stale-debt drain hang: classification proceeds immediately by truth.
+            harness.session.owner.onDeadlineReached()
+            assertEquals(CaptureTerminalStatus.TIMED_OUT, harness.awaitTerminal())
+            assertSettledState(harness, expectedPersisted = 0)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun rejectedSubmission_releasesPreacquiredPendingClaimExactlyOnce() {
+        // Seam C: production rejection contract (reject -> dispose -> false).  The
+        // settlement disposal releases the pre-acquired claim AND the caller's
+        // defensive release fires too: exactly-once means the ledger lands on 0,
+        // NEVER -1.
+        val worker = StubWorker { task -> (task as DisposableCaptureTask).dispose(); false }
+        val harness = createRaceSession(frameCount = 1, worker = worker)
+        try {
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            harness.flush()
+
+            assertEquals(0, harness.session.owner.pendingPersistenceTasksForTest())
+            val snap = harness.session.accounting.snapshot()
+            assertEquals(1, snap.droppedFrames)
+            assertEquals(0, snap.bufferedFrames)
+
+            harness.session.owner.onDeadlineReached()
+            assertEquals(CaptureTerminalStatus.TIMED_OUT, harness.awaitTerminal())
+            assertSettledState(harness, expectedPersisted = 0)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun submitThrows_releasesPreacquiredPendingClaimExactlyOnce() {
+        // Submit throwing before worker ownership is established must release the
+        // pre-acquired claim, then preserve the ordinary-exception semantics.
+        val worker = StubWorker { _ -> throw IllegalStateException("injected submit failure") }
+        val harness = createRaceSession(frameCount = 1, worker = worker)
+        try {
+            harness.session.owner.acceptDirect(FakeDirectAccess())
+            harness.flush()
+
+            assertEquals(0, harness.session.owner.pendingPersistenceTasksForTest())
+            assertEquals(1, harness.session.accounting.snapshot().receivedFrames)
+
+            harness.session.owner.onDeadlineReached()
+            assertEquals(CaptureTerminalStatus.TIMED_OUT, harness.awaitTerminal())
+            assertSettledState(harness, expectedPersisted = 0)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun completionEnvelopeRejected_releasesPendingClaimExactlyOnce() {
+        // Seam D: the worker completes but the owner dispatcher rejects the
+        // completion envelope.  The envelope DISPOSAL path (never the normal
+        // callback) must release the pre-acquired claim exactly once; the task
+        // settlement afterwards must not release it again.
+        val rejectAll = java.util.concurrent.atomic.AtomicBoolean(false)
+        val encodeStart = CountDownLatch(1)
+        val encodeRelease = CountDownLatch(1)
+        val harness = createRaceSession(
+            frameCount = 1,
+            worker = BoundedCaptureWorker("real-race-worker", 4),
+            rejectAllEvents = rejectAll,
+            encodeHook = {
+                encodeStart.countDown()
+                assertTrue(encodeRelease.await(10, TimeUnit.SECONDS))
+            }
+        )
+        try {
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            harness.flush()
+            assertEquals(1, harness.session.owner.pendingPersistenceTasksForTest())
+
+            assertTrue(encodeStart.await(5, TimeUnit.SECONDS))
+            // From here on every owner event (including the completion envelope)
+            // is REJECTED_AND_DISPOSED synchronously inside captureStateOwner.post.
+            rejectAll.set(true)
+            encodeRelease.countDown()
+
+            awaitPendingLedgerZero(harness)
+
+            harness.session.owner.onDeadlineReached()
+            assertEquals(CaptureTerminalStatus.TIMED_OUT, harness.awaitTerminal())
+            assertSettledState(harness, expectedPersisted = 0)
+        } finally {
+            encodeRelease.countDown()
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun bufferedFastCompletion_noPhantomPendingDebt() {
+        // Buffered path under Seam A: fast persistence (e.g. packed-YUV) completes
+        // the whole task before submit() returns.  No phantom debt, normal success.
+        val worker = StubWorker { task -> task.run(); true }
+        val harness = createRaceSession(frameCount = 1, worker = worker)
+        try {
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            harness.flush()
+
+            assertEquals(CaptureTerminalStatus.SUCCESS, harness.awaitTerminal())
+            assertSettledState(harness, expectedPersisted = 1)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun directFastCompletion_noPhantomPendingDebt() {
+        // Direct path under Seam A with TWO frames: both persistence tasks complete
+        // synchronously before their submit() calls return; strict success still
+        // settles normally (full terminal-state proof).
+        val worker = StubWorker { task -> task.run(); true }
+        val harness = createRaceSession(frameCount = 2, worker = worker)
+        try {
+            harness.session.owner.acceptDirect(FakeDirectAccess())
+            harness.session.owner.acceptDirect(FakeDirectAccess())
+            harness.flush()
+
+            assertEquals(CaptureTerminalStatus.SUCCESS, harness.awaitTerminal())
+            harness.flush()
+            assertSettledState(harness, expectedPersisted = 2)
+            assertEquals(2, harness.session.accounting.snapshot().receivedFrames)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun shutdownDisposalAndCompletionRace_releasesExactlyOnce() {
+        // Forced interleaving: the task starts on another thread (encode blocked),
+        // a shutdown-style disposal settles it FIRST (releasing the pre-acquired
+        // claim), and the blocked completion arrives afterwards.  Both paths hit
+        // the SAME claim: exactly one release, no underflow, and the late
+        // completion still adopts truthfully through its envelope.
+        val encodeStart = CountDownLatch(1)
+        val encodeRelease = CountDownLatch(1)
+        val runningTask = java.util.concurrent.atomic.AtomicReference<Runnable?>()
+        val worker = StubWorker { task ->
+            runningTask.set(task)
+            Thread({
+                task.run()
+            }, "yuv-race-task").apply { isDaemon = true }.start()
+            true
+        }
+        val harness = createRaceSession(
+            frameCount = 1,
+            worker = worker,
+            encodeHook = {
+                encodeStart.countDown()
+                assertTrue(encodeRelease.await(10, TimeUnit.SECONDS))
+            }
+        )
+        try {
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            harness.flush()
+            assertTrue(encodeStart.await(5, TimeUnit.SECONDS))
+
+            // Shutdown-style disposal racing the ACTIVE task.
+            val disposed = (runningTask.get() as DisposableCaptureTask).dispose()
+            assertNotNull(disposed)
+            assertEquals(0, harness.session.owner.pendingPersistenceTasksForTest())
+
+            // Late completion arrives after the disposal settlement.
+            encodeRelease.countDown()
+            assertEquals(CaptureTerminalStatus.SUCCESS, harness.awaitTerminal())
+            assertSettledState(harness, expectedPersisted = 1)
+        } finally {
+            encodeRelease.countDown()
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun doubleDisposalAttempt_doesNotUnderflowPendingCounter() {
+        // Two disposal attempts against ONE pre-acquired claim: the CAS guard
+        // releases exactly once; the shared counter must land on 0, never -1.
+        val worker = StubWorker { task ->
+            (task as DisposableCaptureTask).dispose()
+            (task as DisposableCaptureTask).dispose()
+            true
+        }
+        val harness = createRaceSession(frameCount = 1, worker = worker)
+        try {
+            harness.session.owner.acceptDirect(FakeDirectAccess())
+            harness.flush()
+
+            assertEquals(0, harness.session.owner.pendingPersistenceTasksForTest())
+
+            harness.session.owner.onDeadlineReached()
+            assertEquals(CaptureTerminalStatus.TIMED_OUT, harness.awaitTerminal())
+            assertSettledState(harness, expectedPersisted = 0)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
     private fun flushHandler(handler: android.os.Handler) {
         val latch = CountDownLatch(1)
         handler.post { latch.countDown() }
