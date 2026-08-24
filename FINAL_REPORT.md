@@ -1,4 +1,4 @@
-# FINAL REPORT — Production Closure State
+﻿# FINAL REPORT — Production Closure State
 
 ## 1. Starting Point
 - Corrective-series commits (this closure, in order):
@@ -278,3 +278,92 @@ YUV/RAW progressing beyond `CAPTURE_STAGE_COMPLETE` to
 regression signal.
 
 ADDENDUM VERDICT: BACKGROUND TERMINAL DELIVERY + TRUE DURABLE HANDOFF — CLOSED (JVM gates)
+
+
+---
+
+# STAGE-A INDEPENDENT AUDIT CLOSURE — Corrective Series (7 Phases)
+
+## S0. Scope and Baseline
+- Baseline HEAD: 0cce8ad2d8634c622e247bb0c33d18f92b0c413c (packed-YUV v1 + debug-intent gating already landed).
+- Bounded correctness/instrumentation follow-up. The previously-corrected Stage-A fixes (full-acquisition YUV draining, canonical HEIF naming, native-RGBA RAW export, typed Camera2 acquisition progress, serialized background processing) were NOT reopened.
+- Packed-YUV remains OUT of the production default path after this series.
+
+## S1. Commits (each phase committed separately)
+| Phase | Commit | Subject |
+|---|---|---|
+| 1 | 077d723 | fix(yuv): deadline drains ALL accepted persistence before any terminal |
+| 2 | bd52095 | fix(background): SR dual identity, main-scope UI delivery, fatal settlement precedence |
+| 3 | 614efef | feat(timing): wire real production call sites into capture timing ledger |
+| 4 | a9558ba | feat(e2e): expose capture/background timing evidence in physical report |
+| 5 | 4138e50 | fix(packedyuv): sync final header before publish; reject structurally invalid files |
+| 6 | 70d495d | fix(yuv): quality metrics unconditional; heavy debug images stay gated |
+
+(Phases 1-6 above; Phase 7 is the static-audit closure documented in S4.)
+
+## S2. Phase Summaries
+
+### Phase 1 — Durable handoff invariant for ALL accepted persistence work
+- onDeadlineReached() now asks FIRST: does accepted persistence work remain (buffered/reserved/pendingCompletions/queued/inFlight > 0)? If yes -> enter/continue DRAINING regardless of FULL vs PARTIAL acquisition; nothing is published.
+- Terminal classification runs only after every accepted task settles: strict SUCCESS predicate (persisted==requested, manifest complete, buffered/reserved/pending/queued/inFlight all zero), genuine PARTIAL_SUCCESS after full settlement, concrete FAILED on drain failure, actual TIMED_OUT when the bounded drain deadline expires with work outstanding.
+- emergencySettleDeadline() FAILS CLOSED: any observable accepted work (live atomic pending ledger + executor counters + buffered/reserved + draining flag) settles TIMED_OUT - never SUCCESS/PARTIAL.
+- Shutdown-drained worker tasks never posted completions and leaked pending-ledger entries forever (stalled drain settlement). Both buffered and direct persistence tasks now claim pending-ledger ownership via a single-winner CAS: non-throwing posts hand release to the owner envelope; never-attempted posts release at settlement exactly once.
+- Tests: YuvCaptureOwnerAcceptedWorkTest (8 required cases) + updated YuvCaptureOwnerTest / ProductionYuvCaptureBridgeTest.
+
+### Phase 2 — Background ownership leftovers
+- 2A SR dual identity: BackgroundPipelineEvent(requestJobDirectory, resultJobDirectory); terminal carries resultJobDirectoryPath. Routing/diagnostics use the REQUEST identity (source capture job); HardwareE2E finalization reads the RESULT identity (SR output dir); UI refresh uses result identity with request fallback. Relationship persisted durably into BOTH job.json files (superResolutionSourceJobDirectory / superResolutionResultJobDirectory) immediately after output-dir creation and re-asserted on every full SR metadata write - always BEFORE terminal publication. No latest-job lookup anywhere.
+- 2B Main-thread UI delivery: new BackgroundTerminalUiDispatcher - diagnostics immediate/thread-safe on the worker lane; ALL Compose mutation dispatched onto the camera-owned scheduler; CURRENT foreground truth re-queried from pipelineSession.snapshot() INSIDE the dispatched block. Terminal A during capture B refreshes data but never pops preview; idle foreground may show it.
+- 2C Fatal settlement precedence: shared finalizeLaneAfterExecution - Error -> bookkeeping then RETHROW (in-flight preserved as suppressed); CancellationException -> preserved; Exception -> explicit reconciliation debt with boundary UNREACHED so settleTerminal publishes captureResourcesSettled=false instead of an ownership-settled claim unsupported by reality.
+- Tests: BackgroundOwnershipPhase2Test + updated Phase5/Phase6 suites.
+
+### Phase 3 — Timing ledger made real
+- Every advertised milestone now has a REAL production call site: persistenceQueued (owner submit), workerStarted (task entry), encodeFinished (bounded around actual conversion+PNG+candidate-write+fsync span), writeFinished (atomic replace returned), verified (final verification succeeded), committed (accounting commit). Buffered frames additionally record conversionCompleted and the true fsyncFinished boundary (writePngBitmapToSink invokes an onSynced callback at the real fd.sync() instant). New YuvCaptureTimingHooks seam keeps every recorder a non-blocking atomic put; Camera2 callbacks are never blocked.
+- processingHandoffPublishedAt recorded ONLY after publishProcessingHandoff returns true (YUV and RAW).
+- RAW captureStageCompleteAt moved from finishSuccess (internal completion) to the evidenced durable boundary inside terminal settlement: metadata persisted + handoff published + capture owner cleared. RAW also records processingHandoffPublishedAt/captureResourcesSettledAt there.
+- Single-frame YUV uses the same session/hook path (frame-count independent). SR is background-only: no capture-stage ledger applies; its durations live in backgroundStageTimings.
+- Tests: CaptureTimingLedgerProductionTest - causal chain requestSubmitted <= firstCameraEvidence <= acquisitionComplete <= persistenceDrainComplete <= processingHandoffPublished <= captureResourcesSettled <= captureStageComplete (same-timestamp equality allowed), handoff-failure leaves published/settled/stage unset, real per-frame chain end-to-end through a production-shaped session.
+
+### Phase 4 — Physical report exposes the new evidence
+- HardwareE2EJobSummary carries nested captureTiming (HardwareE2ECaptureTiming: cameraAcquisitionMs, persistenceDrainMs, handoffSettlementMs, captureStageTotalMs, aggregate encode/fsync/verify, maxFrameEncodeMs, per-frame segments) and backgroundStageTimings.
+- Flattened run-report fields promoted at finalization: cameraAcquisitionMs, persistenceDrainMs, handoffSettlementMs, captureStageTotalMs, backgroundProcessingMs, backgroundExportMs.
+- Pure snapshot semantics: fromJson() performs no filesystem queries; every new field has a non-default round-trip test (HardwareE2ETimingExposureTest).
+
+### Phase 5 — Packed-YUV V1 hardened (still NOT default)
+- Final header digest patch is explicitly fsynced BEFORE atomic publication (durability sequence payloadSynced -> headerSynced -> published, test-observable).
+- Structural verification rejects header-valid truncated payloads, payload decomposition mismatches (payloadLength == y+u+v), stride/plane invariant violations, insane dimensions, and exact-length padding.
+- Contract documented: structural check does NOT stream payload digest; digest lives exclusively in the separately-named full verifier verifyFull() (= unpack), required before authoritative artifact use. unpack() fails closed on malformed lengths/strides/truncation BEFORE allocating plane buffers.
+
+### Phase 6 — Debug artifact / quality metric separation
+- Fixed: the image-artifacts-disabled early return skipped writeFusionQualityDiagnostics entirely, so production captures had NO quality metrics. New writeBoundedQualityEvidence computes bounded previews + full quality metrics JSON unconditionally through the same production entry point; only heavy full-resolution images/compare/crop sheets remain gated. Five heavy PNGs NOT restored.
+- diagnosticIntent audit: no production writer existed. Real debug entry point (CameraScreen.runCameraJob with an instrumentation scenario) arms process-scoped intent; ColorFusion durably stamps diagnosticIntent=true into job.json at CREATION. Normal user captures keep production_main_camera_screen and are never stamped.
+- Tests: YuvQualityDiagnosticsSeparationTest enters through the production entry point.
+
+## S3. Validation Results (this series)
+All phases committed separately; working tree clean; focused groups run x2 per phase; full unit suite green after every phase.
+
+| Command | Result |
+|---|---|
+| compileDebugKotlin | SUCCESS |
+| compileDebugUnitTestKotlin | SUCCESS |
+| compileDebugAndroidTestKotlin | SUCCESS |
+| testDebugUnitTest (full suite) | SUCCESS |
+| assembleDebug | SUCCESS |
+| assembleDebugAndroidTest | SUCCESS |
+| lintDebug | SUCCESS |
+| git diff --check | PASS |
+
+## S4. Final Static Audit (10-point proof)
+1. No full OR partial YUV handoff with accepted persistence outstanding: deadline classification checks acceptedPersistenceWorkRemains FIRST (YuvCaptureOwner.kt onDeadlineReached); drain completion re-checks before any classification; emergency path fail-closed on live counters.
+2. SR request/result identities explicit: typed fields on BackgroundPipelineEvent + CameraPipelineEvent.Terminal.resultJobDirectoryPath; executor publishes dual identities; E2E finalizes by result; relationship durably linked both directions pre-publication.
+3. No heavy worker callback mutates Compose state directly: hub subscriber delegates to BackgroundTerminalUiDispatcher; mutation only inside the scheduler-dispatched block; foreground truth re-read at delivery time.
+4. Fatal Error not swallowed during lease settlement: finalizeLaneAfterExecution rethrows Error/Cancellation after bookkeeping; ordinary release failures mark the boundary unreached (no false settled claim).
+5. Every advertised timing milestone has a real production call site: see Phase 3 map (ColorFusion / YuvCaptureOwner / RawFusionCapture).
+6. Milestone names match authority boundaries: handoffPublished only after durable publication; captureResourcesSettled/captureStageComplete only after owner clear; committed only after accounting commit; fsyncFinished at the real fd.sync().
+7. HardwareE2E exposes the new timing evidence: summary captureTiming/backgroundStageTimings + flattened run fields, round-trip tested non-default.
+8. Packed-YUV rejects header-valid truncated payloads: exact total length check inside readHeader/unpack (validateStructure).
+9. Packed-YUV final metadata durable before atomic publication: header patch fsync precedes replace; ordering test-enforced.
+10. YUV quality metrics survive heavy-image gating: disabled path calls writeBoundedQualityEvidence through the same production entry point; metrics asserted present, heavy files asserted absent.
+
+## S5. Physical Promotion Gate (PENDING)
+- Code series complete. Packed-YUV production default remains OFF until physical evidence justifies the switch.
+- Next step (manual, hardware): install BOTH APKs (./gradlew :app:installDebug :app:installDebugAndroidTest --console=plain --no-daemon), run the strict physical Stage A, use the newly exposed timing fields (cameraAcquisitionMs / persistenceDrainMs / aggregate+max frame encode/fsync/verify / backgroundProcessingMs / backgroundExportMs) to prove the current foreground bottleneck and record a before/after baseline. Only that baseline may justify enabling packed-YUV as the default.
