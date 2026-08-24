@@ -113,7 +113,7 @@ class CaptureTimingLedgerProductionTest {
         val ledger = CaptureTimingLedger(1) { current += 1_000_000L; current }
         ledger.recordCaptureRequestSubmitted()
         ledger.recordImageReceived(0); ledger.recordResultReceived(0)
-        ledger.recordPersistenceQueued(0)
+            ledger.recordPersistenceSubmitted(0)
         ledger.recordWorkerStarted(0)
         ledger.recordConversionCompleted(0)
         ledger.recordEncodeFinished(0)
@@ -213,7 +213,7 @@ class CaptureTimingLedgerProductionTest {
                 prevAcq.set(Triple(maxOf(received, prev.first), maxOf(completed, prev.second), maxOf(persisted, prev.third)))
             },
             timingHooks = object : YuvCaptureTimingHooks {
-                override fun onPersistenceQueued(frameIndex: Int) = ledger.recordPersistenceQueued(frameIndex)
+                override fun onPersistenceSubmitted(frameIndex: Int) = ledger.recordPersistenceSubmitted(frameIndex)
                 override fun onWorkerStarted(frameIndex: Int) = ledger.recordWorkerStarted(frameIndex)
                 override fun onEncodeFinished(frameIndex: Int) = ledger.recordEncodeFinished(frameIndex)
                 override fun onWriteFinished(frameIndex: Int) = ledger.recordWriteFinished(frameIndex)
@@ -248,14 +248,14 @@ class CaptureTimingLedgerProductionTest {
                 val frame = frames.getJSONObject(index)
                 // EVERY real persistence milestone fired from its production site
                 // (image/result instants are aggregate-only by production wiring):
-                listOf(
-                    "persistenceQueuedAt", "workerStartedAt",
-                    "encodeFinishedAt", "writeFinishedAt", "verifiedAt", "committedAt"
-                ).forEach { key ->
-                    assertTrue("frame $index missing $key", frame.getLong(key) > 0L)
-                }
-                // Per-frame causal order (documented same-timestamp equality allowed).
-                assertTrue(frame.getLong("workerStartedAt") >= frame.getLong("persistenceQueuedAt"))
+                        listOf(
+                            "persistenceSubmittedAt", "workerStartedAt",
+                            "encodeFinishedAt", "writeFinishedAt", "verifiedAt", "committedAt"
+                        ).forEach { key ->
+                            assertTrue("frame $index missing $key", frame.getLong(key) > 0L)
+                        }
+                        // Per-frame causal order (documented same-timestamp equality allowed).
+                        assertTrue(frame.getLong("workerStartedAt") >= frame.getLong("persistenceSubmittedAt"))
                 assertTrue(frame.getLong("encodeFinishedAt") >= frame.getLong("workerStartedAt"))
                 assertTrue(frame.getLong("writeFinishedAt") >= frame.getLong("encodeFinishedAt"))
                 assertTrue(frame.getLong("verifiedAt") >= frame.getLong("writeFinishedAt"))

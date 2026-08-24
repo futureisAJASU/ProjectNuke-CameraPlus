@@ -684,6 +684,7 @@ internal class YuvCaptureOwner(
                                 }
                             }
                         }
+                        timingHooks?.onPersistenceSubmitted(item.frameIndex)
                         val accepted = try {
                             boundedWorker.submit(task)
                         } catch (cancelled: CancellationException) {
@@ -710,7 +711,6 @@ internal class YuvCaptureOwner(
                         } else {
                             // Claim already on the ledger since BEFORE publication:
                             // never increment after submit returns.
-                            timingHooks?.onPersistenceQueued(item.frameIndex)
                         }
                     }
                     is DirectYuvWorkCreation.Failed -> {
@@ -856,6 +856,7 @@ internal class YuvCaptureOwner(
             onSettled = ::postWorkerSettledEvent,
             onTaskStarted = { timingHooks?.onWorkerStarted(frame.frameIndex) }
         )
+        timingHooks?.onPersistenceSubmitted(frame.frameIndex)
         val accepted = try {
             boundedWorker.submit(task)
         } catch (cancelled: CancellationException) {
@@ -882,7 +883,6 @@ internal class YuvCaptureOwner(
         } else {
             // Claim already on the ledger since BEFORE publication:
             // never increment after submit returns.
-            timingHooks?.onPersistenceQueued(frame.frameIndex)
         }
     }
 

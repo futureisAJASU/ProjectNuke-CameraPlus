@@ -127,10 +127,10 @@ class CaptureTimingLedgerTest {
         var current = 0L
         val ledger = CaptureTimingLedger(2) { current += 1_000_000L; current }
         ledger.recordCaptureRequestSubmitted()
-        ledger.recordImageReceived(0)
-        ledger.recordResultReceived(0)
-        ledger.recordPersistenceQueued(0)
-        ledger.recordEncodeFinished(0)
+         ledger.recordImageReceived(0)
+         ledger.recordResultReceived(0)
+         ledger.recordPersistenceSubmitted(0)
+         ledger.recordEncodeFinished(0)
         ledger.recordFsyncFinished(0)
         ledger.recordVerified(0)
         ledger.recordCommitted(0)
@@ -150,7 +150,7 @@ class CaptureTimingLedgerTest {
         ).forEach { key -> assertTrue("missing $key", json.has(key)) }
         val frame0 = json.getJSONArray("frames").getJSONObject(0)
         listOf(
-            "resultAt", "imageAt", "persistenceQueuedAt", "encodeFinishedAt",
+             "resultAt", "imageAt", "persistenceSubmittedAt", "encodeFinishedAt",
             "fsyncFinishedAt", "verifiedAt", "committedAt"
         ).forEach { key -> assertTrue("missing frame.$key", frame0.has(key) && frame0.getLong(key) > 0L) }
     }

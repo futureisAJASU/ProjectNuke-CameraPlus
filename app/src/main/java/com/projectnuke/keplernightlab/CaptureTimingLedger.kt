@@ -28,7 +28,7 @@ internal class CaptureTimingLedger(
     internal class FrameTimes(requested: Int) {
         val resultAt = AtomicLongArray(requested)
         val imageAt = AtomicLongArray(requested)
-        val persistenceQueuedAt = AtomicLongArray(requested)
+        val persistenceSubmittedAt = AtomicLongArray(requested)
         val workerStartedAt = AtomicLongArray(requested)
         val conversionCompletedAt = AtomicLongArray(requested)
         val encodeFinishedAt = AtomicLongArray(requested)
@@ -103,7 +103,7 @@ internal class CaptureTimingLedger(
         }
     }
 
-    fun recordPersistenceQueued(frameIndex: Int) { putFrameInstant(time.persistenceQueuedAt, frameIndex, now()) }
+    fun recordPersistenceSubmitted(frameIndex: Int) { putFrameInstant(time.persistenceSubmittedAt, frameIndex, now()) }
 
     /** Persistence worker actually began executing this frame's task. */
     fun recordWorkerStarted(frameIndex: Int) { putFrameInstant(time.workerStartedAt, frameIndex, now()) }
@@ -200,7 +200,7 @@ internal class CaptureTimingLedger(
                     .put("frameIndex", index)
                     .put("resultAt", time.resultAt.get(index))
                     .put("imageAt", time.imageAt.get(index))
-                    .put("persistenceQueuedAt", time.persistenceQueuedAt.get(index))
+                        .put("persistenceSubmittedAt", time.persistenceSubmittedAt.get(index))
                     .put("workerStartedAt", time.workerStartedAt.get(index))
                     .put("conversionCompletedAt", time.conversionCompletedAt.get(index))
                     .put("encodeFinishedAt", time.encodeFinishedAt.get(index))
@@ -274,8 +274,8 @@ internal data class CaptureTimingSnapshot(
  * synthetic durations.
  */
 internal interface YuvCaptureTimingHooks {
-    /** The owner successfully submitted this frame's persistence task. */
-    fun onPersistenceQueued(frameIndex: Int) {}
+    /** The owner attempted to submit this frame's persistence task. */
+    fun onPersistenceSubmitted(frameIndex: Int) {}
 
     /** A persistence worker thread began executing this frame's task. */
     fun onWorkerStarted(frameIndex: Int) {}

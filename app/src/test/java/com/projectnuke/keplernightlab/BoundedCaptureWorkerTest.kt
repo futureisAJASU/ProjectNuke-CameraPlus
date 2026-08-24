@@ -472,5 +472,23 @@ class BoundedCaptureWorkerTest {
         release.countDown()
         worker.close()
         assertTrue(worker.awaitTermination(5_000))
+    @Test
+    fun workerExecutionCannotPrecedeSubmissionTimestamp() {
+        val submittedAt = java.util.concurrent.atomic.AtomicLong(0L)
+        val startedAt = java.util.concurrent.atomic.AtomicLong(0L)
+        val latch = CountDownLatch(1)
+        
+        val worker = BoundedCaptureWorker("timing-causal", capacity = 1)
+        val task = Runnable {
+            startedAt.set(System.nanoTime())
+            latch.countDown()
+        }
+        
+        submittedAt.set(System.nanoTime())
+        worker.submit(task)
+        
+        assertTrue(latch.await(2, TimeUnit.SECONDS))
+        assertTrue("workerStartedAt >= persistenceSubmittedAt", startedAt.get() >= submittedAt.get())
+        worker.close()
     }
 }

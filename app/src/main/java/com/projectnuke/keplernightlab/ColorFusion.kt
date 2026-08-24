@@ -665,8 +665,8 @@ fun captureYuvBurstColorWithMotion(
             }
         )
         val yuvTimingHooks = object : YuvCaptureTimingHooks {
-            override fun onPersistenceQueued(frameIndex: Int) {
-                captureTimingLedger.recordPersistenceQueued(frameIndex)
+            override fun onPersistenceSubmitted(frameIndex: Int) {
+                captureTimingLedger.recordPersistenceSubmitted(frameIndex)
             }
 
             override fun onWorkerStarted(frameIndex: Int) {
