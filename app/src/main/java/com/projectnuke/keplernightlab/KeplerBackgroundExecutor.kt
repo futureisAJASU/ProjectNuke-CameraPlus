@@ -59,7 +59,17 @@ internal data class BackgroundTerminalSpec(
  */
 internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
 
+    /**
+     * Instrumentation/test-only deterministic gate at heavy-lane entry. It
+     * MUST stay null in production: installed gates delay the single lane at
+     * a safe boundary (before any job work begins) so Stage-B overlap can be
+     * proven without arbitrary sleeps. Never cancels or reorders work.
+     */
+    @Volatile
+    internal var heavyLaneGateForTest: (() -> Unit)? = null
+
     override fun execute(request: BackgroundProcessingRequest, appContext: Context) {
+        heavyLaneGateForTest?.invoke()
         val jobDir = request.exactJobDirectory
         val jobKind = request.jobKind
         val jobJson = try {
