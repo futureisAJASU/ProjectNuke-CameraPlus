@@ -174,7 +174,14 @@ internal data class HardwareE2EJobSummary(
     val processingArtifactJournalCount: Int = 0,
     val processingArtifactJournalStates: List<String> = emptyList(),
     val processingArtifactJournalFinalNames: List<String> = emptyList(),
-    val processingArtifactInvalidJournalCount: Int = 0
+    val processingArtifactInvalidJournalCount: Int = 0,
+    /**
+     * Structured capture-stage timing evidence (Phase 4): parsed from the
+     * persisted "captureTiming" projection.  Null when the job has none.
+     */
+    val captureTiming: HardwareE2ECaptureTiming? = null,
+    /** Bounded background-lane stage durations from "backgroundStageTimings". */
+    val backgroundStageTimings: Map<String, Long> = emptyMap()
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("jobDirectory", jobDirectory)
@@ -245,6 +252,10 @@ internal data class HardwareE2EJobSummary(
         if (processingArtifactInvalidJournalCount > 0) {
             put("processingArtifactInvalidJournalCount", processingArtifactInvalidJournalCount)
         }
+        captureTiming?.let { put("captureTiming", it.toJson()) }
+        if (backgroundStageTimings.isNotEmpty()) {
+            put("backgroundStageTimings", JSONObject(backgroundStageTimings))
+        }
         error?.let { put("error", it) }
     }
 
@@ -310,7 +321,9 @@ internal data class HardwareE2EJobSummary(
             processingArtifactJournalCount = json.optInt("processingArtifactJournalCount", 0),
             processingArtifactJournalStates = json.optJSONArray("processingArtifactJournalStates").toStringList(),
             processingArtifactJournalFinalNames = json.optJSONArray("processingArtifactJournalFinalNames").toStringList(),
-            processingArtifactInvalidJournalCount = json.optInt("processingArtifactInvalidJournalCount", 0)
+            processingArtifactInvalidJournalCount = json.optInt("processingArtifactInvalidJournalCount", 0),
+            captureTiming = json.optJSONObject("captureTiming")?.let(HardwareE2ECaptureTiming::fromJson),
+            backgroundStageTimings = json.optJSONObject("backgroundStageTimings").toLongMap()
         )
     }
 }
@@ -343,6 +356,18 @@ internal data class HardwareE2ERunReport(
      */
     val resultJobDirectoryPath: String? = null,
     val finalJob: HardwareE2EJobSummary?,
+    /**
+     * Flattened physical-diagnosis timings promoted from the finalized job
+     * summary (Phase 4).  Null when no capture timing evidence exists.
+     */
+    val cameraAcquisitionMs: Long? = null,
+    val persistenceDrainMs: Long? = null,
+    val handoffSettlementMs: Long? = null,
+    val captureStageTotalMs: Long? = null,
+    /** Background processing-lane duration ("backgroundStageTimings.processingMs"). */
+    val backgroundProcessingMs: Long? = null,
+    /** Background export-lane duration ("backgroundStageTimings.exportMs"). */
+    val backgroundExportMs: Long? = null,
     val status: HardwareE2EClassification,
     val failure: String? = null,
     val classificationReason: HardwareE2EClassificationReason = HardwareE2EClassificationReason.INCOMPLETE_REPORT,
@@ -372,6 +397,12 @@ internal data class HardwareE2ERunReport(
         latestJobDirectory?.let { put("latestJobDirectory", it) }
         resultJobDirectoryPath?.let { put("resultJobDirectoryPath", it) }
         finalJob?.let { put("finalJob", it.toJson()) }
+        cameraAcquisitionMs?.let { put("cameraAcquisitionMs", it) }
+        persistenceDrainMs?.let { put("persistenceDrainMs", it) }
+        handoffSettlementMs?.let { put("handoffSettlementMs", it) }
+        captureStageTotalMs?.let { put("captureStageTotalMs", it) }
+        backgroundProcessingMs?.let { put("backgroundProcessingMs", it) }
+        backgroundExportMs?.let { put("backgroundExportMs", it) }
         put("status", status.name)
         put("classificationReason", classificationReason.name)
         put("jobCorrelation", jobCorrelation.name)
@@ -458,6 +489,12 @@ internal data class HardwareE2ERunReport(
                 latestJobDirectory = json.optString("latestJobDirectory").takeIf { it.isNotBlank() },
                 resultJobDirectoryPath = json.optString("resultJobDirectoryPath").takeIf { it.isNotBlank() },
                 finalJob = json.optJSONObject("finalJob")?.let(HardwareE2EJobSummary::fromJson),
+                cameraAcquisitionMs = json.optNullableLong("cameraAcquisitionMs"),
+                persistenceDrainMs = json.optNullableLong("persistenceDrainMs"),
+                handoffSettlementMs = json.optNullableLong("handoffSettlementMs"),
+                captureStageTotalMs = json.optNullableLong("captureStageTotalMs"),
+                backgroundProcessingMs = json.optNullableLong("backgroundProcessingMs"),
+                backgroundExportMs = json.optNullableLong("backgroundExportMs"),
                 status = runCatching {
                     HardwareE2EClassification.valueOf(json.optString("status"))
                 }.getOrDefault(HardwareE2EClassification.INCOMPLETE),
@@ -499,6 +536,150 @@ private fun JSONObject?.toLongMap(): Map<String, Long> {
 
 private fun JSONObject.optNullableBoolean(key: String): Boolean? =
     if (!has(key) || isNull(key)) null else optBoolean(key)
+
+/**
+ * Bounded per-frame persistence timing derived from the persisted
+ * "captureTiming" instants (nanoseconds on the monotonic clock).  Durations are
+ * REAL segment boundaries - never inferred:
+ *  - conversionMs: worker start -> conversion completed (buffered path; null when unset)
+ *  - encodeMs: conversion (or worker start) -> encode finished = PNG compression
+ *    + candidate write span
+ *  - fsyncMs: conversion -> durable sink sync returned (buffered path)
+ *  - verifyMs: final-file write -> verification succeeded
+ */
+internal data class HardwareE2EFrameTiming(
+    val frameIndex: Int,
+    val conversionMs: Long? = null,
+    val encodeMs: Long? = null,
+    val fsyncMs: Long? = null,
+    val verifyMs: Long? = null
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("frameIndex", frameIndex)
+        conversionMs?.let { put("conversionMs", it) }
+        encodeMs?.let { put("encodeMs", it) }
+        fsyncMs?.let { put("fsyncMs", it) }
+        verifyMs?.let { put("verifyMs", it) }
+    }
+
+    companion object {
+        fun fromJson(json: JSONObject): HardwareE2EFrameTiming = HardwareE2EFrameTiming(
+            frameIndex = json.optInt("frameIndex"),
+            conversionMs = json.optNullableLong("conversionMs"),
+            encodeMs = json.optNullableLong("encodeMs"),
+            fsyncMs = json.optNullableLong("fsyncMs"),
+            verifyMs = json.optNullableLong("verifyMs")
+        )
+    }
+}
+
+private fun nsSegmentMs(fromNs: Long?, toNs: Long?): Long? =
+    if (fromNs == null || toNs == null || fromNs <= 0L || toNs <= 0L || toNs < fromNs) null else (toNs - fromNs) / 1_000_000L
+
+/**
+ * Structured snapshot of the persisted capture-stage timing evidence for ONE
+ * job.  Pure data: round-trips through JSON without touching the filesystem.
+ */
+internal data class HardwareE2ECaptureTiming(
+    val requestedFrames: Int,
+    val cameraAcquisitionMs: Long,
+    val persistenceDrainMs: Long,
+    val handoffSettlementMs: Long,
+    val captureStageTotalMs: Long,
+    /** Sum of per-frame encode segments across persisted frames (0 when unset). */
+    val aggregateEncodeMs: Long = 0L,
+    /** Sum of per-frame candidate-fsync segments (buffered path; 0 when unset). */
+    val aggregateFsyncMs: Long = 0L,
+    /** Sum of per-frame final-verify segments (0 when unset). */
+    val aggregateVerifyMs: Long = 0L,
+    /** Slowest single-frame encode segment - the foreground bottleneck signal. */
+    val maxFrameEncodeMs: Long = 0L,
+    val frames: List<HardwareE2EFrameTiming> = emptyList()
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("requestedFrames", requestedFrames)
+        put("cameraAcquisitionMs", cameraAcquisitionMs)
+        put("persistenceDrainMs", persistenceDrainMs)
+        put("handoffSettlementMs", handoffSettlementMs)
+        put("captureStageTotalMs", captureStageTotalMs)
+        put("aggregateEncodeMs", aggregateEncodeMs)
+        put("aggregateFsyncMs", aggregateFsyncMs)
+        put("aggregateVerifyMs", aggregateVerifyMs)
+        put("maxFrameEncodeMs", maxFrameEncodeMs)
+        put("frames", JSONArray(frames.map { it.toJson() }))
+    }
+
+    companion object {
+        fun fromJson(json: JSONObject): HardwareE2ECaptureTiming = HardwareE2ECaptureTiming(
+            requestedFrames = json.optInt("requestedFrames"),
+            cameraAcquisitionMs = json.optLong("cameraAcquisitionMs"),
+            persistenceDrainMs = json.optLong("persistenceDrainMs"),
+            handoffSettlementMs = json.optLong("handoffSettlementMs"),
+            captureStageTotalMs = json.optLong("captureStageTotalMs"),
+            aggregateEncodeMs = json.optLong("aggregateEncodeMs"),
+            aggregateFsyncMs = json.optLong("aggregateFsyncMs"),
+            aggregateVerifyMs = json.optLong("aggregateVerifyMs"),
+            maxFrameEncodeMs = json.optLong("maxFrameEncodeMs"),
+            frames = buildList {
+                val array = json.optJSONArray("frames") ?: JSONArray()
+                repeat(array.length()) { index ->
+                    array.optJSONObject(index)?.let { add(HardwareE2EFrameTiming.fromJson(it)) }
+                }
+            }
+        )
+
+        /**
+         * Derives the structured timing from the persisted "captureTiming" JSON
+         * projection of [CaptureTimingLedger].  Bounded arithmetic only.
+         */
+        fun fromCaptureTimingJson(timing: JSONObject): HardwareE2ECaptureTiming {
+            val framesArray = timing.optJSONArray("frames") ?: JSONArray()
+            val frameTimings = buildList {
+                repeat(framesArray.length().coerceAtMost(MAX_TIMING_FRAMES)) { index ->
+                    val frame = framesArray.optJSONObject(index) ?: return@repeat
+                    val conversion = nsSegmentMs(
+                        frame.optLong("workerStartedAt").takeIf { it > 0 },
+                        frame.optLong("conversionCompletedAt").takeIf { it > 0 }
+                    )
+                    val encodeStart = frame.optLong("conversionCompletedAt")
+                        .takeIf { it > 0 } ?: frame.optLong("workerStartedAt").takeIf { it > 0 }
+                    val encode = nsSegmentMs(encodeStart, frame.optLong("encodeFinishedAt").takeIf { it > 0 })
+                    val fsync = nsSegmentMs(
+                        frame.optLong("conversionCompletedAt").takeIf { it > 0 },
+                        frame.optLong("fsyncFinishedAt").takeIf { it > 0 }
+                    )
+                    val verify = nsSegmentMs(
+                        frame.optLong("writeFinishedAt").takeIf { it > 0 },
+                        frame.optLong("verifiedAt").takeIf { it > 0 }
+                    )
+                    add(
+                        HardwareE2EFrameTiming(
+                            frameIndex = frame.optInt("frameIndex", index),
+                            conversionMs = conversion,
+                            encodeMs = encode,
+                            fsyncMs = fsync,
+                            verifyMs = verify
+                        )
+                    )
+                }
+            }
+            return HardwareE2ECaptureTiming(
+                requestedFrames = timing.optInt("requestedFrames"),
+                cameraAcquisitionMs = timing.optLong("cameraAcquisitionMs"),
+                persistenceDrainMs = timing.optLong("persistenceDrainMs"),
+                handoffSettlementMs = timing.optLong("handoffSettlementMs"),
+                captureStageTotalMs = timing.optLong("captureStageTotalMs"),
+                aggregateEncodeMs = frameTimings.sumOf { it.encodeMs ?: 0L },
+                aggregateFsyncMs = frameTimings.sumOf { it.fsyncMs ?: 0L },
+                aggregateVerifyMs = frameTimings.sumOf { it.verifyMs ?: 0L },
+                maxFrameEncodeMs = frameTimings.mapNotNull { it.encodeMs }.maxOrNull() ?: 0L,
+                frames = frameTimings
+            )
+        }
+
+        private const val MAX_TIMING_FRAMES = 32
+    }
+}
 
 // Diagnostics treat blank as unknown; the faithful shared optNullableString
 // preserves "" exactly, so report parsing uses this blank-normalized variant.
@@ -862,6 +1043,12 @@ internal class HardwareE2ERunRecorder private constructor(
                 val updated = report.copy(
                     latestJobDirectory = correlation.summary?.jobDirectory ?: report.latestJobDirectory,
                     finalJob = correlation.summary,
+                    cameraAcquisitionMs = correlation.summary?.captureTiming?.cameraAcquisitionMs,
+                    persistenceDrainMs = correlation.summary?.captureTiming?.persistenceDrainMs,
+                    handoffSettlementMs = correlation.summary?.captureTiming?.handoffSettlementMs,
+                    captureStageTotalMs = correlation.summary?.captureTiming?.captureStageTotalMs,
+                    backgroundProcessingMs = correlation.summary?.backgroundStageTimings?.get("processingMs"),
+                    backgroundExportMs = correlation.summary?.backgroundStageTimings?.get("exportMs"),
                     status = decision.status,
                     failure = if (decision.status == HardwareE2EClassification.PASS) {
                         null
@@ -1314,7 +1501,11 @@ internal class HardwareE2ERunRecorder private constructor(
             processingArtifactJournalCount = journalScan?.validJournals?.size ?: 0,
             processingArtifactJournalStates = processingArtifactJournalStates,
             processingArtifactJournalFinalNames = processingArtifactJournalFinalNames,
-            processingArtifactInvalidJournalCount = journalScan?.invalidFiles?.size ?: 0
+            processingArtifactInvalidJournalCount = journalScan?.invalidFiles?.size ?: 0,
+            captureTiming = runCatching {
+                job.optJSONObject("captureTiming")?.let(HardwareE2ECaptureTiming::fromCaptureTimingJson)
+            }.getOrNull(),
+            backgroundStageTimings = job.optJSONObject("backgroundStageTimings").toLongMap()
         )
     }
 
