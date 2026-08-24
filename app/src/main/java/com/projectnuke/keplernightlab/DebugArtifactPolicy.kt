@@ -22,9 +22,41 @@ internal object DebugArtifactPolicy {
     const val JOB_KEY = "diagnosticIntent"
     const val STATUS_DISABLED = "DISABLED_BY_POLICY"
 
+    /**
+     * The ONLY scenario name that does NOT represent an explicit debug run.
+     * The real debug entry point (CameraScreen.runCameraJob with a real
+     * instrumentation scenario) arms [diagnosticIntentArmedForNewJobs]; normal
+     * user captures keep the production scenario and never arm it.
+     */
+    const val PRODUCTION_DIAGNOSTIC_SCENARIO = "production_main_camera_screen"
+
     /** Test-only override; production code must not write it. */
     @Volatile
     var overrideForTest: Boolean? = null
+
+    /**
+     * Process-scoped intent armed by the REAL debug entry point for the CURRENT
+     * capture.  Never assumed from a mere key presence: a job is durably
+     * stamped with [JOB_KEY] at creation time only while this is armed, and
+     * heavy images additionally require a debug build ([imageArtifactsEnabled]).
+     */
+    @Volatile
+    var diagnosticIntentArmedForNewJobs: Boolean = false
+
+    fun setDiagnosticIntentArmed(armed: Boolean) {
+        diagnosticIntentArmedForNewJobs = armed
+    }
+
+    /**
+     * Durable stamping of NEW capture jobs: called once when the job metadata
+     * is created so the in-memory flag becomes durable truth before any
+     * downstream debug-artifact decision reads the job.
+     */
+    fun stampIntentForNewJob(jobDirStamp: (String, Boolean) -> Unit) {
+        if (diagnosticIntentArmedForNewJobs) {
+            jobDirStamp(JOB_KEY, true)
+        }
+    }
 
     /** True when heavy diagnostic IMAGE artifacts may be generated for this job. */
     fun imageArtifactsEnabled(job: JSONObject): Boolean =

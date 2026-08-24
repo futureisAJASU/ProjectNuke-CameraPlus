@@ -904,7 +904,7 @@ LaunchedEffect(Unit) {
         startMessage: String,
         requestedFrames: Int = 0,
         timeoutMillis: Long = 120_000L,
-        diagnosticScenario: String = "production_main_camera_screen",
+        diagnosticScenario: String = DebugArtifactPolicy.PRODUCTION_DIAGNOSTIC_SCENARIO,
         job: (
             KeplerPipelineCancellationToken,
             KeplerCaptureCancellationHandle,
@@ -912,6 +912,13 @@ LaunchedEffect(Unit) {
             CameraPipelineEventSink
         ) -> Unit
     ) {
+        // Explicit durable diagnostic intent from the REAL debug entry point:
+        // only an actual instrumentation/debug scenario arms heavy-image intent
+        // for the job about to be created.  Normal user captures keep the
+        // production scenario and never arm it.
+        DebugArtifactPolicy.setDiagnosticIntentArmed(
+            diagnosticScenario != DebugArtifactPolicy.PRODUCTION_DIAGNOSTIC_SCENARIO
+        )
         val scenario = HardwareE2ERunScenario(
             requestedTestScenario = diagnosticScenario,
             selectedPipelineMode = pipelineMode.name,

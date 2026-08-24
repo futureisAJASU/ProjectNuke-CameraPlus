@@ -1592,7 +1592,7 @@ private fun writeFusionDebugMetadata(
         .put("fusionAlignmentSummary", alignments)
 }
 
-private fun generateFusionDebugArtifacts(
+internal fun generateFusionDebugArtifacts(
     jobDir: File,
     job: JSONObject,
     referenceFile: File,
@@ -1601,11 +1601,13 @@ private fun generateFusionDebugArtifacts(
     params: ClassicYuvFusionParams
 ) {
     try {
-        // Phase 7: heavy diagnostic IMAGES require explicit debug/diagnostic
-        // intent.  Without it only the required bounded production preview is
-        // written; all fusion debug JSON evidence is still produced elsewhere.
+        // Phase 7 policy + Phase-A corrective split: heavy diagnostic IMAGES
+        // require explicit debug/diagnostic intent.  Bounded quality METRICS /
+        // JSON evidence are UNCONDITIONAL production diagnostic contract and
+        // are computed+persisted on BOTH paths; only expensive full-resolution
+        // image generation is gated.
         if (!DebugArtifactPolicy.imageArtifactsEnabled(job)) {
-            saveBoundedDiagnosticPreview(fusedBitmap, File(jobDir, "yuv_final_preview.png"))
+            writeBoundedQualityEvidence(job, jobDir, referenceFile, mergedBitmap, fusedBitmap, params)
             job.put("debugArtifactStatus", DebugArtifactPolicy.STATUS_DISABLED)
                 .put("debugArtifactImagesEnabled", false)
                 .put("yuvFinalPreviewFile", "yuv_final_preview.png")
@@ -1709,6 +1711,68 @@ private fun generateFusionDebugArtifacts(
     } catch (e: Exception) {
         job.put("debugArtifactStatus", "FAILED")
             .put("debugArtifactError", "${e.javaClass.simpleName}: ${e.message}".take(240))
+    }
+}
+
+/**
+ * UNCONDITIONAL bounded quality evidence for the image-artifacts-disabled path.
+ * Computes the same BOUNDED previews the enabled path uses, derives the fusion
+ * quality metrics JSON ([writeFusionQualityDiagnostics] merges them into the
+ * job; the pipeline persists them via yuv_debug.json), and recycles every
+ * intermediate.  NO heavy full-resolution diagnostic image is written here;
+ * the compare/crop sheets inside [writeFusionQualityDiagnostics] stay gated by
+ * [DebugArtifactPolicy].
+ */
+private fun writeBoundedQualityEvidence(
+    job: JSONObject,
+    jobDir: File,
+    referenceFile: File,
+    mergedBitmap: Bitmap,
+    fusedBitmap: Bitmap,
+    params: ClassicYuvFusionParams
+) {
+    val referencePreview = decodeDebugPreview(referenceFile)
+    var yuvBeforeDenoisePreview: Bitmap? = null
+    var yuvNoSharpenPreview: Bitmap? = null
+    var yuvFinalPreview: Bitmap? = null
+    try {
+        yuvBeforeDenoisePreview = saveBoundedDiagnosticPreview(
+            mergedBitmap,
+            File(jobDir, "yuv_fused_before_denoise_preview.png")
+        )
+        yuvNoSharpenPreview = applyClassicYuvPostProcessing(
+            yuvBeforeDenoisePreview,
+            params.copy(sharpenAmount = 0f, localContrastAmount = 0f)
+        )
+        yuvFinalPreview = saveBoundedDiagnosticPreview(
+            fusedBitmap,
+            File(jobDir, "yuv_final_preview.png")
+        )
+        job.put("yuvFusedBeforeDenoisePreviewFile", "yuv_fused_before_denoise_preview.png")
+            .put("yuvFusedAfterDenoiseNoSharpenPreviewFile", "yuv_fused_after_denoise_no_sharpen_preview.png")
+        writeFusionQualityDiagnostics(
+            job = job,
+            jobDir = jobDir,
+            prefix = "yuv",
+            reference = referencePreview,
+            fused = yuvBeforeDenoisePreview,
+            denoised = yuvNoSharpenPreview,
+            finalImage = yuvFinalPreview,
+            compareFileName = "yuv_compare_reference_vs_final.png"
+        )
+    } finally {
+        var cleanupFailure: Throwable? = null
+        listOfNotNull(referencePreview, yuvBeforeDenoisePreview, yuvNoSharpenPreview, yuvFinalPreview)
+            .forEach { bitmap ->
+                try {
+                    bitmap.recycle()
+                } catch (failure: Throwable) {
+                    cleanupFailure = combineSettlementFailure(cleanupFailure, failure)
+                }
+            }
+        // Recycling failures are diagnostics-only on this path: never fail the
+        // required output pipeline for a debug-bitmap cleanup.
+        cleanupFailure?.let { android.util.Log.w("ClassicYuvFusion", "quality evidence bitmap recycle failed", it) }
     }
 }
 

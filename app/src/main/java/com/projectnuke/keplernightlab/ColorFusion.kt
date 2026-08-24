@@ -597,6 +597,13 @@ fun captureYuvBurstColorWithMotion(
             kind = KeplerActiveOperationKind.CAPTURE_YUV,
             ownerLease = durableCaptureLease
         )
+        // Durable diagnostic intent: only armed by the real debug entry point.
+        // Stamped into the job metadata at CREATION so every later
+        // debug-artifact decision (heavy images) reads durable truth, never an
+        // assumed key.
+        DebugArtifactPolicy.stampIntentForNewJob { key, value ->
+            KeplerJobMetadata.update(currentBurstDir) { job -> job.put(key, value) }
+        }
         } catch (failure: Throwable) {
             durableCaptureLease?.release()
             throw failure
