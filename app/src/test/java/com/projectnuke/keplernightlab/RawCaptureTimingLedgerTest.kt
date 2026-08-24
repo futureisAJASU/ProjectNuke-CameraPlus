@@ -191,6 +191,36 @@ class RawCaptureTimingLedgerTest {
     }
 
     @Test
+    fun rawPersistence_fourFramesStrictlyDurableBeforeHandoff() {
+        // Handoff publication is only truthful after EVERY frame reached its
+        // durable commit boundary; the ledger must expose that ordering.
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index ->
+                image(index, 110 + index * 10L)
+                result(index, 112 + index * 10L)
+            }
+            persistFrame(0, 120, 130, 140, 145, 150, 25_000_000L, 20, 5)
+            persistFrame(1, 155, 165, 175, 180, 185, 25_000_000L, 20, 5)
+            persistFrame(2, 190, 200, 210, 215, 220, 25_000_000L, 20, 5)
+            // Frame 3 NOT yet committed: drain/handoff would be a lie here.
+        }
+        sequence.drain(240)
+        val premature = sequence.ledger.snapshot()
+        // Only three frames committed so far; handoff must still be unset.
+        assertEquals(ms(220), premature.lastFrameCommittedAt)
+        assertEquals(0L, premature.processingHandoffPublishedAt)
+
+        sequence.persistFrame(3, 245, 255, 265, 270, 275, 25_000_000L, 20, 5)
+        sequence.handoff(300)
+
+        val snap = sequence.ledger.snapshot()
+        assertEquals(ms(275), snap.lastFrameCommittedAt)
+        assertTrue(snap.processingHandoffPublishedAt >= snap.lastFrameCommittedAt)
+        assertEquals(ms(300), snap.processingHandoffPublishedAt)
+    }
+
+    @Test
     fun timingSnapshot_roundTripsNonDefaultRawFields() {
         val sequence = fourFrameSequence()
         val json = sequence.ledger.toJson()

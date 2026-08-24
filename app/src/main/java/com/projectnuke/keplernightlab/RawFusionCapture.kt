@@ -1232,8 +1232,13 @@ fun captureRawBurstForFusion(
                     val writeStats = writeCompactRaw16(image, raw16Temp, captureTimingLedger, index)
                     KeplerJobMetadata.atomicReplace(raw16Temp, raw16File)
                     captureTimingLedger.recordWriteFinished(index)
+                    // SINGLE strict post-publish verification of the FINAL file:
+                    // exact size AND content digest equality against the bytes
+                    // streamed into the durable sink. The pre-rename temp
+                    // read-back (2 extra full payload reads) is intentionally
+                    // gone - only verified final bytes reach the manifest.
                     val expectedRaw16Bytes = image.width.toLong() * image.height.toLong() * 2L
-                    verifyRaw16Payload(raw16File, expectedRaw16Bytes)
+                    verifyRaw16Payload(raw16File, expectedRaw16Bytes, writeStats.payloadSha256)
                     captureTimingLedger.recordVerified(index)
                     captureTimingLedger.recordRawFrameWriteStats(index, writeStats.bytesWritten, writeStats.writeDurationMs)
                 } finally {
@@ -3004,8 +3009,40 @@ fun chooseRawFusionSizeV2(
 internal class Raw16WriteStats(
     val bytesWritten: Long,
     val writeDurationMs: Long,
-    val syncDurationMs: Long
+    val syncDurationMs: Long,
+    /** SHA-256 hex over the exact compact payload handed to the kernel. */
+    val payloadSha256: String
 )
+
+/** Which extraction strategy wrote a raw16 frame (observability + test seam). */
+internal enum class Raw16WriteStrategy {
+    /** Contiguous compact plane: bulk sequential row transfers, padding-free by layout. */
+    SEQUENTIAL_BULK,
+    /** Padded rowStride: per-row bulk pack through one reusable bounded buffer. */
+    PADDED_ROW_PACK,
+    /** Legacy scalar path (only for exotic pixelStride != 1 layouts). */
+    SCALAR_FALLBACK
+}
+
+/** Streaming SHA-256 over exactly the bytes that reach the durable sink. */
+internal class DigestingOutputStream(private val downstream: OutputStream) : OutputStream() {
+    private val digest = java.security.MessageDigest.getInstance("SHA-256")
+
+    fun digestHex(): String = digest.digest().joinToString("") { "%02x".format(it) }
+
+    override fun write(b: Int) {
+        digest.update(b.toByte())
+        downstream.write(b)
+    }
+
+    override fun write(buffer: ByteArray, offset: Int, length: Int) {
+        if (length > 0) digest.update(buffer, offset, length)
+        downstream.write(buffer, offset, length)
+    }
+
+    override fun flush() = downstream.flush()
+    override fun close() = downstream.close()
+}
 
 /**
  * Phase-2 latency-audit evidence: the HAL's OWN advertised timing limits for
@@ -3110,11 +3147,16 @@ private fun writeCompactRaw16(
     Trace.beginSection("Kepler_RAW_Persist")
     var writeMs = 0L
     var syncMs = 0L
+    var strategy = Raw16WriteStrategy.SCALAR_FALLBACK
     try {
         FileOutputStream(file).use { rawOutput ->
+            val digesting = DigestingOutputStream(rawOutput)
             val writeStartNs = System.nanoTime()
-            writeRaw16Rows(width, height, rowStride, pixelStride, limit, buffer, rawOutput)
+            strategy = writeRaw16Rows(width, height, rowStride, pixelStride, limit, buffer, digesting)
             writeMs = (System.nanoTime() - writeStartNs) / 1_000_000L
+            // Every payload byte passed through the digesting sink; no userspace
+            // bytes may remain between here and the fsync barrier.
+            digesting.flush()
             Trace.beginSection("Kepler_RAW_Sync")
             val syncStartNs = System.nanoTime()
             rawOutput.fd.sync()
@@ -3123,13 +3165,12 @@ private fun writeCompactRaw16(
             // Recorded immediately after the REAL fsync returned.
             timing?.recordFsyncFinished(frameIndex)
             timing?.recordRawFrameSyncStats(syncMs)
+            val expectedSize = width.toLong() * height.toLong() * 2L
+            return Raw16WriteStats(expectedSize, writeMs, syncMs, digesting.digestHex())
         }
     } finally {
         Trace.endSection()
     }
-    val expectedSize = width.toLong() * height.toLong() * 2L
-    verifyRaw16Payload(file, expectedSize)
-    return Raw16WriteStats(expectedSize, writeMs, syncMs)
 }
 
 internal fun writeRaw16Rows(
@@ -3140,10 +3181,31 @@ internal fun writeRaw16Rows(
     limit: Int,
     buffer: ByteBuffer,
     sink: OutputStream
-) {
-    val rowBytes = ByteArray(width * 2)
+): Raw16WriteStrategy {
+    val payloadRowBytes = width * 2
+    // ONE reusable bounded row buffer; never a full-frame allocation.
+    val rowBytes = ByteArray(payloadRowBytes)
     val output = BufferedOutputStream(sink)
     try {
+        if (pixelStride == 1) {
+            for (y in 0 until height) {
+                val rowOffset = y * rowStride
+                val rowEnd = rowOffset + payloadRowBytes
+                if (rowEnd <= limit) {
+                    // Bulk transfer of exactly one compact row per JNI crossing.
+                    val row = buffer.duplicate()
+                    row.position(rowOffset)
+                    row.limit(rowEnd)
+                    row.get(rowBytes, 0, payloadRowBytes)
+                } else {
+                    // Matches the legacy per-pixel guard: short rows zero-fill.
+                    java.util.Arrays.fill(rowBytes, 0)
+                }
+                output.write(rowBytes, 0, payloadRowBytes)
+            }
+            return if (rowStride == payloadRowBytes) Raw16WriteStrategy.SEQUENTIAL_BULK
+            else Raw16WriteStrategy.PADDED_ROW_PACK
+        }
         for (y in 0 until height) {
             val row = y * rowStride
             var out = 0
@@ -3159,8 +3221,9 @@ internal fun writeRaw16Rows(
             }
             output.write(rowBytes)
         }
-        output.flush()
+        return Raw16WriteStrategy.SCALAR_FALLBACK
     } finally {
+        output.flush()
         // Caller owns sink lifetime; do not close output here.
     }
 }
@@ -3170,6 +3233,24 @@ internal fun verifyRaw16Payload(file: File, expectedSize: Long): NoFollowFileSys
     val digest = NoFollowFileSystem.digestVerified(file)
     check(digest.size == expectedSize) {
         "RAW16 output invalid: ${file.absolutePath}, size=${digest.size}, expected=$expectedSize"
+    }
+    return digest
+}
+
+/**
+ * Strict fail-closed verification: the durable final file must match BOTH the
+ * exact compact size AND the SHA-256 of the bytes streamed at write time.
+ * Any mismatch throws, so a frame can never be adopted into the manifest
+ * with unproven content truth.
+ */
+internal fun verifyRaw16Payload(
+    file: File,
+    expectedSize: Long,
+    expectedSha256: String
+): NoFollowFileSystem.StreamDigest {
+    val digest = verifyRaw16Payload(file, expectedSize)
+    check(digest.sha256.equals(expectedSha256, ignoreCase = true)) {
+        "RAW16 content digest mismatch: ${file.absolutePath}"
     }
     return digest
 }

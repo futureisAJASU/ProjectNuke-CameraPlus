@@ -92,3 +92,44 @@ Targets (in priority order):
   sequentially (no intermediate arrays).
 - C. Padded-stride row packing through ONE reusable bounded direct buffer
   (no per-row/per-frame allocations), preserving exact compact payload.
+
+## Phase-3 result (implemented)
+
+1. **Verification consolidation (target A)**: the pre-rename temp read-back
+   (2 full payload reads) is REMOVED. The single remaining post-publish
+   `verifyRaw16Payload(final, size, sha256)` now additionally enforces
+   SHA-256 equality against the digest streamed at write time — previously
+   only SIZE was asserted. Net: 4 full reads/frame -> 2 (the strict
+   `NoFollowFileSystem.digestVerified` stream+fence is retained for the
+   final artifact), while content truth is STRICTLY STRONGER than before.
+2. **Bulk extraction (targets B/C)**: `writeRaw16Rows` now transfers one
+   complete row per JNI crossing via `ByteBuffer.duplicate()` bulk gets:
+   - `SEQUENTIAL_BULK` when rowStride == width*2 (contiguous plane);
+   - `PADDED_ROW_PACK` when pixelStride==1 with padded stride (one reusable
+     `ByteArray(width*2)` row buffer; padding stripped; zero-fill fallback
+     preserved for short planes);
+   - `SCALAR_FALLBACK` only for exotic pixelStride != 1 layouts.
+   The scalar per-byte loop (~50M JNI crossings per 25 MB frame) is gone
+   from all production layouts. No full-frame allocation exists anywhere on
+   the path.
+3. **Digest-at-write**: every payload byte flows through a
+   `DigestingOutputStream` (SHA-256) placed between row emission and the
+   durable sink, so the write-time digest covers EXACTLY the bytes handed to
+   the kernel, independent of extraction strategy.
+4. **Durability invariants unchanged**: temp write -> fd.sync() ->
+   atomicReplace -> final verify (fail-closed) -> owner adoption
+   (`recordCommitted`) -> drain -> terminal manifest -> handoff publish ->
+   resources settled -> CaptureStageComplete. fsync count is unchanged
+   (exactly one payload sync per frame). Failure/cancellation still fails
+   the frame closed (never adopted) and closes the Image exactly once.
+5. **Removed foreground work summary** (answers "what consumed the time"):
+   - 50 MB/frame of redundant read-back I/O (two full reads);
+   - ~50M scalar JNI byte reads/frame;
+   - nothing else was removed: DNG stays fully skipped when NOT_REQUESTED,
+     no preview/debug/fusion work existed before handoff.
+
+Expected physical effect on SM-S921N: `postAcquisitionToShutterMs`
+(= captureStageCompleteAt - cameraAcquisitionCompleteAt) should drop by
+roughly the eliminated read-back span (~100 MB reads/burst) plus the
+extraction CPU win, bounded below by the mandatory 2 final-read passes
+(~50 MB) + 4 fsyncs + metadata writes.
