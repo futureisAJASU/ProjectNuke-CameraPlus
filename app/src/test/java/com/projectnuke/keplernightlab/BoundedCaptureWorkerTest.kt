@@ -472,6 +472,8 @@ class BoundedCaptureWorkerTest {
         release.countDown()
         worker.close()
         assertTrue(worker.awaitTermination(5_000))
+    }
+
     @Test
     fun workerExecutionCannotPrecedeSubmissionTimestamp() {
         val submittedAt = java.util.concurrent.atomic.AtomicLong(0L)

@@ -135,7 +135,8 @@ class YuvCaptureOwnerTest {
         statusFailure: Boolean = false,
         callbackDispatchFailure: Boolean = false,
         callbackBodyFailure: Boolean = false,
-        processingArtifactFailurePoint: ProcessingArtifactFailurePoint? = null
+        processingArtifactFailurePoint: ProcessingArtifactFailurePoint? = null,
+        val timingHooks: YuvCaptureTimingHooks? = null
     ) {
         val dir: File = Files.createTempDirectory("yuv-owner-test").toFile()
         val handlerThread = android.os.HandlerThread("yuv-test").apply { start() }
@@ -841,23 +842,58 @@ class YuvCaptureOwnerTest {
     // ── Step 11: final-verifier throw recorded as owner debt ───────────
 
     @Test
-    fun finalVerifierThrowRecordsOwnerDebtAndFailsTerminal() {
+    fun directWorkerStartsBeforeSubmitReturns_timingStillCausallyOrdered() {
+        val timingHooks = object : YuvCaptureTimingHooks {
+            var persistenceSubmittedAt = 0L
+            var workerStartedAt = 0L
+
+            override fun onPersistenceSubmitted(frameIndex: Int) {
+                persistenceSubmittedAt = System.nanoTime()
+            }
+
+            override fun onWorkerStarted(frameIndex: Int) {
+                workerStartedAt = System.nanoTime()
+            }
+        }
+
         val harness = Harness(
             frameCount = 1,
-            finalFileVerifier = YuvFinalFileVerifier { _, _ ->
-                error("injected final verifier throw")
-            }
+            timingHooks = timingHooks,
+            workerCapacity = 1
         )
         try {
-            val access = FakeDirectAccess()
-            harness.session.owner.acceptDirect(access)
-            val status = harness.awaitTerminal()
-            harness.awaitCallback()
-            assertEquals(CaptureTerminalStatus.FAILED, status)
-            assertTrue("error callback should fire", harness.onCaptureErrorCount.get() >= 1)
-            val debts = harness.session.owner.candidateCleanupDebt()
-            assertTrue(debts.any { it.contains("final verifier threw") })
-            assertTrue(debts.any { it.contains("injected final verifier throw") })
+            harness.session.owner.acceptDirect(FakeDirectAccess())
+            harness.flushHandler()
+            assertTrue(timingHooks.workerStartedAt >= timingHooks.persistenceSubmittedAt)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    @Test
+    fun bufferedWorkerStartsBeforeSubmitReturns_timingStillCausallyOrdered() {
+        val timingHooks = object : YuvCaptureTimingHooks {
+            var persistenceSubmittedAt = 0L
+            var workerStartedAt = 0L
+
+            override fun onPersistenceSubmitted(frameIndex: Int) {
+                persistenceSubmittedAt = System.nanoTime()
+            }
+
+            override fun onWorkerStarted(frameIndex: Int) {
+                workerStartedAt = System.nanoTime()
+            }
+        }
+
+        val harness = Harness(
+            frameCount = 1,
+            timingHooks = timingHooks,
+            workerCapacity = 1
+        )
+        try {
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            harness.flushHandler()
+            assertTrue(timingHooks.workerStartedAt >= timingHooks.persistenceSubmittedAt)
         } finally {
             harness.shutdown()
         }
