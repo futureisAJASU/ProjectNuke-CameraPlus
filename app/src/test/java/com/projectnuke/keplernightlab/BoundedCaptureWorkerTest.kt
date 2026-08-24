@@ -210,7 +210,7 @@ class BoundedCaptureWorkerTest {
         assertTrue(worker.awaitTermination(5_000))
     }
 
-    // â”€â”€ Observability: rejection path reports correct task identity and throwable â”€
+    // ?€?€ Observability: rejection path reports correct task identity and throwable ?€
 
     @Test
     fun normalRejectionNotifiesDisposalFailureWithTaskIdentity() {
@@ -392,7 +392,7 @@ class BoundedCaptureWorkerTest {
         assertTrue(worker.awaitTermination(5_000))
     }
 
-    // â”€â”€ Phase 0.5: rejection failure persists to cleanup snapshot â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ?€?€ Phase 0.5: rejection failure persists to cleanup snapshot ?€?€?€?€?€?€?€?€?€
 
     @Test
     fun ordinaryRejectionFailurePersistsToFinalCleanupSnapshot() {

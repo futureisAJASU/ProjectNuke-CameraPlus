@@ -250,7 +250,8 @@ class YuvCaptureOwnerTest {
                 callbackLatch.countDown()
             },
             finalFileVerifier = finalFileVerifier,
-            productionResourceCoordinator = testCoordinator
+            productionResourceCoordinator = testCoordinator,
+            timingHooks = timingHooks
         )
 
         /** Wait deterministically for the terminal status to be reached and return it. */
@@ -842,58 +843,210 @@ class YuvCaptureOwnerTest {
     // ── Step 11: final-verifier throw recorded as owner debt ───────────
 
     @Test
-    fun directWorkerStartsBeforeSubmitReturns_timingStillCausallyOrdered() {
-        val timingHooks = object : YuvCaptureTimingHooks {
-            var persistenceSubmittedAt = 0L
-            var workerStartedAt = 0L
-
-            override fun onPersistenceSubmitted(frameIndex: Int) {
-                persistenceSubmittedAt = System.nanoTime()
-            }
-
-            override fun onWorkerStarted(frameIndex: Int) {
-                workerStartedAt = System.nanoTime()
-            }
-        }
-
+    fun finalVerifierThrowRecordsOwnerDebtAndFailsTerminal() {
         val harness = Harness(
             frameCount = 1,
-            timingHooks = timingHooks,
-            workerCapacity = 1
+            finalFileVerifier = YuvFinalFileVerifier { _, _ ->
+                error("injected final verifier throw")
+            }
         )
         try {
-            harness.session.owner.acceptDirect(FakeDirectAccess())
-            harness.flushHandler()
-            assertTrue(timingHooks.workerStartedAt >= timingHooks.persistenceSubmittedAt)
+            val access = FakeDirectAccess()
+            harness.session.owner.acceptDirect(access)
+            val status = harness.awaitTerminal()
+            harness.awaitCallback()
+            assertEquals(CaptureTerminalStatus.FAILED, status)
+            assertTrue("error callback should fire", harness.onCaptureErrorCount.get() >= 1)
+            val debts = harness.session.owner.candidateCleanupDebt()
+            assertTrue(debts.any { it.contains("final verifier threw") })
+            assertTrue(debts.any { it.contains("injected final verifier throw") })
         } finally {
             harness.shutdown()
         }
     }
 
-    @Test
-    fun bufferedWorkerStartsBeforeSubmitReturns_timingStillCausallyOrdered() {
-        val timingHooks = object : YuvCaptureTimingHooks {
-            var persistenceSubmittedAt = 0L
-            var workerStartedAt = 0L
+    // ------------------------------------------------------------------
+    // Persistence timing causal ordering (deterministic publication races)
+    // ------------------------------------------------------------------
 
-            override fun onPersistenceSubmitted(frameIndex: Int) {
-                persistenceSubmittedAt = System.nanoTime()
-            }
+    /**
+     * Captures every milestone the production [YuvCaptureTimingHooks] surface
+     * exposes. Timestamps are recorded exactly where each hook fires — never
+     * clamped, sorted, or rewritten after collection.
+     */
+    private class RecordingTimingHooks : YuvCaptureTimingHooks {
+        var persistenceSubmittedAt = 0L
+        var workerStartedAt = 0L
+        var encodeFinishedAt = 0L
+        var writeFinishedAt = 0L
+        var verifiedAt = 0L
 
-            override fun onWorkerStarted(frameIndex: Int) {
-                workerStartedAt = System.nanoTime()
-            }
+        override fun onPersistenceSubmitted(frameIndex: Int) {
+            persistenceSubmittedAt = System.nanoTime()
         }
 
-        val harness = Harness(
-            frameCount = 1,
-            timingHooks = timingHooks,
-            workerCapacity = 1
-        )
+        override fun onWorkerStarted(frameIndex: Int) {
+            workerStartedAt = System.nanoTime()
+        }
+
+        override fun onEncodeFinished(frameIndex: Int) {
+            encodeFinishedAt = System.nanoTime()
+        }
+
+        override fun onWriteFinished(frameIndex: Int) {
+            writeFinishedAt = System.nanoTime()
+        }
+
+        override fun onVerified(frameIndex: Int) {
+            verifiedAt = System.nanoTime()
+        }
+    }
+
+    /**
+     * Seam A applied to timing: the worker executes the WHOLE task synchronously
+     * INSIDE submit() BEFORE submit() returns. This deterministically recreates
+     * the historical dangerous interleaving (worker observes the task before the
+     * submit caller resumes) and proves the recorded submission instant still
+     * causally precedes every worker-side milestone.
+     */
+    @Test
+    fun directWorkerStartsBeforeSubmitReturns_timingStillCausallyOrdered() {
+        val hooks = RecordingTimingHooks()
+        val worker = StubWorker { task -> task.run(); true }
+        val harness = createRaceSession(frameCount = 1, worker = worker, timingHooks = hooks)
+        try {
+            harness.session.owner.acceptDirect(FakeDirectAccess())
+            harness.flush()
+
+            assertEquals(CaptureTerminalStatus.SUCCESS, harness.awaitTerminal())
+            assertTrue("submission instant must be recorded", hooks.persistenceSubmittedAt > 0)
+            assertTrue(
+                "workerStartedAt=${hooks.workerStartedAt} persistenceSubmittedAt=${hooks.persistenceSubmittedAt}",
+                hooks.persistenceSubmittedAt <= hooks.workerStartedAt
+            )
+            assertSettledState(harness, expectedPersisted = 1)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    /** Buffered-path twin of the direct synchronous-execution race above. */
+    @Test
+    fun bufferedWorkerStartsBeforeSubmitReturns_timingStillCausallyOrdered() {
+        val hooks = RecordingTimingHooks()
+        val worker = StubWorker { task -> task.run(); true }
+        val harness = createRaceSession(frameCount = 1, worker = worker, timingHooks = hooks)
         try {
             harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
-            harness.flushHandler()
-            assertTrue(timingHooks.workerStartedAt >= timingHooks.persistenceSubmittedAt)
+            harness.flush()
+
+            assertEquals(CaptureTerminalStatus.SUCCESS, harness.awaitTerminal())
+            assertTrue("submission instant must be recorded", hooks.persistenceSubmittedAt > 0)
+            assertTrue(
+                "workerStartedAt=${hooks.workerStartedAt} persistenceSubmittedAt=${hooks.persistenceSubmittedAt}",
+                hooks.persistenceSubmittedAt <= hooks.workerStartedAt
+            )
+            assertSettledState(harness, expectedPersisted = 1)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    /**
+     * Full completion before submit() returns: every milestone the production
+     * path emits must remain causally ordered after the submission instant.
+     * Only milestones actually produced by this exact production path are
+     * asserted ([YuvCaptureTimingHooks] exposes up to onVerified).
+     */
+    @Test
+    fun workerCompletesBeforeSubmitReturns_timingDoesNotInvert() {
+        val hooks = RecordingTimingHooks()
+        val worker = StubWorker { task -> task.run(); true }
+        val harness = createRaceSession(frameCount = 1, worker = worker, timingHooks = hooks)
+        try {
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            harness.flush()
+
+            assertEquals(CaptureTerminalStatus.SUCCESS, harness.awaitTerminal())
+            assertTrue(hooks.persistenceSubmittedAt > 0)
+            assertTrue(hooks.workerStartedAt > 0)
+            assertTrue(hooks.encodeFinishedAt > 0)
+            assertTrue(hooks.writeFinishedAt > 0)
+            assertTrue(hooks.verifiedAt > 0)
+            assertTrue(
+                "submitted=${hooks.persistenceSubmittedAt} started=${hooks.workerStartedAt}",
+                hooks.persistenceSubmittedAt <= hooks.workerStartedAt
+            )
+            assertTrue(
+                "started=${hooks.workerStartedAt} encodeFinished=${hooks.encodeFinishedAt}",
+                hooks.workerStartedAt <= hooks.encodeFinishedAt
+            )
+            assertTrue(
+                "encodeFinished=${hooks.encodeFinishedAt} writeFinished=${hooks.writeFinishedAt}",
+                hooks.encodeFinishedAt <= hooks.writeFinishedAt
+            )
+            assertTrue(
+                "writeFinished=${hooks.writeFinishedAt} verified=${hooks.verifiedAt}",
+                hooks.writeFinishedAt <= hooks.verifiedAt
+            )
+            // Joint proof the PendingPersistenceClaim pre-acquisition survived:
+            // the fully-completed-before-submit-return task leaves zero debt.
+            assertEquals(0, harness.session.owner.pendingPersistenceTasksForTest())
+            assertSettledState(harness, expectedPersisted = 1)
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    /**
+     * persistenceSubmittedAt means submission ATTEMPT, not successful queue
+     * admission: a rejected submission legitimately records the attempt instant
+     * while workerStartedAt stays zero because the task can never run.
+     */
+    @Test
+    fun rejectedSubmission_timingSemanticsAreTruthful() {
+        val hooks = RecordingTimingHooks()
+        val worker = StubWorker { _ -> false }
+        val harness = createRaceSession(frameCount = 1, worker = worker, timingHooks = hooks)
+        try {
+            harness.session.owner.acceptBuffered(FakeBufferedAccess(1000L))
+            harness.flush()
+
+            assertTrue(
+                "rejected submission must retain its attempt timestamp",
+                hooks.persistenceSubmittedAt > 0
+            )
+            assertEquals("rejected task must never start", 0L, hooks.workerStartedAt)
+            assertEquals(
+                "pre-acquired claim released exactly once",
+                0,
+                harness.session.owner.pendingPersistenceTasksForTest()
+            )
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    /**
+     * Smallest authority invariant: the submission hook fires BEFORE the task is
+     * published to the worker. Fails if onPersistenceSubmitted is ever moved back
+     * behind boundedWorker.submit().
+     */
+    @Test
+    fun acceptedTask_persistenceSubmissionPrecedesWorkerStart() {
+        val hooks = RecordingTimingHooks()
+        val worker = StubWorker { task -> task.run(); true }
+        val harness = createRaceSession(frameCount = 1, worker = worker, timingHooks = hooks)
+        try {
+            harness.session.owner.acceptDirect(FakeDirectAccess())
+            harness.flush()
+
+            assertTrue(hooks.persistenceSubmittedAt > 0)
+            assertTrue(hooks.workerStartedAt > 0)
+            assertTrue(
+                "workerStartedAt=${hooks.workerStartedAt} persistenceSubmittedAt=${hooks.persistenceSubmittedAt}",
+                hooks.persistenceSubmittedAt <= hooks.workerStartedAt
+            )
         } finally {
             harness.shutdown()
         }
@@ -1196,7 +1349,8 @@ class YuvCaptureOwnerTest {
         worker: BoundedCaptureWorker,
         rejectAllEvents: java.util.concurrent.atomic.AtomicBoolean =
             java.util.concurrent.atomic.AtomicBoolean(false),
-        encodeHook: (() -> Unit)? = null
+        encodeHook: (() -> Unit)? = null,
+        timingHooks: YuvCaptureTimingHooks? = null
     ): RaceSession {
         val dir: File = Files.createTempDirectory("yuv-race-test").toFile()
         val handlerThread = android.os.HandlerThread("yuv-race").apply { start() }
@@ -1251,6 +1405,7 @@ class YuvCaptureOwnerTest {
                 backgroundHandler = null,
                 backgroundThread = null
             ),
+            timingHooks = timingHooks,
             boundedWorkerOverride = worker
         )
         return RaceSession(session, handlerThread, handler, terminalLatch)
