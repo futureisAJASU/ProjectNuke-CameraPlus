@@ -879,6 +879,24 @@ fun captureRawBurstForFusion(
             return
         }
         reader = imageReader
+        // Phase-2 latency audit: record the HAL's own advertised timing limits
+        // for this exact RAW stream so physical reports can separate sensor/HAL
+        // pacing from software cost. Diagnostic evidence only; never gates.
+        try {
+            val streamTiming = RawStreamDurationEvidence.query(
+                characteristics, rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR,
+                maximumResolution = rawSelection.requiresMaximumResolutionPixelMode
+            )
+            baseJob.put("rawStreamTiming", streamTiming.toJson())
+            streamTiming.minFrameDurationNs?.let { baseJob.put("rawMinFrameDurationNs", it) }
+                ?: baseJob.put("rawMinFrameDurationNs", JSONObject.NULL)
+            streamTiming.stallDurationNs?.let { baseJob.put("rawStallDurationNs", it) }
+                ?: baseJob.put("rawStallDurationNs", JSONObject.NULL)
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            // Duration tables are optional diagnostic evidence.
+        }
         when (productionResourceCoordinator.attachImageReader(imageReader)) {
             RawAttachmentDisposition.ACCEPTED,
             RawAttachmentDisposition.ALREADY_OWNED,
@@ -2988,6 +3006,93 @@ internal class Raw16WriteStats(
     val writeDurationMs: Long,
     val syncDurationMs: Long
 )
+
+/**
+ * Phase-2 latency-audit evidence: the HAL's OWN advertised timing limits for
+ * the exact RAW stream being captured (StreamConfigurationMap
+ * min-frame/stall durations for format+size). Comparing observed
+ * cameraAcquisitionMs against requestedFrames * minFrameDurationNs answers
+ * whether sensor/HAL pacing or software consumed the acquisition window.
+ * Diagnostic truth only.
+ */
+internal data class RawStreamDurationEvidence(
+    val width: Int,
+    val height: Int,
+    val format: Int,
+    val minFrameDurationNs: Long?,
+    val stallDurationNs: Long?,
+    val sourceMap: String?
+) {
+    fun toJson(): JSONObject = JSONObject()
+        .put("width", width)
+        .put("height", height)
+        .put("format", format)
+        .put("minFrameDurationNs", minFrameDurationNs ?: JSONObject.NULL)
+        .put("stallDurationNs", stallDurationNs ?: JSONObject.NULL)
+        .put("sourceMap", sourceMap ?: JSONObject.NULL)
+        .put(
+            "advertisedMaxFps",
+            minFrameDurationNs?.takeIf { it > 0 }?.let { 1_000_000_000.0 / it } ?: JSONObject.NULL
+        )
+
+    companion object {
+        internal const val MAP_STANDARD = "STANDARD"
+        internal const val MAP_MAXIMUM_RESOLUTION = "MAXIMUM_RESOLUTION"
+
+        /** Public Camera2 surface for the actual stream configuration table. */
+        internal fun streamConfigurationMapKey(
+            maximumResolution: Boolean
+        ): CameraCharacteristics.Key<android.hardware.camera2.params.StreamConfigurationMap> =
+            if (maximumResolution) {
+                CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION
+            } else {
+                CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP
+            }
+
+        /** Zero means "not advertised" in the Camera2 duration tables. */
+        internal fun fromMap(
+            map: android.hardware.camera2.params.StreamConfigurationMap?,
+            width: Int,
+            height: Int,
+            format: Int,
+            sourceMap: String?
+        ): RawStreamDurationEvidence {
+            if (map == null) {
+                return RawStreamDurationEvidence(width, height, format, null, null, null)
+            }
+            val size = android.util.Size(width, height)
+            return RawStreamDurationEvidence(
+                width = width,
+                height = height,
+                format = format,
+                minFrameDurationNs = map.getOutputMinFrameDuration(format, size).takeIf { it > 0L },
+                stallDurationNs = map.getOutputStallDuration(format, size).takeIf { it > 0L },
+                sourceMap = sourceMap
+            )
+        }
+
+        fun query(
+            characteristics: CameraCharacteristics,
+            width: Int,
+            height: Int,
+            format: Int,
+            maximumResolution: Boolean
+        ): RawStreamDurationEvidence = try {
+            val map = characteristics.get(streamConfigurationMapKey(maximumResolution))
+            fromMap(
+                map,
+                width,
+                height,
+                format,
+                if (maximumResolution) MAP_MAXIMUM_RESOLUTION else MAP_STANDARD
+            )
+        } catch (failure: Error) {
+            throw failure
+        } catch (_: Exception) {
+            RawStreamDurationEvidence(width, height, format, null, null, null)
+        }
+    }
+}
 
 private fun writeCompactRaw16(
     image: Image,

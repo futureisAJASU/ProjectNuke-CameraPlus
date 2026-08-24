@@ -1505,7 +1505,8 @@ internal class HardwareE2ERunRecorder private constructor(
             },
             frameManifestCount = job.optJSONArray("frames")?.length() ?: 0,
             rawMetadata = listOf(
-                "rawWidth", "rawHeight", "rowStride", "pixelStride", "rawSizeSource"
+                "rawWidth", "rawHeight", "rowStride", "pixelStride", "rawSizeSource",
+                "rawMinFrameDurationNs", "rawStallDurationNs"
             ).associateWith { job.optString(it) }.filterValues { it.isNotBlank() },
             selectedRoute = job.optString("selectedRoute", job.optString("zoomRoute")),
             actualRoute = job.optString("actualRoute", job.optString("finalRoute")),
