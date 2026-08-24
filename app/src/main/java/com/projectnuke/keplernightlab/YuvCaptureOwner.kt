@@ -1156,14 +1156,21 @@ internal class YuvCaptureOwner(
     // ------------------------------------------------------------------
 
     /**
-     * Strict success predicate.  A successful capture handoff requires the full
-     * manifest persisted AND zero accepted persistence work outstanding (buffered,
-     * reserved, pending completions, queued or in-flight worker work).  Final-file
-     * verification already succeeded per adopted frame inside [adoptSuccess].
+     * Strict success predicate.  A successful capture handoff requires EXACTLY
+     * the requested frame count persisted AND the manifest holding exactly the
+     * requested entries AND zero accepted persistence work outstanding (buffered,
+     * reserved, pending completions, queued or in-flight worker work).
+     * Final-file verification already succeeded per adopted frame inside
+     * [adoptSuccess].
+     *
+     * The equality (not `>=`) is the documented invariant: persisted/manifest
+     * accounting is expected to be structurally bounded by [frameCount], so an
+     * OVER-COUNT observation means corrupt/double-committed accounting and can
+     * NEVER be classified as strict success (fail-closed).
      */
-    private fun isStrictSuccessState(snap: YuvCaptureAccountingSnapshot): Boolean =
-        snap.persistedFrames >= frameCount &&
-            snap.manifest.size >= frameCount &&
+    internal fun isStrictSuccessState(snap: YuvCaptureAccountingSnapshot): Boolean =
+        snap.persistedFrames == frameCount &&
+            snap.manifest.size == frameCount &&
             snap.bufferedFrames == 0 &&
             snap.reservedCount == 0 &&
             pendingPersistenceTasks.get() == 0 &&
@@ -1408,7 +1415,9 @@ internal class YuvCaptureOwner(
      * reserved, pending completions, queued or in-flight worker work), this path
      * must NEVER publish SUCCESS or PARTIAL_SUCCESS — it settles as an actual
      * timeout.  Only a quiescent state may classify by persisted-count truth, and
-     * SUCCESS still requires the full manifest.
+     * SUCCESS still requires exactly the requested frame count in BOTH the
+     * persisted counter and the manifest (the strict-success equality invariant;
+     * an over-count is corrupt accounting, never success).
      */
     private fun emergencySettleDeadline() {
         val snap = accounting.snapshot()
@@ -1429,7 +1438,10 @@ internal class YuvCaptureOwner(
                 reason = persistenceDrainTimeoutReason(snap)
                 saveMotion = false
             }
-            snap.persistedFrames >= frameCount && snap.manifest.size >= frameCount -> {
+            // Same documented strict-success invariant as [isStrictSuccessState]:
+            // EXACTLY requestedFrames persisted and in the manifest — an
+            // over-count/corrupt observation can never classify as SUCCESS.
+            snap.persistedFrames == frameCount && snap.manifest.size == frameCount -> {
                 status = CaptureTerminalStatus.SUCCESS
                 completionKind = TerminalCompletionKind.SUCCESS
                 reason = "All $frameCount frames persisted"

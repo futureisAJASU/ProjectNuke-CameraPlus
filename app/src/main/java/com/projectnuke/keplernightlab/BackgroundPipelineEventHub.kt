@@ -71,8 +71,16 @@ internal class BackgroundPipelineEventSubscription private constructor(
  *  - The hub NEVER owns production truth. Durable job metadata and
  *    JobOperationLease settlement remain authoritative; publishing must not
  *    depend on any subscriber being present.
- *  - Delivery is strictly observational: a throwing subscriber can never alter
- *    production processing, terminal truth, or other subscribers.
+ *  - Delivery is strictly observational for ORDINARY failures: a subscriber
+ *    throwing an ordinary Exception (including CancellationException) can never
+ *    alter production processing, terminal truth, or other subscribers — the
+ *    failure is logged and delivery continues with the remaining subscribers.
+ *  - FATAL-ISOLATION EXCEPTION: a JVM Error thrown by a subscriber is NEVER
+ *    converted into an ordinary observational failure. It propagates to the
+ *    producer so the producer lane's own fatal-settlement precedence applies
+ *    (Error is rethrown there, never downgraded). Swallowing OOM/StackOverflow
+ *    and similar here would corrupt the process far beyond one lost event, so
+ *    this exact site documents why Error isolation does NOT apply.
  *  - Subscribers are bounded and removed exactly on dispose; the hub holds no
  *    Activity/Composable/callback closures beyond registered lambdas and
  *    retains nothing after disposal.
@@ -100,9 +108,11 @@ internal object BackgroundPipelineEventHub {
     }
 
     /**
-     * Publishes one exact-job background event to current subscribers.
-     * Never throws to the producer; delivery failures are logged and ignored.
-     * Safe with zero subscribers - production completion is independent of this.
+     * Publishes one exact-job background event to current subscribers. Ordinary
+     * subscriber Exceptions are logged and ignored (strictly observational);
+     * an Error propagates to the producer per the documented fatal-isolation
+     * exception above. Safe with zero subscribers - production completion is
+     * independent of this.
      */
     fun publish(event: BackgroundPipelineEvent) {
         val targets: List<BackgroundPipelineEventSubscriber> = synchronized(lock) {
@@ -111,10 +121,12 @@ internal object BackgroundPipelineEventHub {
         targets.forEach { subscriber ->
             try {
                 subscriber.onBackgroundEvent(event)
-            } catch (failure: Throwable) {
+            } catch (fatal: Error) {
+                throw fatal
+            } catch (failure: Exception) {
                 try {
                     Log.w(TAG, "background event observer failed for ${event.requestJobDirectory.name}", failure)
-                } catch (_: Throwable) {
+                } catch (_: Exception) {
                 }
             }
         }

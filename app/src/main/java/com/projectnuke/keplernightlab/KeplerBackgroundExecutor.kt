@@ -95,6 +95,11 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
         }
     }
 
+    /**
+     * Observational FAILED terminal for an unreadable job. Publication failure
+     * on this path is diagnostic only (ordinary Exception); a fatal Error
+     * propagates unchanged — it is never converted into silence.
+     */
     private fun publishReadFailure(request: BackgroundProcessingRequest, failure: Exception) {
         try {
             BackgroundPipelineEventHub.publish(
@@ -110,7 +115,9 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
                     )
                 )
             )
-        } catch (_: Throwable) {
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (_: Exception) {
         }
     }
 
@@ -149,6 +156,11 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
      * Best-effort durable FAILED truth for an ordinary processing exception.
      * Only written when this attempt holds no committed-output claim, so a
      * committed/partial export is never contradicted by a late failure.
+     *
+     * Fatal precedence (durable-truth mutation helper): Error and
+     * CancellationException are NEVER swallowed or converted — both propagate
+     * unchanged. Only ordinary [Exception]s degrade to the documented fallback
+     * (log + leave durable truth untouched).
      */
     private fun markOrdinaryFailureTruth(
         jobDir: File,
@@ -156,13 +168,7 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
         failure: Exception
     ) {
         try {
-            val committedClaim = try {
-                requiredOutputCommittedAfterProcessing(jobDir, lease) ||
-                    currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, lease)
-            } catch (_: Throwable) { false } || runCatching {
-                KeplerJobMetadata.read(jobDir).optBoolean("galleryExportCommitted", false)
-            }.getOrDefault(false)
-            if (committedClaim) return
+            if (hasCommittedOutputClaim(jobDir, lease)) return
             KeplerJobMetadata.update(jobDir) { job ->
                 if (job.optString("currentPipelineStage") == "COMPLETE" ||
                     job.optString("currentPipelineStage") == "PARTIAL"
@@ -175,8 +181,45 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
                     .put("pipelineFailureType", failure.javaClass.name)
                     .put("pipelineFailureMessage", failure.message ?: failure.javaClass.simpleName)
             }
-        } catch (truthFailure: Throwable) {
-            Log.e("KeplerBackgroundExecutor", "durable FAILED truth write failed ${jobDir.name}", truthFailure)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (truthFailure: Exception) {
+            Log.e(
+                "KeplerBackgroundExecutor",
+                "durable FAILED truth write failed ${jobDir.name}",
+                truthFailure
+            )
+        }
+    }
+
+    /**
+     * Read-only committed-output claim probe for [markOrdinaryFailureTruth].
+     * Each probe is isolated independently: an ordinary failure in one probe
+     * falls back to "no claim from THIS probe" without hiding the other probes.
+     * A fatal Error or CancellationException from any probe propagates unchanged.
+     */
+    private fun hasCommittedOutputClaim(jobDir: File, lease: JobOperationLease?): Boolean {
+        val leaseClaim = try {
+            requiredOutputCommittedAfterProcessing(jobDir, lease) ||
+                currentProcessingAttemptHasRequiredOutputClaimForLease(jobDir, lease)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (_: Exception) {
+            false
+        }
+        if (leaseClaim) return true
+        return try {
+            KeplerJobMetadata.read(jobDir).optBoolean("galleryExportCommitted", false)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -738,7 +781,32 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
             // Persist the source/result relationship durably BEFORE any terminal
             // can be published: result side first (stub if fusion metadata does
             // not exist yet), then the reverse link on the source capture job.
-            linkSuperResolutionIdentities(sourceJobDir, outputDir)
+            // FAIL-CLOSED: an unproven durable relationship must never reach SR
+            // terminal truth — an ordinary link-write failure settles this lane
+            // as an ordinary FAILED outcome (cache kept, nothing committed).
+            try {
+                linkSuperResolutionIdentities(sourceJobDir, outputDir)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (linkFailure: Exception) {
+                post("PIPELINE_FAILED: Super Resolution identity link failed; cache kept.")
+                markOrdinaryFailureTruth(
+                    outputDir,
+                    lease,
+                    IllegalStateException(
+                        linkFailure.message ?: linkFailure.javaClass.simpleName,
+                        linkFailure
+                    )
+                )
+                pendingOutcome = BackgroundTerminalSpec(
+                    kind = CameraPipelineEvent.Terminal.Kind.FAILED,
+                    requiredOutputCommitted = false,
+                    publicExportCommitted = false,
+                    verified = false,
+                    message = "Super Resolution identity link failed"
+                )
+                return
+            }
             post("Processing 24M Fusion...")
             emit(
                 CameraPipelineEvent.ProcessingStage(
@@ -911,15 +979,28 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
      *    over it and re-asserts the key.
      *  - REQUEST side (source capture dir): "superResolutionResultJobDirectory".
      *
-     * Best-effort by contract: an identity-link write failure is logged and
-     * never fails the lane — the executor-level event envelope still carries
-     * both identities explicitly for every published event.
+     * FAIL-CLOSED contract: both sides are required. Each side is attempted
+     * independently (so a failure on one side never hides the other side's
+     * diagnostics), and if EITHER durable write fails this function throws —
+     * the caller must treat the source↔result relationship as UNPROVEN and
+     * must not publish an SR terminal that implies it. A partially applied link
+     * (one side written) is asymmetric residue only; because this function
+     * threw, no dual-identity relationship may be claimed from it.
+     *
+     * Fatal precedence: Error and CancellationException are never converted —
+     * both propagate unchanged. The executor-level event envelope keeps its
+     * observational dual identity for every published event regardless; only
+     * the DURABLE claim is gated by this function's outcome.
      */
     internal fun linkSuperResolutionIdentities(sourceJobDir: File, resultJobDir: File) {
+        var resultSideLinked = false
+        var resultSideFailure: Exception? = null
         try {
             val existingResultJob = try {
                 KeplerJobMetadata.read(resultJobDir)
             } catch (_: Exception) {
+                // Absent/unreadable result metadata falls back to the stub write,
+                // which is itself a REQUIRED operation below.
                 null
             }
             if (existingResultJob != null) {
@@ -936,19 +1017,45 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
                         .put(SUPER_RESOLUTION_SOURCE_JOB_KEY, sourceJobDir.absolutePath)
                 )
             }
+            resultSideLinked = true
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
         } catch (fatal: Error) {
             throw fatal
         } catch (linkFailure: Exception) {
-            Log.e("KeplerBackgroundExecutor", "SR result-side identity link failed ${resultJobDir.name}", linkFailure)
+            Log.e(
+                "KeplerBackgroundExecutor",
+                "SR result-side identity link failed ${resultJobDir.name}",
+                linkFailure
+            )
+            resultSideFailure = linkFailure
         }
         try {
             KeplerJobMetadata.update(sourceJobDir) { job ->
                 job.put(SUPER_RESOLUTION_RESULT_JOB_KEY, resultJobDir.absolutePath)
             }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
         } catch (fatal: Error) {
             throw fatal
         } catch (linkFailure: Exception) {
-            Log.e("KeplerBackgroundExecutor", "SR source-side identity link failed ${sourceJobDir.name}", linkFailure)
+            Log.e(
+                "KeplerBackgroundExecutor",
+                "SR source-side identity link failed ${sourceJobDir.name}",
+                linkFailure
+            )
+            throw IllegalStateException(
+                "Super Resolution identity link failed: source-side write failed for ${sourceJobDir.name}",
+                linkFailure
+            ).apply {
+                resultSideFailure?.let { addSuppressed(it) }
+            }
+        }
+        if (!resultSideLinked) {
+            throw IllegalStateException(
+                "Super Resolution identity link failed: result-side write failed for ${resultJobDir.name}",
+                resultSideFailure
+            )
         }
     }
 

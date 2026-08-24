@@ -12,6 +12,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -256,6 +257,72 @@ class BackgroundOwnershipPhase2Test {
         val updatedResult = JSONObject(KeplerJobMetadata.read(resultDir).toString())
         assertEquals("PROCESSING", updatedResult.optString("status"))
         assertEquals(sourceDir.absolutePath, updatedResult.optString("superResolutionSourceJobDirectory"))
+    }
+
+    @Test
+    fun sr_identityLink_resultSideWriteFailure_failsClosed() {
+        val root = newRoot("sr-link-fail-result")
+        val sourceDir = writeSourceCaptureJob(File(root, "srcCapture"))
+        // Injection: the RESULT identity path is a regular FILE, so the required
+        // stub write can never succeed (requireRealJobDirectory check).
+        val brokenResultPath = File(root, "srOutputAsFile").apply { writeText("not a directory") }
+
+        val thrown = assertThrows(IllegalStateException::class.java) {
+            KeplerBackgroundExecutor.linkSuperResolutionIdentities(sourceDir, brokenResultPath)
+        }
+
+        // Fail-closed: the unproven relationship is reported, naming the side.
+        assertTrue(thrown.message!!.contains("result-side"))
+
+        // No durable dual-identity claim is possible: the result side has no
+        // metadata at all (it is not a directory). The source-side attempt still
+        // ran for diagnostics — documented asymmetric residue only.
+        val sourceJob = JSONObject(KeplerJobMetadata.read(sourceDir).toString())
+        assertEquals(brokenResultPath.absolutePath, sourceJob.optString("superResolutionResultJobDirectory"))
+        assertFalse(hasDurableDualIdentityClaim(sourceDir, brokenResultPath))
+
+        // A subsequent successful relink re-establishes BOTH sides durably.
+        val recoveredResultDir = File(root, "srOutput").apply { mkdirs() }
+        KeplerBackgroundExecutor.linkSuperResolutionIdentities(sourceDir, recoveredResultDir)
+        val recoveredResult = JSONObject(KeplerJobMetadata.read(recoveredResultDir).toString())
+        assertEquals(sourceDir.absolutePath, recoveredResult.optString("superResolutionSourceJobDirectory"))
+        val recoveredSource = JSONObject(KeplerJobMetadata.read(sourceDir).toString())
+        assertEquals(recoveredResultDir.absolutePath, recoveredSource.optString("superResolutionResultJobDirectory"))
+    }
+
+    @Test
+    fun sr_identityLink_sourceSideWriteFailure_failsClosed() {
+        val root = newRoot("sr-link-fail-source")
+        // Injection: the SOURCE capture dir exists but its job.json is missing,
+        // so the required reverse-link update throws KeplerJobMetadataMissing.
+        val sourceDir = File(root, "srcCapture").apply { mkdirs() }
+        val resultDir = File(root, "srOutput").apply { mkdirs() }
+
+        val thrown = assertThrows(IllegalStateException::class.java) {
+            KeplerBackgroundExecutor.linkSuperResolutionIdentities(sourceDir, resultDir)
+        }
+
+        assertTrue(thrown.message!!.contains("source-side"))
+
+        // The result-side stub was written BEFORE the failure (attempt-both-sides
+        // diagnostics), but this asymmetric residue never constitutes a claimed
+        // relationship: the function threw and the source side carries no key.
+        val resultStub = JSONObject(KeplerJobMetadata.read(resultDir).toString())
+        assertEquals(sourceDir.absolutePath, resultStub.optString("superResolutionSourceJobDirectory"))
+        // Dual identity remains UNPROVEN on the source side.
+        assertFalse(hasDurableDualIdentityClaim(sourceDir, resultDir))
+    }
+
+    /** True only when BOTH durable directions are present in real metadata. */
+    private fun hasDurableDualIdentityClaim(sourceDir: File, resultDir: File): Boolean {
+        return try {
+            val sourceJob = JSONObject(KeplerJobMetadata.read(sourceDir).toString())
+            val resultJob = JSONObject(KeplerJobMetadata.read(resultDir).toString())
+            sourceJob.optString("superResolutionResultJobDirectory") == resultDir.absolutePath &&
+                resultJob.optString("superResolutionSourceJobDirectory") == sourceDir.absolutePath
+        } catch (_: Exception) {
+            false
+        }
     }
 
     // ------------------------------------------------------------------

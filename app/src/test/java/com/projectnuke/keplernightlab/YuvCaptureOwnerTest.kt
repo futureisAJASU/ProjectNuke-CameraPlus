@@ -687,6 +687,77 @@ class YuvCaptureOwnerTest {
         }
     }
 
+    /**
+     * The strict success predicate is EXACT-count equality with its documented
+     * invariant: persistedFrames == requestedFrames AND manifest.size ==
+     * requestedFrames. Over-count/corrupt/double-committed accounting can never
+     * be accepted as strict success (fail-closed), and normal exact-count
+     * production behavior is unchanged.
+     */
+    @Test
+    fun strictSuccessPredicateRejectsOverCountAndCorruptAccounting() {
+        val harness = Harness(frameCount = 3)
+        try {
+            fun quiescentSnapshot(persisted: Int, manifestSize: Int) = YuvCaptureAccountingSnapshot(
+                receivedFrames = persisted,
+                bufferedFrames = 0,
+                persistedFrames = persisted,
+                failedFrames = 0,
+                droppedFrames = 0,
+                manifest = List(manifestSize) { index ->
+                    YuvFrameManifestEntry(index, "frame_0${index}_color.png", index * 1000L, true)
+                }
+            )
+
+            // Exactly requestedFrames, fully quiescent: strict success.
+            assertTrue(harness.session.owner.isStrictSuccessState(quiescentSnapshot(3, 3)))
+
+            // Under-count is never success.
+            assertFalse(harness.session.owner.isStrictSuccessState(quiescentSnapshot(2, 2)))
+
+            // Over-count (double-committed/corrupt ledger) must NEVER classify as
+            // strict success even when fully quiescent — this is the regression:
+            // the old `>=` predicate accepted it.
+            assertFalse(harness.session.owner.isStrictSuccessState(quiescentSnapshot(4, 4)))
+
+            // Counter/manifest divergence (corrupt accounting shape) too.
+            assertFalse(harness.session.owner.isStrictSuccessState(quiescentSnapshot(3, 4)))
+            assertFalse(harness.session.owner.isStrictSuccessState(quiescentSnapshot(4, 3)))
+        } finally {
+            harness.shutdown()
+        }
+    }
+
+    /**
+     * Emergency deadline settlement (owner-event dispatch rejected) inherits the
+     * same equality invariant: corrupt OVER-COUNT accounting (more entries than
+     * requestedFrames) may not claim SUCCESS — it fails closed to a partial
+     * classification instead.
+     */
+    @Test
+    fun emergencyDeadlineCannotClaimSuccessOnOverCountAccounting() {
+        val harness = Harness(frameCount = 2, rejectDispatch = true)
+        try {
+            val accounting = harness.session.accounting
+            repeat(3) { index ->
+                assertTrue(
+                    accounting.persistedFrame(
+                        YuvFrameManifestEntry(index, "over_0$index.png", index * 1000L, true)
+                    )
+                )
+            }
+            assertEquals(3, accounting.snapshot().persistedFrames)
+
+            // The deadline owner event dispatch is rejected -> the documented
+            // off-dispatcher emergency settlement runs against this corrupt state.
+            harness.session.owner.onDeadlineReached()
+
+            assertEquals(CaptureTerminalStatus.PARTIAL_SUCCESS, harness.awaitTerminal())
+        } finally {
+            harness.shutdown()
+        }
+    }
+
     @Test
     fun finalFilesAreDistinctReadablePngsAfterSuccess() {
         val harness = Harness(frameCount = 3)

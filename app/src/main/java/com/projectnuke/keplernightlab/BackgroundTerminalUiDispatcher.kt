@@ -20,6 +20,13 @@ import java.io.File
  *    may show it.
  *  - RESULT identity drives the refreshed directory (SR output directory),
  *    falling back to the request identity when no result directory exists.
+ *  - DISPATCH-FAILURE POLICY: an ordinary failure while POSTING the UI work
+ *    (Exception, including CancellationException) is reported through
+ *    [onDispatchFailure] and never fails production processing — the refresh
+ *    did not happen and UI state stays untouched. A JVM Error thrown by the
+ *    scheduler propagates unchanged: this seam has NO documented
+ *    fatal-isolation contract, so a fatal Error must not be downgraded into a
+ *    normal "dispatch failed" report.
  */
 internal class BackgroundTerminalUiDispatcher(
     private val session: CameraPipelineUiSession,
@@ -44,9 +51,14 @@ internal class BackgroundTerminalUiDispatcher(
 
         // 3. Dispatch ALL UI work onto the camera-owned scope. The foreground
         //    truth is re-read inside the dispatched block — not here.
+        //    Ordinary post failures (incl. cancellation) are observational:
+        //    report and continue. Errors propagate (no fatal-isolation contract
+        //    at this site).
         val outcome = try {
             scheduler.post(0L) { dispatchUi(wantsPreview, resultDir) }
-        } catch (failure: Throwable) {
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (failure: Exception) {
             onDispatchFailure?.invoke(failure)
             null
         } ?: return
