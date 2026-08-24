@@ -586,6 +586,22 @@ internal data class HardwareE2ECaptureTiming(
     val persistenceDrainMs: Long,
     val handoffSettlementMs: Long,
     val captureStageTotalMs: Long,
+    /** cameraAcquisitionCompleteAt -> persistenceDrainCompleteAt (canonical report name). */
+    val postAcquisitionPersistenceMs: Long = 0L,
+    /** THE 100%-to-shutter interval: cameraAcquisitionCompleteAt -> captureStageCompleteAt. */
+    val postAcquisitionToShutterMs: Long = 0L,
+    /** persistenceDrainCompleteAt -> processingHandoffPublishedAt. */
+    val handoffPublicationMs: Long = 0L,
+    /** processingHandoffPublishedAt -> captureResourcesSettledAt (owner exit). */
+    val captureSettlementMs: Long = 0L,
+    /** Last per-frame commit -> processingHandoffPublishedAt (RAW terminal metadata work). */
+    val rawMetadataSettlementMs: Long = 0L,
+    /** RAW aggregate durable-payload bytes; 0 for YUV jobs. */
+    val rawBytesPersisted: Long = 0L,
+    /** RAW aggregate measured write spans (fsync excluded); 0 for YUV jobs. */
+    val rawPersistenceWriteMs: Long = 0L,
+    /** RAW aggregate measured fsync spans; 0 for YUV jobs. */
+    val rawPersistenceSyncMs: Long = 0L,
     /** Sum of per-frame encode segments across persisted frames (0 when unset). */
     val aggregateEncodeMs: Long = 0L,
     /** Sum of per-frame candidate-fsync segments (buffered path; 0 when unset). */
@@ -602,6 +618,14 @@ internal data class HardwareE2ECaptureTiming(
         put("persistenceDrainMs", persistenceDrainMs)
         put("handoffSettlementMs", handoffSettlementMs)
         put("captureStageTotalMs", captureStageTotalMs)
+        put("postAcquisitionPersistenceMs", postAcquisitionPersistenceMs)
+        put("postAcquisitionToShutterMs", postAcquisitionToShutterMs)
+        put("handoffPublicationMs", handoffPublicationMs)
+        put("captureSettlementMs", captureSettlementMs)
+        put("rawMetadataSettlementMs", rawMetadataSettlementMs)
+        put("rawBytesPersisted", rawBytesPersisted)
+        put("rawPersistenceWriteMs", rawPersistenceWriteMs)
+        put("rawPersistenceSyncMs", rawPersistenceSyncMs)
         put("aggregateEncodeMs", aggregateEncodeMs)
         put("aggregateFsyncMs", aggregateFsyncMs)
         put("aggregateVerifyMs", aggregateVerifyMs)
@@ -616,6 +640,14 @@ internal data class HardwareE2ECaptureTiming(
             persistenceDrainMs = json.optLong("persistenceDrainMs"),
             handoffSettlementMs = json.optLong("handoffSettlementMs"),
             captureStageTotalMs = json.optLong("captureStageTotalMs"),
+            postAcquisitionPersistenceMs = json.optLong("postAcquisitionPersistenceMs"),
+            postAcquisitionToShutterMs = json.optLong("postAcquisitionToShutterMs"),
+            handoffPublicationMs = json.optLong("handoffPublicationMs"),
+            captureSettlementMs = json.optLong("captureSettlementMs"),
+            rawMetadataSettlementMs = json.optLong("rawMetadataSettlementMs"),
+            rawBytesPersisted = json.optLong("rawBytesPersisted"),
+            rawPersistenceWriteMs = json.optLong("rawPersistenceWriteMs"),
+            rawPersistenceSyncMs = json.optLong("rawPersistenceSyncMs"),
             aggregateEncodeMs = json.optLong("aggregateEncodeMs"),
             aggregateFsyncMs = json.optLong("aggregateFsyncMs"),
             aggregateVerifyMs = json.optLong("aggregateVerifyMs"),
@@ -669,6 +701,14 @@ internal data class HardwareE2ECaptureTiming(
                 persistenceDrainMs = timing.optLong("persistenceDrainMs"),
                 handoffSettlementMs = timing.optLong("handoffSettlementMs"),
                 captureStageTotalMs = timing.optLong("captureStageTotalMs"),
+                postAcquisitionPersistenceMs = timing.optLong("postAcquisitionPersistenceMs"),
+                postAcquisitionToShutterMs = timing.optLong("postAcquisitionToShutterMs"),
+                handoffPublicationMs = timing.optLong("handoffPublicationMs"),
+                captureSettlementMs = timing.optLong("captureSettlementMs"),
+                rawMetadataSettlementMs = timing.optLong("rawMetadataSettlementMs"),
+                rawBytesPersisted = timing.optLong("rawBytesPersisted"),
+                rawPersistenceWriteMs = timing.optLong("rawPersistenceWriteMs"),
+                rawPersistenceSyncMs = timing.optLong("rawPersistenceSyncMs"),
                 aggregateEncodeMs = frameTimings.sumOf { it.encodeMs ?: 0L },
                 aggregateFsyncMs = frameTimings.sumOf { it.fsyncMs ?: 0L },
                 aggregateVerifyMs = frameTimings.sumOf { it.verifyMs ?: 0L },

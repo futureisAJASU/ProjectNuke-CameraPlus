@@ -54,6 +54,12 @@ internal class CaptureTimingLedger(
     private val captureResourcesSettledAt = AtomicLong(0L)
     private val captureStageCompleteAt = AtomicLong(0L)
 
+    // RAW aggregate persistence evidence. Accumulated from REAL measured spans
+    // around the raw16 write and its fsync on the save worker; never inferred.
+    private val rawBytesPersisted = AtomicLong(0L)
+    private val rawPersistenceWriteMs = AtomicLong(0L)
+    private val rawPersistenceSyncMs = AtomicLong(0L)
+
     private fun now(): Long = timeSource()
 
     // ------------------------------------------------------------------
@@ -134,6 +140,23 @@ internal class CaptureTimingLedger(
     fun recordCaptureResourcesSettled() { captureResourcesSettledAt.compareAndSet(0L, now()) }
     fun recordCaptureStageComplete() { captureStageCompleteAt.compareAndSet(0L, now()) }
 
+    /**
+     * RAW per-frame write evidence: compact bytes actually persisted plus the
+     * REAL measured span of the row-extraction/write segment (fsync excluded).
+     * Accumulates the aggregate raw* metrics; per-frame segments remain
+     * derivable from workerStartedAt/writeFinishedAt.
+     */
+    fun recordRawFrameWriteStats(frameIndex: Int, bytesWritten: Long, writeDurationMs: Long) {
+        if (frameIndex < 0 || frameIndex >= requestedFrames.coerceAtLeast(1)) return
+        if (bytesWritten > 0) rawBytesPersisted.addAndGet(bytesWritten)
+        if (writeDurationMs > 0) rawPersistenceWriteMs.addAndGet(writeDurationMs)
+    }
+
+    /** Accumulates one REAL measured fd.sync()/force() span (RAW persistence). */
+    fun recordRawFrameSyncStats(syncDurationMs: Long) {
+        if (syncDurationMs > 0) rawPersistenceSyncMs.addAndGet(syncDurationMs)
+    }
+
     private fun putFrameInstant(array: AtomicLongArray, frameIndex: Int, at: Long) {
         if (frameIndex < 0 || frameIndex >= array.length()) return
         array.compareAndSet(frameIndex, 0L, at)
@@ -147,7 +170,10 @@ internal class CaptureTimingLedger(
         val requestSubmitted = requestSubmittedAt.get()
         val acquisitionComplete = cameraAcquisitionCompleteAt.get()
         val drainComplete = persistenceDrainCompleteAt.get()
+        val handoffPublished = processingHandoffPublishedAt.get()
+        val resourcesSettled = captureResourcesSettledAt.get()
         val stageComplete = captureStageCompleteAt.get()
+        val lastCommitted = lastFrameCommittedAt()
         return CaptureTimingSnapshot(
             requestedFrames = requestedFrames,
             captureRequestSubmittedAt = requestSubmitted,
@@ -157,14 +183,34 @@ internal class CaptureTimingLedger(
             lastCaptureResultAt = lastCaptureResultAt.get(),
             cameraAcquisitionCompleteAt = acquisitionComplete,
             persistenceDrainCompleteAt = drainComplete,
-            processingHandoffPublishedAt = processingHandoffPublishedAt.get(),
-            captureResourcesSettledAt = captureResourcesSettledAt.get(),
+            processingHandoffPublishedAt = handoffPublished,
+            captureResourcesSettledAt = resourcesSettled,
             captureStageCompleteAt = stageComplete,
             cameraAcquisitionMs = durationMs(requestSubmitted, acquisitionComplete),
+            postAcquisitionPersistenceMs = durationMs(acquisitionComplete, drainComplete),
             persistenceDrainMs = durationMs(acquisitionComplete, drainComplete),
+            handoffPublicationMs = durationMs(drainComplete, handoffPublished),
+            rawMetadataSettlementMs = durationMs(lastCommitted, handoffPublished),
+            captureSettlementMs = durationMs(handoffPublished, resourcesSettled),
+            postAcquisitionToShutterMs = durationMs(acquisitionComplete, stageComplete),
             handoffSettlementMs = durationMs(drainComplete, stageComplete),
-            captureStageTotalMs = durationMs(requestSubmitted, stageComplete)
+            captureStageTotalMs = durationMs(requestSubmitted, stageComplete),
+            rawBytesPersisted = rawBytesPersisted.get(),
+            rawPersistenceWriteMs = rawPersistenceWriteMs.get(),
+            rawPersistenceSyncMs = rawPersistenceSyncMs.get(),
+            lastFrameCommittedAt = lastCommitted
         )
+    }
+
+    /** Latest nonzero per-frame committed instant (0 when no frame committed). */
+    private fun lastFrameCommittedAt(): Long {
+        var latest = 0L
+        val frames = time.committedAt
+        for (index in 0 until frames.length()) {
+            val at = frames.get(index)
+            if (at > latest) latest = at
+        }
+        return latest
     }
 
     private fun durationMs(fromNanos: Long, toNanos: Long): Long =
@@ -186,9 +232,17 @@ internal class CaptureTimingLedger(
             .put("captureResourcesSettledAt", snap.captureResourcesSettledAt)
             .put("captureStageCompleteAt", snap.captureStageCompleteAt)
             .put("cameraAcquisitionMs", snap.cameraAcquisitionMs)
+            .put("postAcquisitionPersistenceMs", snap.postAcquisitionPersistenceMs)
             .put("persistenceDrainMs", snap.persistenceDrainMs)
+            .put("handoffPublicationMs", snap.handoffPublicationMs)
+            .put("rawMetadataSettlementMs", snap.rawMetadataSettlementMs)
+            .put("captureSettlementMs", snap.captureSettlementMs)
+            .put("postAcquisitionToShutterMs", snap.postAcquisitionToShutterMs)
             .put("handoffSettlementMs", snap.handoffSettlementMs)
             .put("captureStageTotalMs", snap.captureStageTotalMs)
+            .put("rawBytesPersisted", snap.rawBytesPersisted)
+            .put("rawPersistenceWriteMs", snap.rawPersistenceWriteMs)
+            .put("rawPersistenceSyncMs", snap.rawPersistenceSyncMs)
             .put("frames", framesToJson())
     }
 
@@ -261,9 +315,28 @@ internal data class CaptureTimingSnapshot(
     val captureResourcesSettledAt: Long,
     val captureStageCompleteAt: Long,
     val cameraAcquisitionMs: Long,
+    /** cameraAcquisitionCompleteAt -> persistenceDrainCompleteAt (report-canonical name). */
+    val postAcquisitionPersistenceMs: Long = 0L,
+    /** Same segment as [postAcquisitionPersistenceMs]; legacy field name. */
     val persistenceDrainMs: Long,
+    /** persistenceDrainCompleteAt -> processingHandoffPublishedAt. */
+    val handoffPublicationMs: Long = 0L,
+    /** Last per-frame commit -> processingHandoffPublishedAt (RAW terminal JSON work). */
+    val rawMetadataSettlementMs: Long = 0L,
+    /** processingHandoffPublishedAt -> captureResourcesSettledAt (owner exit). */
+    val captureSettlementMs: Long = 0L,
+    /**
+     * THE user-observed 100%-to-shutter interval:
+     * cameraAcquisitionCompleteAt -> captureStageCompleteAt.
+     */
+    val postAcquisitionToShutterMs: Long = 0L,
     val handoffSettlementMs: Long,
-    val captureStageTotalMs: Long
+    val captureStageTotalMs: Long,
+    /** RAW aggregate evidence; 0 for YUV jobs. */
+    val rawBytesPersisted: Long = 0L,
+    val rawPersistenceWriteMs: Long = 0L,
+    val rawPersistenceSyncMs: Long = 0L,
+    val lastFrameCommittedAt: Long = 0L
 )
 
 /**

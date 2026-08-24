@@ -24,6 +24,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.Trace
 import android.util.Log
 import android.util.Size
 import org.json.JSONArray
@@ -385,6 +386,11 @@ fun captureRawBurstForFusion(
     val rawCaptureStartedAt = System.currentTimeMillis()
     // Phase 5: bounded capture-latency instrumentation (atomic, non-blocking).
     val captureTimingLedger = CaptureTimingLedger(requestedFrames)
+    // Arrival ordinals for per-frame acquisition instants. Owner events execute
+    // serialized on the capture thread, so these are exact arrival identities;
+    // paired frame identity is assigned later by the capture ledger.
+    val imageArrivalOrdinal = java.util.concurrent.atomic.AtomicInteger(0)
+    val resultArrivalOrdinal = java.util.concurrent.atomic.AtomicInteger(0)
     fun frameObjectsSnapshot(): JSONArray = ledger.value.frameObjectsSnapshot()
     fun postCaptureProgress() {
         val snapshot = progressSnapshot.get()
@@ -1008,7 +1014,9 @@ fun captureRawBurstForFusion(
                         if (durableCaptureTerminalPersisted &&
                             shouldPublishRawCaptureProcessingHandoff(request.completionKind)
                         ) {
-                            settleRawCaptureHandoffOwnerExit(
+                            Trace.beginSection("Kepler_CaptureHandoff")
+                            try {
+                                settleRawCaptureHandoffOwnerExit(
                                 durableCaptureLease = durableCaptureLease,
                                 publishHandoff = {
                                     val handoffPublished = KeplerJobMetadata.publishProcessingHandoff(
@@ -1048,6 +1056,9 @@ fun captureRawBurstForFusion(
                                     }
                                 }
                             )
+                            } finally {
+                                Trace.endSection()
+                            }
 } else {
                             // The capture terminal record did not persist: register exact terminal debt so the next
                             // production entry converges it and CLEARS the CAPTURE_RAW owner.  The handoff was
@@ -1195,14 +1206,18 @@ fun captureRawBurstForFusion(
                 }
             }
             try {
+                captureTimingLedger.recordWorkerStarted(index)
                 post("RAW saving frame ${index + 1}/$requestedFrames...")
                 val saveStartedAt = System.currentTimeMillis()
                 raw16Temp = File(jobDir, ".${raw16Name}.${System.nanoTime()}.tmp")
                 try {
-                    writeCompactRaw16(image, raw16Temp)
+                    val writeStats = writeCompactRaw16(image, raw16Temp, captureTimingLedger, index)
                     KeplerJobMetadata.atomicReplace(raw16Temp, raw16File)
+                    captureTimingLedger.recordWriteFinished(index)
                     val expectedRaw16Bytes = image.width.toLong() * image.height.toLong() * 2L
                     verifyRaw16Payload(raw16File, expectedRaw16Bytes)
+                    captureTimingLedger.recordVerified(index)
+                    captureTimingLedger.recordRawFrameWriteStats(index, writeStats.bytesWritten, writeStats.writeDurationMs)
                 } finally {
                     val cleanup = deleteOwned(raw16Temp)
                     if (cleanup != RawOutputCleanupStatus.DELETED && cleanup != RawOutputCleanupStatus.ABSENT) {
@@ -1443,6 +1458,9 @@ fun captureRawBurstForFusion(
                             when (completion) {
                                 is RawSaveCompletion.Success -> {
                                     ledger.value.adoptSuccess(completion)
+                                    // The durable artifact is now adopted by the
+                                    // capture ledger: frame commit boundary.
+                                    captureTimingLedger.recordCommitted(completion.frameIndex)
                                     recordAdoptedOutputs(completion)
                                     disposeAdoptedSuccessLeftovers(completion)
                                     publishProgress()
@@ -1501,6 +1519,7 @@ fun captureRawBurstForFusion(
             // Before executor acceptance the owner retains request.image. A rejection
             // therefore returns it to the same pending identity below; a queued task
             // is disposable because ownership moved to the worker after acceptance.
+            captureTimingLedger.recordPersistenceSubmitted(request.frameIndex)
             val accepted = saveWorker.submitRetainedOnRejection(task)
             if (!accepted) {
                 // Rejection happens before worker ownership transfers. Restore the
@@ -1519,10 +1538,15 @@ fun captureRawBurstForFusion(
         }
 
         fun dispatchReadyFrames() {
-            if (captureStateOwner.isClosed() || finished.get()) return
-            while (ledger.value.savedFrames < ledger.value.requestedFrames &&
-                !finished.get() && !captureStateOwner.isClosed()
-            ) {
+            // Diagnostic-only systrace marker for the acquisition-side owner
+            // work (adoption, pairing, save dispatch). Must never gate timing
+            // truth or correctness.
+            Trace.beginSection("Kepler_RAW_Acquisition")
+            try {
+                if (captureStateOwner.isClosed() || finished.get()) return
+                while (ledger.value.savedFrames < ledger.value.requestedFrames &&
+                    !finished.get() && !captureStateOwner.isClosed()
+                ) {
                 val frame = ledger.value.takeNextReadyFrame() ?: return
                 val raw16Name = "frame_${frame.frameIndex.toString().padStart(2, '0')}.raw16"
                 val dngName = "frame_${frame.frameIndex.toString().padStart(2, '0')}.dng"
@@ -1557,6 +1581,9 @@ fun captureRawBurstForFusion(
                     frame = frameManifest
                 )
                 if (!submitSaveRequest(request)) return
+                }
+            } finally {
+                Trace.endSection()
             }
         }
         dispatchReady = { dispatchReadyFrames() }
@@ -1578,7 +1605,7 @@ fun captureRawBurstForFusion(
                     }
                     ledger.value.evictEmergencyUnmatchedImages(readerCapacity)
                     ledger.value.recordImage(timestampNs, image, System.currentTimeMillis())
-                    captureTimingLedger.recordImageReceived()
+                    captureTimingLedger.recordImageReceived(imageArrivalOrdinal.getAndIncrement())
                     if (ledger.value.rawFirstImageDelayMs == null) {
                         ledger.value.rawFirstImageDelayMs = System.currentTimeMillis() - rawCaptureStartedAt
                         post("RAW first image delay: ${ledger.value.rawFirstImageDelayMs}ms")
@@ -1602,7 +1629,7 @@ fun captureRawBurstForFusion(
                     activePhysicalId = activePhysicalIdValue
                     baseJob.put("activePhysicalId", activePhysicalIdValue ?: JSONObject.NULL)
                     ledger.value.recordResult(timestampNs, result)
-                    captureTimingLedger.recordResultReceived()
+                    captureTimingLedger.recordResultReceived(resultArrivalOrdinal.getAndIncrement())
                     publishProgress()
                     postCaptureProgress()
                     dispatchReadyFrames()
@@ -2955,7 +2982,19 @@ fun chooseRawFusionSizeV2(
     }
 }
 
-private fun writeCompactRaw16(image: Image, file: File) {
+/** Real measured spans of ONE raw16 durable write (diagnostic evidence only). */
+internal class Raw16WriteStats(
+    val bytesWritten: Long,
+    val writeDurationMs: Long,
+    val syncDurationMs: Long
+)
+
+private fun writeCompactRaw16(
+    image: Image,
+    file: File,
+    timing: CaptureTimingLedger?,
+    frameIndex: Int
+): Raw16WriteStats {
     val plane = image.planes[0]
     val buffer = plane.buffer
     val width = image.width
@@ -2963,12 +3002,29 @@ private fun writeCompactRaw16(image: Image, file: File) {
     val rowStride = plane.rowStride
     val pixelStride = plane.pixelStride
     val limit = buffer.limit()
-    FileOutputStream(file).use { rawOutput ->
-        writeRaw16Rows(width, height, rowStride, pixelStride, limit, buffer, rawOutput)
-        rawOutput.fd.sync()
+    Trace.beginSection("Kepler_RAW_Persist")
+    var writeMs = 0L
+    var syncMs = 0L
+    try {
+        FileOutputStream(file).use { rawOutput ->
+            val writeStartNs = System.nanoTime()
+            writeRaw16Rows(width, height, rowStride, pixelStride, limit, buffer, rawOutput)
+            writeMs = (System.nanoTime() - writeStartNs) / 1_000_000L
+            Trace.beginSection("Kepler_RAW_Sync")
+            val syncStartNs = System.nanoTime()
+            rawOutput.fd.sync()
+            syncMs = (System.nanoTime() - syncStartNs) / 1_000_000L
+            Trace.endSection()
+            // Recorded immediately after the REAL fsync returned.
+            timing?.recordFsyncFinished(frameIndex)
+            timing?.recordRawFrameSyncStats(syncMs)
+        }
+    } finally {
+        Trace.endSection()
     }
     val expectedSize = width.toLong() * height.toLong() * 2L
     verifyRaw16Payload(file, expectedSize)
+    return Raw16WriteStats(expectedSize, writeMs, syncMs)
 }
 
 internal fun writeRaw16Rows(
