@@ -345,17 +345,14 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
             kotlinx.coroutines.delay(500)
         }
     }
-    val backgroundProcessingLabel = if (backgroundProcessing.hasPendingWork) {
-        buildString {
-            append("사진을 처리하고 있습니다.")
-            if (backgroundProcessing.activeJobDirectory != null) append(" 처리 중 1건")
-            if (backgroundProcessing.queuedCount > 0) {
-                append(" 처리 대기 ${backgroundProcessing.queuedCount}건")
-            }
-        }
-    } else {
-        null
-    }
+    // Bounded completion flash: a background terminal may briefly show a
+    // passive completion line; it never blocks or gates anything.
+    var backgroundCompletionFlashUntilMs by remember { mutableStateOf(0L) }
+    val backgroundCompletionFlash = System.currentTimeMillis() < backgroundCompletionFlashUntilMs
+    val backgroundProcessingLabel = backgroundQueueUiModel(
+        backgroundProcessing,
+        showCompletionFlash = backgroundCompletionFlash
+    ).combinedLabel()
 
     fun publishPipelineState() {
         pipelineUiState = pipelineSession.snapshot()
@@ -653,6 +650,7 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
                     val success = terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE ||
                         terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
                     val exactDir = terminal.jobDirectoryPath?.let { java.io.File(it) }?.takeIf { it.isDirectory }
+                    if (success) backgroundCompletionFlashUntilMs = System.currentTimeMillis() + 4_000L
                     if (exactDir != null) {
                         refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted, exactJobDir = exactDir)
                     } else {
@@ -677,6 +675,7 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
                 val success = terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE ||
                     terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
                 val exactDir = terminal.jobDirectoryPath?.let { java.io.File(it) }?.takeIf { it.isDirectory }
+                if (success) backgroundCompletionFlashUntilMs = System.currentTimeMillis() + 4_000L
                 if (exactDir != null) {
                     refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted, exactJobDir = exactDir)
                 } else {
