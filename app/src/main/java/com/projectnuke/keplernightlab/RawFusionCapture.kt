@@ -1224,6 +1224,10 @@ fun captureRawBurstForFusion(
                 }
             }
             try {
+                // Phase-6 contention policy: this whole task IS foreground RAW
+                // persistence; publish its execution window to the
+                // process-scoped signal consumed by the background heavy lane.
+                ForegroundCaptureActivitySignal.beginPersistence()
                 captureTimingLedger.recordWorkerStarted(index)
                 post("RAW saving frame ${index + 1}/$requestedFrames...")
                 val saveStartedAt = System.currentTimeMillis()
@@ -1369,6 +1373,8 @@ fun captureRawBurstForFusion(
                         failureDescription = "${e.javaClass.simpleName}: ${e.message}"
                     )
                 ))
+            } finally {
+                ForegroundCaptureActivitySignal.endPersistence()
             }
         }
 

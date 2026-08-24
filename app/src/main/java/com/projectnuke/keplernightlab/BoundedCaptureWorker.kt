@@ -93,7 +93,7 @@ internal open class BoundedCaptureWorker(
             return false
         }
         return try {
-            executeWithForegroundSignal(task)
+            executor.execute(task)
             true
         } catch (_: RejectedExecutionException) {
             reject(task)
@@ -110,26 +110,10 @@ internal open class BoundedCaptureWorker(
     fun submitRetainedOnRejection(task: Runnable): Boolean {
         if (closed.get()) return false
         return try {
-            executeWithForegroundSignal(task)
+            executor.execute(task)
             true
         } catch (_: RejectedExecutionException) {
             false
-        }
-    }
-
-    /**
-     * Phase-6 contention policy wiring: every task on this worker IS foreground
-     * capture persistence, so its execution window drives the process-scoped
-     * signal consumed by the background lane's cooperative yield.
-     */
-    private fun executeWithForegroundSignal(task: Runnable) {
-        executor.execute {
-            ForegroundCaptureActivitySignal.beginPersistence()
-            try {
-                task.run()
-            } finally {
-                ForegroundCaptureActivitySignal.endPersistence()
-            }
         }
     }
 

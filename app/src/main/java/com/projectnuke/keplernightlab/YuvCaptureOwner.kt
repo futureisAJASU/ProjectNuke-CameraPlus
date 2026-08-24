@@ -134,6 +134,9 @@ internal class BufferedEncodeTask(
     fun settledOutcome(): CaptureTaskDisposalOutcome? = settledOutcome.get()
 
     override fun run() {
+        // Phase-6 contention policy: this whole task IS foreground YUV
+        // persistence; publish its window to the process-scoped signal.
+        ForegroundCaptureActivitySignal.beginPersistence()
         try {
             onTaskStarted?.invoke()
             val completion = try {
@@ -175,6 +178,8 @@ internal class BufferedEncodeTask(
         } catch (fatal: Error) {
             if (pendingPostClaim.compareAndSet(false, true)) pendingClaim.release()
             throw fatal
+        } finally {
+            ForegroundCaptureActivitySignal.endPersistence()
         }
     }
 
@@ -599,6 +604,11 @@ internal class YuvCaptureOwner(
                         val pendingPostClaim = AtomicBoolean(false)
                         val task = object : OutcomeDisposableCaptureTask {
                             override fun run() {
+                                // Phase-6 contention policy: this whole task IS
+                                // foreground YUV persistence; publish its window
+                                // to the process-scoped signal. Released on every
+                                // exit path below.
+                                ForegroundCaptureActivitySignal.beginPersistence()
                                 try {
                                     timingHooks?.onWorkerStarted(item.frameIndex)
                                     val completion = try {
@@ -662,6 +672,8 @@ internal class YuvCaptureOwner(
                                 } catch (fatal: Error) {
                                     if (pendingPostClaim.compareAndSet(false, true)) claim.release()
                                     throw fatal
+                                } finally {
+                                    ForegroundCaptureActivitySignal.endPersistence()
                                 }
                             }
                             override fun dispose() { disposeWithOutcome() }

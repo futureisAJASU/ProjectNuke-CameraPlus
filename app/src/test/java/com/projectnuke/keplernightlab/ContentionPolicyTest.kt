@@ -49,23 +49,40 @@ class ContentionPolicyTest {
     }
 
     @Test
-    fun boundedCaptureWorker_drivesSignalAroundTasks() {
-        val worker = BoundedCaptureWorker("contention-test", capacity = 1)
+    fun foregroundCaptureSignal_doesNotCancelBackgroundJob() {
+        val appContext = RuntimeEnvironment.getApplication() as Context
+        BackgroundProcessingCoordinator.resetForTest()
+        val coordinator = BackgroundProcessingCoordinator.of(appContext)
         try {
-            val ran = CountDownLatch(1)
-            var observedInside = false
-            worker.submit {
-                observedInside = ForegroundCaptureActivitySignal.isForegroundCaptureActive()
-                ForegroundCaptureActivitySignal.cooperativeYieldAtStageBoundary()
-                ran.countDown()
+            var completed = false
+            var sawForegroundActiveInSink = false
+            coordinator.backgroundExecutor = BackgroundProcessingExecutor { _, _ ->
+                // Simulate the lane publishing a stage transition while
+                // foreground persistence is active: the boundary hook yields
+                // once and the job continues normally to completion.
+                ForegroundCaptureActivitySignal.beginPersistence()
+                try {
+                    ForegroundCaptureActivitySignal.cooperativeYieldAtStageBoundary()
+                    sawForegroundActiveInSink =
+                        ForegroundCaptureActivitySignal.isForegroundCaptureActive()
+                    completed = true
+                } finally {
+                    ForegroundCaptureActivitySignal.endPersistence()
+                }
             }
-            assertTrue(ran.await(5, TimeUnit.SECONDS))
-            assertTrue(observedInside)
-            // Signal is released even though the task itself never ended it.
-            awaitUntil(5_000) { !ForegroundCaptureActivitySignal.isForegroundCaptureActive() }
-            assertFalse(ForegroundCaptureActivitySignal.isForegroundCaptureActive())
+            val dir = File(appContext.filesDir, "cp-no-cancel").apply { mkdirs() }
+            assertEquals(
+                BackgroundEnqueueResult.Accepted,
+                coordinator.enqueue(
+                    BackgroundProcessingRequest(dir, KeplerActiveOperationKind.PROCESSING_YUV)
+                )
+            )
+            assertTrue(awaitUntil(5_000) { completed })
+            assertTrue(sawForegroundActiveInSink)
+            awaitUntil(5_000) { !coordinator.snapshot().hasPendingWork }
+            assertFalse(coordinator.snapshot().hasPendingWork)
         } finally {
-            worker.close()
+            BackgroundProcessingCoordinator.resetForTest()
         }
     }
 
