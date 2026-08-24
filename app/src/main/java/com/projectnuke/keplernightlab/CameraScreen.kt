@@ -1944,8 +1944,14 @@ fun PipelineBusyShutterIndicator(
 ) {
     val progress = captureProgress.progressPercent.coerceIn(0f, 1f)
     val percent = (progress * 100f).roundToInt()
+    // The shutter-busy indicator follows the same two-state model as the bar:
+    // during SETTLING_CAPTURE the sensor work is done and the label must say
+    // saving, not capturing.
+    val settling = captureSettlementView(captureProgress).state ==
+        CaptureDisplayState.SETTLING_CAPTURE
     val label = when {
         percent in 5..99 -> "$percent%"
+        settling -> "저장 중"
         captureProgress.stage == CaptureStage.CAPTURING -> "촬영 중"
         captureProgress.stage == CaptureStage.EXPORTING ||
             captureProgress.stage == CaptureStage.VERIFYING ||
@@ -1999,13 +2005,11 @@ fun CaptureProgressRow(
 ) {
     // The lower capture progress surface represents CAMERA ACQUISITION ONLY:
     // the paired Camera2 evidence count, never persisted frames and never
-    // fusion/export stages.
-    val acquiredFrames = cameraAcquisitionPairCount(
-        captureProgress.receivedImages,
-        captureProgress.completedResults
-    )
-    val captureComplete = captureProgress.requestedFrames > 0 &&
-        acquiredFrames >= captureProgress.requestedFrames
+    // fusion/export stages. Once true acquisition reaches 100% the bar holds
+    // and a distinct SETTLING_CAPTURE state reports durable settlement with
+    // its own truthful persistence count.
+    val view = captureSettlementView(captureProgress)
+    val settling = view.state == CaptureDisplayState.SETTLING_CAPTURE
     val stageText = when (captureProgress.stage) {
         CaptureStage.IDLE -> "Ready"
         CaptureStage.PREPARING -> "Preparing"
@@ -2013,7 +2017,7 @@ fun CaptureProgressRow(
         // still running, hold a distinct short settling state. The bar never
         // drops back below 100% during settlement.
         CaptureStage.CAPTURING ->
-            if (captureComplete) CAPTURE_SETTLING_MESSAGE else "카메라 캡처 중입니다."
+            if (settling) CAPTURE_SETTLING_MESSAGE else "카메라 캡처 중입니다."
         CaptureStage.PROCESSING -> "RAW 합성 처리 중입니다."
         CaptureStage.DEMOSAICING -> "Native RAW ISP 렌더링 중입니다."
         CaptureStage.EXPORTING -> "결과 미리보기를 준비하는 중입니다."
@@ -2025,33 +2029,31 @@ fun CaptureProgressRow(
         CaptureStage.TIMEOUT -> "처리 시간이 초과되었습니다."
     }
     val frameText = if (captureProgress.requestedFrames > 0) {
-        "$acquiredFrames / ${captureProgress.requestedFrames}"
+        "${view.acquiredFrames} / ${captureProgress.requestedFrames}"
     } else {
         ""
     }
-    val detailText = buildString {
-        if (captureProgress.stage == CaptureStage.CAPTURING) {
-            if (captureComplete) {
-                append(CAPTURE_SETTLING_MESSAGE)
-            } else {
-                append("촬영 중입니다. 기기를 움직이지 마세요.")
-            }
-        } else if (
-            captureProgress.stage == CaptureStage.PROCESSING ||
+    val detailText = when {
+        settling -> captureSettlementDetailText(view)
+        captureProgress.stage == CaptureStage.IDLE ||
+            captureProgress.stage == CaptureStage.PREPARING ||
+            captureProgress.stage == CaptureStage.CAPTURING ->
+            if (view.captureComplete) CAPTURE_SETTLING_MESSAGE
+            else "촬영 중입니다. 기기를 움직이지 마세요."
+        captureProgress.stage == CaptureStage.PROCESSING ||
             captureProgress.stage == CaptureStage.DEMOSAICING ||
             captureProgress.stage == CaptureStage.EXPORTING ||
             captureProgress.stage == CaptureStage.VERIFYING ||
-            captureProgress.stage == CaptureStage.CLEANING
-        ) {
-            append("처리 중입니다.")
-        } else if (captureProgress.receivedImages > 0 || captureProgress.completedResults > 0) {
-            append("Images ${captureProgress.receivedImages}")
-            if (captureProgress.requestedFrames > 0) append(" / ${captureProgress.requestedFrames}")
-            append(" · Results ${captureProgress.completedResults}")
-            if (captureProgress.requestedFrames > 0) append(" / ${captureProgress.requestedFrames}")
-        } else {
-            append(captureProgress.message)
+            captureProgress.stage == CaptureStage.CLEANING -> "처리 중입니다."
+        captureProgress.receivedImages > 0 || captureProgress.completedResults > 0 -> {
+            buildString {
+                append("Images ${captureProgress.receivedImages}")
+                if (captureProgress.requestedFrames > 0) append(" / ${captureProgress.requestedFrames}")
+                append(" · Results ${captureProgress.completedResults}")
+                if (captureProgress.requestedFrames > 0) append(" / ${captureProgress.requestedFrames}")
+            }
         }
+        else -> captureProgress.message
     }
 
     Column(
