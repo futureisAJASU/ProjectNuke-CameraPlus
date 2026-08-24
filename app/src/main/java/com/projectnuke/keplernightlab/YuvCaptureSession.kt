@@ -185,7 +185,8 @@ internal class YuvCaptureSession internal constructor(
             finished: AtomicBoolean? = null,
             startTerminalObserverOnCreate: Boolean = true,
             schedulePersistenceDrainDeadline: ((Runnable) -> Unit)? = null,
-            onAcquisitionUpdate: ((receivedImages: Int, completedResults: Int, persistedFrames: Int) -> Unit)? = null
+            onAcquisitionUpdate: ((receivedImages: Int, completedResults: Int, persistedFrames: Int) -> Unit)? = null,
+            timingHooks: YuvCaptureTimingHooks? = null
         ): YuvCaptureSession {
             val captureStateOwner = CaptureStateOwner(dispatch)
             val boundedWorker = BoundedCaptureWorker(workerName, workerCapacity)
@@ -247,7 +248,8 @@ internal class YuvCaptureSession internal constructor(
                 candidateFilesystem = candidateFilesystem,
                 candidateVerifier = candidateVerifier,
                 schedulePersistenceDrainDeadline = schedulePersistenceDrainDeadline,
-                onAcquisitionUpdate = onAcquisitionUpdate
+                onAcquisitionUpdate = onAcquisitionUpdate,
+                timingHooks = timingHooks
             )
             return YuvCaptureSession(
                 captureStateOwner,

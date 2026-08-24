@@ -632,17 +632,52 @@ fun captureYuvBurstColorWithMotion(
         val yuvWorkProcessor = YuvPngWorkProcessor(
             encoder = object : YuvPngEncoder {
                 override fun encodeDirect(image: Image, candidate: File, rotationDegrees: Int) {
+                    // Direct path: conversion+PNG+candidate fsync occur inside one
+                    // existing call; the bounded encode span (owner hook) covers it.
                     saveRotatedColorPngFromYuv(image, candidate, rotationDegrees)
                 }
 
                 override fun encodeBuffered(frame: BufferedYuvFrame, candidate: File, rotationDegrees: Int) {
-                    saveRotatedColorPngFromBufferedYuv(frame, candidate, rotationDegrees)
+                    // Buffered path records REAL sub-boundaries: conversion and
+                    // the durable PNG sink sync are separately observable.
+                    val bitmap = yuv420BufferToBitmap(frame)
+                    val rotated = rotateBitmapIfNeeded(bitmap, rotationDegrees)
+                    captureTimingLedger.recordConversionCompleted(frame.index)
+                    try {
+                        writeBitmapToTempPng(rotated, candidate) {
+                            captureTimingLedger.recordFsyncFinished(frame.index)
+                        }
+                    } finally {
+                        if (rotated !== bitmap) rotated.recycle()
+                        bitmap.recycle()
+                    }
                 }
             },
             committer = YuvCandidateCommitter { candidate, finalFile ->
                 KeplerJobMetadata.atomicReplace(candidate, finalFile)
             }
         )
+        val yuvTimingHooks = object : YuvCaptureTimingHooks {
+            override fun onPersistenceQueued(frameIndex: Int) {
+                captureTimingLedger.recordPersistenceQueued(frameIndex)
+            }
+
+            override fun onWorkerStarted(frameIndex: Int) {
+                captureTimingLedger.recordWorkerStarted(frameIndex)
+            }
+
+            override fun onEncodeFinished(frameIndex: Int) {
+                captureTimingLedger.recordEncodeFinished(frameIndex)
+            }
+
+            override fun onWriteFinished(frameIndex: Int) {
+                captureTimingLedger.recordWriteFinished(frameIndex)
+            }
+
+            override fun onVerified(frameIndex: Int) {
+                captureTimingLedger.recordVerified(frameIndex)
+            }
+        }
 
         var prevTimingReceived = 0
         var prevTimingCompleted = 0
@@ -693,14 +728,18 @@ fun captureYuvBurstColorWithMotion(
                 // result from counters or elapsed time.
                 when (request.completionKind) {
                     TerminalCompletionKind.SUCCESS -> {
-                        captureTimingLedger.recordProcessingHandoffPublished()
                         durableCaptureOperationId?.let { operationId ->
                             val handoffPublished = KeplerJobMetadata.publishProcessingHandoff(
                                     currentBurstDir,
                                     operationId,
                                     KeplerActiveOperationKind.PROCESSING_YUV
                                 )
-                             val ownerSettled = if (handoffPublished) {
+                         if (handoffPublished) {
+                             // The milestone is recorded ONLY after the durable
+                             // handoff publication actually succeeded.
+                             captureTimingLedger.recordProcessingHandoffPublished()
+                         }
+                            val ownerSettled = if (handoffPublished) {
                                  KeplerJobMetadata.clearActiveOperation(
                                      currentBurstDir,
                                      operationId,
@@ -816,7 +855,8 @@ fun captureYuvBurstColorWithMotion(
             // captureBurst operation is accepted below.
             // Terminal consumption starts with session authority, before any
             // fallible ImageReader/camera/session/request setup.
-            startTerminalObserverOnCreate = true
+            startTerminalObserverOnCreate = true,
+            timingHooks = yuvTimingHooks
         )
         postStatus("Color Fusion 초기화 4/7: ImageReader 생성 중...")
 
@@ -1232,12 +1272,12 @@ private fun ensureSufficientSpaceForYuvBurstPngs(
     }
 }
 
-private fun writeBitmapToTempPng(bitmap: Bitmap, finalFile: File) {
+private fun writeBitmapToTempPng(bitmap: Bitmap, finalFile: File, onSynced: (() -> Unit)? = null) {
     commitProcessingArtifact(
         finalFile = finalFile,
         writeTemp = { temp ->
             FileOutputStream(temp).use { output ->
-                writePngBitmapToSink(bitmap, output)
+                writePngBitmapToSink(bitmap, output, onSynced)
             }
         },
         verifyFinal = { committed ->
@@ -1246,12 +1286,18 @@ private fun writeBitmapToTempPng(bitmap: Bitmap, finalFile: File) {
     )
 }
 
-internal fun writePngBitmapToSink(bitmap: Bitmap, sink: FileOutputStream) {
+internal fun writePngBitmapToSink(
+    bitmap: Bitmap,
+    sink: FileOutputStream,
+    onSynced: (() -> Unit)? = null
+) {
     check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, sink)) {
         "Bitmap PNG compression returned false"
     }
     sink.flush()
     sink.fd.sync()
+    // Invoked at the REAL durable-sync boundary (never inferred).
+    onSynced?.invoke()
 }
 
     /*
@@ -1410,11 +1456,12 @@ internal fun writePngBitmapToSink(bitmap: Bitmap, sink: FileOutputStream) {
 fun saveRotatedColorPngFromYuv(
     image: Image,
     outFile: File,
-    rotationDegrees: Int
+    rotationDegrees: Int,
+    onSynced: (() -> Unit)? = null
 ) {
     val bitmap = yuv420ToBitmap(image)
     val rotated = rotateBitmapIfNeeded(bitmap, rotationDegrees)
-    writeBitmapToTempPng(rotated, outFile)
+    writeBitmapToTempPng(rotated, outFile, onSynced)
 
     if (rotated !== bitmap) {
         rotated.recycle()
@@ -1426,11 +1473,12 @@ fun saveRotatedColorPngFromYuv(
 private fun saveRotatedColorPngFromBufferedYuv(
     frame: BufferedYuvFrame,
     outFile: File,
-    rotationDegrees: Int
+    rotationDegrees: Int,
+    onSynced: (() -> Unit)? = null
 ) {
     val bitmap = yuv420BufferToBitmap(frame)
     val rotated = rotateBitmapIfNeeded(bitmap, rotationDegrees)
-    writeBitmapToTempPng(rotated, outFile)
+    writeBitmapToTempPng(rotated, outFile, onSynced)
     if (rotated !== bitmap) rotated.recycle()
     bitmap.recycle()
 }

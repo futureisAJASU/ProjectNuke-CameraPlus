@@ -1011,19 +1011,34 @@ fun captureRawBurstForFusion(
                             settleRawCaptureHandoffOwnerExit(
                                 durableCaptureLease = durableCaptureLease,
                                 publishHandoff = {
-                                    KeplerJobMetadata.publishProcessingHandoff(
+                                    val handoffPublished = KeplerJobMetadata.publishProcessingHandoff(
                                         jobDir,
                                         durableCaptureOperationId,
                                         KeplerActiveOperationKind.PROCESSING_RAW
                                     )
+                                    if (handoffPublished) {
+                                        // Milestone recorded ONLY after the durable
+                                        // processing-handoff publication succeeded.
+                                        captureTimingLedger.recordProcessingHandoffPublished()
+                                    }
+                                    handoffPublished
                                 },
                                 settleOwner = { handoffPublished ->
                                     if (handoffPublished) {
-                                        KeplerJobMetadata.clearActiveOperation(
+                                        val ownerCleared = KeplerJobMetadata.clearActiveOperation(
                                             jobDir,
                                             durableCaptureOperationId,
                                             durableCaptureLease
                                         )
+                                        if (ownerCleared) {
+                                            // Real evidenced capture-stage boundary:
+                                            // metadata persisted + handoff published +
+                                            // capture owner cleared.
+                                            captureTimingLedger.recordCaptureResourcesSettled()
+                                            captureTimingLedger.recordCaptureStageComplete()
+                                            CaptureTimingLedger.persist(jobDir, captureTimingLedger)
+                                        }
+                                        ownerCleared
                                     } else {
                                         KeplerJobMetadata.settleCaptureOwnerAfterHandoffFailure(
                                             jobDir,
@@ -1116,8 +1131,12 @@ fun captureRawBurstForFusion(
         )
 
         fun finishSuccess(partial: Boolean = false, reason: String? = null): Unit {
+            // Drain truth only at THIS point: every accepted raw-frame save has
+            // settled by the time a success terminal is submitted.  The
+            // capture-stage milestones are recorded later, at their real
+            // authoritative boundaries inside terminal settlement (durable
+            // metadata persisted + processing handoff published + owner cleared).
             captureTimingLedger.recordPersistenceDrainComplete()
-            captureTimingLedger.recordCaptureStageComplete()
             CaptureTimingLedger.persist(jobDir, captureTimingLedger)
             return submitTerminal(
                 RawTerminalRequest(

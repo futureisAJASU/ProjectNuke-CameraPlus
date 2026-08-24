@@ -29,7 +29,10 @@ internal class CaptureTimingLedger(
         val resultAt = AtomicLongArray(requested)
         val imageAt = AtomicLongArray(requested)
         val persistenceQueuedAt = AtomicLongArray(requested)
+        val workerStartedAt = AtomicLongArray(requested)
+        val conversionCompletedAt = AtomicLongArray(requested)
         val encodeFinishedAt = AtomicLongArray(requested)
+        val writeFinishedAt = AtomicLongArray(requested)
         val fsyncFinishedAt = AtomicLongArray(requested)
         val verifiedAt = AtomicLongArray(requested)
         val committedAt = AtomicLongArray(requested)
@@ -101,7 +104,27 @@ internal class CaptureTimingLedger(
     }
 
     fun recordPersistenceQueued(frameIndex: Int) { putFrameInstant(time.persistenceQueuedAt, frameIndex, now()) }
+
+    /** Persistence worker actually began executing this frame's task. */
+    fun recordWorkerStarted(frameIndex: Int) { putFrameInstant(time.workerStartedAt, frameIndex, now()) }
+
+    /**
+     * YUV -> color conversion finished (buffered path only; the direct Image
+     * path converts inside the same encoder call and leaves this unset).
+     */
+    fun recordConversionCompleted(frameIndex: Int) { putFrameInstant(time.conversionCompletedAt, frameIndex, now()) }
+
+    /**
+     * Candidate production finished: bounded around the real encode() call
+     * (conversion where not separately recorded + PNG compression + candidate
+     * file write including its fsync).  Never inferred from sub-step durations.
+     */
     fun recordEncodeFinished(frameIndex: Int) { putFrameInstant(time.encodeFinishedAt, frameIndex, now()) }
+
+    /** Final artifact visible: candidate->final atomic replace returned. */
+    fun recordWriteFinished(frameIndex: Int) { putFrameInstant(time.writeFinishedAt, frameIndex, now()) }
+
+    /** The real FileDescriptor.sync() of the PNG sink returned (buffered path). */
     fun recordFsyncFinished(frameIndex: Int) { putFrameInstant(time.fsyncFinishedAt, frameIndex, now()) }
     fun recordVerified(frameIndex: Int) { putFrameInstant(time.verifiedAt, frameIndex, now()) }
     fun recordCommitted(frameIndex: Int) { putFrameInstant(time.committedAt, frameIndex, now()) }
@@ -178,7 +201,10 @@ internal class CaptureTimingLedger(
                     .put("resultAt", time.resultAt.get(index))
                     .put("imageAt", time.imageAt.get(index))
                     .put("persistenceQueuedAt", time.persistenceQueuedAt.get(index))
+                    .put("workerStartedAt", time.workerStartedAt.get(index))
+                    .put("conversionCompletedAt", time.conversionCompletedAt.get(index))
                     .put("encodeFinishedAt", time.encodeFinishedAt.get(index))
+                    .put("writeFinishedAt", time.writeFinishedAt.get(index))
                     .put("fsyncFinishedAt", time.fsyncFinishedAt.get(index))
                     .put("verifiedAt", time.verifiedAt.get(index))
                     .put("committedAt", time.committedAt.get(index))
@@ -239,3 +265,31 @@ internal data class CaptureTimingSnapshot(
     val handoffSettlementMs: Long,
     val captureStageTotalMs: Long
 )
+
+/**
+ * Real production persistence-timing hooks for the YUV owner (Phase 3).
+ * Implementations MUST be non-blocking (atomic puts only): they run on the
+ * owner dispatcher and on persistence worker threads, never on Camera2
+ * callbacks.  Each method marks one REAL operation boundary — no inferred or
+ * synthetic durations.
+ */
+internal interface YuvCaptureTimingHooks {
+    /** The owner successfully submitted this frame's persistence task. */
+    fun onPersistenceQueued(frameIndex: Int) {}
+
+    /** A persistence worker thread began executing this frame's task. */
+    fun onWorkerStarted(frameIndex: Int) {}
+
+    /**
+     * The bounded encode span completed: YUV/color conversion (+ PNG
+     * compression + candidate write incl. its fsync where not separately
+     * recorded).  Recorded immediately after the real encode call returned.
+     */
+    fun onEncodeFinished(frameIndex: Int) {}
+
+    /** Candidate->final atomic replace returned (final artifact visible). */
+    fun onWriteFinished(frameIndex: Int) {}
+
+    /** Final-file verification succeeded for this frame's artifact. */
+    fun onVerified(frameIndex: Int) {}
+}

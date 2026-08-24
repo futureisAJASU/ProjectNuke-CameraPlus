@@ -104,6 +104,8 @@ internal class BufferedEncodeTask(
     private val onWorkDisposalDebt: ((YuvPngWorkItem, YuvWorkDisposalOutcome) -> Unit)? = null,
     /** Invoked exactly once after the task fully settled (or was disposed). */
     private val onSettled: (() -> Unit)? = null,
+    /** Invoked exactly once when the persistence worker begins executing this task. */
+    private val onTaskStarted: (() -> Unit)? = null,
     /**
      * Invoked EXACTLY ONCE when the task settled without ever attempting its
      * completion post (shutdown-drained queue task): releases the owner's
@@ -131,6 +133,7 @@ internal class BufferedEncodeTask(
     fun settledOutcome(): CaptureTaskDisposalOutcome? = settledOutcome.get()
 
     override fun run() {
+        onTaskStarted?.invoke()
         val completion = try {
             encode()
         } catch (cancelled: CancellationException) {
@@ -310,7 +313,16 @@ internal class YuvCaptureOwner(
      * this into a typed [CameraPipelineEvent.CaptureProgress]; English/Korean
      * status strings are never parsed for progress.
      */
-    private val onAcquisitionUpdate: ((receivedImages: Int, completedResults: Int, persistedFrames: Int) -> Unit)? = null
+    private val onAcquisitionUpdate: ((receivedImages: Int, completedResults: Int, persistedFrames: Int) -> Unit)? = null,
+    /**
+     * Real per-frame persistence timing hooks (Phase 3).  Every invocation is a
+     * non-blocking atomic ledger put at the EXACT production operation boundary:
+     * queued (owner submit), worker started (task entry), encode finished
+     * (bounded around the real conversion+PNG+candidate-write+fsync span),
+     * write finished (candidate->final atomic replace returned), verified
+     * (final-file verification succeeded).  Never blocks Camera2 callbacks.
+     */
+    private val timingHooks: YuvCaptureTimingHooks? = null
 ) {
 
     private var completedResults = 0
@@ -518,8 +530,10 @@ internal class YuvCaptureOwner(
                         val pendingPostClaim = AtomicBoolean(false)
                         val task = object : OutcomeDisposableCaptureTask {
                             override fun run() {
+                                timingHooks?.onWorkerStarted(item.frameIndex)
                                 val completion = try {
                                     workProcessor.encode(item, candidate, rotationDegrees)
+                                    timingHooks?.onEncodeFinished(item.frameIndex)
                                     YuvWorkerCompletion.Success(
                                         item.frameIndex, item.timestampNs,
                                         YuvCandidateHandle(item.frameIndex, candidate),
@@ -590,6 +604,7 @@ internal class YuvCaptureOwner(
                             ignoreErrors("direct backpressure status dispatch") { postStatus("YUV direct backpressure: frame ${item.frameIndex + 1} dropped") }
                         } else {
                             trackPendingPersistenceTask()
+                            timingHooks?.onPersistenceQueued(item.frameIndex)
                         }
                     }
                     is DirectYuvWorkCreation.Failed -> {
@@ -664,6 +679,7 @@ internal class YuvCaptureOwner(
                 encode = {
                 try {
                     workProcessor.encode(frame, candidate, rotationDegrees)
+                    timingHooks?.onEncodeFinished(frame.frameIndex)
                     YuvWorkerCompletion.Success(
                         frame.frameIndex, frame.timestampNs,
                         YuvCandidateHandle(frame.frameIndex, candidate),
@@ -727,7 +743,8 @@ internal class YuvCaptureOwner(
                 recordDisposalIfUnclean(workItem, outcome)
             },
             onSettled = ::postWorkerSettledEvent,
-            onPendingWorkAbandoned = ::releasePendingPersistenceTask
+            onPendingWorkAbandoned = ::releasePendingPersistenceTask,
+            onTaskStarted = { timingHooks?.onWorkerStarted(frame.frameIndex) }
         )
         if (!boundedWorker.submit(task)) {
             // Worker already called task.dispose() which calls lifecycle.settleEncoding.
@@ -736,6 +753,7 @@ internal class YuvCaptureOwner(
             ignoreErrors("buffered backpressure status dispatch") { postStatus("YUV backpressure: buffered frame ${frame.frameIndex + 1} dropped") }
         } else {
             trackPendingPersistenceTask()
+            timingHooks?.onPersistenceQueued(frame.frameIndex)
         }
     }
 
@@ -989,6 +1007,7 @@ internal class YuvCaptureOwner(
         //    respected because destinationExistedBeforeAttempt is false here.
         val commitFailure = try {
             workProcessor.commit(handle.file, finalFile)
+            timingHooks?.onWriteFinished(completion.frameIndex)
             null
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -1033,6 +1052,7 @@ internal class YuvCaptureOwner(
             finishError("Final file verification failed for frame ${completion.frameIndex}")
             return
         }
+        timingHooks?.onVerified(completion.frameIndex)
 
         // 7. Commit manifest entry + persistedFrames.  COMMITTED is only visible after
         //    the accounting mutation completed.  If the token commit fails after final
