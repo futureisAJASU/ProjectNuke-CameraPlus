@@ -133,11 +133,17 @@ internal object KeplerBackgroundExecutor : BackgroundProcessingExecutor {
      * publish time (for Super Resolution this switches to the newly created
      * output directory as soon as it exists; before that it equals the request
      * identity, since no result directory exists yet).
+     *
+     * Phase-6 contention policy: every published stage transition is a SAFE
+     * boundary where this serialized lane may voluntarily yield once if
+     * foreground capture persistence is active. The yield never holds state,
+     * never cancels, and never reorders work.
      */
     private fun backgroundEventSink(
         request: BackgroundProcessingRequest,
         resultIdentity: () -> File = { request.exactJobDirectory }
     ): (CameraPipelineEvent) -> Unit = { event ->
+        ForegroundCaptureActivitySignal.cooperativeYieldAtStageBoundary()
         BackgroundPipelineEventHub.publish(
             BackgroundPipelineEvent(
                 requestJobDirectory = request.exactJobDirectory,
