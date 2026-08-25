@@ -92,7 +92,9 @@ internal data class HardwareE2EEventRecord(
     val requiredOutputCommitted: Boolean = false,
     val publicExportCommitted: Boolean = false,
     val verified: Boolean = false,
-    val captureResourcesSettled: Boolean = true
+    val captureResourcesSettled: Boolean = true,
+    /** True only for CaptureStageComplete events that proved the durable handoff. */
+    val handoffEvidenceComplete: Boolean = false
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("checkpoint", checkpoint)
@@ -110,6 +112,7 @@ internal data class HardwareE2EEventRecord(
         put("publicExportCommitted", publicExportCommitted)
         put("verified", verified)
         put("captureResourcesSettled", captureResourcesSettled)
+        if (handoffEvidenceComplete) put("handoffEvidenceComplete", true)
     }
 }
 
@@ -465,7 +468,8 @@ internal data class HardwareE2ERunReport(
                                     requiredOutputCommitted = event.optBoolean("requiredOutputCommitted"),
                                     publicExportCommitted = event.optBoolean("publicExportCommitted"),
                                     verified = event.optBoolean("verified"),
-                                    captureResourcesSettled = event.optBoolean("captureResourcesSettled", true)
+                                    captureResourcesSettled = event.optBoolean("captureResourcesSettled", true),
+                                    handoffEvidenceComplete = event.optBoolean("handoffEvidenceComplete", false)
                                 )
                             )
                         }
@@ -791,6 +795,128 @@ internal object HardwareE2EReportStore {
             report.scenario.requestedTestScenario == expectedScenario &&
             report.scenario.selectedPipelineMode == expectedPipeline
     }
+
+    /**
+     * Stage-B pinning lookup: finds ONE new run whose identity is unambiguous
+     * at its evidenced capture handoff. Unlike [findLatestAfter] this never
+     * resolves runs through a mutable "latest matching pipeline" scan; see
+     * [HardwareE2EStageBRunPinning.selectNewHandoffRun].
+     */
+    fun findNewHandoffRunAfter(
+        context: Context,
+        excludedRunIds: Set<String>,
+        invocationStartWallClock: Long,
+        expectedScenario: String,
+        expectedPipeline: String
+    ): HardwareE2ERunReport? = findNewHandoffRunAfter(
+        directory(context), excludedRunIds, invocationStartWallClock, expectedScenario, expectedPipeline
+    )
+
+    fun findNewHandoffRunAfter(
+        reportDirectory: File,
+        excludedRunIds: Set<String>,
+        invocationStartWallClock: Long,
+        expectedScenario: String,
+        expectedPipeline: String
+    ): HardwareE2ERunReport? = HardwareE2EStageBRunPinning.selectNewHandoffRun(
+        reports = readReports(reportDirectory),
+        excludedRunIds = excludedRunIds,
+        invocationStartWallClock = invocationStartWallClock,
+        expectedScenario = expectedScenario,
+        expectedPipeline = expectedPipeline
+    )
+}
+
+/**
+ * Stage-B sequential-run identity pinning (pure, JVM-testable).
+ *
+ * RAPID SEQUENTIAL pairs can share one pipeline (YUV->YUV, RAW->RAW). The
+ * persisted report source is sorted newest-first, so discovering A and B only
+ * AFTER both captures handed off would let the newest matching report be B and
+ * misidentify it as A. The fix is ordering, not search: each run identity is
+ * PINNED at the moment its own evidenced CaptureStageComplete exists - before
+ * the next capture starts - and terminal waits read that EXACT run id.
+ */
+internal object HardwareE2EStageBRunPinning {
+
+    const val CAPTURE_STAGE_COMPLETE_CHECKPOINT = "CAPTURE_STAGE_COMPLETE"
+
+    /** True when the run's own event history proves the durable handoff boundary. */
+    fun hasEvidencedCaptureStageComplete(report: HardwareE2ERunReport): Boolean =
+        report.eventHistory.any {
+            it.checkpoint == CAPTURE_STAGE_COMPLETE_CHECKPOINT && it.handoffEvidenceComplete
+        }
+
+    /**
+     * Terminal gate for an EXACT pinned run id: never satisfied by any newer
+     * matching run. A pinned run must have published its terminal AND carry its
+     * finalization result (or failure).
+     */
+    fun isTerminalReady(report: HardwareE2ERunReport): Boolean =
+        report.terminalEvent != null && (report.finalJob != null || report.failure != null)
+
+    /**
+     * Selects the new run to pin among already-evidenced candidates:
+     *  - excludes every run captured in [excludedRunIds] (baseline + pinned);
+     *  - requires a run started at/after [invocationStartWallClock];
+     *  - requires the exact scenario + pipeline of THIS capture attempt;
+     *  - requires evidenced CaptureStageComplete in the run's event history.
+     *
+     * Ties on start timestamp cannot occur for sequential captures, but when
+     * several candidates somehow exist the EARLIEST-started one wins: identity
+     * is assigned in creation order, so a newer run can never be mistaken for
+     * an older unpinned one.
+     */
+    fun selectNewHandoffRun(
+        reports: List<HardwareE2ERunReport>,
+        excludedRunIds: Set<String>,
+        invocationStartWallClock: Long,
+        expectedScenario: String,
+        expectedPipeline: String
+    ): HardwareE2ERunReport? = reports
+        .asSequence()
+        .filter { it.runId !in excludedRunIds }
+        .filter { it.runStartWallClockTimestamp >= invocationStartWallClock }
+        .filter { it.scenario.requestedTestScenario == expectedScenario }
+        .filter { it.scenario.selectedPipelineMode == expectedPipeline }
+        .filter(::hasEvidencedCaptureStageComplete)
+        .minByOrNull { it.runStartWallClockTimestamp }
+
+    /** True when the second capture must be reconfigured (persist + recreate) BEFORE its click. */
+    fun requiresConfigurationBeforeSecondClick(pipelineA: String, pipelineB: String): Boolean =
+        pipelineA != pipelineB
+
+    /**
+     * Deterministic Stage-B harness plan. CONFIGURE_PIPELINE_B sits strictly
+     * between A's handoff pin and B's click for mixed pairs: CameraScreen reads
+     * the Compose pipelineMode AT the shutter click, so persisting B's mode
+     * after the click would silently capture B with A's pipeline.
+     */
+    enum class Step {
+        CONFIGURE_PIPELINE_A,
+        CLICK_CAPTURE_A,
+        AWAIT_AND_PIN_HANDOFF_A,
+        CONFIGURE_PIPELINE_B,
+        CLICK_CAPTURE_B,
+        AWAIT_AND_PIN_HANDOFF_B,
+        RELEASE_HEAVY_LANE,
+        AWAIT_TERMINAL_A_BY_PINNED_ID,
+        AWAIT_TERMINAL_B_BY_PINNED_ID
+    }
+
+    fun stageBPlan(pipelineA: String, pipelineB: String): List<Step> = buildList {
+        add(Step.CONFIGURE_PIPELINE_A)
+        add(Step.CLICK_CAPTURE_A)
+        add(Step.AWAIT_AND_PIN_HANDOFF_A)
+        if (requiresConfigurationBeforeSecondClick(pipelineA, pipelineB)) {
+            add(Step.CONFIGURE_PIPELINE_B)
+        }
+        add(Step.CLICK_CAPTURE_B)
+        add(Step.AWAIT_AND_PIN_HANDOFF_B)
+        add(Step.RELEASE_HEAVY_LANE)
+        add(Step.AWAIT_TERMINAL_A_BY_PINNED_ID)
+        add(Step.AWAIT_TERMINAL_B_BY_PINNED_ID)
+    }
 }
 
 internal class HardwareE2ERunRecorder private constructor(
@@ -950,7 +1076,9 @@ internal class HardwareE2ERunRecorder private constructor(
             requiredOutputCommitted = (event as? CameraPipelineEvent.Terminal)?.requiredOutputCommitted == true,
             publicExportCommitted = (event as? CameraPipelineEvent.Terminal)?.publicExportCommitted == true,
             verified = (event as? CameraPipelineEvent.Terminal)?.verified == true,
-            captureResourcesSettled = (event as? CameraPipelineEvent.Terminal)?.captureResourcesSettled ?: true
+            captureResourcesSettled = (event as? CameraPipelineEvent.Terminal)?.captureResourcesSettled ?: true,
+            handoffEvidenceComplete = (event as? CameraPipelineEvent.CaptureStageComplete)
+                ?.handoffEvidenceComplete == true
         )
         mutateRun(targetRunId) { report ->
             val nextCounts = report.progressCounts.toMutableMap()
@@ -1506,7 +1634,8 @@ internal class HardwareE2ERunRecorder private constructor(
             frameManifestCount = job.optJSONArray("frames")?.length() ?: 0,
             rawMetadata = listOf(
                 "rawWidth", "rawHeight", "rowStride", "pixelStride", "rawSizeSource",
-                "rawMinFrameDurationNs", "rawStallDurationNs"
+                "rawMinFrameDurationNs", "rawStallDurationNs",
+                "rawPersistenceWriteStrategy"
             ).associateWith { job.optString(it) }.filterValues { it.isNotBlank() },
             selectedRoute = job.optString("selectedRoute", job.optString("zoomRoute")),
             actualRoute = job.optString("actualRoute", job.optString("finalRoute")),

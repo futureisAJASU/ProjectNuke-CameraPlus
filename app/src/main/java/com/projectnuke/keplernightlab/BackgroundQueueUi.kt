@@ -29,6 +29,14 @@ internal data class BackgroundQueueUiModel(
  * FIFO, so rapid capture can outrun it; the pending queue of DURABLE job refs
  * is therefore explicitly bounded. Admission is prevented BEFORE sensor
  * acquisition once no safe capacity remains - never by deleting durable work.
+ *
+ * POLICY (aligned with the authoritative coordinator): [MAX_QUEUED_HEAVY_JOBS]
+ * counts QUEUED durable refs only; the RUNNING job never consumes queue
+ * capacity. UI admission BLOCKs exactly when queuedCount >= maxQueued -
+ * identical to BackgroundProcessingCoordinator.enqueue's QueueFull boundary.
+ * The foreground capture admitted while queuedCount == maxQueued - 1 becomes
+ * the next queued ref after its durable handoff, filling the lane to exactly
+ * 1 active + maxQueued queued.
  */
 internal const val MAX_QUEUED_HEAVY_JOBS = 3
 
@@ -43,14 +51,19 @@ internal data class BackpressureNotice(
     val userMessage: String?
 )
 
+/**
+ * Pure admission model for the shutter click. [active] is part of the observed
+ * snapshot but deliberately does NOT reduce capacity: subtracting the running
+ * job from a "queued jobs" cap would block one job BEFORE the coordinator is
+ * actually full.
+ */
 internal fun evaluateBackpressure(
     queuedCount: Int,
     active: Boolean,
     maxQueued: Int = MAX_QUEUED_HEAVY_JOBS
 ): BackpressureNotice {
     val pendingBehindLane = queuedCount.coerceAtLeast(0)
-    val capacityLeft = maxQueued - pendingBehindLane - (if (active) 1 else 0)
-    return if (capacityLeft <= 0) {
+    return if (pendingBehindLane >= maxQueued) {
         BackpressureNotice(
             decision = BackpressureDecision.BLOCK,
             userMessage = "처리 대기 중인 사진이 많습니다. 잠시 후 다시 촬영해 주세요."

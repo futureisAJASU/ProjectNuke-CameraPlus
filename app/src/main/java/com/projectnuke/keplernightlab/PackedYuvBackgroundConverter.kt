@@ -51,9 +51,13 @@ internal object PackedYuvBackgroundConverter {
         var converted = 0
         for (index in 0 until frames.length()) {
             val frame = frames.optJSONObject(index) ?: continue
+            // Production capture manifests stamp the packed source under the
+            // "file" key (writeColorJobJson); the legacy test/audit shape uses
+            // "filename". Both are honest durable identities - read either.
             val packedName = frame.optString("packedSourceFilename")
                 .ifBlank { frame.optString("filename") }
-            if (!packedName.endsWith(".yuvpack")) continue
+                .ifBlank { frame.optString("file") }
+            if (!packedName.endsWith(PackedYuvFrameStore.FILE_EXTENSION)) continue
             val packedFile = File(jobDir, packedName)
 
             // Fail-closed content truth for EVERY frame, every recovery pass.
@@ -65,6 +69,9 @@ internal object PackedYuvBackgroundConverter {
                 converted++
             }
 
+            // Fusion reads "file"; keep "filename" in sync so both manifest
+            // shapes stay convertible and auditable.
+            frame.put("file", pngName)
             frame.put("filename", pngName)
             frame.put("packedSourceFilename", packedName)
         }

@@ -60,6 +60,8 @@ internal data class RawFrameManifestData(
     val rawHeight: Int? = null,
     val rowStride: Int? = null,
     val pixelStride: Int? = null,
+    /** Which extraction strategy wrote this frame's raw16 payload (physical evidence). */
+    val raw16WriteStrategy: String? = null,
     val dynamicBlackLevel: List<Float>? = null,
     val dynamicWhiteLevel: Int? = null,
     val colorCorrectionGains: String? = null,

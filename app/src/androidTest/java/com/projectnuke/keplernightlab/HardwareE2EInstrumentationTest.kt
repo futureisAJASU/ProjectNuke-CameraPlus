@@ -206,6 +206,21 @@ class HardwareE2EInstrumentationTest {
         assertTrue(job.frameManifestCount >= job.savedFrames)
         assertTrue(job.rawMetadata["rawWidth"].orEmpty().isNotBlank())
         assertTrue(job.rawMetadata["rawHeight"].orEmpty().isNotBlank())
+        // Physical proof of WHICH raw16 extraction path the device used. A
+        // conformant RAW_SENSOR stream maps to pixelStride == 2, so a real
+        // device must land on SEQUENTIAL_BULK or PADDED_ROW_PACK - never the
+        // scalar fallback. This is what makes the bulk optimization physically
+        // verifiable instead of inferred from elapsed time.
+        val rawWriteStrategy = job.rawMetadata["rawPersistenceWriteStrategy"].orEmpty()
+        assertTrue(
+            "rawPersistenceWriteStrategy missing from durable RAW metadata",
+            rawWriteStrategy.isNotBlank()
+        )
+        assertTrue(
+            "RAW bulk fast path not used by this device: rawPersistenceWriteStrategy=$rawWriteStrategy",
+            rawWriteStrategy == Raw16WriteStrategy.SEQUENTIAL_BULK.name ||
+                rawWriteStrategy == Raw16WriteStrategy.PADDED_ROW_PACK.name
+        )
         assertTrue(job.fileNames.any { it.endsWith(".dng", ignoreCase = true) || it.contains("raw", ignoreCase = true) })
         assertTrue(
             job.dngSidecarSaved == true ||

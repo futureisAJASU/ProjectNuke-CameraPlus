@@ -178,6 +178,14 @@ private class ProductionMetadataWriter(
     var templateFallbackUsed: Boolean? = null
     var templateFailures: List<String>? = null
 
+    /**
+     * Durable A/B strategy stamped at capture creation. Re-asserted on EVERY
+     * full metadata rewrite because writeColorJobJson is a full-replacement
+     * write; without this the creation-time stamp would be lost before the
+     * background lane reads the durable key.
+     */
+    var yuvPersistenceStrategyName: String? = null
+
     fun write(
         status: String,
         savedFrames: Int,
@@ -256,7 +264,8 @@ private class ProductionMetadataWriter(
             yuvQueuedWork = queuedWork,
             yuvInFlightWork = inFlightWork,
             yuvBufferedFrames = yuvBufferedFrames,
-            yuvReservedAdoptionCount = yuvReservedAdoptionCount
+            yuvReservedAdoptionCount = yuvReservedAdoptionCount,
+            yuvPersistenceStrategyName = yuvPersistenceStrategyName
         )
     }
 }
@@ -647,6 +656,8 @@ fun captureYuvBurstColorWithMotion(
             requestedPhysicalCameraId = physicalCameraId
         )
         metadataWriter?.motionInfo = motionInfo
+        // Keep the durable A/B strategy alive across every full metadata rewrite.
+        metadataWriter?.yuvPersistenceStrategyName = yuvPersistenceStrategy.name
 
         val yuvWorkProcessor = YuvPngWorkProcessor(
             encoder = object : YuvPngEncoder {
@@ -1865,7 +1876,8 @@ internal fun writeColorJobJson(
     yuvQueuedWork: Int = 0,
     yuvInFlightWork: Int = 0,
     yuvBufferedFrames: Int = 0,
-    yuvReservedAdoptionCount: Int = 0
+    yuvReservedAdoptionCount: Int = 0,
+    yuvPersistenceStrategyName: String? = null
 ) {
     val actualPhysicalCameraId =
         if (actualRoute == PhysicalCaptureRoute.PHYSICAL.name) physicalCameraId else null
@@ -2020,6 +2032,15 @@ internal fun writeColorJobJson(
         .put("yuvMemoryBufferEstimatedBytes", yuvMemoryBufferEstimatedBytes)
         .put("yuvMemoryBufferFrameLimit", MAX_YUV_MEMORY_BUFFER_FRAMES)
         .put("yuvMemoryBufferByteLimit", MAX_YUV_MEMORY_BUFFER_BYTES)
+        // Durable A/B strategy: re-stamped from the capture-creation resolution
+        // on every rewrite (this writer is a FULL replacement write); falls
+        // back to the previous job's key so recovery passes never lose it.
+        .put(
+            YuvPersistenceStrategy.JOB_KEY,
+            yuvPersistenceStrategyName
+                ?: previousJob?.optString(YuvPersistenceStrategy.JOB_KEY)?.takeIf { it.isNotBlank() }
+                ?: JSONObject.NULL
+        )
         .put(
             "yuvCaptureRequestTemplate",
             yuvCaptureRequestTemplate

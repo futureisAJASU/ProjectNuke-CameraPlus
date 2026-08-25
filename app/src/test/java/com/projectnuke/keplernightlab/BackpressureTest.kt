@@ -28,7 +28,7 @@ class BackpressureTest {
     }
 
     @Test
-    fun backpressureMessage_isFormalKorean_blockOnlyWhenFull() {
+    fun backpressureMessage_isFormalKorean_blockOnlyWhenQueueCapReached() {
         // Normal small backlog: allowed, no scary message.
         val idle = evaluateBackpressure(queuedCount = 0, active = false)
         assertEquals(BackpressureDecision.ALLOW, idle.decision)
@@ -38,7 +38,17 @@ class BackpressureTest {
         assertEquals(BackpressureDecision.ALLOW, oneQueued.decision)
         assertNull(oneQueued.userMessage)
 
-        // No safe capacity left: formal-polite block notice.
+        // The RUNNING job never counts against the QUEUED cap: with one slot
+        // left, the current capture is admitted (it becomes that queued ref).
+        val lastSlotWithActive = evaluateBackpressure(
+            queuedCount = MAX_QUEUED_HEAVY_JOBS - 1,
+            active = true
+        )
+        assertEquals(BackpressureDecision.ALLOW, lastSlotWithActive.decision)
+        assertNull(lastSlotWithActive.userMessage)
+
+        // Queue cap reached: formal-polite block notice regardless of lane
+        // occupancy - exactly the coordinator's QueueFull boundary.
         val full = evaluateBackpressure(
             queuedCount = MAX_QUEUED_HEAVY_JOBS,
             active = false
@@ -47,10 +57,72 @@ class BackpressureTest {
         assertEquals("처리 대기 중인 사진이 많습니다. 잠시 후 다시 촬영해 주세요.", full.userMessage)
 
         val fullWithActive = evaluateBackpressure(
-            queuedCount = MAX_QUEUED_HEAVY_JOBS - 1,
+            queuedCount = MAX_QUEUED_HEAVY_JOBS,
             active = true
         )
         assertEquals(BackpressureDecision.BLOCK, fullWithActive.decision)
+    }
+
+    @Test
+    fun uiAdmission_matchesCoordinatorAdmission_atEveryDepth() {
+        val appContext = RuntimeEnvironment.getApplication() as Context
+        val coordinator = BackgroundProcessingCoordinator.of(appContext)
+        val release = CountDownLatch(1)
+        try {
+            coordinator.backgroundExecutor = BackgroundProcessingExecutor { _, _ ->
+                release.await()
+            }
+            // Occupy the lane deterministically.
+            val laneDir = File(appContext.filesDir, "bp-align-lane").apply { mkdirs() }
+            coordinator.enqueue(
+                BackgroundProcessingRequest(laneDir, KeplerActiveOperationKind.PROCESSING_YUV)
+            )
+            assertTrue(awaitUntil(5_000) { coordinator.snapshot().hasActiveWork })
+
+            // Fill the queue one ref at a time; at every depth the UI admission
+            // decision must match what a NEW handoff enqueue would experience.
+            repeat(MAX_QUEUED_HEAVY_JOBS) { depth ->
+                val uiDecision = evaluateBackpressure(
+                    queuedCount = coordinator.snapshot().queuedCount,
+                    active = coordinator.snapshot().hasActiveWork
+                ).decision
+                assertEquals(
+                    "UI/coordinator admission diverged at queued depth $depth",
+                    BackpressureDecision.ALLOW,
+                    uiDecision
+                )
+                // The coordinator accepts exactly this handoff too.
+                val dir = File(appContext.filesDir, "bp-align-$depth").apply { mkdirs() }
+                assertEquals(
+                    BackgroundEnqueueResult.Accepted,
+                    coordinator.enqueue(
+                        BackgroundProcessingRequest(dir, KeplerActiveOperationKind.PROCESSING_RAW)
+                    )
+                )
+            }
+
+            // Coordinator queue is now FULL: UI must block, and the coordinator
+            // rejects any further handoff cleanly.
+            assertEquals(MAX_QUEUED_HEAVY_JOBS, coordinator.snapshot().queuedCount)
+            assertEquals(
+                BackpressureDecision.BLOCK,
+                evaluateBackpressure(
+                    queuedCount = coordinator.snapshot().queuedCount,
+                    active = coordinator.snapshot().hasActiveWork
+                ).decision
+            )
+            val overflow = File(appContext.filesDir, "bp-align-overflow").apply { mkdirs() }
+            assertEquals(
+                BackgroundEnqueueResult.QueueFull,
+                coordinator.enqueue(
+                    BackgroundProcessingRequest(overflow, KeplerActiveOperationKind.PROCESSING_YUV)
+                )
+            )
+        } finally {
+            release.countDown()
+            awaitUntil(5_000) { !coordinator.snapshot().hasPendingWork }
+            BackgroundProcessingCoordinator.resetForTest()
+        }
     }
 
     @Test

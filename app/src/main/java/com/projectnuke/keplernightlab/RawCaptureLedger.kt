@@ -65,6 +65,7 @@ internal class RawCaptureLedger<IMAGE, RESULT>(
     private val submissionPendingByTimestamp = mutableMapOf<Long, RawReadyFrame<IMAGE, RESULT>>()
     private val identity = CaptureFrameIdentityOwner(requestedFrames)
     private val rawFrameSaveTimesMs = mutableListOf<Long>()
+    private val adoptedWriteStrategies = java.util.LinkedHashSet<String>()
     private val frameObjects = JSONArray()
     private val imageReleaseOutcomes = mutableListOf<RawImageReleaseOutcome>()
 
@@ -197,6 +198,7 @@ internal class RawCaptureLedger<IMAGE, RESULT>(
         savedFrames++
         synchronized(lock) {
             rawFrameSaveTimesMs += completion.saveDurationMs
+            completion.frame.raw16WriteStrategy?.let { adoptedWriteStrategies.add(it) }
             frameObjects.put(completion.frame.toJson())
         }
     }
@@ -232,6 +234,7 @@ internal class RawCaptureLedger<IMAGE, RESULT>(
         .put("rawHeight", rawHeight ?: JSONObject.NULL)
         .put("rowStride", rowStride ?: JSONObject.NULL)
         .put("pixelStride", pixelStride ?: JSONObject.NULL)
+        .put("raw16WriteStrategy", raw16WriteStrategy ?: JSONObject.NULL)
         .put("dynamicBlackLevel", dynamicBlackLevel?.let { JSONArray(it) } ?: JSONObject.NULL)
         .put("dynamicWhiteLevel", dynamicWhiteLevel ?: JSONObject.NULL)
         .put("colorCorrectionGains", colorCorrectionGains ?: JSONObject.NULL)
@@ -239,6 +242,14 @@ internal class RawCaptureLedger<IMAGE, RESULT>(
         .put("failureReason", failureDescription ?: JSONObject.NULL)
 
     fun rawSaveTotalMs(): Long = synchronized(lock) { rawFrameSaveTimesMs.sum() }
+
+    /**
+     * Distinct raw16 extraction strategies adopted by this burst (bounded set:
+     * at most the three enum names). Persisted as job-level evidence so a
+     * physical report can prove which path the device actually used instead of
+     * inferring optimization activation from elapsed time.
+     */
+    fun rawPersistenceWriteStrategies(): Set<String> = synchronized(lock) { adoptedWriteStrategies.toSet() }
 
     fun rawAverageSaveMs(): Double? = synchronized(lock) {
         rawFrameSaveTimesMs.takeIf { it.isNotEmpty() }?.average()

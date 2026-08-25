@@ -988,6 +988,20 @@ fun captureRawBurstForFusion(
                                 .put("captureCompleteness", if (request.status == CaptureTerminalStatus.PARTIAL_SUCCESS) "PARTIAL" else "FULL")
                                 .put("partialCapture", request.status == CaptureTerminalStatus.PARTIAL_SUCCESS)
                                 .put("frames", frameObjectsSnapshot())
+                                // Durable proof of WHICH raw16 extraction path this
+                                // device used (SEQUENTIAL_BULK / PADDED_ROW_PACK /
+                                // SCALAR_FALLBACK); physical reports must read this
+                                // instead of inferring activation from elapsed time.
+                                .put(
+                                    "rawPersistenceWriteStrategy",
+                                    ledger.value.rawPersistenceWriteStrategies().let { strategies ->
+                                        when {
+                                            strategies.isEmpty() -> JSONObject.NULL
+                                            strategies.size == 1 -> strategies.single()
+                                            else -> strategies.sorted().joinToString("+")
+                                        }
+                                    }
+                                )
                                 .put("gyroFile", motionFiles?.first ?: JSONObject.NULL)
                                 .put("rotationVectorFile", motionFiles?.second ?: JSONObject.NULL)
                                 .put("capturedAt", System.currentTimeMillis())
@@ -1209,6 +1223,8 @@ fun captureRawBurstForFusion(
             val dngFile = File(jobDir, dngName)
             var raw16Temp: File? = null
             var dngTemp: File? = null
+            // Durable per-frame extraction evidence; set only after a real write.
+            var adoptedWriteStrategy: Raw16WriteStrategy? = null
             fun settleImageAndAttach(completion: RawSaveCompletion): RawSaveCompletion {
                 return settleRawSaveImage(completion) { image.close() }
             }
@@ -1234,6 +1250,7 @@ fun captureRawBurstForFusion(
                 raw16Temp = File(jobDir, ".${raw16Name}.${System.nanoTime()}.tmp")
                 try {
                     val writeStats = writeCompactRaw16(image, raw16Temp, captureTimingLedger, index)
+                    adoptedWriteStrategy = writeStats.writeStrategy
                     KeplerJobMetadata.atomicReplace(raw16Temp, raw16File)
                     captureTimingLedger.recordWriteFinished(index)
                     // SINGLE strict post-publish verification of the FINAL file:
@@ -1325,6 +1342,7 @@ fun captureRawBurstForFusion(
                     rawHeight = image.height,
                     rowStride = plane.rowStride,
                     pixelStride = plane.pixelStride,
+                    raw16WriteStrategy = adoptedWriteStrategy?.name,
                     dynamicBlackLevel = dynamicBlackLevel?.toList(),
                     dynamicWhiteLevel = result.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL),
                     colorCorrectionGains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.toString(),
@@ -3017,16 +3035,25 @@ internal class Raw16WriteStats(
     val writeDurationMs: Long,
     val syncDurationMs: Long,
     /** SHA-256 hex over the exact compact payload handed to the kernel. */
-    val payloadSha256: String
+    val payloadSha256: String,
+    /** Which extraction strategy produced this payload (durable physical evidence). */
+    val writeStrategy: Raw16WriteStrategy
 )
 
 /** Which extraction strategy wrote a raw16 frame (observability + test seam). */
 internal enum class Raw16WriteStrategy {
-    /** Contiguous compact plane: bulk sequential row transfers, padding-free by layout. */
+    /**
+     * Normal compact RAW_SENSOR plane: pixelStride == 2 and rowStride ==
+     * width * 2. One bulk ByteBuffer transfer per row of exactly width*2 bytes.
+     */
     SEQUENTIAL_BULK,
-    /** Padded rowStride: per-row bulk pack through one reusable bounded buffer. */
+    /**
+     * Normal padded RAW_SENSOR plane: pixelStride == 2 with rowStride >
+     * width * 2. Per-row bulk pack of exactly width*2 bytes through one
+     * reusable bounded buffer; trailing row padding is ignored.
+     */
     PADDED_ROW_PACK,
-    /** Legacy scalar path (only for exotic pixelStride != 1 layouts). */
+    /** Legacy scalar path, only for genuinely non-standard pixelStride != 2 layouts. */
     SCALAR_FALLBACK
 }
 
@@ -3172,7 +3199,7 @@ private fun writeCompactRaw16(
             timing?.recordFsyncFinished(frameIndex)
             timing?.recordRawFrameSyncStats(syncMs)
             val expectedSize = width.toLong() * height.toLong() * 2L
-            return Raw16WriteStats(expectedSize, writeMs, syncMs, digesting.digestHex())
+            return Raw16WriteStats(expectedSize, writeMs, syncMs, digesting.digestHex(), strategy)
         }
     } finally {
         Trace.endSection()
@@ -3193,12 +3220,21 @@ internal fun writeRaw16Rows(
     val rowBytes = ByteArray(payloadRowBytes)
     val output = BufferedOutputStream(sink)
     try {
-        if (pixelStride == 1) {
+        // Android Camera2 RAW_SENSOR is a single-plane 16-bit-per-sample Bayer
+        // format: AOSP ImageReader maps HAL_PIXEL_FORMAT_RAW_SENSOR to
+        // pixelStride == 2. Sample x occupies exactly the two bytes at
+        // rowOffset + x*2, so copying [rowOffset, rowOffset + width*2) per row
+        // is byte-identical to the legacy scalar sample walk - no byte swap,
+        // no endianness reinterpretation.
+        if (pixelStride == 2) {
             for (y in 0 until height) {
                 val rowOffset = y * rowStride
                 val rowEnd = rowOffset + payloadRowBytes
                 if (rowEnd <= limit) {
                     // Bulk transfer of exactly one compact row per JNI crossing.
+                    // Only the mapped payload of THIS row is required; trailing
+                    // rowStride padding (including the final row's) is never
+                    // assumed to be mapped.
                     val row = buffer.duplicate()
                     row.position(rowOffset)
                     row.limit(rowEnd)
@@ -3212,6 +3248,8 @@ internal fun writeRaw16Rows(
             return if (rowStride == payloadRowBytes) Raw16WriteStrategy.SEQUENTIAL_BULK
             else Raw16WriteStrategy.PADDED_ROW_PACK
         }
+        // Genuinely exotic positive pixelStride layouts only: preserve the exact
+        // legacy byte semantics (two bytes read at rowOffset + x*pixelStride).
         for (y in 0 until height) {
             val row = y * rowStride
             var out = 0

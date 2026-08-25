@@ -160,6 +160,96 @@ class PackedYuvStrategyTest {
     }
 
     @Test
+    fun packedStrategy_productionManifestUsesFileKey_andIsConverted() {
+        // PRODUCTION SHAPE: writeColorJobJson stamps packed sources under the
+        // "file" key. Conversion must find them, convert them, and repoint the
+        // exact fusion-consumed identity while retaining the packed source.
+        val jobDir = tmp.newFolder("packed-production-shape")
+        val frames = JSONArray()
+        repeat(2) { index ->
+            val name = yuvFrameFileName(index, YuvPersistenceStrategy.PACKED_YUV_V1)
+            PackedYuvFrameStore.pack(frame(index), rotationDegrees = 0, outFile = File(jobDir, name))
+            frames.put(
+                JSONObject()
+                    .put("index", index)
+                    .put("frameIndex", index)
+                    .put("file", name)
+                    .put("timestampNs", 1000L + index)
+                    .put("persisted", true)
+            )
+        }
+        val job = JSONObject()
+            .put(YuvPersistenceStrategy.JOB_KEY, YuvPersistenceStrategy.PACKED_YUV_V1.name)
+            .put("frames", frames)
+        KeplerJobMetadata.write(jobDir, job)
+
+        val result = PackedYuvBackgroundConverter.convertJob(jobDir, KeplerJobMetadata.read(jobDir))
+
+        assertEquals(2, result.convertedFrames)
+        val persistedFrames = KeplerJobMetadata.read(jobDir).getJSONArray("frames")
+        repeat(2) { index ->
+            val entry = persistedFrames.getJSONObject(index)
+            assertEquals("frame_0${index}_color.png", entry.getString("file"))
+            assertEquals("frame_0${index}_color.yuvpack", entry.getString("packedSourceFilename"))
+            assertTrue(File(jobDir, entry.getString("file")).isFile)
+        }
+    }
+
+    @Test
+    fun strategyStamp_survivesFullMetadataRewrites() {
+        val jobDir = tmp.newFolder("stamp-survival")
+        KeplerJobMetadata.write(jobDir, JSONObject())
+        KeplerJobMetadata.update(jobDir) {
+            it.put(YuvPersistenceStrategy.JOB_KEY, YuvPersistenceStrategy.PACKED_YUV_V1.name)
+        }
+        val jobFile = File(jobDir, JOB_JSON_FILE_NAME)
+
+        // Rewrite WITH the capture-creation value (production metadata writer).
+        writeColorJobJson(
+            jobFile = jobFile,
+            status = "CAPTURING",
+            cameraId = "0",
+            width = 8,
+            height = 8,
+            outputWidth = 8,
+            outputHeight = 8,
+            rotationDegrees = 0,
+            requestedFrames = 2,
+            savedFrames = 0,
+            frameManifest = emptyList(),
+            gyroFile = null,
+            rotationVectorFile = null,
+            gyroSampleCount = 0,
+            rotationVectorSampleCount = 0,
+            motionInfo = "test",
+            yuvPersistenceStrategyName = YuvPersistenceStrategy.PACKED_YUV_V1.name
+        )
+        assertTrue(PackedYuvBackgroundConverter.isSelected(KeplerJobMetadata.read(jobDir)))
+
+        // Rewrite WITHOUT the parameter: the previous durable key must carry
+        // forward so recovery passes never lose the strategy.
+        writeColorJobJson(
+            jobFile = jobFile,
+            status = "CAPTURE_COMPLETE",
+            cameraId = "0",
+            width = 8,
+            height = 8,
+            outputWidth = 8,
+            outputHeight = 8,
+            rotationDegrees = 0,
+            requestedFrames = 2,
+            savedFrames = 2,
+            frameManifest = emptyList(),
+            gyroFile = null,
+            rotationVectorFile = null,
+            gyroSampleCount = 0,
+            rotationVectorSampleCount = 0,
+            motionInfo = "test"
+        )
+        assertTrue(PackedYuvBackgroundConverter.isSelected(KeplerJobMetadata.read(jobDir)))
+    }
+
+    @Test
     fun mixedHistoricalPngJob_reprocessesWithoutConversion() {
         // A legacy job has NO strategy key and plain PNG sources: it must be
         // reprocessable exactly as before, with zero conversion work.

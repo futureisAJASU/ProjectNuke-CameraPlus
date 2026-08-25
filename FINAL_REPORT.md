@@ -402,9 +402,12 @@ BEFORE (per ~25 MB RAW16 frame, 4-frame burst):
    => 4 full payload reads (~100 MB) per frame before manifest commit.
 
 AFTER:
-1. one bulk row transfer per JNI crossing (SEQUENTIAL_BULK for compact stride,
-   PADDED_ROW_PACK through ONE reusable bounded row buffer for padded stride,
-   SCALAR_FALLBACK only for pixelStride != 1);
+1. one bulk row transfer per JNI crossing (SEQUENTIAL_BULK for compact
+    pixelStride==2 planes, PADDED_ROW_PACK through ONE reusable bounded row
+    buffer when rowStride > width*2 at pixelStride==2,
+    SCALAR_FALLBACK only for genuinely exotic pixelStride != 2 layouts -
+    Android Camera2 RAW_SENSOR is a 16-bit single-plane Bayer format that
+    AOSP ImageReader maps to pixelStride == 2);
 2. every payload byte streams through DigestingOutputStream (write-time SHA-256);
 3. fd.sync() (unchanged count);
 4. atomic rename (unchanged);
@@ -412,6 +415,11 @@ AFTER:
    SHA-256 equality vs the write-time digest (fail-closed).
    => 2 full payload reads per frame; content truth STRICTLY STRONGER
    (digest equality vs prior size-only).
+Durable evidence: job.json now carries rawPersistenceWriteStrategy
+(SEQUENTIAL_BULK | PADDED_ROW_PACK | SCALAR_FALLBACK, plus per-frame
+raw16WriteStrategy in the frames manifest), surfaced in HardwareE2E reports as
+finalJob.rawMetadata.rawPersistenceWriteStrategy, so the physical report PROVES
+which path the device used instead of inferring activation from elapsed time.
 
 Removed foreground work: 50 MB/frame redundant read-back I/O; ~50M scalar JNI
 byte reads/frame. Nothing else was removable - DNG is fully skipped when
@@ -557,11 +565,12 @@ adb shell am instrument -w -r `
   -e kepler.hardwareE2E.stageB true `
   com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner
 
-# Optional packed-YUV foreground A/B (non-default; set key, capture, clear key)
-adb shell "run-as com.projectnuke.keplernightlab sh -c 'echo run manual step'"
-# (set SharedPreferences kepler_camera_settings:yuvPersistenceStrategy=PACKED_YUV_V1
-#  via a debug settings screen or am broadcast before capture; compare
-#  postAcquisitionToShutterMs + persistenceDrainMs against the PNG run)
+# Packed-YUV physical A/B (opt-in; writes/restores the DEBUG strategy key itself,
+# runs BOTH the packed capture and the paired PNG reference capture, restores PNG)
+adb shell am instrument -w -r `
+  -e timeout_msec 300000 `
+  -e kepler.hardwareE2E.packedYuv true `
+  com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner
 
 Report must capture per pipeline: cameraAcquisitionMs, postAcquisitionToShutterMs,
 persistenceDrainMs, captureStageTotalMs; RAW additionally rawWriteMs(rawPersistenceWriteMs),
@@ -573,3 +582,129 @@ PACKED-YUV PROMOTION RULE: promote only after physical A/B shows meaningful
 foreground latency benefit on SM-S921N with zero correctness/thermal/memory/
 background regressions. RAW OPTIMIZATION PROMOTION RULE: prefer changes that cut
 cameraAcquisitionCompleteAt -> captureStageCompleteAt.
+
+---
+
+# PRE-PHYSICAL MEGA-BATCH CLOSURE — RAW_SENSOR Fast Path + Exact Stage-B Harness + Packed-YUV A/B
+
+## P0. Commit accounting correction
+
+The mega-batch bundle contains **14 commits after `c036018`** (5110f60, b32830c,
+dcfd868, 7b801b1, ae83ba6, fc1a0df, 543fe56, fa8cd1f, 83c58c3, ff52930,
+50261d3, 3c095fb, 8818f1f, 7306e7a), not 16. Baseline of THIS bounded
+pre-physical patch: `7306e7a8e8cec082e2aa2b7f2935498e7ad9ecc8`.
+
+## P1. RAW_SENSOR bulk fast path corrected (Phase 1)
+
+The mega-batch gated the raw16 bulk path on `pixelStride == 1`, but Android
+Camera2 RAW_SENSOR is a single-plane 16-bit-per-sample Bayer format that AOSP
+ImageReader maps to **pixelStride == 2** - real SM-S921N frames would have run
+the ~50M-scalar-crossing fallback forever. Corrected classification in
+`writeRaw16Rows`:
+
+- pixelStride == 2 && rowStride == width*2 -> SEQUENTIAL_BULK (one bulk
+  ByteBuffer transfer of exactly width*2 bytes per row);
+- pixelStride == 2 && rowStride > width*2 -> PADDED_ROW_PACK (exactly width*2
+  bytes packed per row; trailing padding ignored; only the mapped payload of
+  the row being read is required: rowOffset + width*2 <= buffer.limit);
+- genuinely exotic positive pixelStride != 2 layouts -> SCALAR_FALLBACK with
+  EXACT legacy byte semantics (two bytes read at rowOffset + x*pixelStride; no
+  byte swap, no endianness reinterpretation).
+
+Durable payloads remain byte-identical to the legacy scalar implementation
+(unit-proven against an exact legacy reference for compact + padded layouts).
+RAW durability ordering, digest-at-write, fsync, atomic publication, and
+manifest semantics are untouched.
+
+## P2/P3/P4. Stage-B harness made identity-exact (Phases 2-4)
+
+- PINNING: each sequential run id is pinned at ITS OWN evidenced
+  CaptureStageComplete (`HardwareE2EStageBRunPinning.selectNewHandoffRun`,
+  earliest-started new evidenced run vs excluded ids) BEFORE the next capture
+  starts; terminals are awaited by EXACT pinned run id (`read(runId)`), never
+  by a mutable newest-first "latest matching pipeline" scan. Same-pipeline
+  pairs can no longer misidentify reportA = B.
+- CONFIGURATION ORDER (mixed pairs): YUV->RAW / RAW->YUV previously clicked B
+  FIRST and saved settings afterwards, so CameraScreen captured A's Compose
+  pipelineMode at the click. Now: after A's durable handoff is pinned,
+  `configureSettings(pipelineB)` persists + recreates + re-verifies the store,
+  THEN shutter B is clicked, and `reportB.scenario.selectedPipelineMode ==
+  pipelineB` is asserted before the lane is released.
+- OVERLAP EVIDENCE: while A is held at `heavyLaneGateForTest`, the coordinator
+  snapshot must show active job = A exactly, queued contains B,
+  queuedCount >= 1, and A != B exact directories; runId/jobDir pairs, click/
+  handoff/terminal timestamps, and coordinator queued peak are emitted as
+  STAGE_B_EVIDENCE in the instrumentation log. No sleeps, no production delay;
+  the gate stays null in normal production.
+
+## P5. Packed-YUV physical A/B actually runnable (Phase 5)
+
+Two latent production breaks found and fixed deterministically (both would
+have failed any real PACKED_YUV_V1 capture):
+- writeColorJobJson is a FULL-replacement metadata write and silently dropped
+  the creation-time `yuvPersistenceStrategy` stamp before the background lane
+  read it; the capture writer now re-stamps it on every rewrite (previous-job
+  carry-forward included). Unit-proven: strategyStamp_survivesFullMetadataRewrites.
+- The background converter read packed sources from manifest key "filename",
+  while production capture manifests use "file" (all fusion readers use
+  "file"); conversion now reads both shapes and repoints both plus retains
+  packedSourceFilename. Unit-proven:
+  packedStrategy_productionManifestUsesFileKey_andIsConverted.
+
+New opt-in androidTest `HardwareE2EPackedYuvInstrumentationTest`
+(`-e kepler.hardwareE2E.packedYuv true`) writes the DEBUG strategy key before
+Activity recreation, runs the SAME strict 12MP 4-frame YUV production capture,
+asserts durable strategy metadata, .yuvpack source manifest, FULL structural +
+SHA-256 verification of every packed source, strict PASS conversion/fusion/
+export, and ALWAYS restores PNG in finally. A paired PNG reference capture
+under the same flag yields directly comparable HardwareE2E reports.
+PACKED_YUV_V1 remains NON-default; normal Stage-A does not depend on it.
+
+## P6. UI backpressure aligned with coordinator policy
+
+evaluateBackpressure now BLOCKs exactly when queuedCount >= MAX_QUEUED_HEAVY_JOBS
+(= BackgroundProcessingCoordinator.enqueue QueueFull boundary) and no longer
+subtracts the running job from the queued cap. Admitting a capture while
+queuedCount == maxQueued - 1 leaves exactly one slot for the handoff about to
+be enqueued: the lane represents 1 active + up to 3 queued on both sides.
+uiAdmission_matchesCoordinatorAdmission_atEveryDepth proves UI admission ==
+coordinator admission at every queue depth.
+
+## P7. Physical verification status (READ BEFORE CLAIMING ANYTHING)
+
+| Scope | Status |
+|---|---|
+| Stage-A production correctness (pre-mega-batch) | PHYSICALLY VERIFIED before the mega-batch (SM-S921N, OK 3 tests / 170.554 s) |
+| Mega-batch Stage-A regression | PENDING - rerun command 1 below |
+| Stage-B rapid sequential overlap | CODE VERIFIED ONLY - PENDING physical (command 2) |
+| Packed-YUV physical A/B | CODE VERIFIED ONLY - PENDING physical (command 3) |
+| RAW bulk optimization activation | NOT physically verified. Do NOT claim it until the SM-S921N report shows finalJob.rawMetadata.rawPersistenceWriteStrategy == SEQUENTIAL_BULK or PADDED_ROW_PACK (the Stage-A RAW test now fails closed on SCALAR_FALLBACK). |
+
+## P8. EXACT PHYSICAL COMMANDS (PowerShell)
+
+.\gradlew.bat :app:installDebug :app:installDebugAndroidTest --console=plain --no-daemon
+
+# 1) Strict Stage-A regression (must stay green)
+adb shell am instrument -w -r `
+  -e timeout_msec 300000 `
+  -e kepler.hardwareE2E true `
+  com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner
+
+# 2) Stage-B rapid sequential suite (pinned identities + overlap evidence)
+adb shell am instrument -w -r `
+  -e timeout_msec 600000 `
+  -e kepler.hardwareE2E.stageB true `
+  com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner
+
+# 3) Packed-YUV physical A/B (packed capture + paired PNG reference)
+adb shell am instrument -w -r `
+  -e timeout_msec 300000 `
+  -e kepler.hardwareE2E.packedYuv true `
+  com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner
+
+Decision gates AFTER those results: (a) whether RAW postAcquisitionToShutterMs
+improved and whether remaining delay is HAL acquisition (compare
+cameraAcquisitionMs vs requestedFrames * rawMinFrameDurationNs) or software
+persistence; (b) whether PACKED_YUV_V1 should be promoted (compare its report
+against the paired PNG reference on postAcquisitionToShutterMs /
+persistenceDrainMs with zero correctness regressions).
