@@ -62,9 +62,18 @@ class BackpressureTest {
             coordinator.backgroundExecutor = BackgroundProcessingExecutor { _, _ ->
                 release.await()
             }
+            // Occupy the lane deterministically BEFORE filling the queue.
+            val laneDir = File(appContext.filesDir, "bp-lane").apply { mkdirs() }
+            assertEquals(
+                BackgroundEnqueueResult.Accepted,
+                coordinator.enqueue(
+                    BackgroundProcessingRequest(laneDir, KeplerActiveOperationKind.PROCESSING_YUV)
+                )
+            )
+            assertTrue(awaitUntil(5_000) { coordinator.snapshot().hasActiveWork })
+
             val results = mutableListOf<BackgroundEnqueueResult>()
-            // First job runs (occupies lane); then fill the queue to the cap.
-            repeat(MAX_QUEUED_HEAVY_JOBS + 2) { index ->
+            repeat(MAX_QUEUED_HEAVY_JOBS + 1) { index ->
                 val dir = File(appContext.filesDir, "bp-job-$index").apply { mkdirs() }
                 results += coordinator.enqueue(
                     BackgroundProcessingRequest(dir, KeplerActiveOperationKind.PROCESSING_YUV)
@@ -72,14 +81,10 @@ class BackpressureTest {
             }
             val accepted = results.count { it == BackgroundEnqueueResult.Accepted }
             val rejected = results.count { it == BackgroundEnqueueResult.QueueFull }
-            // Exactly one lane job + cap queue slots admitted; the rest bounced.
-            assertEquals(MAX_QUEUED_HEAVY_JOBS + 1, accepted)
-            assertTrue(rejected >= 1)
-            awaitUntil(5_000) { coordinator.snapshot().hasActiveWork }
-            assertEquals(
-                MAX_QUEUED_HEAVY_JOBS,
-                coordinator.snapshot().queuedCount
-            )
+            // The queue admits exactly its cap; every further handoff bounces.
+            assertEquals(MAX_QUEUED_HEAVY_JOBS, accepted)
+            assertEquals(1, rejected)
+            assertEquals(MAX_QUEUED_HEAVY_JOBS, coordinator.snapshot().queuedCount)
         } finally {
             release.countDown()
             awaitUntil(5_000) { !coordinator.snapshot().hasPendingWork }
@@ -96,11 +101,21 @@ class BackpressureTest {
             coordinator.backgroundExecutor = BackgroundProcessingExecutor { _, _ ->
                 release.await()
             }
-            val dirs = (0 until MAX_QUEUED_HEAVY_JOBS + 1).map { index ->
+            // Lane job, awaited to RUNNING state deterministically.
+            val laneJob = File(appContext.filesDir, "bp-keep-lane").apply { mkdirs() }
+            assertEquals(
+                BackgroundEnqueueResult.Accepted,
+                coordinator.enqueue(
+                    BackgroundProcessingRequest(laneJob, KeplerActiveOperationKind.PROCESSING_YUV)
+                )
+            )
+            assertTrue(awaitUntil(5_000) { coordinator.snapshot().hasActiveWork })
+
+            // Fill the whole queue FIFO.
+            val queuedDirs = (0 until MAX_QUEUED_HEAVY_JOBS).map { index ->
                 File(appContext.filesDir, "bp-keep-$index").apply { mkdirs() }
             }
-            // Lane job + full queue.
-            dirs.dropLast(1).forEach { dir ->
+            queuedDirs.forEach { dir ->
                 assertEquals(
                     BackgroundEnqueueResult.Accepted,
                     coordinator.enqueue(
@@ -109,15 +124,17 @@ class BackpressureTest {
                 )
             }
             // The overflowing job is rejected WITHOUT touching the queue.
-            val overflow = coordinator.enqueue(
-                BackgroundProcessingRequest(dirs.last(), KeplerActiveOperationKind.PROCESSING_RAW)
+            val overflow = File(appContext.filesDir, "bp-keep-overflow").apply { mkdirs() }
+            assertEquals(
+                BackgroundEnqueueResult.QueueFull,
+                coordinator.enqueue(
+                    BackgroundProcessingRequest(overflow, KeplerActiveOperationKind.PROCESSING_RAW)
+                )
             )
-            assertEquals(BackgroundEnqueueResult.QueueFull, overflow)
-            awaitUntil(5_000) { coordinator.snapshot().hasActiveWork }
-            val queuedOrder = coordinator.queuedOrder()
-            assertEquals(dirs.drop(1).dropLast(1).map { it.absolutePath }, queuedOrder)
+            assertEquals(queuedDirs.map { it.absolutePath }, coordinator.queuedOrder())
             // Every previously accepted durable ref still exists on disk.
-            dirs.forEach { assertTrue(it.isDirectory) }
+            assertTrue(laneJob.isDirectory)
+            (queuedDirs + overflow).forEach { assertTrue(it.isDirectory) }
         } finally {
             release.countDown()
             awaitUntil(5_000) { !coordinator.snapshot().hasPendingWork }
@@ -129,8 +146,8 @@ class BackpressureTest {
     fun queueRecoveryTruth_remainsDurable_capacityRecoversAfterDrain() {
         val appContext = RuntimeEnvironment.getApplication() as Context
         val coordinator = BackgroundProcessingCoordinator.of(appContext)
+        var gate: CountDownLatch? = CountDownLatch(1)
         try {
-            var gate: CountDownLatch? = CountDownLatch(1)
             coordinator.backgroundExecutor = BackgroundProcessingExecutor { _, _ ->
                 gate?.await()
             }
@@ -166,6 +183,8 @@ class BackpressureTest {
                 )
             )
         } finally {
+            gate?.countDown()
+            awaitUntil(5_000) { !coordinator.snapshot().hasPendingWork }
             BackgroundProcessingCoordinator.resetForTest()
         }
     }
