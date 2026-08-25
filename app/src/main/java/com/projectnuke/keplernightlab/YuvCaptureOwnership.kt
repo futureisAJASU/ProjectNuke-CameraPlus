@@ -173,6 +173,49 @@ internal object RealYuvFinalFileVerifier : YuvFinalFileVerifier {
 }
 
 /**
+ * PACKED_YUV_V1 post-commit final verification: durable CONTENT truth from the
+ * packed format itself - expected magic/version, structural validity
+ * (dimensions/strides/plane lengths), EXACT total file length, complete
+ * streamed SHA-256 equality against header.payloadDigest, and the STORED
+ * frameIndex equal to the expected frame index.  Verification is bounded-memory
+ * streaming ([PackedYuvFrameStore.verifyFullStreaming]); PNG signature logic is
+ * never applied to packed files.  The filename suffix is only a secondary
+ * sanity check, never the content authority.
+ */
+internal object PackedYuvFinalFileVerifier : YuvFinalFileVerifier {
+    override fun verify(finalFile: File, frameIndex: Int): Boolean {
+        if (!finalFile.name.endsWith(PackedYuvFrameStore.FILE_EXTENSION)) return false
+        return try {
+            PackedYuvFrameStore.verifyFullStreaming(finalFile).frameIndex == frameIndex
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: Error) {
+            throw fatal
+        } catch (_: Exception) {
+            false
+        }
+    }
+}
+
+/**
+ * Strategy-aware terminal final-file verification policy. Selected ONCE from
+ * the capture's immutable [YuvPersistenceStrategy] resolution at session
+ * construction - never re-read from mutable preferences during settlement.
+ * PNG preserves [RealYuvFinalFileVerifier] exactly; PACKED_YUV_V1 verifies the
+ * packed durable format. A packed source under the PNG policy fails (and vice
+ * versa), so a strategy/verifier mismatch can never silently pass.
+ */
+internal fun yuvTerminalFinalVerifierFor(strategy: YuvPersistenceStrategy): YuvTerminalFinalVerifier =
+    when (strategy) {
+        YuvPersistenceStrategy.PNG -> YuvTerminalFinalVerifier { file, frameIndex ->
+            RealYuvFinalFileVerifier.verify(file, frameIndex)
+        }
+        YuvPersistenceStrategy.PACKED_YUV_V1 -> YuvTerminalFinalVerifier { file, frameIndex ->
+            PackedYuvFinalFileVerifier.verify(file, frameIndex)
+        }
+    }
+
+/**
  * Result of a [YuvCandidateHandle.completeAdoption] call.  Structured results
  * prevent the loser of a same-genuine-claim race from being classified as
  * impossible corruption (AdoptionInvariantException).

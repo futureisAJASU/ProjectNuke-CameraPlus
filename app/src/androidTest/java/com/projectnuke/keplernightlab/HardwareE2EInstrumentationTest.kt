@@ -102,7 +102,9 @@ class HardwareE2EInstrumentationTest {
             HardwareE2EClassification.SKIPPED_UNSUPPORTED,
             HardwareE2EReportStore.readLatest(targetContext)?.status
         )
-        recorder.close()
+        // NO close(): the recorder is process-scoped
+        // (HardwareE2ERecorderProcessScope) and its writer lives for the
+        // process; closing it here would silence every later test's evidence.
     }
 
     @Test

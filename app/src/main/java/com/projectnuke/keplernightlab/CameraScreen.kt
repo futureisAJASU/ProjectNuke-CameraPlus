@@ -303,6 +303,9 @@ fun MainCameraScreen(
             }
         )
     }
+    // PROCESS-scoped diagnostic authority: forContext returns the single
+    // HardwareE2ERecorderProcessScope recorder, so Activity recreation rebinds
+    // to the SAME instance that still owns run A's exact job mapping.
     val hardwareE2ERecorder = remember { HardwareE2ERunRecorder.forContext(context) }
 val savedSettings = remember { CameraSettingsStore.load(context) }
 
@@ -361,7 +364,12 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
     DisposableEffect(Unit) {
         onDispose {
             pipelineSession.dispose()
-            hardwareE2ERecorder.close()
+            // hardwareE2ERecorder is PROCESS-scoped
+            // (HardwareE2ERecorderProcessScope): it must NOT be closed here.
+            // Screen disposal ends only this screen's hub subscription; the
+            // recorder keeps owning exact job->run mappings so a background
+            // terminal arriving after Activity recreation still finalizes its
+            // own run. Its writer lives for the process lifetime by design.
             publishPipelineState()
             Log.i("KeplerPipelineState", "camera screen disposed; active pipeline cancelled")
         }

@@ -1172,7 +1172,14 @@ internal class HardwareE2ERunRecorder private constructor(
         synchronized(lock) { runsByRunId.values.toList() }
 
     fun awaitIdle(timeoutMillis: Long = 5_000L): Boolean {
-        val marker = writer.submit { Unit }
+        // A terminated writer (explicit close / process-scope reset) can never
+        // become idle again: report false instead of throwing at callers that
+        // merely probe liveness.
+        val marker = try {
+            writer.submit { Unit }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            return false
+        }
         return runCatching { marker.get(timeoutMillis, TimeUnit.MILLISECONDS); true }.getOrDefault(false)
     }
 
@@ -1690,13 +1697,77 @@ internal class HardwareE2ERunRecorder private constructor(
             jobFinder = jobFinder
         )
 
+        /**
+         * Production accessor: returns ONE process-scoped recorder for the
+         * current KeplerRuntimeSession. Activity/Composable recreation MUST
+         * NOT produce a new recorder - the exact job->run mappings that route
+         * background terminals live here for the whole process lifetime.
+         */
         fun forContext(context: Context): HardwareE2ERunRecorder =
-            HardwareE2ERunRecorder(
-                reportDirectory = HardwareE2EReportStore.directory(context),
-                environment = HardwareE2EEnvironment.fromContext(context),
-                jobFinder = { findKeplerJobDirectories(context) }
-            )
+            HardwareE2ERecorderProcessScope.recorderFor(context)
+
+        /** Sole construction path for the process scope (constructor stays private). */
+        internal fun createProcessScoped(
+            reportDirectory: File,
+            environment: HardwareE2EEnvironment,
+            jobFinder: () -> List<File>
+        ): HardwareE2ERunRecorder = HardwareE2ERunRecorder(
+            reportDirectory = reportDirectory,
+            environment = environment,
+            jobFinder = jobFinder
+        )
     }
+}
+
+/**
+ * PROCESS-SCOPED owner of the production [HardwareE2ERunRecorder].
+ *
+ * Lifecycle audit fix: the recorder previously lived in a Composable
+ * `remember { }`, so Activity recreation (Stage-B mixed pairs intentionally
+ * recreate between captures) destroyed the instance owning
+ * runIdByJobDirectory / runIdByGeneration / runsByRunId. A background terminal
+ * arriving after recreation then hit `runIdByJobDirectory[job] ?: return` and
+ * was silently dropped, hanging any pinned terminal wait.
+ *
+ * Ownership model:
+ *  - exactly one recorder per process/runtime session;
+ *  - holds ONLY report state, exact job/run mappings, its diagnostic writer
+ *    thread, and application-safe lookups (report dir / environment / jobs);
+ *  - NEVER retains an Activity or Composable object and never persists UI
+ *    callbacks - screens subscribe through [BackgroundPipelineEventHub] with a
+ *    method reference into THIS recorder, so disposing/recreating a screen
+ *    swaps only the subscription, not the diagnostic authority.
+ */
+internal object HardwareE2ERecorderProcessScope {
+    private val scopeLock = Any()
+
+    @Volatile
+    private var processRecorder: HardwareE2ERunRecorder? = null
+
+    /** The single recorder for this process; created lazily, reused forever. */
+    fun recorderFor(context: Context): HardwareE2ERunRecorder = synchronized(scopeLock) {
+        val appContext = context.applicationContext
+        processRecorder ?: HardwareE2ERunRecorder.createProcessScoped(
+            reportDirectory = HardwareE2EReportStore.directory(appContext),
+            environment = HardwareE2EEnvironment.fromContext(appContext),
+            jobFinder = { findKeplerJobDirectories(appContext) }
+        ).also { processRecorder = it }
+    }
+
+    /**
+     * Test-only lifecycle hook: terminates the current recorder's writer thread
+     * and discards all run/job mappings so a subsequent [recorderFor] starts a
+     * fresh isolated instance. Ordinary Activity recreation never calls this.
+     */
+    fun resetForTest() {
+        synchronized(scopeLock) {
+            processRecorder?.close()
+            processRecorder = null
+        }
+    }
+
+    /** Explicit alias for suites that prefer shutdown semantics over reset. */
+    fun shutdownForTest() = resetForTest()
 }
 
 internal data class HardwareE2EEnvironment(

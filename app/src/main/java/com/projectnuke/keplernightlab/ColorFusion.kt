@@ -759,9 +759,8 @@ fun captureYuvBurstColorWithMotion(
             verifiedFileReader = YuvVerifiedFileReader { file ->
                 NoFollowFileSystem.readBytesVerified(file)
             },
-            terminalFinalVerifier = YuvTerminalFinalVerifier { file, frameIndex ->
-                RealYuvFinalFileVerifier.verify(file, frameIndex)
-            },
+            terminalFinalVerifier =
+                yuvTerminalFinalVerifierFor(yuvPersistenceStrategy),
             onSessionTerminal = { request ->
                 // Session terminal observer: consumes the SOLE published request and
                 // dispatches exactly one user callback.  Runs on Main (the owner's

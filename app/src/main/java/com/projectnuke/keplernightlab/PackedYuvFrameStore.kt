@@ -380,6 +380,63 @@ internal object PackedYuvFrameStore {
     fun verifyFull(file: File): PackedFrame = unpack(file)
 
     /**
+     * FULL durable verification with BOUNDED memory: identical truth to
+     * [verifyFull] (magic/version, sane dimensions, stride/plane invariants,
+     * payload decomposition, EXACT total length, complete streamed SHA-256
+     * equality) but it NEVER allocates or retains the Y/U/V planes - the
+     * payload is streamed once through the fixed copy buffer and only the
+     * validated [Header] metadata is returned.  The foreground post-commit
+     * final-file verifier uses this so packed persistence keeps its latency
+     * advantage; consumers that actually need pixel arrays keep using
+     * [verifyFull]/[unpack].
+     */
+    fun verifyFullStreaming(file: File): Header {
+        RandomAccessFile(file, "r").use { raf ->
+            val prefix = ByteArray(FIXED_PREFIX_BYTES)
+            raf.readFully(prefix)
+            validatePrefix(prefix)
+            val headerLength = readHeaderLength(raf)
+            require(headerLength > DIGEST_HEX_LENGTH && headerLength < 64 * 1024) {
+                "packed YUV header length invalid: $headerLength"
+            }
+            val headerBytes = ByteArray(headerLength)
+            raf.readFully(headerBytes)
+            val header = Header.fromJson(JSONObject(String(headerBytes, Charsets.UTF_8)))
+            // Full structural validation INCLUDING exact total file length up
+            // front: truncated or padded containers are rejected before any
+            // payload streaming (malformed strides/lengths can never drive a
+            // read loop).
+            validateStructure(header, headerLength, raf.length())
+
+            // Stream the payload exactly once through the fixed bounded buffer,
+            // updating the running SHA-256. No plane allocation ever happens.
+            val digest = MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(COPY_BUFFER_SIZE)
+            raf.seek(FIXED_PREFIX_BYTES.toLong() + headerLength)
+            var remaining = header.payloadLength
+            while (remaining > 0L) {
+                require(remaining > 0L && remaining <= Int.MAX_VALUE) {
+                    "packed YUV payload length unsupported: $remaining"
+                }
+                val chunk = minOf(buffer.size.toLong(), remaining).toInt()
+                raf.readFully(buffer, 0, chunk)
+                digest.update(buffer, 0, chunk)
+                remaining -= chunk
+            }
+            // Reject ANY trailing bytes beyond prefix+header+payload: the exact
+            // length was validated pre-stream; re-assert post-stream cheaply.
+            check(raf.length() == FIXED_PREFIX_BYTES.toLong() + headerLength + header.payloadLength) {
+                "packed YUV trailing data appeared during streaming"
+            }
+            val actualDigest = digest.digest().toHex()
+            require(actualDigest == header.payloadDigest) {
+                "packed YUV digest mismatch"
+            }
+            return header
+        }
+    }
+
+    /**
      * Reads and fully verifies a packed frame: magic/version, sane dimensions,
      * stride/plane invariants, payload decomposition, exact total length
      * (truncation rejected), and streaming SHA-256 digest over the payload.
