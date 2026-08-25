@@ -66,6 +66,9 @@ internal data class BackgroundProcessingSnapshot(
 internal sealed interface BackgroundEnqueueResult {
     data object Accepted : BackgroundEnqueueResult
     data class Duplicate(val existingSequence: Long) : BackgroundEnqueueResult
+
+    /** Phase-10: bounded backlog - the queue of durable job refs is full. */
+    data object QueueFull : BackgroundEnqueueResult
     data object Unavailable : BackgroundEnqueueResult
     data object Shutdown : BackgroundEnqueueResult
 }
@@ -125,6 +128,13 @@ internal class BackgroundProcessingCoordinator private constructor(
 
     private val lock = Any()
     private val queue = ArrayDeque<ExactJobRef>()
+
+    /**
+     * Phase-10 bounded backlog: the queue may hold at most this many durable
+     * job references beyond the running job. Enqueue past the cap is rejected
+     * CLEANLY (QueueFull) - existing jobs are never deleted or reordered.
+     */
+    internal var maxQueuedJobs: Int = MAX_QUEUED_HEAVY_JOBS
     // Legacy path for tests that still use HeavyProcessingWork
     private val workByPath = HashMap<String, HeavyProcessingWork>()
     // New path for immutable requests
@@ -182,6 +192,9 @@ internal class BackgroundProcessingCoordinator private constructor(
         synchronized(lock) {
             val pathKey = request.exactJobDirectory.absolutePath
             sequenceByPath[pathKey]?.let { return BackgroundEnqueueResult.Duplicate(it) }
+            // Phase-10: bounded admission. The running job does not count
+            // against queue capacity; only queued refs do.
+            if (queue.size >= maxQueuedJobs) return BackgroundEnqueueResult.QueueFull
             val sequence = ++nextSequence
             queue.addLast(ref)
             requestByPath[pathKey] = request

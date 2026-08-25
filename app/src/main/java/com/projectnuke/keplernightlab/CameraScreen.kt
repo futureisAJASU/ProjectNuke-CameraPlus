@@ -1168,6 +1168,19 @@ LaunchedEffect(Unit) {
                         Log.i("KeplerPipelineState", "click ignored while capture resources owned status=$status")
                         return@captureClick
                     }
+                    // Phase-10 bounded backlog: prevent a new capture BEFORE
+                    // sensor acquisition when the durable queue has no safe
+                    // capacity. Existing jobs are never dropped.
+                    val backpressure = evaluateBackpressure(
+                        queuedCount = backgroundProcessing.queuedCount,
+                        active = backgroundProcessing.hasActiveWork
+                    )
+                    if (backpressure.decision == BackpressureDecision.BLOCK) {
+                        status = backpressure.userMessage
+                            ?: "처리 대기 중인 사진이 많습니다. 잠시 후 다시 촬영해 주세요."
+                        Log.i("KeplerPipelineState", "click blocked by bounded backlog queued=${backgroundProcessing.queuedCount}")
+                        return@captureClick
+                    }
                     val clickResult = handleCaptureClick(
                         CaptureClickInput(
                             context = context,
@@ -1274,6 +1287,8 @@ LaunchedEffect(Unit) {
                             "최근 촬영 결과가 이미 처리 대기열에 있습니다."
                         is BackgroundEnqueueResult.Accepted ->
                             "최근 촬영 컬러 합성을 백그라운드에서 시작합니다..."
+                        is BackgroundEnqueueResult.QueueFull ->
+                            "처리 대기 중인 사진이 많습니다. 잠시 후 다시 시도해 주세요."
                         is BackgroundEnqueueResult.Unavailable, is BackgroundEnqueueResult.Shutdown ->
                             "백그라운드 처리 등록에 실패했습니다. 캐시를 보존했습니다. 나중에 다시 처리할 수 있습니다."
                     }
