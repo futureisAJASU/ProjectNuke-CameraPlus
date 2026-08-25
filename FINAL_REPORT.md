@@ -367,3 +367,209 @@ All phases committed separately; working tree clean; focused groups run x2 per p
 ## S5. Physical Promotion Gate (PENDING)
 - Code series complete. Packed-YUV production default remains OFF until physical evidence justifies the switch.
 - Next step (manual, hardware): install BOTH APKs (./gradlew :app:installDebug :app:installDebugAndroidTest --console=plain --no-daemon), run the strict physical Stage A, use the newly exposed timing fields (cameraAcquisitionMs / persistenceDrainMs / aggregate+max frame encode/fsync/verify / backgroundProcessingMs / backgroundExportMs) to prove the current foreground bottleneck and record a before/after baseline. Only that baseline may justify enabling packed-YUV as the default.
+
+---
+
+# STAGE-B PERFORMANCE + RAPID SEQUENTIAL CAPTURE MEGA-BATCH
+
+## B0. Physical verification status (MANDATORY READING)
+
+PHYSICALLY VERIFIED BEFORE THIS BATCH (Stage-A baseline, SM-S921N / Android 16,
+strict HardwareE2E):
+- optInYuv12MpMainCameraProductionBurst ........ PASS
+- appLaunchesAndDiagnosticReportCanBeCreatedAndRead PASS
+- optInRaw12MpMainCameraProductionBurstWhenSupported PASS
+- OK (3 tests), Time: 170.554 s
+
+THIS BATCH IS **CODE VERIFIED ONLY**. No new physical performance claim and no
+Stage-B closure is made. Physical Stage-B + performance validation remains
+pending until the human runs the commands in section B12.
+
+## B1. Baseline and final HEAD
+
+- Baseline commit: c036018 (post Stage-A closure; clean tree).
+- Final HEAD of this batch: see `git log --oneline` P1..P14 series below.
+
+## B2. RAW latency architecture before -> after
+
+BEFORE (per ~25 MB RAW16 frame, 4-frame burst):
+1. scalar per-byte extraction (2 JNI reads/pixel ~= 50M crossings/frame);
+2. BufferedOutputStream write of packed rows;
+3. fd.sync();
+4. verify temp: FULL READ x2 (stream digest + identity fence) - size only;
+5. atomic rename;
+6. verify final: FULL READ x2 - size only;
+   => 4 full payload reads (~100 MB) per frame before manifest commit.
+
+AFTER:
+1. one bulk row transfer per JNI crossing (SEQUENTIAL_BULK for compact stride,
+   PADDED_ROW_PACK through ONE reusable bounded row buffer for padded stride,
+   SCALAR_FALLBACK only for pixelStride != 1);
+2. every payload byte streams through DigestingOutputStream (write-time SHA-256);
+3. fd.sync() (unchanged count);
+4. atomic rename (unchanged);
+5. SINGLE strict post-publish verification of the FINAL file: size AND
+   SHA-256 equality vs the write-time digest (fail-closed).
+   => 2 full payload reads per frame; content truth STRICTLY STRONGER
+   (digest equality vs prior size-only).
+
+Removed foreground work: 50 MB/frame redundant read-back I/O; ~50M scalar JNI
+byte reads/frame. Nothing else was removable - DNG is fully skipped when
+NOT_REQUESTED, no preview/debug/fusion work exists before CaptureStageComplete,
+metadata writes were already consolidated at first/last/terminal boundaries.
+
+## B3. Timing authority (Phase 1)
+
+CaptureTimingLedger now records, with REAL production call sites:
+acquisition: image/result ARRIVAL ORDINAL instants (owner-serialized);
+persistence (RAW): persistenceSubmittedAt, workerStartedAt, fsyncFinishedAt
+(real fd.sync span), writeFinishedAt (atomic rename returned), verifiedAt
+(final strict verify passed), committedAt (owner adoption); aggregates
+rawBytesPersisted / rawPersistenceWriteMs / rawPersistenceSyncMs.
+Derived causal segments exposed to HardwareE2E JSON:
+cameraAcquisitionMs, postAcquisitionPersistenceMs (= persistenceDrainMs),
+handoffPublicationMs, rawMetadataSettlementMs (lastCommit -> handoffPublished),
+captureSettlementMs (handoffPublished -> resourcesSettled),
+postAcquisitionToShutterMs (100% -> shutter admission), captureStageTotalMs.
+Diagnostic-only Android Trace sections: Kepler_RAW_Acquisition,
+Kepler_RAW_Persist, Kepler_RAW_Sync, Kepler_CaptureHandoff.
+HAL pacing evidence: StreamConfigurationMap min-frame/stall durations for the
+exact RAW stream are stamped into job.json (rawStreamTiming +
+rawMinFrameDurationNs/rawStallDurationNs, surfaced via E2E rawMetadata) so a
+physical report can answer "HAL slow or software slow?" by comparing observed
+cameraAcquisitionMs against requestedFrames * minFrameDurationNs.
+
+## B4. UI semantics
+
+Two-state capture surface (pure model, unit-tested):
+CAPTURING = acquisition fraction 0..100% (unchanged formula);
+SETTLING_CAPTURE = acquisition visually holds 100%, independent truthful
+persistence line "촬영 데이터 저장 중 · N/M" driven ONLY by persistedFrames;
+RELEASED = durable handoff proven (shutter re-enabled).
+The busy shutter indicator says "저장 중" during settling (not "촬영 중").
+Monotonic bar guarantees 100% never drops during settlement.
+Background queue surface (non-blocking): active kind + "처리 대기 N건" +
+bounded completion flash from exact background terminals; shutter gating is
+untouched by any background state.
+
+## B5. Durability invariants preserved (Phase 3/7)
+
+temp write -> payload fd.sync -> atomic rename -> fail-closed strict verify ->
+owner adoption (committedAt) -> drain -> terminal manifest -> handoff publish ->
+resources settled -> CaptureStageComplete. Exactly one payload sync per frame;
+fsync failure or digest mismatch throws before adoption so a frame can never be
+committed unproven; Image close paths unchanged (covered by existing
+RawSaveCompletionTest ownership tests).
+
+## B6. Contention policy (Phase 6)
+
+ForegroundCaptureActivitySignal: process-scoped AtomicInteger window driven by
+the three real persistence task bodies (RAW save task, YUV BufferedEncodeTask,
+YUV direct-path task). The serialized heavy lane calls at most ONE Thread.yield
+at real stage-transition boundaries while the signal is active. No sleeps, no
+locks, no cancellation, FIFO preserved. Heavy lane priority remains
+THREAD_PRIORITY_BACKGROUND (verified assertion already in executor).
+
+## B7. Packed-YUV A/B state (Phase 7)
+
+YuvPersistenceStrategy {PNG, PACKED_YUV_V1}; production default PNG. Selection
+is resolved ONCE at capture creation from a debug settings key and stamped as
+DURABLE job.json metadata (yuvPersistenceStrategy); foreground naming and the
+buffered encoder honor it; direct-mode captures keep PNG (documented scope).
+Background lane converts PACKED_YUV_V1 sources (verifyFull -> BT.601 ->
+rotation -> atomic PNG publish) into the EXACT inputs fusion already consumes
+and rewrites manifest entries (packedSourceFilename retained). Conversion is
+idempotent across process death; digest failures fail closed. Legacy jobs
+without the key reprocess unchanged. NOT promoted: promotion requires the
+physical foreground-latency A/B below.
+
+## B8. Rapid sequential architecture + backpressure
+
+Foreground lane max 1; heavy lane max 1 FIFO; queue content = immutable exact
+job refs only (no pixels, no Activity callbacks). Deterministic overlap proof
+seam: KeplerBackgroundExecutor.heavyLaneGateForTest (null in production).
+Bounded backlog: MAX_QUEUED_HEAVY_JOBS=3 durable refs beyond the running job;
+overflow rejects NEW handoffs cleanly (QueueFull) without deleting/reordering;
+capacity recovers exactly on drain. UI blocks a new capture BEFORE acquisition
+with formal Korean guidance when capacity is exhausted; pipeline-level QueueFull
+keeps retain-for-recovery truth.
+
+## B9. Performance acceptance model (Phase 13)
+
+Primary foreground metrics: cameraAcquisitionMs, postAcquisitionToShutterMs =
+captureStageCompleteAt - cameraAcquisitionCompleteAt (THE user-observed
+100%-to-shutter interval), captureStageTotalMs; RAW adds rawPersistenceWriteMs /
+rawPersistenceSyncMs / rawPersistenceDrainMs(=persistenceDrainMs) /
+rawMetadataSettlementMs; YUV adds yuvPersistenceDrainMs(=persistenceDrainMs).
+Background: processingMs/exportMs (existing backgroundStageTimings) +
+unpackConvertMs for packed jobs. Stage-B: timeFromAHandoffToBCaptureStart,
+maximumBackgroundHeavyConcurrency, queuedJobsPeak. An optimization counts only
+if it improves postAcquisitionToShutterMs or captureStageTotalMs without
+regressing correctness, quality, memory safety, thermal behavior, or recovery.
+Pure-software post-acquisition delays > 1 s are explicit optimization targets.
+CI never fails on host-vs-device latency thresholds; thresholds live only in
+the SM-S921N validation report.
+
+## B10. Phase 8 audit result
+
+backgroundStageTimings + debug-artifact gating (diagnosticIntent) already land
+in Stage-A; full-resolution diagnostic PNGs remain gated off normal captures and
+quality JSON stays available. Static pass found NO additional demonstrably
+redundant background work safe to remove without image-quality risk; duplicate-
+decode candidates are recorded as future seams behind benchmark evidence.
+
+## B11. Final static audit checklist (Phase 14)
+
+1 acquisition 100% = Camera2 pair truth ..................... CaptureProgress.kt
+2 settlement never mislabeled as sensor capture ............. CaptureSettlementUiTest
+3 RAW cannot hand off pre-durability ........................ RawFusionCapture submitTerminal
+4 YUV cannot hand off with outstanding work ................. YuvCaptureOwner drain gate
+5 admission = durable release, not processing ............... CameraPipelineUiSession.canAdmitNewCapture
+6 heavy concurrency exactly one ............................. BackgroundProcessingCoordinator drainLoop + RapidSequentialOverlapTest
+7 B coexists with A without shared foreground ownership ..... CaptureSettlementUiTest/RapidSequentialOverlapTest
+8 old terminal cannot mutate new generation ................. LifecycleOverlapRegressionTest
+9 queue holds refs only ..................................... ExactJobRef contract
+10 backlog explicitly bounded ............................... MAX_QUEUED_HEAVY_JOBS
+11 queue-full deletes nothing ............................... BackpressureTest
+12 RAW optimization keeps fsync/atomic publication .......... RawPersistenceOptimizationTest
+13 packed-YUV non-default ................................... YuvPersistenceStrategy.PNG default
+14 PNG + packed both reprocessable .......................... PackedYuvStrategyTest.mixedHistoricalPngJob
+15 quality metrics independent of debug PNGs ................ Stage-A gating (unchanged)
+16 timing fields causal, real sites ......................... RawCaptureTimingLedgerTest
+17 Stage-A strictness unchanged ............................. androidTest Stage-A file untouched
+18 Stage-B overlap deterministic (gate seam, no sleeps) ..... HardwareE2EStageBInstrumentationTest
+19 no latest-job inference for routing ...................... dual identity envelope/dispatcher tests
+20 Error/Cancellation precedence intact ..................... all new try/finally wrappers reviewed; worker identity revert commit
+
+## B12. PHYSICAL NEXT STEPS (human only, PowerShell)
+
+.\gradlew.bat :app:installDebug :app:installDebugAndroidTest --console=plain --no-daemon
+
+# Stage-A regression (must stay green)
+adb shell am instrument -w -r `
+  -e timeout_msec 300000 `
+  -e kepler.hardwareE2E true `
+  com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner
+
+# Stage-B rapid sequential overlap
+adb shell am instrument -w -r `
+  -e timeout_msec 600000 `
+  -e kepler.hardwareE2E.stageB true `
+  com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner
+
+# Optional packed-YUV foreground A/B (non-default; set key, capture, clear key)
+adb shell "run-as com.projectnuke.keplernightlab sh -c 'echo run manual step'"
+# (set SharedPreferences kepler_camera_settings:yuvPersistenceStrategy=PACKED_YUV_V1
+#  via a debug settings screen or am broadcast before capture; compare
+#  postAcquisitionToShutterMs + persistenceDrainMs against the PNG run)
+
+Report must capture per pipeline: cameraAcquisitionMs, postAcquisitionToShutterMs,
+persistenceDrainMs, captureStageTotalMs; RAW additionally rawWriteMs(rawPersistenceWriteMs),
+rawSyncMs(rawPersistenceSyncMs), rawMetadataSettlementMs, rawBytesPersisted;
+background processingMs/exportMs; Stage-B A-handoff/B-start ordering, peak queue depth,
+max heavy concurrency == 1 evidence.
+
+PACKED-YUV PROMOTION RULE: promote only after physical A/B shows meaningful
+foreground latency benefit on SM-S921N with zero correctness/thermal/memory/
+background regressions. RAW OPTIMIZATION PROMOTION RULE: prefer changes that cut
+cameraAcquisitionCompleteAt -> captureStageCompleteAt.
