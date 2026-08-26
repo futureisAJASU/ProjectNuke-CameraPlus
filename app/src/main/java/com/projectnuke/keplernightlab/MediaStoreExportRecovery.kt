@@ -14,6 +14,16 @@ internal enum class MediaStoreExportRecoveryClassification {
     PUBLIC_VERIFIED,
     PUBLIC_COMMITTED_UNVERIFIED,
     PUBLIC_COMMIT_MISSING,
+
+    /**
+     * The exact public row is absent, but durable evidence proves this exact
+     * export previously reached a terminal-stable verified cut (state VERIFIED
+     * with a persisted terminal metadata acknowledgement). This is historical
+     * external removal by the user/provider — NOT recovery corruption — and
+     * must never fail-closed block local mutations or reprocess. The journal
+     * keeps its durable VERIFIED evidence; history is never downgraded.
+     */
+    PUBLIC_RESULT_REMOVED,
     INSERT_RESULT_UNKNOWN,
     DELETE_FAILED,
     AMBIGUOUS
@@ -114,6 +124,12 @@ internal fun reconstructRawSidecarJournalEvidence(
                     frame.put("dngSidecarPublicStatus", "PUBLIC_COMMITTED_UNVERIFIED")
                         .put("publicDngUri", journal.uri)
                         .remove("publicDngError")
+                }
+                MediaStoreExportRecoveryClassification.PUBLIC_RESULT_REMOVED -> {
+                    // Historical sidecar evidence whose exact public row was externally
+                    // removed afterwards: report truthful absence, never a live export.
+                    frame.put("dngSidecarPublicStatus", "PUBLIC_NOT_RECOVERED")
+                        .remove("publicDngUri")
                 }
                 MediaStoreExportRecoveryClassification.AMBIGUOUS,
                 MediaStoreExportRecoveryClassification.INSERT_RESULT_UNKNOWN,
@@ -294,6 +310,19 @@ private fun recoverMediaStoreExportJournal(
         )
     }
     if (!inspection.exists) {
+        // Category B (external removal): a terminal-stable VERIFIED cut proves this exact row
+        // existed and was correct before. Its absence today is user/provider deletion, not
+        // commit uncertainty. Preserve the durable VERIFIED evidence — never downgrade it to
+        // PUBLIC_COMMITTED merely because the row later disappeared.
+        if (journal.state == MediaStoreExportState.VERIFIED && journal.terminalMetadataPersisted) {
+            return MediaStoreExportRecoveryResult(
+                journal.exportAttemptId,
+                MediaStoreExportRecoveryClassification.PUBLIC_RESULT_REMOVED,
+                inspection.message ?: "A previously verified public result was removed outside Kepler."
+            )
+        }
+        // Category A (commit uncertainty): an unacknowledged in-flight export keeps the
+        // existing fail-closed policy.
         if (journal.state == MediaStoreExportState.VERIFIED) {
             journal.transition(jobDir, MediaStoreExportState.PUBLIC_COMMITTED)
         }

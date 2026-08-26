@@ -616,7 +616,7 @@ selectionMode = resolveSelectionMode(job, frameSelection)
     check(listing != null) { "Cannot read job directory contents." }
     transaction = backupReprocessTransaction(
         target,
-        listing.filter { it.isFile && isReprocessWorkerWritable(it, kind) },
+        listing.filter { it.isFile && isReprocessWorkerWritable(it, kind, job) },
         job = job,
         jobKind = kind
     ).getOrElse { backupError ->
@@ -3132,6 +3132,15 @@ internal fun detectJobKind(jobDir: File, job: JSONObject): ReprocessJobKind {
 }
 
 internal fun countActualSourceFrames(jobDir: File, job: JSONObject, kind: ReprocessJobKind): Int {
+    // Canonical job-aware authority (Phase 10): counts actual on-disk canonical sources,
+    // including durable .yuvpack authorities while excluding derived packed fusion inputs.
+    val canonicalCount = CanonicalFrameSources.countAvailable(jobDir, job, kind)
+    if (CanonicalFrameSources.packedStrategySelected(job) && kind == ReprocessJobKind.YUV_FUSION) {
+        return canonicalCount
+    }
+    if (canonicalCount > 0 && job.has("frames")) {
+        return canonicalCount
+    }
     val frames = job.optJSONArray("frames")
     if (frames != null) {
         var count = 0
@@ -3146,6 +3155,7 @@ internal fun countActualSourceFrames(jobDir: File, job: JSONObject, kind: Reproc
                     frame.optString("file")
                 )
                 ReprocessJobKind.YUV_FUSION, ReprocessJobKind.COLOR_BURST -> listOfNotNull(
+                    frame.optString("packedSourceFilename"),
                     frame.optString("file"),
                     frame.optString("yuvFile"),
                     frame.optString("nv21File")
@@ -3200,6 +3210,7 @@ internal sealed class MetadataSourceValidation {
  */
 internal fun validateMetadataSourceFrames(jobDir: File, job: JSONObject): MetadataSourceValidation {
     val frames = job.optJSONArray("frames") ?: return MetadataSourceValidation.Valid
+    val packedSelected = CanonicalFrameSources.packedStrategySelected(job)
     if (frames.length() == 0) return MetadataSourceValidation.Malformed(
         "No source frames declared in metadata."
     )
@@ -3213,7 +3224,8 @@ internal fun validateMetadataSourceFrames(jobDir: File, job: JSONObject): Metada
         val frame = value as JSONObject
         val candidates = listOfNotNull(
             frame.optString("raw16File"),
-            frame.optString("dngFile"),
+            // PACKED_YUV_V1 canonical authority participates in validation.
+            frame.optString("packedSourceFilename").takeIf { packedSelected },
             frame.optString("file"),
             frame.optString("yuvFile"),
             frame.optString("nv21File")
@@ -3262,7 +3274,9 @@ private fun isReprocessSourceFrameFromMetadata(lower: String, kind: ReprocessJob
     return when (kind) {
         ReprocessJobKind.RAW_FUSION -> lower.endsWith(".raw16") || lower.endsWith(".dng")
         ReprocessJobKind.YUV_FUSION -> lower.endsWith(".png") || lower.endsWith(".yuv") ||
-            lower.endsWith(".nv21") || lower.endsWith(".yuv420")
+            lower.endsWith(".nv21") || lower.endsWith(".yuv420") ||
+            // PACKED_YUV_V1 canonical source authority (Phase 11).
+            lower.endsWith(PackedYuvFrameStore.FILE_EXTENSION)
         ReprocessJobKind.COLOR_BURST -> lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg")
         ReprocessJobKind.UNSUPPORTED -> false
     }
@@ -3576,16 +3590,31 @@ internal fun validateTransactionIdentity(
  * True if the file is an immutable source frame for [jobKind] that must never be backed up, deleted,
  * or replaced by a reprocess transaction. Identifies source frames from actual job metadata + kind:
  * RAW/YUV/Color PNG/JPEG/RAW/YUV source frames are all immutable.
+ *
+ * PACKED_YUV_V1 jobs (Phase 11): the durable .yuvpack file is the immutable canonical source;
+ * the converted frame_NN_color.png is a derived, recomputable fusion input and stays mutable so
+ * regeneration may rewrite it. The durable metadata stamp — never filenames — selects this rule.
  */
-private fun isImmutableSourceFrame(file: File, jobKind: ReprocessJobKind): Boolean {
+private fun isImmutableSourceFrame(
+    file: File,
+    jobKind: ReprocessJobKind,
+    job: JSONObject? = null
+): Boolean {
     val name = file.name.lowercase(Locale.US)
     if (!name.startsWith("frame_")) return false
+    if (job != null && jobKind == ReprocessJobKind.YUV_FUSION &&
+        CanonicalFrameSources.packedStrategySelected(job)
+    ) {
+        if (name.endsWith(PackedYuvFrameStore.FILE_EXTENSION)) return true
+        if (CanonicalFrameSources.isDerivedFusionInputFileName(file.name, job)) return false
+    }
     return when (jobKind) {
         ReprocessJobKind.RAW_FUSION ->
             name.endsWith(".raw16") || name.endsWith(".dng") || name.endsWith(".png") ||
                 name.endsWith(".jpg") || name.endsWith(".jpeg")
         ReprocessJobKind.YUV_FUSION ->
             name.endsWith(".yuv") || name.endsWith(".nv21") || name.endsWith(".yuv420") ||
+                name.endsWith(PackedYuvFrameStore.FILE_EXTENSION) ||
                 name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg")
         ReprocessJobKind.COLOR_BURST ->
             name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg")
@@ -3594,7 +3623,11 @@ private fun isImmutableSourceFrame(file: File, jobKind: ReprocessJobKind): Boole
 }
 
 /** True if the file is a mutable output or metadata that the reprocess worker may overwrite. */
-internal fun isReprocessWorkerWritable(file: File, kind: ReprocessJobKind): Boolean = !isImmutableSourceFrame(file, kind)
+internal fun isReprocessWorkerWritable(
+    file: File,
+    kind: ReprocessJobKind,
+    job: JSONObject? = null
+): Boolean = !isImmutableSourceFrame(file, kind, job)
 
 /** Compute SHA-256 digest of a file by streaming — never loads whole large files into memory. */
 private fun computeSha256(file: File): String =
@@ -3631,6 +3664,8 @@ internal fun backupReprocessTransaction(
                 val frame = value as JSONObject
                 val candidates = listOfNotNull(
                     frame.optString("raw16File"),
+                    // PACKED_YUV_V1 canonical authority is protected as an immutable source.
+                    frame.optString("packedSourceFilename"),
                     frame.optString("dngFile"),
                     frame.optString("file"),
                     frame.optString("yuvFile"),
@@ -3655,7 +3690,9 @@ internal fun backupReprocessTransaction(
                     }
                     // Must be a regular file that is a direct child of the canonical job directory.
                     if (isValidMetadataSourceFile(source, canonicalJobDir) &&
-                        isReprocessMetadataSourceFrame(ref, resolvedKind)) {
+                        isReprocessMetadataSourceFrame(ref, resolvedKind) &&
+                        !CanonicalFrameSources.isDerivedFusionInputFileName(ref, validatedJob)
+                    ) {
                         hasValidSource = true
                         immutableSourceFiles += source.canonicalFile
                     }
@@ -3665,7 +3702,7 @@ internal fun backupReprocessTransaction(
         } else {
             // Legacy job without frames metadata: use filename-based detection as fallback.
             jobDirListing.forEach { child ->
-                if (child.isFile && isImmutableSourceFrame(child, resolvedKind)) {
+                if (child.isFile && isImmutableSourceFrame(child, resolvedKind, validatedJob)) {
                     immutableSourceFiles += child.canonicalFile
                 }
             }
@@ -3678,7 +3715,7 @@ internal fun backupReprocessTransaction(
             .map { it.canonicalFile }
             .distinctBy { it.path }
             .filter { it.parentFile?.canonicalFile == jobDir.canonicalFile }
-            .filter { it !in immutableSourceFiles && isReprocessWorkerWritable(it, resolvedKind) }
+            .filter { it !in immutableSourceFiles && isReprocessWorkerWritable(it, resolvedKind, validatedJob) }
             .toList()
         val backups = filesToBackup.map { original ->
             val backup = File(root, "${original.name}$BACKUP_ENTRY_SUFFIX")
@@ -4245,7 +4282,7 @@ private fun writeReprocessSuccess(
             job.remove("galleryDisplaySource")
         }
     }
-    putReprocessAvailability(jobDir, job, sourceFrameCount, finalOutputFile)
+    putReprocessAvailability(jobDir, job, sourceFrameCount, finalOutputFile, export?.publicCommitted == true)
     recordReprocessTerminalMetadata(job, "COMPLETE", null)
     }
 }
@@ -4363,7 +4400,7 @@ private fun writeReprocessPartial(
                 job.remove("galleryDisplaySource")
             }
         }
-    putReprocessAvailability(jobDir, job, sourceFrameCount, finalOutputFile)
+    putReprocessAvailability(jobDir, job, sourceFrameCount, finalOutputFile, export?.publicCommitted == true)
     recordReprocessTerminalMetadata(job, "PARTIAL", error ?: if (export?.publicCommitted == true) {
         "Public export committed but worker verification failed"
     } else {
@@ -4428,7 +4465,7 @@ private fun writeReprocessPartialPublicOnly(
         job.remove("galleryDisplayFile")
         job.remove("galleryThumbnailFile")
         job.remove("galleryDisplaySource")
-        putReprocessAvailability(jobDir, job, sourceFrameCount, null)
+        putReprocessAvailability(jobDir, job, sourceFrameCount, null, export?.publicCommitted == true)
         recordReprocessTerminalMetadata(job, "PARTIAL_PUBLIC_ONLY", error)
     }
 }
@@ -4437,7 +4474,8 @@ private fun putReprocessAvailability(
     jobDir: File,
     job: JSONObject,
     sourceFrameCount: Int,
-    finalOutputFile: File?
+    finalOutputFile: File?,
+    publicCommitted: Boolean = false
 ) {
     val debugAvailable = listFilesNoFollow(jobDir).any { file ->
         file.isFile && file.name != JOB_JSON_FILE_NAME && file.name.lowercase(Locale.US).let { name ->
@@ -4447,6 +4485,8 @@ private fun putReprocessAvailability(
     job.put("sourceFramesAvailable", sourceFrameCount > 0)
         .put("debugFilesAvailable", debugAvailable)
         .put("finalOutputAvailable", finalOutputFile?.isFile == true)
+        // A new current export supersedes any historical external-removal truth.
+        .put("publicResultAvailable", publicCommitted)
 }
 
 /**

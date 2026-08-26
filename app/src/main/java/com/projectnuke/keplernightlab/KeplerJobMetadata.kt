@@ -35,6 +35,24 @@ internal enum class JobRecoveryMutationIntent {
 }
 
 /**
+ * Explicit local destructive mutations operate on Kepler-owned job storage only.
+ * They may proceed past public-export history debt because the public MediaStore
+ * row is never touched by them; they must still respect every LIVE ownership and
+ * evidence-uncertainty block (dead operation, handoff, quarantine, invalid or
+ * ambiguous journals, processing cleanup debt, pre-commit export uncertainty).
+ */
+private val DESTRUCTIVE_LOCAL_STORAGE_INTENTS = setOf(
+    JobRecoveryMutationIntent.JOB_DELETE,
+    JobRecoveryMutationIntent.JOB_CLEANUP
+)
+
+/** Public-export HISTORY debts that must not block explicit local job deletion/cleanup. */
+private val PUBLIC_EXPORT_HISTORY_DEBT_OUTCOMES = setOf(
+    JobRecoveryMutationGateOutcome.BLOCKED_PUBLIC_COMMIT_MISSING,
+    JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION
+)
+
+/**
  * Process-local retry input for a PUBLIC_EXPORT terminal settlement which
  * could not complete before its owning worker scope returned.  The durable
  * journals and job metadata remain the authority; this record only preserves
@@ -251,6 +269,17 @@ object KeplerJobMetadata {
                 "PUBLIC_COMMIT_MISSING" -> JobRecoveryMutationGateOutcome.BLOCKED_PUBLIC_COMMIT_MISSING
                 "PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION" -> JobRecoveryMutationGateOutcome.BLOCKED_EXPORT_VERIFICATION
                 else -> JobRecoveryMutationGateOutcome.ALLOWED
+            }.let { outcome ->
+                // Local destructive storage actions never require the public Gallery row to
+                // exist: public-export history debt alone must not block them. Live ownership
+                // and evidence-uncertainty blocks above are preserved for these intents.
+                if (intent in DESTRUCTIVE_LOCAL_STORAGE_INTENTS &&
+                    outcome in PUBLIC_EXPORT_HISTORY_DEBT_OUTCOMES
+                ) {
+                    JobRecoveryMutationGateOutcome.ALLOWED
+                } else {
+                    outcome
+                }
             }
         } catch (_: Exception) {
             JobRecoveryMutationGateOutcome.INSPECTION_FAILED

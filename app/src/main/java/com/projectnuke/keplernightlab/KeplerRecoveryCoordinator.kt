@@ -308,6 +308,42 @@ internal object KeplerRecoveryCoordinator {
                     cleanupFailures = cleanupFailures
                 )
             }
+            // External public-result removal (category B): a terminal-stable VERIFIED MAIN row
+            // that is now absent is user/provider deletion, not recovery corruption. When no
+            // newer verified current export exists, record truthful current availability and
+            // settle STABLE so local deletion/cleanup/reprocess are never blocked by history.
+            // A historical removal must NEVER override a newer verified current export.
+            if (!recoveredMainVerified) {
+                val removedMainCommit = exportResults.firstOrNull { result ->
+                    result.classification == MediaStoreExportRecoveryClassification.PUBLIC_RESULT_REMOVED &&
+                        exportJournalsById[result.attemptId]?.role == MediaStoreExportRole.MAIN_IMAGE &&
+                        (activeOperation.isBlank() ||
+                            exportJournalsById[result.attemptId]?.ownerOperationId == activeOperation)
+                }
+                if (removedMainCommit != null) {
+                    val removedJournal = exportJournalsById[removedMainCommit.attemptId]
+                    // One current MAIN_IMAGE authority: metadata linkage first, then the exact
+                    // removed journal identity. Blank authority means nothing newer exists.
+                    val currentAuthorityUri = sequenceOf(
+                        job.optString("galleryPublicExportLinkage"),
+                        job.optString("exportUri")
+                    ).firstOrNull { it.isNotBlank() && it != "null" }
+                    val removalRepresentsCurrentTruth = currentAuthorityUri == null ||
+                        removedJournal?.uri == null ||
+                        removedJournal.uri == currentAuthorityUri
+                    if (removalRepresentsCurrentTruth) {
+                        KeplerJobMetadata.update(jobDir) { current ->
+                            applyExternalPublicRemovalMetadata(current)
+                        }
+                        return KeplerJobRecoveryResult(
+                            jobDir,
+                            KeplerJobRecoveryClassification.RECOVERED,
+                            actions = listOf(MediaStoreExportRecoveryClassification.PUBLIC_RESULT_REMOVED.name),
+                            cleanupFailures = cleanupFailures
+                        )
+                    }
+                }
+            }
             if (exportAuthorityOperation.isNotBlank() && exportResults.isNotEmpty()) {
                 job = KeplerJobMetadata.update(jobDir) { current ->
                     reconstructMainExportEvidence(jobDir, current, exportAuthorityOperation, exportResults)
@@ -616,6 +652,37 @@ internal object KeplerRecoveryCoordinator {
         return job.optString("status").uppercase() in active ||
             job.optString("processStatus").uppercase() in active ||
             job.optString("currentPipelineStage").uppercase() in active
+    }
+
+    /**
+     * Phase 1B: after a verified CURRENT public result is proven externally removed, the current
+     * availability fields must describe actual truth while bounded historical evidence is kept.
+     * The old exact URI stops being the current-public-result authority; it survives only as
+     * lastVerifiedExport* history. Idempotent across repeated recovery passes.
+     */
+    private fun applyExternalPublicRemovalMetadata(current: org.json.JSONObject) {
+        fun String?.asDurable(): String? =
+            this?.takeIf { it.isNotBlank() && it != "null" }
+        val previousUri = current.optString("exportUri").asDurable()
+            ?: current.optString("galleryPublicExportLinkage").asDurable()
+        val previousDisplayName = current.optString("exportDisplayName").asDurable()
+        if (previousUri != null) current.put("lastVerifiedExportUri", previousUri)
+        if (previousDisplayName != null) current.put("lastVerifiedExportDisplayName", previousDisplayName)
+        if (!current.has("publicResultRemovedAt")) {
+            current.put("publicResultRemovedAt", System.currentTimeMillis())
+        }
+        current.put("galleryExportCommitted", false)
+            .put("exportVerified", false)
+            .put("exportStatus", "REMOVED_EXTERNALLY")
+            .put("publicResultAvailable", false)
+            .put("lastRecoveryClassification", "PUBLIC_RESULT_REMOVED")
+            .put("lastRecoveryMessage", "시스템 갤러리에 저장되었던 결과가 외부에서 삭제되었습니다.")
+            .put("recoveredAt", System.currentTimeMillis())
+            .put("recoveryState", "STABLE")
+        current.remove("recoveryMessage")
+        // A proven-absent row must never remain the current public-result authority.
+        current.remove("exportUri")
+        current.remove("galleryPublicExportLinkage")
     }
 
     private const val LEGACY_RECOVERY_AGE_MILLIS = 15 * 60 * 1000L

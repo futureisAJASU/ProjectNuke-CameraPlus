@@ -153,7 +153,7 @@ fun loadFrameReviewItems(
     val persistedMode = persistedFrameSelectionMode(job)
     val savedSelectionFrames = persistedSelectionFrameMap(job)
     val fromMetadata = job.optJSONArray("frames")
-        ?.let { array -> reviewItemsFromMetadata(target, kind, array, persistedIncluded, savedSelectionFrames, persistedMode) }
+        ?.let { array -> reviewItemsFromMetadata(target, kind, job, array, persistedIncluded, savedSelectionFrames, persistedMode) }
         .orEmpty()
     val items = if (fromMetadata.isNotEmpty()) {
         fromMetadata
@@ -329,6 +329,7 @@ internal fun minimumFrameCount(jobType: String?, jobDir: File?): Int = when {
 private fun reviewItemsFromMetadata(
     jobDir: File,
     kind: ReprocessJobKind,
+    job: JSONObject,
     frames: JSONArray,
     persistedIncluded: Set<Int>,
     savedSelectionFrames: Map<Int, JSONObject>,
@@ -337,7 +338,16 @@ private fun reviewItemsFromMetadata(
     repeat(frames.length()) { position ->
         val frame = frames.optJSONObject(position) ?: return@repeat
         val index = frame.optInt("index", position)
-        val fileName = sourceFrameName(frame, kind)
+        // Canonical job-aware source authority (Phase 10): prefer an existing derived fusion
+        // input for display, but fall back to the durable PACKED_YUV_V1 .yuvpack authority so
+        // source-only jobs remain reviewable and reprocessable after KEEP_SOURCE_ONLY cleanup.
+        val canonicalName = CanonicalFrameSources.canonicalFileName(frame, kind, job)
+            .ifBlank { sourceFrameName(frame, kind) }
+        val fusionName = CanonicalFrameSources.optionalFusionInputName(frame, kind, job)
+        val fileName = listOf(fusionName, canonicalName)
+            .firstOrNull { name ->
+                !name.isNullOrBlank() && NoFollowFileSystem.optionalDirectChildFile(jobDir, name) != null
+            } ?: canonicalName
         if (fileName.isBlank()) return@repeat
         val file = NoFollowFileSystem.optionalDirectChildFile(jobDir, fileName) ?: return@repeat
         if (!isReprocessSourceFrame(file, kind)) return@repeat

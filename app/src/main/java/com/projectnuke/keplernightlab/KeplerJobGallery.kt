@@ -34,8 +34,28 @@ data class KeplerGalleryJobSummary(
     val recoveryState: String = "STABLE",
     val recoveryMessage: String? = null,
     val lastRecoveryClassification: String? = null,
-    val lastRecoveryMessage: String? = null
-)
+    val lastRecoveryMessage: String? = null,
+    /** Local final/preview file actually exists on disk right now. */
+    val localFinalAvailable: Boolean = false,
+    /** Current public Gallery result is believed available (never inferred from history alone). */
+    val publicResultAvailable: Boolean = false,
+    /** Canonical source frames actually exist on disk right now. */
+    val sourceFramesAvailable: Boolean = false,
+    /** Reprocess capability derived from actual remaining sources. */
+    val canReprocess: Boolean = false
+) {
+    /** Public result was proven removed outside Kepler by recovery. */
+    val publicResultRemovedExternally: Boolean
+        get() = metadata?.optString("exportStatus").orEmpty() == "REMOVED_EXTERNALLY"
+
+    /** "있음" / "삭제됨" / "확인 필요" */
+    val publicResultStateText: String
+        get() = when {
+            publicResultAvailable -> "있음"
+            publicResultRemovedExternally -> "삭제됨"
+            else -> "확인 필요"
+        }
+}
 
 data class KeplerJobStorageInfo(
     val totalJobBytes: Long,
@@ -53,10 +73,15 @@ data class KeplerJobStorageInfo(
 
 enum class KeplerJobCleanupType {
     DEBUG_ONLY,
+    /** Legacy name for the modern DELETE_SOURCES action (durable metadata vocabulary). */
     SOURCE_FRAMES_ONLY,
+    /** Legacy "KEEP final only": retains only final outputs; deletes sources as well. */
     FINAL_ONLY,
+    /** Legacy name for the modern KEEP_SOURCE_ONLY action (durable metadata vocabulary). */
     SOURCE_ONLY,
-    FAILED_JOB_DELETE
+    FAILED_JOB_DELETE,
+    /** Modern recomputable intermediate/debug/cache purge; canonical originals and finals are kept. */
+    DERIVED_CACHE_ONLY
 }
 
 enum class CleanupStatus { COMPLETE, PARTIAL, FAILED }
@@ -238,7 +263,11 @@ internal fun recoveryGallerySummary(directory: File, failure: Throwable): Kepler
         frames = frames,
         metadata = null,
         recoveryState = recoveryState,
-        recoveryMessage = recoveryMessage + " (${failure.javaClass.simpleName})"
+        recoveryMessage = recoveryMessage + " (${failure.javaClass.simpleName})",
+        localFinalAvailable = false,
+        publicResultAvailable = false,
+        sourceFramesAvailable = frames.isNotEmpty(),
+        canReprocess = frames.isNotEmpty()
     )
 }
 
@@ -285,10 +314,28 @@ fun deleteKeplerGalleryJob(context: Context, jobDirectory: File): Result<KeplerJ
                 throw injected
             }
             require(target.isDirectory) { "Job directory no longer exists." }
+            val bytesBefore = try {
+                folderSizeBytesNoFollow(target)
+            } catch (failure: Error) {
+                throw failure
+            } catch (_: Exception) {
+                0L
+            }
             val (status, failedPaths) = deleteRecursivelySafe(target)
             if (status == CleanupStatus.COMPLETE) KeplerJobMetadata.removeLockEntry(target)
+            val bytesAfter = if (status == CleanupStatus.COMPLETE) {
+                0L
+            } else {
+                try {
+                    folderSizeBytesNoFollow(target)
+                } catch (failure: Error) {
+                    throw failure
+                } catch (_: Exception) {
+                    bytesBefore
+                }
+            }
             Result.success(KeplerJobCleanupResult(
-                bytesFreed = 0L,
+                bytesFreed = (bytesBefore - bytesAfter).coerceAtLeast(0L),
                 failedPaths = failedPaths,
                 metadataWarning = failedPaths.takeIf { it.isNotEmpty() }
                     ?.let { "Cleanup ${status.name}: ${it.size} path(s) failed" },
@@ -308,6 +355,30 @@ fun cleanupKeplerGalleryJob(
     context: Context,
     jobDirectory: File,
     cleanupType: KeplerJobCleanupType
+): Result<KeplerJobCleanupResult> = cleanupKeplerGalleryJobInternal(context, jobDirectory, cleanupType)
+
+/** Modern explicit storage action entry point (Phase 6). */
+fun cleanupKeplerGalleryJob(
+    context: Context,
+    jobDirectory: File,
+    action: KeplerStorageAction
+): Result<KeplerJobCleanupResult> = when (action) {
+    KeplerStorageAction.DELETE_SOURCES ->
+        cleanupKeplerGalleryJobInternal(context, jobDirectory, KeplerJobCleanupType.SOURCE_FRAMES_ONLY)
+    KeplerStorageAction.DELETE_DERIVED_CACHE ->
+        cleanupKeplerGalleryJobInternal(context, jobDirectory, KeplerJobCleanupType.DERIVED_CACHE_ONLY)
+    KeplerStorageAction.KEEP_SOURCE_ONLY ->
+        cleanupKeplerGalleryJobInternal(context, jobDirectory, KeplerJobCleanupType.SOURCE_ONLY)
+    KeplerStorageAction.DELETE_LOCAL_JOB ->
+        deleteKeplerGalleryJob(context, jobDirectory)
+    KeplerStorageAction.DEBUG_ONLY ->
+        cleanupKeplerGalleryJobInternal(context, jobDirectory, KeplerJobCleanupType.DEBUG_ONLY)
+}
+
+private fun cleanupKeplerGalleryJobInternal(
+    context: Context,
+    jobDirectory: File,
+    requestedType: KeplerJobCleanupType
 ): Result<KeplerJobCleanupResult> {
     return try {
         val target = requireCleanupSafeJobDirectory(context, jobDirectory)
@@ -331,9 +402,11 @@ fun cleanupKeplerGalleryJob(
         is NoFollowInspection.InspectionFailed -> throw resolved.exception
     }
     val finalFiles = finalFilesForCleanup(target, job)
+    // Phase 5: explicit SOURCE deletion must never require a final result. The user may purge
+    // local sources even when the Gallery result was deleted, the local final is absent, export
+    // failed, or no final ever existed — losing reprocess capability is the accepted contract.
     if (
-        cleanupType != KeplerJobCleanupType.DEBUG_ONLY &&
-        cleanupType != KeplerJobCleanupType.SOURCE_ONLY &&
+        requestedType == KeplerJobCleanupType.FINAL_ONLY &&
         finalFiles.isEmpty()
     ) {
         throw IllegalStateException("Final output missing; cleanup refused.")
@@ -341,12 +414,16 @@ fun cleanupKeplerGalleryJob(
     val filesToDelete = listFilesNoFollow(target)
         .filter { NoFollowFileSystem.isRealFile(it.toPath()) }
         .filter { file ->
-            when (cleanupType) {
+            when (requestedType) {
                 KeplerJobCleanupType.DEBUG_ONLY -> isDeletableDebugFile(file, finalFiles)
-                KeplerJobCleanupType.SOURCE_FRAMES_ONLY -> isDeletableSourceOrIntermediate(file, finalFiles)
+                KeplerJobCleanupType.SOURCE_FRAMES_ONLY ->
+                    isDeletableSourceOrIntermediate(file, finalFiles)
+                KeplerJobCleanupType.DERIVED_CACHE_ONLY ->
+                    isDeletableDerivedCache(file, finalFiles, job)
                 KeplerJobCleanupType.FINAL_ONLY ->
                     file.name != JOB_JSON_FILE_NAME && file !in finalFiles
-                KeplerJobCleanupType.SOURCE_ONLY -> isDeletableForSourceOnly(file, finalFiles)
+                KeplerJobCleanupType.SOURCE_ONLY ->
+                    isDeletableForSourceOnly(file, finalFiles, job)
                 KeplerJobCleanupType.FAILED_JOB_DELETE -> false
             }
         }
@@ -379,15 +456,16 @@ fun cleanupKeplerGalleryJob(
         }
     }
     val after = folderSizeBytes(target)
+    // Phase 16: metadata must describe ACTUAL remaining filesystem state, inspected after deletion.
     val remainingFiles = listFilesNoFollow(target).filter { NoFollowFileSystem.isRealFile(it.toPath()) }
-    val sourceAvailable = remainingFiles.any { isSourceFrame(it) }
+    val sourceAvailable = remainingFiles.any { isCanonicalSourceFileForJob(it, job) }
     val debugAvailable = remainingFiles.any { isDebugFile(it, finalFiles.map { f -> f.name }.toSet()) }
     val finalOutputAvailable = finalFiles.any { NoFollowFileSystem.isRealFile(it.toPath()) }
-    val effectiveSourceOnly = cleanupType == KeplerJobCleanupType.SOURCE_ONLY && !finalOutputAvailable
+    val effectiveSourceOnly = requestedType == KeplerJobCleanupType.SOURCE_ONLY && !finalOutputAvailable
     val effectiveCleanupType = when {
         effectiveSourceOnly -> KeplerJobCleanupType.SOURCE_ONLY.name
-        cleanupType == KeplerJobCleanupType.SOURCE_ONLY -> "SOURCE_ONLY_PARTIAL"
-        else -> cleanupType.name
+        requestedType == KeplerJobCleanupType.SOURCE_ONLY -> "SOURCE_ONLY_PARTIAL"
+        else -> requestedType.name
     }
     val metadataWarning = try {
         galleryCleanupMetadataFailureForTest?.let { injected ->
@@ -398,7 +476,8 @@ fun cleanupKeplerGalleryJob(
             val updated = computeKeplerJobStorage(target, j, finalFiles.firstOrNull())
             j.put("cleanupApplied", failed.isEmpty())
                 .put("cleanupType", effectiveCleanupType)
-                .put("requestedCleanupType", cleanupType.name)
+                .put("requestedCleanupType", requestedType.name)
+                .put("storageAction", requestedType.toStorageAction()?.name ?: JSONObject.NULL)
                 .put("cleanupAt", System.currentTimeMillis())
                 .put("bytesFreed", (before - after).coerceAtLeast(0L))
                 .put("remainingJobBytes", after)
@@ -416,6 +495,7 @@ fun cleanupKeplerGalleryJob(
     } catch (failure: Exception) {
         "${failure.javaClass.simpleName}: ${failure.message}"
     }
+    // Metadata truth failures are never reported as full success.
     val cleanupStatus = when {
         metadataWarning != null && failed.isEmpty() -> CleanupStatus.FAILED
         failed.isNotEmpty() || metadataWarning != null -> CleanupStatus.PARTIAL
@@ -530,6 +610,22 @@ fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
                 !journal.uri.isNullOrBlank()
         }
 
+    // Phase 13 — split availability truths. A historical VERIFIED journal is evidence that a
+    // result EXISTED, never that it still exists today; current public availability comes only
+    // from durable claims that recovery has reconciled against provider truth.
+    val localFinalAvailable = finalPreview != null && NoFollowFileSystem.isRealFile(finalPreview.toPath())
+    val exportStatusRemoved = job?.optString("exportStatus").orEmpty() == "REMOVED_EXTERNALLY"
+    val currentPublicClaim = (
+        job?.optBoolean("galleryExportCommitted", false) == true ||
+            job?.optBoolean("exportVerified", false) == true
+        ) && job.optString("exportUri").orEmpty().let { it.isNotBlank() && it != "null" }
+    val publicResultAvailable = !exportStatusRemoved &&
+        job?.optBoolean("publicResultAvailable", true) != false &&
+        currentPublicClaim
+    val sourceFramesAvailable = frames.any { it.file != null }
+    val canReprocess = sourceFramesAvailable &&
+        (job == null || !job.has("canReprocess") || job.optBoolean("canReprocess", true))
+
     return KeplerGalleryJobSummary(
         id = directory.absolutePath,
         jobType = jobType,
@@ -549,7 +645,11 @@ fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
         recoveryState = job?.optString("recoveryState").orEmpty().ifBlank { "STABLE" },
         recoveryMessage = job?.optString("recoveryMessage").orEmpty().ifBlank { null },
         lastRecoveryClassification = job?.optString("lastRecoveryClassification").orEmpty().ifBlank { null },
-        lastRecoveryMessage = job?.optString("lastRecoveryMessage").orEmpty().ifBlank { null }
+        lastRecoveryMessage = job?.optString("lastRecoveryMessage").orEmpty().ifBlank { null },
+        localFinalAvailable = localFinalAvailable,
+        publicResultAvailable = publicResultAvailable,
+        sourceFramesAvailable = sourceFramesAvailable,
+        canReprocess = canReprocess
     )
 }
 
@@ -683,8 +783,28 @@ fun isDeletableSourceOrIntermediate(file: File, finalFiles: Set<File>): Boolean 
     return isSourceFrame(file) || isIntermediateFile(file, finalFiles.map { it.name }.toSet())
 }
 
-fun isDeletableForSourceOnly(file: File, finalFiles: Set<File>): Boolean {
-    if (file.name == JOB_JSON_FILE_NAME || isRequiredSourceOnlyMetadata(file) || isSourceFrame(file)) return false
+/** Modern DELETE_DERIVED_CACHE: recomputable artifacts only; canonical originals and finals kept. */
+fun isDeletableDerivedCache(file: File, finalFiles: Set<File>, job: JSONObject?): Boolean {
+    if (file.name == JOB_JSON_FILE_NAME || isRequiredSourceOnlyMetadata(file) || file in finalFiles) return false
+    // A converted packed fusion input is always recomputable from its .yuvpack authority.
+    if (CanonicalFrameSources.isDerivedFusionInputFileName(file.name, job)) return true
+    if (isCanonicalSourceFileForJob(file, job)) return false
+    return isDeletableDebugFile(file, finalFiles) ||
+        isIntermediateFile(file, finalFiles.map { it.name }.toSet()) ||
+        isCacheFile(file, finalFiles.map { it.name }.toSet()) ||
+        isPreviewFile(file, finalFiles.map { it.name }.toSet())
+}
+
+fun isDeletableForSourceOnly(
+    file: File,
+    finalFiles: Set<File>,
+    job: JSONObject? = null
+): Boolean {
+    if (file.name == JOB_JSON_FILE_NAME || isRequiredSourceOnlyMetadata(file)) return false
+    // PACKED_YUV_V1: the converted frame_NN_color.png is a derived fusion input, never a
+    // canonical original; KEEP_SOURCE_ONLY deletes it while the .yuvpack authority survives.
+    if (CanonicalFrameSources.isDerivedFusionInputFileName(file.name, job)) return true
+    if (isCanonicalSourceFileForJob(file, job)) return false
     val name = file.name.lowercase()
     return file in finalFiles ||
         isDeletableDebugFile(file, finalFiles) ||
@@ -696,6 +816,17 @@ fun isDeletableForSourceOnly(file: File, finalFiles: Set<File>): Boolean {
         name.contains("gallery") ||
         name.contains("temp") ||
         name.contains("tmp")
+}
+
+/**
+ * Job-aware canonical source truth (Phase 10): packed-derived fusion inputs are
+ * excluded and durable .yuvpack authorities are included.
+ */
+internal fun isCanonicalSourceFileForJob(file: File, job: JSONObject?): Boolean {
+    val name = file.name
+    if (CanonicalFrameSources.isDerivedFusionInputFileName(name, job)) return false
+    if (isSourceFrame(file)) return true
+    return CanonicalFrameSources.isCanonicalSourceFileName(name, job)
 }
 
 private fun isRequiredSourceOnlyMetadata(file: File): Boolean {
@@ -748,6 +879,7 @@ private fun JSONArray?.galleryFrames(directory: File): List<KeplerGalleryFrame> 
         repeat(length()) { position ->
             val frame = optJSONObject(position) ?: return@repeat
             val fileName = frame.optString("raw16File")
+                .ifBlank { frame.optString("packedSourceFilename") }
                 .ifBlank { frame.optString("file") }
                 .ifBlank { frame.optString("dngFile") }
             val file = fileName.takeIf { it.isNotBlank() }?.let {
@@ -875,7 +1007,8 @@ fun isSourceFrame(file: File): Boolean {
     val name = file.name.lowercase()
     return name.startsWith("frame_") &&
         (name.endsWith(".png") || name.endsWith(".raw16") || name.endsWith(".dng") ||
-            name.endsWith(".yuv") || name.endsWith(".nv21") || name.endsWith(".yuv420"))
+            name.endsWith(".yuv") || name.endsWith(".nv21") || name.endsWith(".yuv420") ||
+            name.endsWith(PackedYuvFrameStore.FILE_EXTENSION))
 }
 
 internal fun isSafeRelativeFilename(name: String): Boolean {
@@ -890,7 +1023,11 @@ internal fun isSafeRelativeFilename(name: String): Boolean {
     return true
 }
 
+/** Narrow partial-failure seam for whole-job deletion contract tests. */
+internal var deleteRecursivelySafeOverrideForTest: ((root: File) -> Pair<CleanupStatus, List<String>>)? = null
+
 internal fun deleteRecursivelySafe(root: File): Pair<CleanupStatus, List<String>> {
+    deleteRecursivelySafeOverrideForTest?.let { return it(root) }
     return NoFollowFileSystem.deleteTree(root)
 }
 

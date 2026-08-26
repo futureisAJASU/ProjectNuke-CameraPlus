@@ -315,6 +315,18 @@ internal fun reprocessYuvJob(
         }
         try {
             cancellation.throwIfCancelled()
+            // Phase 11A: PACKED_YUV_V1 fusion inputs are derived artifacts and may have been
+            // purged by KEEP_SOURCE_ONLY cleanup. Regenerate them from the verified packed
+            // canonical source before selection/counting; a digest failure throws here and the
+            // job fails closed. The immutable .yuvpack authority is never mutated.
+            val preConvertJob = JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
+            if (PackedYuvBackgroundConverter.isSelected(preConvertJob)) {
+                post("PACKED_YUV_V1: 합성 입력을 팩 소스에서 재생성하는 중…")
+                PackedYuvBackgroundConverter.convertJob(
+                    jobDir,
+                    JSONObject(NoFollowFileSystem.readTextVerified(jobFile))
+                )
+            }
             if (selectedFrameIndices != null) {
                 applyExplicitYuvFrameSelection(jobDir, selectedFrameIndices)
             }
