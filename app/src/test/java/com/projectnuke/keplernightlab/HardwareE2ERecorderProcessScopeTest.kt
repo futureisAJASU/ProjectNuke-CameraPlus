@@ -298,4 +298,31 @@ class HardwareE2ERecorderProcessScopeTest {
         HardwareE2ERecorderProcessScope.resetForTest()
         HardwareE2ERecorderProcessScope.shutdownForTest() // alias is safe twice
     }
+
+    @Test
+    fun sameRecorder_differentSession_sameGeneration_doesNotCollide() {
+        HardwareE2ERecorderProcessScope.resetForTest()
+        val recorder = HardwareE2ERunRecorder.forContext(appContext)
+
+        // Simulate two foreground sessions (e.g., Activity recreations) that
+        // both issue generation=1. The process-scoped recorder must keep their
+        // runs independent.
+        val runA = recorder.start(scenario("sessionA"), foregroundSessionId = 1L, generation = 1L)!!
+        val runB = recorder.start(scenario("sessionB"), foregroundSessionId = 2L, generation = 1L)!!
+        assertNotEquals(runA, runB)
+
+        recorder.recordForegroundEvent(1L, CameraPipelineEvent.Started(1L, "A start"))
+        recorder.recordForegroundEvent(2L, CameraPipelineEvent.Started(1L, "B start"))
+
+        val runs = recorder.snapshotsForTest()
+        val reportA = runs.first { it.runId == runA }
+        val reportB = runs.first { it.runId == runB }
+
+        assertEquals(1, reportA.progressCounts.getOrDefault("CAPTURE_STARTED", 0))
+        assertEquals(1, reportB.progressCounts.getOrDefault("CAPTURE_STARTED", 0))
+        assertEquals("A start", reportA.eventHistory.last { it.checkpoint == "CAPTURE_STARTED" }.message)
+        assertEquals("B start", reportB.eventHistory.last { it.checkpoint == "CAPTURE_STARTED" }.message)
+        assertEquals(HardwareE2EClassification.INCOMPLETE, reportA.status)
+        assertEquals(HardwareE2EClassification.INCOMPLETE, reportB.status)
+    }
 }

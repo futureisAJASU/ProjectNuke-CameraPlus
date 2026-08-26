@@ -16,6 +16,11 @@ internal const val HARDWARE_E2E_REPORT_DIRECTORY = "hardware-e2e"
 private const val HARDWARE_E2E_MAX_REPORTS = 12
 private const val HARDWARE_E2E_TAG = "KeplerHardwareE2E"
 
+internal data class ForegroundRouteKey(
+    val sessionId: Long,
+    val generation: Long
+)
+
 internal enum class HardwareE2EClassification {
     PASS,
     FAIL,
@@ -937,7 +942,7 @@ internal class HardwareE2ERunRecorder private constructor(
     // foreground captures have started.
     private var current: HardwareE2ERunReport? = null
     private val runsByRunId = LinkedHashMap<String, HardwareE2ERunReport>()
-    private val runIdByGeneration = HashMap<Long, String>()
+    private val runIdByForegroundKey = HashMap<ForegroundRouteKey, String>()
     // Exact job-directory -> run binding. Established at the evidenced
     // CaptureStageComplete of a run and used as the FIRST routing priority for
     // background events whose generation is 0 (the foreground generation is no
@@ -952,7 +957,11 @@ internal class HardwareE2ERunRecorder private constructor(
     private val sequenceByRunId = HashMap<String, Long>()
     private var latestRunId: String? = null
 
-    fun start(scenario: HardwareE2ERunScenario): String? {
+    fun start(
+        scenario: HardwareE2ERunScenario,
+        foregroundSessionId: Long = 0L,
+        generation: Long = 0L
+    ): String? {
         if (!enabled) return null
         val now = System.currentTimeMillis()
         val runId = UUID.randomUUID().toString()
@@ -992,13 +1001,30 @@ internal class HardwareE2ERunRecorder private constructor(
             startedAtNanosByRunId[runId] = System.nanoTime()
             sequenceByRunId[runId] = ++latestRunSequence
             latestRunId = runId
+            if (foregroundSessionId != 0L && generation != 0L) {
+                runIdByForegroundKey[ForegroundRouteKey(foregroundSessionId, generation)] = runId
+            }
         }
         recordCheckpoint("RUN_STARTED", null, null, runId)
         return runId
     }
 
     fun recordEvent(event: CameraPipelineEvent) {
-        recordRouted(event, exactJobDirectory = null)
+        if (!enabled) return
+        val targetRunId = synchronized(lock) { current?.runId } ?: return
+        val checkpoint = checkpointFor(event)
+        if (event is CameraPipelineEvent.CaptureStageComplete &&
+            event.handoffEvidenceComplete &&
+            event.jobDirectoryPath != null
+        ) {
+            synchronized(lock) { runIdByJobDirectory[event.jobDirectoryPath] = targetRunId }
+        }
+        recordToRun(event, checkpoint, targetRunId)
+    }
+
+    fun recordForegroundEvent(foregroundSessionId: Long, event: CameraPipelineEvent) {
+        if (!enabled) return
+        recordRouted(event, exactJobDirectory = null, foregroundSessionId = foregroundSessionId)
     }
 
     /**
@@ -1033,17 +1059,21 @@ internal class HardwareE2ERunRecorder private constructor(
 
     /**
      * Routing priority: (1) exact job-directory mapping, (2) foreground
-     * generation mapping, (3) current run only for truly unbound foreground
-     * events before an exact job exists.
+     * composite (sessionId, generation) mapping, (3) current run only for
+     * unbound foreground events with no explicit composite binding. For
+     * non-zero-generation events with no composite binding, fail closed rather
+     * than fall back to current to avoid silent run-attribution corruption.
      */
-    private fun recordRouted(event: CameraPipelineEvent, exactJobDirectory: File?) {
+    private fun recordRouted(event: CameraPipelineEvent, exactJobDirectory: File?, foregroundSessionId: Long) {
         val checkpoint = checkpointFor(event)
         val targetRunId = synchronized(lock) {
             val boundByJob = exactJobDirectory?.absolutePath?.let { runIdByJobDirectory[it] }
             when {
                 boundByJob != null -> boundByJob
-                event.generation != 0L -> runIdByGeneration[event.generation]
-                    ?: current?.runId?.also { runIdByGeneration[event.generation] = it }
+                event.generation != 0L -> {
+                    val key = ForegroundRouteKey(foregroundSessionId, event.generation)
+                    runIdByForegroundKey[key]
+                }
                 else -> current?.runId
             }
         } ?: return
@@ -1725,7 +1755,7 @@ internal class HardwareE2ERunRecorder private constructor(
  * Lifecycle audit fix: the recorder previously lived in a Composable
  * `remember { }`, so Activity recreation (Stage-B mixed pairs intentionally
  * recreate between captures) destroyed the instance owning
- * runIdByJobDirectory / runIdByGeneration / runsByRunId. A background terminal
+ * runIdByJobDirectory / runIdByForegroundKey / runsByRunId. A background terminal
  * arriving after recreation then hit `runIdByJobDirectory[job] ?: return` and
  * was silently dropped, hanging any pinned terminal wait.
  *

@@ -161,7 +161,7 @@ class Phase5EarlyReleaseTest {
             scheduler,
             CameraPipelineUiOrchestrator.Callbacks({}, {}, {})
         )
-        assertTrue(orchestrator.start("first", timeoutMillis = 1_000L) { _, _, _, events -> sink = events })
+        assertTrue(orchestrator.start("first", timeoutMillis = 1_000L) { _, _, _, events -> sink = events } is StartOutcome.Accepted)
         scheduler.run(250L)
         val generation = session.snapshot().generation
         sink!!.invoke(handoffEvent(generation))
@@ -172,7 +172,7 @@ class Phase5EarlyReleaseTest {
         assertTrue(scheduler.entries.none { it.delay == 1_000L })
         val snapshot = session.snapshot()
         assertTrue(snapshot.canAdmitNewCapture)
-        assertTrue(orchestrator.start("second", timeoutMillis = 1_000L) { _, _, _, _ -> })
+        assertTrue(orchestrator.start("second", timeoutMillis = 1_000L) { _, _, _, _ -> } is StartOutcome.Accepted)
     }
 
     @Test

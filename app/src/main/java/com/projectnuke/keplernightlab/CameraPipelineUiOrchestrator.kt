@@ -12,6 +12,11 @@ internal typealias CameraPipelineUiJob = (
     CameraPipelineEventSink
 ) -> Unit
 
+sealed interface StartOutcome {
+    data class Accepted(val generation: Long) : StartOutcome
+    data object Rejected : StartOutcome
+}
+
 /** Production, JVM-testable orchestration seam used by MainCameraScreen. */
 internal class CameraPipelineUiOrchestrator(
     private val session: CameraPipelineUiSession,
@@ -22,7 +27,7 @@ internal class CameraPipelineUiOrchestrator(
         val onStatus: (String) -> Unit,
         val onStateChanged: () -> Unit,
         val onTerminal: (CameraPipelineEvent.Terminal) -> Unit,
-        val onDiagnosticEvent: ((CameraPipelineEvent) -> Unit)? = null,
+        val onForegroundEvent: ((Long, CameraPipelineEvent) -> Unit)? = null,
         val onBackgroundTerminal: ((CameraPipelineEvent.Terminal) -> Unit)? = null
     )
 
@@ -36,7 +41,7 @@ internal class CameraPipelineUiOrchestrator(
 
     private fun notifyDiagnosticEvent(event: CameraPipelineEvent) {
         try {
-            callbacks.onDiagnosticEvent?.invoke(event)
+            callbacks.onForegroundEvent?.invoke(session.diagnosticSessionId, event)
         } catch (error: Throwable) {
             // Diagnostics are strictly passive. A recorder failure must not alter the
             // production session, terminal truth, or the original pipeline failure.
@@ -100,11 +105,11 @@ internal class CameraPipelineUiOrchestrator(
         requestedFrames: Int = 0,
         timeoutMillis: Long = 120_000L,
         job: CameraPipelineUiJob
-    ): Boolean {
+    ): StartOutcome {
         val started = session.start(startMessage, requestedFrames)
         if (started is CameraPipelineUiSession.StartResult.Rejected) {
             callbacks.onStatus("촬영 리소스가 사용 중입니다. 현재 처리 중인 작업이 완료된 후 다시 시도해 주세요.")
-            return false
+            return StartOutcome.Rejected
         }
         val operation = (started as CameraPipelineUiSession.StartResult.Accepted).operation
         val generation = operation.generation
@@ -169,7 +174,7 @@ internal class CameraPipelineUiOrchestrator(
                     callbacks.onStatus("PIPELINE_FAILED: Timeout guard could not be scheduled before capture start.")
                     callbacks.onStateChanged()
                 }
-                return false
+                return StartOutcome.Rejected
             }
         }
 
@@ -324,10 +329,10 @@ internal class CameraPipelineUiOrchestrator(
                     callbacks.onStatus("PIPELINE_FAILED: Capture could not be scheduled before Camera2 acquisition.")
                     callbacks.onStateChanged()
                 }
-                return false
+                return StartOutcome.Rejected
             }
         }
-        return true
+        return StartOutcome.Accepted(generation)
     }
 
     fun dispose() {

@@ -73,7 +73,7 @@ class CameraPipelineUiOrchestratorTest {
                 onStatus = {},
                 onStateChanged = {},
                 onTerminal = { terminalEffects++ },
-                onDiagnosticEvent = { error("diagnostic sink failed") }
+                onForegroundEvent = { _, _ -> error("diagnostic sink failed") }
             )
         )
 
@@ -98,7 +98,7 @@ class CameraPipelineUiOrchestratorTest {
             CameraPipelineUiOrchestrator.Callbacks({}, {}, {})
         )
 
-        assertFalse(orchestrator.start("capture") { _, _, _, _ -> starts++ })
+        assertTrue(orchestrator.start("capture") { _, _, _, _ -> starts++ } !is StartOutcome.Accepted)
         assertEquals(0, starts)
         assertFalse(session.snapshot().isBusy)
         assertTrue(session.snapshot().previewAllowed)
@@ -115,7 +115,7 @@ class CameraPipelineUiOrchestratorTest {
             CameraPipelineUiOrchestrator.Callbacks({}, {}, {})
         )
 
-        assertFalse(orchestrator.start("capture") { _, _, _, _ -> starts++ })
+        assertTrue(orchestrator.start("capture") { _, _, _, _ -> starts++ } !is StartOutcome.Accepted)
         assertEquals(0, starts)
         assertFalse(session.snapshot().isBusy)
         assertTrue(session.snapshot().previewAllowed)
@@ -130,7 +130,7 @@ class CameraPipelineUiOrchestratorTest {
             scheduler,
             CameraPipelineUiOrchestrator.Callbacks({}, {}, {})
         )
-        assertFalse(orchestrator.start("capture") { _, _, _, _ -> })
+        assertTrue(orchestrator.start("capture") { _, _, _, _ -> } !is StartOutcome.Accepted)
         val staleWatchdog = scheduler.removed.first()
 
         assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)
@@ -360,7 +360,7 @@ class CameraPipelineUiOrchestratorTest {
         )
         val oldNotification = scheduler.entries.first { it.delay == 0L }
 
-        assertTrue(orchestrator.start("B") { _, _, _, _ -> })
+        assertTrue(orchestrator.start("B") { _, _, _, _ -> } is StartOutcome.Accepted)
         val statusCountBeforeOldNotification = statuses.size
         scheduler.runEntry(oldNotification)
 
@@ -394,7 +394,7 @@ class CameraPipelineUiOrchestratorTest {
         assertEquals(TerminalUiDeliveryOutcome.REJECTED, orchestrator.terminalUiDeliveryOutcome())
 
         scheduler.rejectDelay = null
-        assertTrue(orchestrator.start("B") { _, _, _, _ -> })
+        assertTrue(orchestrator.start("B") { _, _, _, _ -> } is StartOutcome.Accepted)
         assertEquals(CameraUiDispatchOutcome.REJECTED, orchestrator.reconcileTerminalUiDelivery())
         assertEquals(0, terminalEffects)
         assertEquals(2L, session.snapshot().generation)
@@ -468,7 +468,7 @@ class CameraPipelineUiOrchestratorTest {
             assertTrue(orchestrator.start("capture") { _, _, _, events ->
                 sink = events
                 error("launcher failed")
-            })
+            } is StartOutcome.Accepted)
             scheduler.run(250L)
             assertEquals(CameraPipelineUiSession.Phase.WAITING_FOR_TERMINAL, session.snapshot().phase)
 
@@ -503,7 +503,7 @@ class CameraPipelineUiOrchestratorTest {
         assertTrue(orchestrator.start("capture") { _, _, _, events ->
             sink = events
             error("launcher failed")
-        })
+        } is StartOutcome.Accepted)
         scheduler.run(250L)
         scheduler.run(15_000L)
 
@@ -540,7 +540,7 @@ class CameraPipelineUiOrchestratorTest {
         assertTrue(orchestrator.start("capture") { _, _, _, events ->
             sink = events
             error("launcher failed")
-        })
+        } is StartOutcome.Accepted)
         scheduler.run(250L)
 
         assertEquals(CameraPipelineUiSession.Phase.UNRESOLVED, session.snapshot().phase)
@@ -562,7 +562,7 @@ class CameraPipelineUiOrchestratorTest {
         assertTrue(orchestrator.start("A") { _, _, _, events ->
             sink = events
             error("launcher failed")
-        })
+        } is StartOutcome.Accepted)
         scheduler.run(250L)
         val staleFallback = scheduler.entries.single { it.delay == 15_000L }.work
 
@@ -574,7 +574,7 @@ class CameraPipelineUiOrchestratorTest {
             )
         )
         assertTrue(scheduler.removed.contains(staleFallback))
-        assertTrue(orchestrator.start("B") { _, _, _, _ -> })
+        assertTrue(orchestrator.start("B") { _, _, _, _ -> } is StartOutcome.Accepted)
         staleFallback.run()
 
         assertEquals(2L, session.snapshot().generation)
@@ -591,7 +591,7 @@ class CameraPipelineUiOrchestratorTest {
             scheduler,
             CameraPipelineUiOrchestrator.Callbacks({}, {}, {})
         )
-        assertTrue(orchestrator.start("capture") { _, _, _, _ -> error("job must not start") })
+        assertTrue(orchestrator.start("capture") { _, _, _, _ -> error("job must not start") } is StartOutcome.Accepted)
         val generation = session.snapshot().generation
         assertTrue(session.requestCancellation(generation, "activity stopped"))
         val watchdog = scheduler.entries.single { it.delay == 120_000L }.work
@@ -621,7 +621,7 @@ class CameraPipelineUiOrchestratorTest {
         assertTrue(orchestrator.start("capture") { _, _, _, events ->
             sink = events
             throw CancellationException("cancelled before owner launch")
-        })
+        } is StartOutcome.Accepted)
         val watchdog = scheduler.entries.single { it.delay == 120_000L }.work
 
         scheduler.run(250L)
@@ -660,7 +660,7 @@ class CameraPipelineUiOrchestratorTest {
             assertTrue(orchestrator.start("capture") { _, _, _, events ->
                 sink = events
                 throw CancellationException("cancelled synchronously")
-            })
+            } is StartOutcome.Accepted)
             scheduler.run(250L)
             val fallback = scheduler.entries.single { it.delay == 15_000L }.work
 
@@ -698,7 +698,7 @@ class CameraPipelineUiOrchestratorTest {
         assertTrue(orchestrator.start("capture") { _, _, _, events ->
             sink = events
             throw CancellationException("cancelled synchronously")
-        })
+        } is StartOutcome.Accepted)
         scheduler.run(250L)
         sink!!.invoke(
             CameraPipelineEvent.Terminal(
@@ -735,7 +735,7 @@ class CameraPipelineUiOrchestratorTest {
         assertTrue(orchestrator.start("capture") { _, _, _, events ->
             sink = events
             throw CancellationException("cancelled synchronously")
-        })
+        } is StartOutcome.Accepted)
         scheduler.run(250L)
         scheduler.run(15_000L)
 
@@ -778,7 +778,7 @@ class CameraPipelineUiOrchestratorTest {
                 )
             )
             throw CancellationException("late cancellation")
-        })
+        } is StartOutcome.Accepted)
         scheduler.run(250L)
 
         assertEquals(CameraPipelineUiSession.Phase.TERMINAL, session.snapshot().phase)

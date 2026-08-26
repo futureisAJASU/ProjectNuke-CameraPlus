@@ -1,5 +1,7 @@
 package com.projectnuke.keplernightlab
 
+import java.util.concurrent.atomic.AtomicLong
+
 /** Explicit owner for one Compose-visible capture pipeline operation. */
 internal class CameraPipelineUiSession(
     /**
@@ -9,6 +11,12 @@ internal class CameraPipelineUiSession(
      */
     private val backgroundOccupancy: () -> Boolean = { false }
 ) {
+    companion object {
+        private val sessionIdAllocator = AtomicLong(1L)
+    }
+
+    /** Process-unique diagnostic routing identity for this session's lifetime. */
+    val diagnosticSessionId: Long = sessionIdAllocator.getAndIncrement()
     /** Foreground capture ownership truth, generation-guarded. */
     val foreground = ForegroundCaptureSession()
     enum class Phase {

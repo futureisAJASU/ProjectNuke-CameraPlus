@@ -653,7 +653,9 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
                     val exactDir = terminal.jobDirectoryPath?.let { java.io.File(it) }?.takeIf { it.isDirectory }
                     refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted, exactJobDir = exactDir)
                 },
-                onDiagnosticEvent = hardwareE2ERecorder::recordEvent,
+                onForegroundEvent = { sessionId, event ->
+                    hardwareE2ERecorder.recordForegroundEvent(sessionId, event)
+                },
                 onBackgroundTerminal = { terminal ->
                     val success = terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE ||
                         terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
@@ -678,7 +680,9 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
                 val exactDir = terminal.jobDirectoryPath?.let { java.io.File(it) }?.takeIf { it.isDirectory }
                 refreshLatestResult(showPreview = success && terminal.requiredOutputCommitted, exactJobDir = exactDir)
             },
-            onDiagnosticEvent = hardwareE2ERecorder::recordEvent,
+            onForegroundEvent = { sessionId, event ->
+                hardwareE2ERecorder.recordForegroundEvent(sessionId, event)
+            },
             onBackgroundTerminal = { terminal ->
                 val success = terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE ||
                     terminal.kind == CameraPipelineEvent.Terminal.Kind.COMPLETE_PARTIAL
@@ -919,10 +923,6 @@ LaunchedEffect(Unit) {
             CameraPipelineEventSink
         ) -> Unit
     ) {
-        // Explicit durable diagnostic intent from the REAL debug entry point:
-        // only an actual instrumentation/debug scenario arms heavy-image intent
-        // for the job about to be created.  Normal user captures keep the
-        // production scenario and never arm it.
         DebugArtifactPolicy.setDiagnosticIntentArmed(
             diagnosticScenario != DebugArtifactPolicy.PRODUCTION_DIAGNOSTIC_SCENARIO
         )
@@ -939,14 +939,18 @@ LaunchedEffect(Unit) {
             requestedCameraId = cameraState.selection.cameraId,
             requestedRoute = cameraState.selection.finalZoomRouteName()
         )
-        val accepted = pipelineOrchestrator.start(
+        val outcome = pipelineOrchestrator.start(
             startMessage = startMessage,
             requestedFrames = requestedFrames,
             timeoutMillis = timeoutMillis,
             job = job
         )
-        if (accepted) {
-            hardwareE2ERecorder.start(scenario)?.let {
+        if (outcome is StartOutcome.Accepted) {
+            hardwareE2ERecorder.start(
+                scenario = scenario,
+                foregroundSessionId = pipelineSession.diagnosticSessionId,
+                generation = outcome.generation
+            )?.let {
                 hardwareE2ERecorder.recordCheckpoint("PIPELINE_REQUEST_ACCEPTED", null, null)
             }
         }
