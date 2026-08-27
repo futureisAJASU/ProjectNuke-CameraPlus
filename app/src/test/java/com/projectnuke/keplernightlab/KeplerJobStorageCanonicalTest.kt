@@ -216,4 +216,80 @@ class KeplerJobStorageCanonicalTest {
 
         assertEquals(0, countActualSourceFrames(dir, job, ReprocessJobKind.YUV_FUSION))
     }
+
+    @Test
+    fun metadataNonFrameYuvPngCountsAsFrame() {
+        val dir = tmp.newFolder()
+        val frames = JSONArray().put(
+            JSONObject()
+                .put("frameIndex", 0)
+                .put("file", "legacy_source_a.png")
+        )
+        val job = JSONObject()
+            .put("jobType", "YUV_SINGLE_FRAME")
+            .put("frames", frames)
+        KeplerJobMetadata.write(dir, job)
+        File(dir, "legacy_source_a.png").writeBytes(byteArrayOf(1, 2, 3))
+
+        assertEquals(1, countActualSourceFrames(dir, job, ReprocessJobKind.YUV_FUSION))
+        assertTrue(canReprocessFromCanonicalCounts(dir, job, ReprocessJobKind.YUV_FUSION))
+    }
+
+    @Test
+    fun metadataNonFrameMultiFrameYuv_sourcesCountToRequiredMinimum() {
+        val dir = tmp.newFolder()
+        val frames = JSONArray()
+        frames.put(JSONObject().put("frameIndex", 0).put("file", "legacy_a.png"))
+        frames.put(JSONObject().put("frameIndex", 1).put("file", "legacy_b.png"))
+        val job = JSONObject()
+            .put("jobType", "YUV_NIGHT_FUSION")
+            .put("frames", frames)
+        KeplerJobMetadata.write(dir, job)
+        File(dir, "legacy_a.png").writeBytes(byteArrayOf(1))
+        File(dir, "legacy_b.png").writeBytes(byteArrayOf(2))
+
+        assertEquals(2, countActualSourceFrames(dir, job, ReprocessJobKind.YUV_FUSION))
+        assertTrue(canReprocessFromCanonicalCounts(dir, job, ReprocessJobKind.YUV_FUSION))
+    }
+
+    @Test
+    fun packedMetadataNonFrameYuvpack_isCanonical() {
+        val dir = tmp.newFolder()
+        val frames = JSONArray().put(
+            JSONObject()
+                .put("frameIndex", 0)
+                .put("packedSourceFilename", "legacy_source_a.yuvpack")
+        )
+        val job = JSONObject()
+            .put("jobType", "YUV_SINGLE_FRAME")
+            .put("yuvPersistenceStrategy", "PACKED_YUV_V1")
+            .put("frames", frames)
+        KeplerJobMetadata.write(dir, job)
+        File(dir, "legacy_source_a.yuvpack").writeBytes(byteArrayOf(1, 2, 3))
+
+        assertEquals(1, countActualSourceFrames(dir, job, ReprocessJobKind.YUV_FUSION))
+        assertTrue(canReprocessFromCanonicalCounts(dir, job, ReprocessJobKind.YUV_FUSION))
+    }
+
+    @Test
+    fun packedDerivedPng_neverCanonicalWhenPackedSourceDeclared() {
+        val dir = tmp.newFolder()
+        val frames = JSONArray().put(
+            JSONObject()
+                .put("frameIndex", 0)
+                .put("file", "frame_00_color.png")
+                .put("packedSourceFilename", "legacy_source_a.yuvpack")
+        )
+        val job = JSONObject()
+            .put("jobType", "YUV_NIGHT_FUSION")
+            .put("yuvPersistenceStrategy", "PACKED_YUV_V1")
+            .put("frames", frames)
+        KeplerJobMetadata.write(dir, job)
+        File(dir, "legacy_source_a.yuvpack").writeBytes(byteArrayOf(1, 2, 3))
+        File(dir, "frame_00_color.png").writeBytes(byteArrayOf(4, 5, 6))
+
+        // Only the durable .yuvpack is canonical; the converted PNG is derived.
+        assertEquals(1, countActualSourceFrames(dir, job, ReprocessJobKind.YUV_FUSION))
+        assertEquals(1, CanonicalFrameSources.countAvailable(dir, job, ReprocessJobKind.YUV_FUSION))
+    }
 }

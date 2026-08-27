@@ -623,6 +623,8 @@ fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
                 !journal.uri.isNullOrBlank()
         }
 
+    val kind = if (job != null) detectJobKind(directory, job) else ReprocessJobKind.UNSUPPORTED
+
     // Phase 13 — split availability truths. A historical VERIFIED journal is evidence that a
     // result EXISTED, never that it still exists today; current public availability comes only
     // from durable claims that recovery has reconciled against provider truth.
@@ -635,15 +637,15 @@ fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
     val publicResultAvailable = !exportStatusRemoved &&
         job?.optBoolean("publicResultAvailable", true) != false &&
         currentPublicClaim
-    val sourceFramesAvailable = frames.any { it.file != null }
-    val canReprocess = when {
-        job == null -> false
-        job.has("canReprocess") -> job.optBoolean("canReprocess", true)
-        else -> {
-            val kind = detectJobKind(directory, job)
-            canReprocessFromCanonicalCounts(directory, job, kind)
-        }
+    val hasMetadataFrames = job?.optJSONArray("frames")?.length()?.let { it > 0 } == true
+    val sourceFramesAvailable = if (hasMetadataFrames && kind != ReprocessJobKind.UNSUPPORTED) {
+        canonicalSourceAvailability(directory, job, kind) > 0
+    } else {
+        frames.any { it.file != null }
     }
+    val actualCanonicalCanReprocess = canReprocessFromCanonicalCounts(directory, job, kind)
+    val persistedPolicyAllows = job?.has("canReprocess") != true || job?.optBoolean("canReprocess", true) == true
+    val canReprocess = job != null && persistedPolicyAllows && actualCanonicalCanReprocess
 
     return KeplerGalleryJobSummary(
         id = directory.absolutePath,

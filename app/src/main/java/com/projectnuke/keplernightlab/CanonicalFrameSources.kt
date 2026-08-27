@@ -65,6 +65,28 @@ internal object CanonicalFrameSources {
             lower.endsWith(".yuv") || lower.endsWith(".nv21") || lower.endsWith(".yuv420")
     }
 
+    /**
+     * Metadata-declared source predicate. A source referenced explicitly in the
+     * frames metadata does NOT require a `frame_` prefix. Validity is determined
+     * solely by kind + extension + packed strategy, plus exclusion of derived
+     * fusion inputs. Keep [isCanonicalSourceFileName] for filename/discovery
+     * semantics where stricter conventions still apply.
+     */
+    fun isValidDeclaredSourceName(name: String, kind: ReprocessJobKind, job: JSONObject?): Boolean {
+        val lower = name.lowercase(Locale.US)
+        if (isDerivedFusionInputFileName(name, job)) return false
+        if (packedStrategySelected(job)) {
+            return lower.endsWith(PackedYuvFrameStore.FILE_EXTENSION)
+        }
+        return when (kind) {
+            ReprocessJobKind.RAW_FUSION -> lower.endsWith(".raw16") || lower.endsWith(".dng")
+            ReprocessJobKind.YUV_FUSION -> lower.endsWith(".png") || lower.endsWith(".yuv") ||
+                lower.endsWith(".nv21") || lower.endsWith(".yuv420")
+            ReprocessJobKind.COLOR_BURST -> lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg")
+            ReprocessJobKind.UNSUPPORTED -> false
+        }
+    }
+
     /** Canonical source name for one frames-manifest entry, by authority order. */
     fun canonicalFileName(frame: JSONObject, kind: ReprocessJobKind, job: JSONObject?): String {
         if (kind == ReprocessJobKind.RAW_FUSION) {
@@ -120,7 +142,7 @@ internal object CanonicalFrameSources {
                         ?.let { NoFollowFileSystem.optionalDirectChildFile(jobDir, it) }
                         ?.takeIf { it.isFile }
                 val canonicalFile = safeExisting(canonicalName)
-                    ?.takeIf { isCanonicalSourceFileName(it.name, job) }
+                    ?.takeIf { isValidDeclaredSourceName(it.name, kind, job) }
                 val fusionFile = safeExisting(fusionName)
                 val format = when {
                     canonicalFile == null -> CanonicalFrameFormat.UNKNOWN

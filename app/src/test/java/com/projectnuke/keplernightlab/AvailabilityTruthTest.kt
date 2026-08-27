@@ -1,5 +1,6 @@
 package com.projectnuke.keplernightlab
 
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -122,6 +123,98 @@ class AvailabilityTruthTest {
             val summary = read(dir)
             assertTrue(summary.sourceFramesAvailable)
             assertFalse(summary.canReprocess)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun gallerySummary_persistedCanReprocessTrue_butCanonicalMissing_reportsFalse() {
+        val dir = tmp.newFolder()
+        KeplerJobMetadata.write(
+            dir,
+            JSONObject()
+                .put("jobType", "RAW_NIGHT_FUSION")
+                .put("canReprocess", true)
+        )
+        try {
+            val summary = read(dir)
+            assertFalse(summary.sourceFramesAvailable)
+            assertFalse(summary.canReprocess)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun gallerySummary_persistedCanReprocessFalse_sourcesExist_remainsFalse() {
+        val dir = tmp.newFolder()
+        val frames = JSONArray().put(
+            JSONObject().put("raw16File", "source_001.raw16")
+        )
+        KeplerJobMetadata.write(
+            dir,
+            JSONObject()
+                .put("jobType", "RAW_NIGHT_FUSION")
+                .put("canReprocess", false)
+                .put("frames", frames)
+        )
+        File(dir, "source_001.raw16").writeBytes(byteArrayOf(1))
+        try {
+            val summary = read(dir)
+            assertTrue(summary.sourceFramesAvailable)
+            assertFalse(summary.canReprocess)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun gallerySummary_nonFrameMetadataCanonicalSource_reportsAvailable() {
+        val dir = tmp.newFolder()
+        val frames = JSONArray()
+        frames.put(JSONObject().put("raw16File", "source_001.raw16"))
+        frames.put(JSONObject().put("raw16File", "source_002.raw16"))
+        KeplerJobMetadata.write(
+            dir,
+            JSONObject()
+                .put("jobType", "RAW_NIGHT_FUSION")
+                .put("frames", frames)
+        )
+        File(dir, "source_001.raw16").writeBytes(byteArrayOf(1))
+        File(dir, "source_002.raw16").writeBytes(byteArrayOf(2))
+        try {
+            val summary = read(dir)
+            assertTrue(summary.sourceFramesAvailable)
+            assertTrue(summary.canReprocess)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun packedGallerySummary_yuvpackExistsDerivedPngMissing_reportsReprocessable() {
+        val dir = tmp.newFolder()
+        val frames = JSONArray()
+        frames.put(JSONObject()
+            .put("file", "frame_00_color.png")
+            .put("packedSourceFilename", "legacy_source_a.yuvpack"))
+        frames.put(JSONObject()
+            .put("file", "frame_01_color.png")
+            .put("packedSourceFilename", "legacy_source_b.yuvpack"))
+        KeplerJobMetadata.write(
+            dir,
+            JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("yuvPersistenceStrategy", "PACKED_YUV_V1")
+                .put("frames", frames)
+        )
+        File(dir, "legacy_source_a.yuvpack").writeBytes(byteArrayOf(1, 2, 3))
+        File(dir, "legacy_source_b.yuvpack").writeBytes(byteArrayOf(4, 5, 6))
+        try {
+            val summary = read(dir)
+            assertTrue(summary.sourceFramesAvailable)
+            assertTrue(summary.canReprocess)
         } finally {
             dir.deleteRecursively()
         }
