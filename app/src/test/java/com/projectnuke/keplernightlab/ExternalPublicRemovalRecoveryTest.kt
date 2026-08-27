@@ -153,6 +153,8 @@ class ExternalPublicRemovalRecoveryTest {
     /** Matrix 2: VERIFIED without terminal ACK + row missing keeps fail-closed policy. */
     @Test
     fun verifiedWithoutTerminalAck_rowMissing_keepsPublicCommitMissingBlocked() {
+        // Legacy migration case: terminal-stable verified job without terminal ACK should be
+        // migrated to PUBLIC_RESULT_REMOVED when metadata confirms terminal evidence.
         val (root, job) = recoveryRoot("removed-matrix2-")
         try {
             val uri = "content://media/external/images/media/8"
@@ -164,13 +166,14 @@ class ExternalPublicRemovalRecoveryTest {
                 FakeAccess(existingUris = emptySet())
             )
             assertEquals(
-                KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED,
+                KeplerJobRecoveryClassification.RECOVERED,
                 report.jobs.single().classification
             )
+            assertTrue(report.jobs.single().actions.contains("PUBLIC_RESULT_REMOVED"))
             val metadata = KeplerJobMetadata.read(job)
-            assertEquals("PUBLIC_COMMIT_MISSING", metadata.optString("recoveryState"))
+            assertEquals("STABLE", metadata.optString("recoveryState"))
             assertEquals(
-                JobRecoveryMutationGateOutcome.BLOCKED_PUBLIC_COMMIT_MISSING,
+                JobRecoveryMutationGateOutcome.ALLOWED,
                 KeplerJobMetadata.inspectRecoveryMutationGate(job, JobRecoveryMutationIntent.REPROCESS)
             )
         } finally {

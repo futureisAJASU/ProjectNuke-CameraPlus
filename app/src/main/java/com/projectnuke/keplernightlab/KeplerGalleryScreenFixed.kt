@@ -85,6 +85,13 @@ fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
     var confirmDeleteFailed by remember { mutableStateOf(false) }
     var deleteError by remember { mutableStateOf<String?>(null) }
 
+    fun selectGalleryTab(newTab: Int) {
+        if (newTab != selectedTab) {
+            selectedIds = emptySet()
+        }
+        selectedTab = newTab
+    }
+
     val visiblePhotoJobs by remember(jobs) {
         derivedStateOf { jobs.filterNot { it.isSourceOnlyGalleryJob() } }
     }
@@ -192,7 +199,7 @@ fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
                 .background(galleryFixedBackground)
                 .padding(androidx.compose.foundation.layout.WindowInsets.safeDrawing.asPaddingValues())
         ) {
-            GalleryFixedTabs(selectedTab) { selectedTab = it }
+            GalleryFixedTabs(selectedTab) { selectGalleryTab(it) }
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -211,7 +218,7 @@ fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
             error = error,
             onBack = onBack,
             onRefresh = { refreshKey++ },
-            onSelectTab = { selectedTab = it },
+            onSelectTab = { selectGalleryTab(it) },
             onSelectAll = {
                 selectedIds = gallerySelectAllSelection(visiblePhotoJobs.map { it.id }, selectedIds)
             },
@@ -235,7 +242,7 @@ fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
         error = error,
         onBack = onBack,
         onRefresh = { refreshKey++ },
-        onSelectTab = { selectedTab = it },
+        onSelectTab = { selectGalleryTab(it) },
         onDeleteFailed = { confirmDeleteFailed = true },
         onSelectAll = {
             selectedIds = gallerySelectAllSelection(jobs.map { it.id }, selectedIds)

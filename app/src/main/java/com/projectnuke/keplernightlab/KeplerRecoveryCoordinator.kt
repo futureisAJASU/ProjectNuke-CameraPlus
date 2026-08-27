@@ -229,20 +229,28 @@ internal object KeplerRecoveryCoordinator {
                 exportAccess?.let { recoverMediaStoreExportJournals(jobDir, it) }.orEmpty()
             }
             val exportJournalsById = MediaStoreExportJournal.list(jobDir).associateBy { it.exportAttemptId }
+            val currentAuthorityUri = sequenceOf(
+                job.optString("galleryPublicExportLinkage"),
+                job.optString("exportUri")
+            ).firstOrNull { it.isNotBlank() && it != "null" }
             val recoveredMainVerified = exportResults.any { result ->
                 val journal = exportJournalsById[result.attemptId]
                 val verified = result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
                     result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED
-                verified && journal?.role == MediaStoreExportRole.MAIN_IMAGE &&
-                    (exportAuthorityOperation.isBlank() || journal.ownerOperationId == exportAuthorityOperation)
+                val roleOk = journal?.role == MediaStoreExportRole.MAIN_IMAGE
+                val ownerOk = exportAuthorityOperation.isBlank() || journal?.ownerOperationId == exportAuthorityOperation
+                val uriMatches = currentAuthorityUri.isNullOrBlank() || journal?.uri == currentAuthorityUri
+                verified && roleOk && ownerOk && uriMatches
             }
             val recoveredMainCommit = exportResults.any { result ->
                 val journal = exportJournalsById[result.attemptId]
                 val verified = result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
                     result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED
                 val committed = verified || result.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED
-                committed && journal?.role == MediaStoreExportRole.MAIN_IMAGE &&
-                    (exportAuthorityOperation.isBlank() || journal.ownerOperationId == exportAuthorityOperation)
+                val roleOk = journal?.role == MediaStoreExportRole.MAIN_IMAGE
+                val ownerOk = exportAuthorityOperation.isBlank() || journal?.ownerOperationId == exportAuthorityOperation
+                val uriMatches = currentAuthorityUri.isNullOrBlank() || journal?.uri == currentAuthorityUri
+                committed && roleOk && ownerOk && uriMatches
             }
             val selectedExportTruth = recoveredMainCommit ||
                 (activeOperationKind != KeplerActiveOperationKind.PUBLIC_EXPORT.name &&
@@ -652,6 +660,29 @@ internal object KeplerRecoveryCoordinator {
         return job.optString("status").uppercase() in active ||
             job.optString("processStatus").uppercase() in active ||
             job.optString("currentPipelineStage").uppercase() in active
+    }
+
+    private fun isLegacyTerminalStableVerifiedMainExport(job: org.json.JSONObject, journal: MediaStoreExportJournal): Boolean {
+        if (journal.role != MediaStoreExportRole.MAIN_IMAGE) return false
+        if (journal.state != MediaStoreExportState.VERIFIED) return false
+        if (journal.uri.isNullOrBlank()) return false
+        val activeOperationId = job.optString(ACTIVE_OPERATION_ID)
+        if (activeOperationId.isNotBlank()) return false
+        val currentPipelineStage = job.optString("currentPipelineStage").uppercase()
+        if (currentPipelineStage !in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")) return false
+        if (!job.optBoolean("galleryExportCommitted", false)) return false
+        if (!job.optBoolean("exportVerified", false)) return false
+        val currentUri = job.optString("galleryPublicExportLinkage").takeIf { it.isNotBlank() && it != "null" }
+            ?: job.optString("exportUri")
+        if (currentUri.isNullOrBlank() || currentUri != journal.uri) return false
+        val terminalOperationId = job.optString(TERMINAL_OPERATION_ID).takeIf { it.isNotBlank() }
+        if (terminalOperationId != null) {
+            if (journal.ownerOperationId != terminalOperationId) return false
+        }
+        // No live process/job lease owns the job: activeOperationId already blank.
+        // No unresolved processing handoff/transaction owns the job.
+        if (job.optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()) return false
+        return true
     }
 
     /**

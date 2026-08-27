@@ -683,7 +683,7 @@ fun computeKeplerJobStorage(
         totalBytes += bytes
         fileCount++
         val isFinal = file.name in finalNames
-        val source = isSourceFrame(file)
+        val source = isCanonicalSourceFileForJob(file, job)
         val debug = isDebugFile(file, finalNames)
         val preview = isPreviewFile(file, finalNames)
         val cache = isCacheFile(file, finalNames)

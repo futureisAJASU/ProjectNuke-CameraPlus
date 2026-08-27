@@ -41,7 +41,7 @@ fun KeplerJobCleanupType.toStorageAction(): KeplerStorageAction? = when (this) {
 
 fun KeplerStorageAction.toLegacyCleanupType(): KeplerJobCleanupType = when (this) {
     KeplerStorageAction.DELETE_SOURCES -> KeplerJobCleanupType.SOURCE_FRAMES_ONLY
-    KeplerStorageAction.DELETE_DERIVED_CACHE -> KeplerJobCleanupType.FINAL_ONLY
+    KeplerStorageAction.DELETE_DERIVED_CACHE -> KeplerJobCleanupType.DERIVED_CACHE_ONLY
     KeplerStorageAction.KEEP_SOURCE_ONLY -> KeplerJobCleanupType.SOURCE_ONLY
     KeplerStorageAction.DELETE_LOCAL_JOB -> KeplerJobCleanupType.FAILED_JOB_DELETE
     KeplerStorageAction.DEBUG_ONLY -> KeplerJobCleanupType.DEBUG_ONLY

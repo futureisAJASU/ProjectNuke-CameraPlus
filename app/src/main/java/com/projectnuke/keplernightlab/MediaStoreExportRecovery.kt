@@ -204,6 +204,27 @@ internal fun reconstructMainExportEvidence(
     return true
 }
 
+private fun isLegacyTerminalStableVerifiedMainExportForRecovery(job: org.json.JSONObject, journal: MediaStoreExportJournal): Boolean {
+    if (journal.role != MediaStoreExportRole.MAIN_IMAGE) return false
+    if (journal.state != MediaStoreExportState.VERIFIED) return false
+    if (journal.uri.isNullOrBlank()) return false
+    val activeOperationId = job.optString(ACTIVE_OPERATION_ID)
+    if (activeOperationId.isNotBlank()) return false
+    val currentPipelineStage = job.optString("currentPipelineStage").uppercase()
+    if (currentPipelineStage !in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")) return false
+    if (!job.optBoolean("galleryExportCommitted", false)) return false
+    if (!job.optBoolean("exportVerified", false)) return false
+    val currentUri = job.optString("galleryPublicExportLinkage").takeIf { it.isNotBlank() && it != "null" }
+        ?: job.optString("exportUri")
+    if (currentUri.isNullOrBlank() || currentUri != journal.uri) return false
+    val terminalOperationId = job.optString(TERMINAL_OPERATION_ID).takeIf { it.isNotBlank() }
+    if (terminalOperationId != null) {
+        if (journal.ownerOperationId != terminalOperationId) return false
+    }
+    if (job.optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()) return false
+    return true
+}
+
 private fun recoverMediaStoreExportJournal(
     jobDir: File,
     journal: MediaStoreExportJournal,
@@ -320,6 +341,23 @@ private fun recoverMediaStoreExportJournal(
                 MediaStoreExportRecoveryClassification.PUBLIC_RESULT_REMOVED,
                 inspection.message ?: "A previously verified public result was removed outside Kepler."
             )
+        }
+        // Legacy terminal-stable verification: older jobs may lack terminalMetadataPersisted
+        // but have durable terminal evidence in job metadata.
+        if (journal.state == MediaStoreExportState.VERIFIED && journal.role == MediaStoreExportRole.MAIN_IMAGE) {
+            try {
+                val job = KeplerJobMetadata.read(jobDir)
+                val legacy = isLegacyTerminalStableVerifiedMainExportForRecovery(job, journal)
+                if (legacy) {
+                    return MediaStoreExportRecoveryResult(
+                        journal.exportAttemptId,
+                        MediaStoreExportRecoveryClassification.PUBLIC_RESULT_REMOVED,
+                        inspection.message ?: "A previously verified public result was removed outside Kepler (legacy evidence)."
+                    )
+                }
+            } catch (_: Exception) {
+                // If metadata read fails, fall back to fail-closed policy.
+            }
         }
         // Category A (commit uncertainty): an unacknowledged in-flight export keeps the
         // existing fail-closed policy.

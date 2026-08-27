@@ -3224,6 +3224,7 @@ internal fun validateMetadataSourceFrames(jobDir: File, job: JSONObject): Metada
         val frame = value as JSONObject
         val candidates = listOfNotNull(
             frame.optString("raw16File"),
+            frame.optString("dngFile"),
             // PACKED_YUV_V1 canonical authority participates in validation.
             frame.optString("packedSourceFilename").takeIf { packedSelected },
             frame.optString("file"),
