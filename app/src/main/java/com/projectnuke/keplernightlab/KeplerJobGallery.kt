@@ -636,8 +636,14 @@ fun readKeplerGalleryJob(directory: File): KeplerGalleryJobSummary {
         job?.optBoolean("publicResultAvailable", true) != false &&
         currentPublicClaim
     val sourceFramesAvailable = frames.any { it.file != null }
-    val canReprocess = sourceFramesAvailable &&
-        (job == null || !job.has("canReprocess") || job.optBoolean("canReprocess", true))
+    val canReprocess = when {
+        job == null -> false
+        job.has("canReprocess") -> job.optBoolean("canReprocess", true)
+        else -> {
+            val kind = detectJobKind(directory, job)
+            canReprocessFromCanonicalCounts(directory, job, kind)
+        }
+    }
 
     return KeplerGalleryJobSummary(
         id = directory.absolutePath,

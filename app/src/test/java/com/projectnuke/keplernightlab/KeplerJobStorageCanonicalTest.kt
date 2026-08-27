@@ -59,7 +59,9 @@ class KeplerJobStorageCanonicalTest {
 
         val info = computeKeplerJobStorage(dir, KeplerJobMetadata.read(dir), null)
         assertEquals(3, info.rawFramesBytes)
-        assertTrue("totalJobBytes must include stale file", info.totalJobBytes > info.rawFramesBytes)
+        assertEquals(3, info.previewFilesBytes)
+        assertEquals(6, info.cleanableBytes)
+        assertTrue("totalJobBytes must include all files", info.totalJobBytes >= info.rawFramesBytes + info.previewFilesBytes)
     }
 
     @Test
@@ -196,5 +198,22 @@ class KeplerJobStorageCanonicalTest {
         val jobAfter = KeplerJobMetadata.read(dir)
         assertEquals(1, canonicalSourceAvailability(dir, jobAfter, ReprocessJobKind.YUV_FUSION))
         assertTrue(canReprocessFromCanonicalCounts(dir, jobAfter, ReprocessJobKind.YUV_FUSION))
+    }
+
+    @Test
+    fun countActualSourceFrames_declaredSourceMissing_stalePngDoesNotCount() {
+        val dir = tmp.newFolder()
+        val frames = JSONArray().put(
+            JSONObject()
+                .put("frameIndex", 0)
+                .put("file", "frame_00_color.png")
+        )
+        val job = JSONObject()
+            .put("jobType", "YUV_NIGHT_FUSION")
+            .put("frames", frames)
+        KeplerJobMetadata.write(dir, job)
+        File(dir, "frame_01_color.png").writeBytes(byteArrayOf(5, 6))
+
+        assertEquals(0, countActualSourceFrames(dir, job, ReprocessJobKind.YUV_FUSION))
     }
 }

@@ -778,9 +778,9 @@ class KeplerGalleryReprocessProtocolTest {
         try {
             val job = JSONObject().put("jobType", "RAW_NIGHT_FUSION")
             val frames = JSONArray()
-            frames.put(JSONObject().put("raw16File", "source_001.raw16").put("enabled", true))
+            frames.put(JSONObject().put("raw16File", "frame_0001.raw16").put("enabled", true))
             job.put("frames", frames)
-            File(directory, "source_001.raw16").writeText("raw")
+            File(directory, "frame_0001.raw16").writeText("raw")
             assertEquals(1, countActualSourceFrames(directory, job, ReprocessJobKind.RAW_FUSION))
         } finally {
             directory.deleteRecursively()

@@ -93,6 +93,7 @@ class KeplerStorageLifecycleTest {
         var recoveryCompleted = false
         var localDeleteCompleted = false
 
+        val originalSettings = CameraSettingsStore.load(targetContext)
         try {
             ensureActivityReadyForUi()
             configureSettings(PipelineMode.YUV_NIGHT_FUSION.name)
@@ -123,7 +124,7 @@ class KeplerStorageLifecycleTest {
             assertFalse("MediaStore row must be absent after deletion", mediaStoreRowExists(targetContext, uri))
             providerDeleteCompleted = true
 
-            KeplerRecoveryCoordinator.recoverBeforeGallery(targetContext)
+            KeplerRecoveryCoordinator.reconcileAgain(targetContext).get()
 
             val updatedJob = KeplerJobMetadata.read(testJobDir)
             val summary = readKeplerGalleryJob(testJobDir!!)
@@ -160,6 +161,7 @@ class KeplerStorageLifecycleTest {
                     targetContext.contentResolver.delete(Uri.parse(testExportUri), null, null)
                 } catch (_: Exception) { }
             }
+            CameraSettingsStore.save(targetContext, originalSettings)
         }
     }
 
@@ -181,6 +183,7 @@ class KeplerStorageLifecycleTest {
         var originalExportUri: String? = null
         var reprocessExportUri: String? = null
 
+        val originalSettings = CameraSettingsStore.load(targetContext)
         try {
             ensureActivityReadyForUi()
             configureSettings(PipelineMode.YUV_NIGHT_FUSION.name)
@@ -208,7 +211,7 @@ class KeplerStorageLifecycleTest {
             assertEquals(1L, targetContext.contentResolver.delete(originalUri, null, null).toLong())
             assertFalse("Original MediaStore row must be absent", mediaStoreRowExists(targetContext, originalUri))
 
-            KeplerRecoveryCoordinator.recoverBeforeGallery(targetContext)
+            KeplerRecoveryCoordinator.reconcileAgain(targetContext).get()
 
             val afterRecovery = readKeplerGalleryJob(testJobDir!!)
             assertEquals("STABLE", afterRecovery.recoveryState)
@@ -240,7 +243,7 @@ class KeplerStorageLifecycleTest {
             assertTrue(afterReprocess.publicResultAvailable)
             assertTrue(afterReprocess.metadata?.optBoolean("exportVerified") == true)
 
-            KeplerRecoveryCoordinator.recoverBeforeGallery(targetContext)
+            KeplerRecoveryCoordinator.reconcileAgain(targetContext).get()
             val afterSecondRecovery = readKeplerGalleryJob(testJobDir!!)
             assertEquals("STABLE", afterSecondRecovery.recoveryState)
             assertTrue("Second recovery must preserve new current result", afterSecondRecovery.publicResultAvailable)
@@ -270,7 +273,7 @@ class KeplerStorageLifecycleTest {
 
             if (testJobDir != null && testJobDir.exists()) {
                 try {
-                    KeplerRecoveryCoordinator.recoverBeforeGallery(targetContext)
+                    KeplerRecoveryCoordinator.reconcileAgain(targetContext).get()
                     val gate = KeplerJobMetadata.inspectRecoveryMutationGate(
                         testJobDir, JobRecoveryMutationIntent.JOB_DELETE
                     )
@@ -286,6 +289,7 @@ class KeplerStorageLifecycleTest {
                     println("TEST_CLEANUP: local cleanup failed: ${e.javaClass.simpleName}: ${e.message}")
                 }
             }
+            CameraSettingsStore.save(targetContext, originalSettings)
         }
     }
 

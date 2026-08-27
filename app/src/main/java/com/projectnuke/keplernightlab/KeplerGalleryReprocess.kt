@@ -3138,10 +3138,13 @@ internal fun countActualSourceFrames(jobDir: File, job: JSONObject, kind: Reproc
     if (CanonicalFrameSources.packedStrategySelected(job) && kind == ReprocessJobKind.YUV_FUSION) {
         return canonicalCount
     }
-    if (canonicalCount > 0 && job.has("frames")) {
+    // When frames metadata exists, canonical authority is the single source of truth —
+    // even if the resolved set is empty (all declared sources currently missing).
+    // Do NOT fall back to per-frame heuristics that could count stale undeclared files.
+    val frames = job.optJSONArray("frames")
+    if (frames != null && frames.length() > 0) {
         return canonicalCount
     }
-    val frames = job.optJSONArray("frames")
     if (frames != null) {
         var count = 0
         repeat(frames.length()) { index ->
