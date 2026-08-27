@@ -38,6 +38,17 @@ internal data class KeplerRecoveryReport(
     val completedAt: Long = System.currentTimeMillis()
 )
 
+internal sealed interface CurrentMainAuthorityResolution {
+    data class Resolved(
+        val journal: MediaStoreExportJournal,
+        val result: MediaStoreExportRecoveryResult
+    ) : CurrentMainAuthorityResolution
+
+    data object None : CurrentMainAuthorityResolution
+
+    data class Ambiguous(val reason: String) : CurrentMainAuthorityResolution
+}
+
 /**
  * One process-wide, single-flight restart reconciliation owner.
  *
@@ -229,68 +240,46 @@ internal object KeplerRecoveryCoordinator {
                 exportAccess?.let { recoverMediaStoreExportJournals(jobDir, it) }.orEmpty()
             }
             val exportJournalsById = MediaStoreExportJournal.list(jobDir).associateBy { it.exportAttemptId }
-            fun cleanUri(u: String?) = u?.takeIf { it.isNotBlank() && it != "null" }
-            val linkageUri = cleanUri(job.optString("galleryPublicExportLinkage"))
-            val exportUri = cleanUri(job.optString("exportUri"))
-            // Resolve current URI with agreement rule
-            val currentUri = if (linkageUri != null && exportUri != null) {
-                if (linkageUri == exportUri) linkageUri
-                else {
-                    // Disagreement: attempt resolve via terminal/owner evidence
-                    val candidates = exportJournalsById.values.filter {
-                        it.role == MediaStoreExportRole.MAIN_IMAGE &&
-                            (it.uri == linkageUri || it.uri == exportUri) &&
-                            (terminalOperationId.isBlank() || it.ownerOperationId == terminalOperationId)
-                    }
-                    when {
-                        candidates.size == 1 -> candidates.first().uri
-                        else -> null // fail closed on ambiguity
-                    }
+            val cleanupFailures = exportResults
+                .filter { it.classification == MediaStoreExportRecoveryClassification.DELETE_FAILED }
+                .map { it.message ?: "MediaStore cleanup failed for ${it.attemptId}." }
+            val authority = resolveCurrentMainAuthority(job, exportJournalsById, exportResults, terminalOperationId, exportAuthorityOperation)
+            var recoveredMainVerified = false
+            var recoveredMainCommit = false
+            var currentMainAuthorityJournal: MediaStoreExportJournal? = null
+            var currentMainAuthorityResult: MediaStoreExportRecoveryResult? = null
+            when (authority) {
+                is CurrentMainAuthorityResolution.Resolved -> {
+                    recoveredMainVerified = authority.result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
+                        authority.result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED
+                    recoveredMainCommit = authority.result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
+                        authority.result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED ||
+                        authority.result.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED
+                    currentMainAuthorityJournal = authority.journal
+                    currentMainAuthorityResult = authority.result
                 }
-            } else {
-                linkageUri ?: exportUri
-            }
-            // Resolve exact current main authority
-            val mainJournals = exportJournalsById.values.filter { it.role == MediaStoreExportRole.MAIN_IMAGE }
-            val currentMainCandidates = mainJournals.filter { journal ->
-                val uriOk = currentUri == null || journal.uri == currentUri
-                val ownerOk = terminalOperationId.isBlank() || journal.ownerOperationId == terminalOperationId
-                val opOk = exportAuthorityOperation.isBlank() || journal.ownerOperationId == exportAuthorityOperation
-                uriOk && ownerOk && opOk
-            }
-            val currentMainAuthorityJournal = when {
-                currentMainCandidates.isEmpty() -> null
-                currentMainCandidates.size == 1 -> currentMainCandidates.first()
-                else -> {
-                    // Deterministic tie-break: prefer journal with matching terminalOperationId, then most recent attempt
-                    val withTerminal = currentMainCandidates.filter { terminalOperationId.isNotBlank() && it.ownerOperationId == terminalOperationId }
-                    when {
-                        withTerminal.size == 1 -> withTerminal.first()
-                        withTerminal.isEmpty() && currentMainCandidates.size == 1 -> currentMainCandidates.first()
-                        else -> null // ambiguous, fail closed
+                is CurrentMainAuthorityResolution.Ambiguous -> {
+                    KeplerJobMetadata.update(jobDir) {
+                        it.put("recoveryState", "AMBIGUOUS_RECOVERY_REQUIRED")
+                            .put("recoveryMessage", authority.reason)
                     }
+                    return KeplerJobRecoveryResult(
+                        jobDir,
+                        KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED,
+                        actions = exportResults.map { it.classification.name },
+                        failures = listOf(authority.reason),
+                        cleanupFailures = cleanupFailures
+                    )
+                }
+                is CurrentMainAuthorityResolution.None -> {
+                    // No current authority; historical MAIN results must not affect current state.
                 }
             }
-            val currentMainAuthorityResult = currentMainAuthorityJournal?.let { journal ->
-                exportResults.firstOrNull { it.attemptId == journal.exportAttemptId }
-            }
-            val recoveredMainVerified = currentMainAuthorityResult?.let { result ->
-                result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
-                    result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED
-            } ?: false
-            val recoveredMainCommit = currentMainAuthorityResult?.let { result ->
-                result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
-                    result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED ||
-                    result.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED
-            } ?: false
             val selectedExportTruth = recoveredMainCommit ||
                 (activeOperationKind != KeplerActiveOperationKind.PUBLIC_EXPORT.name &&
                     job.optBoolean("galleryExportCommitted", false) && job.optString("exportUri").isNotBlank()) ||
                 (terminalOperationId == activeOperation && activeOperation.isNotBlank() &&
                     job.optBoolean("galleryExportCommitted", false) && job.optString("exportUri").isNotBlank())
-            val cleanupFailures = exportResults
-                .filter { it.classification == MediaStoreExportRecoveryClassification.DELETE_FAILED }
-                .map { it.message ?: "MediaStore cleanup failed for ${it.attemptId}." }
             val exportFailure = exportResults.firstOrNull {
                 val journal = exportJournalsById[it.attemptId]
                 val abandonedDebt = journal?.state == MediaStoreExportState.CLEANUP_REQUIRED
@@ -695,6 +684,97 @@ internal object KeplerRecoveryCoordinator {
         // No unresolved processing handoff/transaction owns the job.
         if (job.optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()) return false
         return true
+    }
+
+    private fun resolveCurrentMainAuthority(
+        job: org.json.JSONObject,
+        exportJournalsById: Map<String, MediaStoreExportJournal>,
+        exportResults: List<MediaStoreExportRecoveryResult>,
+        terminalOperationId: String,
+        exportAuthorityOperation: String
+    ): CurrentMainAuthorityResolution {
+        fun cleanUri(u: String?) = u?.takeIf { it.isNotBlank() && it != "null" }
+        val linkageUri = cleanUri(job.optString("galleryPublicExportLinkage"))
+        val exportUri = cleanUri(job.optString("exportUri"))
+
+        // 1. URI agreement
+        val currentUri = if (linkageUri != null && exportUri != null) {
+            if (linkageUri == exportUri) {
+                linkageUri
+            } else {
+                // Disagreement: attempt exact resolution via terminal/owner evidence
+                val plausible = exportJournalsById.values.filter {
+                    it.role == MediaStoreExportRole.MAIN_IMAGE &&
+                        (it.uri == linkageUri || it.uri == exportUri) &&
+                        (terminalOperationId.isBlank() || it.ownerOperationId == terminalOperationId)
+                }
+                when {
+                    plausible.size == 1 -> plausible.first().uri
+                    else -> return CurrentMainAuthorityResolution.Ambiguous(
+                        "galleryPublicExportLinkage and exportUri disagree"
+                    )
+                }
+            }
+        } else {
+            linkageUri ?: exportUri
+        }
+
+        // 2. Exact MAIN journal selection
+        val mainJournals = exportJournalsById.values.filter { it.role == MediaStoreExportRole.MAIN_IMAGE }
+        val candidates = mainJournals.filter { journal ->
+            val uriOk = currentUri == null || journal.uri == currentUri
+            val ownerOk = terminalOperationId.isBlank() || journal.ownerOperationId == terminalOperationId
+            uriOk && ownerOk
+        }
+
+        // 3. No current URI => try operation identity if active/public-export operation exists
+        if (currentUri == null) {
+            if (exportAuthorityOperation.isNotBlank()) {
+                val byOp = mainJournals.filter { it.ownerOperationId == exportAuthorityOperation }
+                return when {
+                    byOp.size == 1 -> {
+                        val result = exportResults.firstOrNull { it.attemptId == byOp.first().exportAttemptId }
+                        if (result != null) {
+                            CurrentMainAuthorityResolution.Resolved(byOp.first(), result)
+                        } else {
+                            CurrentMainAuthorityResolution.None
+                        }
+                    }
+                    byOp.isEmpty() -> CurrentMainAuthorityResolution.None
+                    else -> CurrentMainAuthorityResolution.Ambiguous(
+                        "no current URI and ${byOp.size} MAIN journals for operation ${exportAuthorityOperation}"
+                    )
+                }
+            }
+            return CurrentMainAuthorityResolution.None
+        }
+
+        val exact = when {
+            candidates.isEmpty() -> null
+            candidates.size == 1 -> candidates.first()
+            else -> {
+                val withTerminal = candidates.filter { terminalOperationId.isNotBlank() && it.ownerOperationId == terminalOperationId }
+                val withActive = candidates.filter { exportAuthorityOperation.isNotBlank() && it.ownerOperationId == exportAuthorityOperation }
+                when {
+                    withTerminal.size == 1 -> withTerminal.first()
+                    withActive.size == 1 -> withActive.first()
+                    else -> return CurrentMainAuthorityResolution.Ambiguous(
+                        "multiple MAIN journals for current URI $currentUri"
+                    )
+                }
+            }
+        }
+
+        val result = exact?.let { journal ->
+            exportResults.firstOrNull { it.attemptId == journal.exportAttemptId }
+        }
+
+        return if (exact != null && result != null) {
+            CurrentMainAuthorityResolution.Resolved(exact, result)
+        } else {
+            // Exact journal exists but recovery result missing; treat as none for now.
+            CurrentMainAuthorityResolution.None
+        }
     }
 
     /**

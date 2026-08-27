@@ -677,13 +677,35 @@ fun computeKeplerJobStorage(
     var cacheBytes = 0L
     var intermediateBytes = 0L
     var cleanableBytes = 0L
+
+    val kind = when {
+        job == null -> ReprocessJobKind.UNSUPPORTED
+        job.optString("jobType") == "RAW_NIGHT_FUSION" -> ReprocessJobKind.RAW_FUSION
+        job.optString("jobType") == "YUV_NIGHT_FUSION" ||
+            job.optString("jobType") == "YUV_NIGHT_FUSION_MULTI" -> ReprocessJobKind.YUV_FUSION
+        job.optString("jobType") == "COLOR_BURST" -> ReprocessJobKind.COLOR_BURST
+        else -> when {
+            directory.name.startsWith("KPL_RAW_FUSION_") -> ReprocessJobKind.RAW_FUSION
+            directory.name.startsWith("KPL_YUV_FUSION_") -> ReprocessJobKind.YUV_FUSION
+            directory.name.startsWith("KPL_COLOR_BURST_") -> ReprocessJobKind.COLOR_BURST
+            else -> ReprocessJobKind.UNSUPPORTED
+        }
+    }
+    val canonicalSources = if (job != null && kind != ReprocessJobKind.UNSUPPORTED) {
+        CanonicalFrameSources.resolve(directory, job, kind).mapNotNull { it.sourceFile }.toSet()
+    } else emptySet()
+
     listFilesNoFollow(directory).forEach { file ->
         if (!file.isFile) return@forEach
         val bytes = file.length()
         totalBytes += bytes
         fileCount++
         val isFinal = file.name in finalNames
-        val source = isCanonicalSourceFileForJob(file, job)
+        val source = if (canonicalSources.isNotEmpty()) {
+            file in canonicalSources
+        } else {
+            isCanonicalSourceFileForJob(file, job)
+        }
         val debug = isDebugFile(file, finalNames)
         val preview = isPreviewFile(file, finalNames)
         val cache = isCacheFile(file, finalNames)
