@@ -229,29 +229,60 @@ internal object KeplerRecoveryCoordinator {
                 exportAccess?.let { recoverMediaStoreExportJournals(jobDir, it) }.orEmpty()
             }
             val exportJournalsById = MediaStoreExportJournal.list(jobDir).associateBy { it.exportAttemptId }
-            val currentAuthorityUri = sequenceOf(
-                job.optString("galleryPublicExportLinkage"),
-                job.optString("exportUri")
-            ).firstOrNull { it.isNotBlank() && it != "null" }
-            val recoveredMainVerified = exportResults.any { result ->
-                val journal = exportJournalsById[result.attemptId]
-                val verified = result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
-                    result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED
-                val roleOk = journal?.role == MediaStoreExportRole.MAIN_IMAGE
-                val ownerOk = exportAuthorityOperation.isBlank() || journal?.ownerOperationId == exportAuthorityOperation
-                val uriMatches = currentAuthorityUri.isNullOrBlank() || journal?.uri == currentAuthorityUri
-                verified && roleOk && ownerOk && uriMatches
+            fun cleanUri(u: String?) = u?.takeIf { it.isNotBlank() && it != "null" }
+            val linkageUri = cleanUri(job.optString("galleryPublicExportLinkage"))
+            val exportUri = cleanUri(job.optString("exportUri"))
+            // Resolve current URI with agreement rule
+            val currentUri = if (linkageUri != null && exportUri != null) {
+                if (linkageUri == exportUri) linkageUri
+                else {
+                    // Disagreement: attempt resolve via terminal/owner evidence
+                    val candidates = exportJournalsById.values.filter {
+                        it.role == MediaStoreExportRole.MAIN_IMAGE &&
+                            (it.uri == linkageUri || it.uri == exportUri) &&
+                            (terminalOperationId.isBlank() || it.ownerOperationId == terminalOperationId)
+                    }
+                    when {
+                        candidates.size == 1 -> candidates.first().uri
+                        else -> null // fail closed on ambiguity
+                    }
+                }
+            } else {
+                linkageUri ?: exportUri
             }
-            val recoveredMainCommit = exportResults.any { result ->
-                val journal = exportJournalsById[result.attemptId]
-                val verified = result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
-                    result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED
-                val committed = verified || result.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED
-                val roleOk = journal?.role == MediaStoreExportRole.MAIN_IMAGE
-                val ownerOk = exportAuthorityOperation.isBlank() || journal?.ownerOperationId == exportAuthorityOperation
-                val uriMatches = currentAuthorityUri.isNullOrBlank() || journal?.uri == currentAuthorityUri
-                committed && roleOk && ownerOk && uriMatches
+            // Resolve exact current main authority
+            val mainJournals = exportJournalsById.values.filter { it.role == MediaStoreExportRole.MAIN_IMAGE }
+            val currentMainCandidates = mainJournals.filter { journal ->
+                val uriOk = currentUri == null || journal.uri == currentUri
+                val ownerOk = terminalOperationId.isBlank() || journal.ownerOperationId == terminalOperationId
+                val opOk = exportAuthorityOperation.isBlank() || journal.ownerOperationId == exportAuthorityOperation
+                uriOk && ownerOk && opOk
             }
+            val currentMainAuthorityJournal = when {
+                currentMainCandidates.isEmpty() -> null
+                currentMainCandidates.size == 1 -> currentMainCandidates.first()
+                else -> {
+                    // Deterministic tie-break: prefer journal with matching terminalOperationId, then most recent attempt
+                    val withTerminal = currentMainCandidates.filter { terminalOperationId.isNotBlank() && it.ownerOperationId == terminalOperationId }
+                    when {
+                        withTerminal.size == 1 -> withTerminal.first()
+                        withTerminal.isEmpty() && currentMainCandidates.size == 1 -> currentMainCandidates.first()
+                        else -> null // ambiguous, fail closed
+                    }
+                }
+            }
+            val currentMainAuthorityResult = currentMainAuthorityJournal?.let { journal ->
+                exportResults.firstOrNull { it.attemptId == journal.exportAttemptId }
+            }
+            val recoveredMainVerified = currentMainAuthorityResult?.let { result ->
+                result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
+                    result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED
+            } ?: false
+            val recoveredMainCommit = currentMainAuthorityResult?.let { result ->
+                result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
+                    result.classification == MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED ||
+                    result.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED
+            } ?: false
             val selectedExportTruth = recoveredMainCommit ||
                 (activeOperationKind != KeplerActiveOperationKind.PUBLIC_EXPORT.name &&
                     job.optBoolean("galleryExportCommitted", false) && job.optString("exportUri").isNotBlank()) ||
@@ -283,13 +314,10 @@ internal object KeplerRecoveryCoordinator {
                     cleanupFailures = cleanupFailures
                 )
             }
-            if (exportResults.any { result ->
-                    val journal = exportJournalsById[result.attemptId]
-                    (result.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING ||
-                        result.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED) &&
-                        journal?.role == MediaStoreExportRole.MAIN_IMAGE &&
-                        (activeOperation.isBlank() || journal.ownerOperationId == activeOperation)
-                }) {
+            if (currentMainAuthorityResult?.classification in setOf(
+                    MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING,
+                    MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED
+                )) {
                 // Role-aware aggregation: only the MAIN image record's own recovery evidence may
                 // record the committed-pending-verification policy.  A sidecar's commit-unknown
                 // result never forces the MAIN record into verification debt.
@@ -298,10 +326,8 @@ internal object KeplerRecoveryCoordinator {
                         .put("recoveryMessage", "공개 내보내기 증거를 확인할 수 없어 복구가 필요합니다.")
                 }
             }
-            val missingMainCommit = exportResults.firstOrNull { result ->
-                result.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING &&
-                    exportJournalsById[result.attemptId]?.role == MediaStoreExportRole.MAIN_IMAGE &&
-                    (activeOperation.isBlank() || exportJournalsById[result.attemptId]?.ownerOperationId == activeOperation)
+            val missingMainCommit = currentMainAuthorityResult?.let { result ->
+                if (result.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMIT_MISSING) result else null
             }
             if (missingMainCommit != null) {
                 KeplerJobMetadata.update(jobDir) {
@@ -322,34 +348,20 @@ internal object KeplerRecoveryCoordinator {
             // settle STABLE so local deletion/cleanup/reprocess are never blocked by history.
             // A historical removal must NEVER override a newer verified current export.
             if (!recoveredMainVerified) {
-                val removedMainCommit = exportResults.firstOrNull { result ->
-                    result.classification == MediaStoreExportRecoveryClassification.PUBLIC_RESULT_REMOVED &&
-                        exportJournalsById[result.attemptId]?.role == MediaStoreExportRole.MAIN_IMAGE &&
-                        (activeOperation.isBlank() ||
-                            exportJournalsById[result.attemptId]?.ownerOperationId == activeOperation)
+                val removedMainCommit = currentMainAuthorityResult?.let { result ->
+                    if (result.classification == MediaStoreExportRecoveryClassification.PUBLIC_RESULT_REMOVED) result else null
                 }
-                if (removedMainCommit != null) {
-                    val removedJournal = exportJournalsById[removedMainCommit.attemptId]
-                    // One current MAIN_IMAGE authority: metadata linkage first, then the exact
-                    // removed journal identity. Blank authority means nothing newer exists.
-                    val currentAuthorityUri = sequenceOf(
-                        job.optString("galleryPublicExportLinkage"),
-                        job.optString("exportUri")
-                    ).firstOrNull { it.isNotBlank() && it != "null" }
-                    val removalRepresentsCurrentTruth = currentAuthorityUri == null ||
-                        removedJournal?.uri == null ||
-                        removedJournal.uri == currentAuthorityUri
-                    if (removalRepresentsCurrentTruth) {
-                        KeplerJobMetadata.update(jobDir) { current ->
-                            applyExternalPublicRemovalMetadata(current)
-                        }
-                        return KeplerJobRecoveryResult(
-                            jobDir,
-                            KeplerJobRecoveryClassification.RECOVERED,
-                            actions = listOf(MediaStoreExportRecoveryClassification.PUBLIC_RESULT_REMOVED.name),
-                            cleanupFailures = cleanupFailures
-                        )
+                if (removedMainCommit != null && currentMainAuthorityJournal != null) {
+                    // Authority already ensures URI/owner match; legacy migration handled in classification
+                    KeplerJobMetadata.update(jobDir) { current ->
+                        applyExternalPublicRemovalMetadata(current)
                     }
+                    return KeplerJobRecoveryResult(
+                        jobDir,
+                        KeplerJobRecoveryClassification.RECOVERED,
+                        actions = listOf(MediaStoreExportRecoveryClassification.PUBLIC_RESULT_REMOVED.name),
+                        cleanupFailures = cleanupFailures
+                    )
                 }
             }
             if (exportAuthorityOperation.isNotBlank() && exportResults.isNotEmpty()) {
