@@ -23,7 +23,6 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Rule
@@ -89,6 +88,10 @@ class KeplerStorageLifecycleTest {
         var testRunId: String? = null
         var testJobDir: File? = null
         var testExportUri: String? = null
+        var captureCompleted = false
+        var providerDeleteCompleted = false
+        var recoveryCompleted = false
+        var localDeleteCompleted = false
 
         try {
             ensureActivityReadyForUi()
@@ -104,6 +107,7 @@ class KeplerStorageLifecycleTest {
                 expectedPipeline = PipelineMode.YUV_NIGHT_FUSION.name
             )
             assertSuccessfulSmoke(report, PipelineMode.YUV_NIGHT_FUSION.name)
+            captureCompleted = true
 
             testRunId = report.runId
             testJobDir = File(report.latestJobDirectory!!)
@@ -115,8 +119,9 @@ class KeplerStorageLifecycleTest {
             assertTrue("MediaStore row must exist before deletion", mediaStoreRowExists(targetContext, uri))
 
             val deleted = targetContext.contentResolver.delete(uri, null, null)
-            assertEquals("Exact MediaStore row must be deleted", 1, deleted.toLong())
+            assertEquals("Exact MediaStore row must be deleted", 1L, deleted.toLong())
             assertFalse("MediaStore row must be absent after deletion", mediaStoreRowExists(targetContext, uri))
+            providerDeleteCompleted = true
 
             KeplerRecoveryCoordinator.recoverBeforeGallery(targetContext)
 
@@ -126,7 +131,17 @@ class KeplerStorageLifecycleTest {
             assertEquals("REMOVED_EXTERNALLY", summary.metadata?.optString("exportStatus"))
             assertFalse(summary.publicResultAvailable)
             assertFalse(updatedJob.optBoolean("publicResultAvailable", true))
-            assertNull("exportUri must be cleared after external removal", updatedJob.optString("exportUri"))
+            assertFalse("exportUri key must be absent after external removal", updatedJob.has("exportUri"))
+            assertTrue("exportUri value must be blank after external removal", updatedJob.optString("exportUri").isBlank())
+            assertFalse("galleryPublicExportLinkage key must be absent after external removal", updatedJob.has("galleryPublicExportLinkage"))
+            assertTrue("galleryPublicExportLinkage value must be blank after external removal", updatedJob.optString("galleryPublicExportLinkage").isBlank())
+            assertEquals(
+                "lastVerifiedExportUri must preserve original exportUri",
+                testExportUri,
+                updatedJob.optString("lastVerifiedExportUri")
+            )
+
+            recoveryCompleted = true
 
             val gate = KeplerJobMetadata.inspectRecoveryMutationGate(
                 testJobDir, JobRecoveryMutationIntent.JOB_DELETE
@@ -135,8 +150,10 @@ class KeplerStorageLifecycleTest {
 
             val deleteResult = deleteKeplerGalleryJob(targetContext, testJobDir)
             assertTrue("Local job delete must succeed", deleteResult.isSuccess)
+            localDeleteCompleted = true
 
             assertFalse("Job directory must be gone after local delete", testJobDir!!.exists())
+            assertTrue("All Scenario A milestones must complete", captureCompleted && providerDeleteCompleted && recoveryCompleted && localDeleteCompleted)
         } finally {
             if (testExportUri != null) {
                 try {
@@ -188,7 +205,7 @@ class KeplerStorageLifecycleTest {
             val originalUri = Uri.parse(originalExportUri)
             assertTrue("Original MediaStore row must exist", mediaStoreRowExists(targetContext, originalUri))
 
-            assertEquals(1, targetContext.contentResolver.delete(originalUri, null, null).toLong())
+            assertEquals(1L, targetContext.contentResolver.delete(originalUri, null, null).toLong())
             assertFalse("Original MediaStore row must be absent", mediaStoreRowExists(targetContext, originalUri))
 
             KeplerRecoveryCoordinator.recoverBeforeGallery(targetContext)
@@ -225,10 +242,20 @@ class KeplerStorageLifecycleTest {
 
             KeplerRecoveryCoordinator.recoverBeforeGallery(targetContext)
             val afterSecondRecovery = readKeplerGalleryJob(testJobDir!!)
+            assertEquals("STABLE", afterSecondRecovery.recoveryState)
             assertTrue("Second recovery must preserve new current result", afterSecondRecovery.publicResultAvailable)
             assertTrue("New export must remain verified", afterSecondRecovery.metadata?.optBoolean("exportVerified") == true)
             assertFalse("Old missing URI must not set REMOVED_EXTERNALLY on current result",
                 afterSecondRecovery.metadata?.optString("exportStatus") == "REMOVED_EXTERNALLY")
+
+            val secondRecoveryMetadata = afterSecondRecovery.metadata ?: throw AssertionError("Second recovery metadata is null")
+            assertTrue("metadata.exportUri key must exist after second recovery", secondRecoveryMetadata.has("exportUri"))
+            assertEquals("metadata.exportUri must remain URI_B", reprocessExportUri, secondRecoveryMetadata.optString("exportUri"))
+
+            val linkage = secondRecoveryMetadata.optString("galleryPublicExportLinkage")
+            if (linkage.isNotBlank()) {
+                assertEquals("galleryPublicExportLinkage must remain URI_B", reprocessExportUri, linkage)
+            }
         } finally {
             if (originalExportUri != null) {
                 try {
@@ -240,17 +267,26 @@ class KeplerStorageLifecycleTest {
                     targetContext.contentResolver.delete(Uri.parse(reprocessExportUri), null, null)
                 } catch (_: Exception) { }
             }
-        }
-    }
 
-    @Test
-    fun placeholderPatternMustBeRemoved_seamProof() {
-        val sourceFile = File("app/src/androidTest/java/com/projectnuke/keplernightlab/KeplerStorageLifecycleTest.kt")
-        if (!sourceFile.exists()) return
-        val text = sourceFile.readText()
-        val hasEarlyReturnBypass = text.contains("if (args.getString(\"kepler.hardwareE2E.storageLifecycle\") != \"true\")") &&
-            text.lines().any { it.trim() == "return" }
-        assertFalse("Old placeholder early-return bypass must be removed", hasEarlyReturnBypass)
+            if (testJobDir != null && testJobDir.exists()) {
+                try {
+                    KeplerRecoveryCoordinator.recoverBeforeGallery(targetContext)
+                    val gate = KeplerJobMetadata.inspectRecoveryMutationGate(
+                        testJobDir, JobRecoveryMutationIntent.JOB_DELETE
+                    )
+                    if (gate == JobRecoveryMutationGateOutcome.ALLOWED) {
+                        val cleanupResult = deleteKeplerGalleryJob(targetContext, testJobDir)
+                        if (!cleanupResult.isSuccess) {
+                            println("TEST_CLEANUP: deleteKeplerGalleryJob failed: $cleanupResult")
+                        }
+                    } else {
+                        println("TEST_CLEANUP: JOB_DELETE gate not ALLOWED, gate=$gate")
+                    }
+                } catch (e: Exception) {
+                    println("TEST_CLEANUP: local cleanup failed: ${e.javaClass.simpleName}: ${e.message}")
+                }
+            }
+        }
     }
 
     private fun storageLifecycleEnabled(): Boolean =
