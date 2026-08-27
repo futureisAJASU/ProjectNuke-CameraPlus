@@ -411,19 +411,59 @@ private fun cleanupKeplerGalleryJobInternal(
     ) {
         throw IllegalStateException("Final output missing; cleanup refused.")
     }
+    val kind = when {
+        job.optString("jobType") == "RAW_NIGHT_FUSION" -> ReprocessJobKind.RAW_FUSION
+        job.optString("jobType") == "YUV_NIGHT_FUSION" ||
+            job.optString("jobType") == "YUV_NIGHT_FUSION_MULTI" -> ReprocessJobKind.YUV_FUSION
+        job.optString("jobType") == "COLOR_BURST" -> ReprocessJobKind.COLOR_BURST
+        else -> when {
+            target.name.startsWith("KPL_RAW_FUSION_") -> ReprocessJobKind.RAW_FUSION
+            target.name.startsWith("KPL_YUV_FUSION_") -> ReprocessJobKind.YUV_FUSION
+            target.name.startsWith("KPL_COLOR_BURST_") -> ReprocessJobKind.COLOR_BURST
+            else -> ReprocessJobKind.UNSUPPORTED
+        }
+    }
+    val hasMetadataCanonicalAuthority = job.optJSONArray("frames")?.length()?.let { it > 0 } == true && kind != ReprocessJobKind.UNSUPPORTED
+    val canonicalSourceFiles = if (hasMetadataCanonicalAuthority) {
+        CanonicalFrameSources.resolve(target, job, kind).mapNotNull { it.sourceFile }.toSet()
+    } else {
+        listFilesNoFollow(target).filter { it.isFile && isSourceFrame(it) }.toSet()
+    }
     val filesToDelete = listFilesNoFollow(target)
         .filter { NoFollowFileSystem.isRealFile(it.toPath()) }
         .filter { file ->
             when (requestedType) {
                 KeplerJobCleanupType.DEBUG_ONLY -> isDeletableDebugFile(file, finalFiles)
-                KeplerJobCleanupType.SOURCE_FRAMES_ONLY ->
-                    isDeletableSourceOrIntermediate(file, finalFiles)
-                KeplerJobCleanupType.DERIVED_CACHE_ONLY ->
-                    isDeletableDerivedCache(file, finalFiles, job)
-                KeplerJobCleanupType.FINAL_ONLY ->
-                    file.name != JOB_JSON_FILE_NAME && file !in finalFiles
-                KeplerJobCleanupType.SOURCE_ONLY ->
-                    isDeletableForSourceOnly(file, finalFiles, job)
+                KeplerJobCleanupType.SOURCE_FRAMES_ONLY -> {
+                    if (file.name == JOB_JSON_FILE_NAME || file in finalFiles) return@filter false
+                    file in canonicalSourceFiles || isIntermediateFile(file, finalFiles.map { it.name }.toSet())
+                }
+                KeplerJobCleanupType.DERIVED_CACHE_ONLY -> {
+                    if (file.name == JOB_JSON_FILE_NAME || isRequiredSourceOnlyMetadata(file) || file in finalFiles) return@filter false
+                    if (file in canonicalSourceFiles) return@filter false
+                    if (CanonicalFrameSources.isDerivedFusionInputFileName(file.name, job)) return@filter true
+                    isDeletableDebugFile(file, finalFiles) ||
+                        isIntermediateFile(file, finalFiles.map { it.name }.toSet()) ||
+                        isCacheFile(file, finalFiles.map { it.name }.toSet()) ||
+                        isPreviewFile(file, finalFiles.map { it.name }.toSet())
+                }
+                KeplerJobCleanupType.FINAL_ONLY -> file.name != JOB_JSON_FILE_NAME && file !in finalFiles
+                KeplerJobCleanupType.SOURCE_ONLY -> {
+                    if (file.name == JOB_JSON_FILE_NAME || isRequiredSourceOnlyMetadata(file)) return@filter false
+                    if (CanonicalFrameSources.isDerivedFusionInputFileName(file.name, job)) return@filter true
+                    if (file in canonicalSourceFiles) return@filter false
+                    val name = file.name.lowercase()
+                    file in finalFiles ||
+                        isDeletableDebugFile(file, finalFiles) ||
+                        isIntermediateFile(file, finalFiles.map { it.name }.toSet()) ||
+                        isCacheFile(file, finalFiles.map { it.name }.toSet()) ||
+                        isPreviewFile(file, finalFiles.map { it.name }.toSet()) ||
+                        name.startsWith("final") ||
+                        name.contains("thumbnail") ||
+                        name.contains("gallery") ||
+                        name.contains("temp") ||
+                        name.contains("tmp")
+                }
                 KeplerJobCleanupType.FAILED_JOB_DELETE -> false
             }
         }
@@ -458,18 +498,6 @@ private fun cleanupKeplerGalleryJobInternal(
     val after = folderSizeBytes(target)
     // Phase 16: metadata must describe ACTUAL remaining filesystem state, inspected after deletion.
     val remainingFiles = listFilesNoFollow(target).filter { NoFollowFileSystem.isRealFile(it.toPath()) }
-    val kind = when {
-        job.optString("jobType") == "RAW_NIGHT_FUSION" -> ReprocessJobKind.RAW_FUSION
-        job.optString("jobType") == "YUV_NIGHT_FUSION" ||
-            job.optString("jobType") == "YUV_NIGHT_FUSION_MULTI" -> ReprocessJobKind.YUV_FUSION
-        job.optString("jobType") == "COLOR_BURST" -> ReprocessJobKind.COLOR_BURST
-        else -> when {
-            target.name.startsWith("KPL_RAW_FUSION_") -> ReprocessJobKind.RAW_FUSION
-            target.name.startsWith("KPL_YUV_FUSION_") -> ReprocessJobKind.YUV_FUSION
-            target.name.startsWith("KPL_COLOR_BURST_") -> ReprocessJobKind.COLOR_BURST
-            else -> ReprocessJobKind.UNSUPPORTED
-        }
-    }
     val sourceCount = canonicalSourceAvailability(target, job, kind)
     val sourceAvailable = sourceCount > 0
     val debugAvailable = remainingFiles.any { isDebugFile(it, finalFiles.map { f -> f.name }.toSet()) }
