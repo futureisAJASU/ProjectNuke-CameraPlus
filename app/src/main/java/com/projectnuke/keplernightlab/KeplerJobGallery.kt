@@ -458,7 +458,20 @@ private fun cleanupKeplerGalleryJobInternal(
     val after = folderSizeBytes(target)
     // Phase 16: metadata must describe ACTUAL remaining filesystem state, inspected after deletion.
     val remainingFiles = listFilesNoFollow(target).filter { NoFollowFileSystem.isRealFile(it.toPath()) }
-    val sourceAvailable = remainingFiles.any { isCanonicalSourceFileForJob(it, job) }
+    val kind = when {
+        job.optString("jobType") == "RAW_NIGHT_FUSION" -> ReprocessJobKind.RAW_FUSION
+        job.optString("jobType") == "YUV_NIGHT_FUSION" ||
+            job.optString("jobType") == "YUV_NIGHT_FUSION_MULTI" -> ReprocessJobKind.YUV_FUSION
+        job.optString("jobType") == "COLOR_BURST" -> ReprocessJobKind.COLOR_BURST
+        else -> when {
+            target.name.startsWith("KPL_RAW_FUSION_") -> ReprocessJobKind.RAW_FUSION
+            target.name.startsWith("KPL_YUV_FUSION_") -> ReprocessJobKind.YUV_FUSION
+            target.name.startsWith("KPL_COLOR_BURST_") -> ReprocessJobKind.COLOR_BURST
+            else -> ReprocessJobKind.UNSUPPORTED
+        }
+    }
+    val sourceCount = canonicalSourceAvailability(target, job, kind)
+    val sourceAvailable = sourceCount > 0
     val debugAvailable = remainingFiles.any { isDebugFile(it, finalFiles.map { f -> f.name }.toSet()) }
     val finalOutputAvailable = finalFiles.any { NoFollowFileSystem.isRealFile(it.toPath()) }
     val effectiveSourceOnly = requestedType == KeplerJobCleanupType.SOURCE_ONLY && !finalOutputAvailable
@@ -484,7 +497,7 @@ private fun cleanupKeplerGalleryJobInternal(
                 .put("sourceFramesAvailable", sourceAvailable)
                 .put("finalOutputAvailable", finalOutputAvailable)
                 .put("debugFilesAvailable", debugAvailable)
-                .put("canReprocess", sourceAvailable)
+                .put("canReprocess", sourceAvailable && canReprocessFromCanonicalCounts(target, job, kind))
                 .put("galleryDisplayUnavailable", effectiveSourceOnly)
                 .put("galleryVisible", !effectiveSourceOnly)
             putStorageMetadata(j, updated)
@@ -691,7 +704,10 @@ fun computeKeplerJobStorage(
             else -> ReprocessJobKind.UNSUPPORTED
         }
     }
-    val canonicalSources = if (job != null && kind != ReprocessJobKind.UNSUPPORTED) {
+    val hasMetadataCanonicalAuthority = job != null &&
+        kind != ReprocessJobKind.UNSUPPORTED &&
+        (job.optJSONArray("frames")?.length() ?: 0) > 0
+    val canonicalSources = if (hasMetadataCanonicalAuthority) {
         CanonicalFrameSources.resolve(directory, job, kind).mapNotNull { it.sourceFile }.toSet()
     } else emptySet()
 
@@ -701,7 +717,7 @@ fun computeKeplerJobStorage(
         totalBytes += bytes
         fileCount++
         val isFinal = file.name in finalNames
-        val source = if (canonicalSources.isNotEmpty()) {
+        val source = if (hasMetadataCanonicalAuthority) {
             file in canonicalSources
         } else {
             isCanonicalSourceFileForJob(file, job)
@@ -858,6 +874,32 @@ private fun isRequiredSourceOnlyMetadata(file: File): Boolean {
         name == "rotation_vector.csv" ||
         name == "alignment.json" ||
         name == "capture_metadata.json"
+}
+
+/** Canonical source availability for cleanup and reprocess gating. */
+internal fun canonicalSourceAvailability(target: File, job: JSONObject?, kind: ReprocessJobKind): Int {
+    if (job == null || kind == ReprocessJobKind.UNSUPPORTED) {
+        return listFilesNoFollow(target).count { it.isFile && isSourceFrame(it) }
+    }
+    val frames = job.optJSONArray("frames")
+    if (frames == null || frames.length() == 0) {
+        return listFilesNoFollow(target).count { it.isFile && isSourceFrame(it) }
+    }
+    return CanonicalFrameSources.resolve(target, job, kind).count { it.sourceFile != null }
+}
+
+internal fun canReprocessFromCanonicalCounts(target: File, job: JSONObject?, kind: ReprocessJobKind): Boolean {
+    val count = canonicalSourceAvailability(target, job, kind)
+    return when (kind) {
+        ReprocessJobKind.RAW_FUSION -> count >= MIN_RAW_FUSION_FRAMES
+        ReprocessJobKind.YUV_FUSION -> {
+            val singleFrame = job != null && isSingleFrameJob(job)
+            val required = if (singleFrame) 1 else 2
+            count >= required
+        }
+        ReprocessJobKind.COLOR_BURST -> false
+        ReprocessJobKind.UNSUPPORTED -> false
+    }
 }
 
 private fun isDebugFile(file: File, finalNames: Set<String>): Boolean {
