@@ -280,6 +280,53 @@ class KeplerReprocessPublicExportUriTest {
         }
     }
 
+    @Test
+    fun publicCommittedUnverified_thenRecoveryVerified_isScenarioBPublicSuccess_evenIfReprocessStatusRemainsPartial() {
+        val directory = tempJob()
+        try {
+            // before reprocess returns
+            val exportUriB = "content://media/external/images/media/777"
+            KeplerJobMetadata.write(directory, JSONObject().apply {
+                put("currentPipelineStage", "PARTIAL")
+                put("reprocessStatus", "PARTIAL")
+                put("exportStatus", "COMMITTED_UNVERIFIED")
+                put("exportCommitState", GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED.name)
+                put("exportVerified", false)
+                put("galleryExportCommitted", true)
+                put("exportUri", exportUriB)
+            })
+            val beforeState = ReprocessPublicExportState.fromDurableMetadata(KeplerJobMetadata.read(directory))
+            assertEquals(GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED, beforeState.commitState)
+            assertFalse(beforeState.verified)
+            assertFalse(beforeState.isVerifiedPublicSuccess)
+
+            // simulate bounded convergence via recovery
+            KeplerJobMetadata.write(directory, KeplerJobMetadata.read(directory).apply {
+                put("exportStatus", "EXPORTED")
+                put("exportCommitState", GalleryExportCommitState.VERIFIED.name)
+                put("exportVerified", true)
+                put("recoveryState", "STABLE")
+                // keep historical pipeline/reprocess status PARTIAL
+                put("currentPipelineStage", "PARTIAL")
+                put("reprocessStatus", "PARTIAL")
+            })
+
+            val job = KeplerJobMetadata.read(directory)
+            val afterState = ReprocessPublicExportState.fromDurableMetadata(job)
+            assertEquals(GalleryExportCommitState.VERIFIED, afterState.commitState)
+            assertTrue(afterState.verified)
+            assertTrue(afterState.isVerifiedPublicSuccess)
+            assertEquals(exportUriB, job.optString("exportUri"))
+            assertEquals("PARTIAL", job.optString("currentPipelineStage"))
+            assertEquals("PARTIAL", job.optString("reprocessStatus"))
+            assertEquals("EXPORTED", job.optString("exportStatus"))
+            assertTrue(job.optBoolean("galleryExportCommitted"))
+            assertEquals("STABLE", job.optString("recoveryState"))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
     private fun tempJob(): File = Files.createTempDirectory("kepler-public-uri-").toFile().also {
         KeplerJobMetadata.write(it, JSONObject().put("jobType", "RAW_NIGHT_FUSION"))
     }

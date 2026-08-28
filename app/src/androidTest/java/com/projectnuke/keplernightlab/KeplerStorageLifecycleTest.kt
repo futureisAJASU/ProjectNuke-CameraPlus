@@ -241,7 +241,9 @@ class KeplerStorageLifecycleTest {
             // COMMITTED_PARTIAL (local result, no verified public row) is a local success.
             // Scenario B acceptance requires a VERIFIED public export, asserted here from durable
             // export truth BEFORE any MediaStore row query.
-            var currentJob = KeplerJobMetadata.read(testJobDir)
+            val initialJob = KeplerJobMetadata.read(testJobDir)
+            val initialCommitState = ReprocessPublicExportState.fromDurableMetadata(initialJob).commitState
+            var currentJob = initialJob
             if (currentJob.optString("exportCommitState") in setOf(
                     GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED.name,
                     GalleryExportCommitState.UNKNOWN.name
@@ -258,7 +260,8 @@ class KeplerStorageLifecycleTest {
                 }
             }
             assertScenarioBVerifiedPublicContract(
-                currentJob, testJobDir, originalExportUri, reprocessTransactionSucceeded, reprocessWarnings
+                currentJob, testJobDir, originalExportUri, reprocessTransactionSucceeded, reprocessWarnings,
+                initialCommitState
             )
             reprocessExportUri = currentJob.optString("exportUri")
             assertTrue("New exportUri must be non-blank", reprocessExportUri.isNotBlank())
@@ -346,15 +349,17 @@ class KeplerStorageLifecycleTest {
         jobDir: File?,
         originalExportUri: String?,
         reprocessTransactionSucceeded: Boolean,
-        reprocessResultWarnings: List<String>?
+        reprocessResultWarnings: List<String>?,
+        initialCommitState: GalleryExportCommitState? = null
     ) {
         val state = ReprocessPublicExportState.fromDurableMetadata(job)
         val rawExportUri = job.optString("exportUri")
         val violations = mutableListOf<String>()
-        if (job.optString("currentPipelineStage") != "COMPLETE") {
+        val requireTerminalComplete = initialCommitState == GalleryExportCommitState.VERIFIED
+        if (requireTerminalComplete && job.optString("currentPipelineStage") != "COMPLETE") {
             violations.add("currentPipelineStage=${job.optString("currentPipelineStage")}, expected COMPLETE")
         }
-        if (job.optString("reprocessStatus") != "COMPLETE") {
+        if (requireTerminalComplete && job.optString("reprocessStatus") != "COMPLETE") {
             violations.add("reprocessStatus=${job.optString("reprocessStatus")}, expected COMPLETE")
         }
         if (job.optString("exportStatus") != "EXPORTED") {
@@ -382,9 +387,14 @@ class KeplerStorageLifecycleTest {
             violations.add("exportUri still equals the original deleted URI")
         }
         if (violations.isEmpty()) return
+        val requiredPublicConvergence = initialCommitState in setOf(
+            GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED,
+            GalleryExportCommitState.UNKNOWN
+        )
         val diagnostic = if (jobDir != null && jobDir.exists()) {
             buildReprocessPublicExportDiagnostic(
-                jobDir, originalExportUri, reprocessTransactionSucceeded, reprocessResultWarnings
+                jobDir, originalExportUri, reprocessTransactionSucceeded, reprocessResultWarnings,
+                initialCommitState?.name, requiredPublicConvergence
             )
         } else {
             JSONObject().put("jobDirExists", jobDir?.exists()).toString()

@@ -4642,7 +4642,9 @@ internal fun buildReprocessPublicExportDiagnostic(
     jobDir: File,
     originalExportUri: String?,
     reprocessTransactionSucceeded: Boolean,
-    reprocessResultWarnings: List<String>?
+    reprocessResultWarnings: List<String>?,
+    initialExportCommitState: String? = null,
+    requiredPublicConvergence: Boolean? = null
 ): String {
     val job = try {
         KeplerJobMetadata.read(jobDir)
@@ -4697,6 +4699,8 @@ internal fun buildReprocessPublicExportDiagnostic(
             mergedRawName.isNotBlank() &&
                 File(jobDir, mergedRawName).let { it.isFile && it.length() > 0L }
         )
+    diagnostic.put("initialExportCommitState", initialExportCommitState ?: JSONObject.NULL)
+    diagnostic.put("requiredPublicConvergence", requiredPublicConvergence ?: JSONObject.NULL)
     val journals = JSONArray()
     try {
         MediaStoreExportJournal.list(jobDir)
