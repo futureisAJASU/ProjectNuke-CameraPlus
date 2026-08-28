@@ -101,9 +101,9 @@ internal data class ReprocessFinalizationResult(
 
 private const val REPROCESS_TIMEOUT_MS = 10 * 60 * 1000L
 private const val REPROCESS_WORKER_EXIT_TIMEOUT_MS = 30_000L
-private const val REPROCESS_QUARANTINE_MARKER = ".reprocess_quarantine"
+internal const val REPROCESS_QUARANTINE_MARKER = ".reprocess_quarantine"
 private const val REPROCESS_QUARANTINE_MARKER_CONTENT = "quarantined\n"
-private const val REPROCESS_FALLBACK_QUARANTINE_MARKER = ".reprocess_unresolved"
+internal const val REPROCESS_FALLBACK_QUARANTINE_MARKER = ".reprocess_unresolved"
 private const val REPROCESS_PREVIEW_PREFIX = "reprocess_preview_"
 private const val REPROCESS_PREVIEW_MAX_DIMENSION = 1600
 private const val REPROCESS_HISTORY_LIMIT = 32
@@ -2692,7 +2692,7 @@ internal fun ensureDurableFallbackQuarantine(jobDir: File, transaction: Reproces
     }
 }
 
-private fun fallbackIdentity(transaction: ReprocessTransaction): Triple<String, String, Long> = Triple(
+internal fun fallbackIdentity(transaction: ReprocessTransaction): Triple<String, String, Long> = Triple(
     transaction.transactionId, transaction.backupRoot.name, transaction.manifest.createdAt
 )
 
@@ -2835,6 +2835,16 @@ internal fun isExactOwnedActiveReprocessTransaction(jobDir: File, ownerLease: Jo
     if (manifest.transactionId != transactionId) return false
     if (manifest.state != ReprocessTransactionState.ACTIVE) return false
 
+    // Quarantine marker in the transaction root must be absent.
+    // A durable quarantine marker with ACTIVE manifest state means marker persistence succeeded
+    // but state persistence failed — this is unresolved/quarantine evidence and must not receive
+    // the owned-ACTIVE bypass.
+    val quarantineMarker = File(rootFile, REPROCESS_QUARANTINE_MARKER)
+    when (classifyMarkerPath(quarantineMarker, rootFile)) {
+        is MarkerPathClassification.Absent -> { /* OK */ }
+        else -> return false
+    }
+
     // Verify root is direct child via canonical check (resolveDirectChildResult already ensures basic direct child,
     // but we also enforce manifest integrity similar to classifyTransactionManifest)
     try {
@@ -2842,7 +2852,9 @@ internal fun isExactOwnedActiveReprocessTransaction(jobDir: File, ownerLease: Jo
         val rootCanonical = rootFile.canonicalFile
         if (rootCanonical.parentFile?.canonicalFile != jobCanonical) return false
         if (rootCanonical.name != rootName) return false
-    } catch (e: Exception) {
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (e: Error) { throw e }
+    catch (_: Exception) {
         return false
     }
 
