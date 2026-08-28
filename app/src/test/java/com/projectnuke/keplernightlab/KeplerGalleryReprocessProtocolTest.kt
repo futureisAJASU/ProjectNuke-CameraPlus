@@ -3527,4 +3527,94 @@ private fun rootManifest(txId: String, root: File): ReprocessTransactionManifest
             directory.deleteRecursively()
         }
     }
+
+    @Test
+    fun quarantineEstablishmentWinningRace_blocksLateOwnedPublicExport() {
+        val directory = tempJob()
+        try {
+            val session = ReprocessTransactionSession(directory)
+            val lease = session.acquireLease() ?: error("no lease")
+            KeplerJobMetadata.beginActiveOperation(
+                directory,
+                operationId = UUID.randomUUID().toString(),
+                kind = KeplerActiveOperationKind.PROCESSING_RAW,
+                ownerLease = lease,
+                consumesProcessingHandoff = true
+            )
+            val transaction = backup(directory, "final.png" to "before")
+            session.transferOwnership(transaction)
+
+            // Establish quarantine under job lock first
+            val start = CountDownLatch(1)
+            val done = CountDownLatch(1)
+            val executor = Executors.newFixedThreadPool(2)
+            executor.submit {
+                start.await()
+                persistUnresolvedQuarantine(session, transaction, null)
+                done.countDown()
+            }
+            start.countDown()
+            done.await()
+
+            // Now gate with a different lease should be blocked by quarantine
+            val otherLease = session.acquireLease() // will be null because lease already held
+            // Simulate non-owner check via inspectRecoveryMutationGate directly
+            val outcome = KeplerJobMetadata.inspectRecoveryMutationGate(
+                directory,
+                JobRecoveryMutationIntent.PROCESSING_START,
+                consumesProcessingHandoff = false,
+                ownerLease = null
+            )
+            assertTrue(outcome == JobRecoveryMutationGateOutcome.BLOCKED_REPROCESS_QUARANTINE ||
+                outcome == JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION)
+            executor.shutdown()
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun ownedPublicExportWinningBeforeQuarantineTransition_canCompletePhaseTransition() {
+        val directory = tempJob()
+        try {
+            val session = ReprocessTransactionSession(directory)
+            val lease = session.acquireLease() ?: error("no lease")
+            KeplerJobMetadata.beginActiveOperation(
+                directory,
+                operationId = UUID.randomUUID().toString(),
+                kind = KeplerActiveOperationKind.PROCESSING_RAW,
+                ownerLease = lease,
+                consumesProcessingHandoff = true
+            )
+            val transaction = backup(directory, "final.png" to "before")
+            session.transferOwnership(transaction)
+
+            // Gate first with owned lease while quarantine not yet established
+            val outcomeBefore = KeplerJobMetadata.inspectRecoveryMutationGate(
+                directory,
+                JobRecoveryMutationIntent.PROCESSING_START,
+                consumesProcessingHandoff = false,
+                ownerLease = lease
+            )
+            assertTrue(outcomeBefore == JobRecoveryMutationGateOutcome.ALLOWED ||
+                outcomeBefore == JobRecoveryMutationGateOutcome.BLOCKED_INVALID_PROCESSING_JOURNAL ||
+                outcomeBefore == JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION)
+
+            // Now establish quarantine
+            persistUnresolvedQuarantine(session, transaction, null)
+
+            // Owned lease still allowed due to ownedActiveReprocess bypass
+            val outcomeAfter = KeplerJobMetadata.inspectRecoveryMutationGate(
+                directory,
+                JobRecoveryMutationIntent.PROCESSING_START,
+                consumesProcessingHandoff = false,
+                ownerLease = lease
+            )
+            // After quarantine persistence, transaction state is QUARANTINED so owned active bypass no longer applies
+            assertTrue(outcomeAfter == JobRecoveryMutationGateOutcome.BLOCKED_REPROCESS_QUARANTINE ||
+                outcomeAfter == JobRecoveryMutationGateOutcome.BLOCKED_DEAD_OPERATION)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
 }

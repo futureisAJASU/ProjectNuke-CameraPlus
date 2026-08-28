@@ -1761,19 +1761,22 @@ internal fun quarantineWithPersistence(
     transaction: ReprocessTransaction,
     originalError: Throwable
 ): ReprocessFinalizationResult {
+    val jobDir = transaction.backupRoot.parentFile ?: transaction.backupRoot
     // Preserve the original processing/rollback error as primary context.
     var markerError: Throwable? = null
     var stateError: Throwable? = null
-    try {
-        writeQuarantineMarker(transaction)
-    } catch (ce: kotlinx.coroutines.CancellationException) { markerError = ce }
-    catch (e: Error) { markerError = e }
-    catch (mf: Exception) { markerError = mf }
-    try {
-        writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED)
-    } catch (ce: kotlinx.coroutines.CancellationException) { stateError = ce }
-    catch (e: Error) { stateError = e }
-    catch (sf: Exception) { stateError = sf }
+    KeplerJobMetadata.withJobLock(jobDir) {
+        try {
+            writeQuarantineMarker(transaction)
+        } catch (ce: kotlinx.coroutines.CancellationException) { markerError = ce }
+        catch (e: Error) { markerError = e }
+        catch (mf: Exception) { markerError = mf }
+        try {
+            writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED)
+        } catch (ce: kotlinx.coroutines.CancellationException) { stateError = ce }
+        catch (e: Error) { stateError = e }
+        catch (sf: Exception) { stateError = sf }
+    }
 
     // Inner try used addSuppressed for linked failures; replace with narrow helper that ignores
     // only self-suppression or IllegalArgumentException for invalid suppression.
@@ -1788,7 +1791,9 @@ internal fun quarantineWithPersistence(
     // compact fixed messages.
     if (markerError != null && stateError != null) {
         try {
-            ensureDurableFallbackQuarantine(transaction.backupRoot.parentFile ?: transaction.backupRoot, transaction)
+            KeplerJobMetadata.withJobLock(jobDir) {
+                ensureDurableFallbackQuarantine(jobDir, transaction)
+            }
             if (combined is Error || combined is kotlinx.coroutines.CancellationException) {
                 throw combined
             }
@@ -2595,48 +2600,54 @@ internal fun persistUnresolvedQuarantine(
     transaction: ReprocessTransaction,
     cancelFailure: Throwable?
 ): UnresolvedPersistenceResult {
+    val jobDir = transaction.backupRoot.parentFile ?: transaction.backupRoot
     var markerFailure: Throwable? = null
     var stateFailure: Throwable? = null
-    try {
-        writeQuarantineMarker(transaction)
-    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-    catch (oom: OutOfMemoryError) { throw oom }
-    catch (td: ThreadDeath) { throw td }
-    catch (le: LinkageError) { throw le }
-    catch (ie: InternalError) { throw ie }
-    catch (e: Error) { throw e }
-    catch (mf: Exception) { markerFailure = mf }
-
-    try {
-        writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED)
-    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
-    catch (oom: OutOfMemoryError) { throw oom }
-    catch (td: ThreadDeath) { throw td }
-    catch (le: LinkageError) { throw le }
-    catch (ie: InternalError) { throw ie }
-    catch (e: Error) { throw e }
-    catch (sf: Exception) { stateFailure = sf }
-
-    val markerPersisted = markerFailure == null
-    val statePersisted = stateFailure == null
-    // Root evidence succeeds when either mechanism succeeded AND the strict inspection verifies.
-    val jobDir = transaction.backupRoot.parentFile
-    val durableEvidenceEstablished = jobDir != null && (markerPersisted || statePersisted) &&
-        strictRootEvidence(jobDir, transaction) === RootEvidence.Trustworthy
-
-    var fallbackFailure: Throwable? = null
-    var fallbackPersisted = false
-    if (!durableEvidenceEstablished) {
+    var markerPersisted = false
+    var statePersisted = false
+    var durableEvidenceEstablished = false
+    KeplerJobMetadata.withJobLock(jobDir) {
         try {
-            ensureDurableFallbackQuarantine(transaction.backupRoot.parentFile ?: transaction.backupRoot, transaction)
-            fallbackPersisted = true
+            writeQuarantineMarker(transaction)
+            markerPersisted = true
         } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
         catch (oom: OutOfMemoryError) { throw oom }
         catch (td: ThreadDeath) { throw td }
         catch (le: LinkageError) { throw le }
         catch (ie: InternalError) { throw ie }
         catch (e: Error) { throw e }
-        catch (fb: Exception) { fallbackFailure = fb }
+        catch (mf: Exception) { markerFailure = mf }
+
+        try {
+            writeTransactionState(transaction, ReprocessTransactionState.QUARANTINED)
+            statePersisted = true
+        } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+        catch (oom: OutOfMemoryError) { throw oom }
+        catch (td: ThreadDeath) { throw td }
+        catch (le: LinkageError) { throw le }
+        catch (ie: InternalError) { throw ie }
+        catch (e: Error) { throw e }
+        catch (sf: Exception) { stateFailure = sf }
+
+        durableEvidenceEstablished = (markerPersisted || statePersisted) &&
+            strictRootEvidence(jobDir, transaction) === RootEvidence.Trustworthy
+    }
+
+    var fallbackFailure: Throwable? = null
+    var fallbackPersisted = false
+    if (!durableEvidenceEstablished) {
+        KeplerJobMetadata.withJobLock(jobDir) {
+            try {
+                ensureDurableFallbackQuarantine(jobDir, transaction)
+                fallbackPersisted = true
+            } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+            catch (oom: OutOfMemoryError) { throw oom }
+            catch (td: ThreadDeath) { throw td }
+            catch (le: LinkageError) { throw le }
+            catch (ie: InternalError) { throw ie }
+            catch (e: Error) { throw e }
+            catch (fb: Exception) { fallbackFailure = fb }
+        }
     }
     return UnresolvedPersistenceResult(
         rootMarkerPersisted = markerPersisted,
@@ -2828,7 +2839,9 @@ internal fun isExactOwnedActiveReprocessTransaction(jobDir: File, ownerLease: Jo
     }
     val manifest = try {
         loadStrictManifest(manifestFile)
-    } catch (e: Exception) {
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (e: Error) { throw e }
+    catch (_: Exception) {
         return false
     } ?: return false
 
@@ -2861,7 +2874,9 @@ internal fun isExactOwnedActiveReprocessTransaction(jobDir: File, ownerLease: Jo
     // No additional unresolved roots
     val directChildren = try {
         NoFollowFileSystem.requireDirectChildren(jobDir)
-    } catch (e: Exception) {
+    } catch (ce: kotlinx.coroutines.CancellationException) { throw ce }
+    catch (e: Error) { throw e }
+    catch (_: Exception) {
         return false
     }
     for (child in directChildren) {
