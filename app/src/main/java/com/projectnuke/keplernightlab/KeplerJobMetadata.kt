@@ -181,7 +181,10 @@ object KeplerJobMetadata {
         ownerLease: JobOperationLease? = null
     ): JobRecoveryMutationGateOutcome = withJobLock(jobDir) {
         try {
-            if (isReprocessQuarantined(jobDir)) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_REPROCESS_QUARANTINE
+            val key = jobDir.toPath().toAbsolutePath().normalize().toString()
+            val exactCurrentOwner = ownerLease != null && operationLeases[key] === ownerLease
+            val ownedActiveReprocess = exactCurrentOwner && ownerLease != null && isExactOwnedActiveReprocessTransaction(jobDir, ownerLease)
+            if (isReprocessQuarantined(jobDir) && !ownedActiveReprocess) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_REPROCESS_QUARANTINE
             val processingScan = ProcessingArtifactJournal.scan(jobDir)
             if (processingScan.invalidFiles.isNotEmpty()) return@withJobLock JobRecoveryMutationGateOutcome.BLOCKED_INVALID_PROCESSING_JOURNAL
             val children = NoFollowFileSystem.requireDirectChildren(jobDir)
@@ -199,8 +202,6 @@ object KeplerJobMetadata {
             val activeRuntime = job.optString(ACTIVE_RUNTIME_SESSION_ID)
             val handoffId = job.optString(PROCESSING_HANDOFF_OPERATION_ID)
             val handoffRuntime = job.optString(PROCESSING_HANDOFF_RUNTIME_SESSION_ID)
-            val exactCurrentOwner = ownerLease != null &&
-                operationLeases[jobDir.toPath().toAbsolutePath().normalize().toString()] === ownerLease
             if (activeId.isNotBlank() && exactCurrentOwner) {
                 // The exact current owner may reassert its durable phase.
             } else if (activeId.isNotBlank()) {
@@ -1482,6 +1483,26 @@ class JobOperationLease internal constructor(internal val key: String) {
     private val currentDurableOperationKind =
         java.util.concurrent.atomic.AtomicReference<KeplerActiveOperationKind?>(null)
     private val reconciliationReady = AtomicBoolean(false)
+    private val ownedReprocessTransactionId = java.util.concurrent.atomic.AtomicReference<String?>(null)
+
+    internal fun bindOwnedReprocessTransaction(transactionId: String) {
+        if (released.get()) throw IllegalStateException("Lease already released")
+        val current = ownedReprocessTransactionId.get()
+        if (current != null && current != transactionId) {
+            throw IllegalStateException("Lease already bound to different reprocess transaction $current")
+        }
+        ownedReprocessTransactionId.compareAndSet(current, transactionId)
+    }
+
+    internal fun clearOwnedReprocessTransaction(transactionId: String) {
+        val current = ownedReprocessTransactionId.get()
+        if (current == null || current != transactionId) {
+            throw IllegalStateException("Lease not bound to transaction $transactionId")
+        }
+        ownedReprocessTransactionId.compareAndSet(current, null)
+    }
+
+    internal fun ownedReprocessTransactionId(): String? = ownedReprocessTransactionId.get()
 
     internal fun claimProcessingAttempt(attemptId: String): Boolean {
         if (released.get() || !processingAttemptId.compareAndSet(null, attemptId)) return false

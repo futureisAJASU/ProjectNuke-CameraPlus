@@ -312,6 +312,7 @@ internal class ReprocessTransactionSession(val jobDir: File) {
     fun transferOwnership(tx: ReprocessTransaction) {
         transaction = tx
         ownershipTransferred.set(true)
+        lease?.bindOwnedReprocessTransaction(tx.transactionId)
     }
 
     fun bindWorker(run: ReprocessWorkerRun) {
@@ -2142,6 +2143,11 @@ private fun performTerminalCleanupDebt(
         }
         if (ownerSettled) {
             try {
+                if (state == ReprocessTransactionState.COMMITTED || state == ReprocessTransactionState.ROLLED_BACK) {
+                    try {
+                        lease.clearOwnedReprocessTransaction(transaction.transactionId)
+                    } catch (_: IllegalStateException) { /* already cleared */ }
+                }
                 if (!lease.releaseOrRetainForReconciliation()) {
                     warnings += "Processing owner retained for reconciliation."
                 }
@@ -2793,6 +2799,68 @@ internal fun removeMatchingFallbackQuarantine(jobDir: File, transaction: Reproce
         }
         else -> false
     }
+}
+
+/**
+ * Strict ownership check for the exact active reprocess transaction owned by the lease.
+ * Returns true only when ALL conditions are proven.
+ */
+internal fun isExactOwnedActiveReprocessTransaction(jobDir: File, ownerLease: JobOperationLease): Boolean {
+    if (!KeplerJobMetadata.isOperationOwner(jobDir, ownerLease)) return false
+    val transactionId = ownerLease.ownedReprocessTransactionId() ?: return false
+    if (transactionId.isBlank()) return false
+
+    val fallbackMarker = File(jobDir, REPROCESS_FALLBACK_QUARANTINE_MARKER)
+    if (classifyMarkerPath(fallbackMarker, jobDir) !is MarkerPathClassification.Absent) return false
+
+    val rootName = ".reprocess_backup_$transactionId"
+    val rootResult = NoFollowFileSystem.resolveDirectChildResult(jobDir, rootName, requireFile = false)
+    val rootFile = when (rootResult) {
+        is NoFollowInspection.Present -> rootResult.value
+        else -> return false
+    }
+    if (!rootFile.isDirectory) return false
+
+    val manifestResult = NoFollowFileSystem.resolveDirectChildResult(rootFile, REPROCESS_TX_MANIFEST_FILE, requireFile = true)
+    val manifestFile = when (manifestResult) {
+        is NoFollowInspection.Present -> manifestResult.value
+        else -> return false
+    }
+    val manifest = try {
+        loadStrictManifest(manifestFile)
+    } catch (e: Exception) {
+        return false
+    } ?: return false
+
+    if (manifest.transactionId != transactionId) return false
+    if (manifest.state != ReprocessTransactionState.ACTIVE) return false
+
+    // Verify root is direct child via canonical check (resolveDirectChildResult already ensures basic direct child,
+    // but we also enforce manifest integrity similar to classifyTransactionManifest)
+    try {
+        val jobCanonical = jobDir.canonicalFile
+        val rootCanonical = rootFile.canonicalFile
+        if (rootCanonical.parentFile?.canonicalFile != jobCanonical) return false
+        if (rootCanonical.name != rootName) return false
+    } catch (e: Exception) {
+        return false
+    }
+
+    // No additional unresolved roots
+    val directChildren = try {
+        NoFollowFileSystem.requireDirectChildren(jobDir)
+    } catch (e: Exception) {
+        return false
+    }
+    for (child in directChildren) {
+        if (!child.isDirectory) continue
+        val name = child.name
+        if (!name.startsWith(".reprocess_backup_")) continue
+        if (name == rootName) continue
+        val classification = classifyTransactionManifest(jobDir, child)
+        if (classification is ManifestClassification.Unresolved) return false
+    }
+    return true
 }
 
 /**
