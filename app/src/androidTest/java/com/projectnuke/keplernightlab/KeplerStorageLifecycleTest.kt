@@ -20,6 +20,7 @@ import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
 import androidx.test.uiautomator.UiObject2
 import kotlinx.coroutines.runBlocking
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -32,6 +33,8 @@ import org.junit.runner.RunWith
 import org.junit.rules.RuleChain
 import org.junit.rules.TestRule
 import org.junit.runners.model.Statement
+
+private const val SCENARIO_B_RECONCILIATION_MAX_PASSES = 3
 
 @RunWith(AndroidJUnit4::class)
 class KeplerStorageLifecycleTest {
@@ -182,6 +185,8 @@ class KeplerStorageLifecycleTest {
         var testJobDir: File? = null
         var originalExportUri: String? = null
         var reprocessExportUri: String? = null
+        var reprocessTransactionSucceeded = false
+        var reprocessWarnings: List<String>? = null
 
         val originalSettings = CameraSettingsStore.load(targetContext)
         try {
@@ -229,9 +234,33 @@ class KeplerStorageLifecycleTest {
             assertTrue("Reprocess must succeed", reprocessResult.isSuccess)
             val reprocessJob = reprocessResult.getOrNull()
             assertNotNull(reprocessJob)
+            reprocessTransactionSucceeded = true
+            reprocessWarnings = reprocessJob?.warnings
 
-            val updatedJob = KeplerJobMetadata.read(testJobDir)
-            reprocessExportUri = updatedJob.optString("exportUri")
+            // The generic reprocess Result only proves the LOCAL transaction committed:
+            // COMMITTED_PARTIAL (local result, no verified public row) is a local success.
+            // Scenario B acceptance requires a VERIFIED public export, asserted here from durable
+            // export truth BEFORE any MediaStore row query.
+            var currentJob = KeplerJobMetadata.read(testJobDir)
+            if (currentJob.optString("exportCommitState") in setOf(
+                    GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED.name,
+                    GalleryExportCommitState.UNKNOWN.name
+                )
+            ) {
+                for (pass in 1..SCENARIO_B_RECONCILIATION_MAX_PASSES) {
+                    println(
+                        "STORAGE_B_RECONCILIATION_PASS=$pass state=${currentJob.optString("exportCommitState")}"
+                    )
+                    KeplerRecoveryCoordinator.reconcileAgain(targetContext).get()
+                    settleMediaStoreExportDebt(targetContext, testJobDir)
+                    currentJob = KeplerJobMetadata.read(testJobDir)
+                    if (currentJob.optString("exportCommitState") == GalleryExportCommitState.VERIFIED.name) break
+                }
+            }
+            assertScenarioBVerifiedPublicContract(
+                currentJob, testJobDir, originalExportUri, reprocessTransactionSucceeded, reprocessWarnings
+            )
+            reprocessExportUri = currentJob.optString("exportUri")
             assertTrue("New exportUri must be non-blank", reprocessExportUri.isNotBlank())
             assertTrue("New URI must differ from original", reprocessExportUri != originalExportUri)
 
@@ -259,6 +288,20 @@ class KeplerStorageLifecycleTest {
             if (linkage.isNotBlank()) {
                 assertEquals("galleryPublicExportLinkage must remain URI_B", reprocessExportUri, linkage)
             }
+        } catch (failure: Throwable) {
+            // Failure artifacts must survive long enough to diagnose: print the bounded public
+            // export snapshot before cleanup removes the job directory.
+            try {
+                val dir = testJobDir
+                if (dir != null && dir.exists()) {
+                    println(
+                        "STORAGE_B_DIAGNOSTIC=" + buildReprocessPublicExportDiagnostic(
+                            dir, originalExportUri, reprocessTransactionSucceeded, reprocessWarnings
+                        )
+                    )
+                }
+            } catch (_: Exception) { }
+            throw failure
         } finally {
             if (originalExportUri != null) {
                 try {
@@ -291,6 +334,65 @@ class KeplerStorageLifecycleTest {
             }
             CameraSettingsStore.save(targetContext, originalSettings)
         }
+    }
+
+    /**
+     * Scenario B acceptance: the reprocess must leave a VERIFIED public export (not merely a
+     * committed local transaction). Every clause is asserted from durable job.json export truth;
+     * a violation throws with the bounded public-export diagnostic attached.
+     */
+    private fun assertScenarioBVerifiedPublicContract(
+        job: JSONObject,
+        jobDir: File?,
+        originalExportUri: String?,
+        reprocessTransactionSucceeded: Boolean,
+        reprocessResultWarnings: List<String>?
+    ) {
+        val state = ReprocessPublicExportState.fromDurableMetadata(job)
+        val rawExportUri = job.optString("exportUri")
+        val violations = mutableListOf<String>()
+        if (job.optString("currentPipelineStage") != "COMPLETE") {
+            violations.add("currentPipelineStage=${job.optString("currentPipelineStage")}, expected COMPLETE")
+        }
+        if (job.optString("reprocessStatus") != "COMPLETE") {
+            violations.add("reprocessStatus=${job.optString("reprocessStatus")}, expected COMPLETE")
+        }
+        if (job.optString("exportStatus") != "EXPORTED") {
+            violations.add("exportStatus=${job.optString("exportStatus")}, expected EXPORTED")
+        }
+        if (state.commitState != GalleryExportCommitState.VERIFIED) {
+            violations.add("exportCommitState=${state.commitState.name}, expected VERIFIED")
+        }
+        if (!state.verified) {
+            violations.add("exportVerified != true")
+        }
+        if (!job.optBoolean("galleryExportCommitted", false)) {
+            violations.add("galleryExportCommitted != true")
+        }
+        if (!job.has("exportUri") || job.isNull("exportUri")) {
+            violations.add("exportUri key is missing or JSON null")
+        }
+        if (rawExportUri.isBlank() || rawExportUri == "null") {
+            violations.add("exportUri raw value is blank or coerced \"null\": $rawExportUri")
+        }
+        if (state.uri == null) {
+            violations.add("exportUri is not a row-level content URI: raw=$rawExportUri")
+        }
+        if (state.uri != null && rawExportUri == originalExportUri) {
+            violations.add("exportUri still equals the original deleted URI")
+        }
+        if (violations.isEmpty()) return
+        val diagnostic = if (jobDir != null && jobDir.exists()) {
+            buildReprocessPublicExportDiagnostic(
+                jobDir, originalExportUri, reprocessTransactionSucceeded, reprocessResultWarnings
+            )
+        } else {
+            JSONObject().put("jobDirExists", jobDir?.exists()).toString()
+        }
+        throw AssertionError(
+            "Scenario B verified-public contract failed: ${violations.joinToString("; ")}; " +
+                "STORAGE_B_DIAGNOSTIC=$diagnostic"
+        )
     }
 
     private fun storageLifecycleEnabled(): Boolean =

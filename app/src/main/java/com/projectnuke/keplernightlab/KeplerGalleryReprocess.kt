@@ -2,6 +2,7 @@ package com.projectnuke.keplernightlab
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Environment
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -4581,4 +4582,141 @@ private fun requiredSelectedFrameCount(kind: ReprocessJobKind, job: JSONObject):
     ReprocessJobKind.YUV_FUSION -> if (isSingleFrameJob(job)) 1 else 2
     ReprocessJobKind.COLOR_BURST,
     ReprocessJobKind.UNSUPPORTED -> Int.MAX_VALUE
+}
+
+/**
+ * Durable, observable public-export truth for a reprocess attempt, derived strictly from job.json.
+ * The generic reprocess [Result.success] remains the LOCAL transaction outcome: a committed local
+ * result without a verified public row (COMMITTED_PARTIAL) is still a local success. Only this
+ * state may authorize a public-export success claim.
+ */
+internal data class ReprocessPublicExportState(
+    val commitState: GalleryExportCommitState,
+    val verified: Boolean,
+    val uri: Uri?
+) {
+    val isVerifiedPublicSuccess: Boolean
+        get() = commitState == GalleryExportCommitState.VERIFIED && verified && uri != null
+
+    companion object {
+        fun fromDurableMetadata(job: JSONObject): ReprocessPublicExportState {
+            val commitState = try {
+                GalleryExportCommitState.valueOf(job.optString("exportCommitState"))
+            } catch (_: IllegalArgumentException) {
+                GalleryExportCommitState.NOT_COMMITTED
+            }
+            return ReprocessPublicExportState(
+                commitState = commitState,
+                verified = job.optBoolean("exportVerified", false),
+                uri = parsePublicExportUri(job.optString("exportUri").takeIf { it.isNotBlank() })
+            )
+        }
+    }
+}
+
+/**
+ * Accepts only a row-level MediaStore content URI. Rejects blank input, the literal "null"
+ * produced when [JSONObject.NULL] is coerced through [JSONObject.optString], non-content
+ * schemes, non-media authorities, and collection-level URIs without a numeric row id.
+ */
+internal fun parsePublicExportUri(raw: String?): Uri? {
+    val candidate = raw?.trim()?.takeIf { it.isNotEmpty() && it != "null" } ?: return null
+    return try {
+        val uri = Uri.parse(candidate)
+        if (uri.scheme != "content") return null
+        val authority = uri.authority
+        if (authority != "media" && authority != "media/external") return null
+        val rowId = uri.pathSegments.lastOrNull() ?: return null
+        if (rowId.toIntOrNull() == null) return null
+        uri
+    } catch (_: Exception) {
+        null
+    }
+}
+
+/**
+ * Read-only, bounded diagnostic snapshot for a reprocess public-export failure. Scenario B prints
+ * this before cleanup so the next physical failure is diagnosable from logcat alone.
+ */
+internal fun buildReprocessPublicExportDiagnostic(
+    jobDir: File,
+    originalExportUri: String?,
+    reprocessTransactionSucceeded: Boolean,
+    reprocessResultWarnings: List<String>?
+): String {
+    val job = try {
+        KeplerJobMetadata.read(jobDir)
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Exception) {
+        return JSONObject()
+            .put("jobDirExists", jobDir.exists())
+            .put("jobMetadataReadable", false)
+            .toString()
+    }
+    val state = ReprocessPublicExportState.fromDurableMetadata(job)
+    val rawExportUri = job.optString("exportUri")
+    val finalOutputName = job.optString("finalOutputFile")
+    val mergedRawName = job.optString("mergedRawFile")
+    val diagnostic = JSONObject()
+        .put("status", job.optString("status"))
+        .put("processStatus", job.optString("processStatus"))
+        .put("currentPipelineStage", job.optString("currentPipelineStage"))
+        .put("reprocessStatus", job.optString("reprocessStatus"))
+        .put("reprocessError", job.opt("reprocessError"))
+        .put("reprocessWarning", job.opt("reprocessWarning"))
+        .put("reprocessWarnings", job.optJSONArray("reprocessWarnings") ?: JSONArray())
+        .put("exportStatus", job.optString("exportStatus"))
+        .put("exportCommitState", state.commitState.name)
+        .put("exportVerified", state.verified)
+        .put("galleryExportCommitted", job.optBoolean("galleryExportCommitted", false))
+        .put("exportUriHas", job.has("exportUri"))
+        .put("exportUriIsNull", job.has("exportUri") && job.isNull("exportUri"))
+        .put("exportUriRaw", rawExportUri)
+        .put("exportUriParsed", state.uri?.toString() ?: JSONObject.NULL)
+        .put("galleryPublicExportLinkage", job.optString("galleryPublicExportLinkage"))
+        .put("publicResultAvailable", job.optBoolean("publicResultAvailable", false))
+        .put("recoveryState", job.optString("recoveryState"))
+        .put("lastRecoveryClassification", job.optString("lastRecoveryClassification"))
+        .put("lastRecoveryMessage", job.optString("lastRecoveryMessage"))
+        .put("activeOperationId", job.optString(ACTIVE_OPERATION_ID))
+        .put("activeOperationKind", job.optString(ACTIVE_OPERATION_KIND))
+        .put("terminalOperationId", job.optString(TERMINAL_OPERATION_ID))
+        .put("originalExportUri", originalExportUri ?: JSONObject.NULL)
+        .put("reprocessTransactionSucceeded", reprocessTransactionSucceeded)
+        .put("reprocessResultWarnings", JSONArray(reprocessResultWarnings ?: emptyList<String>()))
+        .put("localFinalOutputName", finalOutputName)
+        .put(
+            "localFinalOutputExists",
+            finalOutputName.isNotBlank() &&
+                File(jobDir, finalOutputName).let { it.isFile && it.length() > 0L }
+        )
+        .put("localMergedRawName", mergedRawName)
+        .put(
+            "localMergedRawExists",
+            mergedRawName.isNotBlank() &&
+                File(jobDir, mergedRawName).let { it.isFile && it.length() > 0L }
+        )
+    val journals = JSONArray()
+    try {
+        MediaStoreExportJournal.list(jobDir)
+            .filter { it.role == MediaStoreExportRole.MAIN_IMAGE }
+            .forEach { journal ->
+                journals.put(
+                    JSONObject()
+                        .put("state", journal.state.name)
+                        .put("uri", journal.uri ?: JSONObject.NULL)
+                        .put("ownerOperationId", journal.ownerOperationId ?: JSONObject.NULL)
+                        .put("terminalMetadataPersisted", journal.terminalMetadataPersisted)
+                        .put("terminalOperationId", journal.terminalOperationId ?: JSONObject.NULL)
+                        .put("displayName", journal.displayName)
+                        .put("updatedAt", journal.updatedAt)
+                )
+            }
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Exception) {
+    }
+    diagnostic.put("mainImageJournals", journals)
+    return diagnostic.toString()
 }
