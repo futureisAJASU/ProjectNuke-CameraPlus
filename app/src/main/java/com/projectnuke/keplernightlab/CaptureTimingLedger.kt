@@ -199,7 +199,10 @@ internal class CaptureTimingLedger(
             rawPersistenceWriteMs = rawPersistenceWriteMs.get(),
             rawPersistenceSyncMs = rawPersistenceSyncMs.get(),
             lastFrameCommittedAt = lastCommitted,
-            postAcquisitionVerifyOverlapMs = postAcquisitionVerifyOverlapMs()
+            postAcquisitionVerifyOverlapMs = postAcquisitionVerifyOverlapMs(),
+            postAcquisitionRawWriteOverlapMs = postAcquisitionRawWriteOverlapMs(),
+            postAcquisitionMetadataOverlapMs = postAcquisitionMetadataOverlapMs(),
+            postAcquisitionHandoffOverlapMs = postAcquisitionHandoffOverlapMs()
         )
     }
 
@@ -230,6 +233,53 @@ internal class CaptureTimingLedger(
             totalOverlapNanos += (overlapEnd - overlapStart).coerceAtLeast(0L)
         }
         return totalOverlapNanos / 1_000_000L
+    }
+
+    fun postAcquisitionRawWriteOverlapMs(): Long {
+        val acquisitionComplete = cameraAcquisitionCompleteAt.get()
+        val stageComplete = captureStageCompleteAt.get()
+        if (acquisitionComplete <= 0L || stageComplete <= 0L) return 0L
+        var totalOverlapNanos = 0L
+        val frames = time
+        val count = requestedFrames.coerceAtLeast(1)
+        for (index in 0 until count) {
+            val workerStarted = frames.workerStartedAt.get(index)
+            val writeFinished = frames.writeFinishedAt.get(index)
+            if (workerStarted <= 0L || writeFinished <= 0L) continue
+            val overlapStart = maxOf(workerStarted, acquisitionComplete)
+            val overlapEnd = minOf(writeFinished, stageComplete)
+            totalOverlapNanos += (overlapEnd - overlapStart).coerceAtLeast(0L)
+        }
+        return totalOverlapNanos / 1_000_000L
+    }
+
+    fun postAcquisitionMetadataOverlapMs(): Long {
+        val acquisitionComplete = cameraAcquisitionCompleteAt.get()
+        val stageComplete = captureStageCompleteAt.get()
+        if (acquisitionComplete <= 0L || stageComplete <= 0L) return 0L
+        var totalOverlapNanos = 0L
+        val frames = time
+        val count = requestedFrames.coerceAtLeast(1)
+        for (index in 0 until count) {
+            val writeFinished = frames.writeFinishedAt.get(index)
+            val committedAt = frames.committedAt.get(index)
+            if (writeFinished <= 0L || committedAt <= 0L) continue
+            val overlapStart = maxOf(writeFinished, acquisitionComplete)
+            val overlapEnd = minOf(committedAt, stageComplete)
+            totalOverlapNanos += (overlapEnd - overlapStart).coerceAtLeast(0L)
+        }
+        return totalOverlapNanos / 1_000_000L
+    }
+
+    fun postAcquisitionHandoffOverlapMs(): Long {
+        val acquisitionComplete = cameraAcquisitionCompleteAt.get()
+        val drainComplete = persistenceDrainCompleteAt.get()
+        val handoffPublished = processingHandoffPublishedAt.get()
+        val stageComplete = captureStageCompleteAt.get()
+        if (acquisitionComplete <= 0L || drainComplete <= 0L || handoffPublished <= 0L || stageComplete <= 0L) return 0L
+        val overlapStart = maxOf(drainComplete, acquisitionComplete)
+        val overlapEnd = minOf(handoffPublished, stageComplete)
+        return ((overlapEnd - overlapStart).coerceAtLeast(0L)) / 1_000_000L
     }
 
     private fun durationMs(fromNanos: Long, toNanos: Long): Long =
@@ -263,6 +313,9 @@ internal class CaptureTimingLedger(
             .put("rawPersistenceWriteMs", snap.rawPersistenceWriteMs)
             .put("rawPersistenceSyncMs", snap.rawPersistenceSyncMs)
             .put("postAcquisitionVerifyOverlapMs", snap.postAcquisitionVerifyOverlapMs)
+            .put("postAcquisitionRawWriteOverlapMs", snap.postAcquisitionRawWriteOverlapMs)
+            .put("postAcquisitionMetadataOverlapMs", snap.postAcquisitionMetadataOverlapMs)
+            .put("postAcquisitionHandoffOverlapMs", snap.postAcquisitionHandoffOverlapMs)
             .put("frames", framesToJson())
     }
 
@@ -358,7 +411,13 @@ internal data class CaptureTimingSnapshot(
     val rawPersistenceSyncMs: Long = 0L,
     val lastFrameCommittedAt: Long = 0L,
     /** Overlap of per-frame verify spans with [cameraAcquisitionCompleteAt, persistenceDrainCompleteAt]. */
-    val postAcquisitionVerifyOverlapMs: Long = 0L
+    val postAcquisitionVerifyOverlapMs: Long = 0L,
+    /** Overlap of per-frame write spans with [cameraAcquisitionCompleteAt, captureStageCompleteAt]. */
+    val postAcquisitionRawWriteOverlapMs: Long = 0L,
+    /** Overlap of per-frame metadata commit spans with [cameraAcquisitionCompleteAt, captureStageCompleteAt]. */
+    val postAcquisitionMetadataOverlapMs: Long = 0L,
+    /** Overlap of handoff span [persistenceDrainCompleteAt, processingHandoffPublishedAt] with [cameraAcquisitionCompleteAt, captureStageCompleteAt]. */
+    val postAcquisitionHandoffOverlapMs: Long = 0L
 )
 
 /**
