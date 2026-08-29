@@ -374,7 +374,7 @@ All phases committed separately; working tree clean; focused groups run x2 per p
 
 ## B0. Physical verification status (MANDATORY READING)
 
-PHYSICALLY VERIFIED BEFORE THIS BATCH (Stage-A baseline, SM-S921N / Android 16,
+PHYSICALLY VERIFIED BEFORE THIS BATCH (Stage-A baseline, Samsung Galaxy S24 / SM-S921N / Android 16,
 strict HardwareE2E):
 - optInYuv12MpMainCameraProductionBurst ........ PASS
 - appLaunchesAndDiagnosticReportCanBeCreatedAndRead PASS
@@ -516,7 +516,7 @@ if it improves postAcquisitionToShutterMs or captureStageTotalMs without
 regressing correctness, quality, memory safety, thermal behavior, or recovery.
 Pure-software post-acquisition delays > 1 s are explicit optimization targets.
 CI never fails on host-vs-device latency thresholds; thresholds live only in
-the SM-S921N validation report.
+the Samsung Galaxy S24 / SM-S921N validation report.
 
 ## B10. Phase 8 audit result
 
@@ -579,7 +579,7 @@ background processingMs/exportMs; Stage-B A-handoff/B-start ordering, peak queue
 max heavy concurrency == 1 evidence.
 
 PACKED-YUV PROMOTION RULE: promote only after physical A/B shows meaningful
-foreground latency benefit on SM-S921N with zero correctness/thermal/memory/
+foreground latency benefit on Samsung Galaxy S24 / SM-S921N with zero correctness/thermal/memory/
 background regressions. RAW OPTIMIZATION PROMOTION RULE: prefer changes that cut
 cameraAcquisitionCompleteAt -> captureStageCompleteAt.
 
@@ -598,7 +598,7 @@ pre-physical patch: `7306e7a8e8cec082e2aa2b7f2935498e7ad9ecc8`.
 
 The mega-batch gated the raw16 bulk path on `pixelStride == 1`, but Android
 Camera2 RAW_SENSOR is a single-plane 16-bit-per-sample Bayer format that AOSP
-ImageReader maps to **pixelStride == 2** - real SM-S921N frames would have run
+ImageReader maps to **pixelStride == 2** - real Samsung Galaxy S24 / SM-S921N frames would have run
 the ~50M-scalar-crossing fallback forever. Corrected classification in
 `writeRaw16Rows`:
 
@@ -674,11 +674,11 @@ coordinator admission at every queue depth.
 
 | Scope | Status |
 |---|---|
-| Stage-A production correctness (pre-mega-batch) | PHYSICALLY VERIFIED before the mega-batch (SM-S921N, OK 3 tests / 170.554 s) |
+| Stage-A production correctness (pre-mega-batch) | PHYSICALLY VERIFIED before the mega-batch (Samsung Galaxy S24 / SM-S921N, OK 3 tests / 170.554 s) |
 | Mega-batch Stage-A regression | PENDING - rerun command 1 below |
 | Stage-B rapid sequential overlap | CODE VERIFIED ONLY - PENDING physical (command 2) |
 | Packed-YUV physical A/B | CODE VERIFIED ONLY - PENDING physical (command 3) |
-| RAW bulk optimization activation | NOT physically verified. Do NOT claim it until the SM-S921N report shows finalJob.rawMetadata.rawPersistenceWriteStrategy == SEQUENTIAL_BULK or PADDED_ROW_PACK (the Stage-A RAW test now fails closed on SCALAR_FALLBACK). |
+| RAW bulk optimization activation | NOT physically verified. Do NOT claim it until the Samsung Galaxy S24 / SM-S921N report shows finalJob.rawMetadata.rawPersistenceWriteStrategy == SEQUENTIAL_BULK or PADDED_ROW_PACK (the Stage-A RAW test now fails closed on SCALAR_FALLBACK). |
 
 ## P8. EXACT PHYSICAL COMMANDS (PowerShell)
 

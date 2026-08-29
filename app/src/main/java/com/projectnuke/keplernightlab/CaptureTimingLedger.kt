@@ -198,7 +198,8 @@ internal class CaptureTimingLedger(
             rawBytesPersisted = rawBytesPersisted.get(),
             rawPersistenceWriteMs = rawPersistenceWriteMs.get(),
             rawPersistenceSyncMs = rawPersistenceSyncMs.get(),
-            lastFrameCommittedAt = lastCommitted
+            lastFrameCommittedAt = lastCommitted,
+            postAcquisitionVerifyOverlapMs = postAcquisitionVerifyOverlapMs()
         )
     }
 
@@ -211,6 +212,24 @@ internal class CaptureTimingLedger(
             if (at > latest) latest = at
         }
         return latest
+    }
+
+    fun postAcquisitionVerifyOverlapMs(): Long {
+        val acquisitionComplete = cameraAcquisitionCompleteAt.get()
+        val drainComplete = persistenceDrainCompleteAt.get()
+        if (acquisitionComplete <= 0L || drainComplete <= 0L) return 0L
+        var totalOverlapNanos = 0L
+        val frames = time
+        val count = requestedFrames.coerceAtLeast(1)
+        for (index in 0 until count) {
+            val writeFinished = frames.writeFinishedAt.get(index)
+            val verifiedAt = frames.verifiedAt.get(index)
+            if (writeFinished <= 0L || verifiedAt <= 0L) continue
+            val overlapStart = maxOf(writeFinished, acquisitionComplete)
+            val overlapEnd = minOf(verifiedAt, drainComplete)
+            totalOverlapNanos += (overlapEnd - overlapStart).coerceAtLeast(0L)
+        }
+        return totalOverlapNanos / 1_000_000L
     }
 
     private fun durationMs(fromNanos: Long, toNanos: Long): Long =
@@ -243,6 +262,7 @@ internal class CaptureTimingLedger(
             .put("rawBytesPersisted", snap.rawBytesPersisted)
             .put("rawPersistenceWriteMs", snap.rawPersistenceWriteMs)
             .put("rawPersistenceSyncMs", snap.rawPersistenceSyncMs)
+            .put("postAcquisitionVerifyOverlapMs", snap.postAcquisitionVerifyOverlapMs)
             .put("frames", framesToJson())
     }
 
@@ -336,7 +356,9 @@ internal data class CaptureTimingSnapshot(
     val rawBytesPersisted: Long = 0L,
     val rawPersistenceWriteMs: Long = 0L,
     val rawPersistenceSyncMs: Long = 0L,
-    val lastFrameCommittedAt: Long = 0L
+    val lastFrameCommittedAt: Long = 0L,
+    /** Overlap of per-frame verify spans with [cameraAcquisitionCompleteAt, persistenceDrainCompleteAt]. */
+    val postAcquisitionVerifyOverlapMs: Long = 0L
 )
 
 /**

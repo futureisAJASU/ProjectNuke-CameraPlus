@@ -3,7 +3,7 @@
 Scope: the interval between RAW camera acquisition reaching 100%
 (`cameraAcquisitionCompleteAt`) and shutter admission
 (`captureStageCompleteAt`), for a 4-frame 4080x3060 RAW16 burst
-(~25 MB/frame, ~100 MB total source payload) on SM-S921N / Android 16.
+(~25 MB/frame, ~100 MB total source payload) on Samsung Galaxy S24 / SM-S921N / Android 16.
 
 All timings referenced below are produced by the Phase-1 timing ledger
 wiring (`CaptureTimingLedger`, persisted as `capture_timing.json` and the
@@ -47,7 +47,7 @@ Bytes assume 4080x3060 RAW16 (~25 MB/frame; x4 frames ~100 MB).
 | Temp digest verify | KeplerRawFusionSave | READ 25 MB x2 (stream + identity fence) | 8 KB read buffers | redundant pre-rename check | n/a | YES: consolidate into single post-publish verification |
 | Atomic rename | KeplerRawFusionSave | metadata only | none | REQUIRED atomic publish | no | keep |
 | Final digest verify | KeplerRawFusionSave | READ 25 MB x2 (stream + identity fence) | 8 KB read buffers | REQUIRED content truth for manifest commit | no | PARTIAL: fence re-read can be merged with streamed digest pass |
-| DNG sidecar | KeplerRawFusionSave | 0 when NOT_REQUESTED (SM-S921N production default) | none | skip is correct | n/a | already skipped |
+| DNG sidecar | KeplerRawFusionSave | 0 when NOT_REQUESTED (Samsung Galaxy S24 / SM-S921N production default) | none | skip is correct | n/a | already skipped |
 | Terminal manifest write | owner thread | ~100 KB JSON | none | REQUIRED before handoff | no | already single consolidated write |
 | Handoff publish + owner clear | owner thread | small JSON | none | REQUIRED | no | already consolidated |
 | Preview/debug/fusion before handoff | - | NONE (BALANCED skips debug PNGs) | none | n/a | n/a | nothing to remove |
@@ -128,7 +128,7 @@ Targets (in priority order):
    - nothing else was removed: DNG stays fully skipped when NOT_REQUESTED,
      no preview/debug/fusion work existed before handoff.
 
-Expected physical effect on SM-S921N: `postAcquisitionToShutterMs`
+Expected physical effect on Samsung Galaxy S24 / SM-S921N: `postAcquisitionToShutterMs`
 (= captureStageCompleteAt - cameraAcquisitionCompleteAt) should drop by
 roughly the eliminated read-back span (~100 MB reads/burst) plus the
 extraction CPU win, bounded below by the mandatory 2 final-read passes

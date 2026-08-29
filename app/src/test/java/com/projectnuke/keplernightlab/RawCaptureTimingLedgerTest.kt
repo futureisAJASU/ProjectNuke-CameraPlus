@@ -237,6 +237,7 @@ class RawCaptureTimingLedgerTest {
         assertEquals(128L, timing.postAcquisitionPersistenceMs)
         assertEquals(10L, timing.handoffPublicationMs)
         assertEquals(5L, timing.captureSettlementMs)
+        assertEquals(20L, timing.postAcquisitionVerifyOverlapMs)
         // lastCommit 260 -> handoff 280
         assertEquals(20L, timing.rawMetadataSettlementMs)
         // JSON round-trip keeps every non-default raw field.
@@ -254,5 +255,138 @@ class RawCaptureTimingLedgerTest {
             100_000_000L,
             KeplerJobMetadata.read(jobDir).getJSONObject("captureTiming").getLong("rawBytesPersisted")
         )
+    }
+
+    @Test
+    fun postAcquisitionVerifyOverlap_verifyEntirelyBeforeAcquisition_returnsZero() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index ->
+                image(index, 110 + index * 10L)
+                result(index, 112 + index * 10L)
+            }
+            persistFrame(0, 115, 130, 130, 135, 140, 25_000_000L, 20, 5)
+            drain(300)
+            handoff(310)
+            settled(315)
+            stageComplete(320)
+        }
+        // verifyAt=135, acquisitionComplete=142, drainComplete=300
+        // overlap = min(135,300) - max(130,142) = 135 - 142 = -7 -> 0
+        assertEquals(0L, sequence.ledger.postAcquisitionVerifyOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionVerifyOverlap_verifyEntirelyAfterAcquisition_fullDuration() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index ->
+                image(index, 110 + index * 10L)
+                result(index, 112 + index * 10L)
+            }
+            persistFrame(0, 115, 130, 160, 170, 180, 25_000_000L, 20, 5)
+            persistFrame(1, 155, 165, 190, 200, 210, 25_000_000L, 20, 5)
+            persistFrame(2, 195, 205, 220, 230, 240, 25_000_000L, 20, 5)
+            persistFrame(3, 235, 245, 250, 260, 270, 25_000_000L, 20, 5)
+            drain(300)
+            handoff(310)
+            settled(315)
+            stageComplete(320)
+        }
+        // frame0: verifyAt=170, acquisitionComplete=142, drainComplete=300 -> 170-160=10
+        // frame1: verifyAt=200, acquisitionComplete=142, drainComplete=300 -> 200-190=10
+        // frame2: verifyAt=230, acquisitionComplete=142, drainComplete=300 -> 230-220=10
+        // frame3: verifyAt=260, acquisitionComplete=142, drainComplete=300 -> 260-250=10
+        // total = 40ms
+        assertEquals(40L, sequence.ledger.postAcquisitionVerifyOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionVerifyOverlap_straddlesAcquisition_clippedDuration() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index ->
+                image(index, 110 + index * 10L)
+                result(index, 112 + index * 10L)
+            }
+            persistFrame(0, 115, 130, 130, 160, 170, 25_000_000L, 20, 5)
+            persistFrame(1, 155, 165, 190, 210, 220, 25_000_000L, 20, 5)
+            persistFrame(2, 195, 205, 220, 240, 250, 25_000_000L, 20, 5)
+            persistFrame(3, 235, 245, 250, 270, 280, 25_000_000L, 20, 5)
+            drain(300)
+            handoff(310)
+            settled(315)
+            stageComplete(320)
+        }
+        // frame0: verifyAt=160, acq=142, drain=300 -> max(130,142)=142, min(160,300)=160 -> 18
+        // frame1: verifyAt=210, acq=142, drain=300 -> max(190,142)=190, min(210,300)=210 -> 20
+        // frame2: verifyAt=240, acq=142, drain=300 -> max(220,142)=220, min(240,300)=240 -> 20
+        // frame3: verifyAt=270, acq=142, drain=300 -> max(250,142)=250, min(270,300)=270 -> 20
+        // total = 78ms
+        assertEquals(78L, sequence.ledger.postAcquisitionVerifyOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionVerifyOverlap_runsPastDrain_clippedAtDrain() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index ->
+                image(index, 110 + index * 10L)
+                result(index, 112 + index * 10L)
+            }
+            persistFrame(0, 115, 130, 220, 300, 320, 25_000_000L, 20, 5)
+            persistFrame(1, 155, 165, 280, 340, 360, 25_000_000L, 20, 5)
+            persistFrame(2, 195, 205, 340, 380, 400, 25_000_000L, 20, 5)
+            persistFrame(3, 235, 245, 400, 420, 440, 25_000_000L, 20, 5)
+            drain(250)
+            handoff(260)
+            settled(265)
+            stageComplete(270)
+        }
+        // frame0: verifyAt=300, acq=142, drain=250 -> max(220,142)=220, min(300,250)=250 -> 30
+        // frame1: verifyAt=340, acq=142, drain=250 -> max(280,142)=280, min(340,250)=250 -> 0
+        // frame2: verifyAt=380, acq=142, drain=250 -> max(340,142)=340, min(380,250)=250 -> 0
+        // frame3: verifyAt=420, acq=142, drain=250 -> max(400,142)=400, min(420,250)=250 -> 0
+        // total = 30ms
+        assertEquals(30L, sequence.ledger.postAcquisitionVerifyOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionVerifyOverlap_missingTimestamps_returnsZero() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index ->
+                image(index, 110 + index * 10L)
+                result(index, 112 + index * 10L)
+            }
+            // No persistence recorded for any frame
+            drain(200)
+        }
+        assertEquals(0L, sequence.ledger.postAcquisitionVerifyOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionVerifyOverlap_multipleFrames_boundedSum() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index ->
+                image(index, 110 + index * 10L)
+                result(index, 112 + index * 10L)
+            }
+            persistFrame(0, 115, 130, 160, 170, 180, 25_000_000L, 20, 5)
+            persistFrame(1, 155, 165, 190, 210, 220, 25_000_000L, 20, 5)
+            persistFrame(2, 195, 205, 220, 240, 250, 25_000_000L, 20, 5)
+            persistFrame(3, 235, 245, 250, 270, 280, 25_000_000L, 20, 5)
+            drain(300)
+            handoff(310)
+            settled(315)
+            stageComplete(320)
+        }
+        // frame0: 170-160=10
+        // frame1: 210-190=20
+        // frame2: 240-220=20
+        // frame3: 270-250=20
+        // total = 70ms
+        assertEquals(70L, sequence.ledger.postAcquisitionVerifyOverlapMs())
     }
 }

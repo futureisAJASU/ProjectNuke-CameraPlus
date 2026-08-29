@@ -14,7 +14,6 @@ class GallerySelectionAllTest {
     fun selectAll_selectsEveryCurrentlyVisibleId() {
         val visible = listOf("a", "b", "c")
         assertEquals(setOf("a", "b", "c"), gallerySelectAllSelection(visible, emptySet()))
-        // Existing partial selection is preserved and completed.
         assertEquals(setOf("a", "b", "c"), gallerySelectAllSelection(visible, setOf("b")))
     }
 
@@ -22,11 +21,7 @@ class GallerySelectionAllTest {
     fun selectAll_whenEverythingVisibleIsSelected_becomesDeselectAll() {
         val visible = listOf("a", "b")
         assertEquals(emptySet<String>(), gallerySelectAllSelection(visible, setOf("a", "b")))
-        // Extra IDs from another tab are never touched.
-        assertEquals(
-            setOf("hidden"),
-            gallerySelectAllSelection(visible, setOf("a", "b", "hidden"))
-        )
+        assertEquals(setOf("hidden"), gallerySelectAllSelection(visible, setOf("a", "b", "hidden")))
     }
 
     @Test
@@ -34,7 +29,6 @@ class GallerySelectionAllTest {
         assertEquals("전체 선택", gallerySelectAllLabel(listOf("a"), emptySet()))
         assertEquals("전체 선택", gallerySelectAllLabel(listOf("a", "b"), setOf("a")))
         assertEquals("전체 선택 해제", gallerySelectAllLabel(listOf("a", "b"), setOf("a", "b")))
-        // Empty tabs keep the button disabled; label falls back to plain Select All.
         assertEquals("전체 선택", gallerySelectAllLabel(emptyList(), emptySet()))
     }
 
@@ -53,5 +47,48 @@ class GallerySelectionAllTest {
         val result = gallerySelectAllSelection(photosTabVisible, emptySet())
         assertEquals(setOf("photo1", "photo2"), result)
         assertFalse(result.contains(infoOnlySourceJobId))
+    }
+
+    @Test
+    fun selectAll_fromEmptySelection_addsAllVisibleIds() {
+        val visible = listOf("x", "y", "z")
+        assertEquals(setOf("x", "y", "z"), gallerySelectAllSelection(visible, emptySet()))
+    }
+
+    @Test
+    fun selectAll_fromPartialSelection_completesToFull() {
+        val visible = listOf("a", "b", "c")
+        assertEquals(setOf("a", "b", "c"), gallerySelectAllSelection(visible, setOf("a", "c")))
+    }
+
+    @Test
+    fun selectAll_fromFullSelection_clearsOnlyVisible() {
+        val visible = listOf("a", "b")
+        val crossTab = setOf("a", "b", "sourceOnly1")
+        assertEquals(setOf("sourceOnly1"), gallerySelectAllSelection(visible, crossTab))
+    }
+
+    @Test
+    fun infoTabSelectAll_canSelectSourceOnlyJobsHiddenFromPhotos() {
+        val allJobs = listOf("photo1", "sourceOnly1")
+        val result = gallerySelectAllSelection(allJobs, emptySet())
+        assertEquals(setOf("photo1", "sourceOnly1"), result)
+    }
+
+    @Test
+    fun photosTabSelectAll_neverSelectsInfoOnlyHiddenJobs() {
+        val photosVisible = listOf("photo1", "photo2")
+        val infoOnlyIds = listOf("sourceOnly1", "failedJob1")
+        val result = gallerySelectAllSelection(photosVisible, emptySet())
+        assertEquals(setOf("photo1", "photo2"), result)
+        infoOnlyIds.forEach { assertFalse("Hidden id $it must not leak into Photos selection", result.contains(it)) }
+    }
+
+    @Test
+    fun selection_afterRefresh_intersectsWithRemainingJobs() {
+        val selectedBefore = setOf("a", "b", "c")
+        val remaining = listOf("a", "c")
+        val afterRefresh = selectedBefore.intersect(remaining.toSet())
+        assertEquals(setOf("a", "c"), afterRefresh)
     }
 }

@@ -617,6 +617,8 @@ internal data class HardwareE2ECaptureTiming(
     val aggregateFsyncMs: Long = 0L,
     /** Sum of per-frame final-verify segments (0 when unset). */
     val aggregateVerifyMs: Long = 0L,
+    /** Overlap of per-frame verify spans with the post-acquisition persistence window (0 when unset). */
+    val postAcquisitionVerifyOverlapMs: Long = 0L,
     /** Slowest single-frame encode segment - the foreground bottleneck signal. */
     val maxFrameEncodeMs: Long = 0L,
     val frames: List<HardwareE2EFrameTiming> = emptyList()
@@ -638,6 +640,7 @@ internal data class HardwareE2ECaptureTiming(
         put("aggregateEncodeMs", aggregateEncodeMs)
         put("aggregateFsyncMs", aggregateFsyncMs)
         put("aggregateVerifyMs", aggregateVerifyMs)
+        put("postAcquisitionVerifyOverlapMs", postAcquisitionVerifyOverlapMs)
         put("maxFrameEncodeMs", maxFrameEncodeMs)
         put("frames", JSONArray(frames.map { it.toJson() }))
     }
@@ -660,6 +663,7 @@ internal data class HardwareE2ECaptureTiming(
             aggregateEncodeMs = json.optLong("aggregateEncodeMs"),
             aggregateFsyncMs = json.optLong("aggregateFsyncMs"),
             aggregateVerifyMs = json.optLong("aggregateVerifyMs"),
+            postAcquisitionVerifyOverlapMs = json.optLong("postAcquisitionVerifyOverlapMs"),
             maxFrameEncodeMs = json.optLong("maxFrameEncodeMs"),
             frames = buildList {
                 val array = json.optJSONArray("frames") ?: JSONArray()
@@ -721,9 +725,27 @@ internal data class HardwareE2ECaptureTiming(
                 aggregateEncodeMs = frameTimings.sumOf { it.encodeMs ?: 0L },
                 aggregateFsyncMs = frameTimings.sumOf { it.fsyncMs ?: 0L },
                 aggregateVerifyMs = frameTimings.sumOf { it.verifyMs ?: 0L },
+                postAcquisitionVerifyOverlapMs = computePostAcquisitionVerifyOverlapMs(timing),
                 maxFrameEncodeMs = frameTimings.mapNotNull { it.encodeMs }.maxOrNull() ?: 0L,
                 frames = frameTimings
             )
+        }
+
+        private fun computePostAcquisitionVerifyOverlapMs(timing: JSONObject): Long {
+            val acquisitionComplete = timing.optLong("cameraAcquisitionCompleteAt")
+            val drainComplete = timing.optLong("persistenceDrainCompleteAt")
+            if (acquisitionComplete <= 0L || drainComplete <= 0L) return 0L
+            val framesArray = timing.optJSONArray("frames") ?: JSONArray()
+            var totalOverlapNanos = 0L
+            repeat(framesArray.length().coerceAtMost(MAX_TIMING_FRAMES)) { index ->
+                val frame = framesArray.optJSONObject(index) ?: return@repeat
+                val writeFinished = frame.optLong("writeFinishedAt").takeIf { it > 0 } ?: return@repeat
+                val verifiedAt = frame.optLong("verifiedAt").takeIf { it > 0 } ?: return@repeat
+                val overlapStart = maxOf(writeFinished, acquisitionComplete)
+                val overlapEnd = minOf(verifiedAt, drainComplete)
+                totalOverlapNanos += (overlapEnd - overlapStart).coerceAtLeast(0L)
+            }
+            return totalOverlapNanos / 1_000_000L
         }
 
         private const val MAX_TIMING_FRAMES = 32

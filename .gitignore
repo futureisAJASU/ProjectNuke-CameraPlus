@@ -44,3 +44,6 @@ KeplerColorBurst/
 *.hprof
 hs_err_pid*.log
 replay_pid*.log
+
+# Hardware E2E local diagnostic artifacts (device serial / process info)
+artifacts/hardware-e2e/

@@ -116,6 +116,7 @@ try {
         $instrumentation
     )
     Write-Host "Running opt-in hardware instrumentation on $Serial ..."
+    $harnessStartWallClock = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $instrumentationResult = Invoke-AdbCapture $instrumentationArgs
     $instrumentationResult.Output | Set-Content -Path (Join-Path $artifactDir "instrumentation.txt")
     $runMatch = [regex]::Match($instrumentationResult.Output, "HARDWARE_E2E_RUN_ID=([0-9a-fA-F-]+)")
@@ -134,24 +135,46 @@ try {
         $resultCode = 1
         throw "Instrumentation failed (exit $($instrumentationResult.ExitCode)). See instrumentation.txt."
     }
-    if (-not $runMatch.Success) {
-        throw "Instrumentation succeeded without exposing HARDWARE_E2E_RUN_ID. Exact report retrieval is unsafe."
-    }
 
-    $runId = $runMatch.Groups[1].Value
-    $reportText = Invoke-AdbRequired @("shell", "run-as", $packageName, "cat", "files/hardware-e2e/$runId.json") "exact hardware report retrieval"
-    $reportText | Set-Content -Path (Join-Path $artifactDir "hardware-e2e-report.json")
-    $report = $reportText | ConvertFrom-Json
-    if ($report.runId -ne $runId) {
-        throw "Retrieved report runId '$($report.runId)' does not match instrumentation runId '$runId'."
+    if ($runMatch.Success) {
+        $runId = $runMatch.Groups[1].Value
+        $reportText = Invoke-AdbRequired @("shell", "run-as", $packageName, "cat", "files/hardware-e2e/$runId.json") "exact hardware report retrieval"
+        $reportText | Set-Content -Path (Join-Path $artifactDir "hardware-e2e-report.json")
+        $report = $reportText | ConvertFrom-Json
+        if ($report.runId -ne $runId) {
+            throw "Retrieved report runId '$($report.runId)' does not match instrumentation runId '$runId'."
+        }
+        if ($report.status -ne "PASS") {
+            $result = "FAIL"
+            $resultCode = 1
+            throw "Production hardware smoke did not PASS: status=$($report.status) reason=$($report.classificationReason). See hardware-e2e-report.json."
+        }
+        $result = "PASS"
+        $resultCode = 0
+    } else {
+        $toleranceMs = 5000
+        $latestJson = Invoke-AdbRequired @("shell", "run-as", $packageName, "cat", "files/hardware-e2e/latest.json") "latest.json retrieval for fail-closed fallback"
+        $latestReport = $latestJson | ConvertFrom-Json
+        $reportStart = $latestReport.runStartWallClockTimestamp
+        $diff = [Math]::Abs($reportStart - $harnessStartWallClock)
+        if ($diff -gt $toleranceMs -or [string]::IsNullOrWhiteSpace($latestReport.runId)) {
+            throw "Instrumentation passed without HARDWARE_E2E_RUN_ID and latest.json is not from this harness invocation (runStartWallClockTimestamp=$reportStart, harnessStart=$harnessStartWallClock, diff=$diff ms, tolerance=$toleranceMs ms)."
+        }
+        $runId = $latestReport.runId
+        $reportText = Invoke-AdbRequired @("shell", "run-as", $packageName, "cat", "files/hardware-e2e/$runId.json") "exact hardware report retrieval (fallback)"
+        $reportText | Set-Content -Path (Join-Path $artifactDir "hardware-e2e-report.json")
+        $report = $reportText | ConvertFrom-Json
+        if ($report.runId -ne $runId) {
+            throw "Retrieved report runId '$($report.runId)' does not match fallback runId '$runId'."
+        }
+        if ($report.status -ne "PASS") {
+            $result = "FAIL"
+            $resultCode = 1
+            throw "Production hardware smoke did not PASS: status=$($report.status) reason=$($report.classificationReason). See hardware-e2e-report.json."
+        }
+        $result = "PASS"
+        $resultCode = 0
     }
-    if ($report.status -ne "PASS") {
-        $result = "FAIL"
-        $resultCode = 1
-        throw "Production hardware smoke did not PASS: status=$($report.status) reason=$($report.classificationReason). See hardware-e2e-report.json."
-    }
-    $result = "PASS"
-    $resultCode = 0
 } catch {
     if ($result -eq "HARNESS_ERROR" -and $_.Exception.Message -match "Instrumentation failed") {
         $result = "FAIL"
