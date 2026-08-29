@@ -245,6 +245,35 @@ class MediaStoreExportRecoveryTest {
         } finally { dir.deleteRecursively() }
     }
     @Test
+    fun alreadyVerifiedJournalReinspectionDoesNotRewriteIdenticalState() {
+        val dir = Files.createTempDirectory("media-recovery-verified-idem-").toFile()
+        try {
+            journal(dir, MediaStoreExportState.VERIFIED)
+            val updatedBefore = MediaStoreExportJournal.list(dir).single().updatedAt
+            val writesBefore = KeplerJobMetadata.atomicWriteCount
+            val result = recoverMediaStoreExportJournals(dir, FakeAccess(pending = false, verified = true)).single()
+            assertEquals(MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED, result.classification)
+            val reconstructed = MediaStoreExportJournal.list(dir).single()
+            assertEquals(MediaStoreExportState.VERIFIED, reconstructed.state)
+            assertEquals(updatedBefore, reconstructed.updatedAt)
+            assertEquals(writesBefore, KeplerJobMetadata.atomicWriteCount)
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
+    fun verifiedReinspectionStillTransitionsPublicCommittedToVerified() {
+        val dir = Files.createTempDirectory("media-recovery-committed-upgrade-").toFile()
+        try {
+            journal(dir, MediaStoreExportState.PUBLIC_COMMITTED)
+            val writesBefore = KeplerJobMetadata.atomicWriteCount
+            val result = recoverMediaStoreExportJournals(dir, FakeAccess(pending = false, verified = true)).single()
+            assertEquals(MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED, result.classification)
+            assertEquals(MediaStoreExportState.VERIFIED, MediaStoreExportJournal.list(dir).single().state)
+            assertEquals(writesBefore + 1, KeplerJobMetadata.atomicWriteCount)
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test
     fun inspectionFailureIsAmbiguous() {
         val dir = Files.createTempDirectory("media-recovery-inspect-failure-").toFile()
         try {

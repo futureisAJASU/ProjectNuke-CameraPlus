@@ -184,29 +184,32 @@ class KeplerStableFastPathTest {
                 override fun delete(uri: android.net.Uri) = true
             }
             val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), access)
-            // Fast path is impossible here because terminalResultAlreadyProven == false and journal debt exists.
-            assertTrue(report.jobs.single().classification == KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED ||
-                report.jobs.single().classification == KeplerJobRecoveryClassification.PUBLIC_COMMIT_MISSING ||
-                report.jobs.single().classification == KeplerJobRecoveryClassification.PUBLIC_EXPORT_COMMITTED_PENDING_VERIFICATION ||
-                report.jobs.single().classification != KeplerJobRecoveryClassification.RECOVERED)
+            // Exact expected recovery classification/state for this fixture (public commit missing due to missing row).
+            assertEquals(KeplerJobRecoveryClassification.AMBIGUOUS_RECOVERY_REQUIRED, report.jobs.single().classification)
+            assertEquals("PUBLIC_COMMIT_MISSING", KeplerJobMetadata.read(job).getString("recoveryState"))
+            assertTrue(report.jobs.single().actions.contains("PUBLIC_COMMIT_MISSING"))
+            // The failing PUBLIC_COMMITTED journal is preserved (not deleted) as durable debt evidence.
+            assertEquals(MediaStoreExportState.PUBLIC_COMMITTED, MediaStoreExportJournal.list(job).single().state)
         } finally { root.deleteRecursively() }
     }
 
     @Test
-    fun h_metadataTempAndCaptureTempRecovery_stillExecutes() {
+    fun h_metadataTempRecovery_stillExecutes() {
         val root = newRoot()
         val job = newJob(root, "KPL_YUV_FUSION_h_meta_temp")
         try {
             KeplerJobMetadata.write(job, terminalStableJson("STALE_NEEDS_WRITE", null))
+            val beforeWrites = KeplerJobMetadata.atomicWriteCount
             // Stale metadata temp
             val stale = File(job, ".job.json.1.tmp")
             stale.writeText(JSONObject().put("jobType", "YUV_NIGHT_FUSION").put("status", "COMPLETE").toString())
             val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root))
-            // Stale temp must have been cleaned (fast path not taken).
+            // Stale temp must have been cleaned (the recovery path was executed, not skipped).
             assertFalse(stale.exists())
             assertEquals(KeplerJobRecoveryClassification.RECOVERED, report.jobs.single().classification)
-            // Still settles to STABLE (collection repaired, debt cleaned).
+            // Required durable settlement occurred (recoveryState was not STABLE initially, so a write was necessary).
             assertEquals("STABLE", KeplerJobMetadata.read(job).getString("recoveryState"))
+            assertEquals(beforeWrites + 1, KeplerJobMetadata.atomicWriteCount)
         } finally { root.deleteRecursively() }
     }
 

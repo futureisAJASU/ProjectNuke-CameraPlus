@@ -206,8 +206,6 @@ internal object KeplerRecoveryCoordinator {
                 KeplerActiveOperationKind.SUPER_RESOLUTION.name
             )
             val invalidExportJournals = MediaStoreExportJournal.invalidFiles(jobDir)
-            val currentExportJournals = MediaStoreExportJournal.list(jobDir)
-                .filter { it.ownerOperationId == activeOperation }
             val activeStartedAt = job.optLong(ACTIVE_OPERATION_STARTED_AT, 0L)
             val invalidCurrentExportJournals = if (activeOperationKind == KeplerActiveOperationKind.PUBLIC_EXPORT.name) {
                 invalidExportJournals.filter { activeStartedAt <= 0L || it.lastModified() >= activeStartedAt }
@@ -239,7 +237,8 @@ internal object KeplerRecoveryCoordinator {
             } else {
                 exportAccess?.let { recoverMediaStoreExportJournals(jobDir, it) }.orEmpty()
             }
-            val exportJournalsById = MediaStoreExportJournal.list(jobDir).associateBy { it.exportAttemptId }
+            val exportJournals = MediaStoreExportJournal.list(jobDir)
+            val exportJournalsById = exportJournals.associateBy { it.exportAttemptId }
             val cleanupFailures = exportResults
                 .filter { it.classification == MediaStoreExportRecoveryClassification.DELETE_FAILED }
                 .map { it.message ?: "MediaStore cleanup failed for ${it.attemptId}." }
@@ -358,7 +357,7 @@ internal object KeplerRecoveryCoordinator {
                     reconstructMainExportEvidence(jobDir, current, exportAuthorityOperation, exportResults)
                 }
             }
-            if (exportResults.isNotEmpty() || activeOperation.isNotBlank()) {
+            if ((exportResults.isNotEmpty() || activeOperation.isNotBlank()) && rawSidecarRecoveryApplies(jobDir, job)) {
                 val recoveredAttemptIds = exportResults
                     .filter { result ->
                         result.classification == MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED ||
@@ -366,7 +365,7 @@ internal object KeplerRecoveryCoordinator {
                             result.classification == MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED
                     }
                     .filter { result ->
-                        MediaStoreExportJournal.list(jobDir).any { journal ->
+                        exportJournals.any { journal ->
                             journal.exportAttemptId == result.attemptId &&
                                 journal.role == MediaStoreExportRole.RAW_DNG_SIDECAR
                         }
@@ -376,7 +375,7 @@ internal object KeplerRecoveryCoordinator {
                     reconstructRawSidecarJournalEvidence(
                         jobDir,
                         current,
-                        MediaStoreExportJournal.list(jobDir),
+                        exportJournals,
                         recoveredAttemptIds,
                         classifications = exportResults.associate { it.attemptId to it.classification }
                     )

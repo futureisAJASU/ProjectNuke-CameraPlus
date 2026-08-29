@@ -56,6 +56,31 @@ internal fun recoverMediaStoreExportJournals(
     recoverMediaStoreExportJournal(jobDir, journal, access)
 }
 
+/**
+ * Cheap structural gate: is RAW DNG sidecar recovery semantically relevant to this job?
+ *
+ * Returns false only when the job provably has no RAW sidecar contract, so the surrounding
+ * reconstruction pass (and its enclosing durable job-metadata rewrite) can be skipped. This is
+ * intentionally independent of journal existence: a RAW job whose requested DNG sidecar has no
+ * surviving RAW_DNG_SIDECAR journal must still run reconstruction to record truthful
+ * PUBLIC_NOT_RECOVERED evidence. Conversely an ordinary YUV job whose frames carry no DNG-sidecar
+ * field is structurally unrelated and must not be forced through reconstruction.
+ */
+internal fun rawSidecarRecoveryApplies(jobDir: File, job: org.json.JSONObject): Boolean {
+    if (job.optString("jobType").uppercase() == "RAW_NIGHT_FUSION" || jobDir.name.startsWith("KPL_RAW_FUSION_")) {
+        return true
+    }
+    val frames = job.optJSONArray("frames") ?: return false
+    for (index in 0 until frames.length()) {
+        val frame = frames.optJSONObject(index) ?: continue
+        val dngFile = frame.optString("dngFile").takeUnless { it.isBlank() || it == "null" }
+        if (dngFile != null) return true
+        val status = frame.optString("dngSidecarStatus")
+        if (status.isNotBlank() && status != "NOT_REQUESTED") return true
+    }
+    return false
+}
+
 internal fun reconstructRawSidecarJournalEvidence(
     jobDir: File,
     job: org.json.JSONObject,
@@ -459,7 +484,12 @@ private fun recoverMediaStoreExportJournal(
             inspection.message ?: "Committed MediaStore content could not be verified."
         )
     }
-    journal.transition(jobDir, MediaStoreExportState.VERIFIED)
+    // Same-state idempotency: a journal already durably VERIFIED that inspection freshly
+    // proves verified again must not be rewritten. A redundant transition would mutate
+    // `updatedAt` and therefore reorder historical export evidence for no semantic gain.
+    if (journal.state != MediaStoreExportState.VERIFIED) {
+        journal.transition(jobDir, MediaStoreExportState.VERIFIED)
+    }
     return MediaStoreExportRecoveryResult(
         journal.exportAttemptId,
         MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED
