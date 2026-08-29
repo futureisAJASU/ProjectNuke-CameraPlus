@@ -601,8 +601,12 @@ internal object KeplerRecoveryCoordinator {
                 )
             }
             if (terminalResultAlreadyProven) {
-                KeplerJobMetadata.update(jobDir) {
-                    it.put("recoveryState", "STABLE").remove("recoveryMessage")
+                val needsStableSettlement = job.optString("recoveryState") != "STABLE" ||
+                    job.has("recoveryMessage")
+                if (needsStableSettlement) {
+                    KeplerJobMetadata.update(jobDir) {
+                        it.put("recoveryState", "STABLE").remove("recoveryMessage")
+                    }
                 }
             }
             if (activeOperation.isBlank() &&
