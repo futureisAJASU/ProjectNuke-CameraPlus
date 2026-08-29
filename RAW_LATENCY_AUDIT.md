@@ -18,7 +18,7 @@ wiring (`CaptureTimingLedger`, persisted as `capture_timing.json` and the
 | 3 | Result adopted likewise | `postResultReceived` -> `recordResultReceived(ordinal)` |
 | 4 | Pairing + save dispatch (owner thread) | `dispatchReadyFrames` -> `takeNextReadyFrame` -> `submitSaveRequest` (`persistenceSubmittedAt`) |
 | 5 | Save worker executes frame persistence | `saveRawFrameToCompletion` on `BoundedCaptureWorker("KeplerRawFusionSave", capacity=2)` (`workerStartedAt`) |
-| 6 | raw16 extraction+write (per-pixel scalar copy today) | `writeCompactRaw16`/`writeRaw16Rows` (`fsyncFinishedAt`, `Raw16WriteStats.writeDurationMs`) |
+| 6 | raw16 extraction+write (bulk row copy, post-Phase-3) | `writeCompactRaw16`/`writeRaw16Rows` (`fsyncFinishedAt`, `Raw16WriteStats.writeDurationMs`) |
 | 7 | fsync of temp payload | `rawOutput.fd.sync()` inside `Kepler_RAW_Sync` trace section (`syncDurationMs`) |
 | 8 | Temp digest verification (2 full reads: stream + identity fence) | `verifyRaw16Payload(temp)` -> `NoFollowFileSystem.digestVerified` |
 | 9 | Atomic publish | `KeplerJobMetadata.atomicReplace(temp, final)` (`writeFinishedAt`) |
@@ -65,7 +65,7 @@ Bytes assume 4080x3060 RAW16 (~25 MB/frame; x4 frames ~100 MB).
    gates handoff. This is the primary Phase-3 target.
 3. **Secondary target**: the extraction loop uses scalar byte reads from a
    direct ByteBuffer (`buffer.get(index)` per byte, 50M calls/frame). A
-   compact-stride bulk path (rowStride == width*2, pixelStride == 1) can
+   compact-stride bulk path (rowStride == width*2, pixelStride == 2) can
    eliminate the per-pixel loop entirely.
 4. **HAL pacing evidence** is now recorded per capture
    (`rawStreamTiming` / `rawMinFrameDurationNs` / `rawStallDurationNs`
@@ -104,11 +104,11 @@ Targets (in priority order):
    final artifact), while content truth is STRICTLY STRONGER than before.
 2. **Bulk extraction (targets B/C)**: `writeRaw16Rows` now transfers one
    complete row per JNI crossing via `ByteBuffer.duplicate()` bulk gets:
-   - `SEQUENTIAL_BULK` when rowStride == width*2 (contiguous plane);
-   - `PADDED_ROW_PACK` when pixelStride==1 with padded stride (one reusable
-     `ByteArray(width*2)` row buffer; padding stripped; zero-fill fallback
-     preserved for short planes);
-   - `SCALAR_FALLBACK` only for exotic pixelStride != 1 layouts.
+    - `SEQUENTIAL_BULK` when rowStride == width*2 (contiguous plane);
+    - `PADDED_ROW_PACK` when pixelStride==2 with padded stride (one reusable
+      `ByteArray(width*2)` row buffer; padding stripped; zero-fill fallback
+      preserved for short planes);
+    - `SCALAR_FALLBACK` only for exotic pixelStride != 2 layouts.
    The scalar per-byte loop (~50M JNI crossings per 25 MB frame) is gone
    from all production layouts. No full-frame allocation exists anywhere on
    the path.

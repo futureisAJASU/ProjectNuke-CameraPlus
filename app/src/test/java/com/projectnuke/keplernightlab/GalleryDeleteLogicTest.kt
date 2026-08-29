@@ -65,7 +65,7 @@ class GalleryDeleteLogicTest {
         val currentSelection = setOf("kept1", "targetA", "targetB", "kept2")
         val targetedIds = setOf("targetA", "targetB")
         val unresolvedIds = setOf("targetB", "targetC")
-        val remaining = (currentSelection - targetedIds) + unresolvedIds
+        val remaining = settleGallerySelectionAfterBatchDelete(currentSelection, targetedIds, unresolvedIds)
         assertEquals(setOf<String>("kept1", "kept2", "targetB", "targetC"), remaining)
     }
 
@@ -74,7 +74,7 @@ class GalleryDeleteLogicTest {
         val currentSelection = setOf("targetA", "targetB")
         val targetedIds = setOf("targetA", "targetB")
         val unresolvedIds = emptySet<String>()
-        val remaining = (currentSelection - targetedIds) + unresolvedIds
+        val remaining = settleGallerySelectionAfterBatchDelete(currentSelection, targetedIds, unresolvedIds)
         assertEquals(emptySet<String>(), remaining)
     }
 
@@ -83,7 +83,7 @@ class GalleryDeleteLogicTest {
         val currentSelection = setOf("targetA")
         val targetedIds = setOf("targetA")
         val unresolvedIds = setOf("targetA")
-        val remaining = (currentSelection - targetedIds) + unresolvedIds
+        val remaining = settleGallerySelectionAfterBatchDelete(currentSelection, targetedIds, unresolvedIds)
         assertEquals(setOf<String>("targetA"), remaining)
     }
 
@@ -92,7 +92,14 @@ class GalleryDeleteLogicTest {
         val currentSelection = setOf("kept1")
         val targetedIds = setOf("failedA", "failedB")
         val unresolvedIds = setOf("failedA")
-        val remaining = (currentSelection - targetedIds) + unresolvedIds
+        val remaining = settleGallerySelectionAfterBatchDelete(currentSelection, targetedIds, unresolvedIds)
         assertEquals(setOf<String>("kept1", "failedA"), remaining)
+    }
+
+    @Test
+    fun batchDelete_selectionSettlement_emptyTargetsLeavesSelectionUnchanged() {
+        val currentSelection = setOf("kept1", "kept2")
+        val remaining = settleGallerySelectionAfterBatchDelete(currentSelection, emptySet(), emptySet())
+        assertEquals(setOf("kept1", "kept2"), remaining)
     }
 }

@@ -15,6 +15,9 @@ $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $artifactDir = Join-Path $repoRoot "artifacts/hardware-e2e/$stamp"
 $result = "HARNESS_ERROR"
 $resultCode = 2
+$previousLatestRunId = $null
+$harnessStartWallClock = $null
+$instrumentationEndWallClock = $null
 
 function Invoke-AdbCapture {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
@@ -49,6 +52,32 @@ function Write-BestEffortAdbFile {
     } catch {
         "best-effort collection failed: $($_.Exception.Message)" | Set-Content -Path (Join-Path $artifactDir $Name)
     }
+}
+
+function Read-PreviousLatest {
+    try {
+        $latestJson = Invoke-AdbCapture @("shell", "run-as", $packageName, "cat", "files/hardware-e2e/latest.json")
+        if ($latestJson.ExitCode -eq 0) {
+            $latestReport = $latestJson.Output | ConvertFrom-Json
+            if ($latestReport.runId) {
+                return $latestReport.runId
+            }
+        }
+    } catch {
+        # absent or unreadable prior state is fine
+    }
+    return $null
+}
+
+function Test-AssumptionSkip {
+    param([string]$Output)
+    if ($Output -match "INSTRUMENTATION_STATUS_CODE:\s*-4") {
+        return $true
+    }
+    if ($Output -match "org\.junit\.AssumptionViolatedException") {
+        return $true
+    }
+    return $false
 }
 
 New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
@@ -117,7 +146,9 @@ try {
     )
     Write-Host "Running opt-in hardware instrumentation on $Serial ..."
     $harnessStartWallClock = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $previousLatestRunId = Read-PreviousLatest
     $instrumentationResult = Invoke-AdbCapture $instrumentationArgs
+    $instrumentationEndWallClock = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $instrumentationResult.Output | Set-Content -Path (Join-Path $artifactDir "instrumentation.txt")
     $runMatch = [regex]::Match($instrumentationResult.Output, "HARDWARE_E2E_RUN_ID=([0-9a-fA-F-]+)")
 
@@ -134,6 +165,12 @@ try {
         $result = "FAIL"
         $resultCode = 1
         throw "Instrumentation failed (exit $($instrumentationResult.ExitCode)). See instrumentation.txt."
+    }
+
+    if (Test-AssumptionSkip $instrumentationResult.Output) {
+        $result = "SKIPPED"
+        $resultCode = 3
+        throw "Instrumentation was skipped (assumption not met). Device may be locked or not interactive. See instrumentation.txt."
     }
 
     if ($runMatch.Success) {
@@ -155,11 +192,28 @@ try {
         $toleranceMs = 5000
         $latestJson = Invoke-AdbRequired @("shell", "run-as", $packageName, "cat", "files/hardware-e2e/latest.json") "latest.json retrieval for fail-closed fallback"
         $latestReport = $latestJson | ConvertFrom-Json
+
+        if ([string]::IsNullOrWhiteSpace($latestReport.runId)) {
+            throw "Instrumentation passed without HARDWARE_E2E_RUN_ID and latest.json has blank runId."
+        }
+        if ($previousLatestRunId -and $latestReport.runId -eq $previousLatestRunId) {
+            throw "Instrumentation passed without HARDWARE_E2E_RUN_ID and latest.json runId '$($latestReport.runId)' matches the previous harness invocation."
+        }
         $reportStart = $latestReport.runStartWallClockTimestamp
         $diff = [Math]::Abs($reportStart - $harnessStartWallClock)
-        if ($diff -gt $toleranceMs -or [string]::IsNullOrWhiteSpace($latestReport.runId)) {
+        if ($diff -gt $toleranceMs) {
             throw "Instrumentation passed without HARDWARE_E2E_RUN_ID and latest.json is not from this harness invocation (runStartWallClockTimestamp=$reportStart, harnessStart=$harnessStartWallClock, diff=$diff ms, tolerance=$toleranceMs ms)."
         }
+        if ($latestReport.runEndWallClockTimestamp) {
+            $endDiff = [Math]::Abs($latestReport.runEndWallClockTimestamp - $instrumentationEndWallClock)
+            if ($endDiff -gt $toleranceMs) {
+                throw "Instrumentation passed without HARDWARE_E2E_RUN_ID and latest.json end timestamp is inconsistent with this invocation (runEnd=$($latestReport.runEndWallClockTimestamp), harnessEnd=$instrumentationEndWallClock, diff=$endDiff ms)."
+            }
+        }
+        if ($latestReport.status -ne "PASS") {
+            throw "Instrumentation passed without HARDWARE_E2E_RUN_ID and latest.json status is '$($latestReport.status)' (expected PASS)."
+        }
+
         $runId = $latestReport.runId
         $reportText = Invoke-AdbRequired @("shell", "run-as", $packageName, "cat", "files/hardware-e2e/$runId.json") "exact hardware report retrieval (fallback)"
         $reportText | Set-Content -Path (Join-Path $artifactDir "hardware-e2e-report.json")
@@ -176,9 +230,14 @@ try {
         $resultCode = 0
     }
 } catch {
-    if ($result -eq "HARNESS_ERROR" -and $_.Exception.Message -match "Instrumentation failed") {
-        $result = "FAIL"
-        $resultCode = 1
+    if ($result -eq "HARNESS_ERROR") {
+        if ($_.Exception.Message -match "Instrumentation failed") {
+            $result = "FAIL"
+            $resultCode = 1
+        } elseif ($_.Exception.Message -match "skipped|assumption|not interactive|locked") {
+            $result = "SKIPPED"
+            $resultCode = 3
+        }
     }
     Write-Error $_.Exception.Message
 } finally {

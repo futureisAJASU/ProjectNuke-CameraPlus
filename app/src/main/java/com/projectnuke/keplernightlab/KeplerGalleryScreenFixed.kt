@@ -156,7 +156,7 @@ fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
                                 deleteKeplerGalleryJobsBatch(context, targets)
                             }
                             val unresolvedIds = result.unresolvedEntries.map { it.jobId }.toSet()
-                            selectedIds = (selectedIds - targetedIds) + unresolvedIds
+                            selectedIds = settleGallerySelectionAfterBatchDelete(selectedIds, targetedIds, unresolvedIds)
                             deleteError = keplerBatchDeleteSummaryText(result)?.let { summary ->
                                 val reasons = result.unresolvedEntries.mapNotNull { entry ->
                                     entry.outcome.unresolvedReasonText()
@@ -192,7 +192,7 @@ fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
                                 deleteKeplerGalleryJobsBatch(context, targets)
                             }
                             val unresolvedIds = result.unresolvedEntries.map { it.jobId }.toSet()
-                            selectedIds = (selectedIds - targetedIds) + unresolvedIds
+                            selectedIds = settleGallerySelectionAfterBatchDelete(selectedIds, targetedIds, unresolvedIds)
                             deleteError = keplerBatchDeleteSummaryText(result)?.let { summary ->
                                 val reasons = result.unresolvedEntries.mapNotNull { entry ->
                                     entry.outcome.unresolvedReasonText()
@@ -401,7 +401,7 @@ private fun GalleryInfoGrid(
             Button(onClick = onBack, enabled = !batchDeleteBusy) { Text("뒤로") }
             Button(onClick = onRefresh, enabled = !batchDeleteBusy) { Text("새로고침") }
             TextButton(onClick = onSelectAll, enabled = !batchDeleteBusy && jobs.isNotEmpty()) {
-                Text(selectAllLabel, modifier = Modifier.testTag("kepler.gallery.selectAll"))
+                Text(selectAllLabel, modifier = Modifier.testTag("kepler.gallery.selectAllInfo"))
             }
         }
         GalleryFixedTabs(TAB_INFO, onSelectTab, enabled = !batchDeleteBusy)
@@ -506,6 +506,12 @@ internal fun gallerySelectAllLabel(visibleIds: List<String>, currentSelection: S
         "전체 선택"
     }
 
+internal fun settleGallerySelectionAfterBatchDelete(
+    currentSelection: Set<String>,
+    targetedIds: Set<String>,
+    unresolvedTargetIds: Set<String>
+): Set<String> = (currentSelection - targetedIds) + unresolvedTargetIds
+
 internal fun selectFailedGalleryJobs(
     jobs: List<KeplerGalleryJobSummary>
 ): List<KeplerGalleryJobSummary> = jobs.filter { it.isFailedGalleryJob() }
@@ -555,9 +561,9 @@ internal fun KeplerGalleryJobSummary.isSourceOnlyGalleryJob(): Boolean =
 @Composable
 private fun GalleryFixedTabs(selectedTab: Int, onSelect: (Int) -> Unit, enabled: Boolean = true) {
     PrimaryTabRow(selectedTabIndex = selectedTab, containerColor = galleryFixedBackground) {
-        Tab(selected = selectedTab == TAB_PHOTOS_ONLY, onClick = { if (enabled) onSelect(TAB_PHOTOS_ONLY) }, text = { Text("사진만") })
-        Tab(selected = selectedTab == TAB_INFO, onClick = { if (enabled) onSelect(TAB_INFO) }, text = { Text("정보") })
-        Tab(selected = selectedTab == TAB_DEBUG, onClick = { if (enabled) onSelect(TAB_DEBUG) }, text = { Text("디버그") })
+        Tab(selected = selectedTab == TAB_PHOTOS_ONLY, enabled = enabled, onClick = { onSelect(TAB_PHOTOS_ONLY) }, text = { Text("사진만") })
+        Tab(selected = selectedTab == TAB_INFO, enabled = enabled, onClick = { onSelect(TAB_INFO) }, text = { Text("정보") })
+        Tab(selected = selectedTab == TAB_DEBUG, enabled = enabled, onClick = { onSelect(TAB_DEBUG) }, text = { Text("디버그") })
     }
 }
 
