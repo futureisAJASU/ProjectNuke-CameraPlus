@@ -36,6 +36,14 @@ internal class CaptureTimingLedger(
         val fsyncFinishedAt = AtomicLongArray(requested)
         val verifiedAt = AtomicLongArray(requested)
         val committedAt = AtomicLongArray(requested)
+        // Exact RAW payload-write interval: strictly around writeRaw16Rows (fsync excluded).
+        val rawPayloadWriteStartedAt = AtomicLongArray(requested)
+        val rawPayloadWriteFinishedAt = AtomicLongArray(requested)
+        // Exact RAW fsync interval: strictly around rawOutput.fd.sync().
+        val rawSyncStartedAt = AtomicLongArray(requested)
+        // Exact atomic-publish interval: strictly around KeplerJobMetadata.atomicReplace(temp, final).
+        val rawPublishStartedAt = AtomicLongArray(requested)
+        val rawPublishFinishedAt = AtomicLongArray(requested)
     }
 
     private val time = FrameTimes(requestedFrames.coerceAtLeast(1))
@@ -53,6 +61,9 @@ internal class CaptureTimingLedger(
     private val processingHandoffPublishedAt = AtomicLong(0L)
     private val captureResourcesSettledAt = AtomicLong(0L)
     private val captureStageCompleteAt = AtomicLong(0L)
+    // Terminal durable metadata write (successful RAW terminal settlement): strictly around KeplerJobMetadata.write(jobDir, terminalJob).
+    private val terminalMetadataWriteStartedAt = AtomicLong(0L)
+    private val terminalMetadataWriteFinishedAt = AtomicLong(0L)
 
     // RAW aggregate persistence evidence. Accumulated from REAL measured spans
     // around the raw16 write and its fsync on the save worker; never inferred.
@@ -135,10 +146,25 @@ internal class CaptureTimingLedger(
     fun recordVerified(frameIndex: Int) { putFrameInstant(time.verifiedAt, frameIndex, now()) }
     fun recordCommitted(frameIndex: Int) { putFrameInstant(time.committedAt, frameIndex, now()) }
 
+    // Exact RAW payload-write boundaries: immediately before/after writeRaw16Rows (fsync excluded).
+    fun recordRawPayloadWriteStarted(frameIndex: Int) { putFrameInstant(time.rawPayloadWriteStartedAt, frameIndex, now()) }
+    fun recordRawPayloadWriteFinished(frameIndex: Int) { putFrameInstant(time.rawPayloadWriteFinishedAt, frameIndex, now()) }
+
+    // Exact RAW fsync start: immediately before rawOutput.fd.sync().
+    fun recordRawSyncStarted(frameIndex: Int) { putFrameInstant(time.rawSyncStartedAt, frameIndex, now()) }
+
+    // Exact atomic-publish boundaries: strictly around KeplerJobMetadata.atomicReplace(temp, final).
+    fun recordRawPublishStarted(frameIndex: Int) { putFrameInstant(time.rawPublishStartedAt, frameIndex, now()) }
+    fun recordRawPublishFinished(frameIndex: Int) { putFrameInstant(time.rawPublishFinishedAt, frameIndex, now()) }
+
     fun recordPersistenceDrainComplete() { persistenceDrainCompleteAt.compareAndSet(0L, now()) }
     fun recordProcessingHandoffPublished() { processingHandoffPublishedAt.compareAndSet(0L, now()) }
     fun recordCaptureResourcesSettled() { captureResourcesSettledAt.compareAndSet(0L, now()) }
     fun recordCaptureStageComplete() { captureStageCompleteAt.compareAndSet(0L, now()) }
+
+    // Terminal durable metadata write (successful RAW terminal settlement): strictly around KeplerJobMetadata.write(jobDir, terminalJob).
+    fun recordTerminalMetadataWriteStarted() { terminalMetadataWriteStartedAt.compareAndSet(0L, now()) }
+    fun recordTerminalMetadataWriteFinished() { terminalMetadataWriteFinishedAt.compareAndSet(0L, now()) }
 
     /**
      * RAW per-frame write evidence: compact bytes actually persisted plus the
@@ -200,9 +226,18 @@ internal class CaptureTimingLedger(
             rawPersistenceSyncMs = rawPersistenceSyncMs.get(),
             lastFrameCommittedAt = lastCommitted,
             postAcquisitionVerifyOverlapMs = postAcquisitionVerifyOverlapMs(),
-            postAcquisitionRawWriteOverlapMs = postAcquisitionRawWriteOverlapMs(),
-            postAcquisitionMetadataOverlapMs = postAcquisitionMetadataOverlapMs(),
-            postAcquisitionHandoffOverlapMs = postAcquisitionHandoffOverlapMs()
+            postAcquisitionPreVerifyPersistenceOverlapMs = postAcquisitionPreVerifyPersistenceOverlapMs(),
+            postAcquisitionPostPublishToAdoptionOverlapMs = postAcquisitionPostPublishToAdoptionOverlapMs(),
+            // Deprecated aliases retain broad meaning but must not be presented as exact durations.
+            postAcquisitionRawWriteOverlapMs = postAcquisitionPreVerifyPersistenceOverlapMs(),
+            postAcquisitionMetadataOverlapMs = postAcquisitionPostPublishToAdoptionOverlapMs(),
+            postAcquisitionHandoffOverlapMs = postAcquisitionHandoffOverlapMs(),
+            postAcquisitionRawPayloadWriteOverlapMs = postAcquisitionRawPayloadWriteOverlapMs(),
+            postAcquisitionRawSyncOverlapMs = postAcquisitionRawSyncOverlapMs(),
+            postAcquisitionRawPublishOverlapMs = postAcquisitionRawPublishOverlapMs(),
+            postAcquisitionPostVerifyToAdoptionOverlapMs = postAcquisitionPostVerifyToAdoptionOverlapMs(),
+            terminalMetadataWriteMs = terminalMetadataWriteMs(),
+            postAcquisitionTerminalMetadataWriteOverlapMs = postAcquisitionTerminalMetadataWriteOverlapMs()
         )
     }
 
@@ -235,7 +270,12 @@ internal class CaptureTimingLedger(
         return totalOverlapNanos / 1_000_000L
     }
 
-    fun postAcquisitionRawWriteOverlapMs(): Long {
+    /**
+     * Truthful name for the broad interval previously mislabeled "raw write":
+     * workerStartedAt -> writeFinishedAt includes setup+payload+sync+publish.
+     * Intersected with [cameraAcquisitionCompleteAt, captureStageCompleteAt].
+     */
+    fun postAcquisitionPreVerifyPersistenceOverlapMs(): Long {
         val acquisitionComplete = cameraAcquisitionCompleteAt.get()
         val stageComplete = captureStageCompleteAt.get()
         if (acquisitionComplete <= 0L || stageComplete <= 0L) return 0L
@@ -253,7 +293,13 @@ internal class CaptureTimingLedger(
         return totalOverlapNanos / 1_000_000L
     }
 
-    fun postAcquisitionMetadataOverlapMs(): Long {
+    /**
+     * Truthful name for the broad interval previously mislabeled "metadata commit":
+     * writeFinishedAt -> committedAt is NOT a metadata-write interval; it spans
+     * verification + optional DNG + image settlement + worker dispatch + adoption.
+     * Intersected with [cameraAcquisitionCompleteAt, captureStageCompleteAt].
+     */
+    fun postAcquisitionPostPublishToAdoptionOverlapMs(): Long {
         val acquisitionComplete = cameraAcquisitionCompleteAt.get()
         val stageComplete = captureStageCompleteAt.get()
         if (acquisitionComplete <= 0L || stageComplete <= 0L) return 0L
@@ -269,6 +315,104 @@ internal class CaptureTimingLedger(
             totalOverlapNanos += (overlapEnd - overlapStart).coerceAtLeast(0L)
         }
         return totalOverlapNanos / 1_000_000L
+    }
+
+    /** @deprecated Use [postAcquisitionPreVerifyPersistenceOverlapMs] — old name retained as legacy alias. */
+    @Deprecated("Renamed to postAcquisitionPreVerifyPersistenceOverlapMs for truthful attribution")
+    fun postAcquisitionRawWriteOverlapMs(): Long = postAcquisitionPreVerifyPersistenceOverlapMs()
+
+    /** @deprecated Use [postAcquisitionPostPublishToAdoptionOverlapMs] — old name previously mislabeled as metadata commit. */
+    @Deprecated("Renamed to postAcquisitionPostPublishToAdoptionOverlapMs; not a metadata-write interval")
+    fun postAcquisitionMetadataOverlapMs(): Long = postAcquisitionPostPublishToAdoptionOverlapMs()
+
+    /** Exact RAW payload-write overlap: [rawPayloadWriteStartedAt, rawPayloadWriteFinishedAt] intersected with [cameraAcquisitionCompleteAt, persistenceDrainCompleteAt]. */
+    fun postAcquisitionRawPayloadWriteOverlapMs(): Long {
+        val acquisitionComplete = cameraAcquisitionCompleteAt.get()
+        val drainComplete = persistenceDrainCompleteAt.get()
+        if (acquisitionComplete <= 0L || drainComplete <= 0L) return 0L
+        var totalOverlapNanos = 0L
+        val frames = time
+        val count = requestedFrames.coerceAtLeast(1)
+        for (index in 0 until count) {
+            val started = frames.rawPayloadWriteStartedAt.get(index)
+            val finished = frames.rawPayloadWriteFinishedAt.get(index)
+            if (started <= 0L || finished <= 0L) continue
+            val overlapStart = maxOf(started, acquisitionComplete)
+            val overlapEnd = minOf(finished, drainComplete)
+            totalOverlapNanos += (overlapEnd - overlapStart).coerceAtLeast(0L)
+        }
+        return totalOverlapNanos / 1_000_000L
+    }
+
+    /** Exact RAW fsync overlap: [rawSyncStartedAt, fsyncFinishedAt] intersected with [cameraAcquisitionCompleteAt, persistenceDrainCompleteAt]. */
+    fun postAcquisitionRawSyncOverlapMs(): Long {
+        val acquisitionComplete = cameraAcquisitionCompleteAt.get()
+        val drainComplete = persistenceDrainCompleteAt.get()
+        if (acquisitionComplete <= 0L || drainComplete <= 0L) return 0L
+        var totalOverlapNanos = 0L
+        val frames = time
+        val count = requestedFrames.coerceAtLeast(1)
+        for (index in 0 until count) {
+            val started = frames.rawSyncStartedAt.get(index)
+            val finished = frames.fsyncFinishedAt.get(index)
+            if (started <= 0L || finished <= 0L) continue
+            val overlapStart = maxOf(started, acquisitionComplete)
+            val overlapEnd = minOf(finished, drainComplete)
+            totalOverlapNanos += (overlapEnd - overlapStart).coerceAtLeast(0L)
+        }
+        return totalOverlapNanos / 1_000_000L
+    }
+
+    /** Exact atomic-publish overlap: [rawPublishStartedAt, rawPublishFinishedAt] intersected with [cameraAcquisitionCompleteAt, persistenceDrainCompleteAt]. */
+    fun postAcquisitionRawPublishOverlapMs(): Long {
+        val acquisitionComplete = cameraAcquisitionCompleteAt.get()
+        val drainComplete = persistenceDrainCompleteAt.get()
+        if (acquisitionComplete <= 0L || drainComplete <= 0L) return 0L
+        var totalOverlapNanos = 0L
+        val frames = time
+        val count = requestedFrames.coerceAtLeast(1)
+        for (index in 0 until count) {
+            val started = frames.rawPublishStartedAt.get(index)
+            val finished = frames.rawPublishFinishedAt.get(index)
+            if (started <= 0L || finished <= 0L) continue
+            val overlapStart = maxOf(started, acquisitionComplete)
+            val overlapEnd = minOf(finished, drainComplete)
+            totalOverlapNanos += (overlapEnd - overlapStart).coerceAtLeast(0L)
+        }
+        return totalOverlapNanos / 1_000_000L
+    }
+
+    /** Truthful post-verify residual: [verifiedAt, committedAt] intersected with [cameraAcquisitionCompleteAt, persistenceDrainCompleteAt]. */
+    fun postAcquisitionPostVerifyToAdoptionOverlapMs(): Long {
+        val acquisitionComplete = cameraAcquisitionCompleteAt.get()
+        val drainComplete = persistenceDrainCompleteAt.get()
+        if (acquisitionComplete <= 0L || drainComplete <= 0L) return 0L
+        var totalOverlapNanos = 0L
+        val frames = time
+        val count = requestedFrames.coerceAtLeast(1)
+        for (index in 0 until count) {
+            val verifiedAt = frames.verifiedAt.get(index)
+            val committedAt = frames.committedAt.get(index)
+            if (verifiedAt <= 0L || committedAt <= 0L) continue
+            val overlapStart = maxOf(verifiedAt, acquisitionComplete)
+            val overlapEnd = minOf(committedAt, drainComplete)
+            totalOverlapNanos += (overlapEnd - overlapStart).coerceAtLeast(0L)
+        }
+        return totalOverlapNanos / 1_000_000L
+    }
+
+    fun terminalMetadataWriteMs(): Long = durationMs(terminalMetadataWriteStartedAt.get(), terminalMetadataWriteFinishedAt.get())
+
+    /** Overlap of exact terminal metadata write [terminalMetadataWriteStartedAt, terminalMetadataWriteFinishedAt] with [cameraAcquisitionCompleteAt, captureStageCompleteAt]. */
+    fun postAcquisitionTerminalMetadataWriteOverlapMs(): Long {
+        val acquisitionComplete = cameraAcquisitionCompleteAt.get()
+        val stageComplete = captureStageCompleteAt.get()
+        val started = terminalMetadataWriteStartedAt.get()
+        val finished = terminalMetadataWriteFinishedAt.get()
+        if (acquisitionComplete <= 0L || stageComplete <= 0L || started <= 0L || finished <= 0L) return 0L
+        val overlapStart = maxOf(started, acquisitionComplete)
+        val overlapEnd = minOf(finished, stageComplete)
+        return ((overlapEnd - overlapStart).coerceAtLeast(0L)) / 1_000_000L
     }
 
     fun postAcquisitionHandoffOverlapMs(): Long {
@@ -313,9 +457,20 @@ internal class CaptureTimingLedger(
             .put("rawPersistenceWriteMs", snap.rawPersistenceWriteMs)
             .put("rawPersistenceSyncMs", snap.rawPersistenceSyncMs)
             .put("postAcquisitionVerifyOverlapMs", snap.postAcquisitionVerifyOverlapMs)
+            .put("postAcquisitionPreVerifyPersistenceOverlapMs", snap.postAcquisitionPreVerifyPersistenceOverlapMs)
+            .put("postAcquisitionPostPublishToAdoptionOverlapMs", snap.postAcquisitionPostPublishToAdoptionOverlapMs)
+            // Legacy aliases retained for compatibility; values identical to truthful broad metrics.
             .put("postAcquisitionRawWriteOverlapMs", snap.postAcquisitionRawWriteOverlapMs)
             .put("postAcquisitionMetadataOverlapMs", snap.postAcquisitionMetadataOverlapMs)
             .put("postAcquisitionHandoffOverlapMs", snap.postAcquisitionHandoffOverlapMs)
+            .put("postAcquisitionRawPayloadWriteOverlapMs", snap.postAcquisitionRawPayloadWriteOverlapMs)
+            .put("postAcquisitionRawSyncOverlapMs", snap.postAcquisitionRawSyncOverlapMs)
+            .put("postAcquisitionRawPublishOverlapMs", snap.postAcquisitionRawPublishOverlapMs)
+            .put("postAcquisitionPostVerifyToAdoptionOverlapMs", snap.postAcquisitionPostVerifyToAdoptionOverlapMs)
+            .put("terminalMetadataWriteMs", snap.terminalMetadataWriteMs)
+            .put("postAcquisitionTerminalMetadataWriteOverlapMs", snap.postAcquisitionTerminalMetadataWriteOverlapMs)
+            .put("terminalMetadataWriteStartedAt", terminalMetadataWriteStartedAt.get())
+            .put("terminalMetadataWriteFinishedAt", terminalMetadataWriteFinishedAt.get())
             .put("frames", framesToJson())
     }
 
@@ -335,6 +490,11 @@ internal class CaptureTimingLedger(
                     .put("fsyncFinishedAt", time.fsyncFinishedAt.get(index))
                     .put("verifiedAt", time.verifiedAt.get(index))
                     .put("committedAt", time.committedAt.get(index))
+                    .put("rawPayloadWriteStartedAt", time.rawPayloadWriteStartedAt.get(index))
+                    .put("rawPayloadWriteFinishedAt", time.rawPayloadWriteFinishedAt.get(index))
+                    .put("rawSyncStartedAt", time.rawSyncStartedAt.get(index))
+                    .put("rawPublishStartedAt", time.rawPublishStartedAt.get(index))
+                    .put("rawPublishFinishedAt", time.rawPublishFinishedAt.get(index))
             )
         }
         return array
@@ -412,12 +572,28 @@ internal data class CaptureTimingSnapshot(
     val lastFrameCommittedAt: Long = 0L,
     /** Overlap of per-frame verify spans with [cameraAcquisitionCompleteAt, persistenceDrainCompleteAt]. */
     val postAcquisitionVerifyOverlapMs: Long = 0L,
-    /** Overlap of per-frame write spans with [cameraAcquisitionCompleteAt, captureStageCompleteAt]. */
+    /** Broad pre-verify persistence: [workerStartedAt, writeFinishedAt] with [cameraAcquisitionCompleteAt, captureStageCompleteAt] — truthful name for previously mislabeled rawWrite. */
+    val postAcquisitionPreVerifyPersistenceOverlapMs: Long = 0L,
+    /** Broad post-publish to adoption: [writeFinishedAt, committedAt] with [cameraAcquisitionCompleteAt, captureStageCompleteAt] — truthful name for previously mislabeled metadata commit. */
+    val postAcquisitionPostPublishToAdoptionOverlapMs: Long = 0L,
+    /** @deprecated legacy alias for [postAcquisitionPreVerifyPersistenceOverlapMs]. */
     val postAcquisitionRawWriteOverlapMs: Long = 0L,
-    /** Overlap of per-frame metadata commit spans with [cameraAcquisitionCompleteAt, captureStageCompleteAt]. */
+    /** @deprecated legacy alias for [postAcquisitionPostPublishToAdoptionOverlapMs]. */
     val postAcquisitionMetadataOverlapMs: Long = 0L,
     /** Overlap of handoff span [persistenceDrainCompleteAt, processingHandoffPublishedAt] with [cameraAcquisitionCompleteAt, captureStageCompleteAt]. */
-    val postAcquisitionHandoffOverlapMs: Long = 0L
+    val postAcquisitionHandoffOverlapMs: Long = 0L,
+    /** Exact RAW payload-write overlap: [rawPayloadWriteStartedAt, rawPayloadWriteFinishedAt] intersected with [cameraAcquisitionCompleteAt, persistenceDrainCompleteAt]. */
+    val postAcquisitionRawPayloadWriteOverlapMs: Long = 0L,
+    /** Exact RAW fsync overlap: [rawSyncStartedAt, fsyncFinishedAt] intersected with [cameraAcquisitionCompleteAt, persistenceDrainCompleteAt]. */
+    val postAcquisitionRawSyncOverlapMs: Long = 0L,
+    /** Exact atomic-publish overlap: [rawPublishStartedAt, rawPublishFinishedAt] intersected with [cameraAcquisitionCompleteAt, persistenceDrainCompleteAt]. */
+    val postAcquisitionRawPublishOverlapMs: Long = 0L,
+    /** Truthful post-verify residual: [verifiedAt, committedAt] intersected with [cameraAcquisitionCompleteAt, persistenceDrainCompleteAt]. */
+    val postAcquisitionPostVerifyToAdoptionOverlapMs: Long = 0L,
+    /** Exact terminal metadata write duration [terminalMetadataWriteStartedAt, terminalMetadataWriteFinishedAt]. */
+    val terminalMetadataWriteMs: Long = 0L,
+    /** Overlap of exact terminal metadata write with [cameraAcquisitionCompleteAt, captureStageCompleteAt]. */
+    val postAcquisitionTerminalMetadataWriteOverlapMs: Long = 0L
 )
 
 /**

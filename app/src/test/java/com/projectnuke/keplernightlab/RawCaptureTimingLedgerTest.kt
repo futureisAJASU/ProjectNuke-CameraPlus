@@ -389,4 +389,477 @@ class RawCaptureTimingLedgerTest {
         // total = 70ms
         assertEquals(70L, sequence.ledger.postAcquisitionVerifyOverlapMs())
     }
+
+    // ------------------------------------------------------------------
+    // Exact RAW payload-write overlap: [rawPayloadWriteStartedAt, rawPayloadWriteFinishedAt] x [acquisitionComplete, drainComplete]
+    // ------------------------------------------------------------------
+
+    @Test
+    fun postAcquisitionRawPayloadOverlap_entirelyBeforeAcquisition_returnsZero() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            // payload entirely before acquisitionComplete=142
+            nowMs = 120; ledger.recordRawPayloadWriteStarted(0)
+            nowMs = 130; ledger.recordRawPayloadWriteFinished(0)
+            nowMs = 150; ledger.recordWorkerStarted(0)
+            nowMs = 160; ledger.recordWriteFinished(0)
+            nowMs = 170; ledger.recordVerified(0)
+            nowMs = 180; ledger.recordCommitted(0)
+            drain(250); handoff(260); settled(265); stageComplete(270)
+        }
+        assertEquals(0L, sequence.ledger.postAcquisitionRawPayloadWriteOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionRawPayloadOverlap_entirelyInside_returnsFullDuration() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 160; ledger.recordRawPayloadWriteStarted(0)
+            nowMs = 175; ledger.recordRawPayloadWriteFinished(0)
+            nowMs = 220; ledger.recordRawPayloadWriteStarted(1)
+            nowMs = 240; ledger.recordRawPayloadWriteFinished(1)
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        // 15 + 20 = 35
+        assertEquals(35L, sequence.ledger.postAcquisitionRawPayloadWriteOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionRawPayloadOverlap_straddlesAcquisition_leftClipped() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            // acquisitionComplete=142, payload [130,160] -> clipped to [142,160]=18
+            nowMs = 130; ledger.recordRawPayloadWriteStarted(0)
+            nowMs = 160; ledger.recordRawPayloadWriteFinished(0)
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        assertEquals(18L, sequence.ledger.postAcquisitionRawPayloadWriteOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionRawPayloadOverlap_runsPastDrain_rightClipped() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 280; ledger.recordRawPayloadWriteStarted(0)
+            nowMs = 320; ledger.recordRawPayloadWriteFinished(0)
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        // 300-280=20
+        assertEquals(20L, sequence.ledger.postAcquisitionRawPayloadWriteOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionRawPayloadOverlap_missingTimestamps_returnsZero() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        assertEquals(0L, sequence.ledger.postAcquisitionRawPayloadWriteOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionRawPayloadOverlap_multipleFrames_boundedSum() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 150; ledger.recordRawPayloadWriteStarted(0); nowMs = 160; ledger.recordRawPayloadWriteFinished(0) // 10
+            nowMs = 170; ledger.recordRawPayloadWriteStarted(1); nowMs = 190; ledger.recordRawPayloadWriteFinished(1) // 20
+            nowMs = 200; ledger.recordRawPayloadWriteStarted(2); nowMs = 220; ledger.recordRawPayloadWriteFinished(2) // 20
+            nowMs = 230; ledger.recordRawPayloadWriteStarted(3); nowMs = 250; ledger.recordRawPayloadWriteFinished(3) // 20
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        assertEquals(70L, sequence.ledger.postAcquisitionRawPayloadWriteOverlapMs())
+    }
+
+    // ------------------------------------------------------------------
+    // Exact RAW sync overlap: [rawSyncStartedAt, fsyncFinishedAt] x [acquisitionComplete, drainComplete]
+    // ------------------------------------------------------------------
+
+    @Test
+    fun postAcquisitionRawSyncOverlap_entirelyBeforeAcquisition_returnsZero() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 120; ledger.recordRawSyncStarted(0)
+            nowMs = 130; ledger.recordFsyncFinished(0)
+            drain(250); handoff(260); settled(265); stageComplete(270)
+        }
+        assertEquals(0L, sequence.ledger.postAcquisitionRawSyncOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionRawSyncOverlap_entirelyInside_returnsFullDuration() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 160; ledger.recordRawSyncStarted(0); nowMs = 170; ledger.recordFsyncFinished(0) // 10
+            nowMs = 190; ledger.recordRawSyncStarted(1); nowMs = 200; ledger.recordFsyncFinished(1) // 10
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        assertEquals(20L, sequence.ledger.postAcquisitionRawSyncOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionRawSyncOverlap_straddlesAcquisition_leftClipped() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 135; ledger.recordRawSyncStarted(0)
+            nowMs = 150; ledger.recordFsyncFinished(0)
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        // acq 142 -> 150-142=8
+        assertEquals(8L, sequence.ledger.postAcquisitionRawSyncOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionRawSyncOverlap_runsPastDrain_rightClipped() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 290; ledger.recordRawSyncStarted(0)
+            nowMs = 320; ledger.recordFsyncFinished(0)
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        assertEquals(10L, sequence.ledger.postAcquisitionRawSyncOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionRawSyncOverlap_missingTimestamps_returnsZero() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        assertEquals(0L, sequence.ledger.postAcquisitionRawSyncOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionRawSyncOverlap_multipleFrames_boundedSum() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 150; ledger.recordRawSyncStarted(0); nowMs = 155; ledger.recordFsyncFinished(0) // 5
+            nowMs = 165; ledger.recordRawSyncStarted(1); nowMs = 175; ledger.recordFsyncFinished(1) // 10
+            nowMs = 185; ledger.recordRawSyncStarted(2); nowMs = 195; ledger.recordFsyncFinished(2) // 10
+            nowMs = 205; ledger.recordRawSyncStarted(3); nowMs = 215; ledger.recordFsyncFinished(3) // 10
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        assertEquals(35L, sequence.ledger.postAcquisitionRawSyncOverlapMs())
+    }
+
+    // ------------------------------------------------------------------
+    // Exact atomic-publish overlap: [rawPublishStartedAt, rawPublishFinishedAt] x [acquisitionComplete, drainComplete]
+    // ------------------------------------------------------------------
+
+    @Test
+    fun postAcquisitionRawPublishOverlap_entirelyBeforeAcquisition_returnsZero() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 120; ledger.recordRawPublishStarted(0)
+            nowMs = 125; ledger.recordRawPublishFinished(0)
+            drain(250); handoff(260); settled(265); stageComplete(270)
+        }
+        assertEquals(0L, sequence.ledger.postAcquisitionRawPublishOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionRawPublishOverlap_entirelyInside_returnsFullDuration() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 160; ledger.recordRawPublishStarted(0); nowMs = 162; ledger.recordRawPublishFinished(0)
+            nowMs = 170; ledger.recordRawPublishStarted(1); nowMs = 173; ledger.recordRawPublishFinished(1)
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        assertEquals(5L, sequence.ledger.postAcquisitionRawPublishOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionRawPublishOverlap_straddlesAcquisition_leftClipped() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 140; ledger.recordRawPublishStarted(0)
+            nowMs = 150; ledger.recordRawPublishFinished(0)
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        // 150-142=8
+        assertEquals(8L, sequence.ledger.postAcquisitionRawPublishOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionRawPublishOverlap_runsPastDrain_rightClipped() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 295; ledger.recordRawPublishStarted(0)
+            nowMs = 310; ledger.recordRawPublishFinished(0)
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        assertEquals(5L, sequence.ledger.postAcquisitionRawPublishOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionRawPublishOverlap_missingTimestamps_returnsZero() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        assertEquals(0L, sequence.ledger.postAcquisitionRawPublishOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionRawPublishOverlap_multipleFrames_boundedSum() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 150; ledger.recordRawPublishStarted(0); nowMs = 152; ledger.recordRawPublishFinished(0) //2
+            nowMs = 160; ledger.recordRawPublishStarted(1); nowMs = 163; ledger.recordRawPublishFinished(1) //3
+            nowMs = 170; ledger.recordRawPublishStarted(2); nowMs = 174; ledger.recordRawPublishFinished(2) //4
+            nowMs = 180; ledger.recordRawPublishStarted(3); nowMs = 185; ledger.recordRawPublishFinished(3) //5
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        assertEquals(14L, sequence.ledger.postAcquisitionRawPublishOverlapMs())
+    }
+
+    // ------------------------------------------------------------------
+    // Truthful post-verify to adoption residual: [verifiedAt, committedAt] x [acquisitionComplete, drainComplete]
+    // ------------------------------------------------------------------
+
+    @Test
+    fun postAcquisitionPostVerifyToAdoption_entirelyBeforeAcquisition_returnsZero() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 120; ledger.recordVerified(0)
+            nowMs = 130; ledger.recordCommitted(0)
+            drain(250); handoff(260); settled(265); stageComplete(270)
+        }
+        assertEquals(0L, sequence.ledger.postAcquisitionPostVerifyToAdoptionOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionPostVerifyToAdoption_entirelyInside_returnsFullDuration() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 160; ledger.recordVerified(0); nowMs = 170; ledger.recordCommitted(0)
+            nowMs = 190; ledger.recordVerified(1); nowMs = 200; ledger.recordCommitted(1)
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        assertEquals(20L, sequence.ledger.postAcquisitionPostVerifyToAdoptionOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionPostVerifyToAdoption_straddlesAcquisition_leftClipped() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 135; ledger.recordVerified(0)
+            nowMs = 150; ledger.recordCommitted(0)
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        assertEquals(8L, sequence.ledger.postAcquisitionPostVerifyToAdoptionOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionPostVerifyToAdoption_runsPastDrain_rightClipped() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 290; ledger.recordVerified(0)
+            nowMs = 320; ledger.recordCommitted(0)
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        assertEquals(10L, sequence.ledger.postAcquisitionPostVerifyToAdoptionOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionPostVerifyToAdoption_missingTimestamps_returnsZero() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        assertEquals(0L, sequence.ledger.postAcquisitionPostVerifyToAdoptionOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionPostVerifyToAdoption_multipleFrames_boundedSum() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 150; ledger.recordVerified(0); nowMs = 155; ledger.recordCommitted(0) //5
+            nowMs = 165; ledger.recordVerified(1); nowMs = 175; ledger.recordCommitted(1) //10
+            nowMs = 185; ledger.recordVerified(2); nowMs = 195; ledger.recordCommitted(2) //10
+            nowMs = 205; ledger.recordVerified(3); nowMs = 215; ledger.recordCommitted(3) //10
+            drain(300); handoff(310); settled(315); stageComplete(320)
+        }
+        assertEquals(35L, sequence.ledger.postAcquisitionPostVerifyToAdoptionOverlapMs())
+    }
+
+    // ------------------------------------------------------------------
+    // Terminal metadata write: exact durable terminal write
+    // ------------------------------------------------------------------
+
+    @Test
+    fun terminalMetadataWriteMs_returnsDuration() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            drain(270)
+            nowMs = 272; ledger.recordTerminalMetadataWriteStarted()
+            nowMs = 277; ledger.recordTerminalMetadataWriteFinished()
+            handoff(280); settled(285); stageComplete(290)
+        }
+        assertEquals(5L, sequence.ledger.terminalMetadataWriteMs())
+        assertEquals(5L, sequence.ledger.snapshot().terminalMetadataWriteMs)
+        assertEquals(5L, sequence.ledger.postAcquisitionTerminalMetadataWriteOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionTerminalMetadata_entirelyBeforeAcquisition_returnsZero() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            // terminal write before acquisitionComplete (artificial) -> 0
+            nowMs = 80; ledger.recordTerminalMetadataWriteStarted()
+            nowMs = 90; ledger.recordTerminalMetadataWriteFinished()
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            drain(270); handoff(280); settled(285); stageComplete(290)
+        }
+        assertEquals(0L, sequence.ledger.postAcquisitionTerminalMetadataWriteOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionTerminalMetadata_straddlesAcquisition_leftClipped() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            // acquisition 142, terminal [138,150] -> 8
+            nowMs = 138; ledger.recordTerminalMetadataWriteStarted()
+            nowMs = 150; ledger.recordTerminalMetadataWriteFinished()
+            drain(270); handoff(280); settled(285); stageComplete(290)
+        }
+        assertEquals(8L, sequence.ledger.postAcquisitionTerminalMetadataWriteOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionTerminalMetadata_runsPastStage_rightClipped() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            drain(270)
+            nowMs = 285; ledger.recordTerminalMetadataWriteStarted()
+            nowMs = 310; ledger.recordTerminalMetadataWriteFinished()
+            handoff(300); settled(310); stageComplete(305)
+        }
+        // overlap with [142,305] : 305-285=20 (clipped at stageComplete)
+        // set stageComplete at 305 explicitly
+        assertEquals(20L, sequence.ledger.postAcquisitionTerminalMetadataWriteOverlapMs())
+    }
+
+    @Test
+    fun postAcquisitionTerminalMetadata_missingTimestamps_returnsZero() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            drain(270); handoff(280); settled(285); stageComplete(290)
+        }
+        assertEquals(0L, sequence.ledger.postAcquisitionTerminalMetadataWriteOverlapMs())
+        assertEquals(0L, sequence.ledger.terminalMetadataWriteMs())
+    }
+
+    // ------------------------------------------------------------------
+    // Renamed broad metrics retain truthful semantics and legacy aliases
+    // ------------------------------------------------------------------
+
+    @Test
+    fun renamedBroadMetrics_aliasParity() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            nowMs = 150; ledger.recordWorkerStarted(0); nowMs = 170; ledger.recordWriteFinished(0); nowMs = 180; ledger.recordCommitted(0)
+            nowMs = 190; ledger.recordWorkerStarted(1); nowMs = 210; ledger.recordWriteFinished(1); nowMs = 220; ledger.recordCommitted(1)
+            drain(250); handoff(260); settled(265); stageComplete(270)
+        }
+        assertEquals(sequence.ledger.postAcquisitionPreVerifyPersistenceOverlapMs(), sequence.ledger.postAcquisitionRawWriteOverlapMs())
+        assertEquals(sequence.ledger.postAcquisitionPostPublishToAdoptionOverlapMs(), sequence.ledger.postAcquisitionMetadataOverlapMs())
+    }
+
+    @Test
+    fun toJson_fromCaptureTiming_preservesAllNewFields() {
+        val sequence = RawSequence().apply {
+            submitRequest(100)
+            repeat(4) { index -> image(index, 110 + index * 10L); result(index, 112 + index * 10L) }
+            // payload
+            nowMs = 150; ledger.recordRawPayloadWriteStarted(0); nowMs = 160; ledger.recordRawPayloadWriteFinished(0)
+            nowMs = 170; ledger.recordRawPayloadWriteStarted(1); nowMs = 180; ledger.recordRawPayloadWriteFinished(1)
+            // sync
+            nowMs = 160; ledger.recordRawSyncStarted(0); nowMs = 165; ledger.recordFsyncFinished(0)
+            nowMs = 180; ledger.recordRawSyncStarted(1); nowMs = 185; ledger.recordFsyncFinished(1)
+            // publish
+            nowMs = 165; ledger.recordRawPublishStarted(0); nowMs = 167; ledger.recordRawPublishFinished(0)
+            nowMs = 185; ledger.recordRawPublishStarted(1); nowMs = 188; ledger.recordRawPublishFinished(1)
+            // write/verify/commit
+            nowMs = 167; ledger.recordWriteFinished(0); nowMs = 170; ledger.recordVerified(0); nowMs = 175; ledger.recordCommitted(0)
+            nowMs = 188; ledger.recordWriteFinished(1); nowMs = 190; ledger.recordVerified(1); nowMs = 195; ledger.recordCommitted(1)
+            // remaining frames minimal
+            nowMs = 200; ledger.recordWorkerStarted(2); nowMs = 210; ledger.recordWriteFinished(2); nowMs = 215; ledger.recordVerified(2); nowMs = 220; ledger.recordCommitted(2)
+            nowMs = 220; ledger.recordWorkerStarted(3); nowMs = 230; ledger.recordWriteFinished(3); nowMs = 235; ledger.recordVerified(3); nowMs = 240; ledger.recordCommitted(3)
+            drain(250)
+            nowMs = 252; ledger.recordTerminalMetadataWriteStarted()
+            nowMs = 257; ledger.recordTerminalMetadataWriteFinished()
+            handoff(260); settled(265); stageComplete(270)
+        }
+        val json = sequence.ledger.toJson()
+        val timing = HardwareE2ECaptureTiming.fromCaptureTimingJson(json)
+        // exact overlaps derived from per-frame instants must round-trip via computation
+        assertEquals(sequence.ledger.postAcquisitionRawPayloadWriteOverlapMs(), timing.postAcquisitionRawPayloadWriteOverlapMs)
+        assertEquals(sequence.ledger.postAcquisitionRawSyncOverlapMs(), timing.postAcquisitionRawSyncOverlapMs)
+        assertEquals(sequence.ledger.postAcquisitionRawPublishOverlapMs(), timing.postAcquisitionRawPublishOverlapMs)
+        assertEquals(sequence.ledger.postAcquisitionPostVerifyToAdoptionOverlapMs(), timing.postAcquisitionPostVerifyToAdoptionOverlapMs)
+        assertEquals(sequence.ledger.terminalMetadataWriteMs(), timing.terminalMetadataWriteMs)
+        assertEquals(sequence.ledger.postAcquisitionTerminalMetadataWriteOverlapMs(), timing.postAcquisitionTerminalMetadataWriteOverlapMs)
+        // broad renamed also preserved
+        assertEquals(sequence.ledger.postAcquisitionPreVerifyPersistenceOverlapMs(), timing.postAcquisitionPreVerifyPersistenceOverlapMs)
+        assertEquals(sequence.ledger.postAcquisitionPostPublishToAdoptionOverlapMs(), timing.postAcquisitionPostPublishToAdoptionOverlapMs)
+        // legacy aliases parity
+        assertEquals(timing.postAcquisitionPreVerifyPersistenceOverlapMs, timing.postAcquisitionRawWriteOverlapMs)
+        assertEquals(timing.postAcquisitionPostPublishToAdoptionOverlapMs, timing.postAcquisitionMetadataOverlapMs)
+        // JSON round-trip
+        val decoded = HardwareE2ECaptureTiming.fromJson(timing.toJson())
+        assertEquals(timing, decoded)
+    }
+
+    @Test
+    fun legacyParserCompatibility_oldKeysOnly() {
+        // Simulate already persisted U2.0 local report with only old keys
+        val oldJson = JSONObject()
+            .put("requestedFrames", 4)
+            .put("cameraAcquisitionMs", 50L)
+            .put("persistenceDrainMs", 100L)
+            .put("handoffSettlementMs", 10L)
+            .put("captureStageTotalMs", 160L)
+            .put("postAcquisitionRawWriteOverlapMs", 42L)
+            .put("postAcquisitionMetadataOverlapMs", 99L)
+            .put("postAcquisitionVerifyOverlapMs", 20L)
+            .put("postAcquisitionHandoffOverlapMs", 5L)
+            .put("frames", org.json.JSONArray())
+        val timing = HardwareE2ECaptureTiming.fromJson(oldJson)
+        assertEquals(42L, timing.postAcquisitionPreVerifyPersistenceOverlapMs)
+        assertEquals(42L, timing.postAcquisitionRawWriteOverlapMs)
+        assertEquals(99L, timing.postAcquisitionPostPublishToAdoptionOverlapMs)
+        assertEquals(99L, timing.postAcquisitionMetadataOverlapMs)
+        // new exact fields default to 0
+        assertEquals(0L, timing.postAcquisitionRawPayloadWriteOverlapMs)
+        assertEquals(0L, timing.terminalMetadataWriteMs)
+    }
 }

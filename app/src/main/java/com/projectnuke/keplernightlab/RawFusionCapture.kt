@@ -1009,13 +1009,18 @@ fun captureRawBurstForFusion(
                                 terminalJob.put("partialReason", message)
                             }
                             try {
+                                captureTimingLedger.recordTerminalMetadataWriteStarted()
                                 KeplerJobMetadata.write(jobDir, terminalJob)
+                                captureTimingLedger.recordTerminalMetadataWriteFinished()
                                 metadataOutcome = RawTerminalOperationOutcome.Succeeded
                                 durableCaptureTerminalPersisted = true
                             } catch (failure: Error) {
+                                // Ensure terminal write interval is still closed on failure for diagnostic truth.
+                                try { captureTimingLedger.recordTerminalMetadataWriteFinished() } catch (_: Exception) { }
                                 metadataOutcome = RawTerminalOperationOutcome.Failed(failure)
                                 throw failure
                             } catch (failure: Exception) {
+                                try { captureTimingLedger.recordTerminalMetadataWriteFinished() } catch (_: Exception) { }
                                 metadataOutcome = RawTerminalOperationOutcome.Failed(failure)
                             }
                         } else {
@@ -1251,7 +1256,9 @@ fun captureRawBurstForFusion(
                 try {
                     val writeStats = writeCompactRaw16(image, raw16Temp, captureTimingLedger, index)
                     adoptedWriteStrategy = writeStats.writeStrategy
+                    captureTimingLedger.recordRawPublishStarted(index)
                     KeplerJobMetadata.atomicReplace(raw16Temp, raw16File)
+                    captureTimingLedger.recordRawPublishFinished(index)
                     captureTimingLedger.recordWriteFinished(index)
                     // SINGLE strict post-publish verification of the FINAL file:
                     // exact size AND content digest equality against the bytes
@@ -3184,13 +3191,16 @@ private fun writeCompactRaw16(
     try {
         FileOutputStream(file).use { rawOutput ->
             val digesting = DigestingOutputStream(rawOutput)
+            timing?.recordRawPayloadWriteStarted(frameIndex)
             val writeStartNs = System.nanoTime()
             strategy = writeRaw16Rows(width, height, rowStride, pixelStride, limit, buffer, digesting)
             writeMs = (System.nanoTime() - writeStartNs) / 1_000_000L
+            timing?.recordRawPayloadWriteFinished(frameIndex)
             // Every payload byte passed through the digesting sink; no userspace
             // bytes may remain between here and the fsync barrier.
             digesting.flush()
             Trace.beginSection("Kepler_RAW_Sync")
+            timing?.recordRawSyncStarted(frameIndex)
             val syncStartNs = System.nanoTime()
             rawOutput.fd.sync()
             syncMs = (System.nanoTime() - syncStartNs) / 1_000_000L

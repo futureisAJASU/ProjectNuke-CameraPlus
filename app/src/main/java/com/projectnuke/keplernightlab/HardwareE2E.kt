@@ -603,7 +603,7 @@ internal data class HardwareE2ECaptureTiming(
     val handoffPublicationMs: Long = 0L,
     /** processingHandoffPublishedAt -> captureResourcesSettledAt (owner exit). */
     val captureSettlementMs: Long = 0L,
-    /** Last per-frame commit -> processingHandoffPublishedAt (RAW terminal metadata work). */
+    /** Last per-frame commit -> processingHandoffPublishedAt (RAW terminal JSON work). */
     val rawMetadataSettlementMs: Long = 0L,
     /** RAW aggregate durable-payload bytes; 0 for YUV jobs. */
     val rawBytesPersisted: Long = 0L,
@@ -619,12 +619,28 @@ internal data class HardwareE2ECaptureTiming(
     val aggregateVerifyMs: Long = 0L,
     /** Overlap of per-frame verify spans with the post-acquisition persistence window (0 when unset). */
     val postAcquisitionVerifyOverlapMs: Long = 0L,
-    /** Overlap of per-frame write spans with the post-acquisition window. */
+    /** Broad pre-verify persistence: [workerStartedAt, writeFinishedAt] — truthful rename for previously mislabeled rawWrite. */
+    val postAcquisitionPreVerifyPersistenceOverlapMs: Long = 0L,
+    /** Broad post-publish to adoption: [writeFinishedAt, committedAt] — truthful rename for previously mislabeled metadata. */
+    val postAcquisitionPostPublishToAdoptionOverlapMs: Long = 0L,
+    /** @deprecated legacy alias for [postAcquisitionPreVerifyPersistenceOverlapMs]. */
     val postAcquisitionRawWriteOverlapMs: Long = 0L,
-    /** Overlap of per-frame metadata commit spans with the post-acquisition window. */
+    /** @deprecated legacy alias for [postAcquisitionPostPublishToAdoptionOverlapMs]. */
     val postAcquisitionMetadataOverlapMs: Long = 0L,
     /** Overlap of handoff span with the post-acquisition window. */
     val postAcquisitionHandoffOverlapMs: Long = 0L,
+    /** Exact RAW payload-write overlap: [rawPayloadWriteStartedAt, rawPayloadWriteFinishedAt] with persistence window. */
+    val postAcquisitionRawPayloadWriteOverlapMs: Long = 0L,
+    /** Exact RAW fsync overlap: [rawSyncStartedAt, fsyncFinishedAt] with persistence window. */
+    val postAcquisitionRawSyncOverlapMs: Long = 0L,
+    /** Exact atomic-publish overlap: [rawPublishStartedAt, rawPublishFinishedAt] with persistence window. */
+    val postAcquisitionRawPublishOverlapMs: Long = 0L,
+    /** Truthful post-verify residual: [verifiedAt, committedAt] with persistence window. */
+    val postAcquisitionPostVerifyToAdoptionOverlapMs: Long = 0L,
+    /** Exact terminal metadata write duration. */
+    val terminalMetadataWriteMs: Long = 0L,
+    /** Overlap of exact terminal metadata write with [cameraAcquisitionCompleteAt, captureStageCompleteAt]. */
+    val postAcquisitionTerminalMetadataWriteOverlapMs: Long = 0L,
     /** Slowest single-frame encode segment - the foreground bottleneck signal. */
     val maxFrameEncodeMs: Long = 0L,
     val frames: List<HardwareE2EFrameTiming> = emptyList()
@@ -647,9 +663,17 @@ internal data class HardwareE2ECaptureTiming(
         put("aggregateFsyncMs", aggregateFsyncMs)
         put("aggregateVerifyMs", aggregateVerifyMs)
         put("postAcquisitionVerifyOverlapMs", postAcquisitionVerifyOverlapMs)
+        put("postAcquisitionPreVerifyPersistenceOverlapMs", postAcquisitionPreVerifyPersistenceOverlapMs)
+        put("postAcquisitionPostPublishToAdoptionOverlapMs", postAcquisitionPostPublishToAdoptionOverlapMs)
         put("postAcquisitionRawWriteOverlapMs", postAcquisitionRawWriteOverlapMs)
         put("postAcquisitionMetadataOverlapMs", postAcquisitionMetadataOverlapMs)
         put("postAcquisitionHandoffOverlapMs", postAcquisitionHandoffOverlapMs)
+        put("postAcquisitionRawPayloadWriteOverlapMs", postAcquisitionRawPayloadWriteOverlapMs)
+        put("postAcquisitionRawSyncOverlapMs", postAcquisitionRawSyncOverlapMs)
+        put("postAcquisitionRawPublishOverlapMs", postAcquisitionRawPublishOverlapMs)
+        put("postAcquisitionPostVerifyToAdoptionOverlapMs", postAcquisitionPostVerifyToAdoptionOverlapMs)
+        put("terminalMetadataWriteMs", terminalMetadataWriteMs)
+        put("postAcquisitionTerminalMetadataWriteOverlapMs", postAcquisitionTerminalMetadataWriteOverlapMs)
         put("maxFrameEncodeMs", maxFrameEncodeMs)
         put("frames", JSONArray(frames.map { it.toJson() }))
     }
@@ -673,9 +697,17 @@ internal data class HardwareE2ECaptureTiming(
             aggregateFsyncMs = json.optLong("aggregateFsyncMs"),
             aggregateVerifyMs = json.optLong("aggregateVerifyMs"),
             postAcquisitionVerifyOverlapMs = json.optLong("postAcquisitionVerifyOverlapMs"),
-            postAcquisitionRawWriteOverlapMs = json.optLong("postAcquisitionRawWriteOverlapMs"),
-            postAcquisitionMetadataOverlapMs = json.optLong("postAcquisitionMetadataOverlapMs"),
+            postAcquisitionPreVerifyPersistenceOverlapMs = json.optLong("postAcquisitionPreVerifyPersistenceOverlapMs").takeIf { it != 0L || json.has("postAcquisitionPreVerifyPersistenceOverlapMs") } ?: json.optLong("postAcquisitionRawWriteOverlapMs"),
+            postAcquisitionPostPublishToAdoptionOverlapMs = json.optLong("postAcquisitionPostPublishToAdoptionOverlapMs").takeIf { it != 0L || json.has("postAcquisitionPostPublishToAdoptionOverlapMs") } ?: json.optLong("postAcquisitionMetadataOverlapMs"),
+            postAcquisitionRawWriteOverlapMs = json.optLong("postAcquisitionRawWriteOverlapMs").takeIf { it != 0L || json.has("postAcquisitionRawWriteOverlapMs") } ?: json.optLong("postAcquisitionPreVerifyPersistenceOverlapMs"),
+            postAcquisitionMetadataOverlapMs = json.optLong("postAcquisitionMetadataOverlapMs").takeIf { it != 0L || json.has("postAcquisitionMetadataOverlapMs") } ?: json.optLong("postAcquisitionPostPublishToAdoptionOverlapMs"),
             postAcquisitionHandoffOverlapMs = json.optLong("postAcquisitionHandoffOverlapMs"),
+            postAcquisitionRawPayloadWriteOverlapMs = json.optLong("postAcquisitionRawPayloadWriteOverlapMs"),
+            postAcquisitionRawSyncOverlapMs = json.optLong("postAcquisitionRawSyncOverlapMs"),
+            postAcquisitionRawPublishOverlapMs = json.optLong("postAcquisitionRawPublishOverlapMs"),
+            postAcquisitionPostVerifyToAdoptionOverlapMs = json.optLong("postAcquisitionPostVerifyToAdoptionOverlapMs"),
+            terminalMetadataWriteMs = json.optLong("terminalMetadataWriteMs"),
+            postAcquisitionTerminalMetadataWriteOverlapMs = json.optLong("postAcquisitionTerminalMetadataWriteOverlapMs"),
             maxFrameEncodeMs = json.optLong("maxFrameEncodeMs"),
             frames = buildList {
                 val array = json.optJSONArray("frames") ?: JSONArray()
@@ -738,9 +770,17 @@ internal data class HardwareE2ECaptureTiming(
                 aggregateFsyncMs = frameTimings.sumOf { it.fsyncMs ?: 0L },
                 aggregateVerifyMs = frameTimings.sumOf { it.verifyMs ?: 0L },
                 postAcquisitionVerifyOverlapMs = computePostAcquisitionVerifyOverlapMs(timing),
-                postAcquisitionRawWriteOverlapMs = computePostAcquisitionRawWriteOverlapMs(timing),
-                postAcquisitionMetadataOverlapMs = computePostAcquisitionMetadataOverlapMs(timing),
+                postAcquisitionPreVerifyPersistenceOverlapMs = computePostAcquisitionPreVerifyPersistenceOverlapMs(timing),
+                postAcquisitionPostPublishToAdoptionOverlapMs = computePostAcquisitionPostPublishToAdoptionOverlapMs(timing),
+                postAcquisitionRawWriteOverlapMs = computePostAcquisitionPreVerifyPersistenceOverlapMs(timing),
+                postAcquisitionMetadataOverlapMs = computePostAcquisitionPostPublishToAdoptionOverlapMs(timing),
                 postAcquisitionHandoffOverlapMs = computePostAcquisitionHandoffOverlapMs(timing),
+                postAcquisitionRawPayloadWriteOverlapMs = computePostAcquisitionRawPayloadWriteOverlapMs(timing),
+                postAcquisitionRawSyncOverlapMs = computePostAcquisitionRawSyncOverlapMs(timing),
+                postAcquisitionRawPublishOverlapMs = computePostAcquisitionRawPublishOverlapMs(timing),
+                postAcquisitionPostVerifyToAdoptionOverlapMs = computePostAcquisitionPostVerifyToAdoptionOverlapMs(timing),
+                terminalMetadataWriteMs = computeTerminalMetadataWriteMs(timing),
+                postAcquisitionTerminalMetadataWriteOverlapMs = computePostAcquisitionTerminalMetadataWriteOverlapMs(timing),
                 maxFrameEncodeMs = frameTimings.mapNotNull { it.encodeMs }.maxOrNull() ?: 0L,
                 frames = frameTimings
             )
@@ -763,7 +803,7 @@ internal data class HardwareE2ECaptureTiming(
             return totalOverlapNanos / 1_000_000L
         }
 
-        private fun computePostAcquisitionRawWriteOverlapMs(timing: JSONObject): Long {
+        private fun computePostAcquisitionPreVerifyPersistenceOverlapMs(timing: JSONObject): Long {
             val acquisitionComplete = timing.optLong("cameraAcquisitionCompleteAt")
             val stageComplete = timing.optLong("captureStageCompleteAt")
             if (acquisitionComplete <= 0L || stageComplete <= 0L) return 0L
@@ -780,7 +820,7 @@ internal data class HardwareE2ECaptureTiming(
             return totalOverlapNanos / 1_000_000L
         }
 
-        private fun computePostAcquisitionMetadataOverlapMs(timing: JSONObject): Long {
+        private fun computePostAcquisitionPostPublishToAdoptionOverlapMs(timing: JSONObject): Long {
             val acquisitionComplete = timing.optLong("cameraAcquisitionCompleteAt")
             val stageComplete = timing.optLong("captureStageCompleteAt")
             if (acquisitionComplete <= 0L || stageComplete <= 0L) return 0L
@@ -795,6 +835,96 @@ internal data class HardwareE2ECaptureTiming(
                 totalOverlapNanos += (overlapEnd - overlapStart).coerceAtLeast(0L)
             }
             return totalOverlapNanos / 1_000_000L
+        }
+
+        // Legacy aliases retain old names but delegate to truthful implementations.
+        private fun computePostAcquisitionRawWriteOverlapMs(timing: JSONObject): Long = computePostAcquisitionPreVerifyPersistenceOverlapMs(timing)
+        private fun computePostAcquisitionMetadataOverlapMs(timing: JSONObject): Long = computePostAcquisitionPostPublishToAdoptionOverlapMs(timing)
+
+        private fun computePostAcquisitionRawPayloadWriteOverlapMs(timing: JSONObject): Long {
+            val acquisitionComplete = timing.optLong("cameraAcquisitionCompleteAt")
+            val drainComplete = timing.optLong("persistenceDrainCompleteAt")
+            if (acquisitionComplete <= 0L || drainComplete <= 0L) return 0L
+            val framesArray = timing.optJSONArray("frames") ?: JSONArray()
+            var totalOverlapNanos = 0L
+            repeat(framesArray.length().coerceAtMost(MAX_TIMING_FRAMES)) { index ->
+                val frame = framesArray.optJSONObject(index) ?: return@repeat
+                val started = frame.optLong("rawPayloadWriteStartedAt").takeIf { it > 0 } ?: return@repeat
+                val finished = frame.optLong("rawPayloadWriteFinishedAt").takeIf { it > 0 } ?: return@repeat
+                val overlapStart = maxOf(started, acquisitionComplete)
+                val overlapEnd = minOf(finished, drainComplete)
+                totalOverlapNanos += (overlapEnd - overlapStart).coerceAtLeast(0L)
+            }
+            return totalOverlapNanos / 1_000_000L
+        }
+
+        private fun computePostAcquisitionRawSyncOverlapMs(timing: JSONObject): Long {
+            val acquisitionComplete = timing.optLong("cameraAcquisitionCompleteAt")
+            val drainComplete = timing.optLong("persistenceDrainCompleteAt")
+            if (acquisitionComplete <= 0L || drainComplete <= 0L) return 0L
+            val framesArray = timing.optJSONArray("frames") ?: JSONArray()
+            var totalOverlapNanos = 0L
+            repeat(framesArray.length().coerceAtMost(MAX_TIMING_FRAMES)) { index ->
+                val frame = framesArray.optJSONObject(index) ?: return@repeat
+                val started = frame.optLong("rawSyncStartedAt").takeIf { it > 0 } ?: return@repeat
+                val finished = frame.optLong("fsyncFinishedAt").takeIf { it > 0 } ?: return@repeat
+                val overlapStart = maxOf(started, acquisitionComplete)
+                val overlapEnd = minOf(finished, drainComplete)
+                totalOverlapNanos += (overlapEnd - overlapStart).coerceAtLeast(0L)
+            }
+            return totalOverlapNanos / 1_000_000L
+        }
+
+        private fun computePostAcquisitionRawPublishOverlapMs(timing: JSONObject): Long {
+            val acquisitionComplete = timing.optLong("cameraAcquisitionCompleteAt")
+            val drainComplete = timing.optLong("persistenceDrainCompleteAt")
+            if (acquisitionComplete <= 0L || drainComplete <= 0L) return 0L
+            val framesArray = timing.optJSONArray("frames") ?: JSONArray()
+            var totalOverlapNanos = 0L
+            repeat(framesArray.length().coerceAtMost(MAX_TIMING_FRAMES)) { index ->
+                val frame = framesArray.optJSONObject(index) ?: return@repeat
+                val started = frame.optLong("rawPublishStartedAt").takeIf { it > 0 } ?: return@repeat
+                val finished = frame.optLong("rawPublishFinishedAt").takeIf { it > 0 } ?: return@repeat
+                val overlapStart = maxOf(started, acquisitionComplete)
+                val overlapEnd = minOf(finished, drainComplete)
+                totalOverlapNanos += (overlapEnd - overlapStart).coerceAtLeast(0L)
+            }
+            return totalOverlapNanos / 1_000_000L
+        }
+
+        private fun computePostAcquisitionPostVerifyToAdoptionOverlapMs(timing: JSONObject): Long {
+            val acquisitionComplete = timing.optLong("cameraAcquisitionCompleteAt")
+            val drainComplete = timing.optLong("persistenceDrainCompleteAt")
+            if (acquisitionComplete <= 0L || drainComplete <= 0L) return 0L
+            val framesArray = timing.optJSONArray("frames") ?: JSONArray()
+            var totalOverlapNanos = 0L
+            repeat(framesArray.length().coerceAtMost(MAX_TIMING_FRAMES)) { index ->
+                val frame = framesArray.optJSONObject(index) ?: return@repeat
+                val verifiedAt = frame.optLong("verifiedAt").takeIf { it > 0 } ?: return@repeat
+                val committedAt = frame.optLong("committedAt").takeIf { it > 0 } ?: return@repeat
+                val overlapStart = maxOf(verifiedAt, acquisitionComplete)
+                val overlapEnd = minOf(committedAt, drainComplete)
+                totalOverlapNanos += (overlapEnd - overlapStart).coerceAtLeast(0L)
+            }
+            return totalOverlapNanos / 1_000_000L
+        }
+
+        private fun computeTerminalMetadataWriteMs(timing: JSONObject): Long {
+            val started = timing.optLong("terminalMetadataWriteStartedAt").takeIf { it > 0 } ?: return 0L
+            val finished = timing.optLong("terminalMetadataWriteFinishedAt").takeIf { it > 0 } ?: return 0L
+            if (finished < started) return 0L
+            return (finished - started) / 1_000_000L
+        }
+
+        private fun computePostAcquisitionTerminalMetadataWriteOverlapMs(timing: JSONObject): Long {
+            val acquisitionComplete = timing.optLong("cameraAcquisitionCompleteAt")
+            val stageComplete = timing.optLong("captureStageCompleteAt")
+            val started = timing.optLong("terminalMetadataWriteStartedAt").takeIf { it > 0 } ?: return 0L
+            val finished = timing.optLong("terminalMetadataWriteFinishedAt").takeIf { it > 0 } ?: return 0L
+            if (acquisitionComplete <= 0L || stageComplete <= 0L) return 0L
+            val overlapStart = maxOf(started, acquisitionComplete)
+            val overlapEnd = minOf(finished, stageComplete)
+            return ((overlapEnd - overlapStart).coerceAtLeast(0L)) / 1_000_000L
         }
 
         private fun computePostAcquisitionHandoffOverlapMs(timing: JSONObject): Long {
