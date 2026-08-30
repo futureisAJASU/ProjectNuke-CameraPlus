@@ -465,6 +465,8 @@ class KeplerRecoveryCoordinatorTest {
     fun ordinaryTerminalFinalizationFailureRemainsRecoveryFailedAndPreservesOwner() {
         val root = File(Files.createTempDirectory("kepler-recovery-terminal-finalize-failure-").toFile(), "KeplerYuvFusion").apply { mkdirs() }
         val job = File(root, "KPL_YUV_FUSION_terminal-finalize-failure").apply { mkdirs() }
+        val previousFailure = KeplerJobMetadata.atomicWriteFailureForTest
+        val previousFailureSequence = KeplerJobMetadata.atomicWriteFailureSequenceForTest
         try {
             val operationId = "terminal-finalize-failure"
             KeplerJobMetadata.write(job, JSONObject()
@@ -477,12 +479,20 @@ class KeplerRecoveryCoordinatorTest {
                 .put(ACTIVE_OPERATION_ID, operationId)
                 .put(ACTIVE_OPERATION_KIND, KeplerActiveOperationKind.PUBLIC_EXPORT.name)
                 .put(TERMINAL_OPERATION_ID, operationId))
-            KeplerJobMetadata.atomicWriteFailureForTest = IllegalStateException("ordinary terminal finalization")
+            // Terminal journal mediation performs a no-op metadata write before the finalizer.
+            // Target the finalizer itself instead of whichever earlier durable write happens to
+            // be first in the reconciliation path.
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            KeplerJobMetadata.atomicWriteFailureSequenceForTest = mutableListOf(
+                null,
+                IllegalStateException("ordinary terminal finalization")
+            )
             val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), ExactExportAccess())
             assertEquals(KeplerJobRecoveryClassification.RECOVERY_FAILED, report.jobs.single().classification)
             assertEquals(operationId, KeplerJobMetadata.read(job).optString(ACTIVE_OPERATION_ID))
         } finally {
-            KeplerJobMetadata.atomicWriteFailureForTest = null
+            KeplerJobMetadata.atomicWriteFailureForTest = previousFailure
+            KeplerJobMetadata.atomicWriteFailureSequenceForTest = previousFailureSequence
             root.deleteRecursively()
         }
     }
