@@ -2,7 +2,6 @@ package com.projectnuke.keplernightlab
 
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import kotlin.math.max
 
 internal data class LandscapeLayoutRect(
     val left: Float,
@@ -18,83 +17,193 @@ internal data class LandscapeLayoutRect(
 }
 
 internal data class LandscapeLayoutBounds(
-    val topStatusRegion: LandscapeLayoutRect,
-    val modeRegion: LandscapeLayoutRect,
+    val previewRegion: LandscapeLayoutRect,
+    val utilityRailRegion: LandscapeLayoutRect,
+    val rightChromeRegion: LandscapeLayoutRect,
     val zoomRegion: LandscapeLayoutRect,
-    val primaryActionRegion: LandscapeLayoutRect
+    val primaryActionRegion: LandscapeLayoutRect,
+    val modeRegion: LandscapeLayoutRect,
+    val systemNavigationSafetyRegion: LandscapeLayoutRect,
+    val zoomControlRegion: LandscapeLayoutRect,
+    val cameraSwitchControlRegion: LandscapeLayoutRect,
+    val shutterControlRegion: LandscapeLayoutRect,
+    val resultThumbnailRegion: LandscapeLayoutRect,
+    val modeLabelSlots: List<LandscapeLayoutRect>,
+    val rotatedModeLabelVisualSlots: List<LandscapeLayoutRect>
 ) {
-    val regions: List<LandscapeLayoutRect>
-        get() = listOf(topStatusRegion, modeRegion, zoomRegion, primaryActionRegion)
+    val chromeRegions: List<LandscapeLayoutRect>
+        get() = listOf(utilityRailRegion, zoomRegion, primaryActionRegion, modeRegion)
 }
 
 /**
- * Bounded screen-space placement for landscape camera chrome. The mode lane
- * is a horizontal row of explicit slots below the top/status region; the zoom
- * cluster occupies the lower left/centre; the primary rail owns the right
- * edge. Their rectangles are disjoint even in compact landscape.
+ * Samsung-inspired landscape camera grammar, implemented with Kepler-owned
+ * surfaces and assets:
+ *
+ *   [utility rail] [camera preview] [zoom | actions | mode labels]
+ *
+ * Controls never float randomly on top of the camera image. The preview owns
+ * a bounded central rectangle and the camera chrome owns black side gutters.
+ * Only the mode-label Text rotates; the rail geometry remains screen-stable.
  */
 object LandscapeLayoutSpec {
-    val RightRailWidth: Dp = 96.dp
-    val RightRailEstimatedHeightDp: Dp = 236.dp
+    val UtilityRailWidth: Dp = 58.dp
+    val RightChromeWidth: Dp = 260.dp
+    val ChromeInnerPadding: Dp = 6.dp
+    val NavigationSafetyWidth: Dp = 32.dp
+
+    val ZoomRailWidth: Dp = 54.dp
+    val PrimaryActionWidth: Dp = 92.dp
+    val ModeRailWidth: Dp = 54.dp
+
+    val ModeSlotWidthDp: Dp = ModeRailWidth
+    val ModeSlotHeightDp: Dp = 58.dp
+    val ModeSlotSpacingDp: Dp = 0.dp
+    val ModeLaneEstimatedWidthDp: Dp = ModeRailWidth
+    val ModeLaneEstimatedHeightDp: Dp = (ModeSlotHeightDp.value * 5f).dp
+    val ModeLabelContractWidthDp: Dp = 48.dp
+    val ModeLabelContractHeightDp: Dp = 24.dp
+
+    // These values mirror the existing composable geometry. They are a contract surface only;
+    // changing them would require an intentional visual-layout change outside this batch.
+    val ZoomControlWidthDp: Dp = 48.dp
+    val ZoomControlHeightDp: Dp = 212.dp // 4 zoom rows + optional two-source row and spacing
+    val CircularControlContainerRotationDegrees: Float = 0f
+    val RotatesOnlyModeLabelContent: Boolean = true
+
     val S24LandscapeUsableHeightDp: Dp = 360.dp
     val CompactLandscapeUsableHeightDp: Dp = 320.dp
-    val ZoomSelectorEstimatedWidthDp: Dp = 200.dp
-
-    /** Explicit measured hit-target dimensions for each label. */
-    val ModeSlotWidthDp: Dp = 40.dp
-    val ModeSlotHeightDp: Dp = 60.dp
-    val ModeSlotSpacingDp: Dp = 2.dp
-    val TopStatusRegionHeightDp: Dp = 76.dp
-    val ClusterGapDp: Dp = 4.dp
-    val ZoomRegionWidthDp: Dp = 216.dp
-    val ZoomRegionHeightDp: Dp = 120.dp
-
-    val ModeLaneEstimatedWidthDp: Dp =
-        (ModeSlotWidthDp.value * 5f + ModeSlotSpacingDp.value * 4f).dp
-
-    /** Retained name for callers that use the lane's cross-axis extent. */
-    val ModeLaneEstimatedHeightDp: Dp = ModeSlotHeightDp
-
-    fun rightRailFits(viewportHeightDp: Dp): Boolean =
-        RightRailEstimatedHeightDp <= viewportHeightDp
 
     internal fun bounds(viewportWidthDp: Float, viewportHeightDp: Float): LandscapeLayoutBounds {
         require(viewportWidthDp > 0f && viewportHeightDp > 0f)
-        val topHeight = TopStatusRegionHeightDp.value
-        val gap = ClusterGapDp.value
-        val rightRailWidth = RightRailWidth.value
-        val modeWidth = ModeLaneEstimatedWidthDp.value
-        val modeHeight = ModeLaneEstimatedHeightDp.value
-        val zoomWidth = ZoomRegionWidthDp.value
-        val zoomHeight = ZoomRegionHeightDp.value
-        val primaryHeight = RightRailEstimatedHeightDp.value
-        val primaryLeft = viewportWidthDp - rightRailWidth
-        val primaryTop = max(
-            topHeight + gap,
-            (viewportHeightDp - primaryHeight) / 2f
+
+        val leftRail = UtilityRailWidth.value
+        val rightRail = RightChromeWidth.value
+        val rightStart = (viewportWidthDp - rightRail).coerceAtLeast(leftRail)
+        val padding = ChromeInnerPadding.value
+
+        val zoomLeft = rightStart + padding
+        val zoomRight = zoomLeft + ZoomRailWidth.value
+        val actionLeft = zoomRight + padding
+        val actionRight = actionLeft + PrimaryActionWidth.value
+        val modeLeft = actionRight + padding
+        val modeRight = (rightStart + rightRail - NavigationSafetyWidth.value - padding).coerceAtLeast(modeLeft)
+        val modeRegion = LandscapeLayoutRect(
+            left = modeLeft,
+            top = 0f,
+            right = modeRight,
+            bottom = viewportHeightDp
         )
+        val systemNavigationSafetyRegion = LandscapeLayoutRect(
+            left = viewportWidthDp - NavigationSafetyWidth.value,
+            top = 0f,
+            right = viewportWidthDp,
+            bottom = viewportHeightDp
+        )
+        val zoomRegion = LandscapeLayoutRect(
+            left = zoomLeft,
+            top = 0f,
+            right = zoomRight,
+            bottom = viewportHeightDp
+        )
+        val primaryActionRegion = LandscapeLayoutRect(
+            left = actionLeft,
+            top = 0f,
+            right = actionRight,
+            bottom = viewportHeightDp
+        )
+        val zoomControlRegion = centeredRect(
+            parent = zoomRegion,
+            width = ZoomControlWidthDp.value,
+            height = ZoomControlHeightDp.value
+        )
+        val cameraSwitchControlRegion = centeredRect(
+            parent = primaryActionRegion,
+            width = 56f,
+            height = 56f,
+            top = 42f
+        )
+        val shutterControlRegion = centeredRect(
+            parent = primaryActionRegion,
+            width = 84f,
+            height = 84f
+        )
+        val resultThumbnailRegion = centeredRect(
+            parent = primaryActionRegion,
+            width = 56f,
+            height = 56f,
+            top = viewportHeightDp - 34f - 56f
+        )
+        val modeLabelSlots = modeLabelSlots(modeRegion, viewportHeightDp)
 
         return LandscapeLayoutBounds(
-            topStatusRegion = LandscapeLayoutRect(0f, 0f, viewportWidthDp, topHeight),
-            modeRegion = LandscapeLayoutRect(
-                left = gap,
-                top = topHeight + gap,
-                right = gap + modeWidth,
-                bottom = topHeight + gap + modeHeight
-            ),
-            zoomRegion = LandscapeLayoutRect(
-                left = ((viewportWidthDp - rightRailWidth - zoomWidth) / 2f).coerceAtLeast(gap),
-                top = viewportHeightDp - zoomHeight,
-                right = ((viewportWidthDp - rightRailWidth - zoomWidth) / 2f)
-                    .coerceAtLeast(gap) + zoomWidth,
+            previewRegion = LandscapeLayoutRect(
+                left = leftRail,
+                top = 0f,
+                right = rightStart,
                 bottom = viewportHeightDp
             ),
-            primaryActionRegion = LandscapeLayoutRect(
-                left = primaryLeft,
-                top = primaryTop,
+            utilityRailRegion = LandscapeLayoutRect(
+                left = 0f,
+                top = 0f,
+                right = leftRail,
+                bottom = viewportHeightDp
+            ),
+            rightChromeRegion = LandscapeLayoutRect(
+                left = rightStart,
+                top = 0f,
                 right = viewportWidthDp,
-                bottom = primaryTop + primaryHeight
-            )
+                bottom = viewportHeightDp
+            ),
+            zoomRegion = zoomRegion,
+            primaryActionRegion = primaryActionRegion,
+            modeRegion = modeRegion,
+            systemNavigationSafetyRegion = systemNavigationSafetyRegion,
+            zoomControlRegion = zoomControlRegion,
+            cameraSwitchControlRegion = cameraSwitchControlRegion,
+            shutterControlRegion = shutterControlRegion,
+            resultThumbnailRegion = resultThumbnailRegion,
+            modeLabelSlots = modeLabelSlots,
+            rotatedModeLabelVisualSlots = modeLabelSlots.map { rotateModeLabelContentBounds(it) }
         )
     }
+
+    private fun centeredRect(
+        parent: LandscapeLayoutRect,
+        width: Float,
+        height: Float,
+        top: Float = parent.top + (parent.height - height) / 2f
+    ): LandscapeLayoutRect {
+        val left = parent.left + (parent.width - width) / 2f
+        return LandscapeLayoutRect(left, top, left + width, top + height)
+    }
+
+    private fun modeLabelSlots(
+        modeRegion: LandscapeLayoutRect,
+        viewportHeightDp: Float,
+        statusBarInsetDp: Float = 0f
+    ): List<LandscapeLayoutRect> {
+        val availableHeight = (viewportHeightDp - statusBarInsetDp).coerceAtLeast(0f)
+        val laneHeight = ModeLaneEstimatedHeightDp.value
+        val top = statusBarInsetDp + ((availableHeight - laneHeight) / 2f).coerceAtLeast(0f)
+        val left = modeRegion.left + (modeRegion.width - ModeSlotWidthDp.value) / 2f
+        return List(5) { index ->
+            val slotTop = top + index * (ModeSlotHeightDp.value + ModeSlotSpacingDp.value)
+            LandscapeLayoutRect(
+                left = left,
+                top = slotTop,
+                right = left + ModeSlotWidthDp.value,
+                bottom = slotTop + ModeSlotHeightDp.value
+            )
+        }
+    }
+
+    /** The visual envelope after the existing +/-90-degree text-only transform. */
+    private fun rotateModeLabelContentBounds(slot: LandscapeLayoutRect): LandscapeLayoutRect {
+        val width = ModeLabelContractHeightDp.value
+        val height = ModeLabelContractWidthDp.value
+        return centeredRect(slot, width, height)
+    }
+
+    fun previewStartPadding(): Dp = UtilityRailWidth
+    fun previewEndPadding(): Dp = RightChromeWidth
 }
