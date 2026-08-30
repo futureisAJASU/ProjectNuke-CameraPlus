@@ -62,7 +62,7 @@ class CanonicalMetadataCleanupTest {
             assertFalse(metadata.optBoolean("sourceFramesAvailable", true))
             assertFalse(metadata.optBoolean("canReprocess", true))
         } finally {
-            root.parentFile?.deleteRecursively()
+            job.deleteRecursively()
         }
     }
 
@@ -84,7 +84,7 @@ class CanonicalMetadataCleanupTest {
             val metadata = KeplerJobMetadata.read(job)
             assertFalse(metadata.optBoolean("sourceFramesAvailable", true))
         } finally {
-            root.parentFile?.deleteRecursively()
+            job.deleteRecursively()
         }
     }
 
@@ -110,7 +110,7 @@ class CanonicalMetadataCleanupTest {
             val metadata = KeplerJobMetadata.read(job)
             assertFalse(metadata.optBoolean("sourceFramesAvailable", true))
         } finally {
-            root.parentFile?.deleteRecursively()
+            job.deleteRecursively()
         }
     }
 
@@ -136,7 +136,7 @@ class CanonicalMetadataCleanupTest {
             assertTrue(metadata.optBoolean("sourceFramesAvailable"))
             assertTrue(metadata.optBoolean("canReprocess"))
         } finally {
-            root.parentFile?.deleteRecursively()
+            job.deleteRecursively()
         }
     }
 
@@ -159,7 +159,7 @@ class CanonicalMetadataCleanupTest {
             val metadata = KeplerJobMetadata.read(job)
             assertTrue(metadata.optBoolean("sourceFramesAvailable"))
         } finally {
-            root.parentFile?.deleteRecursively()
+            job.deleteRecursively()
         }
     }
 
@@ -179,7 +179,7 @@ class CanonicalMetadataCleanupTest {
             assertTrue(File(job, "legacy_source_a.yuv").exists())
             assertFalse(File(job, "intermediate.bin").exists())
         } finally {
-            root.parentFile?.deleteRecursively()
+            job.deleteRecursively()
         }
     }
 
@@ -215,7 +215,7 @@ class CanonicalMetadataCleanupTest {
             assertTrue(metadata.optBoolean("sourceFramesAvailable"))
             assertTrue(metadata.optBoolean("canReprocess"))
         } finally {
-            root.parentFile?.deleteRecursively()
+            job.deleteRecursively()
         }
     }
 
@@ -239,7 +239,7 @@ class CanonicalMetadataCleanupTest {
             val metadata = KeplerJobMetadata.read(job)
             assertTrue(metadata.optBoolean("sourceFramesAvailable"))
         } finally {
-            root.parentFile?.deleteRecursively()
+            job.deleteRecursively()
         }
     }
 
@@ -260,7 +260,7 @@ class CanonicalMetadataCleanupTest {
             assertTrue(File(job, "legacy_source_a.yuv").exists())
             assertFalse(File(job, "merged_yuv_intermediate.bin").exists())
         } finally {
-            root.parentFile?.deleteRecursively()
+            job.deleteRecursively()
         }
     }
 
@@ -289,7 +289,7 @@ class CanonicalMetadataCleanupTest {
             assertFalse(File(job, "frame_00_color.png").exists())
             assertTrue(File(job, "final.png").exists())
         } finally {
-            root.parentFile?.deleteRecursively()
+            job.deleteRecursively()
         }
     }
 
@@ -310,7 +310,7 @@ class CanonicalMetadataCleanupTest {
             assertTrue(File(job, "legacy_source_a.png").exists())
             assertFalse(File(job, "stale_source_b.png").exists())
         } finally {
-            root.parentFile?.deleteRecursively()
+            job.deleteRecursively()
         }
     }
 }
