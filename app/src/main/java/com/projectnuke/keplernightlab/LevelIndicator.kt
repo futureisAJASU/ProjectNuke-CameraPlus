@@ -83,9 +83,11 @@ fun rememberDeviceLevelState(
 @Composable
 fun LevelIndicatorOverlay(
     levelState: DeviceLevelState,
+    layoutMode: CameraUiLayoutMode = CameraUiLayoutMode.PORTRAIT,
     modifier: Modifier = Modifier
 ) {
-    if (!levelState.available) {
+    val mappedState = mapLevelStateForLayout(levelState, layoutMode)
+    if (!mappedState.available) {
         Text(
             text = "Level unavailable",
             color = Color.White.copy(alpha = 0.55f),
@@ -99,10 +101,10 @@ fun LevelIndicatorOverlay(
         val center = Offset(size.width / 2f, size.height / 2f)
         val lineColor = Color.White.copy(alpha = 0.65f)
         val accent = Color(0xFFFFD33D).copy(alpha = 0.75f)
-        val pitchOffset = levelState.pitchDegrees.coerceIn(-20f, 20f) * 3f
+        val pitchOffset = mappedState.pitchDegrees.coerceIn(-20f, 20f) * 3f
 
         rotate(
-            degrees = -levelState.rollDegrees,
+            degrees = -mappedState.rollDegrees,
             pivot = center
         ) {
             drawLine(

@@ -27,6 +27,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -53,8 +55,11 @@ fun CameraTopOverlay(
     onMeteringModeClick: () -> Unit = { MeteringModeState.cycle() }
 ) {
     val levelState = rememberDeviceLevelState(enabled = true)
-    val levelText = if (levelState.available) {
-        "PITCH ${levelState.pitchDegrees.toInt()}°  ROLL ${levelState.rollDegrees.toInt()}°"
+    val displayRotation = androidx.compose.ui.platform.LocalView.current.display?.rotation ?: android.view.Surface.ROTATION_0
+    val layoutMode = deriveCameraUiLayoutMode(displayRotation)
+    val mappedLevelState = mapLevelStateForLayout(levelState, layoutMode)
+    val levelText = if (mappedLevelState.available) {
+        "PITCH ${mappedLevelState.pitchDegrees.toInt()}°  ROLL ${mappedLevelState.rollDegrees.toInt()}°"
     } else {
         "LEVEL --"
     }
@@ -151,10 +156,10 @@ fun TopText(text: String, onClick: () -> Unit, testTag: String? = null) {
 }
 
 @Composable
-fun ModeTabs() {
+fun ModeTabs(modifier: Modifier = Modifier) {
     val modes = listOf("인물 사진", "야간", "사진", "동영상", "더보기")
     Column(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(ModeTabsSpacing)
     ) {
         Row(
@@ -191,7 +196,8 @@ fun ModeTabs() {
 fun ShutterButton(
     enabled: Boolean,
     isCapturing: Boolean,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onLongPress: () -> Unit = {}
 ) {
     LaunchedEffect(Unit) {
         android.util.Log.d(
@@ -204,7 +210,14 @@ fun ShutterButton(
             .size(ShutterOuterSize)
             .clip(CircleShape)
             .background(Color.White.copy(alpha = if (enabled) 0.18f else 0.08f))
-            .clickable(enabled = enabled && !isCapturing, onClick = onClick)
+            .pointerInput(enabled, isCapturing) {
+                if (enabled && !isCapturing) {
+                    detectTapGestures(
+                        onTap = { onClick() },
+                        onLongPress = { onLongPress() }
+                    )
+                }
+            }
             .testTag("kepler.camera.shutter"),
         contentAlignment = Alignment.Center
     ) {
@@ -229,11 +242,45 @@ fun CameraSwitchButton(enabled: Boolean, onClick: () -> Unit) {
             .clickable(enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center
     ) {
-        Text(
-            text = "↻",
-            color = Color.White,
-            style = MaterialTheme.typography.headlineMedium
-        )
+        // Centered refresh icon drawn independently of font baselines
+        androidx.compose.foundation.Canvas(modifier = Modifier.size(28.dp)) {
+            val center = androidx.compose.ui.geometry.Offset(size.width / 2f, size.height / 2f)
+            val radius = minOf(size.width, size.height) / 2f - 2.dp.toPx()
+            // Outer circle
+            drawCircle(
+                color = Color(0xFF888888).copy(alpha = 0.9f),
+                radius = radius,
+                center = center,
+                style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.5.dp.toPx())
+            )
+            // Arrow head (right-pointing curved arrow top)
+            val arrowTop = center.copy(y = center.y - radius * 0.45f)
+            val arrowRight = center.copy(x = center.x + radius * 0.55f, y = center.y - radius * 0.15f)
+            val arrowBottom = center.copy(y = center.y + radius * 0.15f)
+            val arrowTopEnd = center.copy(x = center.x + radius * 0.55f, y = center.y - radius * 0.35f)
+            drawLine(
+                color = Color.White,
+                start = arrowTop,
+                end = arrowTopEnd,
+                strokeWidth = 2.dp.toPx(),
+                cap = androidx.compose.ui.graphics.StrokeCap.Round
+            )
+            // Small triangular arrowhead at arrowTopEnd
+            val tip = arrowTopEnd
+            val left = tip.copy(x = tip.x - 4.dp.toPx(), y = tip.y + 3.dp.toPx())
+            val right = tip.copy(x = tip.x - 2.dp.toPx(), y = tip.y - 3.dp.toPx())
+            drawLine(color = Color.White, start = tip, end = left, strokeWidth = 1.5.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round)
+            drawLine(color = Color.White, start = tip, end = right, strokeWidth = 1.5.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round)
+            // Bottom curved line (left side of circle) to complete refresh symbol
+            val bottomLeft = center.copy(x = center.x - radius * 0.55f, y = center.y + radius * 0.35f)
+            drawLine(
+                color = Color(0xFF888888).copy(alpha = 0.9f),
+                start = arrowBottom,
+                end = bottomLeft,
+                strokeWidth = 1.5.dp.toPx(),
+                cap = androidx.compose.ui.graphics.StrokeCap.Round
+            )
+        }
     }
 }
 

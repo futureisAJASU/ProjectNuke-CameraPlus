@@ -70,6 +70,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.geometry.Offset
@@ -375,6 +376,24 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
         }
     }
 
+    val mainActivity = (context as? MainActivity)
+    var volumeShutterAction: (() -> Unit)? = null
+    DisposableEffect(currentScreen, canAdmitNewCapture, isPipelineBusy, volumeShutterAction) {
+        if (currentScreen == MainScreen.CAMERA && mainActivity != null && volumeShutterAction != null) {
+            mainActivity.registerVolumeShutter {
+                if (currentScreen != MainScreen.CAMERA) return@registerVolumeShutter false
+                if (!canAdmitNewCapture || isPipelineBusy) return@registerVolumeShutter false
+                volumeShutterAction?.invoke()
+                true
+            }
+        } else {
+            mainActivity?.unregisterVolumeShutter()
+        }
+        onDispose {
+            mainActivity?.unregisterVolumeShutter()
+        }
+    }
+
     val selectedMode = "사진"
     var selectedResolution by remember {
         mutableStateOf(CaptureResolutionMode.entries.firstOrNull { it.name == savedSettings.selectedResolutionName } ?: CaptureResolutionMode.MP12)
@@ -472,6 +491,9 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
     var latestResult by remember { mutableStateOf<LatestKeplerResult?>(null) }
     var showResultPreview by remember { mutableStateOf(false) }
     val previewUiGeneration = remember { AtomicLong(0L) }
+
+    // P2 floating shutter state
+    val floatingController = remember { FloatingShutterController() }
 
     val ownedLatestBitmap = latestBitmap
     DisposableEffect(ownedLatestBitmap) {
@@ -1106,8 +1128,115 @@ LaunchedEffect(Unit) {
             }
         )
 
+        val displayRotation = LocalView.current.display?.rotation ?: android.view.Surface.ROTATION_0
+        val cameraLayoutMode = deriveCameraUiLayoutMode(displayRotation)
+
+        // Capture action shared between bottom shutter and volume dispatcher
+        val captureCallback = captureAction@ {
+            if (!canAdmitNewCapture) {
+                status = "촬영 자원을 정리하는 중입니다. 잠시 후 다시 시도해 주세요."
+                Log.i("KeplerPipelineState", "volume capture ignored while capture resources owned status=$status")
+                return@captureAction
+            }
+            val backpressure = evaluateBackpressure(
+                queuedCount = backgroundProcessing.queuedCount,
+                active = backgroundProcessing.hasActiveWork
+            )
+            if (backpressure.decision == BackpressureDecision.BLOCK) {
+                status = backpressure.userMessage
+                    ?: "처리 대기 중인 사진이 많습니다. 잠시 후 다시 촬영해 주세요."
+                Log.i("KeplerPipelineState", "volume capture blocked by bounded backlog queued=${backgroundProcessing.queuedCount}")
+                return@captureAction
+            }
+            val clickResult = handleCaptureClick(
+                CaptureClickInput(
+                    context = context,
+                    selectedResolution = selectedResolution,
+                    resolutionPlans = resolutionState.plans,
+                    selectedResolutionPlan = resolutionState.selectedPlan,
+                    buildPreparationInput = { activePlan ->
+                        CapturePreparationInput(
+                            cameraSelection = cameraState.selection,
+                            requestedUiZoomRatio = zoomUiState.zoomRatio,
+                            captureZoomRatio = cameraState.captureZoomRatio,
+                            resolutionPlan = activePlan,
+                            selectedResolution = selectedResolution,
+                            frameCountMode = frameCountMode,
+                            autoMinFrames = autoMinFrames,
+                            autoMaxFrames = autoMaxFrames,
+                            manualFrames = manualFrames,
+                            selectedMode = selectedMode,
+                            captureMode = captureMode,
+                            latestSceneLuma = latestSceneLuma,
+                            latestMotionScore = latestMotionScore
+                        )
+                    }
+                )
+            )
+            when (clickResult) {
+                is CaptureClickResult.InvalidResolution -> {
+                    selectedResolution = CaptureResolutionMode.MP12
+                    status = clickResult.status
+                }
+                is CaptureClickResult.Ready -> {
+                    latestFramePlan = clickResult.prepared.framePlan
+                    val attemptSettings = CaptureAttemptUiSnapshot(
+                        lensSlot = selectedLensSlot,
+                        resolution = selectedResolution,
+                        zoomRatio = zoomUiState.zoomRatio,
+                        focusAeState = focusAeState,
+                        processingSettings = processingSettings,
+                        outputFormat = finalOutputFormat
+                    )
+                    val attemptPipelineMode = if (captureMode == CaptureMode.SINGLE_FRAME) {
+                        PipelineMode.YUV_NIGHT_FUSION
+                    } else {
+                        pipelineMode
+                    }
+                    val attemptCaptureMode = captureMode
+                    val attemptRawSpeedMode = rawSpeedMode
+                    val attemptDisplayRotation = captureDisplayRotation
+                    runCameraJob(
+                        startMessage = clickResult.prepared.startMessage,
+                        requestedFrames = clickResult.prepared.framePlan.framesToCapture,
+                        timeoutMillis = if (
+                            captureMode == CaptureMode.MULTI_FRAME &&
+                            pipelineMode == PipelineMode.RAW_NIGHT_FUSION
+                        ) {
+                            120_000L
+                        } else {
+                            60_000L
+                        }
+                    ) { cancellation, captureCancellation, callback, onEvent ->
+                        startCapturePipeline(
+                            CapturePipelineRequest(
+                                context = context,
+                                pipelineMode = attemptPipelineMode,
+                                prepared = clickResult.prepared,
+                                selectedResolution = attemptSettings.resolution,
+                                resolutionPlan = clickResult.resolutionPlan,
+                                finalOutputFormat = attemptSettings.outputFormat,
+                                focusAeState = attemptSettings.focusAeState,
+                                rawSpeedMode = attemptRawSpeedMode,
+                                captureMode = attemptCaptureMode,
+                                processingSettings = attemptSettings.processingSettings,
+                                displayRotation = attemptDisplayRotation,
+                                captureCancellationHandle = captureCancellation,
+                                cancellation = cancellation
+                            ),
+                            onStatus = callback,
+                            onEvent = onEvent
+                        )
+                    }
+                }
+            }
+        }
+        volumeShutterAction = captureCallback
+
         CameraBottomPanel(
                 modifier = Modifier.align(Alignment.BottomCenter),
+                layoutMode = cameraLayoutMode,
+                floatingController = floatingController,
                 latestBitmap = latestBitmap,
                 selectedLensSlot = selectedLensSlot,
                 onLensSlotChange = { lensSlot ->
@@ -1174,108 +1303,7 @@ LaunchedEffect(Unit) {
                     showFocusAeControls = false
                     showZoomSlider = false
                 },
-                onCapture = captureClick@{
-                    if (!canAdmitNewCapture) {
-                        status = "촬영 자원을 정리하는 중입니다. 잠시 후 다시 시도해 주세요."
-                        Log.i("KeplerPipelineState", "click ignored while capture resources owned status=$status")
-                        return@captureClick
-                    }
-                    // Phase-10 bounded backlog: prevent a new capture BEFORE
-                    // sensor acquisition when the durable queue has no safe
-                    // capacity. Existing jobs are never dropped.
-                    val backpressure = evaluateBackpressure(
-                        queuedCount = backgroundProcessing.queuedCount,
-                        active = backgroundProcessing.hasActiveWork
-                    )
-                    if (backpressure.decision == BackpressureDecision.BLOCK) {
-                        status = backpressure.userMessage
-                            ?: "처리 대기 중인 사진이 많습니다. 잠시 후 다시 촬영해 주세요."
-                        Log.i("KeplerPipelineState", "click blocked by bounded backlog queued=${backgroundProcessing.queuedCount}")
-                        return@captureClick
-                    }
-                    val clickResult = handleCaptureClick(
-                        CaptureClickInput(
-                            context = context,
-                            selectedResolution = selectedResolution,
-                            resolutionPlans = resolutionState.plans,
-                            selectedResolutionPlan = resolutionState.selectedPlan,
-                            buildPreparationInput = { activePlan ->
-                                CapturePreparationInput(
-                                    cameraSelection = cameraState.selection,
-                                    requestedUiZoomRatio = zoomUiState.zoomRatio,
-                                    captureZoomRatio = cameraState.captureZoomRatio,
-                                    resolutionPlan = activePlan,
-                                    selectedResolution = selectedResolution,
-                                    frameCountMode = frameCountMode,
-                                    autoMinFrames = autoMinFrames,
-                                    autoMaxFrames = autoMaxFrames,
-                                    manualFrames = manualFrames,
-                                    selectedMode = selectedMode,
-                                    captureMode = captureMode,
-                                    latestSceneLuma = latestSceneLuma,
-                                    latestMotionScore = latestMotionScore
-                                )
-                            }
-                        )
-                    )
-                    when (clickResult) {
-                        is CaptureClickResult.InvalidResolution -> {
-                            selectedResolution = CaptureResolutionMode.MP12
-                            status = clickResult.status
-                        }
-                        is CaptureClickResult.Ready -> {
-                            latestFramePlan = clickResult.prepared.framePlan
-                            val attemptSettings = CaptureAttemptUiSnapshot(
-                                lensSlot = selectedLensSlot,
-                                resolution = selectedResolution,
-                                zoomRatio = zoomUiState.zoomRatio,
-                                focusAeState = focusAeState,
-                                processingSettings = processingSettings,
-                                outputFormat = finalOutputFormat
-                            )
-                            val attemptPipelineMode = if (captureMode == CaptureMode.SINGLE_FRAME) {
-                                PipelineMode.YUV_NIGHT_FUSION
-                            } else {
-                                pipelineMode
-                            }
-                            val attemptCaptureMode = captureMode
-                            val attemptRawSpeedMode = rawSpeedMode
-                            val attemptDisplayRotation = captureDisplayRotation
-                            runCameraJob(
-                                startMessage = clickResult.prepared.startMessage,
-                                requestedFrames = clickResult.prepared.framePlan.framesToCapture,
-                                timeoutMillis = if (
-                                    captureMode == CaptureMode.MULTI_FRAME &&
-                                    pipelineMode == PipelineMode.RAW_NIGHT_FUSION
-                                ) {
-                                    120_000L
-                                } else {
-                                    60_000L
-                                }
-                            ) { cancellation, captureCancellation, callback, onEvent ->
-                                startCapturePipeline(
-                                    CapturePipelineRequest(
-                                        context = context,
-                                        pipelineMode = attemptPipelineMode,
-                                        prepared = clickResult.prepared,
-                                        selectedResolution = attemptSettings.resolution,
-                                        resolutionPlan = clickResult.resolutionPlan,
-                                        finalOutputFormat = attemptSettings.outputFormat,
-                                        focusAeState = attemptSettings.focusAeState,
-                                        rawSpeedMode = attemptRawSpeedMode,
-                                        captureMode = attemptCaptureMode,
-                                        processingSettings = attemptSettings.processingSettings,
-                                        displayRotation = attemptDisplayRotation,
-                                        captureCancellationHandle = captureCancellation,
-                                        cancellation = cancellation
-                                    ),
-                                    onStatus = callback,
-                                    onEvent = onEvent
-                                )
-                            }
-                        }
-                    }
-                },
+                onCapture = captureCallback,
                 onAverage = average@{
                     // 수동 재생성은 촬영 소유가 아니라 처리 작업입니다. 정확한 최근
                     // 작업 디렉터리로 직렬화된 백그라운드 처리 lane에서 실행되며
@@ -1345,6 +1373,39 @@ LaunchedEffect(Unit) {
             onOpenGallery = onOpenGallery,
             onDismiss = { showResultPreview = false }
         )
+
+        // P2 floating shutter
+        if (floatingController.state.value != FloatingShutterState.DOCKED && currentScreen == MainScreen.CAMERA) {
+            val dockTarget = androidx.compose.ui.geometry.Offset(
+                x = 300.dp.value,
+                y = 700.dp.value
+            )
+            FloatingShutterButton(
+                state = floatingController.state.value,
+                position = floatingController.position.value,
+                onPositionChange = { newPos ->
+                    val clampedX = newPos.x.coerceIn(40f, 1000f)
+                    val clampedY = newPos.y.coerceIn(120f, 1300f)
+                    floatingController.position.value = androidx.compose.ui.geometry.Offset(clampedX, clampedY)
+                    val threshold = 100f
+                    val dist = kotlin.math.hypot(newPos.x - dockTarget.x, newPos.y - dockTarget.y)
+                    if (dist <= threshold) {
+                        floatingController.state.value = FloatingShutterState.DOCKED
+                    } else {
+                        floatingController.state.value = FloatingShutterState.FLOATING_IDLE
+                    }
+                },
+                onTap = {
+                    if (!isPipelineBusy && canAdmitNewCapture) {
+                        captureCallback()
+                    }
+                },
+                onLongPress = {
+                    floatingController.state.value = FloatingShutterState.FLOATING_DRAGGING
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
 
         if (currentScreen == MainScreen.SETTINGS) {
             SettingsScreen(
@@ -1667,6 +1728,8 @@ fun FocusAeOverlay(
 @Composable
 fun CameraBottomPanel(
     modifier: Modifier = Modifier,
+    layoutMode: CameraUiLayoutMode = CameraUiLayoutMode.PORTRAIT,
+    floatingController: FloatingShutterController? = null,
     latestBitmap: Bitmap?,
     selectedLensSlot: LensSlot,
     onLensSlotChange: (LensSlot) -> Unit,
@@ -1691,6 +1754,7 @@ fun CameraBottomPanel(
     onClear: () -> Unit,
     onThumbnail: () -> Unit
 ) {
+    val isLandscape = layoutMode.isLandscape()
     Column(
         modifier = modifier
             .fillMaxWidth()
@@ -1698,10 +1762,10 @@ fun CameraBottomPanel(
             .padding(
                 start = BottomOverlayHorizontalPadding,
                 end = BottomOverlayHorizontalPadding,
-                top = 0.dp,
-                bottom = BottomOverlayBottomPadding
+                top = if (isLandscape) 2.dp else 0.dp,
+                bottom = if (isLandscape) 4.dp else BottomOverlayBottomPadding
             ),
-        verticalArrangement = Arrangement.spacedBy(BottomOverlaySpacing)
+        verticalArrangement = Arrangement.spacedBy(if (isLandscape) 2.dp else BottomOverlaySpacing)
     ) {
         AnimatedVisibility(
             visible = showZoomSlider,
@@ -1743,9 +1807,9 @@ fun CameraBottomPanel(
                 .background(Color(0x54111218))
                 .padding(
                     horizontal = FloatingClusterHorizontalPadding,
-                    vertical = FloatingClusterVerticalPadding
+                    vertical = if (isLandscape) 4.dp else FloatingClusterVerticalPadding
                 ),
-            verticalArrangement = Arrangement.spacedBy(BottomOverlaySpacing)
+            verticalArrangement = Arrangement.spacedBy(if (isLandscape) 2.dp else BottomOverlaySpacing)
         ) {
             Row(
                 modifier = Modifier
@@ -1784,6 +1848,7 @@ fun CameraBottomPanel(
                         .clickable(onClick = onHideFocusAeControls)
                 )
 
+                val controllerRef = floatingController
                 if (isPipelineBusy) {
                     Box(modifier = Modifier.testTag("kepler.capture.busy")) {
                         PipelineBusyShutterIndicator(
@@ -1795,7 +1860,10 @@ fun CameraBottomPanel(
                     ShutterButton(
                         enabled = true,
                         isCapturing = false,
-                        onClick = onCapture
+                        onClick = onCapture,
+                        onLongPress = {
+                            controllerRef?.activateFloating()
+                        }
                     )
                 }
 
@@ -1839,7 +1907,11 @@ fun CameraBottomPanel(
                 )
             }
 
-            ModeTabs()
+            ModeTabs(
+                modifier = if (isLandscape) Modifier.graphicsLayer {
+                    rotationZ = if (layoutMode == CameraUiLayoutMode.LANDSCAPE_LEFT) 90f else -90f
+                } else Modifier
+            )
         }
 
         if (SHOW_LEGACY_RAW_ACTIONS) {

@@ -1,13 +1,14 @@
 package com.projectnuke.keplernightlab
 
+import android.view.Surface
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -16,6 +17,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
@@ -28,6 +30,9 @@ internal fun PreviewStage(
     modifier: Modifier = Modifier,
     meteringMode: MeteringMode = MeteringModeState.mode
 ) {
+    val displayRotation = LocalView.current.display?.rotation ?: Surface.ROTATION_0
+    val layoutMode = deriveCameraUiLayoutMode(displayRotation)
+
     BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()
@@ -35,30 +40,45 @@ internal fun PreviewStage(
             .background(Color.Black),
         contentAlignment = Alignment.TopCenter
     ) {
-        val portraitPhotoAspectRatio = 3f / 4f
-        val previewModifier = if (maxWidth / portraitPhotoAspectRatio <= maxHeight) {
+        val isLandscape = layoutMode.isLandscape()
+        val previewModifier = if (isLandscape) {
             Modifier
-                .fillMaxWidth()
-                .aspectRatio(portraitPhotoAspectRatio)
+                .fillMaxSize()
+                .padding(top = PreviewTopInset)
         } else {
+            val portraitPhotoAspectRatio = 3f / 4f
+            val previewModifierPortrait = if (maxWidth / portraitPhotoAspectRatio <= maxHeight) {
+                Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(portraitPhotoAspectRatio)
+            } else {
+                Modifier
+                    .fillMaxHeight()
+                    .aspectRatio(portraitPhotoAspectRatio)
+            }
             Modifier
-                .fillMaxHeight()
-                .aspectRatio(portraitPhotoAspectRatio)
+                .padding(top = PreviewTopInset)
+                .then(previewModifierPortrait)
         }
 
         Box(
             modifier = Modifier
-                .padding(top = PreviewTopInset)
                 .then(previewModifier)
                 .background(Color.Black)
-                .pointerInput(Unit) {
+                .pointerInput(layoutMode) {
                     detectTapGestures { offset ->
-                        callbacks.onFocusPoint(
-                            NormalizedPoint(
-                                (offset.x / size.width).coerceIn(0f, 1f),
-                                (offset.y / size.height).coerceIn(0f, 1f)
-                            )
+                        val containerSize = androidx.compose.ui.geometry.Size(
+                            width = size.width.toFloat(),
+                            height = size.height.toFloat()
                         )
+                        val point = normalizePointFromPreviewContainer(
+                            offset = androidx.compose.ui.geometry.Offset(offset.x, offset.y),
+                            containerSize = containerSize,
+                            layoutMode = layoutMode
+                        )
+                        if (point != null) {
+                            callbacks.onFocusPoint(point)
+                        }
                     }
                 },
             contentAlignment = Alignment.Center
@@ -86,6 +106,7 @@ internal fun PreviewStage(
             if (state.overlaySettings.showLevel) {
                 LevelIndicatorOverlay(
                     levelState = state.levelState,
+                    layoutMode = layoutMode,
                     modifier = Modifier.fillMaxSize()
                 )
             }
