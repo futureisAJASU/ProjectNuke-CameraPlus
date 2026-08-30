@@ -28,8 +28,24 @@ if (-not (Test-Path -Path $source -PathType Leaf)) {
     throw "Default Android debug keystore not found: $source"
 }
 
-Copy-Item $source $destination
-$fingerprint = Get-DebugCertificateFingerprint $destination
+$null = Get-DebugCertificateFingerprint $source
+$destinationDirectory = Split-Path -Parent $destination
+$temporaryDestination = Join-Path $destinationDirectory ("local-debug.jks.tmp-" + [System.IO.Path]::GetRandomFileName())
+try {
+    Copy-Item -LiteralPath $source -Destination $temporaryDestination
+    $fingerprint = Get-DebugCertificateFingerprint $temporaryDestination
+    if (Test-Path -Path $destination -PathType Leaf) {
+        # A concurrent creator wins; never overwrite its identity.
+        $fingerprint = Get-DebugCertificateFingerprint $destination
+    } else {
+        Move-Item -LiteralPath $temporaryDestination -Destination $destination
+    }
+} catch {
+    if (Test-Path -LiteralPath $temporaryDestination -PathType Leaf) {
+        Remove-Item -LiteralPath $temporaryDestination -Force -ErrorAction SilentlyContinue
+    }
+    throw
+}
 Write-Host "Created the developer-local debug pin; future runs preserve it."
 Write-Host "Source category: developer-local pinned override"
 Write-Host "Certificate SHA-256: $fingerprint"

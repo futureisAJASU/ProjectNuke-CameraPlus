@@ -6,6 +6,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertNull
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -25,11 +26,18 @@ class MediaStoreExportRecoveryTest {
         var inspectionFailed = false
         var returnNullCursor = false
         var committed = false
+        var verificationDiagnosticReason: GalleryExportVerificationReason? = null
         var deleteFailure: Throwable? = null
         var setPendingFailure: Throwable? = null
         var setPendingSideEffectThenFailure = false
         override fun inspect(uri: Uri, journal: MediaStoreExportJournal) =
-            MediaStoreExportInspection(exists, pending, verified, inspectionFailed = inspectionFailed)
+            MediaStoreExportInspection(
+                exists,
+                pending,
+                verified,
+                inspectionFailed = inspectionFailed,
+                verificationDiagnosticReason = verificationDiagnosticReason
+            )
         override fun setPending(uri: Uri, pending: Boolean): Boolean {
             if (setPendingSideEffectThenFailure) {
                 this.pending = pending
@@ -74,6 +82,7 @@ class MediaStoreExportRecoveryTest {
             assertEquals(MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED, result.classification)
             assertTrue(access.committed)
             assertFalse(access.deleted)
+            assertNull(result.verificationDiagnosticReason)
             assertEquals(MediaStoreExportState.VERIFIED, MediaStoreExportJournal.list(dir).single().state)
         } finally {
             dir.deleteRecursively()
@@ -223,6 +232,35 @@ class MediaStoreExportRecoveryTest {
             assertTrue(MediaStoreExportJournal.list(dir).single().uri!!.contains("/7"))
         } finally {
             dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun mainImageVerificationDiagnosticPropagatesWithoutChangingClassification() {
+        val reasons = listOf(
+            GalleryExportVerificationReason.ROW_MISSING,
+            GalleryExportVerificationReason.SIGNATURE_INVALID,
+            GalleryExportVerificationReason.BOUNDS_INVALID,
+            GalleryExportVerificationReason.PIXEL_PROBE_NO_IMAGE,
+            GalleryExportVerificationReason.MIME_MISMATCH,
+            GalleryExportVerificationReason.DIMENSION_MISMATCH
+        )
+        reasons.forEach { reason ->
+            val dir = Files.createTempDirectory("media-recovery-diagnostic-").toFile()
+            try {
+                journal(dir, MediaStoreExportState.CONTENT_WRITTEN)
+                val access = FakeAccess(pending = false, verified = false).apply {
+                    verificationDiagnosticReason = reason
+                }
+
+                val result = recoverMediaStoreExportJournals(dir, access).single()
+
+                assertEquals(MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED, result.classification)
+                assertEquals(reason, result.verificationDiagnosticReason)
+                assertEquals(MediaStoreExportState.PUBLIC_COMMITTED, MediaStoreExportJournal.list(dir).single().state)
+            } finally {
+                dir.deleteRecursively()
+            }
         }
     }
 

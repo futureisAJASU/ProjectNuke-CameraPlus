@@ -34,8 +34,27 @@ if [[ ! -f "$source_keystore" ]]; then
   exit 1
 fi
 
-cp "$source_keystore" "$destination"
-fingerprint="$(certificate_fingerprint "$destination")"
+certificate_fingerprint "$source_keystore" >/dev/null
+temporary_destination="$(mktemp "${destination}.tmp.XXXXXX")"
+cleanup() {
+  if [[ -n "${temporary_destination:-}" && -e "$temporary_destination" ]]; then
+    rm -f -- "$temporary_destination"
+  fi
+}
+trap cleanup EXIT
+cp -- "$source_keystore" "$temporary_destination"
+fingerprint="$(certificate_fingerprint "$temporary_destination")"
+if [[ -e "$destination" ]]; then
+  # A concurrent creator wins; never overwrite its identity.
+  fingerprint="$(certificate_fingerprint "$destination")"
+else
+  # -n keeps a concurrent destination from being overwritten on platforms that support it.
+  mv -n -- "$temporary_destination" "$destination"
+  if [[ -e "$temporary_destination" ]]; then
+    echo "Could not install the local debug pin without overwriting a concurrent destination." >&2
+    exit 1
+  fi
+fi
 echo "Created the developer-local debug pin; future runs preserve it."
 echo "Source category: developer-local pinned override"
 echo "Certificate SHA-256: ${fingerprint}"

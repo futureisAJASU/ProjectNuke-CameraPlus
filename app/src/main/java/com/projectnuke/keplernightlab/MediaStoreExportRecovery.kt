@@ -32,7 +32,9 @@ internal enum class MediaStoreExportRecoveryClassification {
 internal data class MediaStoreExportRecoveryResult(
     val attemptId: String,
     val classification: MediaStoreExportRecoveryClassification,
-    val message: String? = null
+    val message: String? = null,
+    /** Read-only main-image verification evidence; it never participates in recovery authority. */
+    val verificationDiagnosticReason: GalleryExportVerificationReason? = null
 )
 
 internal interface MediaStoreExportRecoveryAccess {
@@ -412,14 +414,16 @@ private fun recoverMediaStoreExportJournal(
                 return MediaStoreExportRecoveryResult(
                     journal.exportAttemptId,
                     MediaStoreExportRecoveryClassification.DELETE_FAILED,
-                    "Unverifiable pending MediaStore row could not be deleted."
+                    "Unverifiable pending MediaStore row could not be deleted.",
+                    inspection.verificationDiagnosticReason
                 )
             }
             journal.transition(jobDir, MediaStoreExportState.CLEANED)
             return MediaStoreExportRecoveryResult(
                 journal.exportAttemptId,
                 MediaStoreExportRecoveryClassification.PENDING_DELETED,
-                inspection.message ?: "Pending MediaStore content was not verifiable."
+                inspection.message ?: "Pending MediaStore content was not verifiable.",
+                inspection.verificationDiagnosticReason
             )
         }
         fun reconcileActualCommitAfterFailure(): MediaStoreExportRecoveryResult? {
@@ -440,7 +444,8 @@ private fun recoverMediaStoreExportJournal(
                 return MediaStoreExportRecoveryResult(
                     journal.exportAttemptId,
                     MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED,
-                    afterFailure.message ?: "MediaStore commit succeeded but verification remains unresolved."
+                    afterFailure.message ?: "MediaStore commit succeeded but verification remains unresolved.",
+                    afterFailure.verificationDiagnosticReason
                 )
             }
             journal.transition(jobDir, MediaStoreExportState.PUBLIC_COMMITTED)
@@ -483,7 +488,8 @@ private fun recoverMediaStoreExportJournal(
         return MediaStoreExportRecoveryResult(
             journal.exportAttemptId,
             MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED,
-            inspection.message ?: "Committed MediaStore content could not be verified."
+            inspection.message ?: "Committed MediaStore content could not be verified.",
+            inspection.verificationDiagnosticReason
         )
     }
     // Same-state idempotency: a journal already durably VERIFIED that inspection freshly
@@ -561,7 +567,15 @@ internal class ContextMediaStoreExportRecoveryAccess(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Exception) {
-            MediaStoreExportInspection(false, false, false, "MediaStore inspection failed: ${failure.message}", inspectionFailed = true)
+            // Keep provider failures fail-closed without exposing arbitrary exception text,
+            // paths, or unrelated URI/provider contents through recovery diagnostics.
+            MediaStoreExportInspection(
+                false,
+                false,
+                false,
+                "MediaStore inspection failed: ${failure.javaClass.simpleName}",
+                inspectionFailed = true
+            )
         }
     }
 

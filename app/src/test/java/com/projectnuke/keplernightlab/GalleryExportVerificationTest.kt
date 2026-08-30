@@ -37,15 +37,20 @@ class GalleryExportVerificationTest {
         private val usePlatformDecode: Boolean = true,
         private val queryFailure: Exception? = null,
         private val queryMissing: Boolean = false,
+        queryMissingResults: List<Boolean> = emptyList(),
         private val openFailure: Exception? = null,
         private val boundsFailure: Exception? = null,
-        private val probeFailure: Exception? = null
+        private val probeFailure: Exception? = null,
+        probeResults: List<Boolean> = emptyList()
     ) : GalleryExportVerificationSource {
         private val queuedBounds = ArrayDeque(bounds)
+        private val queuedQueryMissing = ArrayDeque(queryMissingResults)
+        private val queuedProbeResults = ArrayDeque(probeResults)
         private var opens = 0
         override fun query(uri: Uri): GalleryMediaColumns? {
             queryFailure?.let { throw it }
-            return columns.takeUnless { queryMissing }
+            val missing = if (queuedQueryMissing.isNotEmpty()) queuedQueryMissing.removeFirst() else queryMissing
+            return columns.takeUnless { missing }
         }
         override fun open(uri: Uri): InputStream? {
             openFailure?.let { throw it }
@@ -57,6 +62,7 @@ class GalleryExportVerificationTest {
         }
         override fun decodeProbe(uri: Uri, sampleSize: Int): Boolean {
             probeFailure?.let { throw it }
+            if (queuedProbeResults.isNotEmpty()) return queuedProbeResults.removeFirst()
             if (!usePlatformDecode) return true
             val options = BitmapFactory.Options().apply { inSampleSize = sampleSize }
             val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) ?: return false
@@ -74,9 +80,11 @@ class GalleryExportVerificationTest {
         usePlatformDecode: Boolean = true,
         queryFailure: Exception? = null,
         queryMissing: Boolean = false,
+        queryMissingResults: List<Boolean> = emptyList(),
         openFailure: Exception? = null,
         boundsFailure: Exception? = null,
-        probeFailure: Exception? = null
+        probeFailure: Exception? = null,
+        probeResults: List<Boolean> = emptyList()
     ): GalleryExportVerification = verifyGalleryExportResult(
         RuntimeEnvironment.getApplication(),
         "content://test/final",
@@ -89,9 +97,11 @@ class GalleryExportVerificationTest {
             usePlatformDecode = usePlatformDecode,
             queryFailure = queryFailure,
             queryMissing = queryMissing,
+            queryMissingResults = queryMissingResults,
             openFailure = openFailure,
             boundsFailure = boundsFailure,
-            probeFailure = probeFailure
+            probeFailure = probeFailure,
+            probeResults = probeResults
         ),
         retryScheduler = GalleryVerificationRetryScheduler { }
     )
@@ -132,6 +142,13 @@ class GalleryExportVerificationTest {
     }
     @Test fun validPng_isVerified() = assertTrue(verify(png, OutputFormat.PNG) is GalleryExportVerification.Verified)
     @Test fun validHeif_usesInjectableDecoderAndVerifier() = assertTrue(verify(heif, OutputFormat.HEIF, usePlatformDecode = false) is GalleryExportVerification.Verified)
+    @Test
+    fun structurallyInsufficientHeif_isRejectedBeforeDecode() {
+        val insufficient = heif.clone().also { it[3] = 12 }
+        val result = verify(insufficient, OutputFormat.HEIF, usePlatformDecode = false)
+        assertTrue(result is GalleryExportVerification.PermanentFailure)
+        assertEquals(GalleryExportVerificationReason.SIGNATURE_INVALID, diagnostic(result))
+    }
     @Test
     fun truncatedJpeg_isRejectedWithStreamDiagnostic() {
         val result = verify(jpeg.dropLast(2).toByteArray(), OutputFormat.JPEG)
@@ -246,6 +263,20 @@ class GalleryExportVerificationTest {
     }
     @Test fun unavailableStreamOnce_thenRetriesCompleteVerification() = assertTrue(verify(jpeg, OutputFormat.JPEG, unavailableStreams = 1) is GalleryExportVerification.Verified)
     @Test fun decodeFailureOnce_thenRetriesCompleteVerification() = assertTrue(verify(jpeg, OutputFormat.JPEG, bounds = listOf(0 to 0, 32 to 20)) is GalleryExportVerification.Verified)
+    @Test
+    fun retryDiagnosticUsesLastFailedPredicateWhileKeepingFirstFailureText() {
+        val result = verify(
+            jpeg,
+            OutputFormat.JPEG,
+            bounds = listOf(0 to 0, 32 to 20),
+            queryMissingResults = listOf(true, false, false),
+            probeResults = listOf(false)
+        )
+
+        assertTrue(result is GalleryExportVerification.RetryableFailure)
+        assertEquals("MediaStore row is unavailable", (result as GalleryExportVerification.RetryableFailure).reason)
+        assertEquals(GalleryExportVerificationReason.PIXEL_PROBE_NO_IMAGE, result.diagnosticReason)
+    }
     @Test fun verificationCarriesCommittedTruth() {
         val verified = verify(png, OutputFormat.PNG) as GalleryExportVerification.Verified
         assertEquals(OutputFormat.PNG, verified.detectedFormat)

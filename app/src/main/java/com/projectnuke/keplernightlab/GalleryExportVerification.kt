@@ -175,7 +175,7 @@ internal fun verifyGalleryExportResult(
         )
     }
     var firstRetryableReason: String? = null
-    var firstRetryableDiagnosticReason: GalleryExportVerificationReason? = null
+    var lastRetryableDiagnosticReason: GalleryExportVerificationReason? = null
     repeat(retries.coerceAtLeast(1)) { index ->
         val verification = verifyOnce(uri, expectation, source)
         when (verification) {
@@ -184,15 +184,17 @@ internal fun verifyGalleryExportResult(
             is GalleryExportVerification.RetryableFailure -> {
                 if (firstRetryableReason == null) {
                     firstRetryableReason = verification.reason
-                    firstRetryableDiagnosticReason = verification.diagnosticReason
                 }
+                // Keep the legacy first-failure text, but make typed evidence authoritative for
+                // the last predicate that actually failed after all retry attempts.
+                lastRetryableDiagnosticReason = verification.diagnosticReason
                 if (index + 1 < retries.coerceAtLeast(1)) retryScheduler.beforeRetry(index + 1)
             }
         }
     }
     return GalleryExportVerification.RetryableFailure(
         firstRetryableReason ?: "Verification did not complete",
-        firstRetryableDiagnosticReason ?: GalleryExportVerificationReason.VERIFICATION_INCOMPLETE
+        lastRetryableDiagnosticReason ?: GalleryExportVerificationReason.VERIFICATION_INCOMPLETE
     )
 }
 

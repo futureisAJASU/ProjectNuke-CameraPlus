@@ -32,7 +32,11 @@ The verifier's predicates, in order, are:
 - opening the exact content stream;
 - nonempty readable bytes and, when reported, MediaStore size equal to the readable size;
 - supported encoded signature: JPEG, PNG, or supported HEIF brands (AVIF is rejected);
-- complete payload marker: JPEG EOI, PNG IEND, or a structurally sufficient HEIF ftyp box;
+- JPEG and PNG require their explicit terminal markers (EOI and IEND respectively). HEIF only
+  requires the bounded low-level probe to find a supported `ftyp`/brand declaration and a
+  minimum 16-byte stream; that probe does not prove full ISO-BMFF container completeness. For
+  HEIF, practical validity is strengthened later by positive bounds decode and sampled pixel
+  decode;
 - bounds decode with positive width and height;
 - sampled pixel decode that returns a nonempty bitmap;
 - when an expectation is supplied, matching encoded format and MediaStore MIME;
@@ -44,6 +48,8 @@ The verifier does not independently query `IS_PENDING`, enforce a `content://` s
 or inspect journal/terminal metadata. Those are enforced by the surrounding MediaStore insert and
 recovery protocol described above. In the Android production path the URI is the URI returned by
 MediaStore insertion; the pure verifier also retains its existing `file:` test/source support.
+Thus `content://` authority, exact-row existence, and pending-state predicates are provider /
+recovery predicates, not encoded-content predicates implemented by the pure verifier.
 
 Journal state, terminal metadata, exact owner/operation linkage, and terminal acknowledgement are
 separate durability predicates. Recovery releases an export owner only after the matching terminal
@@ -52,17 +58,23 @@ metadata and journal acknowledgement protocol is settled.
 ## Diagnostic repair and fixtures
 
 `GalleryExportVerificationReason` is a bounded enum attached to each retryable/permanent
-verification failure. `MediaStoreExportInspection` carries the same read-only code for a main-image
-inspection. Exception messages are not part of the code and verifier-generated failure strings use
-exception class names only, so local paths are not exposed through export failure text.
+verification failure. The first retryable human-readable string remains compatibility-stable, but
+the typed reason after retries is the last failed retry predicate, so an early transient reason
+cannot mask the final failure. `MediaStoreExportInspection` carries the same read-only code for a
+main-image inspection, and `MediaStoreExportRecoveryResult` propagates it for
+`PUBLIC_COMMITTED_UNVERIFIED`. It is diagnostic only: it does not participate in classification,
+journal transitions, or owner/recovery authority. Exception messages are not part of the code;
+verifier and recovery failure text uses bounded categories/class names rather than raw provider
+messages or local paths.
 
 `GalleryExportVerificationTest` exercises real verifier layers with deterministic in-memory
-encoded data: valid JPEG/PNG, a structurally accepted HEIF ftyp fixture, bad signature, truncated
-JPEG/PNG, a valid PNG signature with an invalid body, row absence, unavailable/open failures,
-empty content, size mismatch, bounds/pixel failures, MIME/extension/dimension mismatches, and
-retry recovery. The test source uses platform bounds/pixel decoding for JPEG/PNG; HEIF remains an
-explicit injectable host fixture because the host decoder does not provide a production HEIF
-decode.
+encoded data: valid JPEG/PNG, a bounded structurally accepted HEIF ftyp fixture, insufficient HEIF,
+bad signature, truncated JPEG/PNG, a valid PNG signature with an invalid body, row absence,
+unavailable/open failures, empty content, size mismatch, bounds/pixel failures,
+MIME/extension/dimension mismatches, and retry progression whose final typed reason is asserted.
+The test source uses platform bounds/pixel decoding for JPEG/PNG; HEIF remains an explicit
+injectable host fixture because the host decoder does not provide a production HEIF decode. These
+tests do not stand in for a real MediaStore provider.
 
 ## Previous U2.2 cohort
 
