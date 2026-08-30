@@ -2,44 +2,99 @@ package com.projectnuke.keplernightlab
 
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import kotlin.math.max
+
+internal data class LandscapeLayoutRect(
+    val left: Float,
+    val top: Float,
+    val right: Float,
+    val bottom: Float
+) {
+    val width: Float get() = right - left
+    val height: Float get() = bottom - top
+
+    fun intersects(other: LandscapeLayoutRect): Boolean =
+        left < other.right && other.left < right && top < other.bottom && other.top < bottom
+}
+
+internal data class LandscapeLayoutBounds(
+    val topStatusRegion: LandscapeLayoutRect,
+    val modeRegion: LandscapeLayoutRect,
+    val zoomRegion: LandscapeLayoutRect,
+    val primaryActionRegion: LandscapeLayoutRect
+) {
+    val regions: List<LandscapeLayoutRect>
+        get() = listOf(topStatusRegion, modeRegion, zoomRegion, primaryActionRegion)
+}
 
 /**
- * Bounded spec for landscape camera chrome so the height gate is testable
- * without a device.
- *
- * The right-side primary action cluster (result, shutter, switch) must remain
- * visible even on a compact landscape viewport. Secondary clusters (zoom strip,
- * mode labels) are anchored separately and may be shortened/hidden before the
- * primary cluster is allowed to overflow.
+ * Bounded screen-space placement for landscape camera chrome. The mode lane
+ * is a horizontal row of explicit slots below the top/status region; the zoom
+ * cluster occupies the lower left/centre; the primary rail owns the right
+ * edge. Their rectangles are disjoint even in compact landscape.
  */
 object LandscapeLayoutSpec {
-    /** Narrow right rail — intentionally not widened to accommodate the 200dp ZoomSelector. */
     val RightRailWidth: Dp = 96.dp
-
-    /** Primary action rail estimated height in dp (result 56 + shutter 84 + switch 56 + spacings + padding). */
     val RightRailEstimatedHeightDp: Dp = 236.dp
-
-    /** S24-class landscape viewport usable height (short side minus insets). */
     val S24LandscapeUsableHeightDp: Dp = 360.dp
-
-    /** Smaller bounded landscape viewport used as a stress gate. */
     val CompactLandscapeUsableHeightDp: Dp = 320.dp
-
-    /** ZoomSelector horizontal Row estimated width (4×44 + spacing + padding). */
     val ZoomSelectorEstimatedWidthDp: Dp = 200.dp
 
-    /** Fixed width of each vertical mode hit target in landscape. */
-    val ModeSlotWidthDp: Dp = 52.dp
-
-    /** Fixed height of each vertical mode hit target in landscape. */
+    /** Explicit measured hit-target dimensions for each label. */
+    val ModeSlotWidthDp: Dp = 40.dp
     val ModeSlotHeightDp: Dp = 60.dp
-
-    /** Space between adjacent mode hit targets. */
     val ModeSlotSpacingDp: Dp = 2.dp
+    val TopStatusRegionHeightDp: Dp = 76.dp
+    val ClusterGapDp: Dp = 4.dp
+    val ZoomRegionWidthDp: Dp = 216.dp
+    val ZoomRegionHeightDp: Dp = 120.dp
 
-    val ModeLaneEstimatedHeightDp: Dp =
-        (ModeSlotHeightDp.value * 5f + ModeSlotSpacingDp.value * 4f).dp
+    val ModeLaneEstimatedWidthDp: Dp =
+        (ModeSlotWidthDp.value * 5f + ModeSlotSpacingDp.value * 4f).dp
+
+    /** Retained name for callers that use the lane's cross-axis extent. */
+    val ModeLaneEstimatedHeightDp: Dp = ModeSlotHeightDp
 
     fun rightRailFits(viewportHeightDp: Dp): Boolean =
         RightRailEstimatedHeightDp <= viewportHeightDp
+
+    internal fun bounds(viewportWidthDp: Float, viewportHeightDp: Float): LandscapeLayoutBounds {
+        require(viewportWidthDp > 0f && viewportHeightDp > 0f)
+        val topHeight = TopStatusRegionHeightDp.value
+        val gap = ClusterGapDp.value
+        val rightRailWidth = RightRailWidth.value
+        val modeWidth = ModeLaneEstimatedWidthDp.value
+        val modeHeight = ModeLaneEstimatedHeightDp.value
+        val zoomWidth = ZoomRegionWidthDp.value
+        val zoomHeight = ZoomRegionHeightDp.value
+        val primaryHeight = RightRailEstimatedHeightDp.value
+        val primaryLeft = viewportWidthDp - rightRailWidth
+        val primaryTop = max(
+            topHeight + gap,
+            (viewportHeightDp - primaryHeight) / 2f
+        )
+
+        return LandscapeLayoutBounds(
+            topStatusRegion = LandscapeLayoutRect(0f, 0f, viewportWidthDp, topHeight),
+            modeRegion = LandscapeLayoutRect(
+                left = gap,
+                top = topHeight + gap,
+                right = gap + modeWidth,
+                bottom = topHeight + gap + modeHeight
+            ),
+            zoomRegion = LandscapeLayoutRect(
+                left = ((viewportWidthDp - rightRailWidth - zoomWidth) / 2f).coerceAtLeast(gap),
+                top = viewportHeightDp - zoomHeight,
+                right = ((viewportWidthDp - rightRailWidth - zoomWidth) / 2f)
+                    .coerceAtLeast(gap) + zoomWidth,
+                bottom = viewportHeightDp
+            ),
+            primaryActionRegion = LandscapeLayoutRect(
+                left = primaryLeft,
+                top = primaryTop,
+                right = viewportWidthDp,
+                bottom = primaryTop + primaryHeight
+            )
+        )
+    }
 }

@@ -199,10 +199,10 @@ fun LandscapeModeTabs(
     val modes = listOf("인물 사진", "야간", "사진", "동영상", "더보기")
     // Each slot is a stable screen-space hit target. Only its Text content is
     // rotated; the lane and the five targets remain normal Compose geometry.
-    Column(
+    Row(
         modifier = modifier,
-        verticalArrangement = Arrangement.spacedBy(LandscapeLayoutSpec.ModeSlotSpacingDp),
-        horizontalAlignment = Alignment.CenterHorizontally
+        horizontalArrangement = Arrangement.spacedBy(LandscapeLayoutSpec.ModeSlotSpacingDp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
         modes.forEachIndexed { index, mode ->
             val isPhoto = mode == "사진"

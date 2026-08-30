@@ -52,6 +52,7 @@ fun Camera2Preview(
     modifier: Modifier = Modifier,
     cameraId: String,
     physicalCameraId: String? = null,
+    displayRotation: Int = Surface.ROTATION_0,
     zoomRatio: Float = 1.0f,
     selectedLensSlot: LensSlot,
     selectedThreeXSource: ThreeXSourceMode,
@@ -60,12 +61,14 @@ fun Camera2Preview(
     meteringMode: MeteringMode = MeteringModeState.mode,
     enabled: Boolean = true,
     onAeCapabilitiesChanged: (minIndex: Int, maxIndex: Int, stepEv: Float) -> Unit = { _, _, _ -> },
+    onPreviewBufferSizeChanged: (width: Int, height: Int) -> Unit = { _, _ -> },
     onPreviewAvailabilityChanged: (PreviewAvailability) -> Unit = {}
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     var textureView by remember { mutableStateOf<TextureView?>(null) }
     val latestOnAeCapabilitiesChanged = rememberUpdatedState(onAeCapabilitiesChanged)
+    val latestOnPreviewBufferSizeChanged = rememberUpdatedState(onPreviewBufferSizeChanged)
     val latestOnPreviewAvailabilityChanged = rememberUpdatedState(onPreviewAvailabilityChanged)
     var lifecycleStarted by remember {
         mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED))
@@ -78,8 +81,13 @@ fun Camera2Preview(
             physicalCameraId = physicalCameraId,
             actualLensSource = actualLensSource,
             onAeCapabilitiesChangedProvider = { latestOnAeCapabilitiesChanged.value },
+            onPreviewBufferSizeChangedProvider = { latestOnPreviewBufferSizeChanged.value },
             onPreviewAvailabilityChangedProvider = { latestOnPreviewAvailabilityChanged.value }
         )
+    }
+
+    LaunchedEffect(displayRotation) {
+        controller.updateDisplayRotation(displayRotation)
     }
 
     LaunchedEffect(zoomRatio) {
@@ -149,6 +157,7 @@ fun Camera2Preview(
         val view = textureView
 
         if (enabled && lifecycleStarted && view != null) {
+            controller.updateDisplayRotation(displayRotation)
             controller.start(view)
         } else {
             controller.stop()
@@ -166,6 +175,7 @@ internal class CameraPreviewController(
     private val physicalCameraId: String?,
     private val actualLensSource: ActualLensSource,
     private val onAeCapabilitiesChangedProvider: () -> (minIndex: Int, maxIndex: Int, stepEv: Float) -> Unit,
+    private val onPreviewBufferSizeChangedProvider: () -> (width: Int, height: Int) -> Unit = { { _, _ -> } },
     private val onPreviewAvailabilityChangedProvider: () -> (PreviewAvailability) -> Unit,
     private val mainDispatch: (Runnable) -> Boolean = { runnable ->
         Handler(Looper.getMainLooper()).post(runnable)
@@ -185,7 +195,7 @@ internal class CameraPreviewController(
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
     private var previewSurface: Surface? = null
-    private var currentPreviewSize: Size? = null
+    @Volatile private var currentPreviewSize: Size? = null
     @Volatile private var latestZoomRatio: Float = 1.0f
     @Volatile private var latestSelectedLensSlot: LensSlot = LensSlot.MAIN_1X
     @Volatile private var latestSelectedThreeXSource: ThreeXSourceMode = ThreeXSourceMode.OPTICAL
@@ -193,6 +203,7 @@ internal class CameraPreviewController(
     private var lastActivePhysicalLog: String? = null
     @Volatile private var latestFocusAeState: FocusAeState = FocusAeState()
     @Volatile private var latestMeteringMode: MeteringMode = MeteringModeState.mode
+    @Volatile private var latestDisplayRotation: Int = Surface.ROTATION_0
     @Volatile private var meteringDisplayRotation: Int = Surface.ROTATION_0
     private var openRequestedGeneration: Int? = null
     private var lastTextureView: TextureView? = null
@@ -542,6 +553,25 @@ internal class CameraPreviewController(
         }
     }
 
+    /** Updates display-sensitive state and reapplies only the TextureView transform. */
+    fun updateDisplayRotation(newRotation: Int) {
+        val degrees = displayRotationDegrees(newRotation) ?: return
+        val rotation = when (degrees) {
+            0 -> Surface.ROTATION_0
+            90 -> Surface.ROTATION_90
+            180 -> Surface.ROTATION_180
+            else -> Surface.ROTATION_270
+        }
+        latestDisplayRotation = rotation
+        meteringDisplayRotation = rotation
+        val (view, previewSize) = synchronized(lock) {
+            lastTextureView to currentPreviewSize
+        }
+        if (view != null && previewSize != null && view.width > 0 && view.height > 0) {
+            configureTransform(view, previewSize)
+        }
+    }
+
     fun updateZoomRatio(newZoomRatio: Float) {
         if (isDisposed()) {
             recordCommandOutcome(currentCommandGeneration(), PreviewCommandApplyOutcome.DISPATCH_REJECTED)
@@ -745,6 +775,17 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
             if (!storeCurrentPreviewSize(localGeneration, previewSize)) {
                 thread.quitSafely()
                 return
+            }
+            try {
+                if (!mainDispatch(Runnable {
+                        if (isActive(localGeneration)) {
+                            onPreviewBufferSizeChangedProvider().invoke(previewSize.width, previewSize.height)
+                        }
+                    })) {
+                    Log.w(TAG, "preview buffer size dispatch rejected generation=$localGeneration")
+                }
+            } catch (failure: Throwable) {
+                Log.w(TAG, "preview buffer size dispatch threw generation=$localGeneration", failure)
             }
 
             val surfaceTexture = textureView.surfaceTexture
@@ -1243,7 +1284,7 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
         }
     }
 
-private fun buildMeteringRectangle(
+    private fun buildMeteringRectangle(
         characteristics: CameraCharacteristics,
         zoomRatio: Float,
         point: NormalizedPoint?,
@@ -1251,11 +1292,8 @@ private fun buildMeteringRectangle(
         weight: Int
     ): MeteringRectangle? {
         val rawPoint = point ?: return null
-        val sensorPoint = transformDisplayPointToSensorPoint(
-            displayPoint = rawPoint,
-            sensorOrientationDegrees = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0,
-            displayRotation = meteringDisplayRotation
-        )
+        val previewGeometry = currentPreviewGeometry(characteristics) ?: return null
+        val sensorPoint = mapDisplayPointToPreviewBuffer(rawPoint, previewGeometry)
         val cropRegion = buildMeteringCropRegion(characteristics, zoomRatio)
         val regionWidth = max(48, (cropRegion.width() * fraction).roundToInt())
         val regionHeight = max(48, (cropRegion.height() * fraction).roundToInt())
@@ -1270,6 +1308,24 @@ private fun buildMeteringRectangle(
             top + regionHeight
         )
         return MeteringRectangle(rect, weight.coerceIn(0, MeteringRectangle.METERING_WEIGHT_MAX))
+    }
+
+    private fun currentPreviewGeometry(
+        characteristics: CameraCharacteristics
+    ): PreviewTransformGeometry? {
+        val previewSize = currentPreviewSize ?: return null
+        val view = lastTextureView ?: return null
+        if (view.width <= 0 || view.height <= 0) return null
+        return calculatePreviewTransformGeometry(
+            bufferWidth = previewSize.width,
+            bufferHeight = previewSize.height,
+            viewportWidth = view.width.toFloat(),
+            viewportHeight = view.height.toFloat(),
+            sensorOrientationDegrees = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0,
+            displayRotation = meteringDisplayRotation,
+            lensFacing = characteristics.get(CameraCharacteristics.LENS_FACING)
+                ?: CameraCharacteristics.LENS_FACING_BACK
+        )
     }
 
     private fun buildMeteringCropRegion(
@@ -1461,7 +1517,7 @@ private fun storeCaptureSession(
         val sensorOrientation = characteristics
             ?.get(CameraCharacteristics.SENSOR_ORIENTATION)
             ?: 0
-        val displayRotation = textureView.display?.rotation ?: Surface.ROTATION_0
+        val displayRotation = latestDisplayRotation
         meteringDisplayRotation = displayRotation
         val geometry = calculatePreviewTransformGeometry(
             bufferWidth = previewSize.width,
@@ -1469,16 +1525,23 @@ private fun storeCaptureSession(
             viewportWidth = viewWidth,
             viewportHeight = viewHeight,
             sensorOrientationDegrees = sensorOrientation,
-            displayRotation = displayRotation
+            displayRotation = displayRotation,
+            lensFacing = characteristics
+                ?.get(CameraCharacteristics.LENS_FACING)
+                ?: CameraCharacteristics.LENS_FACING_BACK
         )
         Log.d(
             TAG,
             "configureTransform view=${viewWidth}x$viewHeight previewSize=${previewSize.width}x${previewSize.height} " +
                 "sensorOrientation=$sensorOrientation displayRotation=$displayRotation " +
                 "relativeRotation=${geometry.relativeRotationDegrees} " +
+                "cameraOrientation=${geometry.cameraOrientationDegrees} " +
+                "displayCompensation=${geometry.displayCompensationDegrees} " +
                 "logical=${geometry.logicalWidth}x${geometry.logicalHeight} " +
                 "uniformScale=${geometry.uniformScale} " +
+                "implicitScale=${geometry.implicitScaleX}x${geometry.implicitScaleY} " +
                 "scaled=${geometry.scaledWidth}x${geometry.scaledHeight} " +
+                "crop=${geometry.cropOffsetX},${geometry.cropOffsetY} " +
                 "offset=${geometry.offsetX},${geometry.offsetY}"
         )
 

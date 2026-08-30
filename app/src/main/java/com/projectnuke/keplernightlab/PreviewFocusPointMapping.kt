@@ -22,35 +22,28 @@ fun normalizeDisplayPoint(offset: Offset, containerSize: Size): NormalizedPoint?
 }
 
 /**
- * SENSOR-SPACE transform, applied ONLY when Camera2 metering coordinates are
- * built.
- *
- * This uses the same orientation basis as
- * [CameraPreviewController.configureTransform]:
- *   sensorOrientation  = CameraCharacteristics.SENSOR_ORIENTATION
- *   displayRotation   = Surface.ROTATION_0/90/180/270
- *   relativeRotation  = relativeRotationDegrees(sensorOrientation, display)
- *
- * The display-normalized point is counter-rotated by relativeRotation to reach
- * the sensor/crop-normalized space:
- *     0   -> (x, y)
- *     90  -> (1 - y, x)
- *     180 -> (1 - x, 1 - y)
- *     270 -> (y, 1 - x)
- *
- * Center is invariant under every rotation (a pure right-angle rotation maps
- * (0.5, 0.5) to (0.5, 0.5)), which is asserted by tests.
- *
- * [mirrored] exists as an explicit seam for any future front-camera path that
- * horizontally flips the preview. The current production path never mirrors,
- * so callers leave it false; the transform still documents the audit point so a
- * front-camera capture cannot silently share the un-mirrored coordinate basis.
+ * Inverts the exact visual viewfinder transform. The point remains in display
+ * space until this function is called while building Camera2 metering regions.
+ * The returned point is normalized in the unrotated preview-buffer coordinate
+ * system, before it is placed inside the current active-array/zoom crop.
  */
+internal fun mapDisplayPointToPreviewBuffer(
+    displayPoint: NormalizedPoint,
+    geometry: PreviewTransformGeometry
+): NormalizedPoint = geometry.mapDisplayNormalizedPointToBuffer(displayPoint)
+
+/**
+ * Compatibility seam for callers that only need a right-angle orientation
+ * conversion. Production metering must use [mapDisplayPointToPreviewBuffer]
+ * with the actual preview geometry so center-crop offsets cannot be lost.
+ */
+@Deprecated("Use mapDisplayPointToPreviewBuffer with canonical preview geometry")
 fun transformDisplayPointToSensorPoint(
     displayPoint: NormalizedPoint,
     sensorOrientationDegrees: Int,
     displayRotation: Int,
-    mirrored: Boolean = false
+    mirrored: Boolean = false,
+    lensFacing: Int = android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK
 ): NormalizedPoint {
     var x = displayPoint.x.coerceIn(0f, 1f)
     var y = displayPoint.y.coerceIn(0f, 1f)
@@ -59,7 +52,8 @@ fun transformDisplayPointToSensorPoint(
     }
     val relativeRotation = relativeRotationDegrees(
         sensorOrientationDegrees = sensorOrientationDegrees,
-        displayRotation = displayRotation
+        displayRotation = displayRotation,
+        lensFacing = lensFacing
     )
     return when (relativeRotation) {
         90 -> NormalizedPoint(1f - y, x)

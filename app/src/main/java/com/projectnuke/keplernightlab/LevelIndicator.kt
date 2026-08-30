@@ -23,7 +23,6 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalView
 
 data class DeviceLevelState(
     val available: Boolean = false,
@@ -34,10 +33,10 @@ data class DeviceLevelState(
 
 @Composable
 fun rememberDeviceLevelState(
-    enabled: Boolean
+    enabled: Boolean,
+    displayRotation: Int = Surface.ROTATION_0
 ): DeviceLevelState {
     val context = LocalContext.current
-    val displayRotation = LocalView.current.display?.rotation ?: Surface.ROTATION_0
     var state by remember { mutableStateOf(DeviceLevelState()) }
 
     DisposableEffect(enabled, displayRotation) {

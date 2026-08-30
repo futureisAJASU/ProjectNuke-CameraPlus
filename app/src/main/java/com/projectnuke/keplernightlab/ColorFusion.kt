@@ -283,6 +283,8 @@ fun captureYuvBurstColorWithMotion(
     previewRoute: String? = null,
     routeFallbackReason: String? = null,
     focusAeState: FocusAeState = FocusAeState(),
+    displayRotation: Int = Surface.ROTATION_0,
+    previewViewfinderInput: PreviewViewfinderInput? = null,
     frameCountMode: FrameCountMode = FrameCountMode.AUTO,
     autoMinFrames: Int = 4,
     autoMaxFrames: Int = 8,
@@ -476,7 +478,7 @@ fun captureYuvBurstColorWithMotion(
             if (actualCaptureRoute == PhysicalCaptureRoute.PHYSICAL) physicalCameraId else null
         val rotationDegrees = calculateResultRotationDegrees(
             characteristics,
-            context.display?.rotation ?: Surface.ROTATION_0
+            displayRotation
         )
 
         postStatus("Color Fusion 초기화 2/7: 저장 폴더 준비 중...")
@@ -1083,7 +1085,8 @@ fun captureYuvBurstColorWithMotion(
                                                     zoomRatio = requestZoomRatio,
                                                     focusAeState = focusAeState,
                                                     cameraId = cameraId,
-                                                    displayRotation = context.display?.rotation ?: Surface.ROTATION_0,
+                                                    displayRotation = displayRotation,
+                                                    previewViewfinderInput = previewViewfinderInput,
                                                     postStatus = ::postStatus,
                                                     failureMessages = yuvCaptureRequestTemplateFailures
                                                 )
@@ -1714,6 +1717,7 @@ private fun createYuvBurstCaptureRequestBuilder(
     focusAeState: FocusAeState,
     cameraId: String,
     displayRotation: Int,
+    previewViewfinderInput: PreviewViewfinderInput? = null,
     postStatus: (String) -> Unit,
     failureMessages: MutableList<String>? = null
 ): Pair<CaptureRequest.Builder, Int> {
@@ -1777,7 +1781,8 @@ private fun createYuvBurstCaptureRequestBuilder(
             zoomRatio = zoomRatio,
             focusAeState = focusAeState,
             cameraId = cameraId,
-            displayRotation = displayRotation
+            displayRotation = displayRotation,
+            previewViewfinderInput = previewViewfinderInput
         )
         return builder to template
     }

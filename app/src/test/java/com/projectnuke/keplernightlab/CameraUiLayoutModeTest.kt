@@ -67,4 +67,28 @@ class CameraUiLayoutModeTest {
         assertEquals(true, CameraUiLayoutMode.LANDSCAPE_LEFT != CameraUiLayoutMode.PORTRAIT)
         assertEquals(true, CameraUiLayoutMode.LANDSCAPE_RIGHT != CameraUiLayoutMode.PORTRAIT)
     }
+
+    @Test
+    fun authoritativeRotationStateEmitsPortraitLandscapeLeftLandscapeRightPortrait() {
+        val rotations = DisplayRotationState(android.view.Surface.ROTATION_0)
+        listOf(
+            android.view.Surface.ROTATION_90 to CameraUiLayoutMode.LANDSCAPE_LEFT,
+            android.view.Surface.ROTATION_270 to CameraUiLayoutMode.LANDSCAPE_RIGHT,
+            android.view.Surface.ROTATION_0 to CameraUiLayoutMode.PORTRAIT
+        ).forEach { (rotation, expectedMode) ->
+            rotations.update(rotation)
+            assertEquals(rotation, rotations.rotation)
+            assertEquals(expectedMode, deriveCameraUiLayoutMode(rotations.rotation))
+        }
+    }
+
+    @Test
+    fun authoritativeRotationStateAlsoEmitsUpsideDownPortraitWithoutSizeChange() {
+        val rotations = DisplayRotationState(android.view.Surface.ROTATION_0)
+        rotations.update(android.view.Surface.ROTATION_180)
+        assertEquals(android.view.Surface.ROTATION_180, rotations.rotation)
+        assertEquals(CameraUiLayoutMode.PORTRAIT, deriveCameraUiLayoutMode(rotations.rotation))
+        rotations.update(android.view.Surface.ROTATION_0)
+        assertEquals(android.view.Surface.ROTATION_0, rotations.rotation)
+    }
 }

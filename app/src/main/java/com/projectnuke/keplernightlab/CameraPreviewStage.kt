@@ -1,6 +1,5 @@
 package com.projectnuke.keplernightlab
 
-import android.view.Surface
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
@@ -17,7 +16,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
@@ -27,10 +27,11 @@ private val PreviewTopInset: Dp = 88.dp
 internal fun PreviewStage(
     state: CameraPreviewPaneState,
     callbacks: CameraPreviewPaneCallbacks,
+    displayRotation: Int,
+    onPreviewViewportSizeChanged: (IntSize) -> Unit = {},
     modifier: Modifier = Modifier,
     meteringMode: MeteringMode = MeteringModeState.mode
 ) {
-    val displayRotation = LocalView.current.display?.rotation ?: Surface.ROTATION_0
     val layoutMode = deriveCameraUiLayoutMode(displayRotation)
 
     BoxWithConstraints(
@@ -64,6 +65,7 @@ internal fun PreviewStage(
         Box(
             modifier = Modifier
                 .then(previewModifier)
+                .onSizeChanged(onPreviewViewportSizeChanged)
                 .background(Color.Black)
                 .pointerInput(layoutMode) {
                     detectTapGestures { offset ->
@@ -85,6 +87,7 @@ internal fun PreviewStage(
             Camera2Preview(
                 modifier = Modifier.fillMaxSize(),
                 cameraId = state.cameraSelection.cameraId,
+                displayRotation = displayRotation,
                 physicalCameraId = state.cameraSelection.physicalCameraId.takeIf {
                     state.cameraSelection.actualLensSource == ActualLensSource.OPTICAL_TELE_PHYSICAL
                 },
@@ -96,6 +99,7 @@ internal fun PreviewStage(
                 meteringMode = meteringMode,
                 enabled = state.previewEnabled,
                 onAeCapabilitiesChanged = callbacks.onAeCapabilitiesChanged,
+                onPreviewBufferSizeChanged = callbacks.onPreviewBufferSizeChanged,
                 onPreviewAvailabilityChanged = callbacks.onPreviewAvailabilityChanged
             )
 

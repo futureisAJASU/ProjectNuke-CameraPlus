@@ -70,15 +70,16 @@ internal fun levelFromDisplayGravity(
 }
 
 /**
- * Converts a rotation-vector matrix into gravity in natural device axes.
- * Android's rotation matrix maps a device vector into world coordinates, so
- * the inverse-mapped world-Z direction is the matrix's third row.
+ * Converts a rotation-vector matrix into physical DOWN in natural device
+ * axes. Android's rotation matrix exposes the inverse-mapped world-up
+ * direction in its third row; negate it once here so the rest of the level
+ * pipeline consistently consumes physical down (normal forward pose: -Y).
  */
 internal fun gravityFromRotationMatrix(rotationMatrix: FloatArray): DisplayRelativeGravity? {
     if (rotationMatrix.size < 9) return null
     return DisplayRelativeGravity(
-        x = rotationMatrix[6],
-        y = rotationMatrix[7],
-        z = rotationMatrix[8]
+        x = -rotationMatrix[6],
+        y = -rotationMatrix[7],
+        z = -rotationMatrix[8]
     )
 }

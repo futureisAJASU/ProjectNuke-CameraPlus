@@ -60,7 +60,8 @@ fun CaptureRequest.Builder.applyZoomAndFocusAe(
     focusAeState: FocusAeState,
     useMaximumResolutionActiveArray: Boolean = false,
     cameraId: String? = null,
-    displayRotation: Int = android.view.Surface.ROTATION_0
+    displayRotation: Int = android.view.Surface.ROTATION_0,
+    previewViewfinderInput: PreviewViewfinderInput? = null
 ) {
     val zoomApplication = applyCamera2Zoom(
         characteristics = characteristics,
@@ -91,7 +92,19 @@ fun CaptureRequest.Builder.applyZoomAndFocusAe(
         zoomApplication = zoomApplication,
         point = focusAeState.point,
         useMaximumResolutionActiveArray = useMaximumResolutionActiveArray,
-        displayRotation = displayRotation
+        displayRotation = displayRotation,
+        previewGeometry = previewViewfinderInput?.let { input ->
+            calculatePreviewTransformGeometry(
+                bufferWidth = input.bufferWidth,
+                bufferHeight = input.bufferHeight,
+                viewportWidth = input.viewportWidth,
+                viewportHeight = input.viewportHeight,
+                sensorOrientationDegrees = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0,
+                displayRotation = displayRotation,
+                lensFacing = characteristics.get(CameraCharacteristics.LENS_FACING)
+                    ?: CameraCharacteristics.LENS_FACING_BACK
+            )
+        }
     )
     if (region != null) {
         set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
@@ -105,14 +118,13 @@ fun buildFocusAeMeteringRectangle(
     zoomApplication: Camera2ZoomApplication,
     point: NormalizedPoint?,
     useMaximumResolutionActiveArray: Boolean = false,
-    displayRotation: Int = android.view.Surface.ROTATION_0
+    displayRotation: Int = android.view.Surface.ROTATION_0,
+    previewGeometry: PreviewTransformGeometry? = null
 ): MeteringRectangle? {
     if (point == null) return null
-    val sensorPoint = transformDisplayPointToSensorPoint(
-        displayPoint = point,
-        sensorOrientationDegrees = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0,
-        displayRotation = displayRotation
-    )
+    val bufferPoint = previewGeometry?.let { geometry ->
+        mapDisplayPointToPreviewBuffer(point, geometry)
+    } ?: return null
     val activeSource = if (
         zoomApplication.usedControlZoomRatio &&
         useMaximumResolutionActiveArray &&
@@ -136,8 +148,9 @@ fun buildFocusAeMeteringRectangle(
             useMaximumResolutionActiveArray = useMaximumResolutionActiveArray
         ).region ?: active
     }
-    val x = (crop.left + crop.width() * sensorPoint.x.coerceIn(0f, 1f)).roundToInt()
-    val y = (crop.top + crop.height() * sensorPoint.y.coerceIn(0f, 1f)).roundToInt()
+    val cropPoint = mapNormalizedPreviewPointToCrop(bufferPoint, crop)
+    val x = cropPoint.x.roundToInt()
+    val y = cropPoint.y.roundToInt()
     val box = (minOf(crop.width(), crop.height()) * 0.10f).roundToInt().coerceAtLeast(16)
     val rect = Rect(
         (x - box / 2).coerceIn(crop.left, crop.right - 1),
@@ -148,7 +161,16 @@ fun buildFocusAeMeteringRectangle(
     Log.d(
         "KeplerMetering",
         "metering mode=${if (zoomApplication.usedControlZoomRatio) "CONTROL_ZOOM_RATIO" else "SCALER_CROP_REGION"} " +
-            "activeArray=$activeSource zoom=${zoomApplication.appliedZoomRatio} sensorPoint=$sensorPoint region=$rect"
+            "activeArray=$activeSource zoom=${zoomApplication.appliedZoomRatio} bufferPoint=$bufferPoint region=$rect"
     )
     return MeteringRectangle(rect, MeteringRectangle.METERING_WEIGHT_MAX)
 }
+
+/** Maps canonical preview-buffer coordinates into the active Camera2 crop. */
+internal fun mapNormalizedPreviewPointToCrop(
+    bufferPoint: NormalizedPoint,
+    crop: Rect
+): PreviewPoint = PreviewPoint(
+    x = crop.left + (crop.right - crop.left) * bufferPoint.x.coerceIn(0f, 1f),
+    y = crop.top + (crop.bottom - crop.top) * bufferPoint.y.coerceIn(0f, 1f)
+)

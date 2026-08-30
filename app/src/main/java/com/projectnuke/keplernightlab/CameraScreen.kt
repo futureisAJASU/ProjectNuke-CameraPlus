@@ -7,7 +7,6 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Handler
 import android.os.Looper
-import android.view.Surface
 import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -70,6 +69,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -84,7 +84,6 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextOverflow
@@ -172,9 +171,6 @@ private val BottomOverlaySpacing: Dp = 4.dp
 private val FloatingClusterHorizontalPadding: Dp = 10.dp
 private val FloatingClusterVerticalPadding: Dp = 8.dp
 private const val ZoomSliderAutoHideDelayMillis = 2500L
-private val LandscapeChromeWidth: Dp = 96.dp
-private val LandscapeSliderWidth: Dp = 84.dp
-
 private fun mapSliderPositionToValue(
     x: Float,
     width: Float,
@@ -475,8 +471,25 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
         pipelineMode = pipelineMode,
         capabilityRefreshNonce = capabilityRefreshNonce
     )
-    val levelState = rememberDeviceLevelState(enabled = overlaySettings.showLevel)
-    val captureDisplayRotation = LocalView.current.display?.rotation ?: Surface.ROTATION_0
+    val displayRotation = rememberAuthoritativeDisplayRotation()
+    val levelState = rememberDeviceLevelState(
+        enabled = overlaySettings.showLevel,
+        displayRotation = displayRotation
+    )
+    var previewBufferSize by remember { mutableStateOf(IntSize(1920, 1440)) }
+    var previewViewportSize by remember { mutableStateOf(IntSize.Zero) }
+    val previewViewfinderInput = remember(previewBufferSize, previewViewportSize) {
+        if (previewViewportSize.width > 0 && previewViewportSize.height > 0) {
+            PreviewViewfinderInput(
+                bufferWidth = previewBufferSize.width,
+                bufferHeight = previewBufferSize.height,
+                viewportWidth = previewViewportSize.width.toFloat(),
+                viewportHeight = previewViewportSize.height.toFloat()
+            )
+        } else {
+            null
+        }
+    }
 
     LaunchedEffect(Unit) {
         logLongReport("KeplerCameraDump", buildFullCameraDumpReport(context))
@@ -1027,6 +1040,8 @@ LaunchedEffect(Unit) {
             focusAeState = focusAeState,
             rawSpeedMode = rawSpeedMode,
             processingParams = processingSettings.resolvedParams(),
+            displayRotation = displayRotation,
+            previewViewfinderInput = previewViewfinderInput,
             saveDngSidecars = true,
             captureCancellationHandle = captureCancellation,
             onStatus = callback,
@@ -1065,6 +1080,8 @@ LaunchedEffect(Unit) {
     ) {
         PreviewStage(
             modifier = Modifier.fillMaxSize(),
+            displayRotation = displayRotation,
+            onPreviewViewportSizeChanged = { previewViewportSize = it },
             state = CameraPreviewPaneState(
                 cameraSelection = cameraState.selection,
                 previewZoomRatio = cameraState.previewZoomRatio,
@@ -1129,6 +1146,9 @@ LaunchedEffect(Unit) {
                     focusAeUiNonce++
                     showZoomSlider = false
                     status = "EV ${"%.1f".format(index * focusAeState.exposureStepEv)}"
+                },
+                onPreviewBufferSizeChanged = { width, height ->
+                    previewBufferSize = IntSize(width, height)
                 }
             )
         )
@@ -1158,7 +1178,6 @@ LaunchedEffect(Unit) {
             }
         )
 
-        val displayRotation = LocalView.current.display?.rotation ?: android.view.Surface.ROTATION_0
         val cameraLayoutMode = deriveCameraUiLayoutMode(displayRotation)
 
         // Capture action shared between bottom shutter and volume dispatcher
@@ -1225,7 +1244,7 @@ LaunchedEffect(Unit) {
                     }
                     val attemptCaptureMode = captureMode
                     val attemptRawSpeedMode = rawSpeedMode
-                    val attemptDisplayRotation = captureDisplayRotation
+                    val attemptDisplayRotation = displayRotation
                     runCameraJob(
                         startMessage = clickResult.prepared.startMessage,
                         requestedFrames = clickResult.prepared.framePlan.framesToCapture,
@@ -1251,6 +1270,7 @@ LaunchedEffect(Unit) {
                                 captureMode = attemptCaptureMode,
                                 processingSettings = attemptSettings.processingSettings,
                                 displayRotation = attemptDisplayRotation,
+                                previewViewfinderInput = previewViewfinderInput,
                                 captureCancellationHandle = captureCancellation,
                                 cancellation = cancellation
                             ),
@@ -1556,6 +1576,8 @@ LaunchedEffect(Unit) {
                             zoomRatio = 1.0f,
                             requestedUiZoomRatio = 1.0f,
                             focusAeState = focusAeState,
+                            displayRotation = displayRotation,
+                            previewViewfinderInput = previewViewfinderInput,
                             captureCancellationHandle = captureCancellation,
                             onStatus = callback,
                             onComplete = { jobDir ->
@@ -1619,6 +1641,8 @@ LaunchedEffect(Unit) {
                             zoomRatio = 1.0f,
                             requestedUiZoomRatio = 1.0f,
                             focusAeState = focusAeState,
+                            displayRotation = displayRotation,
+                            previewViewfinderInput = previewViewfinderInput,
                             captureMode = CaptureMode.SINGLE_FRAME,
                             captureCancellationHandle = captureCancellation,
                             onComplete = { jobDir ->
@@ -2045,43 +2069,61 @@ private fun CameraLandscapeChrome(
     //   • stable primary actions at the right edge
     // No cluster rotates or paints a full-width translucent panel over the
     // preview; the controls themselves provide their own compact surfaces.
-    Box(
+    BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()
-            .navigationBarsPadding(),
-        contentAlignment = Alignment.CenterEnd
+            .navigationBarsPadding()
     ) {
-        // Zoom cluster — bottom-center, enough width for the selector.
-        Row(
+        val layoutBounds = LandscapeLayoutSpec.bounds(maxWidth.value, maxHeight.value)
+        // Zoom cluster. Its explicit rectangle is kept clear of both the mode
+        // lane and the right-side primary-action lane in compact landscape.
+        Box(
             modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 8.dp, start = 8.dp, end = LandscapeChromeWidth + 8.dp)
-                .padding(horizontal = 4.dp, vertical = 4.dp)
-                .clickable(onClick = onToggleZoomSlider),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                .offset(
+                    x = layoutBounds.zoomRegion.left.dp,
+                    y = layoutBounds.zoomRegion.top.dp
+                )
+                .size(
+                    width = layoutBounds.zoomRegion.width.dp,
+                    height = layoutBounds.zoomRegion.height.dp
+                )
+                .clipToBounds()
+                .clickable(onClick = onToggleZoomSlider)
         ) {
-            ZoomSelector(selected = selectedLensSlot, onSelect = onLensSlotChange)
-            if (selectedLensSlot == LensSlot.THREE_X) {
-                ThreeXSourceDots(selected = selectedThreeXSource, onSelect = onThreeXSourceChange)
-            }
-            AnimatedVisibility(visible = showZoomSlider) {
+            Column(
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .padding(4.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text(
-                        text = "${"%.1f".format(zoomUiState.zoomRatio)}x",
-                        color = Color.White.copy(alpha = 0.72f),
-                        style = MaterialTheme.typography.labelMedium,
-                        modifier = Modifier.clickable(onClick = onToggleZoomSlider)
-                    )
-                    CompactZoomSlider(
-                        value = zoomUiState.zoomRatio,
-                        onZoomRatioChange = onZoomRatioChange,
-                        valueRange = zoomUiState.minZoom..zoomUiState.maxZoom,
-                        modifier = Modifier.width(120.dp)
-                    )
+                    ZoomSelector(selected = selectedLensSlot, onSelect = onLensSlotChange)
+                }
+                if (selectedLensSlot == LensSlot.THREE_X) {
+                    ThreeXSourceDots(selected = selectedThreeXSource, onSelect = onThreeXSourceChange)
+                }
+                AnimatedVisibility(visible = showZoomSlider) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = "${"%.1f".format(zoomUiState.zoomRatio)}x",
+                            color = Color.White.copy(alpha = 0.72f),
+                            style = MaterialTheme.typography.labelMedium,
+                            modifier = Modifier.clickable(onClick = onToggleZoomSlider)
+                        )
+                        CompactZoomSlider(
+                            value = zoomUiState.zoomRatio,
+                            onZoomRatioChange = onZoomRatioChange,
+                            valueRange = zoomUiState.minZoom..zoomUiState.maxZoom,
+                            modifier = Modifier.width(120.dp)
+                        )
+                    }
                 }
             }
         }
@@ -2090,17 +2132,32 @@ private fun CameraLandscapeChrome(
         // content rotates, so hit targets and neighbouring slots stay stable.
         Box(
             modifier = Modifier
-                .align(Alignment.CenterStart)
-                .padding(start = 2.dp)
+                .offset(
+                    x = layoutBounds.modeRegion.left.dp,
+                    y = layoutBounds.modeRegion.top.dp
+                )
+                .size(
+                    width = layoutBounds.modeRegion.width.dp,
+                    height = layoutBounds.modeRegion.height.dp
+                )
         ) {
-            LandscapeModeTabs(layoutMode = layoutMode)
+            LandscapeModeTabs(
+                layoutMode = layoutMode,
+                modifier = Modifier.fillMaxSize()
+            )
         }
 
-        // Narrow right-side action lane — ONLY primary actions.
+        // Narrow right-side action lane — ONLY primary actions. Its measured
+        // rectangle is independent of the top/status and zoom rectangles.
         Column(
             modifier = Modifier
-                .align(Alignment.CenterEnd)
-                .width(LandscapeChromeWidth)
+                .offset(
+                    x = layoutBounds.primaryActionRegion.left.dp,
+                    y = layoutBounds.primaryActionRegion.top.dp
+                )
+                .width(layoutBounds.primaryActionRegion.width.dp)
+                .height(layoutBounds.primaryActionRegion.height.dp)
+                .clipToBounds()
                 .padding(horizontal = 6.dp)
                 .padding(vertical = 10.dp),
             horizontalAlignment = Alignment.CenterHorizontally,

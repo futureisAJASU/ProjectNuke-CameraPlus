@@ -96,6 +96,7 @@ internal data class CapturePipelineRequest(
     val captureMode: CaptureMode = CaptureMode.MULTI_FRAME,
     val processingSettings: ProcessingSettings = ProcessingSettings.default(),
     val displayRotation: Int = android.view.Surface.ROTATION_0,
+    val previewViewfinderInput: PreviewViewfinderInput? = null,
     val captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     val cancellation: KeplerPipelineCancellation = NoOpKeplerPipelineCancellation
 )
@@ -118,6 +119,7 @@ internal data class CameraPreviewPaneCallbacks(
     val onAeCapabilitiesChanged: (Int, Int, Float) -> Unit,
     val onToggleFocusLock: () -> Unit,
     val onExposureStep: (Int) -> Unit,
+    val onPreviewBufferSizeChanged: (Int, Int) -> Unit = { _, _ -> },
     val onPreviewAvailabilityChanged: (PreviewAvailability) -> Unit = {}
 )
 

@@ -203,6 +203,7 @@ fun captureRawBurstForFusion(
     rawSpeedMode: RawSpeedMode = RawSpeedMode.BALANCED,
     processingParams: ClassicYuvFusionParams = ClassicYuvFusionPreset.NATURAL.params,
     displayRotation: Int = android.view.Surface.ROTATION_0,
+    previewViewfinderInput: PreviewViewfinderInput? = null,
     saveDngSidecars: Boolean = false,
     captureCancellationHandle: KeplerCaptureCancellationHandle = NoOpKeplerCaptureCancellationHandle,
     onStatus: (String) -> Unit,
@@ -1861,7 +1862,8 @@ fun captureRawBurstForFusion(
                                             focusAeState = focusAeState,
                                             useMaximumResolutionActiveArray = rawSelection.requiresMaximumResolutionPixelMode,
                                             cameraId = cameraId,
-                                            displayRotation = displayRotation
+                                            displayRotation = displayRotation,
+                                            previewViewfinderInput = previewViewfinderInput
                                         )
                                     }.build()
                                 }
