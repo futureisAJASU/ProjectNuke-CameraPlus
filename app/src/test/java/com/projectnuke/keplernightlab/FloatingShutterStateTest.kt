@@ -187,4 +187,110 @@ class FloatingShutterStateTest {
         controller.endDrag()
         assertEquals(FloatingShutterState.FLOATING_IDLE, controller.state)
     }
+
+    // Floating coordinate contract: center vs top-left
+    @Test
+    fun centerToTopLeftConversion() {
+        val radius = 36f
+        assertEquals(Offset(0f, 0f), floatingShutterTopLeft(Offset(36f, 36f), radius))
+        assertEquals(Offset(328f, 728f), floatingShutterTopLeft(Offset(364f, 764f), radius))
+    }
+
+    @Test
+    fun renderedNodeStaysFullyOnScreen() {
+        val viewportW = 400f
+        val viewportH = 800f
+        val radius = 36f
+        val diameter = radius * 2f
+        val geom = computeFloatingShutterGeometry(
+            viewportWidthPx = viewportW, viewportHeightPx = viewportH,
+            shutterRadiusPx = radius, dockCenterPx = Offset(200f, 400f)
+        )!!
+        // clamped centers still render fully on-screen
+        listOf(
+            Offset(36f, 36f),
+            Offset(364f, 764f),
+            Offset(200f, 400f)
+        ).forEach { center ->
+            val clamped = clampFloatingPosition(center, geom)
+            val topLeft = floatingShutterTopLeft(clamped, radius)
+            assertTrue(topLeft.x >= -0.01f)
+            assertTrue(topLeft.y >= -0.01f)
+            assertTrue(topLeft.x + diameter <= viewportW + 0.01f)
+            assertTrue(topLeft.y + diameter <= viewportH + 0.01f)
+        }
+    }
+
+    @Test
+    fun activationAtDockCenterVisuallyCentersExactly() {
+        val dock = Offset(612f, 1620f)
+        val geom = computeFloatingShutterGeometry(
+            viewportWidthPx = 1080f, viewportHeightPx = 1920f,
+            shutterRadiusPx = 36f, dockCenterPx = dock
+        )!!
+        val controller = FloatingShutterController()
+        controller.updateGeometry(geom)
+        controller.activateFloating(dock)
+        assertEquals(dock.x, controller.position.x, 0.01f)
+        assertEquals(dock.y, controller.position.y, 0.01f)
+        // visual topLeft centers exactly: center - radius
+        assertEquals(dock.x - 36f, floatingShutterTopLeft(controller.position, 36f).x, 0.01f)
+        assertEquals(dock.y - 36f, floatingShutterTopLeft(controller.position, 36f).y, 0.01f)
+    }
+
+    @Test
+    fun dockComparisonUsesCenterNotTopLeft() {
+        val dock = Offset(200f, 200f)
+        val geom = computeFloatingShutterGeometry(
+            viewportWidthPx = 400f, viewportHeightPx = 800f,
+            shutterRadiusPx = 36f, dockCenterPx = dock
+        )!!
+        // If code mistakenly used topLeft instead of center, a center at
+        // (300,200) (100px away, outside dock radius 90) would be mis-evaluated
+        // as inside when passing its topLeft (264,164) (73px away).
+        val centerOutside = Offset(300f, 200f)
+        val topLeftForCenter = Offset(264f, 164f)
+        assertFalse(isWithinDock(centerOutside, geom))
+        assertTrue(isWithinDock(topLeftForCenter, geom))
+        // Conversely dock itself must be inside when passing center
+        assertTrue(isWithinDock(dock, geom))
+        // A point that is topLeft==dock (if misinterpreted as center) would
+        // still be inside, so we prove the distinction via the outside case above.
+    }
+
+    @Test
+    fun dragDeltaChangesCenterByIdenticalPx() {
+        val controller = FloatingShutterController()
+        val geom = computeFloatingShutterGeometry(
+            viewportWidthPx = 800f, viewportHeightPx = 800f,
+            shutterRadiusPx = 36f, dockCenterPx = Offset(400f, 700f)
+        )!!
+        controller.updateGeometry(geom)
+        controller.activateFloating(Offset(200f, 200f))
+        controller.startDrag()
+        controller.dragBy(Offset(15f, -25f))
+        assertEquals(215f, controller.position.x, 0.01f)
+        assertEquals(175f, controller.position.y, 0.01f)
+    }
+
+    @Test
+    fun resizeClampsCenterAndKeepsNodeFullyVisible() {
+        val geomLarge = computeFloatingShutterGeometry(
+            viewportWidthPx = 800f, viewportHeightPx = 1200f,
+            shutterRadiusPx = 36f, dockCenterPx = Offset(400f, 1000f)
+        )!!
+        val controller = FloatingShutterController()
+        controller.updateGeometry(geomLarge)
+        controller.activateFloating(Offset(760f, 1160f))
+        val geomSmall = computeFloatingShutterGeometry(
+            viewportWidthPx = 400f, viewportHeightPx = 800f,
+            shutterRadiusPx = 36f, dockCenterPx = Offset(200f, 700f)
+        )!!
+        controller.updateGeometry(geomSmall)
+        val topLeft = floatingShutterTopLeft(controller.position, 36f)
+        assertTrue(topLeft.x >= -0.01f)
+        assertTrue(topLeft.y >= -0.01f)
+        assertTrue(topLeft.x + 72f <= 400f + 0.01f)
+        assertTrue(topLeft.y + 72f <= 800f + 0.01f)
+    }
 }

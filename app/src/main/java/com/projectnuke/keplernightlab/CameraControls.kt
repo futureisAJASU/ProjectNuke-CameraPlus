@@ -197,19 +197,30 @@ fun ModeTabs(modifier: Modifier = Modifier) {
 fun LandscapeModeTabs(layoutMode: CameraUiLayoutMode) {
     val rotation = layoutMode.modeLabelRotationDegrees()
     val modes = listOf("인물 사진", "야간", "사진", "동영상", "더보기")
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+    // In landscape the labels are visually rotated ±90°, but graphicsLayer
+    // does NOT change measured size. Each label is therefore wrapped in a
+    // fixed-size Box that is large enough for the rotated visual to stay
+    // inside its slot and not overlap neighbours.
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
         modes.forEach { mode ->
             val isPhoto = mode == "사진"
-            Text(
-                text = mode,
-                color = if (isPhoto) Color.White else Color.White.copy(alpha = 0.28f),
-                style = if (isPhoto) MaterialTheme.typography.titleSmall else MaterialTheme.typography.labelLarge,
-                maxLines = 1,
-                modifier = Modifier.graphicsLayer { rotationZ = rotation }
-            )
+            // Fixed slot accommodates the rotated visual: a 90°-rotated Text
+            // swaps its measured width/height, so the slot is tall and narrow.
+            Box(
+                modifier = Modifier.size(width = 38.dp, height = 68.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = mode,
+                    color = if (isPhoto) Color.White else Color.White.copy(alpha = 0.28f),
+                    style = if (isPhoto) MaterialTheme.typography.titleSmall else MaterialTheme.typography.labelLarge,
+                    maxLines = 1,
+                    modifier = Modifier.graphicsLayer { rotationZ = rotation }
+                )
+            }
         }
     }
 }

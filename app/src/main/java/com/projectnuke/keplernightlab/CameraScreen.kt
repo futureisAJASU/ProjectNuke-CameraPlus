@@ -78,6 +78,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
@@ -502,6 +503,7 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
     }
     var floatingViewportSizePx by remember { mutableStateOf(IntSize.Zero) }
     var floatingShutterCenterPx by remember { mutableStateOf(Offset.Zero) }
+    var cameraRootCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
     val floatingShutterRadiusPx = remember(density) {
         with(density) { (FloatingShutterButtonSize / 2f).toPx() }
     }
@@ -1059,6 +1061,7 @@ LaunchedEffect(Unit) {
             .fillMaxSize()
             .background(Color.Black)
             .onSizeChanged { floatingViewportSizePx = it }
+            .onGloballyPositioned { cameraRootCoords = it }
             .testTag("kepler.camera.root")
     ) {
         PreviewStage(
@@ -1279,6 +1282,7 @@ LaunchedEffect(Unit) {
                     if (cameraLayoutMode.isLandscape()) Alignment.CenterEnd else Alignment.BottomCenter
                 ),
                 layoutMode = cameraLayoutMode,
+                cameraRootCoords = cameraRootCoords,
                 onShutterPositioned = { center -> floatingShutterCenterPx = center },
                 onActivateFloating = { floatingController.activateFloating(floatingShutterCenterPx) },
                 latestBitmap = latestBitmap,
@@ -1422,7 +1426,7 @@ LaunchedEffect(Unit) {
         if (floatingController.state != FloatingShutterState.DOCKED && currentScreen == MainScreen.CAMERA) {
             FloatingShutterButton(
                 isDragging = floatingController.state == FloatingShutterState.FLOATING_DRAGGING,
-                position = floatingController.position,
+                center = floatingController.position,
                 onTap = {
                     if (!isPipelineBusy && canAdmitNewCapture) {
                         captureCallback()
@@ -1757,6 +1761,7 @@ fun FocusAeOverlay(
 fun CameraBottomPanel(
     modifier: Modifier = Modifier,
     layoutMode: CameraUiLayoutMode = CameraUiLayoutMode.PORTRAIT,
+    cameraRootCoords: LayoutCoordinates? = null,
     onShutterPositioned: (Offset) -> Unit = {},
     onActivateFloating: () -> Unit = {},
     latestBitmap: Bitmap?,
@@ -1787,7 +1792,9 @@ fun CameraBottomPanel(
 
     if (isLandscape) {
         CameraLandscapeChrome(
+            modifier = modifier,
             layoutMode = layoutMode,
+            cameraRootCoords = cameraRootCoords,
             latestBitmap = latestBitmap,
             selectedLensSlot = selectedLensSlot,
             onLensSlotChange = onLensSlotChange,
@@ -1906,7 +1913,17 @@ fun CameraBottomPanel(
                 Box(
                     modifier = Modifier
                         .onGloballyPositioned { coordinates ->
-                            onShutterPositioned(coordinates.boundsInRoot().center)
+                            val root = cameraRootCoords
+                            val center = if (root != null) {
+                                val localCenter = Offset(
+                                    coordinates.size.width / 2f,
+                                    coordinates.size.height / 2f
+                                )
+                                root.localPositionOf(coordinates, localCenter)
+                            } else {
+                                coordinates.boundsInRoot().center
+                            }
+                            onShutterPositioned(center)
                         }
                         .testTag("kepler.camera.shutter.anchor")
                 ) {
@@ -2000,7 +2017,9 @@ fun CameraBottomPanel(
 
 @Composable
 private fun CameraLandscapeChrome(
+    modifier: Modifier = Modifier,
     layoutMode: CameraUiLayoutMode,
+    cameraRootCoords: LayoutCoordinates? = null,
     latestBitmap: Bitmap?,
     selectedLensSlot: LensSlot,
     onLensSlotChange: (LensSlot) -> Unit,
@@ -2020,56 +2039,103 @@ private fun CameraLandscapeChrome(
     onShutterPositioned: (Offset) -> Unit,
     onActivateFloating: () -> Unit
 ) {
-    // Compact side-anchored chrome. This is a dedicated compositional geometry
-    // (a narrow right/top vertical strip), NOT a rotated full-width bottom lap:
-    // it keeps the preview unobstructed and leaves the majority in view.
-    Column(
-        modifier = Modifier
-            .width(LandscapeChromeWidth)
-            .navigationBarsPadding()
-            .padding(horizontal = 6.dp, vertical = 10.dp)
-            .clip(RoundedCornerShape(22.dp))
-            .background(Color(0x33111218))
-            .padding(vertical = 10.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+    // Defect A fix: `modifier` is the `Alignment.CenterEnd` supplied by the
+    // caller (CameraBottomPanel). Previously this modifier was dropped, so the
+    // landscape chrome had no CenterEnd anchor. Now it is applied to the outer
+    // Box that owns the separate clusters.
+    //
+    // Defect B fix: the 200dp ZoomSelector no longer lives inside the 96dp
+    // side rail. The landscape chrome is a Box with 3 anchored clusters:
+    //   • compact right ACTION rail (96dp, result/shutter/switch only)
+    //   • compact horizontal ZOOM strip at bottom-center (has room for 200dp)
+    //   • MODE labels at top-center, horizontal
+    // Each cluster fits independently and the primary action cluster respects
+    // the landscape viewport height gate (see LandscapeLayoutSpec tests).
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .navigationBarsPadding(),
+        contentAlignment = Alignment.CenterEnd
     ) {
-        CameraSwitchButton(enabled = !isPipelineBusy, onClick = onAverage)
-
-        ResultThumbnail(bitmap = latestBitmap, onClick = onThumbnail)
-
-        ZoomSelector(selected = selectedLensSlot, onSelect = onLensSlotChange)
-        if (selectedLensSlot == LensSlot.THREE_X) {
-            ThreeXSourceDots(selected = selectedThreeXSource, onSelect = onThreeXSourceChange)
-        }
-
-        AnimatedVisibility(visible = showZoomSlider) {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(2.dp)
-            ) {
-                Text(
-                    text = "${"%.1f".format(zoomUiState.zoomRatio)}x",
-                    color = Color.White.copy(alpha = 0.72f),
-                    style = MaterialTheme.typography.labelMedium,
-                    modifier = Modifier.clickable(onClick = onToggleZoomSlider)
-                )
-                CompactZoomSlider(
-                    value = zoomUiState.zoomRatio,
-                    onZoomRatioChange = onZoomRatioChange,
-                    valueRange = zoomUiState.minZoom..zoomUiState.maxZoom,
-                    modifier = Modifier.width(LandscapeSliderWidth)
-                )
+        // Zoom cluster — bottom-center, enough width for the 200dp Row
+        Row(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 8.dp, start = 8.dp, end = LandscapeChromeWidth + 8.dp)
+                .clip(RoundedCornerShape(18.dp))
+                .background(Color(0x44111218))
+                .padding(horizontal = 12.dp, vertical = 6.dp)
+                .clickable(onClick = onToggleZoomSlider),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            ZoomSelector(selected = selectedLensSlot, onSelect = onLensSlotChange)
+            if (selectedLensSlot == LensSlot.THREE_X) {
+                ThreeXSourceDots(selected = selectedThreeXSource, onSelect = onThreeXSourceChange)
+            }
+            AnimatedVisibility(visible = showZoomSlider) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = "${"%.1f".format(zoomUiState.zoomRatio)}x",
+                        color = Color.White.copy(alpha = 0.72f),
+                        style = MaterialTheme.typography.labelMedium,
+                        modifier = Modifier.clickable(onClick = onToggleZoomSlider)
+                    )
+                    CompactZoomSlider(
+                        value = zoomUiState.zoomRatio,
+                        onZoomRatioChange = onZoomRatioChange,
+                        valueRange = zoomUiState.minZoom..zoomUiState.maxZoom,
+                        modifier = Modifier.width(120.dp)
+                    )
+                }
             }
         }
 
+        // Mode labels — top-center, horizontal (each label rotated in a fixed slot)
         Box(
             modifier = Modifier
-                .onGloballyPositioned { coordinates ->
-                    onShutterPositioned(coordinates.boundsInRoot().center)
-                }
-                .testTag("kepler.camera.shutter.anchor")
+                .align(Alignment.TopCenter)
+                .padding(top = 10.dp, end = LandscapeChromeWidth)
         ) {
+            LandscapeModeTabs(layoutMode = layoutMode)
+        }
+
+        // Narrow right-side action rail — ONLY primary actions, respects height gate
+        Column(
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .width(LandscapeChromeWidth)
+                .padding(horizontal = 6.dp)
+                .clip(RoundedCornerShape(22.dp))
+                .background(Color(0x33111218))
+                .padding(vertical = 10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            CameraSwitchButton(enabled = !isPipelineBusy, onClick = onAverage)
+
+            ResultThumbnail(bitmap = latestBitmap, onClick = onThumbnail)
+
+            Box(
+                modifier = Modifier
+                    .onGloballyPositioned { coordinates ->
+                        val root = cameraRootCoords
+                        val center = if (root != null) {
+                            val localCenter = Offset(
+                                coordinates.size.width / 2f,
+                                coordinates.size.height / 2f
+                            )
+                            root.localPositionOf(coordinates, localCenter)
+                        } else {
+                            coordinates.boundsInRoot().center
+                        }
+                        onShutterPositioned(center)
+                    }
+                    .testTag("kepler.camera.shutter.anchor")
+            ) {
             if (isPipelineBusy) {
                 PipelineBusyShutterIndicator(
                     captureProgress = captureProgress,
@@ -2085,21 +2151,21 @@ private fun CameraLandscapeChrome(
             }
         }
 
-        if (isPipelineBusy) {
-            CaptureProgressRow(captureProgress = captureProgress)
-        }
+            if (isPipelineBusy) {
+                CaptureProgressRow(captureProgress = captureProgress)
+            }
 
-        backgroundProcessingLabel?.let { label ->
-            Text(
-                text = label,
-                color = Color.White.copy(alpha = 0.72f),
-                style = MaterialTheme.typography.labelSmall,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+            backgroundProcessingLabel?.let { label ->
+                Text(
+                    text = label,
+                    color = Color.White.copy(alpha = 0.72f),
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(horizontal = 4.dp)
+                )
+            }
         }
-
-        LandscapeModeTabs(layoutMode = layoutMode)
     }
 }
 

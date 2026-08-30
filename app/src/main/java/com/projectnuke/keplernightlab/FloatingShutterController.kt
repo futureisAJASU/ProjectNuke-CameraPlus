@@ -75,9 +75,22 @@ fun isWithinDock(position: Offset, geometry: FloatingShutterGeometry?): Boolean 
 }
 
 /**
- * Pure floating-shutter controller. State and position are Compose state so the
- * camera screen recomposes on transitions; all transition/geometry rules are
- * delegated to the pure functions above so they can be unit-tested directly.
+ * Render helper: the Compose [Modifier.offset] for the floating node expects
+ * the node's TOP-LEFT, but [FloatingShutterController.position] is the
+ * shutter CENTER in the same camera-local pixel frame.
+ */
+fun floatingShutterTopLeft(center: Offset, radiusPx: Float): Offset =
+    Offset(center.x - radiusPx, center.y - radiusPx)
+
+/**
+ * Pure floating-shutter controller. State and [position] are Compose state so
+ * the camera screen recomposes on transitions; all transition/geometry rules
+ * are delegated to the pure functions above so they can be unit-tested
+ * directly.
+ *
+ * [position] is the FLOATING SHUTTER CENTER in the camera root's local
+ * pixel frame (same frame as the dock center and viewport size). The render
+ * layer converts it to top-left via [floatingShutterTopLeft].
  */
 class FloatingShutterController(
     private val onHaptic: (FloatingShutterHaptic) -> Unit = {}
@@ -85,6 +98,7 @@ class FloatingShutterController(
     var state by mutableStateOf(FloatingShutterState.DOCKED)
         private set
 
+    /** CENTER of the 72dp shutter in camera-local pixels. */
     var position by mutableStateOf(Offset.Zero)
         private set
 

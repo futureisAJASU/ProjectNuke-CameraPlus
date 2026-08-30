@@ -43,22 +43,28 @@ internal val FloatingShutterButtonSize: Dp = 72.dp
 @Composable
 fun FloatingShutterButton(
     isDragging: Boolean,
-    position: Offset,
+    center: Offset,
     onTap: () -> Unit,
     onDragStart: () -> Unit,
     onDrag: (Offset) -> Unit,
     onDragEnd: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    // Geometry is center-based; convert to top-left for Modifier.offset.
+    // Hardened for tests: IntOffset is integer, but position stays float.
+    val radiusPx = with(androidx.compose.ui.platform.LocalDensity.current) {
+        (FloatingShutterButtonSize / 2f).toPx()
+    }
+    val topLeft = floatingShutterTopLeft(center, radiusPx)
     // A: full-screen positioning layer — no pointer handling, does not intercept.
     Box(
         modifier = modifier.fillMaxSize(),
         contentAlignment = Alignment.TopStart
     ) {
-        // B: interactive 72dp hit area, placed at [position] in pixels.
+        // B: interactive 72dp hit area, placed at center→topLeft in pixels.
         Box(
             modifier = Modifier
-                .offset { IntOffset(position.x.roundToInt(), position.y.roundToInt()) }
+                .offset { IntOffset(topLeft.x.roundToInt(), topLeft.y.roundToInt()) }
                 .size(FloatingShutterButtonSize)
                 .pointerInput(Unit) {
                     detectTapGestures(onTap = { onTap() })
