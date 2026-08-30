@@ -239,6 +239,11 @@ class GalleryExportVerificationTest {
         assertTrue(result is GalleryExportVerification.PermanentFailure)
         assertEquals(GalleryExportVerificationReason.DIMENSION_MISMATCH, diagnostic(result))
     }
+    @Test fun invalidBounds_areRejectedWithBoundsDiagnostic() {
+        val result = verify(jpeg, OutputFormat.JPEG, bounds = listOf(0 to 0))
+        assertTrue(result is GalleryExportVerification.RetryableFailure)
+        assertEquals(GalleryExportVerificationReason.BOUNDS_INVALID, diagnostic(result))
+    }
     @Test fun unavailableStreamOnce_thenRetriesCompleteVerification() = assertTrue(verify(jpeg, OutputFormat.JPEG, unavailableStreams = 1) is GalleryExportVerification.Verified)
     @Test fun decodeFailureOnce_thenRetriesCompleteVerification() = assertTrue(verify(jpeg, OutputFormat.JPEG, bounds = listOf(0 to 0, 32 to 20)) is GalleryExportVerification.Verified)
     @Test fun verificationCarriesCommittedTruth() {
