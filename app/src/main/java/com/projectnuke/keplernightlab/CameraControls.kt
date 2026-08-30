@@ -12,11 +12,13 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -25,6 +27,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
@@ -196,13 +199,14 @@ fun LandscapeModeTabs(
     modifier: Modifier = Modifier
 ) {
     val rotation = layoutMode.modeLabelRotationDegrees()
-    val modes = listOf("인물 사진", "야간", "사진", "동영상", "더보기")
-    // Each slot is a stable screen-space hit target. Only its Text content is
-    // rotated; the lane and the five targets remain normal Compose geometry.
-    Row(
+    val modes = listOf("더보기", "동영상", "사진", "야간", "인물 사진")
+    // Samsung-style landscape grammar: the mode rail is a stable vertical
+    // screen-space column beside the shutter. Only the label content rotates;
+    // no Row/Column or hit target is rotated.
+    Column(
         modifier = modifier,
-        horizontalArrangement = Arrangement.spacedBy(LandscapeLayoutSpec.ModeSlotSpacingDp),
-        verticalAlignment = Alignment.CenterVertically
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
         modes.forEachIndexed { index, mode ->
             val isPhoto = mode == "사진"
@@ -217,7 +221,7 @@ fun LandscapeModeTabs(
             ) {
                 Text(
                     text = mode,
-                    color = if (isPhoto) Color.White else Color.White.copy(alpha = 0.28f),
+                    color = if (isPhoto) Color.White else Color.White.copy(alpha = 0.34f),
                     style = if (isPhoto) MaterialTheme.typography.titleSmall else MaterialTheme.typography.labelLarge,
                     maxLines = 1,
                     softWrap = false,
@@ -225,6 +229,67 @@ fun LandscapeModeTabs(
                 )
             }
         }
+    }
+}
+
+@Composable
+fun LandscapeUtilityRail(
+    selectedResolution: CaptureResolutionMode,
+    onResolutionClick: () -> Unit,
+    onSettings: () -> Unit,
+    meteringMode: MeteringMode = MeteringModeState.mode,
+    onMeteringModeClick: () -> Unit = { MeteringModeState.cycle() },
+    modifier: Modifier = Modifier
+) {
+    // Keep containers upright and minimal. This rail intentionally carries
+    // secondary controls off the preview, matching the stock-camera layout
+    // philosophy without copying Samsung assets.
+    Column(
+        modifier = modifier
+            .background(Color.Black)
+            .padding(vertical = 12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        CircleMiniButton(label = "⚙", onClick = onSettings, testTag = "kepler.settings.open")
+        RailTextButton(
+            text = meteringMode.shortLabel,
+            onClick = onMeteringModeClick,
+            testTag = "kepler.camera.metering"
+        )
+        RailTextButton(
+            text = when (selectedResolution) {
+                CaptureResolutionMode.MP24_FUSION -> "24M"
+                else -> selectedResolution.label
+            },
+            onClick = onResolutionClick,
+            testTag = "kepler.camera.resolution"
+        )
+    }
+}
+
+@Composable
+private fun RailTextButton(
+    text: String,
+    onClick: () -> Unit,
+    testTag: String
+) {
+    Box(
+        modifier = Modifier
+            .width(50.dp)
+            .height(42.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .clickable(onClick = onClick)
+            .testTag(testTag),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = text,
+            color = Color.White,
+            style = MaterialTheme.typography.titleSmall,
+            maxLines = 1,
+            softWrap = false
+        )
     }
 }
 
@@ -274,51 +339,57 @@ fun CameraSwitchButton(enabled: Boolean, onClick: () -> Unit) {
         modifier = Modifier
             .size(SideButtonSize)
             .clip(CircleShape)
-            .background(Color(0xFF222229))
-            .clickable(enabled = enabled, onClick = onClick),
+            .background(Color(0xFF242429))
+            .clickable(enabled = enabled, onClick = onClick)
+            .testTag("kepler.camera.switch"),
         contentAlignment = Alignment.Center
     ) {
-        // Centered refresh icon drawn independently of font baselines
-        androidx.compose.foundation.Canvas(modifier = Modifier.size(28.dp)) {
-            val center = androidx.compose.ui.geometry.Offset(size.width / 2f, size.height / 2f)
-            val radius = minOf(size.width, size.height) / 2f - 2.dp.toPx()
-            // Outer circle
-            drawCircle(
-                color = Color(0xFF888888).copy(alpha = 0.9f),
-                radius = radius,
-                center = center,
-                style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.5.dp.toPx())
+        // Single refresh/reprocess arrow. The action is not a physical camera
+        // switch; a one-arrow glyph is visually cleaner and avoids the broken
+        // double-arrow look that showed up in landscape screenshots.
+        androidx.compose.foundation.Canvas(modifier = Modifier.size(31.dp)) {
+            val stroke = 2.6.dp.toPx()
+            val inset = 4.3.dp.toPx()
+            val arcSize = androidx.compose.ui.geometry.Size(
+                width = size.width - inset * 2f,
+                height = size.height - inset * 2f
             )
-            // Arrow head (right-pointing curved arrow top)
-            val arrowTop = center.copy(y = center.y - radius * 0.45f)
-            val arrowRight = center.copy(x = center.x + radius * 0.55f, y = center.y - radius * 0.15f)
-            val arrowBottom = center.copy(y = center.y + radius * 0.15f)
-            val arrowTopEnd = center.copy(x = center.x + radius * 0.55f, y = center.y - radius * 0.35f)
+            val topLeft = androidx.compose.ui.geometry.Offset(inset, inset)
+            drawArc(
+                color = Color.White,
+                startAngle = 35f,
+                sweepAngle = 285f,
+                useCenter = false,
+                topLeft = topLeft,
+                size = arcSize,
+                style = Stroke(width = stroke, cap = androidx.compose.ui.graphics.StrokeCap.Round)
+            )
+
+            val radius = arcSize.width / 2f
+            val center = androidx.compose.ui.geometry.Offset(size.width / 2f, size.height / 2f)
+            val head = androidx.compose.ui.geometry.Offset(
+                x = center.x + radius * 0.58f,
+                y = center.y - radius * 0.76f
+            )
+            val wing = 5.2.dp.toPx()
             drawLine(
                 color = Color.White,
-                start = arrowTop,
-                end = arrowTopEnd,
-                strokeWidth = 2.dp.toPx(),
+                start = head,
+                end = head + androidx.compose.ui.geometry.Offset(-wing, -0.5.dp.toPx()),
+                strokeWidth = stroke,
                 cap = androidx.compose.ui.graphics.StrokeCap.Round
             )
-            // Small triangular arrowhead at arrowTopEnd
-            val tip = arrowTopEnd
-            val left = tip.copy(x = tip.x - 4.dp.toPx(), y = tip.y + 3.dp.toPx())
-            val right = tip.copy(x = tip.x - 2.dp.toPx(), y = tip.y - 3.dp.toPx())
-            drawLine(color = Color.White, start = tip, end = left, strokeWidth = 1.5.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round)
-            drawLine(color = Color.White, start = tip, end = right, strokeWidth = 1.5.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round)
-            // Bottom curved line (left side of circle) to complete refresh symbol
-            val bottomLeft = center.copy(x = center.x - radius * 0.55f, y = center.y + radius * 0.35f)
             drawLine(
-                color = Color(0xFF888888).copy(alpha = 0.9f),
-                start = arrowBottom,
-                end = bottomLeft,
-                strokeWidth = 1.5.dp.toPx(),
+                color = Color.White,
+                start = head,
+                end = head + androidx.compose.ui.geometry.Offset(-0.6.dp.toPx(), wing),
+                strokeWidth = stroke,
                 cap = androidx.compose.ui.graphics.StrokeCap.Round
             )
         }
     }
 }
+
 
 @Composable
 fun ResultThumbnail(bitmap: Bitmap?, onClick: () -> Unit) {

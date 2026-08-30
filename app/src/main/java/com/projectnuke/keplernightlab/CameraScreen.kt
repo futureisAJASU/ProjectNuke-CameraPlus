@@ -1070,6 +1070,8 @@ LaunchedEffect(Unit) {
         )
     }
 
+    val cameraLayoutMode = deriveCameraUiLayoutMode(displayRotation)
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -1153,32 +1155,51 @@ LaunchedEffect(Unit) {
             )
         )
 
-        CameraTopOverlay(
-            modifier = Modifier.align(Alignment.TopCenter),
-            status = shortStatus(status),
-            levelState = levelState,
-            selectedResolution = selectedResolution,
-            onHideFocusAeControls = {
-                showFocusAeControls = false
-                showZoomSlider = false
-            },
-            onResolutionClick = {
-                val result = handleResolutionClick(
-                    selectedResolution = selectedResolution,
-                    allowedResolutionModes = resolutionState.allowedModes,
-                    resolutionCapability = resolutionState.capability,
-                    resolutionPlans = resolutionState.plans,
-                    selectedLensSlot = selectedLensSlot
-                )
-                selectedResolution = result.selectedResolution
-                status = result.status
-            },
-            onSettings = {
-                currentScreen = MainScreen.SETTINGS
-            }
-        )
-
-        val cameraLayoutMode = deriveCameraUiLayoutMode(displayRotation)
+        if (cameraLayoutMode.isLandscape()) {
+            LandscapeUtilityRail(
+                selectedResolution = selectedResolution,
+                onResolutionClick = {
+                    val result = handleResolutionClick(
+                        selectedResolution = selectedResolution,
+                        allowedResolutionModes = resolutionState.allowedModes,
+                        resolutionCapability = resolutionState.capability,
+                        resolutionPlans = resolutionState.plans,
+                        selectedLensSlot = selectedLensSlot
+                    )
+                    selectedResolution = result.selectedResolution
+                    status = result.status
+                },
+                onSettings = { currentScreen = MainScreen.SETTINGS },
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .width(LandscapeLayoutSpec.UtilityRailWidth)
+                    .fillMaxHeight()
+                    .statusBarsPadding()
+            )
+        } else {
+            CameraTopOverlay(
+                modifier = Modifier.align(Alignment.TopCenter),
+                status = shortStatus(status),
+                levelState = levelState,
+                selectedResolution = selectedResolution,
+                onHideFocusAeControls = {
+                    showFocusAeControls = false
+                    showZoomSlider = false
+                },
+                onResolutionClick = {
+                    val result = handleResolutionClick(
+                        selectedResolution = selectedResolution,
+                        allowedResolutionModes = resolutionState.allowedModes,
+                        resolutionCapability = resolutionState.capability,
+                        resolutionPlans = resolutionState.plans,
+                        selectedLensSlot = selectedLensSlot
+                    )
+                    selectedResolution = result.selectedResolution
+                    status = result.status
+                },
+                onSettings = { currentScreen = MainScreen.SETTINGS }
+            )
+        }
 
         // Capture action shared between bottom shutter and volume dispatcher
         val captureCallback = captureAction@ {
@@ -2070,20 +2091,26 @@ private fun CameraLandscapeChrome(
     onShutterPositioned: (Offset) -> Unit,
     onActivateFloating: () -> Unit
 ) {
-    // The landscape chrome keeps three independent screen-space clusters:
-    //   • a narrow MODE lane at the left edge (fixed slots, rotated Text only)
-    //   • a compact horizontal ZOOM selector at the bottom-center
-    //   • stable primary actions at the right edge
-    // No cluster rotates or paints a full-width translucent panel over the
-    // preview; the controls themselves provide their own compact surfaces.
     BoxWithConstraints(
-        modifier = modifier
-            .fillMaxSize()
-            .navigationBarsPadding()
+        modifier = modifier.fillMaxSize()
     ) {
         val layoutBounds = LandscapeLayoutSpec.bounds(maxWidth.value, maxHeight.value)
-        // Zoom cluster. Its explicit rectangle is kept clear of both the mode
-        // lane and the right-side primary-action lane in compact landscape.
+
+        // A real black camera-control gutter, not a floating panel over the
+        // image. The viewfinder itself is bounded to stop at this edge.
+        Box(
+            modifier = Modifier
+                .offset(x = layoutBounds.rightChromeRegion.left.dp, y = 0.dp)
+                .size(
+                    width = layoutBounds.rightChromeRegion.width.dp,
+                    height = layoutBounds.rightChromeRegion.height.dp
+                )
+                .background(Color.Black)
+                .testTag("kepler.camera.landscape.chrome")
+        )
+
+        // Vertical lens selector immediately left of the shutter, matching the
+        // stock-camera interaction grammar while keeping Kepler's four slots.
         Box(
             modifier = Modifier
                 .offset(
@@ -2093,89 +2120,50 @@ private fun CameraLandscapeChrome(
                 .size(
                     width = layoutBounds.zoomRegion.width.dp,
                     height = layoutBounds.zoomRegion.height.dp
-                )
-                .clipToBounds()
-                .clickable(onClick = onToggleZoomSlider)
+                ),
+            contentAlignment = Alignment.Center
         ) {
             Column(
-                modifier = Modifier
-                    .align(Alignment.CenterStart)
-                    .padding(4.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(4.dp)
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    ZoomSelector(selected = selectedLensSlot, onSelect = onLensSlotChange)
-                }
+                LandscapeZoomSelector(
+                    selected = selectedLensSlot,
+                    onSelect = onLensSlotChange,
+                    onToggleSlider = onToggleZoomSlider
+                )
                 if (selectedLensSlot == LensSlot.THREE_X) {
-                    ThreeXSourceDots(selected = selectedThreeXSource, onSelect = onThreeXSourceChange)
-                }
-                AnimatedVisibility(visible = showZoomSlider) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Text(
-                            text = "${"%.1f".format(zoomUiState.zoomRatio)}x",
-                            color = Color.White.copy(alpha = 0.72f),
-                            style = MaterialTheme.typography.labelMedium,
-                            modifier = Modifier.clickable(onClick = onToggleZoomSlider)
-                        )
-                        CompactZoomSlider(
-                            value = zoomUiState.zoomRatio,
-                            onZoomRatioChange = onZoomRatioChange,
-                            valueRange = zoomUiState.minZoom..zoomUiState.maxZoom,
-                            modifier = Modifier.width(120.dp)
-                        )
-                    }
+                    ThreeXSourceDots(
+                        selected = selectedThreeXSource,
+                        onSelect = onThreeXSourceChange
+                    )
                 }
             }
         }
 
-        // Mode lane — left edge. Each label owns a fixed slot; only the Text
-        // content rotates, so hit targets and neighbouring slots stay stable.
+        // Primary action column: switch above, shutter centered, result below.
         Box(
-            modifier = Modifier
-                .offset(
-                    x = layoutBounds.modeRegion.left.dp,
-                    y = layoutBounds.modeRegion.top.dp
-                )
-                .size(
-                    width = layoutBounds.modeRegion.width.dp,
-                    height = layoutBounds.modeRegion.height.dp
-                )
-        ) {
-            LandscapeModeTabs(
-                layoutMode = layoutMode,
-                modifier = Modifier.fillMaxSize()
-            )
-        }
-
-        // Narrow right-side action lane — ONLY primary actions. Its measured
-        // rectangle is independent of the top/status and zoom rectangles.
-        Column(
             modifier = Modifier
                 .offset(
                     x = layoutBounds.primaryActionRegion.left.dp,
                     y = layoutBounds.primaryActionRegion.top.dp
                 )
-                .width(layoutBounds.primaryActionRegion.width.dp)
-                .height(layoutBounds.primaryActionRegion.height.dp)
-                .clipToBounds()
-                .padding(horizontal = 6.dp)
-                .padding(vertical = 10.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+                .size(
+                    width = layoutBounds.primaryActionRegion.width.dp,
+                    height = layoutBounds.primaryActionRegion.height.dp
+                )
         ) {
-            CameraSwitchButton(enabled = !isPipelineBusy, onClick = onAverage)
-
-            ResultThumbnail(bitmap = latestBitmap, onClick = onThumbnail)
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 42.dp)
+            ) {
+                CameraSwitchButton(enabled = !isPipelineBusy, onClick = onAverage)
+            }
 
             Box(
                 modifier = Modifier
+                    .align(Alignment.Center)
                     .onGloballyPositioned { coordinates ->
                         val root = cameraRootCoords
                         val center = if (root != null) {
@@ -2191,35 +2179,96 @@ private fun CameraLandscapeChrome(
                     }
                     .testTag("kepler.camera.shutter.anchor")
             ) {
-            if (isPipelineBusy) {
-                PipelineBusyShutterIndicator(
-                    captureProgress = captureProgress,
-                    modifier = Modifier.size(ShutterOuterSize)
+                if (isPipelineBusy) {
+                    PipelineBusyShutterIndicator(
+                        captureProgress = captureProgress,
+                        modifier = Modifier.size(ShutterOuterSize)
+                    )
+                } else {
+                    ShutterButton(
+                        enabled = true,
+                        isCapturing = isCapturing,
+                        onClick = onCapture,
+                        onLongPress = onActivateFloating
+                    )
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 34.dp)
+            ) {
+                ResultThumbnail(bitmap = latestBitmap, onClick = onThumbnail)
+            }
+        }
+
+        // Mode labels live beside the shutter instead of crossing the preview.
+        Box(
+            modifier = Modifier
+                .offset(
+                    x = layoutBounds.modeRegion.left.dp,
+                    y = layoutBounds.modeRegion.top.dp
                 )
-            } else {
-                ShutterButton(
-                    enabled = true,
-                    isCapturing = false,
-                    onClick = onCapture,
-                    onLongPress = onActivateFloating
+                .size(
+                    width = layoutBounds.modeRegion.width.dp,
+                    height = layoutBounds.modeRegion.height.dp
+                )
+                .statusBarsPadding()
+        ) {
+            LandscapeModeTabs(
+                layoutMode = layoutMode,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+
+        // Detailed zoom is transient and remains inside the control gutter.
+        AnimatedVisibility(
+            visible = showZoomSlider,
+            modifier = Modifier
+                .offset(
+                    x = layoutBounds.rightChromeRegion.left.dp + 8.dp,
+                    y = (maxHeight.value - 44f).coerceAtLeast(0f).dp
+                )
+        ) {
+            Row(
+                modifier = Modifier
+                    .width(150.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(Color(0xE6222228))
+                    .padding(horizontal = 10.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Text(
+                    text = "${"%.1f".format(zoomUiState.zoomRatio)}x",
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelSmall
+                )
+                CompactZoomSlider(
+                    value = zoomUiState.zoomRatio,
+                    onZoomRatioChange = onZoomRatioChange,
+                    valueRange = zoomUiState.minZoom..zoomUiState.maxZoom,
+                    modifier = Modifier.weight(1f)
                 )
             }
         }
 
-            if (isPipelineBusy) {
-                CaptureProgressRow(captureProgress = captureProgress)
-            }
-
-            backgroundProcessingLabel?.let { label ->
-                Text(
-                    text = label,
-                    color = Color.White.copy(alpha = 0.72f),
-                    style = MaterialTheme.typography.labelSmall,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(horizontal = 4.dp)
-                )
-            }
+        backgroundProcessingLabel?.let { label ->
+            Text(
+                text = label,
+                color = Color.White.copy(alpha = 0.52f),
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .offset(
+                        x = layoutBounds.rightChromeRegion.left.dp + 8.dp,
+                        y = 8.dp
+                    )
+                    .width(142.dp)
+                    .testTag("kepler.processing.busy")
+            )
         }
     }
 }
@@ -2524,6 +2573,51 @@ fun ZoomSelector(
                     text = value.label,
                     color = Color.White,
                     style = MaterialTheme.typography.labelLarge
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LandscapeZoomSelector(
+    selected: LensSlot,
+    onSelect: (LensSlot) -> Unit,
+    onToggleSlider: () -> Unit
+) {
+    val values = listOf(
+        LensSlot.THREE_X to "3",
+        LensSlot.MAIN_2X to "2",
+        LensSlot.MAIN_1X to "1×",
+        LensSlot.ULTRAWIDE to ".6"
+    )
+    Column(
+        modifier = Modifier
+            .width(48.dp)
+            .clip(RoundedCornerShape(24.dp))
+            .background(Color(0xFF202024))
+            .padding(vertical = 5.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        values.forEach { (slot, label) ->
+            val selectedSlot = selected == slot
+            Box(
+                modifier = Modifier
+                    .size(width = 42.dp, height = 40.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(if (selectedSlot) Color(0xFF515158) else Color.Transparent)
+                    .clickable {
+                        onSelect(slot)
+                        if (selectedSlot) onToggleSlider()
+                    }
+                    .testTag("kepler.camera.zoom.${slot.name}"),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = label,
+                    color = Color.White,
+                    style = if (selectedSlot) MaterialTheme.typography.titleSmall else MaterialTheme.typography.labelLarge
                 )
             }
         }

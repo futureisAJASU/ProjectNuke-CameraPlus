@@ -43,9 +43,15 @@ internal fun PreviewStage(
     ) {
         val isLandscape = layoutMode.isLandscape()
         val previewModifier = if (isLandscape) {
+            // Landscape owns a bounded central viewfinder. Black side gutters
+            // are reserved for camera chrome so mode/action controls never
+            // drift on top of the preview image.
             Modifier
                 .fillMaxSize()
-                .padding(top = PreviewTopInset)
+                .padding(
+                    start = LandscapeLayoutSpec.previewStartPadding(),
+                    end = LandscapeLayoutSpec.previewEndPadding()
+                )
         } else {
             val portraitPhotoAspectRatio = 3f / 4f
             val previewModifierPortrait = if (maxWidth / portraitPhotoAspectRatio <= maxHeight) {
