@@ -28,8 +28,8 @@ fun normalizeDisplayPoint(offset: Offset, containerSize: Size): NormalizedPoint?
  * This uses the same orientation basis as
  * [CameraPreviewController.configureTransform]:
  *   sensorOrientation  = CameraCharacteristics.SENSOR_ORIENTATION
- *   displayDegrees     = Surface.ROTATION_0/90/180/270
- *   relativeRotation   = (sensorOrientation - displayDegrees + 360) % 360
+ *   displayRotation   = Surface.ROTATION_0/90/180/270
+ *   relativeRotation  = relativeRotationDegrees(sensorOrientation, display)
  *
  * The display-normalized point is counter-rotated by relativeRotation to reach
  * the sensor/crop-normalized space:
@@ -52,14 +52,15 @@ fun transformDisplayPointToSensorPoint(
     displayRotation: Int,
     mirrored: Boolean = false
 ): NormalizedPoint {
-    val sensor = normalizeRightAngle(sensorOrientationDegrees) ?: 0
-    val display = displayRotationDegrees(displayRotation) ?: 0
     var x = displayPoint.x.coerceIn(0f, 1f)
     var y = displayPoint.y.coerceIn(0f, 1f)
     if (mirrored) {
         x = 1f - x
     }
-    val relativeRotation = ((sensor - display) % 360 + 360) % 360
+    val relativeRotation = relativeRotationDegrees(
+        sensorOrientationDegrees = sensorOrientationDegrees,
+        displayRotation = displayRotation
+    )
     return when (relativeRotation) {
         90 -> NormalizedPoint(1f - y, x)
         180 -> NormalizedPoint(1f - x, 1f - y)

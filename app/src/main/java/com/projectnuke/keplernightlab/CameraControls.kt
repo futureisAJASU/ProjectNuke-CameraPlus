@@ -47,6 +47,7 @@ private val TopMiniButtonSize: Dp = 40.dp
 @Composable
 fun CameraTopOverlay(
     status: String,
+    levelState: DeviceLevelState,
     selectedResolution: CaptureResolutionMode,
     onHideFocusAeControls: () -> Unit,
     onResolutionClick: () -> Unit,
@@ -55,12 +56,8 @@ fun CameraTopOverlay(
     meteringMode: MeteringMode = MeteringModeState.mode,
     onMeteringModeClick: () -> Unit = { MeteringModeState.cycle() }
 ) {
-    val levelState = rememberDeviceLevelState(enabled = true)
-    val displayRotation = androidx.compose.ui.platform.LocalView.current.display?.rotation ?: android.view.Surface.ROTATION_0
-    val layoutMode = deriveCameraUiLayoutMode(displayRotation)
-    val mappedLevelState = mapLevelStateForLayout(levelState, layoutMode)
-    val levelText = if (mappedLevelState.available) {
-        "PITCH ${mappedLevelState.pitchDegrees.toInt()}°  ROLL ${mappedLevelState.rollDegrees.toInt()}°"
+    val levelText = if (levelState.available) {
+        "PITCH ${levelState.pitchDegrees.toInt()}°  ROLL ${levelState.rollDegrees.toInt()}°"
     } else {
         "LEVEL --"
     }
@@ -194,23 +191,28 @@ fun ModeTabs(modifier: Modifier = Modifier) {
 }
 
 @Composable
-fun LandscapeModeTabs(layoutMode: CameraUiLayoutMode) {
+fun LandscapeModeTabs(
+    layoutMode: CameraUiLayoutMode,
+    modifier: Modifier = Modifier
+) {
     val rotation = layoutMode.modeLabelRotationDegrees()
     val modes = listOf("인물 사진", "야간", "사진", "동영상", "더보기")
-    // In landscape the labels are visually rotated ±90°, but graphicsLayer
-    // does NOT change measured size. Each label is therefore wrapped in a
-    // fixed-size Box that is large enough for the rotated visual to stay
-    // inside its slot and not overlap neighbours.
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalAlignment = Alignment.CenterVertically
+    // Each slot is a stable screen-space hit target. Only its Text content is
+    // rotated; the lane and the five targets remain normal Compose geometry.
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(LandscapeLayoutSpec.ModeSlotSpacingDp),
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        modes.forEach { mode ->
+        modes.forEachIndexed { index, mode ->
             val isPhoto = mode == "사진"
-            // Fixed slot accommodates the rotated visual: a 90°-rotated Text
-            // swaps its measured width/height, so the slot is tall and narrow.
             Box(
-                modifier = Modifier.size(width = 38.dp, height = 68.dp),
+                modifier = Modifier
+                    .size(
+                        width = LandscapeLayoutSpec.ModeSlotWidthDp,
+                        height = LandscapeLayoutSpec.ModeSlotHeightDp
+                    )
+                    .testTag("kepler.camera.mode.$index"),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
@@ -218,6 +220,7 @@ fun LandscapeModeTabs(layoutMode: CameraUiLayoutMode) {
                     color = if (isPhoto) Color.White else Color.White.copy(alpha = 0.28f),
                     style = if (isPhoto) MaterialTheme.typography.titleSmall else MaterialTheme.typography.labelLarge,
                     maxLines = 1,
+                    softWrap = false,
                     modifier = Modifier.graphicsLayer { rotationZ = rotation }
                 )
             }

@@ -28,6 +28,18 @@ object LandscapeLayoutSpec {
     /** ZoomSelector horizontal Row estimated width (4×44 + spacing + padding). */
     val ZoomSelectorEstimatedWidthDp: Dp = 200.dp
 
+    /** Fixed width of each vertical mode hit target in landscape. */
+    val ModeSlotWidthDp: Dp = 52.dp
+
+    /** Fixed height of each vertical mode hit target in landscape. */
+    val ModeSlotHeightDp: Dp = 60.dp
+
+    /** Space between adjacent mode hit targets. */
+    val ModeSlotSpacingDp: Dp = 2.dp
+
+    val ModeLaneEstimatedHeightDp: Dp =
+        (ModeSlotHeightDp.value * 5f + ModeSlotSpacingDp.value * 4f).dp
+
     fun rightRailFits(viewportHeightDp: Dp): Boolean =
         RightRailEstimatedHeightDp <= viewportHeightDp
 }

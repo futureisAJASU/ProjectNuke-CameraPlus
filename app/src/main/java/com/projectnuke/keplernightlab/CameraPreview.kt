@@ -4,9 +4,7 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Matrix
 import android.graphics.Rect
-import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -1459,66 +1457,32 @@ private fun storeCaptureSession(
 
         if (viewWidth <= 0f || viewHeight <= 0f) return
 
-        val centerX = viewWidth / 2f
-        val centerY = viewHeight / 2f
-        val viewRect = RectF(0f, 0f, viewWidth, viewHeight)
         val characteristics = cameraCharacteristics
         val sensorOrientation = characteristics
             ?.get(CameraCharacteristics.SENSOR_ORIENTATION)
             ?: 0
         val displayRotation = textureView.display?.rotation ?: Surface.ROTATION_0
         meteringDisplayRotation = displayRotation
-        val displayDegrees = when (displayRotation) {
-            Surface.ROTATION_90 -> 90
-            Surface.ROTATION_180 -> 180
-            Surface.ROTATION_270 -> 270
-            else -> 0
-        }
-        val relativeRotation = (sensorOrientation - displayDegrees + 360) % 360
-        val swapDimensions = relativeRotation == 90 || relativeRotation == 270
-        val rotatedBufferWidth = if (swapDimensions) {
-            previewSize.height.toFloat()
-        } else {
-            previewSize.width.toFloat()
-        }
-        val rotatedBufferHeight = if (swapDimensions) {
-            previewSize.width.toFloat()
-        } else {
-            previewSize.height.toFloat()
-        }
-        val scaleX = viewWidth / rotatedBufferWidth
-        val scaleY = viewHeight / rotatedBufferHeight
-        val finalScale = max(scaleX, scaleY)
+        val geometry = calculatePreviewTransformGeometry(
+            bufferWidth = previewSize.width,
+            bufferHeight = previewSize.height,
+            viewportWidth = viewWidth,
+            viewportHeight = viewHeight,
+            sensorOrientationDegrees = sensorOrientation,
+            displayRotation = displayRotation
+        )
         Log.d(
             TAG,
             "configureTransform view=${viewWidth}x$viewHeight previewSize=${previewSize.width}x${previewSize.height} " +
-                "sensorOrientation=$sensorOrientation displayRotation=$displayRotation relativeRotation=$relativeRotation " +
-                "displayDegrees=$displayDegrees swapDimensions=$swapDimensions " +
-                "scaleX=$scaleX scaleY=$scaleY finalScale=$finalScale"
+                "sensorOrientation=$sensorOrientation displayRotation=$displayRotation " +
+                "relativeRotation=${geometry.relativeRotationDegrees} " +
+                "logical=${geometry.logicalWidth}x${geometry.logicalHeight} " +
+                "uniformScale=${geometry.uniformScale} " +
+                "scaled=${geometry.scaledWidth}x${geometry.scaledHeight} " +
+                "offset=${geometry.offsetX},${geometry.offsetY}"
         )
 
-        val bufferRect = RectF(
-            0f,
-            0f,
-            rotatedBufferWidth,
-            rotatedBufferHeight
-        ).apply {
-            offset(centerX - centerX(), centerY - centerY())
-        }
-
-        val matrix = Matrix().apply {
-            setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
-            postScale(finalScale, finalScale, centerX, centerY)
-            val displayCorrection = when (displayRotation) {
-                Surface.ROTATION_90 -> -90f
-                Surface.ROTATION_180 -> 180f
-                Surface.ROTATION_270 -> 90f
-                else -> 0f
-            }
-            postRotate(displayCorrection, centerX, centerY)
-        }
-
-        textureView.setTransform(matrix)
+        textureView.setTransform(buildPreviewTransformMatrix(geometry))
     }
 
     private data class StopRefs(

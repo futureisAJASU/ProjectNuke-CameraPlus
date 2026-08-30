@@ -47,13 +47,21 @@ class LandscapeLayoutSpecTest {
 
     @Test
     fun rotatedLabelSlotsHaveFixedFootprint() {
-        // LandscapeModeTabs wraps each label in a Box(38x68) so a 90° rotation
-        // does not cause visual overlap; the slot is tall/narrow to hold the
-        // swapped dimensions.
-        // This structural contract is asserted by checking the spec and the
-        // modeLabelRotationDirections (which drives the per-label rotation).
+        // LandscapeModeTabs wraps each label in a fixed 52x60dp Box so a 90°
+        // rotation does not change hit-target geometry or overlap neighbours.
         assertEquals(-90f, CameraUiLayoutMode.LANDSCAPE_LEFT.modeLabelRotationDegrees(), 0.01f)
         assertEquals(90f, CameraUiLayoutMode.LANDSCAPE_RIGHT.modeLabelRotationDegrees(), 0.01f)
         assertEquals(0f, CameraUiLayoutMode.PORTRAIT.modeLabelRotationDegrees(), 0.01f)
+        assertEquals(52f, LandscapeLayoutSpec.ModeSlotWidthDp.value, 0.01f)
+        assertEquals(60f, LandscapeLayoutSpec.ModeSlotHeightDp.value, 0.01f)
+    }
+
+    @Test
+    fun modeLaneFitsCompactLandscapeWithoutAFullWidthPanel() {
+        assertTrue(
+            LandscapeLayoutSpec.ModeLaneEstimatedHeightDp.value <=
+                LandscapeLayoutSpec.CompactLandscapeUsableHeightDp.value
+        )
+        assertTrue(LandscapeLayoutSpec.ModeSlotWidthDp.value < LandscapeLayoutSpec.RightRailWidth.value)
     }
 }

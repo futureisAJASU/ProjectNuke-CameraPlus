@@ -72,7 +72,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.geometry.Offset
@@ -1137,6 +1136,7 @@ LaunchedEffect(Unit) {
         CameraTopOverlay(
             modifier = Modifier.align(Alignment.TopCenter),
             status = shortStatus(status),
+            levelState = levelState,
             selectedResolution = selectedResolution,
             onHideFocusAeControls = {
                 showFocusAeControls = false
@@ -2039,32 +2039,24 @@ private fun CameraLandscapeChrome(
     onShutterPositioned: (Offset) -> Unit,
     onActivateFloating: () -> Unit
 ) {
-    // Defect A fix: `modifier` is the `Alignment.CenterEnd` supplied by the
-    // caller (CameraBottomPanel). Previously this modifier was dropped, so the
-    // landscape chrome had no CenterEnd anchor. Now it is applied to the outer
-    // Box that owns the separate clusters.
-    //
-    // Defect B fix: the 200dp ZoomSelector no longer lives inside the 96dp
-    // side rail. The landscape chrome is a Box with 3 anchored clusters:
-    //   • compact right ACTION rail (96dp, result/shutter/switch only)
-    //   • compact horizontal ZOOM strip at bottom-center (has room for 200dp)
-    //   • MODE labels at top-center, horizontal
-    // Each cluster fits independently and the primary action cluster respects
-    // the landscape viewport height gate (see LandscapeLayoutSpec tests).
+    // The landscape chrome keeps three independent screen-space clusters:
+    //   • a narrow MODE lane at the left edge (fixed slots, rotated Text only)
+    //   • a compact horizontal ZOOM selector at the bottom-center
+    //   • stable primary actions at the right edge
+    // No cluster rotates or paints a full-width translucent panel over the
+    // preview; the controls themselves provide their own compact surfaces.
     Box(
         modifier = modifier
             .fillMaxSize()
             .navigationBarsPadding(),
         contentAlignment = Alignment.CenterEnd
     ) {
-        // Zoom cluster — bottom-center, enough width for the 200dp Row
+        // Zoom cluster — bottom-center, enough width for the selector.
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(bottom = 8.dp, start = 8.dp, end = LandscapeChromeWidth + 8.dp)
-                .clip(RoundedCornerShape(18.dp))
-                .background(Color(0x44111218))
-                .padding(horizontal = 12.dp, vertical = 6.dp)
+                .padding(horizontal = 4.dp, vertical = 4.dp)
                 .clickable(onClick = onToggleZoomSlider),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -2094,23 +2086,22 @@ private fun CameraLandscapeChrome(
             }
         }
 
-        // Mode labels — top-center, horizontal (each label rotated in a fixed slot)
+        // Mode lane — left edge. Each label owns a fixed slot; only the Text
+        // content rotates, so hit targets and neighbouring slots stay stable.
         Box(
             modifier = Modifier
-                .align(Alignment.TopCenter)
-                .padding(top = 10.dp, end = LandscapeChromeWidth)
+                .align(Alignment.CenterStart)
+                .padding(start = 2.dp)
         ) {
             LandscapeModeTabs(layoutMode = layoutMode)
         }
 
-        // Narrow right-side action rail — ONLY primary actions, respects height gate
+        // Narrow right-side action lane — ONLY primary actions.
         Column(
             modifier = Modifier
                 .align(Alignment.CenterEnd)
                 .width(LandscapeChromeWidth)
                 .padding(horizontal = 6.dp)
-                .clip(RoundedCornerShape(22.dp))
-                .background(Color(0x33111218))
                 .padding(vertical = 10.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(10.dp)

@@ -105,7 +105,6 @@ internal fun PreviewStage(
             if (state.overlaySettings.showLevel) {
                 LevelIndicatorOverlay(
                     levelState = state.levelState,
-                    layoutMode = layoutMode,
                     modifier = Modifier.fillMaxSize()
                 )
             }

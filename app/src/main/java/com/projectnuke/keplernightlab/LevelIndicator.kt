@@ -5,6 +5,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.view.Surface
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
@@ -22,7 +23,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.platform.LocalContext
-import kotlin.math.PI
+import androidx.compose.ui.platform.LocalView
 
 data class DeviceLevelState(
     val available: Boolean = false,
@@ -36,9 +37,10 @@ fun rememberDeviceLevelState(
     enabled: Boolean
 ): DeviceLevelState {
     val context = LocalContext.current
+    val displayRotation = LocalView.current.display?.rotation ?: Surface.ROTATION_0
     var state by remember { mutableStateOf(DeviceLevelState()) }
 
-    DisposableEffect(enabled) {
+    DisposableEffect(enabled, displayRotation) {
         if (!enabled) {
             state = DeviceLevelState()
             onDispose { }
@@ -51,20 +53,22 @@ fun rememberDeviceLevelState(
                 onDispose { }
             } else {
                 val rotationMatrix = FloatArray(9)
-                val orientation = FloatArray(3)
                 val listener = object : SensorEventListener {
                     override fun onSensorChanged(event: SensorEvent) {
                         SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
-                        SensorManager.getOrientation(rotationMatrix, orientation)
-                        val pitch = (orientation[1] * 180f / PI.toFloat())
-                        val roll = (orientation[2] * 180f / PI.toFloat())
-                        // TODO: tune pitch/roll sign for Samsung portrait orientation if needed.
-                        state = DeviceLevelState(
-                            available = true,
-                            pitchDegrees = -pitch,
-                            rollDegrees = roll,
-                            accuracy = event.accuracy
-                        )
+                        val gravity = gravityFromRotationMatrix(rotationMatrix)
+                            ?.let { remapGravityForDisplay(it, displayRotation) }
+                        val level = gravity?.let(::levelFromDisplayGravity)
+                        state = if (level == null) {
+                            DeviceLevelState(available = false, accuracy = event.accuracy)
+                        } else {
+                            DeviceLevelState(
+                                available = true,
+                                pitchDegrees = level.pitchDegrees,
+                                rollDegrees = level.rollDegrees,
+                                accuracy = event.accuracy
+                            )
+                        }
                     }
 
                     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
@@ -83,11 +87,9 @@ fun rememberDeviceLevelState(
 @Composable
 fun LevelIndicatorOverlay(
     levelState: DeviceLevelState,
-    layoutMode: CameraUiLayoutMode = CameraUiLayoutMode.PORTRAIT,
     modifier: Modifier = Modifier
 ) {
-    val mappedState = mapLevelStateForLayout(levelState, layoutMode)
-    if (!mappedState.available) {
+    if (!levelState.available) {
         Text(
             text = "Level unavailable",
             color = Color.White.copy(alpha = 0.55f),
@@ -101,10 +103,10 @@ fun LevelIndicatorOverlay(
         val center = Offset(size.width / 2f, size.height / 2f)
         val lineColor = Color.White.copy(alpha = 0.65f)
         val accent = Color(0xFFFFD33D).copy(alpha = 0.75f)
-        val pitchOffset = mappedState.pitchDegrees.coerceIn(-20f, 20f) * 3f
+        val pitchOffset = levelState.pitchDegrees.coerceIn(-20f, 20f) * 3f
 
         rotate(
-            degrees = -mappedState.rollDegrees,
+            degrees = -levelState.rollDegrees,
             pivot = center
         ) {
             drawLine(
