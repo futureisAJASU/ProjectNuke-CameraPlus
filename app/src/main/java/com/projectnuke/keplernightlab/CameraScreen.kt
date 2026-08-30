@@ -1724,6 +1724,23 @@ fun FocusAeOverlay(
         val x = maxWidth * point.x
         val y = maxHeight * point.y
 
+        // Keep the display-space marker centered on the exact point. The
+        // controls have a wider EV row and must not determine the marker's
+        // horizontal anchor through Column measurement.
+        Box(
+            modifier = Modifier
+                .offset(
+                    x = x - 36.dp,
+                    y = y - 36.dp
+                )
+                .size(72.dp)
+                .border(
+                    width = 2.dp,
+                    color = Color(0xFFFFD33D),
+                    shape = CircleShape
+                )
+        )
+
         Column(
             modifier = Modifier.offset(
                 x = x - 78.dp,
@@ -1742,16 +1759,6 @@ fun FocusAeOverlay(
             ) {
                 Text(if (focusAeState.locked) "LOCKED" else "LOCK")
             }
-
-            Box(
-                modifier = Modifier
-                    .size(72.dp)
-                    .border(
-                        width = 2.dp,
-                        color = Color(0xFFFFD33D),
-                        shape = CircleShape
-                    )
-            )
 
             Row(
                 modifier = Modifier
