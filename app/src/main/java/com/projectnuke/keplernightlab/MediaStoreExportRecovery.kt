@@ -46,7 +46,9 @@ internal data class MediaStoreExportInspection(
     val pending: Boolean,
     val verified: Boolean,
     val message: String? = null,
-    val inspectionFailed: Boolean = false
+    val inspectionFailed: Boolean = false,
+    /** Read-only main-image verification evidence; null for verified/DNG/structural failures. */
+    val verificationDiagnosticReason: GalleryExportVerificationReason? = null
 )
 
 internal fun recoverMediaStoreExportJournals(
@@ -522,6 +524,7 @@ internal class ContextMediaStoreExportRecoveryAccess(
                 true
             }
             if (!exists) return MediaStoreExportInspection(false, false, false, "The exact MediaStore row is missing.")
+            var verificationDiagnosticReason: GalleryExportVerificationReason? = null
             val verified = when (journal.role) {
                 MediaStoreExportRole.MAIN_IMAGE -> {
                     val format = when (journal.mimeType) {
@@ -529,17 +532,30 @@ internal class ContextMediaStoreExportRecoveryAccess(
                         "image/heif" -> OutputFormat.HEIF
                         else -> OutputFormat.JPEG
                     }
-                    verifyGalleryExportResult(
+                    val verification = verifyGalleryExportResult(
                         context,
                         uri.toString(),
                         GalleryExportExpectation(format, journal.expectedWidth, journal.expectedHeight)
-                    ) is GalleryExportVerification.Verified
+                    )
+                    if (verification !is GalleryExportVerification.Verified) {
+                        verificationDiagnosticReason = when (verification) {
+                            is GalleryExportVerification.RetryableFailure -> verification.diagnosticReason
+                            is GalleryExportVerification.PermanentFailure -> verification.diagnosticReason
+                            is GalleryExportVerification.Verified -> null
+                        }
+                    }
+                    verification is GalleryExportVerification.Verified
                 }
                 MediaStoreExportRole.RAW_DNG_SIDECAR -> {
                     journal.expectedSha256 != null && verifyDngJournalContent(context, uri, journal)
                 }
             }
-            MediaStoreExportInspection(true, pending, verified)
+            MediaStoreExportInspection(
+                exists = true,
+                pending = pending,
+                verified = verified,
+                verificationDiagnosticReason = verificationDiagnosticReason
+            )
         } catch (failure: Error) {
             throw failure
         } catch (cancelled: CancellationException) {

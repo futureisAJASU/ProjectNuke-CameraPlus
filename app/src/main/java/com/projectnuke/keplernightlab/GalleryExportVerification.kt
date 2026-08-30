@@ -19,8 +19,49 @@ sealed interface GalleryExportVerification {
         val size: Long
     ) : GalleryExportVerification
 
-    data class RetryableFailure(val reason: String) : GalleryExportVerification
-    data class PermanentFailure(val reason: String) : GalleryExportVerification
+    data class RetryableFailure(
+        val reason: String,
+        val diagnosticReason: GalleryExportVerificationReason = GalleryExportVerificationReason.UNSPECIFIED
+    ) : GalleryExportVerification
+
+    data class PermanentFailure(
+        val reason: String,
+        val diagnosticReason: GalleryExportVerificationReason = GalleryExportVerificationReason.UNSPECIFIED
+    ) : GalleryExportVerification
+}
+
+/**
+ * Bounded, non-sensitive evidence for why a verification predicate did not pass.
+ *
+ * This is deliberately separate from [GalleryExportVerification.RetryableFailure.reason]: the
+ * latter remains a compatibility/user-facing string, while this enum is safe to persist in
+ * diagnostics and cannot contain provider exception messages or local paths.
+ */
+enum class GalleryExportVerificationReason {
+    UNSPECIFIED,
+    URI_BLANK,
+    URI_PARSE_FAILED,
+    MEDIASTORE_QUERY_FAILED,
+    ROW_MISSING,
+    CONTENT_OPEN_FAILED,
+    CONTENT_STREAM_UNAVAILABLE,
+    CONTENT_EMPTY,
+    MEDIASTORE_SIZE_MISMATCH,
+    SIGNATURE_INVALID,
+    STREAM_TRUNCATED,
+    BOUNDS_DECODE_FAILED,
+    BOUNDS_INVALID,
+    PIXEL_PROBE_FAILED,
+    PIXEL_PROBE_NO_IMAGE,
+    FORMAT_MISMATCH,
+    MIME_MISMATCH,
+    DISPLAY_NAME_INVALID,
+    DUPLICATED_HEIF_NAME,
+    EXTENSION_MISMATCH,
+    DIMENSION_MISMATCH,
+    JOURNAL_SETTLEMENT_PENDING,
+    JOURNAL_PERSISTENCE_FAILED,
+    VERIFICATION_INCOMPLETE
 }
 
 @Volatile
@@ -113,7 +154,10 @@ internal fun verifyGalleryExportResult(
         Thread.sleep(100L * attempt.coerceAtLeast(1))
     }
 ): GalleryExportVerification {
-    if (uriString.isBlank()) return GalleryExportVerification.PermanentFailure("Committed URI is blank")
+    if (uriString.isBlank()) return GalleryExportVerification.PermanentFailure(
+        "Committed URI is blank",
+        GalleryExportVerificationReason.URI_BLANK
+    )
     val uri = try {
         galleryExportUriParseFailureForTest?.let { failure ->
             galleryExportUriParseFailureForTest = null
@@ -125,21 +169,31 @@ internal fun verifyGalleryExportResult(
     } catch (cancelled: CancellationException) {
         throw cancelled
     } catch (failure: Exception) {
-        return GalleryExportVerification.PermanentFailure("Committed URI is invalid: ${failure.message}")
+        return GalleryExportVerification.PermanentFailure(
+            "Committed URI is invalid",
+            GalleryExportVerificationReason.URI_PARSE_FAILED
+        )
     }
     var firstRetryableReason: String? = null
+    var firstRetryableDiagnosticReason: GalleryExportVerificationReason? = null
     repeat(retries.coerceAtLeast(1)) { index ->
         val verification = verifyOnce(uri, expectation, source)
         when (verification) {
             is GalleryExportVerification.Verified,
             is GalleryExportVerification.PermanentFailure -> return verification
             is GalleryExportVerification.RetryableFailure -> {
-                if (firstRetryableReason == null) firstRetryableReason = verification.reason
+                if (firstRetryableReason == null) {
+                    firstRetryableReason = verification.reason
+                    firstRetryableDiagnosticReason = verification.diagnosticReason
+                }
                 if (index + 1 < retries.coerceAtLeast(1)) retryScheduler.beforeRetry(index + 1)
             }
         }
     }
-    return GalleryExportVerification.RetryableFailure(firstRetryableReason ?: "Verification did not complete")
+    return GalleryExportVerification.RetryableFailure(
+        firstRetryableReason ?: "Verification did not complete",
+        firstRetryableDiagnosticReason ?: GalleryExportVerificationReason.VERIFICATION_INCOMPLETE
+    )
 }
 
 private fun verifyOnce(
@@ -152,80 +206,120 @@ private fun verifyOnce(
     } catch (cancelled: CancellationException) {
         throw cancelled
     } catch (error: Exception) {
-        return GalleryExportVerification.RetryableFailure("MediaStore query failed: ${error.javaClass.simpleName}: ${error.message}")
-    } ?: return GalleryExportVerification.RetryableFailure("MediaStore row is unavailable")
+        return GalleryExportVerification.RetryableFailure(
+            "MediaStore query failed: ${error.javaClass.simpleName}",
+            GalleryExportVerificationReason.MEDIASTORE_QUERY_FAILED
+        )
+    } ?: return GalleryExportVerification.RetryableFailure(
+        "MediaStore row is unavailable",
+        GalleryExportVerificationReason.ROW_MISSING
+    )
 
     val probe = try {
         source.open(uri)?.use(::probeImageStream)
     } catch (cancelled: CancellationException) {
         throw cancelled
     } catch (error: Exception) {
-        return GalleryExportVerification.RetryableFailure("Committed content is unreadable: ${error.javaClass.simpleName}: ${error.message}")
-    } ?: return GalleryExportVerification.RetryableFailure("Committed content stream is unavailable")
-    if (probe.size <= 0L) return GalleryExportVerification.RetryableFailure("Committed content is empty")
+        return GalleryExportVerification.RetryableFailure(
+            "Committed content is unreadable: ${error.javaClass.simpleName}",
+            GalleryExportVerificationReason.CONTENT_OPEN_FAILED
+        )
+    } ?: return GalleryExportVerification.RetryableFailure(
+        "Committed content stream is unavailable",
+        GalleryExportVerificationReason.CONTENT_STREAM_UNAVAILABLE
+    )
+    if (probe.size <= 0L) return GalleryExportVerification.RetryableFailure(
+        "Committed content is empty",
+        GalleryExportVerificationReason.CONTENT_EMPTY
+    )
     if (columns.size != null && columns.size > 0L && columns.size != probe.size) {
         return GalleryExportVerification.RetryableFailure(
-            "MediaStore size ${columns.size} does not match readable size ${probe.size}"
+            "MediaStore size ${columns.size} does not match readable size ${probe.size}",
+            GalleryExportVerificationReason.MEDIASTORE_SIZE_MISMATCH
         )
     }
     val format = probe.format
-        ?: return GalleryExportVerification.PermanentFailure("Unrecognized or unsupported image signature")
-    if (!probe.complete) return GalleryExportVerification.PermanentFailure("Truncated or malformed ${format.label} payload")
+        ?: return GalleryExportVerification.PermanentFailure(
+            "Unrecognized or unsupported image signature",
+            GalleryExportVerificationReason.SIGNATURE_INVALID
+        )
+    if (!probe.complete) return GalleryExportVerification.PermanentFailure(
+        "Truncated or malformed ${format.label} payload",
+        GalleryExportVerificationReason.STREAM_TRUNCATED
+    )
 
     val (width, height) = try {
         source.decodeBounds(uri)
     } catch (cancelled: CancellationException) {
         throw cancelled
     } catch (error: Exception) {
-        return GalleryExportVerification.RetryableFailure("Bounds decode failed: ${error.javaClass.simpleName}: ${error.message}")
+        return GalleryExportVerification.RetryableFailure(
+            "Bounds decode failed: ${error.javaClass.simpleName}",
+            GalleryExportVerificationReason.BOUNDS_DECODE_FAILED
+        )
     }
-    if (width <= 0 || height <= 0) return GalleryExportVerification.RetryableFailure("Decoded bounds are invalid: ${width}x${height}")
+    if (width <= 0 || height <= 0) return GalleryExportVerification.RetryableFailure(
+        "Decoded bounds are invalid: ${width}x${height}",
+        GalleryExportVerificationReason.BOUNDS_INVALID
+    )
     val sample = sampledProbeSize(width, height)
     val pixelsDecoded = try {
         source.decodeProbe(uri, sample)
     } catch (cancelled: CancellationException) {
         throw cancelled
     } catch (error: Exception) {
-        return GalleryExportVerification.RetryableFailure("Pixel decode probe failed: ${error.javaClass.simpleName}: ${error.message}")
+        return GalleryExportVerification.RetryableFailure(
+            "Pixel decode probe failed: ${error.javaClass.simpleName}",
+            GalleryExportVerificationReason.PIXEL_PROBE_FAILED
+        )
     }
-    if (!pixelsDecoded) return GalleryExportVerification.RetryableFailure("Pixel decode probe returned no image")
+    if (!pixelsDecoded) return GalleryExportVerification.RetryableFailure(
+        "Pixel decode probe returned no image",
+        GalleryExportVerificationReason.PIXEL_PROBE_NO_IMAGE
+    )
 
     val expected = expectation ?: return GalleryExportVerification.Verified(
         format, columns.mimeType.orEmpty(), columns.displayName.orEmpty(), width, height, probe.size
     )
     if (expected.format != null && format != expected.format) {
         return GalleryExportVerification.PermanentFailure(
-            "Format mismatch: expected ${expected.format.label}, detected ${format.label}"
+            "Format mismatch: expected ${expected.format.label}, detected ${format.label}",
+            GalleryExportVerificationReason.FORMAT_MISMATCH
         )
     }
     val expectedFormat = expected.format ?: format
     if (!columns.mimeType.equals(expectedFormat.mimeType, ignoreCase = true)) {
         return GalleryExportVerification.PermanentFailure(
-            "MediaStore MIME mismatch: expected ${expectedFormat.mimeType}, actual ${columns.mimeType ?: "missing"}"
+            "MediaStore MIME mismatch: expected ${expectedFormat.mimeType}, actual ${columns.mimeType ?: "missing"}",
+            GalleryExportVerificationReason.MIME_MISMATCH
         )
     }
     val displayName = columns.displayName
     val nameLower = displayName?.lowercase(Locale.US)
     if (nameLower.isNullOrBlank()) {
         return GalleryExportVerification.PermanentFailure(
-            "Display-name extension mismatch: expected ${expectedExtensionLabel(expectedFormat)}, actual ${displayName ?: "missing"}"
+            "Display-name extension mismatch: expected ${expectedExtensionLabel(expectedFormat)}, actual ${displayName ?: "missing"}",
+            GalleryExportVerificationReason.DISPLAY_NAME_INVALID
         )
     }
     if (isDuplicatedHeifGeneratedName(nameLower)) {
         return GalleryExportVerification.PermanentFailure(
-            "Display-name is a duplicated malformed generated name: actual $displayName"
+            "Display-name is a duplicated malformed generated name: actual $displayName",
+            GalleryExportVerificationReason.DUPLICATED_HEIF_NAME
         )
     }
     if (!acceptsDisplayNameExtension(expectedFormat, nameLower)) {
         return GalleryExportVerification.PermanentFailure(
-            "Display-name extension mismatch: expected ${expectedExtensionLabel(expectedFormat)}, actual $displayName"
+            "Display-name extension mismatch: expected ${expectedExtensionLabel(expectedFormat)}, actual $displayName",
+            GalleryExportVerificationReason.EXTENSION_MISMATCH
         )
     }
     if (expected.width != null && expected.height != null &&
         (width != expected.width || height != expected.height)
     ) {
         return GalleryExportVerification.PermanentFailure(
-            "Dimension mismatch: expected ${expected.width}x${expected.height}, decoded ${width}x${height}"
+            "Dimension mismatch: expected ${expected.width}x${expected.height}, decoded ${width}x${height}",
+            GalleryExportVerificationReason.DIMENSION_MISMATCH
         )
     }
     return GalleryExportVerification.Verified(

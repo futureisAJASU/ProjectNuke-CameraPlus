@@ -564,7 +564,8 @@ internal fun verifyCommittedGalleryExport(
             authoritative is GalleryExportVerification.Verified
         ) {
             return GalleryExportVerification.RetryableFailure(
-                "Public row verified but export verification settlement is pending."
+                "Public row verified but export verification settlement is pending.",
+                GalleryExportVerificationReason.JOURNAL_SETTLEMENT_PENDING
             )
         }
         return authoritative
@@ -2231,11 +2232,12 @@ internal fun writeGalleryBitmap(
                 fileSizeBytes = verification.size,
                 formatUsed = verification.detectedFormat,
                 fallbackUsed = fallbackUsed,
-                errorMessage = "Public row verified but export journal verification could not be persisted: ${failure.message}",
+                errorMessage = "Public row verified but export journal verification could not be persisted: ${failure.javaClass.simpleName}",
                 attemptedFormats = listOf(format),
-                candidateFailureReasons = listOf(failure.message ?: "Export journal verification failed"),
+                candidateFailureReasons = listOf("Export journal verification failed: ${failure.javaClass.simpleName}"),
                 verification = GalleryExportVerification.RetryableFailure(
-                    "Export journal verification could not be persisted: ${failure.message}"
+                    "Export journal verification could not be persisted: ${failure.javaClass.simpleName}",
+                    GalleryExportVerificationReason.JOURNAL_PERSISTENCE_FAILED
                 ),
                 publicCommitState = GalleryExportCommitState.PUBLIC_COMMITTED_UNVERIFIED
             )
