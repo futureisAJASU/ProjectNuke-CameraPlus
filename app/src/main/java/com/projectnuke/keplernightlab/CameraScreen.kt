@@ -44,6 +44,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -64,6 +65,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -75,12 +77,20 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -162,6 +172,8 @@ private val BottomOverlaySpacing: Dp = 4.dp
 private val FloatingClusterHorizontalPadding: Dp = 10.dp
 private val FloatingClusterVerticalPadding: Dp = 8.dp
 private const val ZoomSliderAutoHideDelayMillis = 2500L
+private val LandscapeChromeWidth: Dp = 96.dp
+private val LandscapeSliderWidth: Dp = 84.dp
 
 private fun mapSliderPositionToValue(
     x: Float,
@@ -377,22 +389,6 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
     }
 
     val mainActivity = (context as? MainActivity)
-    var volumeShutterAction: (() -> Unit)? = null
-    DisposableEffect(currentScreen, canAdmitNewCapture, isPipelineBusy, volumeShutterAction) {
-        if (currentScreen == MainScreen.CAMERA && mainActivity != null && volumeShutterAction != null) {
-            mainActivity.registerVolumeShutter {
-                if (currentScreen != MainScreen.CAMERA) return@registerVolumeShutter false
-                if (!canAdmitNewCapture || isPipelineBusy) return@registerVolumeShutter false
-                volumeShutterAction?.invoke()
-                true
-            }
-        } else {
-            mainActivity?.unregisterVolumeShutter()
-        }
-        onDispose {
-            mainActivity?.unregisterVolumeShutter()
-        }
-    }
 
     val selectedMode = "사진"
     var selectedResolution by remember {
@@ -492,8 +488,38 @@ val savedSettings = remember { CameraSettingsStore.load(context) }
     var showResultPreview by remember { mutableStateOf(false) }
     val previewUiGeneration = remember { AtomicLong(0L) }
 
-    // P2 floating shutter state
-    val floatingController = remember { FloatingShutterController() }
+    // P2 floating shutter state + measured geometry.
+    val hapticFeedback = LocalHapticFeedback.current
+    val density = LocalDensity.current
+    val floatingController = remember {
+        FloatingShutterController(onHaptic = { event ->
+            when (event) {
+                FloatingShutterHaptic.ACTIVATE,
+                FloatingShutterHaptic.BEGIN_DRAG ->
+                    hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+            }
+        })
+    }
+    var floatingViewportSizePx by remember { mutableStateOf(IntSize.Zero) }
+    var floatingShutterCenterPx by remember { mutableStateOf(Offset.Zero) }
+    val floatingShutterRadiusPx = remember(density) {
+        with(density) { (FloatingShutterButtonSize / 2f).toPx() }
+    }
+    val floatingGeometry = remember(
+        floatingViewportSizePx,
+        floatingShutterCenterPx,
+        floatingShutterRadiusPx
+    ) {
+        computeFloatingShutterGeometry(
+            viewportWidthPx = floatingViewportSizePx.width.toFloat(),
+            viewportHeightPx = floatingViewportSizePx.height.toFloat(),
+            shutterRadiusPx = floatingShutterRadiusPx,
+            dockCenterPx = floatingShutterCenterPx
+        )
+    }
+    LaunchedEffect(floatingGeometry) {
+        floatingController.updateGeometry(floatingGeometry)
+    }
 
     val ownedLatestBitmap = latestBitmap
     DisposableEffect(ownedLatestBitmap) {
@@ -1032,6 +1058,7 @@ LaunchedEffect(Unit) {
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
+            .onSizeChanged { floatingViewportSizePx = it }
             .testTag("kepler.camera.root")
     ) {
         PreviewStage(
@@ -1231,12 +1258,29 @@ LaunchedEffect(Unit) {
                 }
             }
         }
-        volumeShutterAction = captureCallback
+        val latestVolumeCaptureCallback by rememberUpdatedState(captureCallback)
+        val volumeShutterEligible = currentScreen == MainScreen.CAMERA && mainActivity != null
+        DisposableEffect(volumeShutterEligible) {
+            if (volumeShutterEligible) {
+                checkNotNull(mainActivity).registerVolumeShutter {
+                    latestVolumeCaptureCallback()
+                    true
+                }
+                onDispose {
+                    checkNotNull(mainActivity).unregisterVolumeShutter()
+                }
+            } else {
+                onDispose { }
+            }
+        }
 
         CameraBottomPanel(
-                modifier = Modifier.align(Alignment.BottomCenter),
+                modifier = Modifier.align(
+                    if (cameraLayoutMode.isLandscape()) Alignment.CenterEnd else Alignment.BottomCenter
+                ),
                 layoutMode = cameraLayoutMode,
-                floatingController = floatingController,
+                onShutterPositioned = { center -> floatingShutterCenterPx = center },
+                onActivateFloating = { floatingController.activateFloating(floatingShutterCenterPx) },
                 latestBitmap = latestBitmap,
                 selectedLensSlot = selectedLensSlot,
                 onLensSlotChange = { lensSlot ->
@@ -1374,35 +1418,19 @@ LaunchedEffect(Unit) {
             onDismiss = { showResultPreview = false }
         )
 
-        // P2 floating shutter
-        if (floatingController.state.value != FloatingShutterState.DOCKED && currentScreen == MainScreen.CAMERA) {
-            val dockTarget = androidx.compose.ui.geometry.Offset(
-                x = 300.dp.value,
-                y = 700.dp.value
-            )
+        // Floating shutter: px-placed, split hit area, measured dock, px-consistent.
+        if (floatingController.state != FloatingShutterState.DOCKED && currentScreen == MainScreen.CAMERA) {
             FloatingShutterButton(
-                state = floatingController.state.value,
-                position = floatingController.position.value,
-                onPositionChange = { newPos ->
-                    val clampedX = newPos.x.coerceIn(40f, 1000f)
-                    val clampedY = newPos.y.coerceIn(120f, 1300f)
-                    floatingController.position.value = androidx.compose.ui.geometry.Offset(clampedX, clampedY)
-                    val threshold = 100f
-                    val dist = kotlin.math.hypot(newPos.x - dockTarget.x, newPos.y - dockTarget.y)
-                    if (dist <= threshold) {
-                        floatingController.state.value = FloatingShutterState.DOCKED
-                    } else {
-                        floatingController.state.value = FloatingShutterState.FLOATING_IDLE
-                    }
-                },
+                isDragging = floatingController.state == FloatingShutterState.FLOATING_DRAGGING,
+                position = floatingController.position,
                 onTap = {
                     if (!isPipelineBusy && canAdmitNewCapture) {
                         captureCallback()
                     }
                 },
-                onLongPress = {
-                    floatingController.state.value = FloatingShutterState.FLOATING_DRAGGING
-                },
+                onDragStart = { floatingController.startDrag() },
+                onDrag = { delta -> floatingController.dragBy(delta) },
+                onDragEnd = { floatingController.endDrag() },
                 modifier = Modifier.fillMaxSize()
             )
         }
@@ -1729,7 +1757,8 @@ fun FocusAeOverlay(
 fun CameraBottomPanel(
     modifier: Modifier = Modifier,
     layoutMode: CameraUiLayoutMode = CameraUiLayoutMode.PORTRAIT,
-    floatingController: FloatingShutterController? = null,
+    onShutterPositioned: (Offset) -> Unit = {},
+    onActivateFloating: () -> Unit = {},
     latestBitmap: Bitmap?,
     selectedLensSlot: LensSlot,
     onLensSlotChange: (LensSlot) -> Unit,
@@ -1755,6 +1784,32 @@ fun CameraBottomPanel(
     onThumbnail: () -> Unit
 ) {
     val isLandscape = layoutMode.isLandscape()
+
+    if (isLandscape) {
+        CameraLandscapeChrome(
+            layoutMode = layoutMode,
+            latestBitmap = latestBitmap,
+            selectedLensSlot = selectedLensSlot,
+            onLensSlotChange = onLensSlotChange,
+            selectedThreeXSource = selectedThreeXSource,
+            onThreeXSourceChange = onThreeXSourceChange,
+            zoomUiState = zoomUiState,
+            showZoomSlider = showZoomSlider,
+            onToggleZoomSlider = onToggleZoomSlider,
+            onZoomRatioChange = onZoomRatioChange,
+            isPipelineBusy = isPipelineBusy,
+            isCapturing = isCapturing,
+            captureProgress = captureProgress,
+            backgroundProcessingLabel = backgroundProcessingLabel,
+            onCapture = onCapture,
+            onAverage = onAverage,
+            onThumbnail = onThumbnail,
+            onShutterPositioned = onShutterPositioned,
+            onActivateFloating = onActivateFloating
+        )
+        return
+    }
+
     Column(
         modifier = modifier
             .fillMaxWidth()
@@ -1762,10 +1817,10 @@ fun CameraBottomPanel(
             .padding(
                 start = BottomOverlayHorizontalPadding,
                 end = BottomOverlayHorizontalPadding,
-                top = if (isLandscape) 2.dp else 0.dp,
-                bottom = if (isLandscape) 4.dp else BottomOverlayBottomPadding
+                top = 0.dp,
+                bottom = BottomOverlayBottomPadding
             ),
-        verticalArrangement = Arrangement.spacedBy(if (isLandscape) 2.dp else BottomOverlaySpacing)
+        verticalArrangement = Arrangement.spacedBy(BottomOverlaySpacing)
     ) {
         AnimatedVisibility(
             visible = showZoomSlider,
@@ -1848,23 +1903,26 @@ fun CameraBottomPanel(
                         .clickable(onClick = onHideFocusAeControls)
                 )
 
-                val controllerRef = floatingController
-                if (isPipelineBusy) {
-                    Box(modifier = Modifier.testTag("kepler.capture.busy")) {
+                Box(
+                    modifier = Modifier
+                        .onGloballyPositioned { coordinates ->
+                            onShutterPositioned(coordinates.boundsInRoot().center)
+                        }
+                        .testTag("kepler.camera.shutter.anchor")
+                ) {
+                    if (isPipelineBusy) {
                         PipelineBusyShutterIndicator(
                             captureProgress = captureProgress,
                             modifier = Modifier.size(ShutterOuterSize)
                         )
+                    } else {
+                        ShutterButton(
+                            enabled = true,
+                            isCapturing = false,
+                            onClick = onCapture,
+                            onLongPress = onActivateFloating
+                        )
                     }
-                } else {
-                    ShutterButton(
-                        enabled = true,
-                        isCapturing = false,
-                        onClick = onCapture,
-                        onLongPress = {
-                            controllerRef?.activateFloating()
-                        }
-                    )
                 }
 
                 Spacer(
@@ -1907,11 +1965,7 @@ fun CameraBottomPanel(
                 )
             }
 
-            ModeTabs(
-                modifier = if (isLandscape) Modifier.graphicsLayer {
-                    rotationZ = if (layoutMode == CameraUiLayoutMode.LANDSCAPE_LEFT) 90f else -90f
-                } else Modifier
-            )
+            ModeTabs(modifier = Modifier)
         }
 
         if (SHOW_LEGACY_RAW_ACTIONS) {
@@ -1941,6 +1995,111 @@ fun CameraBottomPanel(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun CameraLandscapeChrome(
+    layoutMode: CameraUiLayoutMode,
+    latestBitmap: Bitmap?,
+    selectedLensSlot: LensSlot,
+    onLensSlotChange: (LensSlot) -> Unit,
+    selectedThreeXSource: ThreeXSourceMode,
+    onThreeXSourceChange: (ThreeXSourceMode) -> Unit,
+    zoomUiState: ZoomUiState,
+    showZoomSlider: Boolean,
+    onToggleZoomSlider: () -> Unit,
+    onZoomRatioChange: (Float) -> Unit,
+    isPipelineBusy: Boolean,
+    isCapturing: Boolean,
+    captureProgress: CaptureProgressState,
+    backgroundProcessingLabel: String?,
+    onCapture: () -> Unit,
+    onAverage: () -> Unit,
+    onThumbnail: () -> Unit,
+    onShutterPositioned: (Offset) -> Unit,
+    onActivateFloating: () -> Unit
+) {
+    // Compact side-anchored chrome. This is a dedicated compositional geometry
+    // (a narrow right/top vertical strip), NOT a rotated full-width bottom lap:
+    // it keeps the preview unobstructed and leaves the majority in view.
+    Column(
+        modifier = Modifier
+            .width(LandscapeChromeWidth)
+            .navigationBarsPadding()
+            .padding(horizontal = 6.dp, vertical = 10.dp)
+            .clip(RoundedCornerShape(22.dp))
+            .background(Color(0x33111218))
+            .padding(vertical = 10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        CameraSwitchButton(enabled = !isPipelineBusy, onClick = onAverage)
+
+        ResultThumbnail(bitmap = latestBitmap, onClick = onThumbnail)
+
+        ZoomSelector(selected = selectedLensSlot, onSelect = onLensSlotChange)
+        if (selectedLensSlot == LensSlot.THREE_X) {
+            ThreeXSourceDots(selected = selectedThreeXSource, onSelect = onThreeXSourceChange)
+        }
+
+        AnimatedVisibility(visible = showZoomSlider) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                Text(
+                    text = "${"%.1f".format(zoomUiState.zoomRatio)}x",
+                    color = Color.White.copy(alpha = 0.72f),
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.clickable(onClick = onToggleZoomSlider)
+                )
+                CompactZoomSlider(
+                    value = zoomUiState.zoomRatio,
+                    onZoomRatioChange = onZoomRatioChange,
+                    valueRange = zoomUiState.minZoom..zoomUiState.maxZoom,
+                    modifier = Modifier.width(LandscapeSliderWidth)
+                )
+            }
+        }
+
+        Box(
+            modifier = Modifier
+                .onGloballyPositioned { coordinates ->
+                    onShutterPositioned(coordinates.boundsInRoot().center)
+                }
+                .testTag("kepler.camera.shutter.anchor")
+        ) {
+            if (isPipelineBusy) {
+                PipelineBusyShutterIndicator(
+                    captureProgress = captureProgress,
+                    modifier = Modifier.size(ShutterOuterSize)
+                )
+            } else {
+                ShutterButton(
+                    enabled = true,
+                    isCapturing = false,
+                    onClick = onCapture,
+                    onLongPress = onActivateFloating
+                )
+            }
+        }
+
+        if (isPipelineBusy) {
+            CaptureProgressRow(captureProgress = captureProgress)
+        }
+
+        backgroundProcessingLabel?.let { label ->
+            Text(
+                text = label,
+                color = Color.White.copy(alpha = 0.72f),
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        LandscapeModeTabs(layoutMode = layoutMode)
     }
 }
 

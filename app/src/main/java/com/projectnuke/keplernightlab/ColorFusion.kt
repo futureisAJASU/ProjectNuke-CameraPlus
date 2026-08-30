@@ -1083,6 +1083,7 @@ fun captureYuvBurstColorWithMotion(
                                                     zoomRatio = requestZoomRatio,
                                                     focusAeState = focusAeState,
                                                     cameraId = cameraId,
+                                                    displayRotation = context.display?.rotation ?: Surface.ROTATION_0,
                                                     postStatus = ::postStatus,
                                                     failureMessages = yuvCaptureRequestTemplateFailures
                                                 )
@@ -1712,6 +1713,7 @@ private fun createYuvBurstCaptureRequestBuilder(
     zoomRatio: Float,
     focusAeState: FocusAeState,
     cameraId: String,
+    displayRotation: Int,
     postStatus: (String) -> Unit,
     failureMessages: MutableList<String>? = null
 ): Pair<CaptureRequest.Builder, Int> {
@@ -1774,7 +1776,8 @@ private fun createYuvBurstCaptureRequestBuilder(
             characteristics = characteristics,
             zoomRatio = zoomRatio,
             focusAeState = focusAeState,
-            cameraId = cameraId
+            cameraId = cameraId,
+            displayRotation = displayRotation
         )
         return builder to template
     }

@@ -71,10 +71,9 @@ internal fun PreviewStage(
                             width = size.width.toFloat(),
                             height = size.height.toFloat()
                         )
-                        val point = normalizePointFromPreviewContainer(
+                        val point = normalizeDisplayPoint(
                             offset = androidx.compose.ui.geometry.Offset(offset.x, offset.y),
-                            containerSize = containerSize,
-                            layoutMode = layoutMode
+                            containerSize = containerSize
                         )
                         if (point != null) {
                             callbacks.onFocusPoint(point)

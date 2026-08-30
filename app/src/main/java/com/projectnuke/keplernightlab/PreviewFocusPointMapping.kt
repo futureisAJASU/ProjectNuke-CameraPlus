@@ -1,26 +1,69 @@
 package com.projectnuke.keplernightlab
 
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 
-fun normalizePointFromPreviewContainer(
-    offset: Offset,
-    containerSize: androidx.compose.ui.geometry.Size,
-    layoutMode: CameraUiLayoutMode
-): NormalizedPoint? {
+/**
+ * DISPLAY-SPACE normalization only.
+ *
+ * The preview tap is expressed as a normalized point in the on-screen preview
+ * container. This value is stored verbatim on [FocusAeState.point] and consumed
+ * by [FocusAeOverlay] (which multiplies it against its own BoxWithConstraints
+ * dimensions). It MUST NOT be rotated here: rotating display coordinates before
+ * persistence would move the AF/AE marker away from the user's finger in
+ * landscape.
+ */
+fun normalizeDisplayPoint(offset: Offset, containerSize: Size): NormalizedPoint? {
     if (containerSize.width <= 0f || containerSize.height <= 0f) return null
-    val rawX = (offset.x / containerSize.width).coerceIn(0f, 1f)
-    val rawY = (offset.y / containerSize.height).coerceIn(0f, 1f)
-    return when (layoutMode) {
-        CameraUiLayoutMode.PORTRAIT -> NormalizedPoint(rawX, rawY)
-        CameraUiLayoutMode.LANDSCAPE_LEFT -> {
-            // In landscape left (rotation 90), the sensor is rotated 90 clockwise relative to display.
-            // To keep tap-to-focus intuitive: the user's tap at top-left of screen (in landscape left)
-            // should correspond to the top-left of the preview area in sensor coordinates.
-            // We swap and invert accordingly.
-            NormalizedPoint(1f - rawY, rawX)
-        }
-        CameraUiLayoutMode.LANDSCAPE_RIGHT -> {
-            NormalizedPoint(rawY, 1f - rawX)
-        }
+    return NormalizedPoint(
+        x = (offset.x / containerSize.width).coerceIn(0f, 1f),
+        y = (offset.y / containerSize.height).coerceIn(0f, 1f)
+    )
+}
+
+/**
+ * SENSOR-SPACE transform, applied ONLY when Camera2 metering coordinates are
+ * built.
+ *
+ * This uses the same orientation basis as
+ * [CameraPreviewController.configureTransform]:
+ *   sensorOrientation  = CameraCharacteristics.SENSOR_ORIENTATION
+ *   displayDegrees     = Surface.ROTATION_0/90/180/270
+ *   relativeRotation   = (sensorOrientation - displayDegrees + 360) % 360
+ *
+ * The display-normalized point is counter-rotated by relativeRotation to reach
+ * the sensor/crop-normalized space:
+ *     0   -> (x, y)
+ *     90  -> (1 - y, x)
+ *     180 -> (1 - x, 1 - y)
+ *     270 -> (y, 1 - x)
+ *
+ * Center is invariant under every rotation (a pure right-angle rotation maps
+ * (0.5, 0.5) to (0.5, 0.5)), which is asserted by tests.
+ *
+ * [mirrored] exists as an explicit seam for any future front-camera path that
+ * horizontally flips the preview. The current production path never mirrors,
+ * so callers leave it false; the transform still documents the audit point so a
+ * front-camera capture cannot silently share the un-mirrored coordinate basis.
+ */
+fun transformDisplayPointToSensorPoint(
+    displayPoint: NormalizedPoint,
+    sensorOrientationDegrees: Int,
+    displayRotation: Int,
+    mirrored: Boolean = false
+): NormalizedPoint {
+    val sensor = normalizeRightAngle(sensorOrientationDegrees) ?: 0
+    val display = displayRotationDegrees(displayRotation) ?: 0
+    var x = displayPoint.x.coerceIn(0f, 1f)
+    var y = displayPoint.y.coerceIn(0f, 1f)
+    if (mirrored) {
+        x = 1f - x
+    }
+    val relativeRotation = ((sensor - display) % 360 + 360) % 360
+    return when (relativeRotation) {
+        90 -> NormalizedPoint(1f - y, x)
+        180 -> NormalizedPoint(1f - x, 1f - y)
+        270 -> NormalizedPoint(y, 1f - x)
+        else -> NormalizedPoint(x, y)
     }
 }

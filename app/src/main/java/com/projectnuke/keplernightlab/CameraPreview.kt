@@ -195,6 +195,7 @@ internal class CameraPreviewController(
     private var lastActivePhysicalLog: String? = null
     @Volatile private var latestFocusAeState: FocusAeState = FocusAeState()
     @Volatile private var latestMeteringMode: MeteringMode = MeteringModeState.mode
+    @Volatile private var meteringDisplayRotation: Int = Surface.ROTATION_0
     private var openRequestedGeneration: Int? = null
     private var lastTextureView: TextureView? = null
     private var cleanupDiagnostics = PreviewCleanupDiagnostics()
@@ -1244,19 +1245,24 @@ val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_
         }
     }
 
-    private fun buildMeteringRectangle(
+private fun buildMeteringRectangle(
         characteristics: CameraCharacteristics,
         zoomRatio: Float,
         point: NormalizedPoint?,
         fraction: Float,
         weight: Int
     ): MeteringRectangle? {
-        val safePoint = point ?: return null
+        val rawPoint = point ?: return null
+        val sensorPoint = transformDisplayPointToSensorPoint(
+            displayPoint = rawPoint,
+            sensorOrientationDegrees = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0,
+            displayRotation = meteringDisplayRotation
+        )
         val cropRegion = buildMeteringCropRegion(characteristics, zoomRatio)
         val regionWidth = max(48, (cropRegion.width() * fraction).roundToInt())
         val regionHeight = max(48, (cropRegion.height() * fraction).roundToInt())
-        val centerX = cropRegion.left + (cropRegion.width() * safePoint.x.coerceIn(0f, 1f)).roundToInt()
-        val centerY = cropRegion.top + (cropRegion.height() * safePoint.y.coerceIn(0f, 1f)).roundToInt()
+        val centerX = cropRegion.left + (cropRegion.width() * sensorPoint.x.coerceIn(0f, 1f)).roundToInt()
+        val centerY = cropRegion.top + (cropRegion.height() * sensorPoint.y.coerceIn(0f, 1f)).roundToInt()
         val left = (centerX - regionWidth / 2).coerceIn(cropRegion.left, cropRegion.right - regionWidth)
         val top = (centerY - regionHeight / 2).coerceIn(cropRegion.top, cropRegion.bottom - regionHeight)
         val rect = Rect(
@@ -1461,6 +1467,7 @@ private fun storeCaptureSession(
             ?.get(CameraCharacteristics.SENSOR_ORIENTATION)
             ?: 0
         val displayRotation = textureView.display?.rotation ?: Surface.ROTATION_0
+        meteringDisplayRotation = displayRotation
         val displayDegrees = when (displayRotation) {
             Surface.ROTATION_90 -> 90
             Surface.ROTATION_180 -> 180

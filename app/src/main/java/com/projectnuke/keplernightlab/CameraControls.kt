@@ -26,6 +26,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -189,6 +190,27 @@ fun ModeTabs(modifier: Modifier = Modifier) {
             style = MaterialTheme.typography.labelSmall,
             modifier = Modifier.align(Alignment.CenterHorizontally)
         )
+    }
+}
+
+@Composable
+fun LandscapeModeTabs(layoutMode: CameraUiLayoutMode) {
+    val rotation = layoutMode.modeLabelRotationDegrees()
+    val modes = listOf("인물 사진", "야간", "사진", "동영상", "더보기")
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        modes.forEach { mode ->
+            val isPhoto = mode == "사진"
+            Text(
+                text = mode,
+                color = if (isPhoto) Color.White else Color.White.copy(alpha = 0.28f),
+                style = if (isPhoto) MaterialTheme.typography.titleSmall else MaterialTheme.typography.labelLarge,
+                maxLines = 1,
+                modifier = Modifier.graphicsLayer { rotationZ = rotation }
+            )
+        }
     }
 }
 

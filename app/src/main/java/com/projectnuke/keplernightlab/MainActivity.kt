@@ -18,15 +18,27 @@ class MainActivity : ComponentActivity() {
     fun unregisterVolumeShutter() = volumeShutterDispatcher.unregister()
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        when (keyCode) {
-            KeyEvent.KEYCODE_VOLUME_UP,
-            KeyEvent.KEYCODE_VOLUME_DOWN -> {
-                if (volumeShutterDispatcher.dispatch()) {
+        if (VolumeKeyEventPolicy.isVolumeKey(keyCode) && volumeShutterDispatcher.isRegistered) {
+            val action = VolumeKeyEventPolicy.resolve(
+                keyCode = keyCode,
+                repeatCount = event?.repeatCount ?: 0,
+                camerasOwnInput = volumeShutterDispatcher.isRegistered,
+                isKeyDown = true
+            )
+            when (action) {
+                VolumeKeyAction.DISPATCH -> {
+                    volumeShutterDispatcher.dispatch()
                     return true
                 }
+                VolumeKeyAction.CONSUME_ONLY -> return true
+                VolumeKeyAction.IGNORE -> { }
             }
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        return super.onKeyUp(keyCode, event)
     }
 
     @Suppress("DEPRECATION")

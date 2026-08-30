@@ -59,7 +59,8 @@ fun CaptureRequest.Builder.applyZoomAndFocusAe(
     zoomRatio: Float,
     focusAeState: FocusAeState,
     useMaximumResolutionActiveArray: Boolean = false,
-    cameraId: String? = null
+    cameraId: String? = null,
+    displayRotation: Int = android.view.Surface.ROTATION_0
 ) {
     val zoomApplication = applyCamera2Zoom(
         characteristics = characteristics,
@@ -89,7 +90,8 @@ fun CaptureRequest.Builder.applyZoomAndFocusAe(
         characteristics = characteristics,
         zoomApplication = zoomApplication,
         point = focusAeState.point,
-        useMaximumResolutionActiveArray = useMaximumResolutionActiveArray
+        useMaximumResolutionActiveArray = useMaximumResolutionActiveArray,
+        displayRotation = displayRotation
     )
     if (region != null) {
         set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
@@ -102,9 +104,15 @@ fun buildFocusAeMeteringRectangle(
     characteristics: CameraCharacteristics,
     zoomApplication: Camera2ZoomApplication,
     point: NormalizedPoint?,
-    useMaximumResolutionActiveArray: Boolean = false
+    useMaximumResolutionActiveArray: Boolean = false,
+    displayRotation: Int = android.view.Surface.ROTATION_0
 ): MeteringRectangle? {
     if (point == null) return null
+    val sensorPoint = transformDisplayPointToSensorPoint(
+        displayPoint = point,
+        sensorOrientationDegrees = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0,
+        displayRotation = displayRotation
+    )
     val activeSource = if (
         zoomApplication.usedControlZoomRatio &&
         useMaximumResolutionActiveArray &&
@@ -128,8 +136,8 @@ fun buildFocusAeMeteringRectangle(
             useMaximumResolutionActiveArray = useMaximumResolutionActiveArray
         ).region ?: active
     }
-    val x = (crop.left + crop.width() * point.x.coerceIn(0f, 1f)).roundToInt()
-    val y = (crop.top + crop.height() * point.y.coerceIn(0f, 1f)).roundToInt()
+    val x = (crop.left + crop.width() * sensorPoint.x.coerceIn(0f, 1f)).roundToInt()
+    val y = (crop.top + crop.height() * sensorPoint.y.coerceIn(0f, 1f)).roundToInt()
     val box = (minOf(crop.width(), crop.height()) * 0.10f).roundToInt().coerceAtLeast(16)
     val rect = Rect(
         (x - box / 2).coerceIn(crop.left, crop.right - 1),
@@ -140,7 +148,7 @@ fun buildFocusAeMeteringRectangle(
     Log.d(
         "KeplerMetering",
         "metering mode=${if (zoomApplication.usedControlZoomRatio) "CONTROL_ZOOM_RATIO" else "SCALER_CROP_REGION"} " +
-            "activeArray=$activeSource zoom=${zoomApplication.appliedZoomRatio} point=$point region=$rect"
+            "activeArray=$activeSource zoom=${zoomApplication.appliedZoomRatio} sensorPoint=$sensorPoint region=$rect"
     )
     return MeteringRectangle(rect, MeteringRectangle.METERING_WEIGHT_MAX)
 }

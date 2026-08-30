@@ -21,3 +21,22 @@ fun CameraUiLayoutMode.isLandscape(): Boolean = this != CameraUiLayoutMode.PORTR
 fun CameraUiLayoutMode.isLandscapeLeft(): Boolean = this == CameraUiLayoutMode.LANDSCAPE_LEFT
 
 fun CameraUiLayoutMode.isLandscapeRight(): Boolean = this == CameraUiLayoutMode.LANDSCAPE_RIGHT
+
+enum class CameraChromeOrientation {
+    BOTTOM,
+    SIDE
+}
+
+fun CameraUiLayoutMode.chromeOrientation(): CameraChromeOrientation =
+    if (this == CameraUiLayoutMode.PORTRAIT) CameraChromeOrientation.BOTTOM else CameraChromeOrientation.SIDE
+
+/**
+ * Per-label rotation for landscape chrome. Only individual mode labels are
+ * rotated (±90°), never the whole layout tree: rotating a full-width tree with
+ * graphicsLayer would not change its measured footprint.
+ */
+fun CameraUiLayoutMode.modeLabelRotationDegrees(): Float = when (this) {
+    CameraUiLayoutMode.PORTRAIT -> 0f
+    CameraUiLayoutMode.LANDSCAPE_LEFT -> -90f
+    CameraUiLayoutMode.LANDSCAPE_RIGHT -> 90f
+}

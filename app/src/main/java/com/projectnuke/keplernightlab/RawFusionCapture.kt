@@ -1860,7 +1860,8 @@ fun captureRawBurstForFusion(
                                             zoomRatio = requestZoomRatio,
                                             focusAeState = focusAeState,
                                             useMaximumResolutionActiveArray = rawSelection.requiresMaximumResolutionPixelMode,
-                                            cameraId = cameraId
+                                            cameraId = cameraId,
+                                            displayRotation = displayRotation
                                         )
                                     }.build()
                                 }
