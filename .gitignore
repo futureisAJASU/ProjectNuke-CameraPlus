@@ -47,3 +47,9 @@ replay_pid*.log
 
 # Hardware E2E local diagnostic artifacts (device serial / process info)
 artifacts/hardware-e2e/
+
+# Signing material: only the intentionally public debug identity is versioned.
+*.jks
+*.keystore
+!app/kepler-debug.jks
+app/local-debug.jks

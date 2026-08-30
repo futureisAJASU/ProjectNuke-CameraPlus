@@ -8,6 +8,24 @@ android {
     compileSdk = 36
     ndkVersion = "29.0.14206865"
 
+    signingConfigs {
+        // Project-pinned DEBUG identity. A local override lets the user's
+        // existing machine-local debug identity be preserved without mutating
+        // the checked-in fallback key. Never reuse either key for release.
+        getByName("debug") {
+            val localDebugKeystore = rootProject.file("app/local-debug.jks")
+            val pinnedDebugKeystore = rootProject.file("app/kepler-debug.jks")
+            storeFile = when {
+                localDebugKeystore.isFile -> localDebugKeystore
+                pinnedDebugKeystore.isFile -> pinnedDebugKeystore
+                else -> error("Debug signing requires app/local-debug.jks or app/kepler-debug.jks")
+            }
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     defaultConfig {
         applicationId = "com.projectnuke.keplernightlab"
         minSdk = 36
@@ -25,6 +43,9 @@ android {
     }
 
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("debug")
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
@@ -47,6 +68,50 @@ android {
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
+        }
+    }
+}
+
+tasks.register("verifyDebugSigningSafety") {
+    group = "verification"
+    description = "Checks that debug signing uses only the intended project keystores."
+    doLast {
+        fun gitContainsTracked(path: String): Boolean {
+            val process = ProcessBuilder("git", "ls-files", "--error-unmatch", path)
+                .directory(rootProject.projectDir)
+                .redirectErrorStream(true)
+                .start()
+            return process.waitFor() == 0
+        }
+
+        val localPath = rootProject.file("app/local-debug.jks")
+        val pinnedPath = rootProject.file("app/kepler-debug.jks")
+        check(!gitContainsTracked("app/local-debug.jks")) {
+            "Developer-local app/local-debug.jks must never be tracked"
+        }
+        check(gitContainsTracked("app/kepler-debug.jks")) {
+            "The project-pinned fallback app/kepler-debug.jks must be tracked"
+        }
+        check(pinnedPath.isFile) { "Missing project-pinned fallback debug keystore" }
+        check(localPath.isFile || pinnedPath.isFile) {
+            "Debug signing has no usable project keystore"
+        }
+
+        val source = project.file("build.gradle.kts").readText()
+        check("app/local-debug.jks" in source && "app/kepler-debug.jks" in source) {
+            "Debug signing must reference only the intended project keystore paths"
+        }
+        val signingSource = source.substringBefore("defaultConfig")
+        check("debug.keystore" !in signingSource) {
+            "Debug signing must not fall back to a machine-default debug keystore"
+        }
+        val releaseStart = source.indexOf("release {")
+        check(releaseStart >= 0) { "Release build type is missing" }
+        val releaseEnd = source.indexOf("compileOptions", releaseStart)
+        check(releaseEnd > releaseStart) { "Release build type boundary is missing" }
+        val releaseBlock = source.substring(releaseStart, releaseEnd)
+        check("signingConfig" !in releaseBlock) {
+            "Release signing must remain independent from the debug signing config"
         }
     }
 }
