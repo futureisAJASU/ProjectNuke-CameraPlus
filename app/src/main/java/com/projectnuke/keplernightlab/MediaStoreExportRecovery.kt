@@ -507,17 +507,20 @@ private fun recoverMediaStoreExportJournal(
 internal class ContextMediaStoreExportRecoveryAccess(
     private val context: Context
 ) : MediaStoreExportRecoveryAccess {
-    override fun inspect(uri: Uri, journal: MediaStoreExportJournal): MediaStoreExportInspection {
-        return try {
+    override fun inspect(uri: Uri, journal: MediaStoreExportJournal): MediaStoreExportInspection =
+        R3GalleryColdMeasurement.measureInspection(journal) {
+            try {
             var pending = false
-            val cursor = context.contentResolver.query(
-                uri,
-                arrayOf(MediaStore.MediaColumns.IS_PENDING),
-                null,
-                null,
-                null
-            )
-            if (cursor == null) return MediaStoreExportInspection(
+            val cursor = R3GalleryColdMeasurement.measureQuery {
+                context.contentResolver.query(
+                    uri,
+                    arrayOf(MediaStore.MediaColumns.IS_PENDING),
+                    null,
+                    null,
+                    null
+                )
+            }
+            if (cursor == null) return@measureInspection MediaStoreExportInspection(
                 exists = false,
                 pending = false,
                 verified = false,
@@ -529,7 +532,7 @@ internal class ContextMediaStoreExportRecoveryAccess(
                 pending = cursor.getInt(0) != 0
                 true
             }
-            if (!exists) return MediaStoreExportInspection(false, false, false, "The exact MediaStore row is missing.")
+            if (!exists) return@measureInspection MediaStoreExportInspection(false, false, false, "The exact MediaStore row is missing.")
             var verificationDiagnosticReason: GalleryExportVerificationReason? = null
             val verified = when (journal.role) {
                 MediaStoreExportRole.MAIN_IMAGE -> {
@@ -538,11 +541,13 @@ internal class ContextMediaStoreExportRecoveryAccess(
                         "image/heif" -> OutputFormat.HEIF
                         else -> OutputFormat.JPEG
                     }
-                    val verification = verifyGalleryExportResult(
-                        context,
-                        uri.toString(),
-                        GalleryExportExpectation(format, journal.expectedWidth, journal.expectedHeight)
-                    )
+                    val verification = R3GalleryColdMeasurement.measureVerification {
+                        verifyGalleryExportResult(
+                            context,
+                            uri.toString(),
+                            GalleryExportExpectation(format, journal.expectedWidth, journal.expectedHeight)
+                        )
+                    }
                     if (verification !is GalleryExportVerification.Verified) {
                         verificationDiagnosticReason = when (verification) {
                             is GalleryExportVerification.RetryableFailure -> verification.diagnosticReason
@@ -562,22 +567,22 @@ internal class ContextMediaStoreExportRecoveryAccess(
                 verified = verified,
                 verificationDiagnosticReason = verificationDiagnosticReason
             )
-        } catch (failure: Error) {
-            throw failure
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (failure: Exception) {
+            } catch (failure: Error) {
+                throw failure
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
             // Keep provider failures fail-closed without exposing arbitrary exception text,
             // paths, or unrelated URI/provider contents through recovery diagnostics.
-            MediaStoreExportInspection(
-                false,
-                false,
-                false,
-                "MediaStore inspection failed: ${failure.javaClass.simpleName}",
-                inspectionFailed = true
-            )
+                MediaStoreExportInspection(
+                    false,
+                    false,
+                    false,
+                    "MediaStore inspection failed: ${failure.javaClass.simpleName}",
+                    inspectionFailed = true
+                )
+            }
         }
-    }
 
     override fun setPending(uri: Uri, pending: Boolean): Boolean =
         context.contentResolver.update(

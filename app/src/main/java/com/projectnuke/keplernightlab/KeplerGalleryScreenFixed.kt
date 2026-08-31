@@ -120,6 +120,7 @@ fun KeplerGalleryScreenFixed(onBack: () -> Unit) {
         }
             .onSuccess {
                 jobs = it
+                R3GalleryColdMeasurement.galleryReady(context, it.size)
                 selectedIds = selectedIds.intersect(it.map { job -> job.id }.toSet())
                 error = null
             }

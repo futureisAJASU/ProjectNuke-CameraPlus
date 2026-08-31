@@ -681,16 +681,22 @@ internal fun inspectProcessingHandoff(
             is NoFollowInspection.InspectionFailed -> throw KeplerJobMetadataCorrupt(jobDir, result.exception)
             is NoFollowInspection.Present -> result.value
         }
-        val job = try {
-            JSONObject(NoFollowFileSystem.readTextVerified(file))
-        } catch (parseFailure: JSONException) {
-            throw KeplerJobMetadataCorrupt(jobDir, parseFailure)
+        val originalText = try {
+            NoFollowFileSystem.readTextVerified(file)
         } catch (ioFailure: Exception) {
             throw KeplerJobMetadataCorrupt(jobDir, ioFailure)
         }
+        val job = try {
+            JSONObject(originalText)
+        } catch (parseFailure: JSONException) {
+            throw KeplerJobMetadataCorrupt(jobDir, parseFailure)
+        }
         mutate(job)
         job.put("schemaVersion", job.optInt("schemaVersion", KEPLER_JOB_SCHEMA_VERSION))
-        atomicWrite(File(jobDir, JOB_JSON_FILE_NAME), job.toString(2))
+        val serialized = job.toString(2)
+        R3GalleryColdMeasurement.measureMetadataWrite(originalText == serialized) {
+            atomicWrite(File(jobDir, JOB_JSON_FILE_NAME), serialized)
+        }
         job
     }
 

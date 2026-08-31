@@ -52,7 +52,9 @@ internal data class MediaStoreExportJournal(
 ) {
     fun writeTo(jobDir: File): MediaStoreExportJournal {
         require(jobIdentity == jobDir.name) { "Export journal job identity mismatch" }
-        KeplerJobMetadata.atomicWrite(fileFor(jobDir, exportAttemptId), toJson().toString(2))
+        R3GalleryColdMeasurement.measureJournalWrite {
+            KeplerJobMetadata.atomicWrite(fileFor(jobDir, exportAttemptId), toJson().toString(2))
+        }
         return this
     }
 
@@ -68,12 +70,15 @@ internal data class MediaStoreExportJournal(
         updatedAt = System.currentTimeMillis()
     ).writeTo(jobDir)
 
-    fun markTerminalPersisted(jobDir: File, operationId: String? = terminalOperationId): MediaStoreExportJournal = copy(
-        terminalMetadataPersisted = true,
-        terminalMetadataPersistedAt = System.currentTimeMillis(),
-        terminalOperationId = operationId,
-        updatedAt = System.currentTimeMillis()
-    ).writeTo(jobDir)
+    fun markTerminalPersisted(jobDir: File, operationId: String? = terminalOperationId): MediaStoreExportJournal =
+        R3GalleryColdMeasurement.measureTerminalMetadataWrite {
+            copy(
+                terminalMetadataPersisted = true,
+                terminalMetadataPersistedAt = System.currentTimeMillis(),
+                terminalOperationId = operationId,
+                updatedAt = System.currentTimeMillis()
+            ).writeTo(jobDir)
+        }
 
     fun deleteIfOwned(jobDir: File) {
         val file = fileFor(jobDir, exportAttemptId)

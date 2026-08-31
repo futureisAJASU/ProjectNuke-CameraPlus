@@ -44,6 +44,7 @@ class MainActivity : ComponentActivity() {
     @Suppress("DEPRECATION")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        R3GalleryColdMeasurement.onProcessStart(applicationContext)
         window.statusBarColor = Color.BLACK
         window.navigationBarColor = Color.BLACK
         WindowCompat.setDecorFitsSystemWindows(window, false)

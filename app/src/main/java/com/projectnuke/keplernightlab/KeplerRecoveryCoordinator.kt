@@ -105,6 +105,7 @@ internal object KeplerRecoveryCoordinator {
     }
 
     private fun scan(context: Context): KeplerRecoveryReport {
+        R3GalleryColdMeasurement.recoveryStarted()
         val report = recoverRoots(
             keplerGalleryRoots(context),
             ContextMediaStoreExportRecoveryAccess(context)
@@ -116,7 +117,9 @@ internal object KeplerRecoveryCoordinator {
         } catch (failure: Exception) {
             KeplerCacheCleanupResult(failures = listOf("Cache cleanup failed: ${failure.message}"))
         }
-        return report.copy(cacheCleanupFailures = cacheCleanup.failures)
+        return report.copy(cacheCleanupFailures = cacheCleanup.failures).also {
+            R3GalleryColdMeasurement.recoveryFinished(it)
+        }
     }
 
     internal fun recoverRoots(
@@ -353,8 +356,10 @@ internal object KeplerRecoveryCoordinator {
                 }
             }
             if (exportAuthorityOperation.isNotBlank() && exportResults.isNotEmpty()) {
-                job = KeplerJobMetadata.update(jobDir) { current ->
-                    reconstructMainExportEvidence(jobDir, current, exportAuthorityOperation, exportResults)
+                job = R3GalleryColdMeasurement.measureReconstruction {
+                    KeplerJobMetadata.update(jobDir) { current ->
+                        reconstructMainExportEvidence(jobDir, current, exportAuthorityOperation, exportResults)
+                    }
                 }
             }
             if ((exportResults.isNotEmpty() || activeOperation.isNotBlank()) && rawSidecarRecoveryApplies(jobDir, job)) {

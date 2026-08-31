@@ -95,12 +95,12 @@ internal fun interface GalleryVerificationRetryScheduler {
 private class AndroidGalleryExportVerificationSource(
     private val context: Context
 ) : GalleryExportVerificationSource {
-    override fun query(uri: Uri): GalleryMediaColumns? {
+    override fun query(uri: Uri): GalleryMediaColumns? = R3GalleryColdMeasurement.measureQuery {
         if (uri.scheme == "file") {
-            val file = uri.path?.let { path -> java.io.File(path) } ?: return null
-            return GalleryMediaColumns(null, file.name, file.length())
+            val file = uri.path?.let { path -> java.io.File(path) } ?: return@measureQuery null
+            return@measureQuery GalleryMediaColumns(null, file.name, file.length())
         }
-        return context.contentResolver.query(
+        context.contentResolver.query(
             uri,
             arrayOf(
                 MediaStore.MediaColumns.MIME_TYPE,
@@ -122,21 +122,21 @@ private class AndroidGalleryExportVerificationSource(
 
     override fun open(uri: Uri): InputStream? = context.contentResolver.openInputStream(uri)
 
-    override fun decodeBounds(uri: Uri): Pair<Int, Int> {
+    override fun decodeBounds(uri: Uri): Pair<Int, Int> = R3GalleryColdMeasurement.measureBoundsDecode {
         val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
-        return options.outWidth to options.outHeight
+        options.outWidth to options.outHeight
     }
 
-    override fun decodeProbe(uri: Uri, sampleSize: Int): Boolean {
+    override fun decodeProbe(uri: Uri, sampleSize: Int): Boolean = R3GalleryColdMeasurement.measureSampledPixelDecode {
         val options = BitmapFactory.Options().apply {
             inSampleSize = sampleSize.coerceAtLeast(1)
             inPreferredConfig = android.graphics.Bitmap.Config.RGB_565
         }
         val bitmap = context.contentResolver.openInputStream(uri)?.use {
             BitmapFactory.decodeStream(it, null, options)
-        } ?: return false
-        return try {
+        } ?: return@measureSampledPixelDecode false
+        try {
             !bitmap.isRecycled && bitmap.width > 0 && bitmap.height > 0
         } finally {
             bitmap.recycle()
@@ -218,7 +218,9 @@ private fun verifyOnce(
     )
 
     val probe = try {
-        source.open(uri)?.use(::probeImageStream)
+        R3GalleryColdMeasurement.measureContentStream {
+            source.open(uri)?.use(::probeImageStream)
+        }
     } catch (cancelled: CancellationException) {
         throw cancelled
     } catch (error: Exception) {
