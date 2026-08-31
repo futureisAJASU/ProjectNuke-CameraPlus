@@ -672,7 +672,12 @@ internal fun inspectProcessingHandoff(
      * modify it in place. Only the modified keys are saved back; unrelated concurrent keys are
      * preserved. Use [removeKey] inside the lambda to remove keys.
      */
-    fun update(jobDir: File, mutate: (JSONObject) -> Unit): JSONObject = synchronized(lockFor(jobDir)) {
+    internal fun update(
+        jobDir: File,
+        source: R3GalleryColdMeasurement.MetadataWriteSource =
+            R3GalleryColdMeasurement.MetadataWriteSource.OTHER,
+        mutate: (JSONObject) -> Unit
+    ): JSONObject = synchronized(lockFor(jobDir)) {
         requireRealJobDirectory(jobDir)
         val file = when (val result = NoFollowFileSystem.resolveDirectChildResult(
             jobDir, JOB_JSON_FILE_NAME, requireFile = true
@@ -694,11 +699,15 @@ internal fun inspectProcessingHandoff(
         mutate(job)
         job.put("schemaVersion", job.optInt("schemaVersion", KEPLER_JOB_SCHEMA_VERSION))
         val serialized = job.toString(2)
-        R3GalleryColdMeasurement.measureMetadataWrite(originalText == serialized) {
+        val contentChanged = R3GalleryColdMeasurement.metadataContentChanged(originalText, serialized)
+        R3GalleryColdMeasurement.measureMetadataWrite(contentChanged, source) {
             atomicWrite(File(jobDir, JOB_JSON_FILE_NAME), serialized)
         }
         job
     }
+
+    fun update(jobDir: File, mutate: (JSONObject) -> Unit): JSONObject =
+        update(jobDir, R3GalleryColdMeasurement.MetadataWriteSource.OTHER, mutate)
 
     /**
      * Persists restart-reconciliation ownership without replacing the live in-process lease.
@@ -950,7 +959,7 @@ internal fun inspectProcessingHandoff(
     /** Clears a dead-process marker only after recovery has matched its exact operation. */
     internal fun clearRecoveredActiveOperation(jobDir: File, operationId: String): Boolean = runCatching {
         var matched = false
-        update(jobDir) { job ->
+        update(jobDir, R3GalleryColdMeasurement.MetadataWriteSource.TERMINAL_STABLE_SETTLEMENT) { job ->
             if (job.optString(ACTIVE_OPERATION_ID) != operationId ||
                 job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id
             ) return@update
@@ -974,7 +983,7 @@ internal fun inspectProcessingHandoff(
         recoveryLease: JobOperationLease? = null
     ): Boolean = try {
         var matched = false
-        update(jobDir) { job ->
+        update(jobDir, R3GalleryColdMeasurement.MetadataWriteSource.TERMINAL_STABLE_SETTLEMENT) { job ->
             if (job.optString(ACTIVE_OPERATION_ID) != operationId ||
                 (job.optString(ACTIVE_RUNTIME_SESSION_ID) == KeplerRuntimeSession.id &&
                     (recoveryLease == null || !isOperationOwner(jobDir, recoveryLease))) ||

@@ -20,6 +20,14 @@ import java.util.concurrent.Executors
 @RunWith(RobolectricTestRunner::class)
 class KeplerJobMetadataTest {
     @Test
+    fun r3MetadataWriteClassificationPreservesBothPolarities() {
+        val serialized = "{\"status\":\"COMPLETE\"}"
+
+        assertFalse(R3GalleryColdMeasurement.metadataContentChanged(serialized, serialized))
+        assertTrue(R3GalleryColdMeasurement.metadataContentChanged(serialized, "$serialized\n"))
+    }
+
+    @Test
     fun atomicWriteKeepsReadableMetadataAndAddsSchemaVersion() {
         val directory = Files.createTempDirectory("kepler-job-").toFile()
         try {

@@ -113,11 +113,33 @@ internal object R3GalleryColdMeasurement {
         { sample, elapsed -> sample.sampledPixelDecodeNanos += elapsed }, block
     )
 
-    internal fun <T> measureMetadataWrite(contentChanging: Boolean, block: () -> T): T {
+    internal enum class MetadataWriteSource {
+        RECONSTRUCT_MAIN_EXPORT,
+        TERMINAL_STABLE_SETTLEMENT,
+        GALLERY_STORAGE_SUMMARY,
+        OTHER
+    }
+
+    internal fun metadataContentChanged(originalText: String, serialized: String): Boolean =
+        originalText != serialized
+
+    internal fun <T> measureMetadataWrite(
+        contentChanged: Boolean,
+        source: MetadataWriteSource,
+        block: () -> T
+    ): T {
         val state = active.get()
         if (state == null) return block()
         state.metadataWriteAttempts++
-        if (contentChanging) state.contentChangingWrites++ else state.sameContentRewrites++
+        val sourceState = state.sourceStats.getValue(source)
+        sourceState.writeAttempts++
+        if (contentChanged) {
+            state.contentChangingWrites++
+            sourceState.contentChangingWrites++
+        } else {
+            state.sameContentRewrites++
+            sourceState.sameContentWrites++
+        }
         if (reconstructionDepth > 0) state.reconstructionWriteAttempts++
         val started = SystemClock.elapsedRealtimeNanos()
         return try {
@@ -125,7 +147,9 @@ internal object R3GalleryColdMeasurement {
         } finally {
             val elapsed = SystemClock.elapsedRealtimeNanos() - started
             state.metadataPersistenceNanos += elapsed
-            if (!contentChanging) state.sameContentRewriteNanos += elapsed
+            sourceState.persistenceNanos += elapsed
+            if (contentChanged) state.contentChangingPersistenceNanos += elapsed
+            else state.sameContentRewriteNanos += elapsed
         }
     }
 
@@ -227,6 +251,7 @@ internal object R3GalleryColdMeasurement {
         .put("contentChangingWrites", state.contentChangingWrites)
         .put("sameContentRewrites", state.sameContentRewrites)
         .put("sameContentRewriteMs", nanosToMs(state.sameContentRewriteNanos))
+        .put("contentChangingPersistenceMs", nanosToMs(state.contentChangingPersistenceNanos))
         .put("metadataPersistenceMs", nanosToMs(state.metadataPersistenceNanos))
         .put("reconstructionMs", nanosToMs(state.reconstructionNanos))
         .put("reconstructionWriteAttempts", state.reconstructionWriteAttempts)
@@ -234,6 +259,15 @@ internal object R3GalleryColdMeasurement {
         .put("journalPersistenceMs", nanosToMs(state.journalPersistenceNanos))
         .put("terminalMetadataWrites", state.terminalMetadataWrites)
         .put("terminalMetadataWriteMs", nanosToMs(state.terminalMetadataWriteNanos))
+        .put("bySource", JSONObject().apply {
+            state.sourceStats.forEach { (source, stats) ->
+                put(source.name, JSONObject()
+                    .put("writeAttempts", stats.writeAttempts)
+                    .put("contentChangingWrites", stats.contentChangingWrites)
+                    .put("sameContentWrites", stats.sameContentWrites)
+                    .put("persistenceMs", nanosToMs(stats.persistenceNanos)))
+            }
+        })
 
     private fun stats(values: List<Long>): JSONObject {
         val sorted = values.map(::nanosToMs).sorted()
@@ -275,6 +309,7 @@ internal object R3GalleryColdMeasurement {
         var contentChangingWrites = 0
         var sameContentRewrites = 0
         var sameContentRewriteNanos = 0L
+        var contentChangingPersistenceNanos = 0L
         var metadataPersistenceNanos = 0L
         var reconstructionNanos = 0L
         var reconstructionWriteAttempts = 0
@@ -282,6 +317,14 @@ internal object R3GalleryColdMeasurement {
         var journalPersistenceNanos = 0L
         var terminalMetadataWrites = 0
         var terminalMetadataWriteNanos = 0L
+        val sourceStats = MetadataWriteSource.values().associateWith { MetadataWriteSourceStats() }
+    }
+
+    private class MetadataWriteSourceStats {
+        var writeAttempts = 0
+        var contentChangingWrites = 0
+        var sameContentWrites = 0
+        var persistenceNanos = 0L
     }
 
     private data class InspectionSample(

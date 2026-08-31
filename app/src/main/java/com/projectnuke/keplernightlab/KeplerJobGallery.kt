@@ -804,7 +804,10 @@ fun maybePersistStorageMetadata(
         job.optInt("fileCount", -1) == storage.fileCount
     ) return
     try {
-        KeplerJobMetadata.update(directory) {
+        KeplerJobMetadata.update(
+            directory,
+            R3GalleryColdMeasurement.MetadataWriteSource.GALLERY_STORAGE_SUMMARY
+        ) {
             putStorageMetadata(it, storage)
                 .put("storageScannedAt", System.currentTimeMillis())
         }

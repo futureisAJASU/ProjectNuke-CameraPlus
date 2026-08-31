@@ -357,7 +357,10 @@ internal object KeplerRecoveryCoordinator {
             }
             if (exportAuthorityOperation.isNotBlank() && exportResults.isNotEmpty()) {
                 job = R3GalleryColdMeasurement.measureReconstruction {
-                    KeplerJobMetadata.update(jobDir) { current ->
+                    KeplerJobMetadata.update(
+                        jobDir,
+                        R3GalleryColdMeasurement.MetadataWriteSource.RECONSTRUCT_MAIN_EXPORT
+                    ) { current ->
                         reconstructMainExportEvidence(jobDir, current, exportAuthorityOperation, exportResults)
                     }
                 }
@@ -413,7 +416,10 @@ internal object KeplerRecoveryCoordinator {
                         KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT
                     else -> KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT
                 }
-                KeplerJobMetadata.update(jobDir) { current ->
+                KeplerJobMetadata.update(
+                    jobDir,
+                    R3GalleryColdMeasurement.MetadataWriteSource.TERMINAL_STABLE_SETTLEMENT
+                ) { current ->
                     current.put("lastRecoveryClassification", terminalDebtClassification.name)
                         .put("lastRecoveryMessage", "종료 작업의 정리 확인이 끝나지 않아 소유권을 보존했습니다.")
                         .put("recoveredAt", System.currentTimeMillis())
@@ -608,7 +614,10 @@ internal object KeplerRecoveryCoordinator {
                 val needsStableSettlement = job.optString("recoveryState") != "STABLE" ||
                     job.has("recoveryMessage")
                 if (needsStableSettlement) {
-                    KeplerJobMetadata.update(jobDir) {
+                    KeplerJobMetadata.update(
+                        jobDir,
+                        R3GalleryColdMeasurement.MetadataWriteSource.TERMINAL_STABLE_SETTLEMENT
+                    ) {
                         it.put("recoveryState", "STABLE").remove("recoveryMessage")
                     }
                 }
