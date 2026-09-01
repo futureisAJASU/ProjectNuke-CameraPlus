@@ -123,7 +123,7 @@ internal fun isModernTerminallySettledMainExport(
     //    recoveryState == "STABLE" with no recoveryMessage. Missing/blank recoveryState fails.
     if (job.optString(ACTIVE_OPERATION_ID).isNotBlank()) return false
     if (job.optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()) return false
-    if (job.optString("currentPipelineStage").uppercase() !in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")) return false
+    if (job.optString("currentPipelineStage") !in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")) return false
     if (job.optString("recoveryState") != "STABLE") return false
     if (job.has("recoveryMessage")) return false
     if (!job.optBoolean("galleryExportCommitted", false)) return false

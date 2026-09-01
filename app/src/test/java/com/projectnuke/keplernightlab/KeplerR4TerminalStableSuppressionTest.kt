@@ -10,6 +10,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import java.io.File
 import java.nio.file.Files
+import java.util.UUID
 
 /**
  * R4.2 fail-closed terminal-stable MAIN reconstruction suppression tests.
@@ -209,6 +210,21 @@ class KeplerR4TerminalStableSuppressionTest {
     }
 
     @Test
+    fun pipelineStageLowercaseComplete_failsClosed() {
+        assertIneligible(job = eligibleJobJson().put("currentPipelineStage", "complete"))
+    }
+
+    @Test
+    fun pipelineStageMixedCaseComplete_failsClosed() {
+        assertIneligible(job = eligibleJobJson().put("currentPipelineStage", "Complete"))
+    }
+
+    @Test
+    fun pipelineStagePaddedComplete_failsClosed() {
+        assertIneligible(job = eligibleJobJson().put("currentPipelineStage", " COMPLETE "))
+    }
+
+    @Test
     fun recoveryStateNotStable_failsClosed() {
         assertIneligible(job = eligibleJobJson().put("recoveryState", "PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL"))
     }
@@ -353,6 +369,21 @@ class KeplerR4TerminalStableSuppressionTest {
         verifyReconstructionStillRuns(recoveryState = "")
     }
 
+    @Test
+    fun pipelineStageLowercaseComplete_reconstructsTwoWrites() {
+        verifyReconstructionStillRunsForMalformedStage("complete")
+    }
+
+    @Test
+    fun pipelineStageMixedCaseComplete_reconstructsTwoWrites() {
+        verifyReconstructionStillRunsForMalformedStage("Complete")
+    }
+
+    @Test
+    fun pipelineStagePaddedComplete_reconstructsTwoWrites() {
+        verifyReconstructionStillRunsForMalformedStage(" COMPLETE ")
+    }
+
     private fun verifyReconstructionStillRuns(recoveryState: String?) {
         val parent = Files.createTempDirectory("r4-root-").toFile()
         val root = File(parent, "KeplerYuvFusion").apply { mkdirs() }
@@ -374,6 +405,32 @@ class KeplerR4TerminalStableSuppressionTest {
             assertEquals(writesBefore + 2, KeplerJobMetadata.atomicWriteCount)
             assertEquals("STABLE", KeplerJobMetadata.read(job).getString("recoveryState"))
             assertFalse(KeplerJobMetadata.read(job).has("recoveryMessage"))
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    private fun verifyReconstructionStillRunsForMalformedStage(stage: String) {
+        val parent = Files.createTempDirectory("r4-root-").toFile()
+        val root = File(parent, "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_r4_malformed_stage").apply { mkdirs() }
+        try {
+            val metadata = eligibleJobJson().put("currentPipelineStage", stage)
+            KeplerJobMetadata.write(job, metadata)
+            MediaStoreExportJournal.create(
+                job, MediaStoreExportRole.MAIN_IMAGE, null, DISPLAY_NAME, "Pictures/Kepler",
+                MIME, Uri.parse("content://media/external/images/media"), ownerOperationId = OP
+            ).transition(job, MediaStoreExportState.VERIFIED, URI).markTerminalPersisted(job, OP)
+
+            val writesBefore = KeplerJobMetadata.atomicWriteCount
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), VerifiedAccess())
+
+            assertEquals(KeplerJobRecoveryClassification.RECOVERED, report.jobs.single().classification)
+            assertEquals(writesBefore + 1, KeplerJobMetadata.atomicWriteCount)
+            val recovered = KeplerJobMetadata.read(job)
+            assertEquals(stage, recovered.getString("currentPipelineStage"))
+            assertEquals("PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL", recovered.getString("recoveryState"))
+            assertTrue(recovered.has("recoveryMessage"))
         } finally {
             parent.deleteRecursively()
         }
@@ -465,6 +522,104 @@ class KeplerR4TerminalStableSuppressionTest {
             assertEquals("AMBIGUOUS_RECOVERY_REQUIRED", KeplerJobMetadata.read(job).getString("recoveryState"))
             assertTrue(File(job, ".processing_tx_corrupt.json").exists())
         } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    // ---- 14. End-to-end: downstream processing-artifact safety (valid unresolved journal) ----
+
+    @Test
+    fun validUnresolvedProcessingArtifactJournal_mainSuppressedProcessingRecovers() {
+        val parent = Files.createTempDirectory("r4-root-").toFile()
+        val root = File(parent, "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_r4_valid_processing").apply { mkdirs() }
+        try {
+            KeplerJobMetadata.write(job, eligibleJobJson())
+            MediaStoreExportJournal.create(
+                job, MediaStoreExportRole.MAIN_IMAGE, null, DISPLAY_NAME, "Pictures/Kepler",
+                MIME, Uri.parse("content://media/external/images/media"), ownerOperationId = OP
+            ).transition(job, MediaStoreExportState.VERIFIED, URI).markTerminalPersisted(job, OP)
+
+            val prior = File(job, "prior_result.bin").apply { writeBytes(byteArrayOf(4, 5, 6, 7)) }
+            val priorDigest = NoFollowFileSystem.digestVerified(prior)
+            ProcessingArtifactJournal(
+                transactionId = UUID.randomUUID().toString(),
+                processingAttemptId = null,
+                runtimeSessionId = "old-runtime",
+                artifactType = "BIN",
+                finalName = "final_result.bin",
+                tempName = ".final_result.tmp",
+                priorName = prior.name,
+                verificationKind = "BIN",
+                priorExpectedSizeBytes = priorDigest.size,
+                priorExpectedSha256 = priorDigest.sha256,
+                priorSemanticVerified = true,
+                state = ProcessingArtifactJournalState.PRIOR_BACKED_UP,
+                createdAt = 1L,
+                updatedAt = 2L
+            ).writeTo(job)
+
+            val journalFile = MediaStoreExportJournal.list(job).single().let { MediaStoreExportJournal.fileFor(job, it.exportAttemptId) }
+            val journalBefore = journalFile.readText()
+            val writesBefore = KeplerJobMetadata.atomicWriteCount
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), VerifiedAccess())
+
+            assertEquals(KeplerJobRecoveryClassification.INTERRUPTED_PRE_COMMIT, report.jobs.single().classification)
+            assertEquals(writesBefore + 3, KeplerJobMetadata.atomicWriteCount)
+            val recovered = KeplerJobMetadata.read(job)
+            assertEquals("STABLE", recovered.getString("recoveryState"))
+            assertFalse(recovered.has("recoveryMessage"))
+            assertEquals(journalBefore, journalFile.readText())
+            assertTrue(File(job, "final_result.bin").exists())
+            assertEquals(priorDigest.sha256, NoFollowFileSystem.digestVerified(File(job, "final_result.bin")).sha256)
+            assertEquals("COMPLETE", recovered.getString("currentPipelineStage"))
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    // ---- 15. End-to-end: downstream processing-artifact safety (cleanup debt) ----
+
+    @Test
+    fun processingCleanupDebt_mainSuppressed_cleanupRequiredRecorded() {
+        val parent = Files.createTempDirectory("r4-root-").toFile()
+        val root = File(parent, "KeplerYuvFusion").apply { mkdirs() }
+        val job = File(root, "KPL_YUV_FUSION_r4_cleanup_debt").apply { mkdirs() }
+        try {
+            KeplerJobMetadata.write(job, eligibleJobJson())
+            MediaStoreExportJournal.create(
+                job, MediaStoreExportRole.MAIN_IMAGE, null, DISPLAY_NAME, "Pictures/Kepler",
+                MIME, Uri.parse("content://media/external/images/media"), ownerOperationId = OP
+            ).transition(job, MediaStoreExportState.VERIFIED, URI).markTerminalPersisted(job, OP)
+
+            ProcessingArtifactJournal(
+                transactionId = UUID.randomUUID().toString(),
+                processingAttemptId = null,
+                runtimeSessionId = "old-runtime",
+                artifactType = "BIN",
+                finalName = "final_result.bin",
+                tempName = ".final_result.tmp",
+                priorName = ".final_result.prior",
+                state = ProcessingArtifactJournalState.PREPARED,
+                createdAt = 1L,
+                updatedAt = 2L
+            ).writeTo(job)
+
+            val journalFile = MediaStoreExportJournal.list(job).single().let { MediaStoreExportJournal.fileFor(job, it.exportAttemptId) }
+            val journalBefore = journalFile.readText()
+            processingArtifactJournalDeleteFailureForTest = true
+            val writesBefore = KeplerJobMetadata.atomicWriteCount
+            val report = KeplerRecoveryCoordinator.recoverRoots(listOf(root), VerifiedAccess())
+            processingArtifactJournalDeleteFailureForTest = false
+
+            assertEquals(KeplerJobRecoveryClassification.PROCESSING_CLEANUP_REQUIRED, report.jobs.single().classification)
+            assertEquals("PROCESSING_CLEANUP_REQUIRED", KeplerJobMetadata.read(job).getString("recoveryState"))
+            assertEquals(writesBefore + 2, KeplerJobMetadata.atomicWriteCount)
+            assertEquals("COMPLETE", KeplerJobMetadata.read(job).getString("currentPipelineStage"))
+            assertEquals(journalBefore, journalFile.readText())
+            assertTrue(ProcessingArtifactJournal.list(job).isNotEmpty())
+        } finally {
+            processingArtifactJournalDeleteFailureForTest = false
             parent.deleteRecursively()
         }
     }
