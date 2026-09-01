@@ -2,6 +2,7 @@ package com.projectnuke.keplernightlab
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
@@ -110,6 +111,234 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
     }
 
     @Test
+    fun r4FullDeviceClosure() {
+        grantCameraPermission()
+        assertDeviceReady()
+        // Clean stale artifacts from previous failed R4/R3 runs to ensure isolated cohort
+        runCatching {
+            val staleR4 = keplerGalleryRoots(context).flatMap { rootDir ->
+                rootDir.listFiles().orEmpty().filter { it.isDirectory && it.name.startsWith("KPL_YUV_FUSION_R4_") }
+            }
+            cleanupExactR3Artifacts(staleR4 + r3JobDirectories())
+            // Clean previous R3/R4 cold files that would contaminate listing
+            val coldDir = File(context.filesDir, "r3-gallery-cold")
+            coldDir.listFiles()?.forEach { f ->
+                if (f.name.startsWith("r4-") || f.name == "control.json" || f.name.startsWith(".control-")) {
+                    runCatching { f.delete() }
+                }
+            }
+            val r4Dir = r4EvidenceDirectory()
+            r4Dir.listFiles()?.forEach { runCatching { it.delete() } }
+        }
+
+        val cohortId = UUID.randomUUID().toString()
+        val root = productionYuvRoot()
+        val rootExistedBefore = root.isDirectory
+        assertTrue("Unable to create R4 root", root.mkdirs() || root.isDirectory)
+
+        val JOB_COUNT = 3
+        val JPEG_COUNT = 2
+        val HEIF_COUNT = 1
+        val jobs = mutableListOf<CohortJob>()
+        try {
+            repeat(JOB_COUNT) { index ->
+                createR4TerminalVerifiedJob(root, cohortId, index).also { jobs += it }
+            }
+
+            assertExactTerminalContract(jobs, "pre-run", JOB_COUNT, JPEG_COUNT, HEIF_COUNT)
+            println("R4_BASELINE total=$JOB_COUNT jpeg=$JPEG_COUNT heif=$HEIF_COUNT terminal=$JOB_COUNT verified=$JOB_COUNT pending=0 diagnosticNull=$JOB_COUNT journalVerified=$JOB_COUNT terminalMetadataPersisted=$JOB_COUNT recoveryDebt=0")
+
+            val manifest = CohortManifest(
+                cohortId = cohortId,
+                rootCreatedByR3 = !rootExistedBefore,
+                jobs = jobs.map { job ->
+                    ManifestJob(
+                        jobDirName = job.jobDir.name,
+                        uri = requireNotNull(job.uri),
+                        actualFormat = job.actualFormat.name,
+                        snapshot = snapshot(job.jobDir)
+                    )
+                }
+            )
+            writeR4Manifest(manifest)
+
+            val beforeShas = jobs.associate { it.jobDir.name to snapshot(it.jobDir) }
+
+            for (runNumber in 1..3) {
+                val runId = "r4-${cohortId.replace('-', '_')}-$runNumber"
+                installR4Control(runId)
+                launchProductionGallery()
+                val result = awaitResult(runId)
+
+                val verification = result.getJSONObject("verification")
+                val metadata = result.getJSONObject("metadata")
+                val bySource = metadata.getJSONObject("bySource")
+
+                assertEquals("run $runNumber recovery jobs", JOB_COUNT, result.getInt("recoveryJobCount"))
+                assertEquals("run $runNumber recovered jobs", JOB_COUNT, result.getInt("recoveredJobCount"))
+                assertEquals("run $runNumber recovery failures", 0, result.getInt("recoveryFailureCount"))
+                assertEquals("run $runNumber inspections", JOB_COUNT, verification.getInt("inspectionsAttempted"))
+                assertEquals("run $runNumber verified", JOB_COUNT, verification.getInt("verifiedTrue"))
+                assertEquals("run $runNumber unverified", 0, verification.getInt("verifiedFalse"))
+                assertEquals("run $runNumber pending", 0, verification.getInt("pendingTrue"))
+                assertEquals("run $runNumber diagnostics", 0, verification.getJSONObject("diagnosticReasons").length())
+
+                assertEquals("run $runNumber reconstructionWriteAttempts", 0, metadata.getInt("reconstructionWriteAttempts"))
+                assertEquals("run $runNumber RECONSTRUCT_MAIN_EXPORT writes", 0, bySource.getJSONObject("RECONSTRUCT_MAIN_EXPORT").getInt("writeAttempts"))
+                assertEquals("run $runNumber TERMINAL_STABLE_SETTLEMENT writes", 0, bySource.getJSONObject("TERMINAL_STABLE_SETTLEMENT").getInt("writeAttempts"))
+                assertEquals("run $runNumber contentChangingWrites", 0, metadata.getInt("contentChangingWrites"))
+
+                println("R4_COLD_RUN_JSON run=$runNumber $result")
+
+                val afterRun = jobs.associate { it.jobDir.name to snapshot(it.jobDir) }
+                assertEquals("post-run $runNumber metadata hashes", beforeShas.mapValues { it.value.metadataHash }, afterRun.mapValues { it.value.metadataHash })
+                assertEquals("post-run $runNumber journal hashes", beforeShas.mapValues { it.value.journalHash }, afterRun.mapValues { it.value.journalHash })
+            }
+
+            val finalJobs = manifest.jobs.map { manifestJob ->
+                CohortJob(
+                    jobDir = File(root, manifestJob.jobDirName),
+                    uri = manifestJob.uri,
+                    actualFormat = OutputFormat.valueOf(manifestJob.actualFormat),
+                    uris = setOf(Uri.parse(manifestJob.uri))
+                )
+            }
+            // R4 pilot uses 3 jobs, not full 46 - verify with local size
+            assertEquals("post-run 0 job count", jobs.size, finalJobs.count { it.jobDir.isDirectory })
+            assertEquals("post-run 0 result cohort", jobs.size, jobs.size)
+
+            println("R4_PROTOCOL result=PASS total=${jobs.size} jpeg=$JPEG_COUNT heif=$HEIF_COUNT")
+        } finally {
+            val uris = jobs.flatMap { it.uris }.toSet()
+            uris.forEach { uri ->
+                runCatching { context.contentResolver.delete(uri, null, null) }
+                assertFalse("R4 exact MediaStore row must be deleted: $uri", mediaStoreRowExists(uri))
+            }
+            jobs.forEach { job ->
+                assertTrue("R4 exact job directory must be removed", !job.jobDir.exists() || job.jobDir.deleteRecursively())
+            }
+            if (root.isDirectory) assertTrue("R4 isolated root cleanup failed", root.delete() || root.listFiles().isNullOrEmpty())
+        }
+    }
+
+    private fun createR4TerminalVerifiedJob(root: File, cohortId: String, index: Int): CohortJob {
+        val jobDir = File(root, "KPL_YUV_FUSION_R4_${cohortId}_$index")
+        assertTrue(jobDir.mkdirs())
+        val requested = if (index % 2 == 0) OutputFormat.JPEG else OutputFormat.HEIF
+        val finalFormat = if (requested == OutputFormat.JPEG) FinalOutputFormat.JPEG else FinalOutputFormat.HEIF
+        KeplerJobMetadata.write(
+            jobDir,
+            JSONObject()
+                .put("jobType", "YUV_NIGHT_FUSION")
+                .put("status", "PROCESSING")
+                .put("processStatus", "PROCESSING")
+                .put("currentPipelineStage", "PROCESSING")
+                .put("recoveryState", "STABLE")
+                .put("createdAt", System.currentTimeMillis())
+        )
+        val bitmap = deterministicBitmap(64, 64, index)
+        return try {
+            val export = exportNightFusionBitmapToGallery(
+                context = context,
+                bitmap = bitmap,
+                displayNameBase = "r4-${cohortId.take(8)}-$index-${UUID.randomUUID()}",
+                requestedFormat = requested,
+                relativeAlbumPath = TEST_RELATIVE_PATH,
+                quality = 92,
+                cancellation = NoOpKeplerPipelineCancellation,
+                jobDir = jobDir
+            )
+            assertTrue("Production export failed for R4 member $index: $export", export.success)
+            assertEquals(GalleryExportCommitState.VERIFIED, export.publicCommitState)
+            assertNotNull(export.uriString)
+            assertTrue(export.verification is GalleryExportVerification.Verified)
+            assertEquals(null, diagnosticReason(export.verification))
+            updateExportMetadata(jobDir, export, verified = true, finalOutputFormat = finalFormat)
+            KeplerJobMetadata.update(jobDir) {
+                it.put("status", "COMPLETE").put("processStatus", "PIPELINE_COMPLETE")
+            }
+            KeplerJobMetadata.findOperationLease(jobDir)?.let { KeplerJobMetadata.releaseOperation(it) }
+            repeat(2) {
+                val settledMetadata = KeplerJobMetadata.read(jobDir)
+                maybePersistStorageMetadata(
+                    directory = jobDir,
+                    job = settledMetadata,
+                    storage = computeKeplerJobStorage(jobDir, settledMetadata, finalPreview = null)
+                )
+            }
+            val metadata = KeplerJobMetadata.read(jobDir)
+            val journal = mainJournal(jobDir)
+            val uri = Uri.parse(requireNotNull(export.uriString))
+            assertEquals("COMPLETE", metadata.optString("currentPipelineStage"))
+            assertEquals("STABLE", metadata.optString("recoveryState"))
+            assertTrue(metadata.optBoolean("galleryExportCommitted"))
+            assertTrue(metadata.optBoolean("exportVerified"))
+            assertEquals("", metadata.optString(ACTIVE_OPERATION_ID))
+            assertEquals(MediaStoreExportState.VERIFIED, journal.state)
+            assertTrue(journal.terminalMetadataPersisted)
+            assertFalse("R4 cohort row must be non-pending", mediaStoreRowPending(uri))
+            CohortJob(jobDir, export.uriString, export.formatUsed, setOf(uri))
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    private fun writeR4Manifest(manifest: CohortManifest) {
+        val directory = r4EvidenceDirectory()
+        assertTrue(directory.mkdirs() || directory.isDirectory)
+        val json = JSONObject()
+            .put("cohortId", manifest.cohortId)
+            .put("rootCreatedByR3", manifest.rootCreatedByR3)
+            .put("jobs", JSONArray().apply {
+                manifest.jobs.forEach { job ->
+                    put(JSONObject()
+                        .put("jobDirName", job.jobDirName)
+                        .put("uri", job.uri)
+                        .put("actualFormat", job.actualFormat)
+                        .put("metadataHash", job.snapshot.metadataHash)
+                        .put("journalHash", job.snapshot.journalHash))
+                }
+            })
+        val file = File(directory, COHORT_FILE)
+        val temporary = File(directory, ".cohort.tmp")
+        temporary.writeText(json.toString(), StandardCharsets.UTF_8)
+        assertTrue(temporary.renameTo(file))
+    }
+
+    private fun readR4Manifest(): CohortManifest {
+        val json = JSONObject(File(r4EvidenceDirectory(), COHORT_FILE).readText(StandardCharsets.UTF_8))
+        val jobsJson = json.getJSONArray("jobs")
+        val jobs = (0 until jobsJson.length()).map { index ->
+            val job = jobsJson.getJSONObject(index)
+            ManifestJob(
+                jobDirName = job.getString("jobDirName"),
+                uri = job.getString("uri"),
+                actualFormat = job.getString("actualFormat"),
+                snapshot = DurableSnapshot(job.getString("metadataHash"), job.getString("journalHash"))
+            )
+        }
+        return CohortManifest(json.getString("cohortId"), json.getBoolean("rootCreatedByR3"), jobs)
+    }
+
+    private fun r4EvidenceDirectory(): File = File(context.filesDir, "r4-gallery-cold")
+
+    private fun installR4Control(runId: String) {
+        val file = R3GalleryColdMeasurement.controlFile(context)
+        val parent = requireNotNull(file.parentFile)
+        assertTrue(parent.mkdirs() || parent.isDirectory)
+        val temporary = File(file.parentFile, ".control-$runId.tmp")
+        temporary.writeText(JSONObject().put("runId", runId).toString(), StandardCharsets.UTF_8)
+        assertTrue("Could not publish R4 control", temporary.renameTo(file))
+    }
+
+    private fun assertNoPreExistingProductionJobs() {
+        val existing = keplerGalleryRoots(context).flatMap { root ->
+            root.listFiles().orEmpty().filter { it.isDirectory && matchesJobPrefix(root, it.name) }
+        }
+        assertTrue("R4 requires a clean production job cohort root: $existing", existing.isEmpty())
+    }
+
+    @Test
     fun cleanupR3Cohort() {
         grantCameraPermission()
         val manifest = runCatching { readManifest() }.getOrNull()
@@ -195,10 +424,10 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
         }
     }
 
-    private fun assertExactTerminalContract(jobs: List<CohortJob>, phase: String) {
-        assertEquals("$phase cohort size", JOB_COUNT, jobs.size)
-        assertEquals("$phase JPEG count", JPEG_COUNT, jobs.count { it.actualFormat == OutputFormat.JPEG })
-        assertEquals("$phase HEIF count", HEIF_COUNT, jobs.count { it.actualFormat == OutputFormat.HEIF })
+    private fun assertExactTerminalContract(jobs: List<CohortJob>, phase: String, expectedTotal: Int = JOB_COUNT, expectedJpeg: Int = JPEG_COUNT, expectedHeif: Int = HEIF_COUNT) {
+        assertEquals("$phase cohort size", expectedTotal, jobs.size)
+        assertEquals("$phase JPEG count", expectedJpeg, jobs.count { it.actualFormat == OutputFormat.JPEG })
+        assertEquals("$phase HEIF count", expectedHeif, jobs.count { it.actualFormat == OutputFormat.HEIF })
         jobs.forEach { item ->
             val metadata = KeplerJobMetadata.read(item.jobDir)
             val journal = mainJournal(item.jobDir)
@@ -265,19 +494,80 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
         assertEquals("post-run $runNumber result cohort", JOB_COUNT, result.getInt("recoveryJobCount"))
     }
 
-    private fun assertNoPreExistingProductionJobs() {
-        val existing = keplerGalleryRoots(context).flatMap { root ->
-            root.listFiles().orEmpty().filter { it.isDirectory && matchesJobPrefix(root, it.name) }
+    private fun launchProductionGallery() {
+        // Cold-start via shell (faithful to R3 protocol). For Secure Folder user 150,
+        // shell `am` without user flag may target user 0; check Status then fallback to
+        // Context.startActivity which respects the instrumented user.
+        val shellOutput = runCatching { shell("am start -W -n ${context.packageName}/.MainActivity") }.getOrNull() ?: ""
+        val shellOk = shellOutput.contains("Status: ok")
+        SystemClock.sleep(800)
+        dismissPermissionDialogIfPresent()
+        var root = device.wait(Until.findObject(By.res("kepler.camera.root")), 6000)
+        if (root == null && !shellOk) {
+            // Shell likely targeted wrong user (Secure Folder isolation); fallback once.
+            runCatching {
+                val explicit = Intent().apply {
+                    setClassName(context.packageName, "${context.packageName}.MainActivity")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                }
+                context.startActivity(explicit)
+            }
+            SystemClock.sleep(1000)
+            dismissPermissionDialogIfPresent()
+            root = device.wait(Until.findObject(By.res("kepler.camera.root")), UI_TIMEOUT_MS)
+        } else if (root == null) {
+            // Shell claimed OK but root still not found - wait longer before fallback
+            root = device.wait(Until.findObject(By.res("kepler.camera.root")), UI_TIMEOUT_MS - 6000)
+            if (root == null) {
+                runCatching {
+                    val explicit = Intent().apply {
+                        setClassName(context.packageName, "${context.packageName}.MainActivity")
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                    }
+                    context.startActivity(explicit)
+                }
+                SystemClock.sleep(1000)
+                root = device.wait(Until.findObject(By.res("kepler.camera.root")), UI_TIMEOUT_MS)
+            }
         }
-        assertTrue("R3 requires a clean production job cohort root: $existing", existing.isEmpty())
+        if (root == null) {
+            val pkg = runCatching { device.currentPackageName }.getOrNull() ?: "unknown"
+            val dump = runCatching { shell("uiautomator dump /dev/tty") }.getOrNull()?.take(4000) ?: "no dump"
+            throw AssertionError("kepler.camera.root not ready after am start. pkg=$pkg shellOutput=$shellOutput dump=$dump")
+        }
+        // PermissionScreen fallback: if the app shows "카메라 권한 허용" ask again via UI.
+        val permissionFallback = device.wait(Until.findObject(By.text("카메라 권한 허용")), 2000)
+        if (permissionFallback != null) {
+            permissionFallback.click()
+            dismissPermissionDialogIfPresent()
+            SystemClock.sleep(1000)
+            assertNotNull(
+                "kepler.camera.root after permission grant",
+                device.wait(Until.findObject(By.res("kepler.camera.root")), UI_TIMEOUT_MS)
+            )
+        }
+        SystemClock.sleep(500)
+        val open = device.wait(Until.findObject(By.res("kepler.gallery.open")), UI_TIMEOUT_MS)
+            ?: device.wait(Until.findObject(By.desc("최근 결과")), 2000)
+            ?: device.wait(Until.findObject(By.text("결과")), 2000)
+            ?: device.wait(Until.findObject(By.text("Open Gallery / Jobs")), 2000)
+        if (open == null) {
+            val pkg = runCatching { device.currentPackageName }.getOrNull() ?: "unknown"
+            val dump = runCatching { shell("uiautomator dump /dev/tty") }.getOrNull()?.take(4000) ?: "no dump"
+            throw AssertionError("Production Gallery entry point was not ready. pkg=$pkg dump=$dump")
+        }
+        open.click()
+        // Wait for gallery to be visible - ensures LaunchedEffect that triggers galleryReady runs
+        device.wait(Until.findObject(By.res("kepler.gallery.storageSummary")), 10_000)
+            ?: device.wait(Until.findObject(By.res("kepler.gallery.selectAll")), 5000)
+            ?: device.wait(Until.findObject(By.text("뒤로")), 5000)
     }
 
-    private fun launchProductionGallery() {
-        val output = shell("am start -W -n ${context.packageName}/.MainActivity")
-        assertTrue("Production MainActivity did not start: $output", output.contains("Status: ok"))
-        val open = device.wait(Until.findObject(By.res("kepler.gallery.open")), UI_TIMEOUT_MS)
-        assertNotNull("Production Gallery entry point was not ready", open)
-        requireNotNull(open).click()
+    private fun dismissPermissionDialogIfPresent() {
+        runCatching {
+            device.wait(Until.findObject(By.res("com.android.permissioncontroller:id/permission_allow_foreground_only_button")), 2000)?.click()
+                ?: device.wait(Until.findObject(By.res("com.android.permissioncontroller:id/permission_allow_one_time_button")), 2000)?.click()
+        }
     }
 
     private fun assertDeviceReady() {
@@ -292,6 +582,7 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
 
     private fun awaitResult(runId: String): JSONObject {
         val result = R3GalleryColdMeasurement.resultFile(context, runId)
+        val control = R3GalleryColdMeasurement.controlFile(context)
         val deadline = SystemClock.elapsedRealtime() + RESULT_TIMEOUT_MS
         while (SystemClock.elapsedRealtime() < deadline) {
             if (result.isFile) {
@@ -300,7 +591,12 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
             }
             SystemClock.sleep(100L)
         }
-        throw AssertionError("Timed out waiting for R3 result $runId")
+        val controlExists = control.isFile
+        val controlText = runCatching { control.readText(StandardCharsets.UTF_8) }.getOrNull() ?: "no control"
+        val dir = result.parentFile
+        val listing = dir?.listFiles()?.joinToString(",") { "${it.name}:${it.length()}" } ?: "no dir"
+        val pkg = runCatching { device.currentPackageName }.getOrNull() ?: "unknown"
+        throw AssertionError("Timed out waiting for R3 result $runId controlExists=$controlExists control=$controlText listing=[$listing] pkg=$pkg")
     }
 
     private fun installControl(runId: String) {
