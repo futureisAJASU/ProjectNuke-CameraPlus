@@ -85,6 +85,67 @@ internal fun rawSidecarRecoveryApplies(jobDir: File, job: org.json.JSONObject): 
     return false
 }
 
+/**
+ * R4.2 fail-closed eligibility predicate for the terminal-stable MAIN reconstruction suppression.
+ *
+ * A MAIN Gallery export may suppress only the transient [reconstructMainExportEvidence] metadata
+ * write when EVERY predicate below is proven from the current recovery inputs. The helper accepts
+ * the authoritative [jobDir] and the already-scanned [journals] collection so it never introduces
+ * a redundant [MediaStoreExportJournal.list] scan and never derives authority from a metadata path.
+ *
+ * Any uncertainty (null journal/result, missing/blank field, structural mismatch, unresolved
+ * sidecar/debt evidence) returns false, forcing the standard reconstruction path.
+ */
+internal fun isModernTerminallySettledMainExport(
+    job: org.json.JSONObject,
+    journal: MediaStoreExportJournal?,
+    result: MediaStoreExportRecoveryResult?,
+    terminalOperationId: String,
+    journals: List<MediaStoreExportJournal>,
+    jobDir: File
+): Boolean {
+    if (journal == null || result == null) return false
+
+    // 1. MediaStore inspection & result reality: must be a live PUBLIC_VERIFIED result with no
+    //    verification diagnostic. Never trust prior exportVerified or journal state alone.
+    if (result.classification != MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED) return false
+    if (result.verificationDiagnosticReason != null) return false
+
+    // 2. Journal durable contract: exact modern terminal acknowledgement with owner correlation.
+    if (journal.role != MediaStoreExportRole.MAIN_IMAGE) return false
+    if (journal.state != MediaStoreExportState.VERIFIED) return false
+    if (!journal.terminalMetadataPersisted) return false
+    if (terminalOperationId.isBlank()) return false
+    if (journal.ownerOperationId != terminalOperationId) return false
+    if (journal.terminalOperationId != terminalOperationId) return false
+
+    // 3. Metadata durable contract: no live owner/handoff, terminal stage, and an EXPLICIT
+    //    recoveryState == "STABLE" with no recoveryMessage. Missing/blank recoveryState fails.
+    if (job.optString(ACTIVE_OPERATION_ID).isNotBlank()) return false
+    if (job.optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()) return false
+    if (job.optString("currentPipelineStage").uppercase() !in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")) return false
+    if (job.optString("recoveryState") != "STABLE") return false
+    if (job.has("recoveryMessage")) return false
+    if (!job.optBoolean("galleryExportCommitted", false)) return false
+    if (!job.optBoolean("exportVerified", false)) return false
+
+    // 4. Exact structural linkage & field agreement between metadata and the MAIN journal.
+    val exportUri = job.optString("exportUri").takeIf { it.isNotBlank() && it != "null" } ?: return false
+    val linkageUri = job.optString("galleryPublicExportLinkage").takeIf { it.isNotBlank() && it != "null" } ?: return false
+    if (exportUri != linkageUri) return false
+    if (journal.uri != exportUri) return false
+    if (journal.displayName != job.optString("exportDisplayName")) return false
+    if (journal.mimeType != job.optString("exportMimeType")) return false
+
+    // 5. No unresolved export-journal debt: every non-MAIN journal must already be CLEANED.
+    if (journals.any { it.exportAttemptId != journal.exportAttemptId && it.state != MediaStoreExportState.CLEANED }) return false
+
+    // 6. RAW / sidecar scope isolation: no DNG sidecar recovery work for this job.
+    if (rawSidecarRecoveryApplies(jobDir, job)) return false
+
+    return true
+}
+
 internal fun reconstructRawSidecarJournalEvidence(
     jobDir: File,
     job: org.json.JSONObject,

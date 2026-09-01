@@ -355,7 +355,18 @@ internal object KeplerRecoveryCoordinator {
                     )
                 }
             }
-            if (exportAuthorityOperation.isNotBlank() && exportResults.isNotEmpty()) {
+            val suppressMainReconstruction =
+                exportAuthorityOperation.isNotBlank() &&
+                    exportResults.isNotEmpty() &&
+                    isModernTerminallySettledMainExport(
+                        job = job,
+                        journal = currentMainAuthorityJournal,
+                        result = currentMainAuthorityResult,
+                        terminalOperationId = terminalOperationId,
+                        journals = exportJournals,
+                        jobDir = jobDir
+                    )
+            if (exportAuthorityOperation.isNotBlank() && exportResults.isNotEmpty() && !suppressMainReconstruction) {
                 job = R3GalleryColdMeasurement.measureReconstruction {
                     KeplerJobMetadata.update(
                         jobDir,
