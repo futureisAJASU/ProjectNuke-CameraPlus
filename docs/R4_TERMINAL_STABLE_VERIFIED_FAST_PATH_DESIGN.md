@@ -1,7 +1,13 @@
 # docs/R4_TERMINAL_STABLE_VERIFIED_FAST_PATH_DESIGN.md
 
 ## START HEAD
-`4aab900b2128d1214ce12d43a4766bcce3b84a43`
+`36c30c5fb2d0c900f071b211eaa2bb15c33f12bd`
+
+---
+
+## R4.1 DESIGN CORRECTIVE — NARROW MAIN-RECONSTRUCTION SUPPRESSION
+
+> **NOTICE (R4.1 CORRECTIVE)**: The original R4 implementation sketch in Section 8 (Early Return) is **SUPERSEDED BY R4.1**. An early return immediately before `reconstructMainExportEvidence` would bypass independent downstream recovery work—specifically `ProcessingArtifactJournal.scan(jobDir)` and `recoverProcessingArtifactJournals(jobDir, job)`. R4.1 replaces the early-return design with **narrow MAIN reconstruction suppression**: skipping *only* the transient `reconstructMainExportEvidence` metadata update when MAIN export evidence is already byte-for-byte settled, while allowing the complete normal control flow of `KeplerRecoveryCoordinator.recoverOne` to execute.
 
 ---
 
@@ -64,13 +70,13 @@ Thus, utilizing `terminalResultAlreadyProven` as a fast-path gate alone would vi
 
 ## 3. FAIL-CLOSED ELIGIBILITY CONTRACT
 
-We design the narrowest, most defensive eligibility predicate to safely authorize the fast-path bypass. 
+We design the narrowest, most defensive eligibility predicate to safely authorize the MAIN reconstruction suppression.
 
 ### Field-by-Field/Condition Audit:
 
 | Condition / Field Check | Required? | Justification / Proof of Requirement |
 |---|---|---|
-| `no ACTIVE_OPERATION_ID` | **Yes** | A live or dead active operation owner means the job is not yet stable; it must proceed through the slow/reconstruction path. |
+| `no ACTIVE_OPERATION_ID` | **Yes** | A live or dead active operation owner means the job is not yet stable; it must proceed through standard reconstruction. |
 | `no PROCESSING_HANDOFF_OPERATION_ID` | **Yes** | Active processing transactions must be resolved; handoffs block terminal recovery. |
 | `terminal pipeline stage` | **Yes** | Must be in `COMPLETE`, `PARTIAL`, `FAILED`, or `CANCELLED`. Incomplete jobs cannot have stable terminal exports. |
 | `recoveryState == STABLE` | **Yes** | If the previous recovery state was not `STABLE`, then there is unresolved debt or active recovery work. |
@@ -85,17 +91,15 @@ We design the narrowest, most defensive eligibility predicate to safely authoriz
 | `exact MAIN_IMAGE journal` | **Yes** | There must be an inspected, valid, single MAIN_IMAGE journal corresponding to the export. |
 | `journal URI matches exportUri` | **Yes** | Structural correlation between metadata and journal. |
 | `journal state == VERIFIED` | **Yes** | The journal must have historically reached verification. |
-| `journal.isTerminallyStable() == true` | **Yes** | Re-verifies terminal stable acknowledgment. Requires `terminalMetadataPersisted == true`. |
-| `terminal operation / journal correlation is exact` | **Yes** | If `terminalOperationId` exists, the journal's `ownerOperationId` must match it exactly. |
+| `journal.terminalMetadataPersisted == true` | **Yes** | Requires modern terminal stable acknowledgment. Rejects legacy un-acknowledged journals. |
+| `journal.terminalOperationId == TERMINAL_OPERATION_ID` | **Yes** | Exact triple correlation: `journal.ownerOperationId == journal.terminalOperationId == metadata.TERMINAL_OPERATION_ID`. |
 | `current MediaStore inspection exists` | **Yes** | We must have completed a live MediaStore provider inspection in the current session. |
 | `IS_PENDING == false` | **Yes** | The row must be committed and not pending in MediaStore. |
 | `current verification result == PUBLIC_VERIFIED` | **Yes** | Real pixels and bounds must be verified successfully right now. |
-| `verification diagnostic == null` | **Yes** | Any validation warning/failure blocks fast-path. |
-| `no ambiguity / missing-commit / unverified result` | **Yes** | Any unresolved classification forces slow path. |
-| `no unresolved current export journal debt` | **Yes** | No other journals for this job (including sidecars) can be terminally unstable. |
-
-### Conclusion:
-Every single item above is **strictly required**. Any uncertainty or mismatch automatically fails closed, reverting the job to the standard recovery state-machine path.
+| `verification diagnostic == null` | **Yes** | Any validation warning/failure blocks optimization. |
+| `no ambiguity / missing-commit / unverified result` | **Yes** | Any unresolved classification forces standard path. |
+| `no unresolved export journal debt` | **Yes** | All other journals for this job must be in state `CLEANED` or absent. |
+| `no RAW sidecar recovery work` | **Yes** | `rawSidecarRecoveryApplies(jobDir, job) == false`. RAW sidecar jobs are excluded. |
 
 ---
 
@@ -118,13 +122,20 @@ For a job meeting the Fail-Closed Eligibility Contract:
 - `recoveryMessage` -> Removed (blank/absent).
 
 ### Net Change:
-The net effect of the slow path is a cycle where `recoveryState` and `recoveryMessage` undergo a transient mutation and are then reverted back to `"STABLE"` and `absent` respectively. No other fields are altered because they already equal the values retrieved from the current resolved authority journal.
+Under standard production, the net effect of the cycle is that `recoveryState` and `recoveryMessage` undergo a transient mutation and are then reverted back to `"STABLE"` and `absent` respectively. When `reconstructMainExportEvidence` is suppressed, `recoveryState` remains `"STABLE"` and `recoveryMessage` remains absent throughout `recoverOne`.
 
-### Equivalence:
-Byte-for-byte equivalence of the JSON payload is **guaranteed** because:
-1. All static/factual fields match the current journal fields by contract.
-2. The transient fields (`recoveryState` / `recoveryMessage`) return to their baseline.
-3. The schema and formatting output of `JSONObject.toString(2)` are fully deterministic.
+### Zero-Write Settlement Proof:
+At lines 613-624 of `KeplerRecoveryCoordinator.kt`:
+```kotlin
+if (terminalResultAlreadyProven) {
+    val needsStableSettlement = job.optString("recoveryState") != "STABLE" ||
+        job.has("recoveryMessage")
+    if (needsStableSettlement) {
+        KeplerJobMetadata.update(jobDir, R3GalleryColdMeasurement.MetadataWriteSource.TERMINAL_STABLE_SETTLEMENT) { ... }
+    }
+}
+```
+Because `recoveryState` was never mutated away from `"STABLE"`, `needsStableSettlement` evaluates to `false`. Therefore `KeplerJobMetadata.update` is **never invoked**, resulting in **0 write attempts** for both `RECONSTRUCT_MAIN_EXPORT` and `TERMINAL_STABLE_SETTLEMENT`.
 
 ---
 
@@ -132,35 +143,30 @@ Byte-for-byte equivalence of the JSON payload is **guaranteed** because:
 
 Does durably writing `PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL` provide any safety value for an already-settled cohort?
 
-### Crash Points comparison:
-
-| Crash Point | Current Durable State (Slow Path) | Proposed Fast Path Durable State | Safety Evaluation |
+| Crash Point | Current Durable State (Slow Path) | Proposed R4.1 Durable State | Safety Evaluation |
 |---|---|---|---|
 | **Before MediaStore Inspection** | `STABLE` | `STABLE` | Identical. |
 | **During MediaStore Inspection / Verifier** | `STABLE` | `STABLE` | Identical. No write occurs. |
 | **After Verification / Before Reconstruction Write** | `STABLE` | `STABLE` | Identical. |
-| **After Reconstruction Write but Before Settlement** | `PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL` | `STABLE` | **Fast Path is Safer**: Under the current slow path, a crash here leaves the metadata in an intermediate debt state. On reboot, recovery must re-evaluate. Fast path remains clean and stable. |
+| **After Reconstruction Write but Before Settlement** | `PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL` | `STABLE` | **R4.1 is Safer**: Under standard production, a crash here leaves the metadata in an intermediate debt state. On reboot, recovery must re-evaluate. R4.1 remains clean and stable. |
 | **During Stable Settlement Write** | `STABLE` (In Flight) | `STABLE` | Identical. |
 | **After Recovery Completed** | `STABLE` | `STABLE` | Identical. |
-
-### Conclusion:
-For an already terminal-stable and terminal-acknowledged job, writing `PUBLIC_EXPORT_VERIFIED_PENDING_TERMINAL` introduces *risk* rather than *safety*. A crash during the transient cycle leaves the metadata modified. The proposed fast-path bypass keeps the metadata durably `STABLE` at all times, making it **equal or safer** than the current path.
 
 ---
 
 ## 6. AUDIT NON-ELIGIBLE COUNTEREXAMPLES
 
-These cases must be rejected by the fast-path gate and continue through the existing slow/recovery paths:
+These cases must be rejected by the fast-path gate and continue through the standard reconstruction path:
 
 1. **Committed but unverified export**: `exportVerified` is `false` or current inspection results in `PUBLIC_COMMITTED_UNVERIFIED`.
    - *Gate Action*: **Rejects** because `exportVerified == true` and current verification == `PUBLIC_VERIFIED` are required.
 2. **VERIFIED journal without `terminalMetadataPersisted`**: 
-   - *Gate Action*: **Rejects** because `journal.isTerminallyStable() == true` is required.
+   - *Gate Action*: **Rejects** because `journal.terminalMetadataPersisted == true` is required.
 3. **Mismatched `exportUri` vs `galleryPublicExportLinkage`**:
    - *Gate Action*: **Rejects** because linkage agreement is required.
 4. **Journal URI mismatch**: Journal `uri` does not match metadata `exportUri`.
    - *Gate Action*: **Rejects** because exact structural agreement is required.
-5. **Journal owner / `terminalOperationId` mismatch**: `terminalOperationId` is nonblank but journal `ownerOperationId` differs.
+5. **Journal owner / `terminalOperationId` mismatch**: `terminalOperationId` is nonblank but journal `ownerOperationId` or `terminalOperationId` differs.
    - *Gate Action*: **Rejects** because precise owner-correlation is required.
 6. **Missing MAIN journal**:
    - *Gate Action*: **Rejects** because `CurrentMainAuthorityResolution` will resolve to `None`.
@@ -175,7 +181,7 @@ These cases must be rejected by the fast-path gate and continue through the exis
 11. **Active operation / Processing handoff present**: `ACTIVE_OPERATION_ID` or `PROCESSING_HANDOFF_OPERATION_ID` is present.
     - *Gate Action*: **Rejects** because active owners block eligibility.
 12. **`recoveryState` not `STABLE` / `recoveryMessage` present**:
-    - *Gate Action*: **Rejects** because preexisting debt must go through the slow path to resolve.
+    - *Gate Action*: **Rejects** because preexisting debt must go through the standard path to resolve.
 13. **Invalid export journal**:
     - *Gate Action*: **Rejects** because `invalidFiles(jobDir)` is non-empty.
 14. **RAW job with DNG-sidecar recovery requirements**:
@@ -188,79 +194,294 @@ These cases must be rejected by the fast-path gate and continue through the exis
 The R3.1 timing cohort was composed of 46 YUV (JPEG & HEIF) jobs. RAW jobs have a DNG sidecar contract that executes `reconstructRawSidecarJournalEvidence`, which updates frame-level fields in metadata.
 
 ### Scope Decision:
-**Option B: Intentionally scoped to jobs with no RAW-sidecar recovery work.**
+**Intentionally scoped to jobs with no RAW-sidecar recovery work.**
 
 ### Rationale:
-- The fast path is safest and most predictable when focused strictly on MAIN-image recovery.
+- Scoped strictly to MAIN-image recovery.
 - A RAW job with sidecars has multi-file state alignment requirements. Skimping on sidecar alignment could hide state desynchronizations.
-- A cheap structural gate (`rawSidecarRecoveryApplies(...) == false`) can be used to isolate the YUV/non-sidecar cohort cleanly.
-
-### Broadening Evidence Required:
-To broaden this to RAW jobs in the future, we would need to:
-1. Prove that `reconstructRawSidecarJournalEvidence` results in zero content-changing writes for already-terminal RAW jobs.
-2. Verify that sidecar journals are also fully terminally stable (`terminalMetadataPersisted == true`) and align byte-for-byte.
+- A cheap structural gate (`rawSidecarRecoveryApplies(jobDir, job) == false`) isolates the YUV/non-sidecar cohort cleanly.
 
 ---
 
-## 8. FUTURE IMPLEMENTATION LOCATION
+## 8. SUPERSEDED R4 EARLY RETURN PROPOSAL & R4.1 REPLACEMENT
 
-The fast path logic should be placed in `KeplerRecoveryCoordinator.recoverOne` right before the first reconstruction gate check:
+### 8.1 SUPERSEDED EARLY RETURN (R4 — DO NOT USE)
+
+> The R4 design originally proposed an early return at line 358:
+> ```kotlin
+> // SUPERSEDED - DO NOT IMPLEMENT
+> val fastPathEligible = checkFastPathEligibility(...)
+> if (fastPathEligible) {
+>     return KeplerJobRecoveryResult(
+>         jobDir,
+>         KeplerJobRecoveryClassification.RECOVERED,
+>         actions = exportResults.map { it.classification.name },
+>         cleanupFailures = cleanupFailures
+>     )
+> }
+> ```
+> **Why Superseded**: Downstream recovery work after line 358 (including `ProcessingArtifactJournal.scan` and `recoverProcessingArtifactJournals`) was completely bypassed. If a job had a verified MAIN export but also contained processing journal debt or invalid processing files, the early return would silently ignore processing issues and incorrectly classify the job as `RECOVERED`. Furthermore, returning `actions = exportResults.map { ... }` diverged from standard production recovery results (which return `metadataTemps.actions`).
+
+---
+
+### 8.2 R4.1 REPLACEMENT: NARROW RECONSTRUCTION SUPPRESSION
+
+In R4.1, we place the optimization gate **strictly around the `reconstructMainExportEvidence` call** (lines 358-367 in `KeplerRecoveryCoordinator.kt`), allowing all remaining code in `recoverOne` to execute normally.
 
 ```kotlin
-// Proposed location within KeplerRecoveryCoordinator.recoverOne:
-// After: CurrentMainAuthorityResolution.Resolved has verified the MAIN export, and
-// MediaStore verification has completed successfully with PUBLIC_VERIFIED.
-// Before: reconstructMainExportEvidence is executed.
+// R4.1 Implementation Design within KeplerRecoveryCoordinator.recoverOne:
+// Placed at lines 358-367:
 
-val fastPathEligible = checkFastPathEligibility(
-    job,
-    currentMainAuthorityJournal,
-    currentMainAuthorityResult,
-    exportResults,
-    invalidExportJournals
-)
-
-if (fastPathEligible) {
-    // Skip reconstructMainExportEvidence and terminal stable settlement.
-    // Settle RECOVERED directly with zero writes.
-    return KeplerJobRecoveryResult(
-        jobDir,
-        KeplerJobRecoveryClassification.RECOVERED,
-        actions = exportResults.map { it.classification.name },
-        cleanupFailures = cleanupFailures
+val suppressMainReconstruction = exportAuthorityOperation.isNotBlank() &&
+    exportResults.isNotEmpty() &&
+    isModernTerminallySettledMainExport(
+        job = job,
+        journal = currentMainAuthorityJournal,
+        result = currentMainAuthorityResult,
+        terminalOperationId = terminalOperationId,
+        exportResults = exportResults
     )
+
+if (exportAuthorityOperation.isNotBlank() && exportResults.isNotEmpty() && !suppressMainReconstruction) {
+    job = R3GalleryColdMeasurement.measureReconstruction {
+        KeplerJobMetadata.update(
+            jobDir,
+            R3GalleryColdMeasurement.MetadataWriteSource.RECONSTRUCT_MAIN_EXPORT
+        ) { current ->
+            reconstructMainExportEvidence(jobDir, current, exportAuthorityOperation, exportResults)
+        }
+    }
 }
+
+// ALL DOWNSTREAM CONTROL FLOW CONTINUES UNTOUCHED:
+// - RAW sidecar reconstruction (lines 368-391)
+// - Terminal operation settlement (lines 392-441)
+// - recoverCaptureOwnedTemps (line 442)
+// - PROCESSING_HANDOFF finalization (lines 443-453)
+// - ProcessingArtifactJournal.scan & recoverProcessingArtifactJournals (lines 454-527)
+// - Active operation recovery (lines 528-600)
+// - Invalid export journal handling (lines 601-612)
+// - Terminal stable settlement check (lines 613-624) -> naturally skips write because recoveryState=="STABLE"
+// - Local-output terminal classification (lines 625-640)
+// - Legacy active job recovery (lines 641-658)
+// - Standard KeplerJobRecoveryResult construction (lines 659-665)
 ```
 
 ---
 
-## 9. FUTURE DESIGN TEST MATRIX
+## 9. DOWNSTREAM RECOVERY AUDIT AFTER LINE 358
 
-Deterministic host tests (in `KeplerRecoveryCoordinatorTest.kt`) must verify the following properties:
+Starting immediately after line 358 (`reconstructMainExportEvidence`), every step in `recoverOne` is audited under the strict eligibility contract:
 
-1. **Eligible Job**:
-   - Inputs: Already-terminal stable YUV job, verified journal, terminal acked, present in MediaStore, passes verification.
-   - Assertions: `0` `RECONSTRUCT_MAIN_EXPORT` writes, `0` `TERMINAL_STABLE_SETTLEMENT` writes, metadata SHA unchanged, journal SHA unchanged, classification == `RECOVERED`.
-2. **Current Verification Enforcement**:
-   - Verify that real MediaStore query and bounds verification are *still executed* even on the fast path.
-3. **Mismatched Linkage**:
-   - `galleryPublicExportLinkage != exportUri` -> Runs standard path (2 writes).
-4. **Mismatched DisplayName / MimeType**:
-   - Metadata display name != Journal display name -> Runs standard path to align fields.
-5. **External Removal**:
-   - Row missing in MediaStore -> Standard path runs, executes `applyExternalPublicRemovalMetadata`, sets `REMOVED_EXTERNALLY`.
-6. **Committed Unverified**:
-   - Journal state is verified but current verification result is unverified -> Standard path runs, records debt.
-7. **Active Operation / Processing Handoff**:
-   - Presence of `ACTIVE_OPERATION_ID` -> Standard path runs to resolve owner.
-8. **Invalid Journal**:
-   - Mutilated export journal json -> Standard path runs, reports `AMBIGUOUS_RECOVERY_REQUIRED`.
-
-*To strengthen the polarity regression from R3.1:* Ensure tests assert the specific `R3GalleryColdMeasurement` write-source counters (`RECONSTRUCT_MAIN_EXPORT`, `TERMINAL_STABLE_SETTLEMENT`) are exactly 0 for eligible runs.
+| # | Step in `recoverOne` | Line Range | Classification for Strict Eligible State | Audit & Proof |
+|---|---|---|---|---|
+| 1 | **MAIN Evidence Reconstruction** | 358-367 | **Target of Suppression** | Suppressed when `suppressMainReconstruction == true`. Avoids Write 1 (`RECONSTRUCT_MAIN_EXPORT`). |
+| 2 | **RAW Sidecar Reconstruction** | 368-391 | **A** (Provably Irrelevant under Contract) | Gated by `rawSidecarRecoveryApplies(jobDir, job)`. Strict eligibility contract requires `rawSidecarRecoveryApplies == false`. Gate evaluates to false; block is skipped cleanly. |
+| 3 | **Terminal Operation Settlement** | 392-441 | **A** (Provably Irrelevant under Contract) | Gated by `terminalOperationId == activeOperation && activeOperation.isNotBlank()`. Contract requires `activeOperation.isBlank()`. Block is skipped cleanly. |
+| 4 | **Capture-Owned Temp Recovery** | 442 | **A** (Provably Irrelevant under Contract) | `recoverCaptureOwnedTemps` is called with `oldActiveOperation = activeOperation.isNotBlank() == false`. `KeplerRestartArtifactRecovery.kt` line 126 immediately returns empty `KeplerCaptureTempRecovery()`. Zero side-effects. |
+| 5 | **PROCESSING_HANDOFF Finalization** | 443-453 | **A** (Provably Irrelevant under Contract) | Gated by `PROCESSING_HANDOFF_OPERATION_ID.isNotBlank()`. Contract requires handoff ID blank. Block is skipped cleanly. |
+| 6 | **Processing Artifact Journal Scan** | 454 | **B** (Must Still Execute) | `ProcessingArtifactJournal.scan(jobDir)` runs unconditionally. Essential for detecting processing evidence/debt. |
+| 7 | **Processing Artifact Recovery & Debt Handling** | 457-527 | **B** (Must Still Execute) | Runs whenever `processingEvidenceExists == true`. Handles invalid processing journals, cleanup debt, and current processing claims. (See Section 10 Counterexample). |
+| 8 | **Active Operation Recovery** | 528-600 | **A** (Provably Irrelevant under Contract) | Gated by `activeOperation.isNotBlank()`. Contract requires `activeOperation.isBlank()`. Block is skipped cleanly. |
+| 9 | **Invalid Export Journal Handling** | 601-612 | **A** (Provably Irrelevant under Contract) | Gated by `invalidExportJournals.isNotEmpty() && !terminalResultAlreadyProven`. Contract requires `invalidExportJournals.isEmpty()`. Block is skipped cleanly. |
+| 10 | **Terminal Stable Settlement** | 613-624 | **B** (Must Still Execute) | Runs when `terminalResultAlreadyProven == true`. Checks `needsStableSettlement = (recoveryState != "STABLE" \|\| has("recoveryMessage"))`. Under suppression, `recoveryState` remains `"STABLE"` and `recoveryMessage` is absent, so `needsStableSettlement` is **false**. **Zero writes performed**. |
+| 11 | **Local-Output Terminal Classification** | 625-640 | **A** (Provably Irrelevant under Contract) | Gated by `currentPipelineStage !in terminalStages`. Contract requires terminal stage (`COMPLETE`, etc.). Block is skipped cleanly. |
+| 12 | **Legacy Active Job Recovery** | 641-658 | **A** (Provably Irrelevant under Contract) | `isLegacyActiveJob(job)` checks active status fields. For terminal stage jobs with no active markers, returns false. Block is skipped cleanly. |
+| 13 | **Final Result Construction** | 659-665 | **B** (Must Still Execute) | Standard exit point: constructs `KeplerJobRecoveryResult(jobDir, RECOVERED, actions = metadataTemps.actions, failures = metadataTemps.failures, cleanupFailures = cleanupFailures)`. Preserves exact return semantics. |
 
 ---
 
-## 10. PREDICTED PERFORMANCE BOUND
+## 10. SPECIFIC PROCESSING-ARTIFACT COUNTEREXAMPLE
+
+### Scenario:
+- MAIN export is fully modern terminal-stable `VERIFIED`.
+- Real MediaStore inspection returns `PUBLIC_VERIFIED`.
+- Job metadata `recoveryState` is `"STABLE"`, no active/handoff operations exist.
+- RAW sidecar recovery does not apply.
+- **BUT** `ProcessingArtifactJournal.scan(jobDir)` discovers:
+  - **Case A**: An invalid processing journal file (e.g. `.processing_tx_corrupt.json`).
+  - **Case B**: A valid processing journal with outstanding cleanup debt (e.g. `ADOPTED_CURRENT_WITH_CLEANUP_DEBT`).
+  - **Case C**: Unsettled processing artifact evidence requiring adoption/restoration.
+
+### Production Behavior vs. Superseded Early Return:
+
+```
+                                  [ MAIN Export Verified & Settled ]
+                                                 │
+                   ┌─────────────────────────────┴─────────────────────────────┐
+                   ▼                                                           ▼
+     Superseded Early Return (R4 §8)                               R4.1 Narrow Suppression
+  ────────────────────────────────────                       ───────────────────────────
+  • Immediately returns RECOVERED                             • Skips reconstructMainExportEvidence
+  • Bypasses ProcessingArtifactJournal.scan                   • Continues to ProcessingArtifactJournal.scan
+  • Invalid processing journal IGNORED                        • Case A: Detects invalid journal
+  • Fail-closed policy VIOLATED                                 ──> Writes AMBIGUOUS_RECOVERY_REQUIRED
+  • Processing cleanup debt IGNORED                             ──> Returns AMBIGUOUS_RECOVERY_REQUIRED
+  • Returns RECOVERED (FAIL-OPEN BUG)                         • Case B: Detects cleanup debt
+                                                                ──> Writes PROCESSING_CLEANUP_REQUIRED
+                                                                ──> Returns PROCESSING_CLEANUP_REQUIRED
+                                                              • Case C: Resolves processing claim
+                                                                ──> Returns correct classification
+```
+
+### Proof of Requirement:
+Under standard production, lines 454-527 execute processing artifact recovery regardless of MAIN export status. If an invalid processing journal exists, production updates metadata to `AMBIGUOUS_RECOVERY_REQUIRED` and returns `AMBIGUOUS_RECOVERY_REQUIRED` (lines 464-474). 
+
+The early-return proposal would have silently bypassed this check and returned `RECOVERED`. This represents a **fail-closed to fail-open safety regression**.
+
+The R4.1 narrow suppression design guarantees that processing artifact recovery always runs, preserving full behavioral equivalence and fail-closed safety.
+
+---
+
+## 11. RETURN-SEMANTICS EQUIVALENCE AUDIT
+
+Comparing the result produced by the superseded early-return proposal vs. the standard production path and R4.1:
+
+| Result Component | Superseded R4 Early Return | Standard Production Path | R4.1 Narrow Suppression | Equivalence Evaluation |
+|---|---|---|---|---|
+| **Classification** | Hardcoded `RECOVERED` | `if (metadataTemps.classification == AMBIGUOUS) AMBIGUOUS_RECOVERY_REQUIRED else RECOVERED` | Identical to Production | Early return failed to account for ambiguous metadata temp recovery. R4.1 preserves production classification logic exactly. |
+| **`actions`** | `exportResults.map { it.classification.name }` (e.g. `["PUBLIC_VERIFIED"]`) | `metadataTemps.actions` (e.g. `[]` or `["DELETED_.job.json.1.tmp"]`) | Identical to Production (`metadataTemps.actions`) | Early return synthesized artificial export action strings. R4.1 retains exact production action list. |
+| **`failures`** | `emptyList()` | `metadataTemps.failures` | Identical to Production (`metadataTemps.failures`) | Early return dropped metadata temp failure diagnostics. R4.1 preserves them. |
+| **`cleanupFailures`** | `cleanupFailures` | `cleanupFailures` | Identical to Production (`cleanupFailures`) | Identical across all. |
+
+### Conclusion:
+The superseded early return produced non-equivalent `KeplerJobRecoveryResult` objects. The R4.1 narrow-suppression design falls through to the existing single return block (lines 659-665), guaranteeing **100% return-semantics equivalence by construction**.
+
+---
+
+## 12. LEGACY TERMINAL EVIDENCE COUNTEREXAMPLE
+
+### Production Legacy Context:
+Current production contains legacy terminal-stable recovery logic (`MediaStoreExportRecovery.kt` lines 374-390) for older jobs whose `MAIN_IMAGE` journals have `state == VERIFIED` but lack modern `terminalMetadataPersisted == true` acknowledgment.
+
+When the MediaStore row for such a legacy job is externally removed, production uses `isLegacyTerminalStableVerifiedMainExportForRecovery` to classify the result as `PUBLIC_RESULT_REMOVED` instead of `PUBLIC_COMMIT_MISSING`.
+
+### Fast-Path Eligibility Requirement:
+The fast-path reconstruction suppression **MUST NOT** accept legacy terminal evidence. Legacy jobs did not undergo modern terminal-acknowledged metadata persistence and may require reconstructive metadata updates.
+
+To enforce this, the eligibility predicate explicitly requires:
+```kotlin
+journal.state == MediaStoreExportState.VERIFIED &&
+journal.terminalMetadataPersisted == true &&
+journal.terminalOperationId == terminalOperationId &&
+journal.ownerOperationId == terminalOperationId
+```
+Any job with `terminalMetadataPersisted == false` fails eligibility and falls back to standard production recovery.
+
+---
+
+## 13. DEFINE "TERMINALLY STABLE" USING REAL DURABLE FIELDS
+
+The conceptual term "terminally stable" corresponds to specific durable fields across `KeplerJobMetadata` and `MediaStoreExportJournal`. Note that `MediaStoreExportJournal.isTerminallyStable()` exists in production (`GalleryExporter.kt` line 78):
+```kotlin
+internal fun MediaStoreExportJournal.isTerminallyStable(): Boolean =
+    terminalMetadataPersisted || state in setOf(
+        MediaStoreExportState.CLEANED,
+        MediaStoreExportState.INSERT_FAILED_NO_ROW
+    )
+```
+However, for MAIN export fast-path eligibility, `journal.isTerminallyStable()` alone is insufficient because it includes `CLEANED` and `INSERT_FAILED_NO_ROW` states.
+
+The exact durable contract for `isModernTerminallySettledMainExport` is defined using current production fields:
+
+```kotlin
+internal fun isModernTerminallySettledMainExport(
+    job: org.json.JSONObject,
+    journal: MediaStoreExportJournal?,
+    result: MediaStoreExportRecoveryResult?,
+    terminalOperationId: String,
+    exportResults: List<MediaStoreExportRecoveryResult>
+): Boolean {
+    if (journal == null || result == null) return false
+    
+    // 1. MediaStore Inspection & Result Reality
+    if (result.classification != MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED) return false
+    if (result.verificationDiagnosticReason != null) return false
+    
+    // 2. Journal Durable Contract
+    if (journal.role != MediaStoreExportRole.MAIN_IMAGE) return false
+    if (journal.state != MediaStoreExportState.VERIFIED) return false
+    if (!journal.terminalMetadataPersisted) return false
+    if (terminalOperationId.isBlank()) return false
+    if (journal.ownerOperationId != terminalOperationId) return false
+    if (journal.terminalOperationId != terminalOperationId) return false
+    
+    // 3. Metadata Durable Contract
+    if (job.optString(ACTIVE_OPERATION_ID).isNotBlank()) return false
+    if (job.optString(PROCESSING_HANDOFF_OPERATION_ID).isNotBlank()) return false
+    if (job.optString("currentPipelineStage").uppercase() !in setOf("COMPLETE", "PARTIAL", "FAILED", "CANCELLED")) return false
+    if (job.optString("recoveryState").ifBlank { "STABLE" } != "STABLE") return false
+    if (job.has("recoveryMessage")) return false
+    if (!job.optBoolean("galleryExportCommitted", false)) return false
+    if (!job.optBoolean("exportVerified", false)) return false
+    
+    // 4. Exact Structural Linkage & Field Agreement
+    val exportUri = job.optString("exportUri").takeIf { it.isNotBlank() && it != "null" } ?: return false
+    val linkageUri = job.optString("galleryPublicExportLinkage").takeIf { it.isNotBlank() && it != "null" } ?: return false
+    if (exportUri != linkageUri) return false
+    if (journal.uri != exportUri) return false
+    if (journal.displayName != job.optString("exportDisplayName")) return false
+    if (journal.mimeType != job.optString("exportMimeType")) return false
+    
+    // 5. No Unresolved Export Debt Across Other Journals
+    // All non-MAIN journals for this job directory must already be CLEANED or absent.
+    val allJournals = MediaStoreExportJournal.list(journal.jobIdentity.let { File(job.optString("jobDirAbsolutePath")) })
+    if (allJournals.any { it.exportAttemptId != journal.exportAttemptId && it.state != MediaStoreExportState.CLEANED }) return false
+    
+    // 6. RAW / Sidecar Scope Isolation
+    // Must have no RAW sidecar recovery requirements.
+    val jobDir = File(job.optString("jobDirAbsolutePath"))
+    if (rawSidecarRecoveryApplies(jobDir, job)) return false
+    
+    return true
+}
+```
+
+This predicate uses **only existing durable fields** and introduces no new state sources or assumptions.
+
+---
+
+## 14. UPDATED TEST MATRIX
+
+Future implementation tests (in `KeplerRecoveryCoordinatorTest.kt`) must verify the following matrix:
+
+### ELIGIBLE Ordinary Terminal YUV Cohort:
+1. **Zero-Write Fast Path**:
+   - *Inputs*: Modern terminal YUV job, `journal.state == VERIFIED`, `terminalMetadataPersisted == true`, MediaStore inspection `PUBLIC_VERIFIED`.
+   - *Assertions*: Real MediaStore inspection is **still executed**; `RECONSTRUCT_MAIN_EXPORT` writes == `0`; `TERMINAL_STABLE_SETTLEMENT` writes == `0`; processing artifact scan still executes; final classification == `RECOVERED`; metadata SHA unchanged; journal SHA unchanged.
+
+### Processing Artifact Scenarios (Safety & Integrity):
+2. **Valid Processing Artifact Journal Present**:
+   - *Inputs*: Eligible MAIN export, but job directory contains a valid unresolved processing artifact journal.
+   - *Assertions*: Fast path suppresses MAIN reconstruction, but downstream processing recovery executes, adopts/settles processing journal, updates metadata appropriately.
+3. **Invalid Processing Artifact Journal Present**:
+   - *Inputs*: Eligible MAIN export, but job directory contains an invalid/mutilated processing journal (`.processing_tx_corrupt.json`).
+   - *Assertions*: Downstream processing recovery detects invalid file, sets `recoveryState = AMBIGUOUS_RECOVERY_REQUIRED`, returns `AMBIGUOUS_RECOVERY_REQUIRED` (fail-closed preserved).
+4. **Processing Cleanup Debt Present**:
+   - *Inputs*: Eligible MAIN export, but processing artifact cleanup failed (`ADOPTED_CURRENT_WITH_CLEANUP_DEBT`).
+   - *Assertions*: Downstream processing recovery records processing cleanup debt, sets `recoveryState = PROCESSING_CLEANUP_REQUIRED`, returns `PROCESSING_CLEANUP_REQUIRED`.
+
+### Legacy Evidence Isolation:
+5. **Legacy Terminal VERIFIED Job (No `terminalMetadataPersisted`)**:
+   - *Inputs*: Legacy job with `journal.state == VERIFIED`, but `terminalMetadataPersisted == false`.
+   - *Assertions*: `isModernTerminallySettledMainExport` returns `false`; standard reconstruction path runs (2 writes); legacy recovery behavior preserved.
+
+### RAW / Sidecar Isolation:
+6. **RAW Job with DNG Sidecars**:
+   - *Inputs*: `rawSidecarRecoveryApplies == true`.
+   - *Assertions*: `isModernTerminallySettledMainExport` returns `false`; standard reconstruction path runs.
+
+### Existing R4 Counterexamples (All Retained):
+7. **Unverified Export**: `exportVerified == false` -> Standard path (2 writes).
+8. **Mismatched Linkage**: `galleryPublicExportLinkage != exportUri` -> Standard path.
+9. **Mismatched DisplayName / MimeType**: Metadata vs. journal mismatch -> Standard path.
+10. **External Removal**: MediaStore row absent -> Standard path runs, executes `applyExternalPublicRemovalMetadata`, sets `REMOVED_EXTERNALLY`.
+11. **Active Operation / Handoff**: `ACTIVE_OPERATION_ID` present -> Standard path runs.
+12. **Invalid Export Journal**: Mutilated export journal -> Standard path reports `AMBIGUOUS_RECOVERY_REQUIRED`.
+
+---
+
+## 15. PREDICTED PERFORMANCE BOUND
 
 In R3.1, the cold metadata persistence timing across 92 writes for the 46 jobs was:
 - Run 1: `234.787` ms
@@ -277,11 +498,13 @@ In R3.1, the cold metadata persistence timing across 92 writes for the 46 jobs w
 
 ---
 
-## 11. UNRESOLVED RISKS
+## 16. UNRESOLVED RISKS
 
-1. **Undetected Metadata Modifications**: If another part of the system modifies job metadata fields (e.g., custom user tags, gallery categories) during export without updating journals, a fast-path bypass could skip reconciliation. This is mitigated by restricting eligibility strictly to `recoveryState == STABLE` and matching `exportDisplayName`/`exportMimeType` to journals.
-2. **Concurrent Directory Modifications**: If a concurrent background process modifies the job directory during the recovery scan, a race could occur. This is mitigated by the existing single-flight `JobOperationLease` mechanism.
+1. **Undetected Metadata Modifications**: If another part of the system modifies job metadata fields during export without updating journals, suppressing reconstruction could skip reconciliation. Mitigated by strictly matching `exportDisplayName` and `exportMimeType` to journals and requiring `recoveryState == STABLE`.
+2. **Concurrent Directory Modifications**: Mitigated by the existing single-flight `JobOperationLease` mechanism.
 
 ---
 
-## R4 DESIGN PASS — SAFE BOUNDED IMPLEMENTATION DEFINED
+## FINAL CLASSIFICATION
+
+R4.1 DESIGN PASS — NARROW MAIN-RECONSTRUCTION SUPPRESSION PROVEN SAFE
