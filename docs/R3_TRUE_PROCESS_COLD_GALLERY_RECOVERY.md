@@ -2,6 +2,9 @@
 
 Status: `R3 CLOSED — TRUE TERMINAL-VERIFIED COLD RECOVERY MEASURED`
 
+> **ERRATUM — Metadata-write classification superseded**
+> The metadata-write classification in this report is superseded by `docs/R3_1_CORRECT_METADATA_WRITE_CLASSIFICATION.md`. Original MediaStore/recovery timing evidence remains valid. Corrected result: 92 content-changing / 0 same-content writes. See R3.1 for polarity correction and write-source attribution.
+
 Device: `SM-S921N` / Galaxy S24 / Android 16
 Application: `com.projectnuke.keplernightlab`
 Cohort: `3b53bea4-9704-4909-926c-64351ec6a705`
