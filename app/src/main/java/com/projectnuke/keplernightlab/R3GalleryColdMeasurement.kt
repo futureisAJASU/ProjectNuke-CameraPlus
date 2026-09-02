@@ -32,13 +32,10 @@ internal object R3GalleryColdMeasurement {
     internal fun onProcessStart(context: Context) {
         active.set(null)
         val control = controlFile(context)
-        val raw = runCatching { control.readText(StandardCharsets.UTF_8) }.getOrNull()
-        android.util.Log.d("R3Cold", "onProcessStart controlExists=${control.exists()} raw=$raw")
         val runId = runCatching {
             JSONObject(control.readText(StandardCharsets.UTF_8)).optString("runId")
         }.getOrNull()?.takeIf { it.matches(Regex("[A-Za-z0-9_-]{8,80}")) }
         if (runId == null) {
-            android.util.Log.d("R3Cold", "onProcessStart no valid runId")
             return
         }
         android.util.Log.d("R3Cold", "onProcessStart activated runId=$runId")
@@ -47,12 +44,14 @@ internal object R3GalleryColdMeasurement {
     }
 
     internal fun recoveryStarted() {
-        android.util.Log.d("R3Cold", "recoveryStarted active=${active.get()?.runId}")
-        active.get()?.recoveryStartedAtNanos = SystemClock.elapsedRealtimeNanos()
+        val state = active.get() ?: return
+        android.util.Log.d("R3Cold", "recoveryStarted active=${state.runId}")
+        state.recoveryStartedAtNanos = SystemClock.elapsedRealtimeNanos()
     }
 
     internal fun recoveryFinished(report: KeplerRecoveryReport) {
-        android.util.Log.d("R3Cold", "recoveryFinished jobs=${report.jobs.size} active=${active.get()?.runId}")
+        val runId = active.get()?.runId
+        if (runId != null) android.util.Log.d("R3Cold", "recoveryFinished jobs=${report.jobs.size} active=$runId")
         active.get()?.let { state ->
             state.recoveryFinishedAtNanos = SystemClock.elapsedRealtimeNanos()
             state.recoveryJobCount = report.jobs.size
@@ -66,14 +65,10 @@ internal object R3GalleryColdMeasurement {
     }
 
     internal fun galleryReady(context: Context, jobCount: Int) {
-        android.util.Log.d("R3Cold", "galleryReady jobCount=$jobCount active=${active.get()?.runId}")
-        val state = active.get() ?: run {
-            android.util.Log.d("R3Cold", "galleryReady no active")
-            return
-        }
+        val state = active.get() ?: return
+        android.util.Log.d("R3Cold", "galleryReady jobCount=$jobCount active=${state.runId}")
         synchronized(state) {
             if (state.galleryReadyAtNanos != null) {
-                android.util.Log.d("R3Cold", "galleryReady already done")
                 return
             }
             state.galleryReadyAtNanos = SystemClock.elapsedRealtimeNanos()
@@ -219,19 +214,9 @@ internal object R3GalleryColdMeasurement {
     }
 
     private fun writeResult(context: Context, state: RunState) {
-        android.util.Log.d("R3Cold", "writeResult attempt runId=${state.runId} recoveryStart=${state.recoveryStartedAtNanos} recoveryEnd=${state.recoveryFinishedAtNanos} galleryReady=${state.galleryReadyAtNanos}")
-        val recoveryStart = state.recoveryStartedAtNanos ?: run {
-            android.util.Log.d("R3Cold", "writeResult missing recoveryStart")
-            return
-        }
-        val recoveryEnd = state.recoveryFinishedAtNanos ?: run {
-            android.util.Log.d("R3Cold", "writeResult missing recoveryEnd")
-            return
-        }
-        val galleryReady = state.galleryReadyAtNanos ?: run {
-            android.util.Log.d("R3Cold", "writeResult missing galleryReady")
-            return
-        }
+        val recoveryStart = state.recoveryStartedAtNanos ?: return
+        val recoveryEnd = state.recoveryFinishedAtNanos ?: return
+        val galleryReady = state.galleryReadyAtNanos ?: return
         val json = JSONObject()
             .put("runId", state.runId)
             .put("clock", "SystemClock.elapsedRealtimeNanos")

@@ -179,6 +179,7 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
         installR4Control(runId)
         launchProductionGallery()
         val result = awaitResult(runId)
+        try {
         // Section 7: fail if recovery did not actually execute — fresh evidence required
         val processStartedAtNanos = result.optLong("processStartedAtNanos", -1L)
         val recoveryStartedAtNanos = result.optLong("recoveryStartedAtNanos", -1L)
@@ -234,6 +235,14 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
             "R4_TIMING run=$runNumber recoveryMs=$recoveryMs verificationAggMs=$inspectionAgg jpegAggMs=$jpegAgg heifAggMs=$heifAgg " +
                 "metadataPersistenceMs=$metadataPersistenceMs postRecoveryToGalleryReadyMs=$postRecoveryToGalleryMs totalMs=$totalMs"
         )
+        } finally {
+            clearR4ControlIfOwned(manifest)
+            // Completed run must leave no R4-owned control — fail-closed for unrelated R3
+            assertFalse(
+                "R4-owned control.json remains after completed run ${R3GalleryColdMeasurement.controlFile(context)}",
+                isR4OwnedControl(manifest)
+            )
+        }
     }
 
     @Test
@@ -247,15 +256,29 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
         }
         cleanupExactR4Artifacts(exactDirectories)
         assertTrue("R4 job directories remain: ${r4JobDirectories()}", r4JobDirectories().isEmpty())
-        val evidenceDirectory = r4EvidenceDirectory()
-        listOf(COHORT_FILE, CONTROL_FILE).forEach { name ->
-            assertFalse("R4 evidence remains: $name", File(evidenceDirectory, name).exists())
+        // Final cleanup must verify the REAL authoritative control location: filesDir/r3-gallery-cold/control.json
+        // and the real r3-gallery-cold directory for R4 artifacts — not r4-gallery-cold/CONTROL_FILE.
+        clearR4ControlIfOwned(manifest)
+        val coldDir = File(context.filesDir, R3_EVIDENCE_DIRECTORY)
+        if (coldDir.isDirectory) {
+            val r4Results = coldDir.listFiles().orEmpty().filter { it.name.startsWith("r4-") }
+            assertTrue("R4 result files remain in r3-gallery-cold: $r4Results", r4Results.isEmpty())
+            val r4Temps = coldDir.listFiles().orEmpty().filter { it.name.startsWith(".control-r4-") }
+            assertTrue("R4 temp control files remain in r3-gallery-cold: $r4Temps", r4Temps.isEmpty())
+            assertFalse(
+                "R4-owned control.json remains in r3-gallery-cold after cleanup",
+                isR4OwnedControl(manifest)
+            )
+        } else {
+            assertFalse("R4-owned control.json remains (no coldDir) ", isR4OwnedControl(manifest))
         }
-        // Also ensure no r4-* result files remain
+        // Verify R4 manifest/evidence files are gone from r4-gallery-cold
+        val evidenceDirectory = r4EvidenceDirectory()
+        assertFalse("R4 cohort manifest remains: $COHORT_FILE", File(evidenceDirectory, COHORT_FILE).exists())
         val remainingResults = evidenceDirectory.listFiles().orEmpty().filter { it.name.startsWith("r4-") }
-        assertTrue("R4 result files remain: $remainingResults", remainingResults.isEmpty())
+        assertTrue("R4 result files remain in r4-gallery-cold: $remainingResults", remainingResults.isEmpty())
         if (evidenceDirectory.isDirectory) {
-            val leftover = evidenceDirectory.listFiles().orEmpty().filter { it.name.startsWith(".control-") || it.name.startsWith(".cohort") }
+            val leftover = evidenceDirectory.listFiles().orEmpty().filter { it.name.startsWith(".control-") || it.name.startsWith(".cohort") || it.name == CONTROL_FILE }
             leftover.forEach { runCatching { it.delete() } }
             if (evidenceDirectory.listFiles().isNullOrEmpty()) {
                 assertTrue("R4 evidence directory cleanup failed", evidenceDirectory.delete())
@@ -263,6 +286,63 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
         }
         // Verify exact rows are absent — if manifest was present, we already deleted them in cleanupExactR4Artifacts.
         // If no manifest, we have no URI list; best-effort check is that no R4 rows remain via directory scan (already empty).
+    }
+
+    @Test
+    fun r4ControlCleanupIsOwnershipChecked() {
+        grantCameraPermission()
+        val control = R3GalleryColdMeasurement.controlFile(context)
+        val parent = requireNotNull(control.parentFile)
+        assertTrue(parent.mkdirs() || parent.isDirectory)
+        // Ensure clean start
+        runCatching { control.delete() }
+        parent.listFiles().orEmpty().filter { it.name.startsWith(".control-r4-") || it.name.startsWith(".control-r3-") }.forEach { runCatching { it.delete() } }
+
+        // A. R4-owned control is deleted by ownership helper
+        control.writeText(JSONObject().put("runId", "r4-example-1").toString(), StandardCharsets.UTF_8)
+        assertTrue("setup: R4 control exists", control.isFile)
+        clearR4ControlIfOwned()
+        assertFalse("R4-owned control must be deleted by R4 cleanup", control.exists())
+
+        // B. unrelated R3 control is NOT deleted by R4-specific helper
+        control.writeText(JSONObject().put("runId", "r3-example-1").toString(), StandardCharsets.UTF_8)
+        assertTrue("setup: R3 control exists", control.isFile)
+        clearR4ControlIfOwned()
+        assertTrue("unrelated R3 control must NOT be deleted by R4 helper", control.isFile)
+        assertEquals("r3-example-1", JSONObject(control.readText(StandardCharsets.UTF_8)).optString("runId"))
+        // When manifest is provided, R4 helper must also not delete R3; and when helper is called with null manifest for R4 mismatch
+        clearR4ControlIfOwned(null)
+        assertTrue("R3 control still present after second R4 clear", control.isFile)
+
+        // Also verify that R4 helper with mismatched cohort prefix does not delete a different R4 run
+        control.writeText(JSONObject().put("runId", "r4-other-cohort-1").toString(), StandardCharsets.UTF_8)
+        val fakeManifest = CohortManifest(cohortId = "11111111-2222-3333-4444-555555555555", rootCreatedByR3 = false, jobs = emptyList())
+        // fakeManifest prefix is r4-11111111_2222_3333_4444_555555555555- ; our control is r4-other-cohort-1 -> should NOT be deleted
+        clearR4ControlIfOwned(fakeManifest)
+        assertTrue("R4 control with mismatched cohort must NOT be deleted when manifest prefix required", control.isFile)
+        // Without manifest, any r4- is owned -> should be deleted
+        clearR4ControlIfOwned(null)
+        assertFalse("R4 control with any r4- prefix must be deleted when no manifest filter", control.exists())
+
+        // C. malformed/unknown control is handled fail-closed without deleting unrelated evidence
+        control.writeText("not-json-at-all", StandardCharsets.UTF_8)
+        assertTrue("setup: malformed control exists", control.isFile)
+        clearR4ControlIfOwned()
+        assertTrue("malformed control must be left intact (fail-closed)", control.isFile)
+        // empty json without runId
+        control.writeText(JSONObject().toString(), StandardCharsets.UTF_8)
+        clearR4ControlIfOwned()
+        assertTrue("control without runId must be left intact", control.isFile)
+        // unknown prefix
+        control.writeText(JSONObject().put("runId", "unknown-prefix-1").toString(), StandardCharsets.UTF_8)
+        clearR4ControlIfOwned()
+        assertTrue("unknown prefix control must be left intact", control.isFile)
+
+        // Final hygiene: leave no control
+        runCatching { control.delete() }
+        assertFalse("cleanup regression must leave no control", control.exists())
+        // Also ensure no temp controls remain
+        parent.listFiles().orEmpty().filter { it.name.startsWith(".control-") }.forEach { runCatching { it.delete() } }
     }
 
     private fun createR4TerminalVerifiedJob(root: File, cohortId: String, index: Int): CohortJob {
@@ -389,9 +469,11 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
                 .filter { it.name == COHORT_FILE || it.name == CONTROL_FILE || it.name.startsWith("r4-") || it.name.startsWith(".control-") || it.name.startsWith(".cohort") }
                 .forEach { file -> assertTrue("R4 evidence cleanup failed: $file", !file.exists() || file.delete()) }
         }
-        // Also clean any stale control/result in r3-gallery-cold that belong to r4
+        // Also clean any stale control/result in r3-gallery-cold that belong to r4 — exact ownership for control.json
         val coldDir = File(context.filesDir, R3_EVIDENCE_DIRECTORY)
         if (coldDir.isDirectory) {
+            val manifestForControl = runCatching { readR4Manifest() }.getOrNull()
+            clearR4ControlIfOwned(manifestForControl)
             coldDir.listFiles().orEmpty()
                 .filter { it.name.startsWith("r4-") || it.name.startsWith(".control-r4-") }
                 .forEach { runCatching { it.delete() } }
@@ -405,6 +487,36 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
         val temporary = File(file.parentFile, ".control-$runId.tmp")
         temporary.writeText(JSONObject().put("runId", runId).toString(), StandardCharsets.UTF_8)
         assertTrue("Could not publish R4 control", temporary.renameTo(file))
+    }
+
+    private fun clearR4ControlIfOwned(manifest: CohortManifest? = null) {
+        val control = R3GalleryColdMeasurement.controlFile(context)
+        if (!control.isFile) return
+        val runId = runCatching {
+            JSONObject(control.readText(StandardCharsets.UTF_8)).optString("runId")
+        }.getOrNull()?.takeIf { it.isNotEmpty() } ?: return
+        if (!runId.startsWith("r4-")) return
+        if (manifest != null) {
+            val cohortPrefix = "r4-${manifest.cohortId.replace('-', '_')}-"
+            if (!runId.startsWith(cohortPrefix)) return
+        }
+        runCatching { control.delete() }
+        val tmp = File(requireNotNull(control.parentFile), ".control-$runId.tmp")
+        runCatching { if (tmp.isFile) tmp.delete() }
+    }
+
+    private fun isR4OwnedControl(manifest: CohortManifest? = null): Boolean {
+        val control = R3GalleryColdMeasurement.controlFile(context)
+        if (!control.isFile) return false
+        val runId = runCatching {
+            JSONObject(control.readText(StandardCharsets.UTF_8)).optString("runId")
+        }.getOrNull()?.takeIf { it.isNotEmpty() } ?: return false
+        if (!runId.startsWith("r4-")) return false
+        if (manifest != null) {
+            val cohortPrefix = "r4-${manifest.cohortId.replace('-', '_')}-"
+            if (!runId.startsWith(cohortPrefix)) return false
+        }
+        return true
     }
 
     private fun assertNoPreExistingR4Jobs() {
