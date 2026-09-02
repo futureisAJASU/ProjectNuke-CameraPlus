@@ -30,11 +30,10 @@ internal object R3GalleryColdMeasurement {
         File(File(context.filesDir, DIRECTORY), "$runId$RESULT_SUFFIX")
 
     internal fun onProcessStart(context: Context) {
-        val previous = active.get()
         active.set(null)
         val control = controlFile(context)
         val raw = runCatching { control.readText(StandardCharsets.UTF_8) }.getOrNull()
-        android.util.Log.d("R3Cold", "onProcessStart controlExists=${control.exists()} raw=$raw prevRunId=${previous?.runId} prevRecoveryStart=${previous?.recoveryStartedAtNanos}")
+        android.util.Log.d("R3Cold", "onProcessStart controlExists=${control.exists()} raw=$raw")
         val runId = runCatching {
             JSONObject(control.readText(StandardCharsets.UTF_8)).optString("runId")
         }.getOrNull()?.takeIf { it.matches(Regex("[A-Za-z0-9_-]{8,80}")) }
@@ -44,53 +43,6 @@ internal object R3GalleryColdMeasurement {
         }
         android.util.Log.d("R3Cold", "onProcessStart activated runId=$runId")
         val newState = RunState(runId, SystemClock.elapsedRealtimeNanos())
-        // Preserve recovery timing across sequential in-process cold simulations
-        // (R4 does 3 gallery openings without process kill). If previous run already
-        // completed recovery, reuse its timing so writeResult can succeed even when
-        // KeplerRecoveryCoordinator does not re-run recovery in the same process.
-        if (previous != null && previous.recoveryStartedAtNanos != null && previous.recoveryFinishedAtNanos != null) {
-            // Only reuse if new runId is different but process is same - indicates
-            // sequential R4 loop without true process restart.
-            if (previous.runId != runId) {
-                newState.recoveryStartedAtNanos = previous.recoveryStartedAtNanos
-                newState.recoveryFinishedAtNanos = previous.recoveryFinishedAtNanos
-                newState.recoveryJobCount = previous.recoveryJobCount
-                newState.recoveredJobCount = previous.recoveredJobCount
-                newState.recoveryFailureCount = previous.recoveryFailureCount
-                // Also reuse verification/metadata to allow second galleryReady without re-inspection
-                // to still publish a valid result. This is a test-only tolerance for in-process loops.
-                if (previous.inspectionsAttempted > 0) {
-                    newState.inspectionsAttempted = previous.inspectionsAttempted
-                    newState.verifiedTrue = previous.verifiedTrue
-                    newState.verifiedFalse = previous.verifiedFalse
-                    newState.pendingTrue = previous.pendingTrue
-                    newState.pendingFalse = previous.pendingFalse
-                    newState.diagnosticReasons.putAll(previous.diagnosticReasons)
-                    newState.inspectionWallNanos = previous.inspectionWallNanos
-                    newState.samples.addAll(previous.samples)
-                    newState.metadataWriteAttempts = previous.metadataWriteAttempts
-                    newState.contentChangingWrites = previous.contentChangingWrites
-                    newState.sameContentRewrites = previous.sameContentRewrites
-                    newState.sameContentRewriteNanos = previous.sameContentRewriteNanos
-                    newState.contentChangingPersistenceNanos = previous.contentChangingPersistenceNanos
-                    newState.metadataPersistenceNanos = previous.metadataPersistenceNanos
-                    newState.reconstructionNanos = previous.reconstructionNanos
-                    newState.reconstructionWriteAttempts = previous.reconstructionWriteAttempts
-                    newState.journalWrites = previous.journalWrites
-                    newState.journalPersistenceNanos = previous.journalPersistenceNanos
-                    newState.terminalMetadataWrites = previous.terminalMetadataWrites
-                    newState.terminalMetadataWriteNanos = previous.terminalMetadataWriteNanos
-                    previous.sourceStats.forEach { (src, stats) ->
-                        val dst = newState.sourceStats.getValue(src)
-                        dst.writeAttempts = stats.writeAttempts
-                        dst.contentChangingWrites = stats.contentChangingWrites
-                        dst.sameContentWrites = stats.sameContentWrites
-                        dst.persistenceNanos = stats.persistenceNanos
-                    }
-                }
-                android.util.Log.d("R3Cold", "onProcessStart reused recovery+verification from ${previous.runId} for $runId")
-            }
-        }
         active.set(newState)
     }
 
@@ -283,6 +235,10 @@ internal object R3GalleryColdMeasurement {
         val json = JSONObject()
             .put("runId", state.runId)
             .put("clock", "SystemClock.elapsedRealtimeNanos")
+            .put("processStartedAtNanos", state.processStartedAtNanos)
+            .put("recoveryStartedAtNanos", recoveryStart)
+            .put("recoveryFinishedAtNanos", recoveryEnd)
+            .put("galleryReadyAtNanos", galleryReady)
             .put("processStartToRecoveryStartMs", nanosToMs(recoveryStart - state.processStartedAtNanos))
             .put("recoveryMs", nanosToMs(recoveryEnd - recoveryStart))
             .put("postRecoveryToGalleryReadyMs", nanosToMs(galleryReady - recoveryEnd))

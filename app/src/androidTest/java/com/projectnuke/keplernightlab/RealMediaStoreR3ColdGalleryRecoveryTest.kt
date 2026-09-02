@@ -111,43 +111,36 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
     }
 
     @Test
-    fun r4FullDeviceClosure() {
+    fun prepareR4Cohort() {
         grantCameraPermission()
-        assertDeviceReady()
-        // Clean stale artifacts from previous failed R4/R3 runs to ensure isolated cohort
+        // Isolate R4 exactly: clean any stale R4 dirs and any stale R4 evidence before preparing.
+        // Do NOT delete unrelated R3 cohort unless it collides on the same root prefix.
         runCatching {
             val staleR4 = keplerGalleryRoots(context).flatMap { rootDir ->
-                rootDir.listFiles().orEmpty().filter { it.isDirectory && it.name.startsWith("KPL_YUV_FUSION_R4_") }
+                rootDir.listFiles().orEmpty().filter { it.isDirectory && it.name.startsWith(R4_JOB_PREFIX) }
             }
-            cleanupExactR3Artifacts(staleR4 + r3JobDirectories())
-            // Clean previous R3/R4 cold files that would contaminate listing
-            val coldDir = File(context.filesDir, "r3-gallery-cold")
-            coldDir.listFiles()?.forEach { f ->
-                if (f.name.startsWith("r4-") || f.name == "control.json" || f.name.startsWith(".control-")) {
-                    runCatching { f.delete() }
-                }
+            if (staleR4.isNotEmpty()) {
+                cleanupExactR4Artifacts(staleR4)
             }
             val r4Dir = r4EvidenceDirectory()
-            r4Dir.listFiles()?.forEach { runCatching { it.delete() } }
+            r4Dir.listFiles()?.forEach { f ->
+                // Keep only r4 cohort/control/result files isolated; do not touch r3-gallery-cold.
+                runCatching { if (f.name == COHORT_FILE || f.name == CONTROL_FILE || f.name.startsWith("r4-") || f.name.startsWith(".control-") || f.name.startsWith(".cohort")) f.delete() }
+            }
         }
-
         val cohortId = UUID.randomUUID().toString()
         val root = productionYuvRoot()
         val rootExistedBefore = root.isDirectory
         assertTrue("Unable to create R4 root", root.mkdirs() || root.isDirectory)
-
-        val JOB_COUNT = 3
-        val JPEG_COUNT = 2
-        val HEIF_COUNT = 1
+        assertNoPreExistingR4Jobs()
         val jobs = mutableListOf<CohortJob>()
         try {
-            repeat(JOB_COUNT) { index ->
+            repeat(R4_JOB_COUNT) { index ->
                 createR4TerminalVerifiedJob(root, cohortId, index).also { jobs += it }
             }
-
-            assertExactTerminalContract(jobs, "pre-run", JOB_COUNT, JPEG_COUNT, HEIF_COUNT)
-            println("R4_BASELINE total=$JOB_COUNT jpeg=$JPEG_COUNT heif=$HEIF_COUNT terminal=$JOB_COUNT verified=$JOB_COUNT pending=0 diagnosticNull=$JOB_COUNT journalVerified=$JOB_COUNT terminalMetadataPersisted=$JOB_COUNT recoveryDebt=0")
-
+            assertExactTerminalContract(jobs, "R4 pre-run", R4_JOB_COUNT, R4_JPEG_COUNT, R4_HEIF_COUNT)
+            // Full preconditions per spec section 5: pending 0, recovery debt 0, diagnostic null etc
+            // asserted inside assertExactTerminalContract (terminal STABLE, VERIFIED, etc)
             val manifest = CohortManifest(
                 cohortId = cohortId,
                 rootCreatedByR3 = !rootExistedBefore,
@@ -161,64 +154,115 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
                 }
             )
             writeR4Manifest(manifest)
-
-            val beforeShas = jobs.associate { it.jobDir.name to snapshot(it.jobDir) }
-
-            for (runNumber in 1..3) {
-                val runId = "r4-${cohortId.replace('-', '_')}-$runNumber"
-                installR4Control(runId)
-                launchProductionGallery()
-                val result = awaitResult(runId)
-
-                val verification = result.getJSONObject("verification")
-                val metadata = result.getJSONObject("metadata")
-                val bySource = metadata.getJSONObject("bySource")
-
-                assertEquals("run $runNumber recovery jobs", JOB_COUNT, result.getInt("recoveryJobCount"))
-                assertEquals("run $runNumber recovered jobs", JOB_COUNT, result.getInt("recoveredJobCount"))
-                assertEquals("run $runNumber recovery failures", 0, result.getInt("recoveryFailureCount"))
-                assertEquals("run $runNumber inspections", JOB_COUNT, verification.getInt("inspectionsAttempted"))
-                assertEquals("run $runNumber verified", JOB_COUNT, verification.getInt("verifiedTrue"))
-                assertEquals("run $runNumber unverified", 0, verification.getInt("verifiedFalse"))
-                assertEquals("run $runNumber pending", 0, verification.getInt("pendingTrue"))
-                assertEquals("run $runNumber diagnostics", 0, verification.getJSONObject("diagnosticReasons").length())
-
-                assertEquals("run $runNumber reconstructionWriteAttempts", 0, metadata.getInt("reconstructionWriteAttempts"))
-                assertEquals("run $runNumber RECONSTRUCT_MAIN_EXPORT writes", 0, bySource.getJSONObject("RECONSTRUCT_MAIN_EXPORT").getInt("writeAttempts"))
-                assertEquals("run $runNumber TERMINAL_STABLE_SETTLEMENT writes", 0, bySource.getJSONObject("TERMINAL_STABLE_SETTLEMENT").getInt("writeAttempts"))
-                assertEquals("run $runNumber contentChangingWrites", 0, metadata.getInt("contentChangingWrites"))
-
-                println("R4_COLD_RUN_JSON run=$runNumber $result")
-
-                val afterRun = jobs.associate { it.jobDir.name to snapshot(it.jobDir) }
-                assertEquals("post-run $runNumber metadata hashes", beforeShas.mapValues { it.value.metadataHash }, afterRun.mapValues { it.value.metadataHash })
-                assertEquals("post-run $runNumber journal hashes", beforeShas.mapValues { it.value.journalHash }, afterRun.mapValues { it.value.journalHash })
-            }
-
-            val finalJobs = manifest.jobs.map { manifestJob ->
-                CohortJob(
-                    jobDir = File(root, manifestJob.jobDirName),
-                    uri = manifestJob.uri,
-                    actualFormat = OutputFormat.valueOf(manifestJob.actualFormat),
-                    uris = setOf(Uri.parse(manifestJob.uri))
-                )
-            }
-            // R4 pilot uses 3 jobs, not full 46 - verify with local size
-            assertEquals("post-run 0 job count", jobs.size, finalJobs.count { it.jobDir.isDirectory })
-            assertEquals("post-run 0 result cohort", jobs.size, jobs.size)
-
-            println("R4_PROTOCOL result=PASS total=${jobs.size} jpeg=$JPEG_COUNT heif=$HEIF_COUNT")
-        } finally {
-            val uris = jobs.flatMap { it.uris }.toSet()
-            uris.forEach { uri ->
-                runCatching { context.contentResolver.delete(uri, null, null) }
-                assertFalse("R4 exact MediaStore row must be deleted: $uri", mediaStoreRowExists(uri))
-            }
-            jobs.forEach { job ->
-                assertTrue("R4 exact job directory must be removed", !job.jobDir.exists() || job.jobDir.deleteRecursively())
-            }
-            if (root.isDirectory) assertTrue("R4 isolated root cleanup failed", root.delete() || root.listFiles().isNullOrEmpty())
+            println(
+                "R4_COHORT_BASELINE total=$R4_JOB_COUNT jpeg=$R4_JPEG_COUNT heif=$R4_HEIF_COUNT terminal=$R4_JOB_COUNT " +
+                    "verified=$R4_JOB_COUNT pending=0 diagnosticNull=$R4_JOB_COUNT journalVerified=$R4_JOB_COUNT " +
+                    "terminalMetadataPersisted=$R4_JOB_COUNT recoveryDebt=0 sameCohort=true root=$ROOT_NAME"
+            )
+        } catch (failure: Throwable) {
+            // On failure remove exactly the R4 cohort we just created so next prepare is clean.
+            cleanupExactR4Artifacts(jobs.map { it.jobDir })
+            throw failure
         }
+    }
+
+    @Test
+    fun measureR4ColdRun() {
+        grantCameraPermission()
+        assertDeviceReady()
+        val runNumber = InstrumentationRegistry.getArguments().getString(R4_RUN_ARGUMENT)?.toIntOrNull()
+            ?: throw AssertionError("Missing $R4_RUN_ARGUMENT instrumentation argument")
+        assertTrue("R4 run number must be 1..3", runNumber in 1..3)
+        val manifest = readR4Manifest()
+        assertEquals("R4 cohort must remain 46 jobs", R4_JOB_COUNT, manifest.jobs.size)
+        val runId = "r4-${manifest.cohortId.replace('-', '_')}-$runNumber"
+        installR4Control(runId)
+        launchProductionGallery()
+        val result = awaitResult(runId)
+        // Section 7: fail if recovery did not actually execute — fresh evidence required
+        val processStartedAtNanos = result.optLong("processStartedAtNanos", -1L)
+        val recoveryStartedAtNanos = result.optLong("recoveryStartedAtNanos", -1L)
+        val recoveryFinishedAtNanos = result.optLong("recoveryFinishedAtNanos", -1L)
+        assertTrue("run $runNumber recoveryStartedAtNanos > processStartedAtNanos: $recoveryStartedAtNanos > $processStartedAtNanos", recoveryStartedAtNanos > processStartedAtNanos)
+        assertTrue("run $runNumber recoveryFinishedAtNanos > recoveryStartedAtNanos: $recoveryFinishedAtNanos > $recoveryStartedAtNanos", recoveryFinishedAtNanos > recoveryStartedAtNanos)
+        assertEquals("run $runNumber recovery jobs", R4_JOB_COUNT, result.getInt("recoveryJobCount"))
+        assertEquals("run $runNumber recovered jobs", R4_JOB_COUNT, result.getInt("recoveredJobCount"))
+        assertEquals("run $runNumber recovery failures", 0, result.getInt("recoveryFailureCount"))
+        val verification = result.getJSONObject("verification")
+        assertEquals("run $runNumber inspections", R4_JOB_COUNT, verification.getInt("inspectionsAttempted"))
+        assertEquals("run $runNumber verified", R4_JOB_COUNT, verification.getInt("verifiedTrue"))
+        assertEquals("run $runNumber unverified", 0, verification.getInt("verifiedFalse"))
+        assertEquals("run $runNumber pending", 0, verification.getInt("pendingTrue"))
+        assertEquals("run $runNumber diagnostics", 0, verification.getJSONObject("diagnosticReasons").length())
+        assertEquals("run $runNumber JPEG inspections", R4_JPEG_COUNT, verification.getJSONObject("jpegInspectionMs").getInt("count"))
+        assertEquals("run $runNumber HEIF inspections", R4_HEIF_COUNT, verification.getJSONObject("heifInspectionMs").getInt("count"))
+        // Section 8: zero-write contract
+        val metadata = result.getJSONObject("metadata")
+        val bySource = metadata.getJSONObject("bySource")
+        assertEquals("run $runNumber reconstructionWriteAttempts", 0, metadata.getInt("reconstructionWriteAttempts"))
+        assertEquals("run $runNumber RECONSTRUCT_MAIN_EXPORT writes", 0, bySource.getJSONObject("RECONSTRUCT_MAIN_EXPORT").getInt("writeAttempts"))
+        assertEquals("run $runNumber TERMINAL_STABLE_SETTLEMENT writes", 0, bySource.getJSONObject("TERMINAL_STABLE_SETTLEMENT").getInt("writeAttempts"))
+        assertEquals("run $runNumber contentChangingWrites", 0, metadata.getInt("contentChangingWrites"))
+        assertEquals("run $runNumber sameContentRewrites", 0, metadata.getInt("sameContentRewrites"))
+        assertEquals("run $runNumber journalWrites", 0, metadata.getInt("journalWrites"))
+        assertEquals("run $runNumber terminalMetadataWrites", 0, metadata.getInt("terminalMetadataWrites"))
+        // Also verify bySource same-content counters are zero for the two suppressed sources
+        assertEquals("run $runNumber RECONSTRUCT contentChanging", 0, bySource.getJSONObject("RECONSTRUCT_MAIN_EXPORT").getInt("contentChangingWrites"))
+        assertEquals("run $runNumber RECONSTRUCT sameContent", 0, bySource.getJSONObject("RECONSTRUCT_MAIN_EXPORT").getInt("sameContentWrites"))
+        assertEquals("run $runNumber TERMINAL_STABLE contentChanging", 0, bySource.getJSONObject("TERMINAL_STABLE_SETTLEMENT").getInt("contentChangingWrites"))
+        assertEquals("run $runNumber TERMINAL_STABLE sameContent", 0, bySource.getJSONObject("TERMINAL_STABLE_SETTLEMENT").getInt("sameContentWrites"))
+        println("R4_COLD_RUN_JSON run=$runNumber $result")
+        // Section 9: durable cohort invariants after every run
+        val jobs = manifest.jobs.map { manifestJob ->
+            CohortJob(
+                jobDir = File(productionYuvRoot(), manifestJob.jobDirName),
+                uri = manifestJob.uri,
+                actualFormat = OutputFormat.valueOf(manifestJob.actualFormat),
+                uris = setOf(Uri.parse(manifestJob.uri))
+            )
+        }
+        assertPostRunTerminalContract(jobs, manifest, result, runNumber, R4_JOB_COUNT, R4_JPEG_COUNT, R4_HEIF_COUNT)
+        // Timing report (section 10) — only after contract satisfied
+        val recoveryMs = result.getDouble("recoveryMs")
+        val inspectionAgg = verification.getDouble("aggregateMs")
+        val jpegAgg = verification.getJSONObject("jpegInspectionMs").getDouble("aggregateMs")
+        val heifAgg = verification.getJSONObject("heifInspectionMs").getDouble("aggregateMs")
+        val metadataPersistenceMs = metadata.getDouble("metadataPersistenceMs")
+        val postRecoveryToGalleryMs = result.getDouble("postRecoveryToGalleryReadyMs")
+        val totalMs = result.getDouble("totalProcessColdGalleryReadyMs")
+        println(
+            "R4_TIMING run=$runNumber recoveryMs=$recoveryMs verificationAggMs=$inspectionAgg jpegAggMs=$jpegAgg heifAggMs=$heifAgg " +
+                "metadataPersistenceMs=$metadataPersistenceMs postRecoveryToGalleryReadyMs=$postRecoveryToGalleryMs totalMs=$totalMs"
+        )
+    }
+
+    @Test
+    fun cleanupR4Cohort() {
+        grantCameraPermission()
+        val manifest = runCatching { readR4Manifest() }.getOrNull()
+        val exactDirectories = if (manifest != null) {
+            manifest.jobs.map { File(productionYuvRoot(), it.jobDirName) }
+        } else {
+            r4JobDirectories()
+        }
+        cleanupExactR4Artifacts(exactDirectories)
+        assertTrue("R4 job directories remain: ${r4JobDirectories()}", r4JobDirectories().isEmpty())
+        val evidenceDirectory = r4EvidenceDirectory()
+        listOf(COHORT_FILE, CONTROL_FILE).forEach { name ->
+            assertFalse("R4 evidence remains: $name", File(evidenceDirectory, name).exists())
+        }
+        // Also ensure no r4-* result files remain
+        val remainingResults = evidenceDirectory.listFiles().orEmpty().filter { it.name.startsWith("r4-") }
+        assertTrue("R4 result files remain: $remainingResults", remainingResults.isEmpty())
+        if (evidenceDirectory.isDirectory) {
+            val leftover = evidenceDirectory.listFiles().orEmpty().filter { it.name.startsWith(".control-") || it.name.startsWith(".cohort") }
+            leftover.forEach { runCatching { it.delete() } }
+            if (evidenceDirectory.listFiles().isNullOrEmpty()) {
+                assertTrue("R4 evidence directory cleanup failed", evidenceDirectory.delete())
+            }
+        }
+        // Verify exact rows are absent — if manifest was present, we already deleted them in cleanupExactR4Artifacts.
+        // If no manifest, we have no URI list; best-effort check is that no R4 rows remain via directory scan (already empty).
     }
 
     private fun createR4TerminalVerifiedJob(root: File, cohortId: String, index: Int): CohortJob {
@@ -322,6 +366,38 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
 
     private fun r4EvidenceDirectory(): File = File(context.filesDir, "r4-gallery-cold")
 
+    private fun r4JobDirectories(): List<File> = keplerGalleryRoots(context).flatMap { root ->
+        root.listFiles().orEmpty().filter { it.isDirectory && it.name.startsWith(R4_JOB_PREFIX) }
+    }
+
+    private fun cleanupExactR4Artifacts(jobDirectories: List<File>) {
+        val uris = jobDirectories.flatMap { jobDir ->
+            MediaStoreExportJournal.list(jobDir).mapNotNull { it.uri }.map(Uri::parse)
+        }.toSet()
+        // Also include manifest URIs if directories already deleted but manifest still references them
+        val manifestUris = runCatching { readR4Manifest() }.getOrNull()?.jobs?.map { Uri.parse(it.uri) }?.toSet().orEmpty()
+        (uris + manifestUris).forEach { uri ->
+            runCatching { context.contentResolver.delete(uri, null, null) }
+            assertFalse("R4 exact MediaStore row must be deleted: $uri", mediaStoreRowExists(uri))
+        }
+        jobDirectories.forEach { jobDir ->
+            assertTrue("R4 exact job directory cleanup failed: $jobDir", !jobDir.exists() || jobDir.deleteRecursively())
+        }
+        val evidenceDirectory = r4EvidenceDirectory()
+        if (evidenceDirectory.isDirectory) {
+            evidenceDirectory.listFiles().orEmpty()
+                .filter { it.name == COHORT_FILE || it.name == CONTROL_FILE || it.name.startsWith("r4-") || it.name.startsWith(".control-") || it.name.startsWith(".cohort") }
+                .forEach { file -> assertTrue("R4 evidence cleanup failed: $file", !file.exists() || file.delete()) }
+        }
+        // Also clean any stale control/result in r3-gallery-cold that belong to r4
+        val coldDir = File(context.filesDir, R3_EVIDENCE_DIRECTORY)
+        if (coldDir.isDirectory) {
+            coldDir.listFiles().orEmpty()
+                .filter { it.name.startsWith("r4-") || it.name.startsWith(".control-r4-") }
+                .forEach { runCatching { it.delete() } }
+        }
+    }
+
     private fun installR4Control(runId: String) {
         val file = R3GalleryColdMeasurement.controlFile(context)
         val parent = requireNotNull(file.parentFile)
@@ -329,6 +405,11 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
         val temporary = File(file.parentFile, ".control-$runId.tmp")
         temporary.writeText(JSONObject().put("runId", runId).toString(), StandardCharsets.UTF_8)
         assertTrue("Could not publish R4 control", temporary.renameTo(file))
+    }
+
+    private fun assertNoPreExistingR4Jobs() {
+        val existing = r4JobDirectories()
+        assertTrue("R4 requires a clean R4 job cohort root: $existing", existing.isEmpty())
     }
 
     private fun assertNoPreExistingProductionJobs() {
@@ -470,9 +551,12 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
         jobs: List<CohortJob>,
         manifest: CohortManifest,
         result: JSONObject,
-        runNumber: Int
+        runNumber: Int,
+        expectedTotal: Int = JOB_COUNT,
+        expectedJpeg: Int = JPEG_COUNT,
+        expectedHeif: Int = HEIF_COUNT
     ) {
-        assertEquals("post-run $runNumber job count", JOB_COUNT, jobs.count { it.jobDir.isDirectory })
+        assertEquals("post-run $runNumber job count", expectedTotal, jobs.count { it.jobDir.isDirectory })
         jobs.forEach { item ->
             val metadata = KeplerJobMetadata.read(item.jobDir)
             val journal = mainJournal(item.jobDir)
@@ -491,7 +575,7 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
         val expected = manifest.jobs.associate { it.jobDirName to it.snapshot }
         assertEquals("post-run $runNumber metadata hashes", expected.mapValues { it.value.metadataHash }, current.mapValues { it.value.metadataHash })
         assertEquals("post-run $runNumber journal hashes", expected.mapValues { it.value.journalHash }, current.mapValues { it.value.journalHash })
-        assertEquals("post-run $runNumber result cohort", JOB_COUNT, result.getInt("recoveryJobCount"))
+        assertEquals("post-run $runNumber result cohort", expectedTotal, result.getInt("recoveryJobCount"))
     }
 
     private fun launchProductionGallery() {
@@ -765,12 +849,18 @@ class RealMediaStoreR3ColdGalleryRecoveryTest {
         const val TEST_RELATIVE_PATH = "Pictures/KeplerR3TrueColdGallery"
         const val R3_JOB_PREFIX = "KPL_YUV_FUSION_R3_"
         const val R3_EVIDENCE_DIRECTORY = "r3-gallery-cold"
+        const val R4_JOB_PREFIX = "KPL_YUV_FUSION_R4_"
+        const val R4_EVIDENCE_DIRECTORY = "r4-gallery-cold"
         const val COHORT_FILE = "cohort.json"
         const val CONTROL_FILE = "control.json"
         const val RUN_ARGUMENT = "r3.run"
+        const val R4_RUN_ARGUMENT = "r4.run"
         const val JOB_COUNT = 46
         const val JPEG_COUNT = 23
         const val HEIF_COUNT = 23
+        const val R4_JOB_COUNT = 46
+        const val R4_JPEG_COUNT = 23
+        const val R4_HEIF_COUNT = 23
         const val UI_TIMEOUT_MS = 30_000L
         const val RESULT_TIMEOUT_MS = 120_000L
     }
