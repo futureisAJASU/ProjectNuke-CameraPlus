@@ -40,6 +40,13 @@ The first U2.3-C characterization is INVALID (unproven writes, synchronous sampl
 
 **Key Finding:** MediaStore verification is approximately **84% of recovery time**. HEIF dominates the verification aggregate.
 
+> **C3 aggregate correction (2026-09-04):** the R4 values below are **aggregates for
+> 23 rows each, NOT per-row values**. Correct reading: 23 JPEG rows ≈ 596 ms aggregate
+> (≈26 ms/row), 23 HEIF rows ≈ 2873 ms aggregate (≈125 ms/row), total ≈ 3469 ms.
+> Never compute `23 × 596` or `23 × 2873`. A JPEG-only skip can therefore remove at most
+> ≈596 ms before cheap-check overhead — ≈596/4093 ≈ **14.6%** of R4 median recovery as a
+> theoretical upper bound, not ~40%. See §17 and `docs/U2_3_C3_GENERATION_CONTINUITY.md`.
+
 ---
 
 ## 2. COMPLETE CURRENT VERIFIER TRACE
@@ -174,6 +181,12 @@ KeplerRecoveryCoordinator.recoverOne (line 163)
 
 ## 4. OFFICIAL ANDROID MEDIASTORE SIGNAL RESEARCH
 
+> **C3 note (2026-09-04):** the candidate-signal strength table in §4.3 below predates C2/C3
+> device evidence and is retained only as pre-evidence analysis. It is NOT authoritative:
+> C2 proved generation advances on isolated writes (with delay); C3 proved generation
+> routinely MISSES rapid repeated writes (see `docs/U2_3_C3_GENERATION_CONTINUITY.md`).
+> The binding contract is §4.5.
+
 ### 4.1 Candidate Signals
 
 | Signal | API Level | Documented Semantics | Changes on Metadata Update | Changes on Content Modify | Survives Reboot | Provider Restart | Database Rebuild |
@@ -226,7 +239,37 @@ KeplerRecoveryCoordinator.recoverOne (line 163)
 
 **Legend:** ✅ = Reliable detection, ⚠️ = May detect (unreliable), ❌ = No detection
 
-### 4.4 Critical Finding: Same-Size Content Replacement
+### 4.5 BINDING OFFICIAL CONTRACT (C3, from current developer.android.com)
+
+The following are the ONLY generation/version guarantees the design may rely on.
+Quotations are from the current `MediaStore.getGeneration` / `getVersion` reference
+(fetched 2026-09-04):
+
+- `getGeneration(Context, String)` (API 30+): "Return the latest generation value for
+  the given volume. Generation numbers are **monotonically increasing over time**, and
+  can be safely arithmetically compared." They are "more robust than
+  `DATE_ADDED`/`DATE_MODIFIED`", which "may change in unexpected ways".
+- **Version-first rule (mandatory):** "before comparing these detailed generation values,
+  you should first confirm that the overall version hasn't changed by checking
+  `MediaStore.getVersion(Context, String)`, since that indicates when a more radical
+  change has occurred. **If the overall version changes, you should assume that
+  generation numbers have been reset and perform a full synchronization pass.**"
+- `getVersion(Context)` (API 12) covers `VOLUME_EXTERNAL_PRIMARY`;
+  `getVersion(Context, String)` (API 29+) covers a specific volume. The version is an
+  **opaque** string: "No other assumptions should be made about the meaning of the
+  version." The `volumeName` argument must be one of `getExternalVolumeNames(Context)`.
+- AOSP MediaProvider module: `GENERATION_ADDED`/`GENERATION_MODIFIED` exist "for use in
+  quickly and reliably detecting changes that have occurred since a previous
+  synchronization point" — a design goal, not a per-write guarantee. The documentation
+  **does not promise one generation increment per content write**, monotonicity only.
+- C3 device evidence is consistent with exactly this weak contract: increments happen
+  (C2) but may be coalesced under repetition (C3). No stronger guarantee may be invented.
+
+**Consequence for any candidate policy:** persist the exact volume name + last verified
+`getVersion` per row cohort; on ANY version mismatch, generation evidence is void →
+full verification. This fallback requires NO destructive database experiment.
+
+### 4.6 Pre-evidence counterexample (rebuild scenario, retained analysis)
 
 **Question:** Can materially different content exist while every proposed cheap authorization signal remains unchanged?
 
@@ -423,6 +466,13 @@ internal data class GenerationSnapshot(
 
 ## 9. CANDIDATE POLICY COMPARISON
 
+> **C3 status (2026-09-04):** NO policy below is chosen. The old "Policy F (Hybrid)"
+> framing (JPEG skip / HEIF always full verify) is NOT authoritative: its C2-era
+> justification is superseded, and C3 proved generation misses rapid writes (see
+> `docs/U2_3_C3_GENERATION_CONTINUITY.md` for the binding comparison, pixel-probe
+> safety analysis, and corrected performance model). This section is retained as
+> pre-evidence candidate analysis only.
+
 ### 9.1 Policy A — Full Verify Every Cold Start
 
 **Description:** Current behavior. Run full byte/decode verification on every cold start.
@@ -603,42 +653,37 @@ internal data class GenerationSnapshot(
 
 ## 12. EXACT FAIL-CLOSED CANDIDATE
 
+> **C3 status (2026-09-04):** the format-specific "Answer" formerly in this section
+> (JPEG skip / HEIF always full verify) is WITHDRAWN as the chosen policy. C3 proved a
+> single settled generation match cannot authorize skipping verification (generation
+> misses ~40–47% of rapid repeated writes entirely — coalesced, not merely delayed).
+> No predicate below may be used until a future design PASS re-justifies it against C2+C3
+> evidence. The mandatory predicate elements for any future PASS are listed in
+> `docs/U2_3_C3_GENERATION_CONTINUITY.md` §8.
+
 ### 12.1 The Question
 
 > "What cheap CURRENT evidence is sufficient to conclude that a full byte/decode verification does not need to run on THIS cold start?"
 
-### 12.2 The Answer
+### 12.2 The Answer (C3: NO POLICY CHOSEN)
 
-**For JPEG:**
-- Row exists (query returns cursor)
-- IS_PENDING = 0
-- GENERATION_MODIFIED matches last verified generation
-- SIZE matches last verified size
-- MIME_TYPE matches last verified MIME
-- Not first cold start after reboot
-- Not first cold start after app upgrade
-- Verification algorithm version matches
+**No cheap evidence set is currently sufficient.** In particular, a matching
+`GENERATION_MODIFIED` — even after a settled observation window — does NOT prove content
+is unchanged, because the provider may coalesce increments across repeated writes.
 
-**For HEIF:**
-- **Full verification required** (cost too high to risk false negative)
-
-**Rationale:**
-- JPEG verification is relatively fast (~596 ms median)
-- HEIF verification dominates cost (~2873 ms median)
-- HEIF container parsing is complex; higher risk of undetected corruption
-- Format-specific policy optimizes for the common case (JPEG) while maintaining safety for HEIF
-
-### 12.3 Fail-Closed Fallback
+### 12.3 Fail-Closed Fallback (retained — applies to any future candidate)
 
 | Condition | Action |
 |-----------|--------|
 | Row missing | `PUBLIC_RESULT_REMOVED` or `PUBLIC_COMMIT_MISSING` |
 | IS_PENDING = 1 | Retry commit or full verify |
+| MediaStore version mismatch (persisted vs current, per exact volume) | Generation evidence void → full verify |
 | GENERATION_MODIFIED mismatch | Full verify |
 | GENERATION_MODIFIED missing (legacy) | Full verify |
+| GENERATION_MODIFIED match | **NOT sufficient alone** (C3 coalescing) → full verify until a future PASS proves otherwise |
 | SIZE mismatch | Full verify |
 | MIME_TYPE mismatch | Full verify |
-| Reboot detected | Full verify (policy-dependent) |
+| Reboot detected | Full verify (mandatory, not policy-dependent) |
 | App upgrade detected | Full verify |
 | Algorithm version mismatch | Full verify |
 | Cadence expired | Full verify |
@@ -651,9 +696,14 @@ internal data class GenerationSnapshot(
 
 **Issue:** Does GENERATION_MODIFIED survive reboot?
 
-**Answer:** **Yes** on SM-S921N (observed), but **not guaranteed** by platform documentation.
+**Answer:** **UNKNOWN — not measured.** C2 did NOT test reboot; no reboot characterization
+has been executed on SM-S921N in any U2.3 pass. Any prior claim of observed reboot
+stability is withdrawn.
 
-**Recommendation:** Full verify after reboot (fail-closed).
+**Recommendation:** Mandatory full verify after reboot (fail-closed) until a future
+authorized reboot pass proves continuity. Reboot prep rows were captured in C3 without
+executing the reboot (permission not granted); see
+`docs/U2_3_C3_GENERATION_CONTINUITY.md` §6.
 
 **Detection:**
 - Track `lastBootId` (random UUID generated at app first-start after BOOT_COMPLETED)
@@ -761,9 +811,9 @@ internal data class GenerationSnapshot(
 - Three independent true process-cold runs
 - Screen-off operation (no UI required)
 
-### 16.2 Expected Counters
+### 16.2 Expected Counters (reference shapes, NOT approved policies)
 
-| Counter | Policy A (Current) | Policy F (Hybrid) |
+| Counter | Policy A (Current: full verify) | Hypothetical gated policy (NOT approved) |
 |---------|-------------------|-------------------|
 | Cheap provider inspections | 0 | 46 per run |
 | Fast-path hits (JPEG skip) | 0 | ~23 per run (if unchanged) |
@@ -771,6 +821,8 @@ internal data class GenerationSnapshot(
 | Generation mismatch fallback | 0 | Variable (depends on device) |
 | Deletion fallback | 0 | Same as current |
 | Corruption fallback | 46 per run | ~23 per run (HEIF) |
+
+> C3: the "hypothetical" column is illustrative only. C3 proved its core gate unsafe.
 
 ### 16.3 Success Criteria
 
@@ -783,43 +835,39 @@ internal data class GenerationSnapshot(
 
 ---
 
-## 17. PERFORMANCE MODEL
+## 17. PERFORMANCE MODEL (corrected C3 — aggregates, not per-row)
 
-### 17.1 R4 Baseline
+### 17.1 R4 Baseline (correct reading)
 
-| Metric | Value |
-|--------|-------|
-| Median recovery | 4093.030 ms |
-| Median verification | 3469.124 ms |
-| JPEG verification | ~596 ms |
-| HEIF verification | ~2873 ms |
+| Metric | Value | Correct interpretation |
+|--------|-------|------------------------|
+| Median recovery | 4093.030 ms | per-run median |
+| Median verification | 3469.124 ms | per-run aggregate median |
+| JPEG verification | ~596 ms | **aggregate for all 23 JPEG rows** (≈26 ms/row) |
+| HEIF verification | ~2873 ms | **aggregate for all 23 HEIF rows** (≈125 ms/row) |
 
-### 17.2 Policy F (Hybrid) Model
+Check: 596 + 2873 = 3469. Prior drafts that multiplied these aggregates by 23 again
+(e.g. `23 × 596`, `23 × 2873`, totals ≈ 79,787 ms) were arithmetically invalid and are
+withdrawn.
 
-**Assumptions:**
-- JPEG skip saves ~596 ms per JPEG job
-- HEIF full verify retained (~2873 ms per HEIF job)
-- Cheap query overhead ~10 ms per job
-- 23 JPEG, 23 HEIF jobs
+### 17.2 Corrected bounds
 
-**Calculations:**
-- Current verification: 23 × 596 + 23 × 2873 = 13,708 + 66,079 = 79,787 ms (aggregate)
-- Policy F verification: 23 × 10 + 23 × 2873 = 230 + 66,079 = 66,309 ms (aggregate)
-- Savings: 79,787 - 66,309 = 13,478 ms (aggregate)
-- Per-run savings: 13,478 / 46 = 293 ms (median per job)
-- Recovery improvement: 4093 - 293 = 3800 ms (estimated median)
+- JPEG-only skip upper bound: ≈596 ms saved before cheap-check overhead →
+  ≈596/4093 ≈ **14.6%** of R4 median recovery. Limited upside (JPEG is the cheap format).
+- HEIF holds ≈2873/3469 ≈ **83%** of verification cost: any material saving must come
+  from HEIF, whose dominant stage is sampled pixel decode (C2 fixture: ≈108 ms of
+  ≈139 ms total; R4 per-row ≈125 ms is directionally consistent). Pixel-probe reduction
+  is NOT proven safe — see `docs/U2_3_C3_GENERATION_CONTINUITY.md` §§5,7.
+- Any generation-settlement wait (100–1000 ms+) must be budgeted EXPLICITLY as a cost
+  line, never hidden behind "cheap gate". C3 shows even a settled wait does not make a
+  generation match sufficient (coalesced writes never bump).
 
-### 17.3 Performance Estimates
+### 17.3 Performance Estimates (withdrawn)
 
-| Scenario | Conservative | Likely | Upper Bound |
-|----------|--------------|--------|-------------|
-| JPEG skip rate | 50% | 80% | 100% |
-| HEIF full verify | 100% | 100% | 100% |
-| Cheap query overhead | 20 ms | 10 ms | 5 ms |
-| Median recovery improvement | 10% | 15% | 20% |
-| Median recovery time | 3684 ms | 3479 ms | 3274 ms |
-
-**Note:** Actual performance depends on device behavior, generation stability, and cohort characteristics.
+Prior per-scenario estimates (10–20% recovery improvement) were built on the invalid
+`23 × aggregate` arithmetic and are withdrawn. No replacement estimates are offered
+until a design PASS defines an actually-safe predicate; see the C3 model
+(`docs/U2_3_C3_GENERATION_CONTINUITY.md` §9) for the cost decomposition that bound.
 
 ---
 
@@ -841,7 +889,7 @@ internal data class GenerationSnapshot(
 | Evidence serialization bugs | Medium | Host tests for JSON read/write |
 | Migration logic errors | Medium | Host tests for legacy → new |
 | Policy predicate bugs | High | Exhaustive host tests |
-| Race condition (concurrent modification) | Low | MediaStore serializes writes |
+| Concurrent modification / generation coalescing (C3 PROVEN) | **High** | No single-query or settled-generation gate; full verify until a future PASS proves a safe predicate. C2 proved async staleness; C3 proved whole writes are missed under repetition (20/20 race windows stale, ~40–47% of rapid writes never bump within 5 s). |
 
 ### 18.3 Device Characterization Risks
 
@@ -854,26 +902,23 @@ internal data class GenerationSnapshot(
 
 ---
 
-## 19. RECOMMENDATIONS
+## 19. RECOMMENDATIONS (C3 — NO IMPLEMENTATION)
 
-### 19.1 Proceed to Implementation
+### 19.1 Do NOT proceed to implementation
 
-**Recommendation:** Proceed with Policy F (Hybrid) implementation.
+Classification is REOPEN. **No implementation is recommended before a design PASS.**
+The former "Proceed with Policy F implementation" recommendation is withdrawn: its
+performance case rested on invalid aggregate arithmetic and its safety case on a
+generation gate that C3 disproved.
 
-**Rationale:**
-- Preserves all critical safety guarantees
-- Reduces verification cost by ~40% (JPEG skip)
-- Format-specific policy optimizes for HEIF dominance
-- Fail-closed on all uncertain conditions
+### 19.2 C3-gated next steps (characterization only, no production changes)
 
-### 19.2 Implementation Priorities
-
-1. **Add verification evidence fields to journal** (durable storage)
-2. **Implement cheap query path** (generation, date, size, MIME)
-3. **Implement policy predicate** (format-specific logic)
-4. **Add host tests** (policy logic, evidence serialization)
-5. **Add device tests** (signal characterization, integration)
-6. **Run 46×3 closure** (performance validation)
+1. Authorized reboot continuity pass (C3 prep captured; permission pending).
+2. Write-spacing threshold: at what inter-write spacing does per-write generation
+   advancement become reliable, if ever (C3 shows coalescing under rapid repetition).
+3. Concurrent-writer attribution: isolate provider-coalescing mechanism vs external bumps.
+4. Pixel-probe safety proof or rejection (C3 analysis in continuity doc §7).
+5. Full-resolution 46×3 closure ONLY after a design PASS defines a safe predicate.
 
 ### 19.3 Future Work
 
@@ -908,18 +953,42 @@ internal data class GenerationSnapshot(
    sampled codec decode (~78% of HEIF verify time) with no optimization implemented.
 
 **Agrees with:** `docs/U2_3_DEVICE_CHARACTERIZATION.md` §11
-(U2.3 DESIGN REOPEN — ADDITIONAL DEVICE CHARACTERIZATION REQUIRED).
+(U2.3 DESIGN REOPEN — ADDITIONAL DEVICE CHARACTERIZATION REQUIRED) as partially
+superseded by C3: the remaining characterization is now specifically the race/coalescing
+question, resolved AGAINST generation gating — see below.
 
 **Production behavior:** UNCHANGED — full verification every cold start. DO NOT implement
 U2.3.
 
-**Next Steps:**
+## 20B. C3 SUPPLEMENT (2026-09-04) — FINAL CLASSIFICATION
 
-1. Execute device characterization on SM-S921N (8-row cohort)
-2. Validate generation behavior (increment, reboot, rebuild)
-3. Measure actual substage timings (query, stream, bounds, pixel)
-4. Refine policy based on empirical results
-5. Proceed to implementation phase
+### U2.3 DESIGN REOPEN — CONCURRENT GENERATION RACE UNSAFE
+
+**C3 evidence** (`docs/U2_3_C3_GENERATION_CONTINUITY.md`, SM-S921N / Android 17 / API 37,
+80 SHA-proven same-size writes + 40-window race probe):
+
+1. Generation advancement is NOT per-write: 14/30 + 14/30 idle writes and 4/10 + 4/10
+   loaded writes NEVER advanced row generation within 5000 ms. When it lands: JPEG
+   min 27 / p50 46 / max 60 ms; HEIF min 30 / p50 59 / max 116 ms. Load does not
+   materially change the shape (~40–47% miss rate idle and loaded).
+2. A cold-start-like reader observes OLD generation with NEW bytes in 20/20 windows for
+   BOTH formats; only 7/20 (JPEG) and 6/20 (HEIF) windows show any generation change.
+   A single immediate generation query is therefore UNSAFE, and — because missed writes
+   never land — no bounded settled wait repairs it.
+3. Reboot continuity remains UNKNOWN (reboot executed in NO U2.3 pass; C3 captured prep
+   only, permission pending). Any future policy must full-verify after every reboot
+   regardless.
+4. No pixel-probe reduction is proven safe (failure-mode analysis in C3 doc §7), and a
+   JPEG-only skip caps at ≈14.6% of R4 recovery — the economics do not justify the risk.
+
+**Next steps (C3 only, characterization — no production changes):**
+
+1. Authorized reboot continuity pass using the C3 prep procedure.
+2. Inter-write spacing threshold for reliable per-write advancement (if any).
+3. Pixel-probe safety proof or formal rejection.
+4. 46×3 closure ONLY after a design PASS.
+
+**DO NOT IMPLEMENT U2.3. STOP after this evidence.**
 
 ---
 
@@ -931,10 +1000,11 @@ U2.3.
 | IS_PENDING | developer.android.com/reference/android/provider/MediaStore.MediaColumns#IS_PENDING | Pending state documentation |
 | GENERATION_ADDED | developer.android.com/reference/android/provider/MediaStore.MediaColumns#GENERATION_ADDED | Generation at creation (API 30+) |
 | GENERATION_MODIFIED | developer.android.com/reference/android/provider/MediaStore.MediaColumns#GENERATION_MODIFIED | Generation at modification (API 30+) |
-| MediaStore getGeneration | developer.android.com/reference/android/provider/MediaStore#getGeneration(android.net.Uri) | Generation query helper |
-| MediaStore getVersion | developer.android.com/reference/android/provider/MediaStore#getVersion(android.content.Context, java.lang.String) | Provider version query |
+| MediaStore getGeneration | developer.android.com/reference/android/provider/MediaStore#getGeneration(android.content.Context,%20java.lang.String) | Volume generation (API 30+); monotonic per volume; check getVersion first; version change → assume reset → full sync |
+| MediaStore getVersion | developer.android.com/reference/android/provider/MediaStore#getVersion(android.content.Context,%20java.lang.String) | Opaque provider version (volume overload API 29+); no assumptions beyond reset detection |
 
-**Note:** URLs not fetched due to network timeout. Citations based on known Android documentation structure.
+**Note:** Contract quotations in §4.5 verified against the current reference on 2026-09-04
+(getGeneration/getVersion semantics, version-first rule, opaque-version rule).
 
 ---
 
@@ -955,7 +1025,7 @@ U2.3.
 
 ---
 
-**Document Version:** 1.0  
-**Author:** U2.3 Design Phase  
-**Status:** DESIGN REOPEN — ADDITIONAL DEVICE CHARACTERIZATION REQUIRED
+**Document Version:** 1.1 (C3 reconciliation)
+**Author:** U2.3 Design Phase
+**Status:** DESIGN REOPEN — CONCURRENT GENERATION RACE UNSAFE (see §20B)
 

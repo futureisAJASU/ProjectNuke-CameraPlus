@@ -84,10 +84,11 @@ class U23MediaStoreCharacterizationTest {
             ownedUris.toList().forEach { uri ->
                 try { context.contentResolver.delete(uri, null, null) } catch (_: Exception) { }
             }
-            // Verify no owned row remains (bounded convergence per row).
+            // Verify no owned row remains (bounded convergence per row, asserted).
             ownedUris.forEach { uri ->
                 val absent = awaitRowAbsent(uri, timeoutMs = 5000L)
                 Log.d(TAG, "CLEANUP-C2 uri=$uri absent=$absent")
+                assertTrue("CLEANUP-C2: exact owned row must be absent: $uri", absent)
             }
             persistEvidence()
             Log.d(TAG, "CLEANUP-C2 completed")
@@ -360,19 +361,28 @@ class U23MediaStoreCharacterizationTest {
         return out
     }
 
+    private enum class RowPresence { PRESENT, ABSENT, QUERY_FAILED }
+
+    private fun queryRowPresence(uri: Uri): RowPresence = try {
+        val cursor = context.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns._ID), null, null, null)
+            ?: return RowPresence.QUERY_FAILED
+        cursor.use { if (it.moveToFirst()) RowPresence.PRESENT else RowPresence.ABSENT }
+    } catch (_: Exception) {
+        RowPresence.QUERY_FAILED
+    }
+
     private fun awaitRowAbsent(uri: Uri, timeoutMs: Long): Boolean = awaitRowAbsentMs(uri, timeoutMs) != null
 
+    // A provider/query exception is NEVER deletion success: only an authoritative
+    // empty/missing row converges; QUERY_FAILED keeps waiting until the bound.
     private fun awaitRowAbsentMs(uri: Uri, timeoutMs: Long): Long? {
         val start = SystemClock.elapsedRealtime()
         val deadline = start + timeoutMs
         while (true) {
-            val count = try {
-                context.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns._ID), null, null, null)
-                    ?.use { if (it.moveToFirst()) 1 else 0 } ?: 0
-            } catch (_: Exception) {
-                0
+            when (queryRowPresence(uri)) {
+                RowPresence.ABSENT -> return SystemClock.elapsedRealtime() - start
+                RowPresence.PRESENT, RowPresence.QUERY_FAILED -> { }
             }
-            if (count == 0) return SystemClock.elapsedRealtime() - start
             if (SystemClock.elapsedRealtime() >= deadline) return null
             Thread.sleep(100)
         }
