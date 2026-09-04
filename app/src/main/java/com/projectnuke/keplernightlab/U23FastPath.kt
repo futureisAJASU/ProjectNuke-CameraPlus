@@ -165,49 +165,60 @@ internal class AndroidU23MediaReads(private val context: Context) : U23MediaRead
         U23Read.QueryFailed(e.javaClass.simpleName)
     }
 
-    override fun rowSnapshot(uriString: String): U23Read<U23RowSnapshot> = try {
-        val cursor = context.contentResolver.query(
-            Uri.parse(uriString),
-            arrayOf(
-                MediaStore.MediaColumns._ID,
-                MediaStore.MediaColumns.IS_PENDING,
-                MediaStore.MediaColumns.SIZE,
-                MediaStore.MediaColumns.MIME_TYPE,
-                MediaStore.MediaColumns.DISPLAY_NAME,
-                MediaStore.MediaColumns.WIDTH,
-                MediaStore.MediaColumns.HEIGHT
-            ),
-            null, null, null
-        ) ?: return U23Read.QueryFailed("null-cursor")
-        cursor.use {
-            if (!it.moveToFirst()) return U23Read.RowAbsent
-            U23Read.Value(
-                U23RowSnapshot(
-                    id = it.getLong(0),
-                    pending = it.getInt(1) != 0,
-                    size = it.getLong(2),
-                    mimeType = it.getString(3),
-                    displayName = it.getString(4),
-                    width = it.getInt(5),
-                    height = it.getInt(6)
+    override fun rowSnapshot(uriString: String): U23Read<U23RowSnapshot> {
+        val t0 = System.nanoTime()
+        try {
+            val cursor = context.contentResolver.query(
+                Uri.parse(uriString),
+                arrayOf(
+                    MediaStore.MediaColumns._ID,
+                    MediaStore.MediaColumns.IS_PENDING,
+                    MediaStore.MediaColumns.SIZE,
+                    MediaStore.MediaColumns.MIME_TYPE,
+                    MediaStore.MediaColumns.DISPLAY_NAME,
+                    MediaStore.MediaColumns.WIDTH,
+                    MediaStore.MediaColumns.HEIGHT
+                ),
+                null, null, null
+            ) ?: return U23Read.QueryFailed("null-cursor")
+            cursor.use {
+                if (!it.moveToFirst()) return U23Read.RowAbsent
+                return U23Read.Value(
+                    U23RowSnapshot(
+                        id = it.getLong(0),
+                        pending = it.getInt(1) != 0,
+                        size = it.getLong(2),
+                        mimeType = it.getString(3),
+                        displayName = it.getString(4),
+                        width = it.getInt(5),
+                        height = it.getInt(6)
+                    )
                 )
-            )
+            }
+        } catch (e: Exception) {
+            return U23Read.QueryFailed(e.javaClass.simpleName)
+        } finally {
+            U23Timings.addRowQuery(System.nanoTime() - t0)
         }
-    } catch (e: Exception) {
-        U23Read.QueryFailed(e.javaClass.simpleName)
     }
 
     override fun providerState(volume: String): U23ProviderState {
+        val t0 = System.nanoTime()
         val version: U23Read<String> = try {
             val v = MediaStore.getVersion(context, volume)
             if (v.isNullOrBlank()) U23Read.QueryFailed("null-version") else U23Read.Value(v)
         } catch (e: Exception) {
             U23Read.QueryFailed(e.javaClass.simpleName)
+        } finally {
+            U23Timings.addVersionQuery(System.nanoTime() - t0)
         }
+        val t1 = System.nanoTime()
         val generation: U23Read<Long> = try {
             U23Read.Value(MediaStore.getGeneration(context, volume))
         } catch (e: Exception) {
             U23Read.QueryFailed(e.javaClass.simpleName)
+        } finally {
+            U23Timings.addGenerationQuery(System.nanoTime() - t1)
         }
         return U23ProviderState(version, generation)
     }
@@ -414,6 +425,8 @@ internal object U23Counters {
         private set
     var fallbacks: Int = 0
         private set
+    var evidencePersistFailures: Int = 0
+        private set
     private val fallbackReasons: MutableMap<U23FallbackReason, Int> = mutableMapOf()
 
     fun reset() = synchronized(lock) {
@@ -421,6 +434,7 @@ internal object U23Counters {
         fastPathHits = 0
         fullVerifierRuns = 0
         fallbacks = 0
+        evidencePersistFailures = 0
         fallbackReasons.clear()
     }
 
@@ -432,6 +446,12 @@ internal object U23Counters {
         fallbackReasons[reason] = (fallbackReasons[reason] ?: 0) + 1
     }
 
+    /**
+     * Optional U2.3 evidence could not be persisted. In-memory diagnostic only; never
+     * durable failure state. The current recovery result is unaffected.
+     */
+    fun evidencePersistFailed() = synchronized(lock) { evidencePersistFailures++ }
+
     fun reasonCount(reason: U23FallbackReason): Int = synchronized(lock) {
         fallbackReasons[reason] ?: 0
     }
@@ -442,7 +462,53 @@ internal object U23Counters {
             put("fastPathHits", fastPathHits)
             put("fullVerifierRuns", fullVerifierRuns)
             put("fallbacks", fallbacks)
+            put("evidencePersistFailures", evidencePersistFailures)
             fallbackReasons.forEach { (reason, count) -> put("fallback:${reason.name}", count) }
         }
+    }
+}
+
+/**
+ * In-memory only stage timings for the cheap path (closure measurement, never
+ * persisted). All values nanoseconds unless suffixed; reset per recovery run by tests.
+ */
+internal object U23Timings {
+    private val lock = Any()
+    var rowQueryNanos: Long = 0L
+        private set
+    var rowQueries: Int = 0
+        private set
+    var versionQueryNanos: Long = 0L
+        private set
+    var versionQueries: Int = 0
+        private set
+    var generationQueryNanos: Long = 0L
+        private set
+    var generationQueries: Int = 0
+        private set
+    var predicateNanos: Long = 0L
+        private set
+    var predicates: Int = 0
+        private set
+
+    fun reset() = synchronized(lock) {
+        rowQueryNanos = 0L; rowQueries = 0
+        versionQueryNanos = 0L; versionQueries = 0
+        generationQueryNanos = 0L; generationQueries = 0
+        predicateNanos = 0L; predicates = 0
+    }
+
+    fun addRowQuery(nanos: Long) = synchronized(lock) { rowQueryNanos += nanos; rowQueries++ }
+    fun addVersionQuery(nanos: Long) = synchronized(lock) { versionQueryNanos += nanos; versionQueries++ }
+    fun addGenerationQuery(nanos: Long) = synchronized(lock) { generationQueryNanos += nanos; generationQueries++ }
+    fun addPredicate(nanos: Long) = synchronized(lock) { predicateNanos += nanos; predicates++ }
+
+    fun snapshot(): Map<String, Long> = synchronized(lock) {
+        mapOf(
+            "rowQueryNanos" to rowQueryNanos, "rowQueries" to rowQueries.toLong(),
+            "versionQueryNanos" to versionQueryNanos, "versionQueries" to versionQueries.toLong(),
+            "generationQueryNanos" to generationQueryNanos, "generationQueries" to generationQueries.toLong(),
+            "predicateNanos" to predicateNanos, "predicates" to predicates.toLong()
+        )
     }
 }

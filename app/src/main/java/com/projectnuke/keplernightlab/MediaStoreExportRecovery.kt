@@ -427,13 +427,28 @@ private fun recoverMediaStoreExportJournal(
             "Export journal contains an invalid URI."
         )
     val inspection = access.inspect(uri, journal)
-    // U2.3-I1 stable issuance (§9/§10): persist the candidate through the existing atomic
-    // journal mechanism, but skip the write when identical evidence is already stored so
-    // the stable fast path stays zero-write. All downstream logic uses liveJournal.
+    // U2.3-I1 stable issuance (§9/§10, fail-safe per I1.1 §2): persist the candidate
+    // through the existing atomic journal mechanism, but skip the write when identical
+    // evidence is already stored so the stable fast path stays zero-write.
+    // The evidence block is FUTURE fast-path authorization state, never authority for
+    // the current proven FULL verification: an ordinary persistence failure preserves
+    // the current PUBLIC_VERIFIED result and leaves evidence unavailable (next cold
+    // start falls back to FULL verification). Fatal Errors and CancellationExceptions
+    // propagate unchanged per repository policy. All downstream logic uses liveJournal.
     var liveJournal = journal
     inspection.stableEvidenceToPersist?.let { candidate ->
         if (liveJournal.verificationEvidence != candidate) {
-            liveJournal = liveJournal.withVerificationEvidence(jobDir, candidate)
+            try {
+                liveJournal = liveJournal.withVerificationEvidence(jobDir, candidate)
+            } catch (cancelled: java.util.concurrent.CancellationException) {
+                throw cancelled
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (fatal: Error) {
+                throw fatal
+            } catch (_: Exception) {
+                U23Counters.evidencePersistFailed()
+            }
         }
     }
     if (inspection.inspectionFailed) {
@@ -627,9 +642,11 @@ internal class ContextMediaStoreExportRecoveryAccess(
         val after = volume?.let { reads.providerState(it) } ?: before
         val appVersionCode = reads.appVersionCode()
         val bootCount = reads.bootCount()
+        val t0 = System.nanoTime()
         val decision = evaluateU23Predicate(
             stored, uriString, resolvedVolume, appVersionCode, bootCount, row, before, after
         )
+        U23Timings.addPredicate(System.nanoTime() - t0)
         return U23Attempt(decision, volume, before, appVersionCode, bootCount)
     }
 

@@ -459,8 +459,114 @@ class U23FastPathPredicateTest {
         }
     }
 
-    private fun readJournalWithRawEvidence(block: JSONObject): MediaStoreExportJournal {
-        val dir = Files.createTempDirectory("u23-malformed-").toFile()
+    // ---- I1.1 §3: failure-injection integration at the real recovery seam ----
+    //
+    // A FULL-verified inspection carrying a stable candidate, with the existing
+    // KeplerJobMetadata.atomicWriteFailureForTest seam armed, proves the fail-safe:
+    // ordinary persistence failure preserves the current PUBLIC_VERIFIED result.
+
+    private class CandidateAccess(private val candidate: U23VerificationEvidence?) : MediaStoreExportRecoveryAccess {
+        override fun inspect(uri: Uri, journal: MediaStoreExportJournal) =
+            MediaStoreExportInspection(
+                exists = true, pending = false, verified = true,
+                stableEvidenceToPersist = candidate
+            )
+        override fun setPending(uri: Uri, pending: Boolean) = true
+        override fun delete(uri: Uri) = true
+    }
+
+    private fun candidate(): U23VerificationEvidence = U23VerificationEvidence(
+        schemaVersion = U23_EVIDENCE_SCHEMA_VERSION,
+        algorithmVersion = U23_VERIFICATION_ALGORITHM_VERSION,
+        exactVolumeName = "external", mediaStoreVersion = "v9", volumeGeneration = 555L,
+        rowId = 7L, uri = uri, size = 1234L, mimeType = "image/jpeg",
+        displayName = "shot.jpg", width = 64, height = 64,
+        appVersionCode = 7L, bootCount = 3, fullVerifiedAt = 2000L
+    )
+
+    private fun seededJournal(dir: java.io.File): MediaStoreExportJournal {
+        val created = MediaStoreExportJournal.create(
+            jobDir = dir, role = MediaStoreExportRole.MAIN_IMAGE, frameIndex = null,
+            displayName = "shot.jpg", relativePath = "Pictures/Kepler",
+            mimeType = "image/jpeg", collectionUri = Uri.parse("content://media/external/images/media")
+        )
+        return created.transition(dir, MediaStoreExportState.ROW_INSERTED, uri)
+    }
+
+    @Test
+    fun persistFailure_ordinaryException_preservesPublicVerified() {
+        U23Counters.reset()
+        val dir = Files.createTempDirectory("u23-persist-fail-").toFile()
+        try {
+            seededJournal(dir)
+            KeplerJobMetadata.atomicWriteFailureForTest = java.io.IOException("disk full")
+            try {
+                val result = recoverMediaStoreExportJournals(dir, CandidateAccess(candidate())).single()
+                assertEquals(MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED, result.classification)
+                assertEquals(U23VerificationMode.FULL, result.verificationMode)
+            } finally {
+                KeplerJobMetadata.atomicWriteFailureForTest = null
+            }
+            // No corrupt/partial journal: still exactly one readable journal, evidence
+            // absent, state VERIFIED via the legitimate transition (which does rewrite the
+            // file — byte-identity is NOT expected here, evidence-absence is).
+            val reread = MediaStoreExportJournal.list(dir).single()
+            assertNull(reread.verificationEvidence)
+            assertFalse(reread.verificationEvidencePresent)
+            assertEquals(MediaStoreExportState.VERIFIED, reread.state)
+            assertEquals(1, U23Counters.snapshot()["evidencePersistFailures"])
+            // Next evaluation cannot fast-path from the failed new evidence.
+            assertMiss(decide(stored = U23StoredEvidence.Absent), U23FallbackReason.NO_EVIDENCE)
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun persistFailure_error_propagates() {
+        U23Counters.reset()
+        val dir = Files.createTempDirectory("u23-persist-error-").toFile()
+        try {
+            seededJournal(dir)
+            KeplerJobMetadata.atomicWriteFailureForTest = Error("fatal")
+            try {
+                org.junit.Assert.assertThrows(
+                    Error::class.java
+                ) { recoverMediaStoreExportJournals(dir, CandidateAccess(candidate())) }
+            } finally {
+                KeplerJobMetadata.atomicWriteFailureForTest = null
+            }
+            assertEquals(0, U23Counters.snapshot()["evidencePersistFailures"])
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun persistFailure_cancellation_propagates() {
+        U23Counters.reset()
+        val dir = Files.createTempDirectory("u23-persist-cancel-").toFile()
+        try {
+            seededJournal(dir)
+            KeplerJobMetadata.atomicWriteFailureForTest =
+                java.util.concurrent.CancellationException("cancel")
+            try {
+                org.junit.Assert.assertThrows(
+                    java.util.concurrent.CancellationException::class.java
+                ) { recoverMediaStoreExportJournals(dir, CandidateAccess(candidate())) }
+            } finally {
+                KeplerJobMetadata.atomicWriteFailureForTest = null
+            }
+            assertEquals(0, U23Counters.snapshot()["evidencePersistFailures"])
+        } finally {
+            KeplerJobMetadata.atomicWriteFailureForTest = null
+            dir.deleteRecursively()
+        }
+    }
+
+    private fun readJournalWithRawEvidence(block: JSONObject): MediaStoreExportJournal {        val dir = Files.createTempDirectory("u23-malformed-").toFile()
         try {
             val created = MediaStoreExportJournal.create(
                 jobDir = dir, role = MediaStoreExportRole.MAIN_IMAGE, frameIndex = null,

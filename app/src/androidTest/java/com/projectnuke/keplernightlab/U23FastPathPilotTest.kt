@@ -183,6 +183,18 @@ class U23FastPathPilotTest {
             log("MUTATE-D journalState=${journalD.state} counters=$countersD")
             assertEquals(MediaStoreExportState.PUBLIC_COMMITTED, journalD.state)
             assertTrue((countersD["fullVerifierRuns"] ?: 0) >= 1)
+            assertTrue((countersD["fallback:VOLUME_GENERATION_MISMATCH"] ?: 0) >= 1)
+            // Typed diagnostic integration: the actual recovery/export result must carry
+            // SIGNATURE_INVALID, not merely a PUBLIC_COMMITTED journal state inference.
+            val directD = recoverMediaStoreExportJournals(
+                targetJpeg.jobDir, ContextMediaStoreExportRecoveryAccess(context)
+            )
+            val mainD = directD.single { it.attemptId == journalD.exportAttemptId }
+            log("MUTATE-D diagnostic=${mainD.verificationDiagnosticReason} classification=${mainD.classification}")
+            assertEquals(GalleryExportVerificationReason.SIGNATURE_INVALID, mainD.verificationDiagnosticReason)
+            assertEquals(
+                MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED, mainD.classification
+            )
 
             // E: exact-target deletion (first HEIF job).
             U23Counters.reset()
@@ -213,6 +225,67 @@ class U23FastPathPilotTest {
             Log.d(TAG, "CLEANUP-DONE")
         }
     }
+
+    // ------------------------------------------------- standalone §6 diagnostic check
+    //
+    // I1.1 §6 gate before 46x3: one exact JPEG row, proven same-size corruption,
+    // volume-mismatch fallback, FULL verifier, TYPED SIGNATURE_INVALID, exact cleanup.
+
+    @Test
+    fun pilotCorruptionDiagnostic() {
+        U23FastPathGate.overrideForTest = true
+        U23Counters.reset()
+        // Isolated single-job root sibling to avoid touching any other cohort.
+        val soloRoot = File(
+            requireNotNull(context.getExternalFilesDir(android.os.Environment.DIRECTORY_PICTURES)),
+            "U23Diag/KeplerYuvFusion"
+        )
+        assertTrue(soloRoot.mkdirs() || soloRoot.isDirectory)
+        var job: PilotJob? = null
+        try {
+            job = createPilotJob(soloRoot, 0, OutputFormat.JPEG)
+            val access = ContextMediaStoreExportRecoveryAccess(context)
+            // Seed evidence first so the corruption must trip VOLUME_GENERATION_MISMATCH.
+            recoverMediaStoreExportJournals(job.jobDir, access)
+            var passes = 1
+            while (evidenced(job) == null && passes < 4) {
+                passes++
+                recoverMediaStoreExportJournals(job.jobDir, access)
+            }
+            assertTrue("seed evidence required", evidenced(job) != null)
+
+            val origBytes = readBytes(job.uri)
+            val killed = origBytes.copyOf().also { it[0] = 0x00; it[1] = 0x00; it[2] = 0x00 }
+            writeBytes(job.uri, killed)
+            val readback = readBytes(job.uri)
+            assertEquals(origBytes.size, readback.size)
+            assertTrue("SHA must prove corruption", sha256(origBytes) != sha256(readback))
+            assertTrue(readback.contentEquals(killed))
+
+            U23Counters.reset()
+            val results = recoverMediaStoreExportJournals(job.jobDir, access)
+            val main = results.single { it.attemptId == journalAttempt(job) }
+            log("DIAG classification=${main.classification} diagnostic=${main.verificationDiagnosticReason} counters=${U23Counters.snapshot()}")
+            assertEquals(GalleryExportVerificationReason.SIGNATURE_INVALID, main.verificationDiagnosticReason)
+            assertEquals(MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED, main.classification)
+            assertEquals(1, U23Counters.snapshot()["fallback:VOLUME_GENERATION_MISMATCH"])
+            assertTrue((U23Counters.snapshot()["fullVerifierRuns"] ?: 0) >= 1)
+            val journal = MediaStoreExportJournal.list(job.jobDir).single { it.role == MediaStoreExportRole.MAIN_IMAGE }
+            assertEquals(MediaStoreExportState.PUBLIC_COMMITTED, journal.state)
+            runCatching { soloRoot.deleteRecursively() }
+            log("DIAG-DONE")
+        } finally {
+            job?.let {
+                runCatching { context.contentResolver.delete(it.uri, null, null) }
+                assertTrue("diag row must be absent", awaitAbsent(it.uri))
+                runCatching { it.jobDir.deleteRecursively() }
+            }
+            U23FastPathGate.overrideForTest = false
+        }
+    }
+
+    private fun journalAttempt(job: PilotJob): String =
+        MediaStoreExportJournal.list(job.jobDir).single { it.role == MediaStoreExportRole.MAIN_IMAGE }.exportAttemptId
 
     // ---------------------------------------------------------------- helpers
 

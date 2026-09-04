@@ -124,11 +124,21 @@ Measured (logcat `U23PILOT`, three force-separated process-cold invocations):
 - D (same-size signature kill on exact JPEG row, readback-SHA proven): volume-mismatch
   rejection, full verifier ran, journal → `PUBLIC_COMMITTED` (`SIGNATURE_INVALID`
   semantics preserved).
-- E (exact HEIF-row deletion): `RECOVERED` with `PUBLIC_RESULT_REMOVED`, no false
-  fast-path success.
+- E (exact HEIF-row deletion): `PUBLIC_RESULT_REMOVED`, no false fast-path success.
 - Timing directional only (46×3 remains the performance authority).
 - All pilot rows/jobs/controls removed (asserted absent); user media untouched;
   `stayon false`; gate reset OFF.
+
+## 12.1 I1.1 EVIDENCE-PERSISTENCE CORRECTIVE (2026-09-05)
+
+Fixed §2 blocker: optional U2.3 evidence persistence can no longer fail the current
+recovery. The write now catches ordinary `Exception` (preserving `Error` and
+`CancellationException` per repository policy), records an in-memory
+`EVIDENCE_PERSIST_FAILED` counter, and preserves the current `PUBLIC_VERIFIED`
+result. The next cold start falls back to FULL verification. Host regression
+`persistFailure_ordinaryException_preservesPublicVerified` + `Error`/
+`CancellationException` propagation tests prove the fail-safe. No alternate
+non-atomic path; no retry loop; no durable failure state.
 
 ## 13. FILES CHANGED
 

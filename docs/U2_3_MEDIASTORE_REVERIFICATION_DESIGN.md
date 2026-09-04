@@ -1107,7 +1107,7 @@ where retained for audit.
 
 ---
 
-**Document Version:** 1.3 (I1 implementation; authoritative status §20C)
+**Document Version:** 1.4 (I2 closure; authoritative status §20C)
 **Author:** U2.3 Design Phase
-**Status:** DESIGN PASS — predicate DEFINED in §20C; implementation DEFAULT OFF (see docs/U2_3_I1_IMPLEMENTATION.md)
+**Status:** DESIGN PASS — predicate DEFINED in §20C; implementation DEFAULT OFF; I2 46×3 CLOSURE PROVEN (see docs/U2_3_I2_46X3_CLOSURE.md)
 
