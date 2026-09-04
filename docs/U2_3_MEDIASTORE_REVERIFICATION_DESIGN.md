@@ -1,4 +1,4 @@
-# U2.3 DESIGN: Safe Terminal MediaStore Re-verification Reduction
+﻿# U2.3 DESIGN: Safe Terminal MediaStore Re-verification Reduction
 
 **Repository:** futureisAJASU/ProjectNuke-CameraPlus  
 **Baseline:** `97fcd890a3b6517f446251d0ed72d7e89f10cb5d` (R4 closed)  
@@ -932,3 +932,4 @@ internal data class GenerationSnapshot(
 **Document Version:** 1.0  
 **Author:** U2.3 Design Phase  
 **Status:** DESIGN REOPEN — ADDITIONAL DEVICE CHARACTERIZATION REQUIRED
+
