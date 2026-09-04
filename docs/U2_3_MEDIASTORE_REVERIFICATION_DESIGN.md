@@ -220,7 +220,7 @@ KeplerRecoveryCoordinator.recoverOne (line 163)
 **Key Properties:**
 - **Monotonic:** Always increases, never decreases
 - **Per-row:** Each MediaStore row has independent generation
-- **Incremented on:** Content write, metadata update, IS_PENDING transition
+- **Incremented on (documented intent, NOT a per-write promise):** Content write, metadata update, IS_PENDING transition. C3 measured: increments may be coalesced across rapid repeated writes — monotonicity holds, per-write correspondence does NOT.
 - **Not incremented on:** Query operations, read-only access
 - **Persistence:** Survives reboot, provider restart
 - **Database rebuild:** **May reset** - provider-dependent
@@ -287,7 +287,13 @@ full verification. This fallback requires NO destructive database experiment.
 
 ## 5. DOCUMENTED GUARANTEES VS DEVICE OBSERVATIONS
 
-### 5.1 Platform Guarantees (API 30+)
+### 5.1 Platform Guarantees (API 30+) — HISTORICAL TABLE, CORRECTED BY C2/C3/C3.1
+
+> The table below states the pre-evidence reading of the documentation. It is NOT
+> current truth. Measured reality (SM-S921N): row `GENERATION_MODIFIED` increments on
+> isolated writes (C2) but routinely MISSES rapid repeated writes entirely (C3: ~40–47%
+> never land by 5 s); **volume** `getGeneration` advanced on 60/60 proven writes plus
+> 40/40 race windows with zero stale observations (C3.1). The binding contract is §4.5.
 
 | Guarantee | Source | Reliability |
 |-----------|--------|-------------|
@@ -297,13 +303,14 @@ full verification. This fallback requires NO destructive database experiment.
 | `SIZE` reflects current file size | MediaStore contract | **Documented** |
 | `_ID` is unique per row | MediaStore contract | **Documented** |
 
-### 5.2 Device Observations (SM-S921N, Android 17 / API 37 — corrected by U2.3-C2)
+### 5.2 Device Observations (SM-S921N, Android 17 / API 37 — corrected by U2.3-C2/C3/C3.1)
 
 **Note:** The following are **observed behaviors** on Samsung Galaxy S24, not platform guarantees.
 
 | Observation | Device | Caveat |
 |-------------|--------|--------|
-| `GENERATION_MODIFIED` advances on content write (JPEG + HEIF, proven bytes) | SM-S921N | **Settled, not synchronous:** immediate post-close sample still shows the old value; increment observed within +100 ms (1000 ms window). Any cheap gate must compare settled state. |
+| `GENERATION_MODIFIED` advances on isolated content write (JPEG + HEIF, proven bytes) | SM-S921N | **Settled, not synchronous:** immediate post-close sample still shows the old value; increment observed within +100 ms (1000 ms window). Any cheap gate must compare settled state. **C3: under rapid repetition ~40–47% of proven writes never advance row generation at all (coalesced). Row generation alone can NEVER authorize skipping.** |
+| Volume `getGeneration(external)` advances on every proven write (60/60, 5 s bound) | SM-S921N | C3.1: D=0 across 30 JPEG + 30 HEIF writes; race probe 0/40 stale-volume windows. Coarse invalidation candidate (see §20C). |
 | `GENERATION_MODIFIED` increments on metadata update and IS_PENDING transition | SM-S921N | Samsung provider may differ from AOSP |
 | `DATE_MODIFIED` has 1-second granularity | SM-S921N | Rapid updates may collide |
 | Generation survives reboot | SM-S921N | Observed; not guaranteed across all devices |
@@ -404,7 +411,11 @@ internal data class GenerationSnapshot(
 | **E. Content Rewrite (same size)** | Replace with same-size different content | `GENERATION_MODIFIED`++, `DATE_MODIFIED`++, `SIZE` unchanged |
 | **F. Row Deletion** | Delete test row | Row absent |
 
-### 7.2 Expected Results Table
+### 7.2 Expected Results Table — HISTORICAL (pre-evidence expectations, DISPROVEN for row generation)
+
+> Retained for audit only. The `G1 → G2` column assumed one increment per write; C3
+> disproved this for row generation under repetition. Row `B` (row-unchanged /
+> volume-changed) is the COMMON case, not an edge case. The binding evidence is C3/C3.1.
 
 | Case | Row Exists? | IS_PENDING | SIZE Before/After | DATE_MODIFIED Before/After | GENERATION_MODIFIED Before/After | Full Verifier Before/After | Cheap Gate Detects? |
 |------|-------------|------------|-------------------|---------------------------|----------------------------------|---------------------------|---------------------|
@@ -435,7 +446,12 @@ internal data class GenerationSnapshot(
 
 ## 8. JPEG VS HEIF VERIFIER COST BREAKDOWN
 
-### 8.1 R4 Timing Evidence
+### 8.1 R4 Timing Evidence — HISTORICAL ESTIMATES, SUPERSEDED BY C2 MEASUREMENT
+
+> The per-stage numbers below were pre-evidence estimates. Binding measured values are
+> the C2 substage timings (128×128 fixture: JPEG total 15.3 ms; HEIF total 138.7 ms,
+> pixel ≈107.9 ms). R4 aggregates (JPEG ≈596 ms / 23 rows; HEIF ≈2873 ms / 23 rows)
+> remain the production-scale baseline.
 
 | Stage | JPEG Median | HEIF Median |
 |-------|-------------|-------------|
@@ -552,7 +568,7 @@ internal data class GenerationSnapshot(
 - JPEG: Cheaper verification (faster decode)
 - HEIF: Full verification (or generation-based with strict fail-closed)
 
-### 9.6 Policy F — Hybrid (Recommended)
+### 9.6 Policy F — Hybrid (HISTORICAL / REJECTED — retained for audit only)
 
 **Description:** Combine cheap row check with bounded full-verify cadence and format-specific policy.
 
@@ -577,7 +593,7 @@ internal data class GenerationSnapshot(
 | **Cost** | ✅ Reduced - JPEG skip saves ~596 ms per job |
 | **Simplicity** | ⚠️ Moderate - multiple conditions |
 | **Guarantees** | ✅ All critical guarantees preserved |
-| **Estimated savings** | ~50% verification time (JPEG skip) |
+| **Estimated savings** | ~50% verification time (JPEG skip) — WITHDRAWN: invalid aggregate arithmetic; correct JPEG ceiling ≈14.6% (see §17) |
 
 ---
 
@@ -714,11 +730,11 @@ executing the reboot (permission not granted); see
 
 **Issue:** Does GENERATION_MODIFIED survive MediaStore provider restart?
 
-**Answer:** **Yes** (provider maintains state in SQLite database).
+**Answer:** **UNKNOWN — inferred only, never tested.** No provider restart was induced in
+any U2.3 pass (destructive testing explicitly out of scope).
 
-**Caveat:** Provider crash + database rebuild may reset generation.
-
-**Recommendation:** Full verify if database rebuild detected.
+**Standing rule:** `getVersion` mismatch → generation evidence void → full verify
+(§4.5 version-first contract). No experiment required.
 
 **Detection:**
 - Track `providerVersion` (query from MediaStore)
@@ -729,14 +745,12 @@ executing the reboot (permission not granted); see
 
 **Issue:** Does GENERATION_MODIFIED survive MediaStore database rebuild?
 
-**Answer:** **No** (inferred). Database rebuild recreates rows with new generations.
+**Answer:** **Assumed NO (fail-closed posture), never tested destructively — and it does
+not need to be.** The version-first contract (§4.5) handles rebuilds without any
+rebuild experiment: version mismatch → full verification.
 
-**Recommendation:** Full verify if database rebuild detected.
-
-**Detection:**
-- Difficult to detect directly
-- Heuristic: All generations reset to 1 (or low values)
-- Alternative: Require full verify after factory reset (detected via app data loss)
+**Detection (sole mechanism):** exact-volume `getVersion` equality vs persisted value.
+No heuristics (generation-reset guessing, factory-reset detection) are used.
 
 ---
 
@@ -785,9 +799,9 @@ executing the reboot (permission not granted); see
 | Generation increment (metadata) | Verify GENERATION_MODIFIED increments on metadata update | ✅ |
 | Same-size content replacement | Verify generation detects same-size replacement | ✅ |
 | Database rebuild simulation | Verify behavior after provider reset | ✅ |
-| Reboot behavior | Verify generation survives reboot | ✅ |
-| JPEG verification skip | Verify JPEG skip path (unchanged signals) | ✅ |
-| HEIF full verify | Verify HEIF always runs full verify | ✅ |
+| Reboot behavior | Verify generation survives reboot | ✅ (DEFERRED — reboot never authorized; standing rule: full verify after every reboot) |
+| JPEG verification skip | Verify JPEG skip path (unchanged signals) | ❌ WITHDRAWN — row-generation gating disproven (C3); replaced by version/volume-gated predicate (§20C) |
+| HEIF full verify | Verify HEIF always runs full verify | ❌ WITHDRAWN as blanket rule — HEIF follows the same §20C predicate |
 | Cadence expiration | Verify full verify after N cold starts | ✅ |
 | Legacy migration | Verify full verify for missing evidence | ✅ |
 
@@ -829,7 +843,7 @@ executing the reboot (permission not granted); see
 | Criterion | Requirement |
 |-----------|-------------|
 | Correctness | All 46 jobs verified correctly (no false positives) |
-| Performance | Median recovery time reduced by ≥40% |
+| Performance | Median recovery time reduced by ≥40% | — WITHDRAWN (rested on invalid arithmetic and a disproven gate; no improvement target is set without a PASS predicate) |
 | Safety | All failure modes detected (no regression) |
 | Stability | Three runs produce consistent results |
 
@@ -897,7 +911,7 @@ until a design PASS defines an actually-safe predicate; see the C3 model
 |------|----------|------------|
 | Test cohort too small | Medium | Use 8 rows (4 JPEG, 4 HEIF) minimum |
 | Screen-on required | Low | Use ContentResolver directly (no UI) |
-| Reboot required for characterization | Medium | Defer until implementation phase |
+| Reboot required for characterization | Medium | Authorized reboot pass only; otherwise mandatory full-verify-after-reboot (no design block) |
 | Database rebuild hard to simulate | High | Accept as unresolved, fail-closed |
 
 ---
@@ -990,6 +1004,69 @@ U2.3.
 
 **DO NOT IMPLEMENT U2.3. STOP after this evidence.**
 
+## 20C. C3.1 SUPPLEMENT (2026-09-04) — FINAL CLASSIFICATION
+
+### U2.3 DESIGN PASS — SAFE VERSION/VOLUME-GENERATION BOUNDED POLICY DEFINED
+
+**C3.1 evidence** (`docs/U2_3_C3_1_VOLUME_GENERATION.md`, SM-S921N / Android 17 / API 37,
+60 SHA-proven writes + 40 race windows + false-positive probe, version pinned throughout,
+zero query failures): volume `getGeneration(exactVolume)` advanced on **60/60 writes**
+(matrix D = 0/60; row generation missed 29/60 as in C3) and showed **0/40 stale-volume
+windows** at ~5 ms reader cadence. The coarse volume-generation candidate is viable;
+row-generation gating remains REJECTED and is NOT resurrected.
+
+### 20C.1 The authoritative predicate (B: version + volume-generation coarse invalidation)
+
+On THIS cold start, for a journal with durable prior FULL verification, the expensive
+content/decode verifier stages (content stream + signature/container probe + bounds
+decode + sampled pixel decode) may be omitted **iff ALL of the following hold**
+(current evidence, freshly queried — never cached across starts):
+
+1. Exact row exists (authoritative non-empty query; QUERY_FAILED → full verify).
+2. `IS_PENDING == 0` (== 1 → commit path / full verify).
+3. Row identity stable: `_ID` (and URI) equal to the durable record.
+4. `MediaStore.getVersion(exactVolume)` equals the persisted version (mismatch → full
+   verify; generation evidence void — §4.5).
+5. `MediaStore.getGeneration(exactVolume)` equals the persisted volume generation
+   (mismatch → full verify: SOMETHING on the volume changed).
+6. `SIZE`, `MIME_TYPE`, display-name extension, and `WIDTH`/`HEIGHT` equal the durable
+   record (any mismatch → full verify).
+7. Verification evidence schema + algorithm version match (mismatch/legacy-missing →
+   full verify, then write evidence).
+8. NOT the first cold start after reboot (boot-ID boundary → full verify, always).
+9. NOT the first cold start after app upgrade (version-code change → full verify).
+
+**Any single failure, exception, or unavailable signal → FULL VERIFY.** Query failures
+are never "unchanged". Row `GENERATION_MODIFIED` is NEVER consulted as an allow-signal
+(C3); it may be persisted for diagnostics only.
+
+### 20C.2 What is omitted, what still runs
+
+- Omitted ONLY under the full §20C.1 predicate: stream open/read, signature/container
+  parsing, bounds decode, sampled pixel decode.
+- Still runs EVERY cold start: row query, pending check, identity/version/volume-generation/size/MIME/name/dimension comparison, schema + boot + upgrade gates.
+- Durable evidence per journal (FUTURE implementation schema): exact volume name,
+  `lastVerifiedVersion`, `lastVerifiedVolumeGeneration`, `lastVerifiedSize`,
+  `lastVerifiedMimeType`, `lastVerifiedDisplayName`, `lastVerifiedWidth/Height`,
+  `algorithmVersion`, `appVersionCode`, `lastVerifiedAt`, `lastBootId`.
+- Pixel-probe note: omission is safe here ONLY because version-stable +
+  volume-unchanged proves no volume change since the prior full verification (official
+  monotonicity + 100/100 observed bumps), so current-state validity evidence still
+  holds. This does not generalize to any weaker gate.
+
+### 20C.3 Honest bounds (PASS scope)
+
+Single reference device/volume; ≤100 observed volume bumps; no reboot-continuity claim
+(fail-closed instead); volume-delay true distribution unmeasured beyond the 5 s bound
+(race proves ms-freshness, which is what the gate needs); busy-volume false-positive
+rate unquantified (safe direction: extra full verifies). **Predicate DEFINED;
+implementation is future work and requires its own host/device closure (46×3) before
+production use. Production behavior TODAY remains full verify every cold start.**
+
+**Document status:** this §20C is the ONE authoritative current policy status. All
+contradictory earlier recommendations are labeled HISTORICAL / REJECTED / WITHDRAWN
+where retained for audit.
+
 ---
 
 ## APPENDIX A: OFFICIAL ANDROID SOURCES
@@ -1025,7 +1102,7 @@ U2.3.
 
 ---
 
-**Document Version:** 1.1 (C3 reconciliation)
+**Document Version:** 1.2 (C3.1 PASS — bounded predicate defined)
 **Author:** U2.3 Design Phase
-**Status:** DESIGN REOPEN — CONCURRENT GENERATION RACE UNSAFE (see §20B)
+**Status:** DESIGN PASS — SAFE VERSION/VOLUME-GENERATION BOUNDED POLICY DEFINED (see §20C; NOT implemented)
 
