@@ -34,7 +34,13 @@ internal data class MediaStoreExportRecoveryResult(
     val classification: MediaStoreExportRecoveryClassification,
     val message: String? = null,
     /** Read-only main-image verification evidence; it never participates in recovery authority. */
-    val verificationDiagnosticReason: GalleryExportVerificationReason? = null
+    val verificationDiagnosticReason: GalleryExportVerificationReason? = null,
+    /**
+     * U2.3-I1: which verification actually executed. FULL unless a stable-evidence fast-path
+     * hit authorized omitting content/decode stages. External classification semantics are
+     * identical either way.
+     */
+    val verificationMode: U23VerificationMode = U23VerificationMode.FULL
 )
 
 internal interface MediaStoreExportRecoveryAccess {
@@ -50,7 +56,15 @@ internal data class MediaStoreExportInspection(
     val message: String? = null,
     val inspectionFailed: Boolean = false,
     /** Read-only main-image verification evidence; null for verified/DNG/structural failures. */
-    val verificationDiagnosticReason: GalleryExportVerificationReason? = null
+    val verificationDiagnosticReason: GalleryExportVerificationReason? = null,
+    /** U2.3-I1: FULL unless a stable-evidence fast-path hit skipped content/decode stages. */
+    val verificationMode: U23VerificationMode = U23VerificationMode.FULL,
+    /**
+     * U2.3-I1: stable evidence to persist, set ONLY after a true FULL verifier Verified
+     * result bracketed by a stable version/generation window. The caller persists it
+     * (skipping the write when already stored); never trusted without persistence.
+     */
+    val stableEvidenceToPersist: U23VerificationEvidence? = null
 )
 
 internal fun recoverMediaStoreExportJournals(
@@ -413,6 +427,15 @@ private fun recoverMediaStoreExportJournal(
             "Export journal contains an invalid URI."
         )
     val inspection = access.inspect(uri, journal)
+    // U2.3-I1 stable issuance (§9/§10): persist the candidate through the existing atomic
+    // journal mechanism, but skip the write when identical evidence is already stored so
+    // the stable fast path stays zero-write. All downstream logic uses liveJournal.
+    var liveJournal = journal
+    inspection.stableEvidenceToPersist?.let { candidate ->
+        if (liveJournal.verificationEvidence != candidate) {
+            liveJournal = liveJournal.withVerificationEvidence(jobDir, candidate)
+        }
+    }
     if (inspection.inspectionFailed) {
         return MediaStoreExportRecoveryResult(
             journal.exportAttemptId,
@@ -425,7 +448,7 @@ private fun recoverMediaStoreExportJournal(
         // existed and was correct before. Its absence today is user/provider deletion, not
         // commit uncertainty. Preserve the durable VERIFIED evidence — never downgrade it to
         // PUBLIC_COMMITTED merely because the row later disappeared.
-        if (journal.state == MediaStoreExportState.VERIFIED && journal.terminalMetadataPersisted) {
+        if (liveJournal.state == MediaStoreExportState.VERIFIED && liveJournal.terminalMetadataPersisted) {
             return MediaStoreExportRecoveryResult(
                 journal.exportAttemptId,
                 MediaStoreExportRecoveryClassification.PUBLIC_RESULT_REMOVED,
@@ -434,10 +457,10 @@ private fun recoverMediaStoreExportJournal(
         }
         // Legacy terminal-stable verification: older jobs may lack terminalMetadataPersisted
         // but have durable terminal evidence in job metadata.
-        if (journal.state == MediaStoreExportState.VERIFIED && journal.role == MediaStoreExportRole.MAIN_IMAGE) {
+        if (liveJournal.state == MediaStoreExportState.VERIFIED && liveJournal.role == MediaStoreExportRole.MAIN_IMAGE) {
             try {
                 val job = KeplerJobMetadata.read(jobDir)
-                val legacy = isLegacyTerminalStableVerifiedMainExportForRecovery(job, journal)
+                val legacy = isLegacyTerminalStableVerifiedMainExportForRecovery(job, liveJournal)
                 if (legacy) {
                     return MediaStoreExportRecoveryResult(
                         journal.exportAttemptId,
@@ -451,8 +474,8 @@ private fun recoverMediaStoreExportJournal(
         }
         // Category A (commit uncertainty): an unacknowledged in-flight export keeps the
         // existing fail-closed policy.
-        if (journal.state == MediaStoreExportState.VERIFIED) {
-            journal.transition(jobDir, MediaStoreExportState.PUBLIC_COMMITTED)
+        if (liveJournal.state == MediaStoreExportState.VERIFIED) {
+            liveJournal.transition(jobDir, MediaStoreExportState.PUBLIC_COMMITTED)
         }
         return MediaStoreExportRecoveryResult(
             journal.exportAttemptId,
@@ -501,7 +524,7 @@ private fun recoverMediaStoreExportJournal(
                 return null
             }
             if (!afterFailure.verified) {
-                journal.transition(jobDir, MediaStoreExportState.PUBLIC_COMMITTED)
+                liveJournal.transition(jobDir, MediaStoreExportState.PUBLIC_COMMITTED)
                 return MediaStoreExportRecoveryResult(
                     journal.exportAttemptId,
                     MediaStoreExportRecoveryClassification.PUBLIC_COMMITTED_UNVERIFIED,
@@ -509,8 +532,8 @@ private fun recoverMediaStoreExportJournal(
                     afterFailure.verificationDiagnosticReason
                 )
             }
-            journal.transition(jobDir, MediaStoreExportState.PUBLIC_COMMITTED)
-            journal.transition(jobDir, MediaStoreExportState.VERIFIED)
+            liveJournal.transition(jobDir, MediaStoreExportState.PUBLIC_COMMITTED)
+            liveJournal.transition(jobDir, MediaStoreExportState.VERIFIED)
             return MediaStoreExportRecoveryResult(
                 journal.exportAttemptId,
                 MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED,
@@ -539,12 +562,13 @@ private fun recoverMediaStoreExportJournal(
         journal.transition(jobDir, MediaStoreExportState.VERIFIED)
         return MediaStoreExportRecoveryResult(
             journal.exportAttemptId,
-            MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED
+            MediaStoreExportRecoveryClassification.PENDING_VERIFIED_AND_COMMITTED,
+            verificationMode = inspection.verificationMode
         )
     }
     if (!inspection.verified) {
-        if (journal.state != MediaStoreExportState.PUBLIC_COMMITTED) {
-            journal.transition(jobDir, MediaStoreExportState.PUBLIC_COMMITTED)
+        if (liveJournal.state != MediaStoreExportState.PUBLIC_COMMITTED) {
+            liveJournal.transition(jobDir, MediaStoreExportState.PUBLIC_COMMITTED)
         }
         return MediaStoreExportRecoveryResult(
             journal.exportAttemptId,
@@ -556,21 +580,80 @@ private fun recoverMediaStoreExportJournal(
     // Same-state idempotency: a journal already durably VERIFIED that inspection freshly
     // proves verified again must not be rewritten. A redundant transition would mutate
     // `updatedAt` and therefore reorder historical export evidence for no semantic gain.
-    if (journal.state != MediaStoreExportState.VERIFIED) {
-        journal.transition(jobDir, MediaStoreExportState.VERIFIED)
+    // (Same rule covers already-stored U2.3 evidence: the issuance wiring above skips
+    // identical rewrites, keeping the stable fast path zero-write.)
+    if (liveJournal.state != MediaStoreExportState.VERIFIED) {
+        liveJournal.transition(jobDir, MediaStoreExportState.VERIFIED)
     }
     return MediaStoreExportRecoveryResult(
         journal.exportAttemptId,
-        MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED
+        MediaStoreExportRecoveryClassification.PUBLIC_VERIFIED,
+        verificationMode = inspection.verificationMode
     )
 }
 
 internal class ContextMediaStoreExportRecoveryAccess(
-    private val context: Context
+    private val context: Context,
+    private val u23Reads: U23MediaReads? = null
 ) : MediaStoreExportRecoveryAccess {
+    private fun reads(): U23MediaReads = u23Reads ?: AndroidU23MediaReads(context)
+
+    /**
+     * U2.3-I1 fast-path attempt. Returns Hit (caller returns a stable inspection without
+     * running content/decode stages) or Miss (caller falls back to the existing full
+     * verifier). Carries the pre-verifier bracket reads for later stable issuance.
+     */
+    private data class U23Attempt(
+        val decision: U23Decision,
+        val volume: String?,
+        val before: U23ProviderState,
+        val appVersionCode: U23Read<Long>,
+        val bootCount: U23Read<Int>
+    )
+
+    private fun attemptU23FastPath(uriString: String, journal: MediaStoreExportJournal): U23Attempt {
+        val reads = reads()
+        val stored = when {
+            journal.verificationEvidence != null -> U23StoredEvidence.Valid(journal.verificationEvidence)
+            journal.verificationEvidencePresent -> U23StoredEvidence.Malformed
+            else -> U23StoredEvidence.Absent
+        }
+        val resolvedVolume = reads.resolveVolume(uriString)
+        val volume = (resolvedVolume as? U23Read.Value)?.value
+        // Ordering bracket (§7): version/gen BEFORE -> row snapshot -> version/gen AFTER.
+        val before = volume?.let { reads.providerState(it) }
+            ?: U23ProviderState(U23Read.QueryFailed("no-volume"), U23Read.QueryFailed("no-volume"))
+        val row = reads.rowSnapshot(uriString)
+        val after = volume?.let { reads.providerState(it) } ?: before
+        val appVersionCode = reads.appVersionCode()
+        val bootCount = reads.bootCount()
+        val decision = evaluateU23Predicate(
+            stored, uriString, resolvedVolume, appVersionCode, bootCount, row, before, after
+        )
+        return U23Attempt(decision, volume, before, appVersionCode, bootCount)
+    }
+
     override fun inspect(uri: Uri, journal: MediaStoreExportJournal): MediaStoreExportInspection =
         R3GalleryColdMeasurement.measureInspection(journal) {
             try {
+            val gateOn = U23FastPathGate.isEnabled()
+            var u23Attempt: U23Attempt? = null
+            if (gateOn && journal.role == MediaStoreExportRole.MAIN_IMAGE) {
+                U23Counters.cheapInspection()
+                u23Attempt = attemptU23FastPath(uri.toString(), journal)
+                when (val decision = u23Attempt.decision) {
+                    U23Decision.Hit -> {
+                        U23Counters.fastPathHit()
+                        return@measureInspection MediaStoreExportInspection(
+                            exists = true,
+                            pending = false,
+                            verified = true,
+                            verificationMode = U23VerificationMode.STABLE_MEDIASTORE_EVIDENCE
+                        )
+                    }
+                    is U23Decision.Miss -> U23Counters.fallback(decision.reason)
+                }
+            }
             var pending = false
             val cursor = R3GalleryColdMeasurement.measureQuery {
                 context.contentResolver.query(
@@ -595,6 +678,7 @@ internal class ContextMediaStoreExportRecoveryAccess(
             }
             if (!exists) return@measureInspection MediaStoreExportInspection(false, false, false, "The exact MediaStore row is missing.")
             var verificationDiagnosticReason: GalleryExportVerificationReason? = null
+            var fullVerification: GalleryExportVerification? = null
             val verified = when (journal.role) {
                 MediaStoreExportRole.MAIN_IMAGE -> {
                     val format = when (journal.mimeType) {
@@ -609,6 +693,8 @@ internal class ContextMediaStoreExportRecoveryAccess(
                             GalleryExportExpectation(format, journal.expectedWidth, journal.expectedHeight)
                         )
                     }
+                    U23Counters.fullVerifierRun()
+                    fullVerification = verification
                     if (verification !is GalleryExportVerification.Verified) {
                         verificationDiagnosticReason = when (verification) {
                             is GalleryExportVerification.RetryableFailure -> verification.diagnosticReason
@@ -622,11 +708,43 @@ internal class ContextMediaStoreExportRecoveryAccess(
                     journal.expectedSha256 != null && verifyDngJournalContent(context, uri, journal)
                 }
             }
+            // U2.3-I1 stable issuance (§9): only from a true FULL Verified result bracketed by
+            // a stable version/generation window, and only when the gate is ON (no pointless
+            // journal writes while the feature is OFF). Unstable -> no trust issued.
+            var stableEvidenceToPersist: U23VerificationEvidence? = null
+            val attempt = u23Attempt
+            if (gateOn && attempt != null && attempt.volume != null &&
+                fullVerification is GalleryExportVerification.Verified &&
+                journal.role == MediaStoreExportRole.MAIN_IMAGE
+            ) {
+                val reads = reads()
+                val after = reads.providerState(attempt.volume)
+                val finalRow = reads.rowSnapshot(uri.toString())
+                stableEvidenceToPersist = decideStableEvidence(
+                    gateEnabled = true,
+                    verifierVerified = fullVerification,
+                    volume = attempt.volume,
+                    journalUri = uri.toString(),
+                    versionBefore = attempt.before.version,
+                    genBefore = attempt.before.volumeGeneration,
+                    versionAfter = after.version,
+                    genAfter = after.volumeGeneration,
+                    finalRow = finalRow,
+                    appVersionCode = attempt.appVersionCode,
+                    bootCount = attempt.bootCount,
+                    nowMs = System.currentTimeMillis()
+                )
+                if (stableEvidenceToPersist == null) {
+                    U23Counters.fallback(U23FallbackReason.UNSTABLE_FULL_VERIFY_SNAPSHOT)
+                }
+            }
             MediaStoreExportInspection(
                 exists = true,
                 pending = pending,
                 verified = verified,
-                verificationDiagnosticReason = verificationDiagnosticReason
+                verificationDiagnosticReason = verificationDiagnosticReason,
+                verificationMode = U23VerificationMode.FULL,
+                stableEvidenceToPersist = stableEvidenceToPersist
             )
             } catch (failure: Error) {
                 throw failure

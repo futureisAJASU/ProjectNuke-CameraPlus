@@ -46,6 +46,14 @@ internal data class MediaStoreExportJournal(
     val terminalMetadataPersisted: Boolean = false,
     val terminalMetadataPersistedAt: Long? = null,
     val terminalOperationId: String? = null,
+    /**
+     * U2.3-I1 additive durable verification evidence. Null for old journals (absent key)
+     * and for malformed blocks. NEVER inferred from legacy booleans/state. Row generation
+     * is never stored for authority (diagnostics only, and not stored at all).
+     */
+    val verificationEvidence: U23VerificationEvidence? = null,
+    /** True when the raw journal JSON contained a verificationEvidence block (even malformed). */
+    val verificationEvidencePresent: Boolean = false,
     val state: MediaStoreExportState,
     val createdAt: Long,
     val updatedAt: Long
@@ -80,6 +88,18 @@ internal data class MediaStoreExportJournal(
             ).writeTo(jobDir)
         }
 
+    /**
+     * U2.3-I1 additive evidence write. Uses the same atomic journal persistence as every
+     * other journal mutation. Callers must skip this call when the stored evidence already
+     * equals [evidence] so the stable fast path stays zero-write.
+     */
+    fun withVerificationEvidence(jobDir: File, evidence: U23VerificationEvidence): MediaStoreExportJournal =
+        copy(
+            verificationEvidence = evidence,
+            verificationEvidencePresent = true,
+            updatedAt = System.currentTimeMillis()
+        ).writeTo(jobDir)
+
     fun deleteIfOwned(jobDir: File) {
         val file = fileFor(jobDir, exportAttemptId)
         if (file.isFile) file.delete()
@@ -105,6 +125,7 @@ internal data class MediaStoreExportJournal(
         .put("terminalMetadataPersisted", terminalMetadataPersisted)
         .put("terminalMetadataPersistedAt", terminalMetadataPersistedAt ?: JSONObject.NULL)
         .put("terminalOperationId", terminalOperationId ?: JSONObject.NULL)
+        .put("verificationEvidence", verificationEvidence?.toJson() ?: JSONObject.NULL)
         .put("state", state.name)
         .put("createdAt", createdAt)
         .put("updatedAt", updatedAt)
@@ -194,6 +215,8 @@ internal data class MediaStoreExportJournal(
                 json.optBoolean("terminalMetadataPersisted", false) || json.optString("state") == "TERMINAL_PERSISTED",
                 json.optLong("terminalMetadataPersistedAt").takeIf { json.has("terminalMetadataPersistedAt") && !json.isNull("terminalMetadataPersistedAt") },
                 json.optString("terminalOperationId").takeIf { it.isNotBlank() && it != "null" },
+                json.optJSONObject("verificationEvidence")?.let { U23VerificationEvidence.fromJson(it) },
+                json.has("verificationEvidence") && !json.isNull("verificationEvidence"),
                 state,
                 json.getLong("createdAt"),
                 json.getLong("updatedAt")

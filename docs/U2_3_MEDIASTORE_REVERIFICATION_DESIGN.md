@@ -313,16 +313,17 @@ full verification. This fallback requires NO destructive database experiment.
 | Volume `getGeneration(external)` advances on every proven write (60/60, 5 s bound) | SM-S921N | C3.1: D=0 across 30 JPEG + 30 HEIF writes; race probe 0/40 stale-volume windows. Coarse invalidation candidate (see §20C). |
 | `GENERATION_MODIFIED` increments on metadata update and IS_PENDING transition | SM-S921N | Samsung provider may differ from AOSP |
 | `DATE_MODIFIED` has 1-second granularity | SM-S921N | Rapid updates may collide |
-| Generation survives reboot | SM-S921N | Observed; not guaranteed across all devices |
-| Generation may reset after database rebuild | **Inferred** | Provider-dependent |
+| Generation continuity across reboot | SM-S921N | **UNKNOWN — never tested; withdrawn.** Standing rule: full verify after every reboot (§13.1, §20C). |
+| Generation after database rebuild | **Untestable destructively; handled by contract** | Version-first rule: version mismatch → evidence void → full verify (§4.5). |
 
 **U2.3-C2 correction:** an earlier draft of this document treated the invalid first U2.3-C
 run as evidence that generation does NOT change on same-size replacement and rejected
 Policy F on that basis. That rejection was **invalid** — the first run never proved its
 writes landed and sampled generation before the provider posted the increment. Settled
 observation (JPEG `314810->314817`, HEIF `314844->314848`, readback SHA proven changed)
-shows generation DOES advance. The design is therefore re-opened for re-evaluation
-around a settled-generation gate, not closed on platform-signal insufficiency.
+shows generation DOES advance on isolated writes. C3 then proved row generation misses
+rapid repeated writes entirely (row gate REJECTED); C3.1 proved volume generation viable
+as the coarse gate. **Current status is the §20C PASS predicate, not this paragraph.**
 
 ### 5.3 OEM Caveats
 
@@ -681,7 +682,7 @@ internal data class GenerationSnapshot(
 
 > "What cheap CURRENT evidence is sufficient to conclude that a full byte/decode verification does not need to run on THIS cold start?"
 
-### 12.2 The Answer (C3: NO POLICY CHOSEN)
+### 12.2 The Answer (C3 HISTORICAL state — SUPERSEDED by the §20C PASS predicate)
 
 **No cheap evidence set is currently sufficient.** In particular, a matching
 `GENERATION_MODIFIED` — even after a settled observation window — does NOT prove content
@@ -797,9 +798,9 @@ No heuristics (generation-reset guessing, factory-reset detection) are used.
 | IS_PENDING check | Verify IS_PENDING=1 detection | ✅ |
 | Generation increment | Verify GENERATION_MODIFIED increments on content write | ✅ |
 | Generation increment (metadata) | Verify GENERATION_MODIFIED increments on metadata update | ✅ |
-| Same-size content replacement | Verify generation detects same-size replacement | ✅ |
+| Same-size content replacement | Row generation misses proven writes (C3) — row gate REJECTED; volume gate per §20C | ✅ (C3 + C3.1) |
 | Database rebuild simulation | Verify behavior after provider reset | ✅ |
-| Reboot behavior | Verify generation survives reboot | ✅ (DEFERRED — reboot never authorized; standing rule: full verify after every reboot) |
+| Reboot behavior | Reboot continuity UNKNOWN; rule = full verify after every reboot | Standing rule enforced (§13.1, §20C); authorized reboot pass still pending |
 | JPEG verification skip | Verify JPEG skip path (unchanged signals) | ❌ WITHDRAWN — row-generation gating disproven (C3); replaced by version/volume-gated predicate (§20C) |
 | HEIF full verify | Verify HEIF always runs full verify | ❌ WITHDRAWN as blanket rule — HEIF follows the same §20C predicate |
 | Cadence expiration | Verify full verify after N cold starts | ✅ |
@@ -943,9 +944,9 @@ generation gate that C3 disproved.
 
 ---
 
-## 20. FINAL CLASSIFICATION
+## 20. FINAL CLASSIFICATION (C2-era — HISTORICAL / SUPERSEDED BY §20C)
 
-### U2.3 DESIGN REOPEN — ADDITIONAL DEVICE CHARACTERIZATION REQUIRED
+### U2.3 DESIGN REOPEN — ADDITIONAL DEVICE CHARACTERIZATION REQUIRED (HISTORICAL)
 
 **Rationale (corrected 2026-09-04 by U2.3-C2, supersedes prior text):**
 
@@ -974,7 +975,11 @@ question, resolved AGAINST generation gating — see below.
 **Production behavior:** UNCHANGED — full verification every cold start. DO NOT implement
 U2.3.
 
-## 20B. C3 SUPPLEMENT (2026-09-04) — FINAL CLASSIFICATION
+## 20B. C3 SUPPLEMENT (2026-09-04) — HISTORICAL / SUPERSEDED BY §20C
+
+> C3's "REOPEN — CONCURRENT GENERATION RACE UNSAFE" verdict applied to ROW-generation
+> gating and stands for that scope. C3.1 subsequently passed the VOLUME-generation gate;
+> the ONE authoritative current status is §20C below.
 
 ### U2.3 DESIGN REOPEN — CONCURRENT GENERATION RACE UNSAFE
 
@@ -1102,7 +1107,7 @@ where retained for audit.
 
 ---
 
-**Document Version:** 1.2 (C3.1 PASS — bounded predicate defined)
+**Document Version:** 1.3 (I1 implementation; authoritative status §20C)
 **Author:** U2.3 Design Phase
-**Status:** DESIGN PASS — SAFE VERSION/VOLUME-GENERATION BOUNDED POLICY DEFINED (see §20C; NOT implemented)
+**Status:** DESIGN PASS — predicate DEFINED in §20C; implementation DEFAULT OFF (see docs/U2_3_I1_IMPLEMENTATION.md)
 
