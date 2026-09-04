@@ -5,6 +5,9 @@
 **Reference Device:** Samsung Galaxy S24 (SM-S921N, Android 16 / API 36)  
 **Package:** `com.projectnuke.keplernightlab`  
 **Date:** 2026-09-03
+**C2 corrective update:** 2026-09-04 — see `docs/U2_3_DEVICE_CHARACTERIZATION.md` (U2.3-C2).
+The first U2.3-C characterization is INVALID (unproven writes, synchronous sampling artifact).
+§20 final status updated to agree with the C2 report. Production policy UNCHANGED.
 
 ---
 
@@ -251,17 +254,25 @@ KeplerRecoveryCoordinator.recoverOne (line 163)
 | `SIZE` reflects current file size | MediaStore contract | **Documented** |
 | `_ID` is unique per row | MediaStore contract | **Documented** |
 
-### 5.2 Device Observations (SM-S921N, Android 16)
+### 5.2 Device Observations (SM-S921N, Android 17 / API 37 — corrected by U2.3-C2)
 
 **Note:** The following are **observed behaviors** on Samsung Galaxy S24, not platform guarantees.
 
 | Observation | Device | Caveat |
 |-------------|--------|--------|
-| `GENERATION_MODIFIED` increments on content write | SM-S921N | Samsung provider may differ from AOSP |
+| `GENERATION_MODIFIED` advances on content write (JPEG + HEIF, proven bytes) | SM-S921N | **Settled, not synchronous:** immediate post-close sample still shows the old value; increment observed within +100 ms (1000 ms window). Any cheap gate must compare settled state. |
+| `GENERATION_MODIFIED` increments on metadata update and IS_PENDING transition | SM-S921N | Samsung provider may differ from AOSP |
 | `DATE_MODIFIED` has 1-second granularity | SM-S921N | Rapid updates may collide |
-| `IS_PENDING` transition triggers generation increment | SM-S921N | Provider-specific |
-| Generation survives reboot | SM-S921N | Not guaranteed across all devices |
+| Generation survives reboot | SM-S921N | Observed; not guaranteed across all devices |
 | Generation may reset after database rebuild | **Inferred** | Provider-dependent |
+
+**U2.3-C2 correction:** an earlier draft of this document treated the invalid first U2.3-C
+run as evidence that generation does NOT change on same-size replacement and rejected
+Policy F on that basis. That rejection was **invalid** — the first run never proved its
+writes landed and sampled generation before the provider posted the increment. Settled
+observation (JPEG `314810->314817`, HEIF `314844->314848`, readback SHA proven changed)
+shows generation DOES advance. The design is therefore re-opened for re-evaluation
+around a settled-generation gate, not closed on platform-signal insufficiency.
 
 ### 5.3 OEM Caveats
 
@@ -877,15 +888,30 @@ internal data class GenerationSnapshot(
 
 ### U2.3 DESIGN REOPEN — ADDITIONAL DEVICE CHARACTERIZATION REQUIRED
 
-**Rationale:**
+**Rationale (corrected 2026-09-04 by U2.3-C2, supersedes prior text):**
 
-1. **Platform guarantees insufficient:** Android documentation does not guarantee GENERATION_MODIFIED survives database rebuild. Samsung provider behavior is observed, not guaranteed.
+1. **Prior Policy-F rejection was invalid:** the first U2.3-C run never proved its content
+   writes executed and sampled generation synchronously at stream-close. Corrected settled
+   observation on SM-S921N (Android 17 / API 37) proves `GENERATION_MODIFIED` advances on
+   real same-URI content writes for both JPEG (`314810->314817`) and native HEIF
+   (`314844->314848`), with readback SHA-256 proving the byte mutation. Platform signals
+   are therefore NOT established as insufficient.
 
-2. **Device characterization incomplete:** This design phase did not execute actual device tests on SM-S921N. Signal behavior (generation increment, reboot survival, database rebuild) requires empirical validation.
+2. **Settled-gate requirement:** the increment is delayed (immediate sample stale), so any
+   future cheap-signal gate must compare **settled** provider state (bounded ~1000 ms
+   observation), never a synchronous post-close read.
 
-3. **Same-URI content replacement risk:** Cheap signals cannot detect same-URI content replacement after database rebuild. Policy F mitigates this with fail-closed, but device characterization required to quantify rebuild frequency.
+3. **No bounded policy is yet defined or closed:** reboot survival, database-rebuild/reset
+   behavior, cross-OEM validity, generation-delay bounds under load, and full-resolution
+   46×3 closure remain uncharacterized. The verifier contract is now accurately scoped to
+   current-state validity (not byte identity), and the HEIF bottleneck is isolated to
+   sampled codec decode (~78% of HEIF verify time) with no optimization implemented.
 
-4. **HEIF dominance unaddressed:** HEIF verification dominates 84% of verification time. Policy F retains full HEIF verify, limiting optimization potential. Additional research into HEIF-specific optimization may be warranted.
+**Agrees with:** `docs/U2_3_DEVICE_CHARACTERIZATION.md` §11
+(U2.3 DESIGN REOPEN — ADDITIONAL DEVICE CHARACTERIZATION REQUIRED).
+
+**Production behavior:** UNCHANGED — full verification every cold start. DO NOT implement
+U2.3.
 
 **Next Steps:**
 
