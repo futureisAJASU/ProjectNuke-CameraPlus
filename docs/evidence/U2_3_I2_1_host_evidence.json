@@ -1,213 +1,612 @@
-[
-  {
-    "runId": "i21Seed46",
-    "mode": "SEED",
-    "adbSerial": "R3CX40A15GB",
+{
+  "schema": "u23-i21-host-evidence/v1",
+  "machineGenerated": true,
+  "generator": "tools/u23_i21_ab_host.py",
+  "productionGateDefault": "OFF",
+  "note": "Every OFF/ON run is independently true process-cold: force-stopped and proven absent (pidof + scoped ps) before each fresh instrumentation invocation. Timestamps are the live HOST clock. The appResult block is the verbatim per-invocation handoff from filesDir/u23i21-last-run.json, correlated by runId.",
+  "gitHead": "b53eb14ad7d0e953eefff44eeaf442313fc70f52",
+  "adbSerial": "R3CX40A15GB",
+  "device": {
     "deviceModel": "SM-S921N",
     "androidRelease": "17",
     "androidApi": 37,
     "androidUser": 0,
-    "timestamp": 1725502980529,
-    "seedMs": 3495,
-    "seedPasses": 1,
-    "counters": {
-      "cheapInspections": 46,
-      "fastPathHits": 0,
-      "fullVerifierRuns": 46,
-      "fallbacks": 46,
-      "evidencePersistFailures": 0,
-      "fallback:NO_EVIDENCE": 46
+    "buildId": "S921NKSUHZZHL"
+  },
+  "generatedAt": {
+    "hostTimestampUtc": "2026-09-05T09:59:18.511Z",
+    "hostTimestampEpochMs": 1788602358511
+  },
+  "sequence": [
+    "SEED",
+    "OFF-1",
+    "ON-1",
+    "OFF-2",
+    "ON-2",
+    "OFF-3",
+    "ON-3",
+    "ZERO-WRITE",
+    "FINAL-SWEEP"
+  ],
+  "runs": [
+    {
+      "runId": "i21Seed46",
+      "mode": "SEED",
+      "testMethod": "i21Seed46",
+      "gitHead": "b53eb14ad7d0e953eefff44eeaf442313fc70f52",
+      "adbSerial": "R3CX40A15GB",
+      "deviceModel": "SM-S921N",
+      "androidRelease": "17",
+      "androidApi": 37,
+      "androidUser": 0,
+      "buildId": "S921NKSUHZZHL",
+      "hostTimestampUtc": "2026-09-05T09:58:32.021Z",
+      "hostTimestampEpochMs": 1788602312021,
+      "deviceWallClockUtc": "2026-09-05T09:58:16Z",
+      "prevInstrumentationExitStatus": null,
+      "preForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "preForceStopPids": [],
+      "forceStopCommand": "am force-stop com.projectnuke.keplernightlab",
+      "forceStopExitStatus": 0,
+      "postForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "postForceStopPids": [],
+      "processAbsentAfterForceStop": true,
+      "instrumentationCommand": "adb -s R3CX40A15GB shell am instrument -w -e class com.projectnuke.keplernightlab.U23I21ActivationReadinessTest#i21Seed46 com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner",
+      "instrumentationExitStatus": 0,
+      "instrumentationPassed": true,
+      "instrumentationTail": [
+        "com.projectnuke.keplernightlab.U23I21ActivationReadinessTest:.",
+        "",
+        "Time: 14.648",
+        "",
+        "OK (1 test)"
+      ],
+      "appResult": {
+        "runId": "i21Seed46",
+        "mode": "SEED",
+        "totalMs": 5464,
+        "seedPasses": 2,
+        "recovered": 46,
+        "jobsTotal": 46,
+        "jpeg": 23,
+        "heif": 23,
+        "counters": {
+          "cheapInspections": 92,
+          "fastPathHits": 30,
+          "fullVerifierRuns": 62,
+          "fallbacks": 63,
+          "evidencePersistFailures": 0,
+          "fallback:NO_EVIDENCE": 47,
+          "fallback:UNSTABLE_FULL_VERIFY_SNAPSHOT": 1,
+          "fallback:VOLUME_GENERATION_MISMATCH": 15
+        }
+      }
+    },
+    {
+      "runId": "OFF-1",
+      "mode": "OFF",
+      "testMethod": "i21ColdRunOff1",
+      "gitHead": "b53eb14ad7d0e953eefff44eeaf442313fc70f52",
+      "adbSerial": "R3CX40A15GB",
+      "deviceModel": "SM-S921N",
+      "androidRelease": "17",
+      "androidApi": 37,
+      "androidUser": 0,
+      "buildId": "S921NKSUHZZHL",
+      "hostTimestampUtc": "2026-09-05T09:58:39.741Z",
+      "hostTimestampEpochMs": 1788602319741,
+      "deviceWallClockUtc": "2026-09-05T09:58:16Z",
+      "prevInstrumentationExitStatus": 0,
+      "preForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "preForceStopPids": [],
+      "forceStopCommand": "am force-stop com.projectnuke.keplernightlab",
+      "forceStopExitStatus": 0,
+      "postForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "postForceStopPids": [],
+      "processAbsentAfterForceStop": true,
+      "instrumentationCommand": "adb -s R3CX40A15GB shell am instrument -w -e class com.projectnuke.keplernightlab.U23I21ActivationReadinessTest#i21ColdRunOff1 com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner",
+      "instrumentationExitStatus": 0,
+      "instrumentationPassed": true,
+      "instrumentationTail": [
+        "com.projectnuke.keplernightlab.U23I21ActivationReadinessTest:.",
+        "",
+        "Time: 5.381",
+        "",
+        "OK (1 test)"
+      ],
+      "appResult": {
+        "runId": "OFF-1",
+        "mode": "OFF",
+        "totalMs": 5174,
+        "recovered": 46,
+        "jobsTotal": 46,
+        "counters": {
+          "cheapInspections": 0,
+          "fastPathHits": 0,
+          "fullVerifierRuns": 46,
+          "fallbacks": 0,
+          "evidencePersistFailures": 0
+        },
+        "timingsMs": {
+          "rowQueryAvgMs": 0,
+          "versionAvgMs": 0,
+          "generationAvgMs": 0,
+          "predicateAvgMs": 0,
+          "rowTotalMs": 0,
+          "versionTotalMs": 0,
+          "generationTotalMs": 0,
+          "predicateTotalMs": 0
+        },
+        "zeroWriteVerified": true
+      },
+      "zeroWriteVerified": true
+    },
+    {
+      "runId": "ON-1",
+      "mode": "ON",
+      "testMethod": "i21ColdRunOn1",
+      "gitHead": "b53eb14ad7d0e953eefff44eeaf442313fc70f52",
+      "adbSerial": "R3CX40A15GB",
+      "deviceModel": "SM-S921N",
+      "androidRelease": "17",
+      "androidApi": 37,
+      "androidUser": 0,
+      "buildId": "S921NKSUHZZHL",
+      "hostTimestampUtc": "2026-09-05T09:58:43.197Z",
+      "hostTimestampEpochMs": 1788602323197,
+      "deviceWallClockUtc": "2026-09-05T09:58:16Z",
+      "prevInstrumentationExitStatus": 0,
+      "preForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "preForceStopPids": [],
+      "forceStopCommand": "am force-stop com.projectnuke.keplernightlab",
+      "forceStopExitStatus": 0,
+      "postForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "postForceStopPids": [],
+      "processAbsentAfterForceStop": true,
+      "instrumentationCommand": "adb -s R3CX40A15GB shell am instrument -w -e class com.projectnuke.keplernightlab.U23I21ActivationReadinessTest#i21ColdRunOn1 com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner",
+      "instrumentationExitStatus": 0,
+      "instrumentationPassed": true,
+      "instrumentationTail": [
+        "com.projectnuke.keplernightlab.U23I21ActivationReadinessTest:.",
+        "",
+        "Time: 0.87",
+        "",
+        "OK (1 test)"
+      ],
+      "appResult": {
+        "runId": "ON-1",
+        "mode": "ON",
+        "totalMs": 680,
+        "recovered": 46,
+        "jobsTotal": 46,
+        "counters": {
+          "cheapInspections": 46,
+          "fastPathHits": 46,
+          "fullVerifierRuns": 0,
+          "fallbacks": 0,
+          "evidencePersistFailures": 0
+        },
+        "timingsMs": {
+          "rowQueryAvgMs": 2.38322002173913,
+          "versionAvgMs": 0.7161388260869564,
+          "generationAvgMs": 0.6176214891304348,
+          "predicateAvgMs": 0.03375258695652174,
+          "rowTotalMs": 109.628121,
+          "versionTotalMs": 65.884772,
+          "generationTotalMs": 56.821177,
+          "predicateTotalMs": 1.552619
+        },
+        "zeroWriteVerified": true
+      },
+      "zeroWriteVerified": true
+    },
+    {
+      "runId": "OFF-2",
+      "mode": "OFF",
+      "testMethod": "i21ColdRunOff2",
+      "gitHead": "b53eb14ad7d0e953eefff44eeaf442313fc70f52",
+      "adbSerial": "R3CX40A15GB",
+      "deviceModel": "SM-S921N",
+      "androidRelease": "17",
+      "androidApi": 37,
+      "androidUser": 0,
+      "buildId": "S921NKSUHZZHL",
+      "hostTimestampUtc": "2026-09-05T09:58:50.779Z",
+      "hostTimestampEpochMs": 1788602330779,
+      "deviceWallClockUtc": "2026-09-05T09:58:16Z",
+      "prevInstrumentationExitStatus": 0,
+      "preForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "preForceStopPids": [],
+      "forceStopCommand": "am force-stop com.projectnuke.keplernightlab",
+      "forceStopExitStatus": 0,
+      "postForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "postForceStopPids": [],
+      "processAbsentAfterForceStop": true,
+      "instrumentationCommand": "adb -s R3CX40A15GB shell am instrument -w -e class com.projectnuke.keplernightlab.U23I21ActivationReadinessTest#i21ColdRunOff2 com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner",
+      "instrumentationExitStatus": 0,
+      "instrumentationPassed": true,
+      "instrumentationTail": [
+        "com.projectnuke.keplernightlab.U23I21ActivationReadinessTest:.",
+        "",
+        "Time: 5.165",
+        "",
+        "OK (1 test)"
+      ],
+      "appResult": {
+        "runId": "OFF-2",
+        "mode": "OFF",
+        "totalMs": 4977,
+        "recovered": 46,
+        "jobsTotal": 46,
+        "counters": {
+          "cheapInspections": 0,
+          "fastPathHits": 0,
+          "fullVerifierRuns": 46,
+          "fallbacks": 0,
+          "evidencePersistFailures": 0
+        },
+        "timingsMs": {
+          "rowQueryAvgMs": 0,
+          "versionAvgMs": 0,
+          "generationAvgMs": 0,
+          "predicateAvgMs": 0,
+          "rowTotalMs": 0,
+          "versionTotalMs": 0,
+          "generationTotalMs": 0,
+          "predicateTotalMs": 0
+        },
+        "zeroWriteVerified": true
+      },
+      "zeroWriteVerified": true
+    },
+    {
+      "runId": "ON-2",
+      "mode": "ON",
+      "testMethod": "i21ColdRunOn2",
+      "gitHead": "b53eb14ad7d0e953eefff44eeaf442313fc70f52",
+      "adbSerial": "R3CX40A15GB",
+      "deviceModel": "SM-S921N",
+      "androidRelease": "17",
+      "androidApi": 37,
+      "androidUser": 0,
+      "buildId": "S921NKSUHZZHL",
+      "hostTimestampUtc": "2026-09-05T09:58:54.152Z",
+      "hostTimestampEpochMs": 1788602334152,
+      "deviceWallClockUtc": "2026-09-05T09:58:16Z",
+      "prevInstrumentationExitStatus": 0,
+      "preForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "preForceStopPids": [],
+      "forceStopCommand": "am force-stop com.projectnuke.keplernightlab",
+      "forceStopExitStatus": 0,
+      "postForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "postForceStopPids": [],
+      "processAbsentAfterForceStop": true,
+      "instrumentationCommand": "adb -s R3CX40A15GB shell am instrument -w -e class com.projectnuke.keplernightlab.U23I21ActivationReadinessTest#i21ColdRunOn2 com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner",
+      "instrumentationExitStatus": 0,
+      "instrumentationPassed": true,
+      "instrumentationTail": [
+        "com.projectnuke.keplernightlab.U23I21ActivationReadinessTest:.",
+        "",
+        "Time: 0.869",
+        "",
+        "OK (1 test)"
+      ],
+      "appResult": {
+        "runId": "ON-2",
+        "mode": "ON",
+        "totalMs": 690,
+        "recovered": 46,
+        "jobsTotal": 46,
+        "counters": {
+          "cheapInspections": 46,
+          "fastPathHits": 46,
+          "fullVerifierRuns": 0,
+          "fallbacks": 0,
+          "evidencePersistFailures": 0
+        },
+        "timingsMs": {
+          "rowQueryAvgMs": 2.441926847826087,
+          "versionAvgMs": 0.8701701847826087,
+          "generationAvgMs": 0.6074091195652174,
+          "predicateAvgMs": 0.03439363043478261,
+          "rowTotalMs": 112.328635,
+          "versionTotalMs": 80.055657,
+          "generationTotalMs": 55.881639,
+          "predicateTotalMs": 1.582107
+        },
+        "zeroWriteVerified": true
+      },
+      "zeroWriteVerified": true
+    },
+    {
+      "runId": "OFF-3",
+      "mode": "OFF",
+      "testMethod": "i21ColdRunOff3",
+      "gitHead": "b53eb14ad7d0e953eefff44eeaf442313fc70f52",
+      "adbSerial": "R3CX40A15GB",
+      "deviceModel": "SM-S921N",
+      "androidRelease": "17",
+      "androidApi": 37,
+      "androidUser": 0,
+      "buildId": "S921NKSUHZZHL",
+      "hostTimestampUtc": "2026-09-05T09:59:02.121Z",
+      "hostTimestampEpochMs": 1788602342121,
+      "deviceWallClockUtc": "2026-09-05T09:58:16Z",
+      "prevInstrumentationExitStatus": 0,
+      "preForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "preForceStopPids": [],
+      "forceStopCommand": "am force-stop com.projectnuke.keplernightlab",
+      "forceStopExitStatus": 0,
+      "postForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "postForceStopPids": [],
+      "processAbsentAfterForceStop": true,
+      "instrumentationCommand": "adb -s R3CX40A15GB shell am instrument -w -e class com.projectnuke.keplernightlab.U23I21ActivationReadinessTest#i21ColdRunOff3 com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner",
+      "instrumentationExitStatus": 0,
+      "instrumentationPassed": true,
+      "instrumentationTail": [
+        "com.projectnuke.keplernightlab.U23I21ActivationReadinessTest:.",
+        "",
+        "Time: 5.341",
+        "",
+        "OK (1 test)"
+      ],
+      "appResult": {
+        "runId": "OFF-3",
+        "mode": "OFF",
+        "totalMs": 5126,
+        "recovered": 46,
+        "jobsTotal": 46,
+        "counters": {
+          "cheapInspections": 0,
+          "fastPathHits": 0,
+          "fullVerifierRuns": 46,
+          "fallbacks": 0,
+          "evidencePersistFailures": 0
+        },
+        "timingsMs": {
+          "rowQueryAvgMs": 0,
+          "versionAvgMs": 0,
+          "generationAvgMs": 0,
+          "predicateAvgMs": 0,
+          "rowTotalMs": 0,
+          "versionTotalMs": 0,
+          "generationTotalMs": 0,
+          "predicateTotalMs": 0
+        },
+        "zeroWriteVerified": true
+      },
+      "zeroWriteVerified": true
+    },
+    {
+      "runId": "ON-3",
+      "mode": "ON",
+      "testMethod": "i21ColdRunOn3",
+      "gitHead": "b53eb14ad7d0e953eefff44eeaf442313fc70f52",
+      "adbSerial": "R3CX40A15GB",
+      "deviceModel": "SM-S921N",
+      "androidRelease": "17",
+      "androidApi": 37,
+      "androidUser": 0,
+      "buildId": "S921NKSUHZZHL",
+      "hostTimestampUtc": "2026-09-05T09:59:05.466Z",
+      "hostTimestampEpochMs": 1788602345466,
+      "deviceWallClockUtc": "2026-09-05T09:58:16Z",
+      "prevInstrumentationExitStatus": 0,
+      "preForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "preForceStopPids": [],
+      "forceStopCommand": "am force-stop com.projectnuke.keplernightlab",
+      "forceStopExitStatus": 0,
+      "postForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "postForceStopPids": [],
+      "processAbsentAfterForceStop": true,
+      "instrumentationCommand": "adb -s R3CX40A15GB shell am instrument -w -e class com.projectnuke.keplernightlab.U23I21ActivationReadinessTest#i21ColdRunOn3 com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner",
+      "instrumentationExitStatus": 0,
+      "instrumentationPassed": true,
+      "instrumentationTail": [
+        "com.projectnuke.keplernightlab.U23I21ActivationReadinessTest:.",
+        "",
+        "Time: 0.878",
+        "",
+        "OK (1 test)"
+      ],
+      "appResult": {
+        "runId": "ON-3",
+        "mode": "ON",
+        "totalMs": 685,
+        "recovered": 46,
+        "jobsTotal": 46,
+        "counters": {
+          "cheapInspections": 46,
+          "fastPathHits": 46,
+          "fullVerifierRuns": 0,
+          "fallbacks": 0,
+          "evidencePersistFailures": 0
+        },
+        "timingsMs": {
+          "rowQueryAvgMs": 2.3751469347826086,
+          "versionAvgMs": 0.719525304347826,
+          "generationAvgMs": 0.616638902173913,
+          "predicateAvgMs": 0.03509852173913044,
+          "rowTotalMs": 109.256759,
+          "versionTotalMs": 66.196328,
+          "generationTotalMs": 56.730779,
+          "predicateTotalMs": 1.614532
+        },
+        "zeroWriteVerified": true
+      },
+      "zeroWriteVerified": true
+    },
+    {
+      "runId": "i21ZeroWrite",
+      "mode": "VERIFY",
+      "testMethod": "i21ZeroWrite",
+      "gitHead": "b53eb14ad7d0e953eefff44eeaf442313fc70f52",
+      "adbSerial": "R3CX40A15GB",
+      "deviceModel": "SM-S921N",
+      "androidRelease": "17",
+      "androidApi": 37,
+      "androidUser": 0,
+      "buildId": "S921NKSUHZZHL",
+      "hostTimestampUtc": "2026-09-05T09:59:13.735Z",
+      "hostTimestampEpochMs": 1788602353735,
+      "deviceWallClockUtc": "2026-09-05T09:58:16Z",
+      "prevInstrumentationExitStatus": 0,
+      "preForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "preForceStopPids": [],
+      "forceStopCommand": "am force-stop com.projectnuke.keplernightlab",
+      "forceStopExitStatus": 0,
+      "postForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "postForceStopPids": [],
+      "processAbsentAfterForceStop": true,
+      "instrumentationCommand": "adb -s R3CX40A15GB shell am instrument -w -e class com.projectnuke.keplernightlab.U23I21ActivationReadinessTest#i21ZeroWrite com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner",
+      "instrumentationExitStatus": 0,
+      "instrumentationPassed": true,
+      "instrumentationTail": [
+        "com.projectnuke.keplernightlab.U23I21ActivationReadinessTest:.",
+        "",
+        "Time: 5.775",
+        "",
+        "OK (1 test)"
+      ],
+      "appResult": {
+        "runId": "i21ZeroWrite",
+        "mode": "VERIFY",
+        "zeroWriteVerified": true,
+        "counters": {
+          "OFF": {
+            "cheapInspections": 0,
+            "fastPathHits": 0,
+            "fullVerifierRuns": 46,
+            "fallbacks": 0,
+            "evidencePersistFailures": 0
+          },
+          "ON": {
+            "cheapInspections": 46,
+            "fastPathHits": 46,
+            "fullVerifierRuns": 0,
+            "fallbacks": 0,
+            "evidencePersistFailures": 0
+          }
+        }
+      }
+    },
+    {
+      "runId": "i21FinalSweep",
+      "mode": "CLEANUP",
+      "testMethod": "i21FinalSweep",
+      "gitHead": "b53eb14ad7d0e953eefff44eeaf442313fc70f52",
+      "adbSerial": "R3CX40A15GB",
+      "deviceModel": "SM-S921N",
+      "androidRelease": "17",
+      "androidApi": 37,
+      "androidUser": 0,
+      "buildId": "S921NKSUHZZHL",
+      "hostTimestampUtc": "2026-09-05T09:59:17.002Z",
+      "hostTimestampEpochMs": 1788602357002,
+      "deviceWallClockUtc": "2026-09-05T09:58:16Z",
+      "prevInstrumentationExitStatus": 0,
+      "preForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "preForceStopPids": [],
+      "forceStopCommand": "am force-stop com.projectnuke.keplernightlab",
+      "forceStopExitStatus": 0,
+      "postForceStopProcessQuery": "pidof com.projectnuke.keplernightlab -> '(none)'; ps -A|grep -F com.projectnuke.keplernightlab -> '(none)'",
+      "postForceStopPids": [],
+      "processAbsentAfterForceStop": true,
+      "instrumentationCommand": "adb -s R3CX40A15GB shell am instrument -w -e class com.projectnuke.keplernightlab.U23I21ActivationReadinessTest#i21FinalSweep com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner",
+      "instrumentationExitStatus": 0,
+      "instrumentationPassed": true,
+      "instrumentationTail": [
+        "com.projectnuke.keplernightlab.U23I21ActivationReadinessTest:.",
+        "",
+        "Time: 0.855",
+        "",
+        "OK (1 test)"
+      ],
+      "appResult": {
+        "runId": "i21FinalSweep",
+        "mode": "CLEANUP",
+        "cleanupVerified": true,
+        "urisAbsent": 46,
+        "urisTotal": 46,
+        "jobDirsRemoved": 46,
+        "rootAbsent": true,
+        "manifestAbsent": true,
+        "leftoverTestRows": 0
+      },
+      "resultFileAbsentAfterPull": true
+    }
+  ],
+  "performance": {
+    "offTotalMs": [
+      5174.0,
+      4977.0,
+      5126.0
+    ],
+    "onTotalMs": [
+      680.0,
+      690.0,
+      685.0
+    ],
+    "medianOffMs": 5126.0,
+    "medianOnMs": 685.0,
+    "absoluteDeltaMs": -4441.0,
+    "percentageDelta": -86.64,
+    "onStageMs": {
+      "rowQuery": {
+        "perRunTotalsMs": [
+          109.628,
+          112.329,
+          109.257
+        ],
+        "sumTotalMs": 331.214,
+        "avgPerRunTotalMs": 110.405,
+        "avgPerRowMs": 2.4001
+      },
+      "getVersion": {
+        "perRunTotalsMs": [
+          65.885,
+          80.056,
+          66.196
+        ],
+        "sumTotalMs": 212.137,
+        "avgPerRunTotalMs": 70.712,
+        "avgPerRowMs": 0.7686
+      },
+      "getGeneration": {
+        "perRunTotalsMs": [
+          56.821,
+          55.882,
+          56.731
+        ],
+        "sumTotalMs": 169.434,
+        "avgPerRunTotalMs": 56.478,
+        "avgPerRowMs": 0.6139
+      },
+      "predicate": {
+        "perRunTotalsMs": [
+          1.553,
+          1.582,
+          1.615
+        ],
+        "sumTotalMs": 4.749,
+        "avgPerRunTotalMs": 1.583,
+        "avgPerRowMs": 0.0344
+      }
     }
   },
-  {
-    "runId": "OFF-1",
-    "mode": "OFF",
-    "adbSerial": "R3CX40A15GB",
-    "deviceModel": "SM-S921N",
-    "androidRelease": "17",
-    "androidApi": 37,
-    "androidUser": 0,
-    "timestamp": 1725503578938,
-    "totalMs": 3046,
-    "counters": {
-      "cheapInspections": 0,
-      "fastPathHits": 0,
-      "fullVerifierRuns": 46,
-      "fallbacks": 0,
-      "evidencePersistFailures": 0
-    },
-    "timingsMs": {
-      "rowQueryAvgMs": 0,
-      "versionAvgMs": 0,
-      "generationAvgMs": 0,
-      "predicateAvgMs": 0,
-      "rowTotalMs": 0,
-      "versionTotalMs": 0,
-      "generationTotalMs": 0
-    }
+  "invariants": {
+    "offFullVerifierRuns": [
+      46,
+      46,
+      46
+    ],
+    "onFastPathHits": [
+      46,
+      46,
+      46
+    ],
+    "allPairedZeroWrite": true,
+    "processAbsentAfterForceStopAll": true
   },
-  {
-    "runId": "ON-1",
-    "mode": "ON",
-    "adbSerial": "R3CX40A15GB",
-    "deviceModel": "SM-S921N",
-    "androidRelease": "17",
-    "androidApi": 37,
-    "androidUser": 0,
-    "timestamp": 1725503588584,
-    "totalMs": 748,
-    "counters": {
-      "cheapInspections": 46,
-      "fastPathHits": 46,
-      "fullVerifierRuns": 0,
-      "fallbacks": 0,
-      "evidencePersistFailures": 0
-    },
-    "timingsMs": {
-      "rowQueryAvgMs": 2.76,
-      "versionAvgMs": 0.99,
-      "generationAvgMs": 0.68,
-      "predicateAvgMs": 0.038,
-      "rowTotalMs": 127.0,
-      "versionTotalMs": 90.8,
-      "generationTotalMs": 62.9
-    }
-  },
-  {
-    "runId": "OFF-2",
-    "mode": "OFF",
-    "adbSerial": "R3CX40A15GB",
-    "deviceModel": "SM-S921N",
-    "androidRelease": "17",
-    "androidApi": 37,
-    "androidUser": 0,
-    "timestamp": 1725503598154,
-    "totalMs": 5263,
-    "counters": {
-      "cheapInspections": 0,
-      "fastPathHits": 0,
-      "fullVerifierRuns": 46,
-      "fallbacks": 0,
-      "evidencePersistFailures": 0
-    },
-    "timingsMs": {
-      "rowQueryAvgMs": 0,
-      "versionAvgMs": 0,
-      "generationAvgMs": 0,
-      "predicateAvgMs": 0,
-      "rowTotalMs": 0,
-      "versionTotalMs": 0,
-      "generationTotalMs": 0
-    }
-  },
-  {
-    "runId": "ON-2",
-    "mode": "ON",
-    "adbSerial": "R3CX40A15GB",
-    "deviceModel": "SM-S921N",
-    "androidRelease": "17",
-    "androidApi": 37,
-    "androidUser": 0,
-    "timestamp": 1725503609385,
-    "totalMs": 750,
-    "counters": {
-      "cheapInspections": 46,
-      "fastPathHits": 46,
-      "fullVerifierRuns": 0,
-      "fallbacks": 0,
-      "evidencePersistFailures": 0
-    },
-    "timingsMs": {
-      "rowQueryAvgMs": 2.85,
-      "versionAvgMs": 0.86,
-      "generationAvgMs": 0.71,
-      "predicateAvgMs": 0.042,
-      "rowTotalMs": 131.0,
-      "versionTotalMs": 79.3,
-      "generationTotalMs": 65.1
-    }
-  },
-  {
-    "runId": "OFF-3",
-    "mode": "OFF",
-    "adbSerial": "R3CX40A15GB",
-    "deviceModel": "SM-S921N",
-    "androidRelease": "17",
-    "androidApi": 37,
-    "androidUser": 0,
-    "timestamp": 1725503620567,
-    "totalMs": 4527,
-    "counters": {
-      "cheapInspections": 0,
-      "fastPathHits": 0,
-      "fullVerifierRuns": 46,
-      "fallbacks": 0,
-      "evidencePersistFailures": 0
-    },
-    "timingsMs": {
-      "rowQueryAvgMs": 0,
-      "versionAvgMs": 0,
-      "generationAvgMs": 0,
-      "predicateAvgMs": 0,
-      "rowTotalMs": 0,
-      "versionTotalMs": 0,
-      "generationTotalMs": 0
-    }
-  },
-  {
-    "runId": "ON-3",
-    "mode": "ON",
-    "adbSerial": "R3CX40A15GB",
-    "deviceModel": "SM-S921N",
-    "androidRelease": "17",
-    "androidApi": 37,
-    "androidUser": 0,
-    "timestamp": 1725503627997,
-    "totalMs": 721,
-    "counters": {
-      "cheapInspections": 46,
-      "fastPathHits": 46,
-      "fullVerifierRuns": 0,
-      "fallbacks": 0,
-      "evidencePersistFailures": 0
-    },
-    "timingsMs": {
-      "rowQueryAvgMs": 2.70,
-      "versionAvgMs": 0.77,
-      "generationAvgMs": 0.67,
-      "predicateAvgMs": 0.045,
-      "rowTotalMs": 124.4,
-      "versionTotalMs": 70.4,
-      "generationTotalMs": 61.2
-    }
-  },
-  {
-    "runId": "i21ZeroWrite",
-    "mode": "VERIFY",
-    "adbSerial": "R3CX40A15GB",
-    "deviceModel": "SM-S921N",
-    "androidRelease": "17",
-    "androidApi": 37,
-    "androidUser": 0,
-    "timestamp": 1725503655359,
-    "counters": {
-      "OFF": { "cheapInspections": 0, "fastPathHits": 0, "fullVerifierRuns": 46, "fallbacks": 0 },
-      "ON": { "cheapInspections": 46, "fastPathHits": 46, "fullVerifierRuns": 0, "fallbacks": 0 }
-    },
-    "zeroWriteVerified": true
-  },
-  {
-    "runId": "i21FinalSweep",
-    "mode": "CLEANUP",
-    "adbSerial": "R3CX40A15GB",
-    "deviceModel": "SM-S921N",
-    "androidRelease": "17",
-    "androidApi": 37,
-    "androidUser": 0,
-    "timestamp": 1725503667788,
-    "cleanupVerified": true,
-    "urisCleaned": 46,
-    "jobDirsRemoved": 46,
-    "manifestRemoved": true
-  }
-]
+  "classification": "U2.3-I2.1 ACTIVATION READINESS PASS — PAIRED CURRENT-BUILD A/B + HOST PROCESS-COLD PROVEN"
+}
