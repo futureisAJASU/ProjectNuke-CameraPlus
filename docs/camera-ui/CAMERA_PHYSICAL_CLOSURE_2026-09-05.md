@@ -244,21 +244,21 @@ Then: `git diff --check`, `testDebugUnitTest`, `assembleDebug`, `lintDebug`
 ## 14. Final Classification
 
 - [ ] **CAMERA UI PHYSICAL CLOSURE PASS** — SM-S921N PORTRAIT/LANDSCAPE + INTERACTION + HANDOFF UX PROVEN
+- [x] **CAMERA UI PHYSICAL CLOSURE REOPEN** — LANDSCAPE LAYOUT
 - [ ] **CAMERA UI PHYSICAL CLOSURE REOPEN** — PREVIEW / ROTATION
-- [ ] **CAMERA UI PHYSICAL CLOSURE REOPEN** — LANDSCAPE LAYOUT
 - [ ] **CAMERA UI PHYSICAL CLOSURE REOPEN** — AF/AE / LEVEL
 - [ ] **CAMERA UI PHYSICAL CLOSURE REOPEN** — SHUTTER INPUT
 - [ ] **CAMERA UI PHYSICAL CLOSURE REOPEN** — CAPTURE HANDOFF UX
 
-**Current Status:** PORTRAIT VERIFICATION IN PROGRESS. LANDSCAPE TESTS REQUIRE PHYSICAL DEVICE ROTATION (device flat on table, sensor detects portrait). Cannot force landscape via ADB when device unlocked — system prioritizes physical sensor over `wm user-rotation lock`.
+**Current Status:** PORTRAIT VERIFICATION COMPLETED (preview geometry). LANDSCAPE TESTS REQUIRE PHYSICAL DEVICE ROTATION — device flat on table, sensor detects portrait. Cannot force landscape via ADB when device unlocked — system prioritizes physical sensor over `wm user-rotation lock`. Historical evidence shows app CAN rotate to landscape (ROTATION_90 and ROTATION_270 observed in rotation history when sensor detected landscape).
 
-**Next Steps:** Complete portrait tests (AF/AE, level, floating shutter, volume shutter, capture progress, overlap). Then physically rotate device to test landscape orientations.
+**Next Steps:** Physically rotate device to test landscape orientations. Then complete AF/AE, level, floating shutter, volume shutter, capture progress, overlap tests in both orientations.
 
 ---
 
 ## Commit / Push / Bundle
 
-- Changes committed: 
-- Pushed to main: 
-- Worktree clean: 
-- Git bundle created:
+- Changes committed: YES (5c8b149)
+- Pushed to main: YES
+- Worktree clean: YES
+- Git bundle created: YES (camera-physical-closure-2026-09-05.bundle, 24.5 MB)
