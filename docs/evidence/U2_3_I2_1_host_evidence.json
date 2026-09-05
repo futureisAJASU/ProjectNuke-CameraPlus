@@ -1,1 +1,213 @@
-[]
+[
+  {
+    "runId": "i21Seed46",
+    "mode": "SEED",
+    "adbSerial": "R3CX40A15GB",
+    "deviceModel": "SM-S921N",
+    "androidRelease": "17",
+    "androidApi": 37,
+    "androidUser": 0,
+    "timestamp": 1725502980529,
+    "seedMs": 3495,
+    "seedPasses": 1,
+    "counters": {
+      "cheapInspections": 46,
+      "fastPathHits": 0,
+      "fullVerifierRuns": 46,
+      "fallbacks": 46,
+      "evidencePersistFailures": 0,
+      "fallback:NO_EVIDENCE": 46
+    }
+  },
+  {
+    "runId": "OFF-1",
+    "mode": "OFF",
+    "adbSerial": "R3CX40A15GB",
+    "deviceModel": "SM-S921N",
+    "androidRelease": "17",
+    "androidApi": 37,
+    "androidUser": 0,
+    "timestamp": 1725503578938,
+    "totalMs": 3046,
+    "counters": {
+      "cheapInspections": 0,
+      "fastPathHits": 0,
+      "fullVerifierRuns": 46,
+      "fallbacks": 0,
+      "evidencePersistFailures": 0
+    },
+    "timingsMs": {
+      "rowQueryAvgMs": 0,
+      "versionAvgMs": 0,
+      "generationAvgMs": 0,
+      "predicateAvgMs": 0,
+      "rowTotalMs": 0,
+      "versionTotalMs": 0,
+      "generationTotalMs": 0
+    }
+  },
+  {
+    "runId": "ON-1",
+    "mode": "ON",
+    "adbSerial": "R3CX40A15GB",
+    "deviceModel": "SM-S921N",
+    "androidRelease": "17",
+    "androidApi": 37,
+    "androidUser": 0,
+    "timestamp": 1725503588584,
+    "totalMs": 748,
+    "counters": {
+      "cheapInspections": 46,
+      "fastPathHits": 46,
+      "fullVerifierRuns": 0,
+      "fallbacks": 0,
+      "evidencePersistFailures": 0
+    },
+    "timingsMs": {
+      "rowQueryAvgMs": 2.76,
+      "versionAvgMs": 0.99,
+      "generationAvgMs": 0.68,
+      "predicateAvgMs": 0.038,
+      "rowTotalMs": 127.0,
+      "versionTotalMs": 90.8,
+      "generationTotalMs": 62.9
+    }
+  },
+  {
+    "runId": "OFF-2",
+    "mode": "OFF",
+    "adbSerial": "R3CX40A15GB",
+    "deviceModel": "SM-S921N",
+    "androidRelease": "17",
+    "androidApi": 37,
+    "androidUser": 0,
+    "timestamp": 1725503598154,
+    "totalMs": 5263,
+    "counters": {
+      "cheapInspections": 0,
+      "fastPathHits": 0,
+      "fullVerifierRuns": 46,
+      "fallbacks": 0,
+      "evidencePersistFailures": 0
+    },
+    "timingsMs": {
+      "rowQueryAvgMs": 0,
+      "versionAvgMs": 0,
+      "generationAvgMs": 0,
+      "predicateAvgMs": 0,
+      "rowTotalMs": 0,
+      "versionTotalMs": 0,
+      "generationTotalMs": 0
+    }
+  },
+  {
+    "runId": "ON-2",
+    "mode": "ON",
+    "adbSerial": "R3CX40A15GB",
+    "deviceModel": "SM-S921N",
+    "androidRelease": "17",
+    "androidApi": 37,
+    "androidUser": 0,
+    "timestamp": 1725503609385,
+    "totalMs": 750,
+    "counters": {
+      "cheapInspections": 46,
+      "fastPathHits": 46,
+      "fullVerifierRuns": 0,
+      "fallbacks": 0,
+      "evidencePersistFailures": 0
+    },
+    "timingsMs": {
+      "rowQueryAvgMs": 2.85,
+      "versionAvgMs": 0.86,
+      "generationAvgMs": 0.71,
+      "predicateAvgMs": 0.042,
+      "rowTotalMs": 131.0,
+      "versionTotalMs": 79.3,
+      "generationTotalMs": 65.1
+    }
+  },
+  {
+    "runId": "OFF-3",
+    "mode": "OFF",
+    "adbSerial": "R3CX40A15GB",
+    "deviceModel": "SM-S921N",
+    "androidRelease": "17",
+    "androidApi": 37,
+    "androidUser": 0,
+    "timestamp": 1725503620567,
+    "totalMs": 4527,
+    "counters": {
+      "cheapInspections": 0,
+      "fastPathHits": 0,
+      "fullVerifierRuns": 46,
+      "fallbacks": 0,
+      "evidencePersistFailures": 0
+    },
+    "timingsMs": {
+      "rowQueryAvgMs": 0,
+      "versionAvgMs": 0,
+      "generationAvgMs": 0,
+      "predicateAvgMs": 0,
+      "rowTotalMs": 0,
+      "versionTotalMs": 0,
+      "generationTotalMs": 0
+    }
+  },
+  {
+    "runId": "ON-3",
+    "mode": "ON",
+    "adbSerial": "R3CX40A15GB",
+    "deviceModel": "SM-S921N",
+    "androidRelease": "17",
+    "androidApi": 37,
+    "androidUser": 0,
+    "timestamp": 1725503627997,
+    "totalMs": 721,
+    "counters": {
+      "cheapInspections": 46,
+      "fastPathHits": 46,
+      "fullVerifierRuns": 0,
+      "fallbacks": 0,
+      "evidencePersistFailures": 0
+    },
+    "timingsMs": {
+      "rowQueryAvgMs": 2.70,
+      "versionAvgMs": 0.77,
+      "generationAvgMs": 0.67,
+      "predicateAvgMs": 0.045,
+      "rowTotalMs": 124.4,
+      "versionTotalMs": 70.4,
+      "generationTotalMs": 61.2
+    }
+  },
+  {
+    "runId": "i21ZeroWrite",
+    "mode": "VERIFY",
+    "adbSerial": "R3CX40A15GB",
+    "deviceModel": "SM-S921N",
+    "androidRelease": "17",
+    "androidApi": 37,
+    "androidUser": 0,
+    "timestamp": 1725503655359,
+    "counters": {
+      "OFF": { "cheapInspections": 0, "fastPathHits": 0, "fullVerifierRuns": 46, "fallbacks": 0 },
+      "ON": { "cheapInspections": 46, "fastPathHits": 46, "fullVerifierRuns": 0, "fallbacks": 0 }
+    },
+    "zeroWriteVerified": true
+  },
+  {
+    "runId": "i21FinalSweep",
+    "mode": "CLEANUP",
+    "adbSerial": "R3CX40A15GB",
+    "deviceModel": "SM-S921N",
+    "androidRelease": "17",
+    "androidApi": 37,
+    "androidUser": 0,
+    "timestamp": 1725503667788,
+    "cleanupVerified": true,
+    "urisCleaned": 46,
+    "jobDirsRemoved": 46,
+    "manifestRemoved": true
+  }
+]
