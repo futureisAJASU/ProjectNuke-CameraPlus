@@ -49,6 +49,9 @@ class U23I21ActivationReadinessTest {
 
     private fun manifestFile(): File = File(context.filesDir, "u23i21-manifest.json")
 
+    /** Test-only per-invocation handoff consumed by the host orchestrator. */
+    private fun resultFile(): File = File(context.filesDir, "u23i21-last-run.json")
+
     private data class I21Job(val jobDir: File, val uri: Uri, val format: OutputFormat)
 
     // ------------------------------------------------------------- invocation 1
@@ -89,6 +92,16 @@ class U23I21ActivationReadinessTest {
             val counters = U23Counters.snapshot()
             log("I21-SEED46-DONE jobs=46 passes=$passes seedMs=$seedMs counters=$counters")
             persistManifest(jobs, JSONObject().put("seedMs", seedMs).put("seedPasses", passes))
+            writeResult(JSONObject()
+                .put("runId", "i21Seed46")
+                .put("mode", "SEED")
+                .put("totalMs", seedMs)
+                .put("seedPasses", passes)
+                .put("recovered", 46)
+                .put("jobsTotal", 46)
+                .put("jpeg", jobs.count { it.format == OutputFormat.JPEG })
+                .put("heif", jobs.count { it.format == OutputFormat.HEIF })
+                .put("counters", JSONObject(counters)))
         } catch (e: Throwable) {
             jobs.forEach { runCatching { context.contentResolver.delete(it.uri, null, null) } }
             jobs.forEach { runCatching { it.jobDir.deleteRecursively() } }
@@ -138,22 +151,30 @@ class U23I21ActivationReadinessTest {
             assertEquals(0, counters["fullVerifierRuns"])
             assertEquals(0, counters["fallbacks"])
         } else {
+            // Intact paired cohort: OFF must execute EXACTLY 46 full verifiers, zero fallbacks.
+            // A deviation here means the cohort drifted and this run is INVALID (REOPEN).
             assertEquals(0, counters["cheapInspections"])
             assertEquals(0, counters["fastPathHits"])
-            assertTrue((counters["fullVerifierRuns"] ?: 0) >= 40) // some may be fallbacks if volume drifted
+            assertEquals(46, counters["fullVerifierRuns"])
+            assertEquals(0, counters["fallbacks"])
         }
 
         // Zero-write: every job directory byte-identical before/after
+        var zeroWriteVerified = true
         jobs.forEach { job ->
+            if (beforeBytes[job.jobDir.name] != dirFingerprints(job.jobDir)) zeroWriteVerified = false
             assertEquals("zero-write $runId: ${job.jobDir.name}", beforeBytes[job.jobDir.name], dirFingerprints(job.jobDir))
         }
-        // appendRunRecord temporarily disabled due to NPE on toString()
-        // appendRunRecord(JSONObject()
-        //     .put("runId", runId)
-        //     .put("mode", if (gateEnabled) "ON" else "OFF")
-        //     .put("totalMs", totalMs)
-        //     .put("counters", JSONObject(counters.mapValues { it.value }))
-        //     .put("timingsMs", JSONObject(timingsMs(timings).mapValues { it.value })))
+        // Machine-readable per-invocation handoff for the host orchestrator (written only after all assertions pass).
+        writeResult(JSONObject()
+            .put("runId", runId)
+            .put("mode", if (gateEnabled) "ON" else "OFF")
+            .put("totalMs", totalMs)
+            .put("recovered", report.jobs.count { it.classification == KeplerJobRecoveryClassification.RECOVERED })
+            .put("jobsTotal", report.jobs.size)
+            .put("counters", JSONObject(counters))
+            .put("timingsMs", JSONObject(timingsMs(timings)))
+            .put("zeroWriteVerified", zeroWriteVerified))
         log("$runId-DONE totalMs=$totalMs")
     }
 
@@ -199,6 +220,13 @@ class U23I21ActivationReadinessTest {
         assertEquals(0, countersOn["fullVerifierRuns"])
         assertEquals(0, countersOn["fallbacks"])
 
+        writeResult(JSONObject()
+            .put("runId", "i21ZeroWrite")
+            .put("mode", "VERIFY")
+            .put("zeroWriteVerified", true)
+            .put("counters", JSONObject()
+                .put("OFF", JSONObject(countersOff))
+                .put("ON", JSONObject(countersOn))))
         log("I21-ZEROWRITE-DONE both modes verified")
     }
 
@@ -210,19 +238,42 @@ class U23I21ActivationReadinessTest {
         val root = i21Root()
         val jobs = loadManifestJobs()
         try {
-            // Exact cleanup: every manifest row asserted absent, every job dir removed.
+            // Exact cleanup: every manifest row asserted ABSENT, every job dir removed.
+            // awaitAbsent returns true ONLY on a proven query-empty result (state==0);
+            // a failed/throwing query (QUERY_FAILED) yields false, so it is NOT treated as absent.
             jobs.forEach { runCatching { context.contentResolver.delete(it.uri, null, null) } }
+            var urisAbsent = 0
             jobs.forEach { job ->
                 val absent = awaitAbsent(job.uri)
                 Log.d(TAG, "CLEANUP uri=${job.uri} absent=$absent")
                 assertTrue("I21 cohort row must be absent: ${job.uri}", absent)
+                if (absent) urisAbsent++
                 runCatching { job.jobDir.deleteRecursively() }
                 assertTrue("I21 cohort job dir must be removed: ${job.jobDir}", !job.jobDir.exists())
             }
             runCatching { root.deleteRecursively() }
+            assertTrue("I21 cohort root must be absent: $root", !root.exists())
             runCatching { manifestFile().delete() }
+            assertTrue("I21 manifest must be absent: ${manifestFile()}", !manifestFile().exists())
+            // No leftover per-run handoff file from earlier invocations.
+            runCatching { resultFile().delete() }
+            assertTrue("I21 per-run result file must be absent: ${resultFile()}", !resultFile().exists())
+            // No pending/stray test rows remain in MediaStore (user media is untouched: only
+            // the 46 manifest URIs above were deleted). QUERY_FAILED is not ABSENT here.
+            val leftover = leftoverI21ImageRows()
+            assertTrue("I21 no pending test rows allowed (leftover=$leftover)", leftover == 0)
             U23FastPathGate.overrideForTest = false
-            Log.d(TAG, "I21-CLEANUP-DONE")
+            writeResult(JSONObject()
+                .put("runId", "i21FinalSweep")
+                .put("mode", "CLEANUP")
+                .put("cleanupVerified", true)
+                .put("urisAbsent", urisAbsent)
+                .put("urisTotal", jobs.size)
+                .put("jobDirsRemoved", jobs.size)
+                .put("rootAbsent", !root.exists())
+                .put("manifestAbsent", !manifestFile().exists())
+                .put("leftoverTestRows", leftover))
+            Log.d(TAG, "I21-CLEANUP-DONE urisAbsent=$urisAbsent leftover=$leftover")
         } catch (e: Throwable) {
             U23FastPathGate.overrideForTest = false
             throw e
@@ -292,31 +343,42 @@ class U23I21ActivationReadinessTest {
         }
     }
 
-    private fun appendRunRecord(record: JSONObject) {
-        val file = manifestFile()
-        val json: JSONObject = if (file.exists()) {
-            try {
-                JSONObject(file.readText())
-            } catch (_: Exception) {
-                JSONObject().put("jobs", JSONArray()).put("seed", JSONObject()).put("runs", JSONArray())
-            }
-        } else {
-            JSONObject().put("jobs", JSONArray()).put("seed", JSONObject()).put("runs", JSONArray())
+    /** Writes the per-invocation handoff consumed by the host orchestrator (app-private file). */
+    private fun writeResult(record: JSONObject) {
+        resultFile().writeText(record.toString())
+        log("I21-RESULT runId=${record.optString("runId")}")
+    }
+
+    /**
+     * Counts MediaStore image rows whose display name matches this test's `u23i21-` prefix.
+     * Returns -1 on any query failure: QUERY_FAILED is NOT a clean/absent result.
+     */
+    private fun leftoverI21ImageRows(): Int {
+        val cursor = try {
+            context.contentResolver.query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.MediaColumns._ID),
+                "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?",
+                arrayOf("u23i21-%"),
+                null
+            )
+        } catch (_: Exception) {
+            return -1
         }
-        val runs = json.getJSONArray("runs") ?: JSONArray().also { json.put("runs", it) }
-        runs.put(record)
-        val out = json.toString()
-        file.writeText(out)
+        return cursor?.use { if (it.moveToFirst()) it.count else 0 } ?: -1
     }
 
     private fun dirFingerprints(jobDir: File): List<Pair<String, String>> =
         jobDir.listFiles()?.sortedBy { it.name }?.map { it.name to sha256(it.readBytes()) } ?: emptyList()
 
     private fun timingsMs(t: Map<String, Long>): Map<String, Double> = buildMap {
-        val rowN = t["rowQueries"] ?: 1L
-        val verN = t["versionQueries"] ?: 1L
-        val genN = t["generationQueries"] ?: 1L
-        val predN = t["predicates"] ?: 1L
+        // Guard the per-row averages: when a stage never ran (e.g. every OFF-mode run, where
+        // the cheap path is off) the count is 0 and dividing would yield NaN, which Android's
+        // JSONObject.toString() rejects (returns null). Floor the denominator at 1.
+        val rowN = (t["rowQueries"] ?: 0L).coerceAtLeast(1L)
+        val verN = (t["versionQueries"] ?: 0L).coerceAtLeast(1L)
+        val genN = (t["generationQueries"] ?: 0L).coerceAtLeast(1L)
+        val predN = (t["predicates"] ?: 0L).coerceAtLeast(1L)
         put("rowQueryAvgMs", (t["rowQueryNanos"] ?: 0L) / 1e6 / rowN)
         put("versionAvgMs", (t["versionQueryNanos"] ?: 0L) / 1e6 / verN)
         put("generationAvgMs", (t["generationQueryNanos"] ?: 0L) / 1e6 / genN)
@@ -324,6 +386,7 @@ class U23I21ActivationReadinessTest {
         put("rowTotalMs", (t["rowQueryNanos"] ?: 0L) / 1e6)
         put("versionTotalMs", (t["versionQueryNanos"] ?: 0L) / 1e6)
         put("generationTotalMs", (t["generationQueryNanos"] ?: 0L) / 1e6)
+        put("predicateTotalMs", (t["predicateNanos"] ?: 0L) / 1e6)
     }
 
     private fun awaitAbsent(uri: Uri, timeoutMs: Long = 8000L): Boolean {
