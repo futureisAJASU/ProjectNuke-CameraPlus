@@ -68,7 +68,10 @@ External semantics identical: 46× `PUBLIC_VERIFIED` + `STABLE_MEDIASTORE_EVIDEN
 
 ### OFF-proof
 - Gate OFF, overrideForTest = false → 0 cheap inspections, 0 fast-path hits
-- 45 full verifier runs, 0 fallbacks, identical `PUBLIC_VERIFIED` + `FULL` mode
+- 45 intact rows execute the FULL verifier, preserving `PUBLIC_VERIFIED` + `FULL` mode
+- two deliberately corrupted rows remain `PUBLIC_COMMITTED_UNVERIFIED` / `SIGNATURE_INVALID`
+- the deleted row remains `PUBLIC_RESULT_REMOVED`
+- no U2.3 cheap reads or fast-path hits occur
 - Exploding fake reads never touched (parity with baseline)
 
 ---

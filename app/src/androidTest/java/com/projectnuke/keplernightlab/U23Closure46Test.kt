@@ -224,7 +224,14 @@ class U23Closure46Test {
                 assertEquals(1, countersE["fallback:MALFORMED_EVIDENCE"])
             } finally {
                 eJobs.forEach { runCatching { context.contentResolver.delete(it.uri, null, null) } }
+                eJobs.forEach { job ->
+                    val absent = awaitAbsent(job.uri)
+                    assertTrue("E throwaway URI must be authoritatively absent: ${job.uri}", absent)
+                    runCatching { job.jobDir.deleteRecursively() }
+                    assertTrue("E throwaway job dir must be removed: ${job.jobDir}", !job.jobDir.exists())
+                }
                 runCatching { eRoot.deleteRecursively() }
+                assertTrue("E throwaway root must be removed: $eRoot", !eRoot.exists())
             }
 
             // F/G: boot + version mismatch via the TEST seam (throwaway root, real rows).
@@ -263,6 +270,15 @@ class U23Closure46Test {
                 assertTrue((U23Counters.snapshot()["fullVerifierRuns"] ?: 0) >= 1)
                 runCatching { context.contentResolver.delete(gJob.uri, null, null) }
                 runCatching { gJob.jobDir.deleteRecursively() }
+                // Authoritative cleanup proof for F/G throwaway rows
+                listOf(fJob, gJob).forEach { job ->
+                    val absent = awaitAbsent(job.uri)
+                    assertTrue("F/G throwaway URI must be authoritatively absent: ${job.uri}", absent)
+                    runCatching { job.jobDir.deleteRecursively() }
+                    assertTrue("F/G throwaway job dir must be removed: ${job.jobDir}", !job.jobDir.exists())
+                }
+                runCatching { fgRoot.deleteRecursively() }
+                assertTrue("F/G throwaway root must be removed: $fgRoot", !fgRoot.exists())
                 log("FB-FG-DONE bootBoundary versionMismatch")
             } finally {
                 runCatching { fgRoot.deleteRecursively() }
