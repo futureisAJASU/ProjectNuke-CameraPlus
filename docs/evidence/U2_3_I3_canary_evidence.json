@@ -9,10 +9,10 @@
     "api": 37,
     "platformIncremental": "S921NKSUHZZHL"
   },
-  "note": "Validated-target default-path pilot. The test override is never set; every run is gate-ON solely via U23RolloutPolicy. Each invocation is independently true process-cold (proven absent via explicit pidof/ps result types before each fresh instrumentation). Timestamps are the live HOST clock. appResult is the verbatim per-invocation handoff, correlated by runId. This tool aborts invalid runs and does not rewrite the final evidence; there is no rejected-attempt artifact.",
-  "gitHead": "8fff8be9f5d8e4002ac0e27e9aa96578e6b20682",
-  "appApkSha256": "2197e4fc6626c773e4c162d09c6407060a76ffd039c534ec8e77be8fa57bea4c",
-  "testApkSha256": "0f720056a0fbe5ca7416b24c6cd07b3ffd29685bf2a05e2b04c73ada702db877",
+  "note": "Validated-target default-path pilot. The test override is never set; every run is gate-ON solely via U23RolloutPolicy. Each invocation is independently true process-cold (proven absent via explicit pidof/ps result types before each fresh instrumentation). The cold hit is the FIRST and ONLY recovery in its fresh process (recoveriesExecuted=1); stabilization is a separate exited process. Timestamps are the live HOST clock. appResult is the verbatim per-invocation handoff, correlated by runId. Drifted cold-hit attempts are retained in attempts[] (machine-generated, never overwritten); this tool aborts invalid runs and does not rewrite the final evidence.",
+  "gitHead": "59c4e7132cee3bb367e779510836d75c67e8437e",
+  "appApkSha256": "0753cd165fc5bb39394d535abcc805698f5b6d70d2bb6681fae8d98bac9a58a1",
+  "testApkSha256": "598013e7b61b5458325b205dbd2605d7c7b4e9538bcada4154392633cba54e61",
   "appApk": "app-debug.apk",
   "testApk": "app-debug-androidTest.apk",
   "appVersionCode": "1",
@@ -29,11 +29,12 @@
     "displayId": "CP2A.260605.016.S921NKSUHZZHL"
   },
   "generatedAt": {
-    "hostTimestampUtc": "2026-09-05T10:37:18.673Z",
-    "hostTimestampEpochMs": 1788604638673
+    "hostTimestampUtc": "2026-09-05T10:58:25.304Z",
+    "hostTimestampEpochMs": 1788605905304
   },
   "sequence": [
     "SEED",
+    "STABILIZE",
     "HIT",
     "GEN_MISMATCH",
     "SIG_KILL",
@@ -46,9 +47,9 @@
       "runId": "i3Seed6",
       "mode": "SEED",
       "testMethod": "i3Seed6",
-      "gitHead": "8fff8be9f5d8e4002ac0e27e9aa96578e6b20682",
-      "appApkSha256": "2197e4fc6626c773e4c162d09c6407060a76ffd039c534ec8e77be8fa57bea4c",
-      "testApkSha256": "0f720056a0fbe5ca7416b24c6cd07b3ffd29685bf2a05e2b04c73ada702db877",
+      "gitHead": "59c4e7132cee3bb367e779510836d75c67e8437e",
+      "appApkSha256": "0753cd165fc5bb39394d535abcc805698f5b6d70d2bb6681fae8d98bac9a58a1",
+      "testApkSha256": "598013e7b61b5458325b205dbd2605d7c7b4e9538bcada4154392633cba54e61",
       "appVersionCode": "1",
       "appVersionName": "1.0",
       "buildType": "debug",
@@ -60,9 +61,9 @@
       "manufacturer": "samsung",
       "buildId": "S921NKSUHZZHL",
       "displayId": "CP2A.260605.016.S921NKSUHZZHL",
-      "hostTimestampUtc": "2026-09-05T10:36:59.956Z",
-      "hostTimestampEpochMs": 1788604619956,
-      "deviceWallClockUtc": "2026-09-05T10:36:57Z",
+      "hostTimestampUtc": "2026-09-05T10:58:01.361Z",
+      "hostTimestampEpochMs": 1788605881361,
+      "deviceWallClockUtc": "2026-09-05T10:57:58Z",
       "prevInstrumentationExitStatus": null,
       "preForceStopPidof": {
         "command": "pidof com.projectnuke.keplernightlab",
@@ -99,7 +100,7 @@
       "instrumentationTail": [
         "com.projectnuke.keplernightlab.U23I3ProductionCanaryTest:.",
         "",
-        "Time: 2.424",
+        "Time: 2.308",
         "",
         "OK (1 test)"
       ],
@@ -108,7 +109,7 @@
         "mode": "SEED",
         "policyEnabled": true,
         "testOverride": "UNSET",
-        "totalMs": 482,
+        "totalMs": 501,
         "seedPasses": 1,
         "recovered": 6,
         "jobsTotal": 6,
@@ -133,12 +134,12 @@
       }
     },
     {
-      "runId": "i3ColdHit",
-      "mode": "HIT",
-      "testMethod": "i3ColdHit",
-      "gitHead": "8fff8be9f5d8e4002ac0e27e9aa96578e6b20682",
-      "appApkSha256": "2197e4fc6626c773e4c162d09c6407060a76ffd039c534ec8e77be8fa57bea4c",
-      "testApkSha256": "0f720056a0fbe5ca7416b24c6cd07b3ffd29685bf2a05e2b04c73ada702db877",
+      "runId": "i3Stabilize",
+      "mode": "STABILIZE",
+      "testMethod": "i3Stabilize",
+      "gitHead": "59c4e7132cee3bb367e779510836d75c67e8437e",
+      "appApkSha256": "0753cd165fc5bb39394d535abcc805698f5b6d70d2bb6681fae8d98bac9a58a1",
+      "testApkSha256": "598013e7b61b5458325b205dbd2605d7c7b4e9538bcada4154392633cba54e61",
       "appVersionCode": "1",
       "appVersionName": "1.0",
       "buildType": "debug",
@@ -150,9 +151,88 @@
       "manufacturer": "samsung",
       "buildId": "S921NKSUHZZHL",
       "displayId": "CP2A.260605.016.S921NKSUHZZHL",
-      "hostTimestampUtc": "2026-09-05T10:37:02.468Z",
-      "hostTimestampEpochMs": 1788604622468,
-      "deviceWallClockUtc": "2026-09-05T10:36:57Z",
+      "hostTimestampUtc": "2026-09-05T10:58:03.718Z",
+      "hostTimestampEpochMs": 1788605883718,
+      "deviceWallClockUtc": "2026-09-05T10:57:58Z",
+      "prevInstrumentationExitStatus": 0,
+      "preForceStopPidof": {
+        "command": "pidof com.projectnuke.keplernightlab",
+        "exitStatus": 1,
+        "stdout": "",
+        "stderr": ""
+      },
+      "preForceStopPs": {
+        "command": "ps -A 2>/dev/null | grep -F com.projectnuke.keplernightlab",
+        "exitStatus": 1,
+        "stdout": "",
+        "stderr": ""
+      },
+      "forceStopCommand": "am force-stop --user 0 com.projectnuke.keplernightlab",
+      "forceStopExitStatus": 0,
+      "forceStopStdout": "",
+      "forceStopStderr": "",
+      "postForceStopPidof": {
+        "command": "pidof com.projectnuke.keplernightlab",
+        "exitStatus": 1,
+        "stdout": "",
+        "stderr": ""
+      },
+      "postForceStopPs": {
+        "command": "ps -A 2>/dev/null | grep -F com.projectnuke.keplernightlab",
+        "exitStatus": 1,
+        "stdout": "",
+        "stderr": ""
+      },
+      "processAbsentAfterForceStop": true,
+      "instrumentationCommand": "adb -s R3CX40A15GB shell am instrument -w -e class com.projectnuke.keplernightlab.U23I3ProductionCanaryTest#i3Stabilize com.projectnuke.keplernightlab.test/androidx.test.runner.AndroidJUnitRunner",
+      "instrumentationExitStatus": 0,
+      "instrumentationPassed": true,
+      "instrumentationTail": [
+        "com.projectnuke.keplernightlab.U23I3ProductionCanaryTest:.",
+        "",
+        "Time: 0.164",
+        "",
+        "OK (1 test)"
+      ],
+      "appResult": {
+        "runId": "i3Stabilize",
+        "mode": "STABILIZE",
+        "policyEnabled": true,
+        "testOverride": "UNSET",
+        "totalMs": 139,
+        "passes": 1,
+        "recovered": 6,
+        "jobsTotal": 6,
+        "counters": {
+          "cheapInspections": 6,
+          "fastPathHits": 6,
+          "fullVerifierRuns": 0,
+          "fallbacks": 0,
+          "evidencePersistFailures": 0
+        }
+      }
+    },
+    {
+      "runId": "i3ColdHit",
+      "mode": "HIT",
+      "testMethod": "i3ColdHit",
+      "gitHead": "59c4e7132cee3bb367e779510836d75c67e8437e",
+      "appApkSha256": "0753cd165fc5bb39394d535abcc805698f5b6d70d2bb6681fae8d98bac9a58a1",
+      "testApkSha256": "598013e7b61b5458325b205dbd2605d7c7b4e9538bcada4154392633cba54e61",
+      "appVersionCode": "1",
+      "appVersionName": "1.0",
+      "buildType": "debug",
+      "adbSerial": "R3CX40A15GB",
+      "deviceModel": "SM-S921N",
+      "androidRelease": "17",
+      "androidApi": 37,
+      "androidUser": 0,
+      "manufacturer": "samsung",
+      "buildId": "S921NKSUHZZHL",
+      "displayId": "CP2A.260605.016.S921NKSUHZZHL",
+      "hostTimestampUtc": "2026-09-05T10:58:06.174Z",
+      "hostTimestampEpochMs": 1788605886174,
+      "deviceWallClockUtc": "2026-09-05T10:57:58Z",
       "prevInstrumentationExitStatus": 0,
       "preForceStopPidof": {
         "command": "pidof com.projectnuke.keplernightlab",
@@ -189,7 +269,7 @@
       "instrumentationTail": [
         "com.projectnuke.keplernightlab.U23I3ProductionCanaryTest:.",
         "",
-        "Time: 0.253",
+        "Time: 0.176",
         "",
         "OK (1 test)"
       ],
@@ -198,7 +278,9 @@
         "mode": "HIT",
         "policyEnabled": true,
         "testOverride": "UNSET",
-        "totalMs": 83,
+        "totalMs": 122,
+        "recoveriesExecuted": 1,
+        "passed": true,
         "recovered": 6,
         "jobsTotal": 6,
         "counters": {
@@ -209,25 +291,26 @@
           "evidencePersistFailures": 0
         },
         "timingsMs": {
-          "rowQueryAvgMs": 2.17847,
-          "versionAvgMs": 0.6746745000000001,
-          "generationAvgMs": 0.61830725,
-          "predicateAvgMs": 0.030195166666666665,
-          "rowTotalMs": 13.07082,
-          "versionTotalMs": 8.096094,
-          "generationTotalMs": 7.419687,
-          "predicateTotalMs": 0.181171
+          "rowQueryAvgMs": 2.4245053333333333,
+          "versionAvgMs": 0.8198859166666667,
+          "generationAvgMs": 0.59953125,
+          "predicateAvgMs": 0.06944,
+          "rowTotalMs": 14.547032,
+          "versionTotalMs": 9.838631,
+          "generationTotalMs": 7.194375,
+          "predicateTotalMs": 0.41664
         },
         "zeroWriteVerified": true
-      }
+      },
+      "attempt": 1
     },
     {
       "runId": "i3GenMismatch",
       "mode": "GEN_MISMATCH",
       "testMethod": "i3GenMismatch",
-      "gitHead": "8fff8be9f5d8e4002ac0e27e9aa96578e6b20682",
-      "appApkSha256": "2197e4fc6626c773e4c162d09c6407060a76ffd039c534ec8e77be8fa57bea4c",
-      "testApkSha256": "0f720056a0fbe5ca7416b24c6cd07b3ffd29685bf2a05e2b04c73ada702db877",
+      "gitHead": "59c4e7132cee3bb367e779510836d75c67e8437e",
+      "appApkSha256": "0753cd165fc5bb39394d535abcc805698f5b6d70d2bb6681fae8d98bac9a58a1",
+      "testApkSha256": "598013e7b61b5458325b205dbd2605d7c7b4e9538bcada4154392633cba54e61",
       "appVersionCode": "1",
       "appVersionName": "1.0",
       "buildType": "debug",
@@ -239,9 +322,9 @@
       "manufacturer": "samsung",
       "buildId": "S921NKSUHZZHL",
       "displayId": "CP2A.260605.016.S921NKSUHZZHL",
-      "hostTimestampUtc": "2026-09-05T10:37:05.834Z",
-      "hostTimestampEpochMs": 1788604625834,
-      "deviceWallClockUtc": "2026-09-05T10:36:57Z",
+      "hostTimestampUtc": "2026-09-05T10:58:09.531Z",
+      "hostTimestampEpochMs": 1788605889531,
+      "deviceWallClockUtc": "2026-09-05T10:57:58Z",
       "prevInstrumentationExitStatus": 0,
       "preForceStopPidof": {
         "command": "pidof com.projectnuke.keplernightlab",
@@ -278,7 +361,7 @@
       "instrumentationTail": [
         "com.projectnuke.keplernightlab.U23I3ProductionCanaryTest:.",
         "",
-        "Time: 0.918",
+        "Time: 0.868",
         "",
         "OK (1 test)"
       ],
@@ -287,7 +370,7 @@
         "mode": "GEN_MISMATCH",
         "policyEnabled": true,
         "testOverride": "UNSET",
-        "totalMs": 762,
+        "totalMs": 684,
         "recovered": 6,
         "jobsTotal": 6,
         "counters": {
@@ -304,9 +387,9 @@
       "runId": "i3JpegSigKill",
       "mode": "SIG_KILL",
       "testMethod": "i3JpegSigKill",
-      "gitHead": "8fff8be9f5d8e4002ac0e27e9aa96578e6b20682",
-      "appApkSha256": "2197e4fc6626c773e4c162d09c6407060a76ffd039c534ec8e77be8fa57bea4c",
-      "testApkSha256": "0f720056a0fbe5ca7416b24c6cd07b3ffd29685bf2a05e2b04c73ada702db877",
+      "gitHead": "59c4e7132cee3bb367e779510836d75c67e8437e",
+      "appApkSha256": "0753cd165fc5bb39394d535abcc805698f5b6d70d2bb6681fae8d98bac9a58a1",
+      "testApkSha256": "598013e7b61b5458325b205dbd2605d7c7b4e9538bcada4154392633cba54e61",
       "appVersionCode": "1",
       "appVersionName": "1.0",
       "buildType": "debug",
@@ -318,9 +401,9 @@
       "manufacturer": "samsung",
       "buildId": "S921NKSUHZZHL",
       "displayId": "CP2A.260605.016.S921NKSUHZZHL",
-      "hostTimestampUtc": "2026-09-05T10:37:09.068Z",
-      "hostTimestampEpochMs": 1788604629068,
-      "deviceWallClockUtc": "2026-09-05T10:36:57Z",
+      "hostTimestampUtc": "2026-09-05T10:58:13.281Z",
+      "hostTimestampEpochMs": 1788605893281,
+      "deviceWallClockUtc": "2026-09-05T10:57:58Z",
       "prevInstrumentationExitStatus": 0,
       "preForceStopPidof": {
         "command": "pidof com.projectnuke.keplernightlab",
@@ -357,7 +440,7 @@
       "instrumentationTail": [
         "com.projectnuke.keplernightlab.U23I3ProductionCanaryTest:.",
         "",
-        "Time: 0.815",
+        "Time: 0.893",
         "",
         "OK (1 test)"
       ],
@@ -366,8 +449,8 @@
         "mode": "SIG_KILL",
         "policyEnabled": true,
         "testOverride": "UNSET",
-        "totalMs": 709,
-        "target": "KPL_YUV_FUSION_I3_0_bca9afc6-9403-443a-a018-076116ddf542",
+        "totalMs": 782,
+        "target": "KPL_YUV_FUSION_I3_0_b48ccb37-7aa5-48ee-b2b5-aaf2d10bc189",
         "targetDiagnostic": "SIGNATURE_INVALID",
         "counters": {
           "cheapInspections": 6,
@@ -383,9 +466,9 @@
       "runId": "i3HeifFtypKill",
       "mode": "FTYP_KILL",
       "testMethod": "i3HeifFtypKill",
-      "gitHead": "8fff8be9f5d8e4002ac0e27e9aa96578e6b20682",
-      "appApkSha256": "2197e4fc6626c773e4c162d09c6407060a76ffd039c534ec8e77be8fa57bea4c",
-      "testApkSha256": "0f720056a0fbe5ca7416b24c6cd07b3ffd29685bf2a05e2b04c73ada702db877",
+      "gitHead": "59c4e7132cee3bb367e779510836d75c67e8437e",
+      "appApkSha256": "0753cd165fc5bb39394d535abcc805698f5b6d70d2bb6681fae8d98bac9a58a1",
+      "testApkSha256": "598013e7b61b5458325b205dbd2605d7c7b4e9538bcada4154392633cba54e61",
       "appVersionCode": "1",
       "appVersionName": "1.0",
       "buildType": "debug",
@@ -397,9 +480,9 @@
       "manufacturer": "samsung",
       "buildId": "S921NKSUHZZHL",
       "displayId": "CP2A.260605.016.S921NKSUHZZHL",
-      "hostTimestampUtc": "2026-09-05T10:37:11.800Z",
-      "hostTimestampEpochMs": 1788604631800,
-      "deviceWallClockUtc": "2026-09-05T10:36:57Z",
+      "hostTimestampUtc": "2026-09-05T10:58:16.742Z",
+      "hostTimestampEpochMs": 1788605896742,
+      "deviceWallClockUtc": "2026-09-05T10:57:58Z",
       "prevInstrumentationExitStatus": 0,
       "preForceStopPidof": {
         "command": "pidof com.projectnuke.keplernightlab",
@@ -436,7 +519,7 @@
       "instrumentationTail": [
         "com.projectnuke.keplernightlab.U23I3ProductionCanaryTest:.",
         "",
-        "Time: 0.512",
+        "Time: 0.765",
         "",
         "OK (1 test)"
       ],
@@ -445,16 +528,17 @@
         "mode": "FTYP_KILL",
         "policyEnabled": true,
         "testOverride": "UNSET",
-        "totalMs": 406,
-        "target": "KPL_YUV_FUSION_I3_1_dfe5082d-efb3-4311-b98e-d43f13f44477",
+        "totalMs": 636,
+        "target": "KPL_YUV_FUSION_I3_1_b911750a-21e2-40d3-84a4-ff0917013f76",
         "targetDiagnostic": "SIGNATURE_INVALID",
         "counters": {
           "cheapInspections": 6,
           "fastPathHits": 0,
           "fullVerifierRuns": 6,
-          "fallbacks": 6,
+          "fallbacks": 7,
           "evidencePersistFailures": 0,
-          "fallback:VOLUME_GENERATION_MISMATCH": 6
+          "fallback:VOLUME_GENERATION_MISMATCH": 6,
+          "fallback:UNSTABLE_FULL_VERIFY_SNAPSHOT": 1
         }
       }
     },
@@ -462,9 +546,9 @@
       "runId": "i3ExactDelete",
       "mode": "DELETE",
       "testMethod": "i3ExactDelete",
-      "gitHead": "8fff8be9f5d8e4002ac0e27e9aa96578e6b20682",
-      "appApkSha256": "2197e4fc6626c773e4c162d09c6407060a76ffd039c534ec8e77be8fa57bea4c",
-      "testApkSha256": "0f720056a0fbe5ca7416b24c6cd07b3ffd29685bf2a05e2b04c73ada702db877",
+      "gitHead": "59c4e7132cee3bb367e779510836d75c67e8437e",
+      "appApkSha256": "0753cd165fc5bb39394d535abcc805698f5b6d70d2bb6681fae8d98bac9a58a1",
+      "testApkSha256": "598013e7b61b5458325b205dbd2605d7c7b4e9538bcada4154392633cba54e61",
       "appVersionCode": "1",
       "appVersionName": "1.0",
       "buildType": "debug",
@@ -476,9 +560,9 @@
       "manufacturer": "samsung",
       "buildId": "S921NKSUHZZHL",
       "displayId": "CP2A.260605.016.S921NKSUHZZHL",
-      "hostTimestampUtc": "2026-09-05T10:37:14.923Z",
-      "hostTimestampEpochMs": 1788604634923,
-      "deviceWallClockUtc": "2026-09-05T10:36:57Z",
+      "hostTimestampUtc": "2026-09-05T10:58:20.833Z",
+      "hostTimestampEpochMs": 1788605900833,
+      "deviceWallClockUtc": "2026-09-05T10:57:58Z",
       "prevInstrumentationExitStatus": 0,
       "preForceStopPidof": {
         "command": "pidof com.projectnuke.keplernightlab",
@@ -515,7 +599,7 @@
       "instrumentationTail": [
         "com.projectnuke.keplernightlab.U23I3ProductionCanaryTest:.",
         "",
-        "Time: 1.108",
+        "Time: 1.482",
         "",
         "OK (1 test)"
       ],
@@ -524,18 +608,17 @@
         "mode": "DELETE",
         "policyEnabled": true,
         "testOverride": "UNSET",
-        "totalMs": 497,
-        "target": "KPL_YUV_FUSION_I3_0_bca9afc6-9403-443a-a018-076116ddf542",
+        "totalMs": 670,
+        "target": "KPL_YUV_FUSION_I3_0_b48ccb37-7aa5-48ee-b2b5-aaf2d10bc189",
         "targetActions": "[PUBLIC_RESULT_REMOVED]",
         "counters": {
           "cheapInspections": 6,
           "fastPathHits": 0,
           "fullVerifierRuns": 5,
-          "fallbacks": 7,
+          "fallbacks": 6,
           "evidencePersistFailures": 0,
           "fallback:ROW_MISSING": 1,
-          "fallback:VOLUME_GENERATION_MISMATCH": 5,
-          "fallback:UNSTABLE_FULL_VERIFY_SNAPSHOT": 1
+          "fallback:VOLUME_GENERATION_MISMATCH": 5
         }
       }
     },
@@ -543,9 +626,9 @@
       "runId": "i3FinalSweep",
       "mode": "CLEANUP",
       "testMethod": "i3FinalSweep",
-      "gitHead": "8fff8be9f5d8e4002ac0e27e9aa96578e6b20682",
-      "appApkSha256": "2197e4fc6626c773e4c162d09c6407060a76ffd039c534ec8e77be8fa57bea4c",
-      "testApkSha256": "0f720056a0fbe5ca7416b24c6cd07b3ffd29685bf2a05e2b04c73ada702db877",
+      "gitHead": "59c4e7132cee3bb367e779510836d75c67e8437e",
+      "appApkSha256": "0753cd165fc5bb39394d535abcc805698f5b6d70d2bb6681fae8d98bac9a58a1",
+      "testApkSha256": "598013e7b61b5458325b205dbd2605d7c7b4e9538bcada4154392633cba54e61",
       "appVersionCode": "1",
       "appVersionName": "1.0",
       "buildType": "debug",
@@ -557,9 +640,9 @@
       "manufacturer": "samsung",
       "buildId": "S921NKSUHZZHL",
       "displayId": "CP2A.260605.016.S921NKSUHZZHL",
-      "hostTimestampUtc": "2026-09-05T10:37:17.231Z",
-      "hostTimestampEpochMs": 1788604637231,
-      "deviceWallClockUtc": "2026-09-05T10:36:57Z",
+      "hostTimestampUtc": "2026-09-05T10:58:23.746Z",
+      "hostTimestampEpochMs": 1788605903746,
+      "deviceWallClockUtc": "2026-09-05T10:57:58Z",
       "prevInstrumentationExitStatus": 0,
       "preForceStopPidof": {
         "command": "pidof com.projectnuke.keplernightlab",
@@ -596,7 +679,7 @@
       "instrumentationTail": [
         "com.projectnuke.keplernightlab.U23I3ProductionCanaryTest:.",
         "",
-        "Time: 0.124",
+        "Time: 0.176",
         "",
         "OK (1 test)"
       ],
@@ -616,9 +699,12 @@
       "resultFileAbsentAfterPull": true
     }
   ],
+  "attempts": [],
   "pilot": {
-    "seedTotalMs": 482,
-    "hitTotalMs": 83,
+    "seedTotalMs": 501,
+    "hitAttempt": 1,
+    "hitTotalMs": 122,
+    "hitRecoveriesExecuted": 1,
     "hitCounters": {
       "cheapInspections": 6,
       "fastPathHits": 6,
@@ -627,14 +713,14 @@
       "evidencePersistFailures": 0
     },
     "hitTimingsMs": {
-      "rowQueryAvgMs": 2.17847,
-      "versionAvgMs": 0.6746745000000001,
-      "generationAvgMs": 0.61830725,
-      "predicateAvgMs": 0.030195166666666665,
-      "rowTotalMs": 13.07082,
-      "versionTotalMs": 8.096094,
-      "generationTotalMs": 7.419687,
-      "predicateTotalMs": 0.181171
+      "rowQueryAvgMs": 2.4245053333333333,
+      "versionAvgMs": 0.8198859166666667,
+      "generationAvgMs": 0.59953125,
+      "predicateAvgMs": 0.06944,
+      "rowTotalMs": 14.547032,
+      "versionTotalMs": 9.838631,
+      "generationTotalMs": 7.194375,
+      "predicateTotalMs": 0.41664
     },
     "hitZeroWriteVerified": true
   },
