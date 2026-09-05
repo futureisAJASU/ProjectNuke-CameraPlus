@@ -49,7 +49,7 @@ class U23Closure46Test {
 
     @Test
     fun closureSeed46() {
-        U23FastPathGate.overrideForTest = true
+        U23FastPathGate.testOverride = U23TestOverride.FORCE_ON
         U23Counters.reset()
         U23Timings.reset()
         log("SEED46 device=${Build.MODEL} sdk=${Build.VERSION.SDK_INT}")
@@ -95,7 +95,7 @@ class U23Closure46Test {
 
     @Test
     fun closureColdRun() {
-        U23FastPathGate.overrideForTest = true
+        U23FastPathGate.testOverride = U23TestOverride.FORCE_ON
         U23Counters.reset()
         U23Timings.reset()
         val root = closureRoot()
@@ -129,7 +129,7 @@ class U23Closure46Test {
 
     @Test
     fun closureFallbacks() {
-        U23FastPathGate.overrideForTest = true
+        U23FastPathGate.testOverride = U23TestOverride.FORCE_ON
         val root = closureRoot()
         val jobs = loadManifestJobs()
         assertEquals(46, jobs.size)
@@ -181,7 +181,7 @@ class U23Closure46Test {
 
     @Test
     fun closureFinalSweep() {
-        U23FastPathGate.overrideForTest = true
+        U23FastPathGate.testOverride = U23TestOverride.FORCE_ON
         val root = closureRoot()
         val jobs = loadManifestJobs()
         try {
@@ -286,7 +286,7 @@ class U23Closure46Test {
 
             // Default-OFF final proof on an intact cohort job: no U23 reads, full verifier
             // runs, no evidence issuance from default startup.
-            U23FastPathGate.overrideForTest = false
+            U23FastPathGate.testOverride = U23TestOverride.FORCE_OFF
             U23Counters.reset()
             val intact = jobs.filter { it.format == OutputFormat.JPEG }[1]
             val intactBefore = dirFingerprints(intact.jobDir)
@@ -313,7 +313,7 @@ class U23Closure46Test {
             }
             runCatching { root.deleteRecursively() }
             runCatching { manifestFile().delete() }
-            U23FastPathGate.overrideForTest = false
+            U23FastPathGate.testOverride = U23TestOverride.FORCE_OFF
             Log.d(TAG, "CLEANUP-DONE")
         }
     }

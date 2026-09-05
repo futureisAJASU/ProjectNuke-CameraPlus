@@ -50,7 +50,7 @@ class U23FastPathPilotTest {
 
     @Test
     fun pilotSeed() {
-        U23FastPathGate.overrideForTest = true
+        U23FastPathGate.testOverride = U23TestOverride.FORCE_ON
         U23Counters.reset()
         log("SEED device=${Build.MODEL} sdk=${Build.VERSION.SDK_INT} gate=${U23FastPathGate.isEnabled()}")
         val root = pilotRoot()
@@ -105,7 +105,7 @@ class U23FastPathPilotTest {
 
     @Test
     fun pilotUnchanged() {
-        U23FastPathGate.overrideForTest = true
+        U23FastPathGate.testOverride = U23TestOverride.FORCE_ON
         U23Counters.reset()
         val root = pilotRoot()
         val jobs = loadState()
@@ -139,7 +139,7 @@ class U23FastPathPilotTest {
 
     @Test
     fun pilotMutations() {
-        U23FastPathGate.overrideForTest = true
+        U23FastPathGate.testOverride = U23TestOverride.FORCE_ON
         U23Counters.reset()
         val root = pilotRoot()
         val jobs = loadState()
@@ -221,7 +221,7 @@ class U23FastPathPilotTest {
             jobs.forEach { assertTrue("pilot job dir must be removed: ${it.jobDir}", !it.jobDir.exists()) }
             runCatching { root.delete() }
             runCatching { stateFile().delete() }
-            U23FastPathGate.overrideForTest = false
+            U23FastPathGate.testOverride = U23TestOverride.FORCE_OFF
             Log.d(TAG, "CLEANUP-DONE")
         }
     }
@@ -233,7 +233,7 @@ class U23FastPathPilotTest {
 
     @Test
     fun pilotCorruptionDiagnostic() {
-        U23FastPathGate.overrideForTest = true
+        U23FastPathGate.testOverride = U23TestOverride.FORCE_ON
         U23Counters.reset()
         // Isolated single-job root sibling to avoid touching any other cohort.
         val soloRoot = File(
@@ -280,7 +280,7 @@ class U23FastPathPilotTest {
                 assertTrue("diag row must be absent", awaitAbsent(it.uri))
                 runCatching { it.jobDir.deleteRecursively() }
             }
-            U23FastPathGate.overrideForTest = false
+            U23FastPathGate.testOverride = U23TestOverride.FORCE_OFF
         }
     }
 

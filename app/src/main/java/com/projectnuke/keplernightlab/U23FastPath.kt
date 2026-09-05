@@ -17,11 +17,33 @@ import org.json.JSONObject
  * provider reads, no evidence issuance, full verifier every cold start.
  */
 internal object U23FastPathGate {
-    /** Test/debug-only override. Production default is OFF; never persisted anywhere. */
+    /**
+     * Debug-only explicit override. Never persisted anywhere; release builds ignore it
+     * entirely. UNSET means "no override" so the production rollout policy decides —
+     * that is how the validated-target pilot exercises the actual production decision.
+     */
     @Volatile
-    var overrideForTest: Boolean = false
+    var testOverride: U23TestOverride = U23TestOverride.UNSET
 
-    fun isEnabled(): Boolean = BuildConfig.DEBUG && overrideForTest
+    fun isEnabled(): Boolean {
+        if (BuildConfig.DEBUG) {
+            when (testOverride) {
+                U23TestOverride.FORCE_ON -> return true
+                U23TestOverride.FORCE_OFF -> return false
+                U23TestOverride.UNSET -> { /* fall through to the production policy */ }
+            }
+        }
+        // Release builds decide ONLY via the rollout policy. Debug builds with UNSET do
+        // too, so the default-path pilot proves the production decision, not an override.
+        return U23RolloutPolicy.isProductionEnabled(U23RolloutPolicy.currentEnvironment())
+    }
+}
+
+/** Debug-only tri-state override for the U2.3 gate. */
+internal enum class U23TestOverride {
+    UNSET,
+    FORCE_OFF,
+    FORCE_ON
 }
 
 /** Which verification actually executed for a recovery inspection result. */

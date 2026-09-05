@@ -142,11 +142,12 @@ An OFF run that is not exactly 46 full verifiers with 0 fallbacks is INVALID (RE
 
 ## Volume generation changes
 
-If unrelated real MediaStore activity changes volume generation during a run, the affected
-run records its rejected/fallback counters honestly. Unrelated user media is never deleted or
-manipulated to force a quiet volume. A repeat under a later quiet window is allowed; a
-rejected attempt is retained in the evidence. In the committed run all six comparison runs
-were clean (OFF 46/0, ON 46/0).
+If unrelated real MediaStore activity changes volume generation during a run, the host
+orchestrator aborts that run as invalid and does NOT rewrite the committed evidence.
+There is no separate rejected-attempt artifact; a rejected run leaves no partial evidence.
+Unrelated user media is never deleted or manipulated to force a quiet volume. A repeat
+under a later quiet window is allowed, but it is a fresh run, not a retained rejection.
+In the committed R1 run all six comparison runs were clean (OFF 46/0, ON 46/0).
 
 ---
 

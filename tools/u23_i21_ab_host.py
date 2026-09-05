@@ -99,14 +99,39 @@ def adb_shell(adb, serial, cmd, timeout=600):
     return rc, out, err
 
 
-def pids_out(adb, serial):
-    rc, out, _ = adb_shell(adb, serial, "pidof %s" % PACKAGE)
-    return [p for p in out.split() if p.strip().isdigit()]
+class QueryResult:
+    """Explicit process-query result. Absence is a proven fact, never an inference
+    from a failed command."""
+
+    def __init__(self, command, exit_status, stdout, stderr):
+        self.command = command
+        self.exit_status = exit_status
+        self.stdout = stdout
+        self.stderr = stderr
+
+    def to_dict(self):
+        return {
+            "command": self.command,
+            "exitStatus": self.exit_status,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+        }
 
 
-def ps_out(adb, serial):
-    rc, out, _ = adb_shell(adb, serial, "ps -A 2>/dev/null | grep -F %s" % PACKAGE)
-    return out.strip()
+def pidof_query(adb, serial):
+    cmd = "pidof %s" % PACKAGE
+    rc, out, err = adb_shell(adb, serial, cmd)
+    return QueryResult(cmd, rc, out.strip(), err.strip())
+
+
+def ps_query(adb, serial):
+    cmd = "ps -A 2>/dev/null | grep -F %s" % PACKAGE
+    rc, out, err = adb_shell(adb, serial, cmd)
+    return QueryResult(cmd, rc, out.strip(), err.strip())
+
+
+def pids_of(q):
+    return [p for p in q.stdout.split() if p.strip().isdigit()]
 
 
 def host_now():
@@ -164,36 +189,42 @@ def install(adb, serial, apk):
         raise Fail("install failed rc=%d out=%r err=%r" % (rc, out, err))
 
 
-def process_cold_block(adb, serial, prev_rc):
-    """Record the process-cold proof and force-stop the app BEFORE a fresh invocation."""
+def process_cold_block(adb, serial, user, prev_rc):
+    """Proven process-cold. Absence requires BOTH queries to succeed with no target;
+    a failed query is never absence."""
     block = {
         "prevInstrumentationExitStatus": prev_rc,
     }
-    pre_pids = pids_out(adb, serial)
-    pre_ps = ps_out(adb, serial)
-    block["preForceStopProcessQuery"] = "pidof %s -> %r; ps -A|grep -F %s -> %r" % (
-        PACKAGE, " ".join(pre_pids) if pre_pids else "(none)", PACKAGE, pre_ps if pre_ps else "(none)")
-    block["preForceStopPids"] = pre_pids
+    pre_pidof = pidof_query(adb, serial)
+    pre_ps = ps_query(adb, serial)
+    block["preForceStopPidof"] = pre_pidof.to_dict()
+    block["preForceStopPs"] = pre_ps.to_dict()
 
-    force_cmd = "am force-stop %s" % PACKAGE
+    force_cmd = "am force-stop --user %d %s" % (user, PACKAGE)
     block["forceStopCommand"] = force_cmd
-    rc, out, _ = adb_shell(adb, serial, force_cmd)
+    rc, out, err = adb_shell(adb, serial, force_cmd)
     block["forceStopExitStatus"] = rc
+    block["forceStopStdout"] = out.strip()
+    block["forceStopStderr"] = err.strip()
     if rc != 0:
-        raise Fail("force-stop failed rc=%d out=%r" % (rc, out))
+        raise Fail("force-stop failed rc=%d out=%r err=%r" % (rc, out, err))
 
     # Brief settle, then prove absence with TWO independent queries.
     import time
     time.sleep(0.5)
-    post_pids = pids_out(adb, serial)
-    post_ps = ps_out(adb, serial)
-    block["postForceStopProcessQuery"] = "pidof %s -> %r; ps -A|grep -F %s -> %r" % (
-        PACKAGE, " ".join(post_pids) if post_pids else "(none)", PACKAGE, post_ps if post_ps else "(none)")
-    block["postForceStopPids"] = post_pids
-    absent = (len(post_pids) == 0) and (post_ps == "")
+    post_pidof = pidof_query(adb, serial)
+    post_ps = ps_query(adb, serial)
+    block["postForceStopPidof"] = post_pidof.to_dict()
+    block["postForceStopPs"] = post_ps.to_dict()
+    pidof_ok = (len(pids_of(post_pidof)) == 0) and (post_pidof.exit_status in (0, 1)) \
+        and (post_pidof.stdout == "") and (post_pidof.stderr == "")
+    ps_ok = (post_ps.stdout == "") and (post_ps.stderr == "") and (post_ps.exit_status in (0, 1))
+    absent = pidof_ok and ps_ok
     block["processAbsentAfterForceStop"] = absent
     if not absent:
-        raise Fail("RUN INVALID: target process still present after force-stop: pids=%r ps=%r" % (post_pids, post_ps))
+        raise Fail(
+            "RUN INVALID: target process not proven absent after force-stop: "
+            "pidof=%r ps=%r" % (post_pidof.to_dict(), post_ps.to_dict()))
     return block
 
 
@@ -259,6 +290,31 @@ def cleanup_cohort(adb, serial):
     print("[cleanup] deleted %d manifest URIs" % len(uris))
     print("[cleanup] external root absent=%s (ls=%r)" % ("No such file" in root_ls, root_ls.strip()))
     print("[cleanup] manifest absent=%s (ls=%r)" % ("No such file" in manifest_ls, manifest_ls.strip()))
+
+
+def wakefulness(adb, serial):
+    _, out, _ = adb_shell(adb, serial, "dumpsys power 2>/dev/null | grep -E 'mWakefulness='")
+    m = __import__("re").search(r"mWakefulness=(\w+)", out)
+    return m.group(1) if m else "UNKNOWN"
+
+
+def screen_off(adb, serial):
+    """Deterministically turn the screen off. Never blind-toggles power. Sends
+    KEYCODE_SLEEP only when awake, then polls the authoritative wakefulness until
+    it leaves Awake (the transition can take many seconds)."""
+    import time
+    before = wakefulness(adb, serial)
+    after = before
+    for attempt in range(2):
+        if after != "Awake":
+            break
+        adb_shell(adb, serial, "input keyevent KEYCODE_SLEEP")
+        for _ in range(15):
+            time.sleep(2)
+            after = wakefulness(adb, serial)
+            if after != "Awake":
+                break
+    return {"wakefulnessBefore": before, "wakefulnessAfter": after, "screenOff": after != "Awake"}
 
 
 def median(xs):
@@ -395,10 +451,11 @@ def main():
 
     records = []
     prev_rc = None
+    screen = {"wakefulnessBefore": "UNKNOWN", "wakefulnessAfter": "UNKNOWN", "screenOff": False}
     try:
         for method, mode, expected_run_id in RUNS:
             print("[host] === %s (%s) ===" % (expected_run_id, mode))
-            cold = process_cold_block(adb, args.serial, prev_rc)
+            cold = process_cold_block(adb, args.serial, facts["androidUser"], prev_rc)
 
             # Reset any stale per-invocation handoff BEFORE launch (staleness guard).
             reset_result(adb, args.serial)
@@ -449,10 +506,14 @@ def main():
         if not result_file_absent:
             raise Fail("FINAL-SWEEP: on-device per-run result file still present after host pull")
     finally:
-        # Restore power state and turn the screen off, regardless of outcome.
+        # Restore power state and deterministically turn the screen off.
         adb_shell(adb, args.serial, "svc power stayon false")
-        adb_shell(adb, args.serial, "input keyevent KEYCODE_POWER")
-        adb_shell(adb, args.serial, "dumpsys power | grep -E 'mWakefulness=Awake' >/dev/null && echo screen-on || echo screen-off")
+        screen = screen_off(adb, args.serial)
+        print("[host] screen: %s -> %s (off=%s)" % (
+            screen["wakefulnessBefore"], screen["wakefulnessAfter"], screen["screenOff"]))
+
+    if not screen["screenOff"]:
+        raise Fail("final screen state is not OFF (wakefulness=%r)" % screen["wakefulnessAfter"])
 
     perf = build_performance(records)
     off_full = [r["appResult"]["counters"].get("fullVerifierRuns") for r in records if r["mode"] == "OFF"]

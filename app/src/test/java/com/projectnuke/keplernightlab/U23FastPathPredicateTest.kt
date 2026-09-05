@@ -68,7 +68,7 @@ class U23FastPathPredicateTest {
 
     @After
     fun resetGate() {
-        U23FastPathGate.overrideForTest = false
+        U23FastPathGate.testOverride = U23TestOverride.UNSET
         U23Counters.reset()
     }
 
@@ -81,7 +81,7 @@ class U23FastPathPredicateTest {
     // B. feature OFF -> legacy path (gate reports OFF; predicate never consulted by production).
     @Test
     fun b_featureOff_gateReportsDisabled() {
-        U23FastPathGate.overrideForTest = false
+        U23FastPathGate.testOverride = U23TestOverride.FORCE_OFF
         assertFalse(U23FastPathGate.isEnabled())
     }
 
@@ -383,7 +383,7 @@ class U23FastPathPredicateTest {
     // and counters stay at zero.
     @Test
     fun offParity_noU23ReadsOrCounters() {
-        U23FastPathGate.overrideForTest = false
+        U23FastPathGate.testOverride = U23TestOverride.FORCE_OFF
         U23Counters.reset()
         val dir = Files.createTempDirectory("u23-off-").toFile()
         try {
@@ -422,7 +422,7 @@ class U23FastPathPredicateTest {
     // without the full verifier, PUBLIC_VERIFIED with STABLE mode, counters prove the path.
     @Test
     fun onHit_stableInspectionWithoutFullVerifier() {
-        U23FastPathGate.overrideForTest = true
+        U23FastPathGate.testOverride = U23TestOverride.FORCE_ON
         U23Counters.reset()
         val dir = Files.createTempDirectory("u23-hit-").toFile()
         try {

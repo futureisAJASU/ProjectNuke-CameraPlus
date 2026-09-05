@@ -58,7 +58,7 @@ class U23I21ActivationReadinessTest {
 
     @Test
     fun i21Seed46() {
-        U23FastPathGate.overrideForTest = true
+        U23FastPathGate.testOverride = U23TestOverride.FORCE_ON
         U23Counters.reset()
         U23Timings.reset()
         log("I21-SEED46 device=${Build.MODEL} sdk=${Build.VERSION.SDK_INT}")
@@ -126,7 +126,7 @@ class U23I21ActivationReadinessTest {
     fun i21ColdRunOn3()  { runPairedColdRun("ON-3",  gateEnabled = true) }
 
     private fun runPairedColdRun(runId: String, gateEnabled: Boolean) {
-        U23FastPathGate.overrideForTest = gateEnabled
+        U23FastPathGate.testOverride = if (gateEnabled) U23TestOverride.FORCE_ON else U23TestOverride.FORCE_OFF
         U23Counters.reset()
         U23Timings.reset()
         val root = i21Root()
@@ -187,7 +187,7 @@ class U23I21ActivationReadinessTest {
         assertEquals(46, jobs.size)
 
         // OFF zero-write
-        U23FastPathGate.overrideForTest = false
+        U23FastPathGate.testOverride = U23TestOverride.FORCE_OFF
         U23Counters.reset()
         U23Timings.reset()
         val beforeOff = jobs.associate { it.jobDir.name to dirFingerprints(it.jobDir) }
@@ -203,7 +203,7 @@ class U23I21ActivationReadinessTest {
         assertEquals(0, countersOff["fastPathHits"])
 
         // ON zero-write
-        U23FastPathGate.overrideForTest = true
+        U23FastPathGate.testOverride = U23TestOverride.FORCE_ON
         U23Counters.reset()
         U23Timings.reset()
         val beforeOn = jobs.associate { it.jobDir.name to dirFingerprints(it.jobDir) }
@@ -234,7 +234,7 @@ class U23I21ActivationReadinessTest {
 
     @Test
     fun i21FinalSweep() {
-        U23FastPathGate.overrideForTest = true
+        U23FastPathGate.testOverride = U23TestOverride.FORCE_ON
         val root = i21Root()
         val jobs = loadManifestJobs()
         try {
@@ -262,7 +262,7 @@ class U23I21ActivationReadinessTest {
             // the 46 manifest URIs above were deleted). QUERY_FAILED is not ABSENT here.
             val leftover = leftoverI21ImageRows()
             assertTrue("I21 no pending test rows allowed (leftover=$leftover)", leftover == 0)
-            U23FastPathGate.overrideForTest = false
+            U23FastPathGate.testOverride = U23TestOverride.FORCE_OFF
             writeResult(JSONObject()
                 .put("runId", "i21FinalSweep")
                 .put("mode", "CLEANUP")
@@ -275,7 +275,7 @@ class U23I21ActivationReadinessTest {
                 .put("leftoverTestRows", leftover))
             Log.d(TAG, "I21-CLEANUP-DONE urisAbsent=$urisAbsent leftover=$leftover")
         } catch (e: Throwable) {
-            U23FastPathGate.overrideForTest = false
+            U23FastPathGate.testOverride = U23TestOverride.FORCE_OFF
             throw e
         }
     }
