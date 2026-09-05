@@ -14,17 +14,18 @@ import android.os.Build
  * and OFF means zero U2.3 cheap reads with the existing FULL verifier every cold start.
  * There is no fall-through to ON for unknown environments.
  *
- * Strict-build pin: the validated `ro.build.version.incremental` is S921NKSUHZZHL
- * (Build.DISPLAY "CP2A.260605.016.S921NKSUHZZHL" on the validated build). A platform
- * update changes the incremental, so rollout goes OFF until revalidated. Row
+ * Exact incremental pin: the validated `ro.build.version.incremental` is S921NKSUHZZHL,
+ * resolved literally from Build.VERSION.INCREMENTAL and required by exact equality.
+ * Build.DISPLAY is NOT rollout authority. A platform update changes the incremental, so
+ * rollout goes OFF until revalidated. Unknown or blank incremental is OFF. Row
  * GENERATION_MODIFIED is never consulted here.
  */
 internal data class U23Environment(
     val manufacturer: String,
     val model: String,
     val sdk: Int,
-    /** Platform build identity; resolved from Build.DISPLAY (which ends with the incremental). */
-    val platformBuild: String
+    /** Exact platform incremental; resolved from Build.VERSION.INCREMENTAL. */
+    val platformIncremental: String
 )
 
 internal object U23RolloutPolicy {
@@ -37,7 +38,7 @@ internal object U23RolloutPolicy {
         if (!env.manufacturer.equals(TARGET_MANUFACTURER, ignoreCase = true)) return false
         if (env.model != TARGET_MODEL) return false
         if (env.sdk != TARGET_SDK) return false
-        if (!env.platformBuild.endsWith(TARGET_PLATFORM_INCREMENTAL)) return false
+        if (env.platformIncremental != TARGET_PLATFORM_INCREMENTAL) return false
         return true
     }
 
@@ -45,6 +46,6 @@ internal object U23RolloutPolicy {
         manufacturer = Build.MANUFACTURER ?: "",
         model = Build.MODEL ?: "",
         sdk = Build.VERSION.SDK_INT,
-        platformBuild = Build.DISPLAY ?: ""
+        platformIncremental = Build.VERSION.INCREMENTAL ?: ""
     )
 }

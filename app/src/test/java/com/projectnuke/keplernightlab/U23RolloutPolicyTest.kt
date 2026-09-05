@@ -26,7 +26,7 @@ class U23RolloutPolicyTest {
         manufacturer = "samsung",
         model = "SM-S921N",
         sdk = 37,
-        platformBuild = "CP2A.260605.016.S921NKSUHZZHL"
+        platformIncremental = "S921NKSUHZZHL"
     )
 
     @After
@@ -62,18 +62,32 @@ class U23RolloutPolicyTest {
     }
 
     @Test
-    fun platformBuildMismatch_isOff() {
+    fun platformIncrementalMismatch_isOff() {
         // Different incremental (OTA) -> OFF until revalidated.
         assertFalse(
             U23RolloutPolicy.isProductionEnabled(
-                validated().copy(platformBuild = "CP2A.260605.016.S921NKSUHZZI1")
+                validated().copy(platformIncremental = "S921NKSUHZZI1")
             )
         )
-        assertFalse(U23RolloutPolicy.isProductionEnabled(validated().copy(platformBuild = "")))
-        // Right prefix, wrong incremental suffix -> OFF.
+        // Blank/unknown incremental -> OFF.
+        assertFalse(U23RolloutPolicy.isProductionEnabled(validated().copy(platformIncremental = "")))
+        // Prefix trick (extra leading content) -> OFF (exact equality, not endsWith).
         assertFalse(
             U23RolloutPolicy.isProductionEnabled(
-                validated().copy(platformBuild = "CP2A.260605.016.S921NKSUHZZHL.EXTRA")
+                validated().copy(platformIncremental = "XS921NKSUHZZHL")
+            )
+        )
+        // Suffix trick (extra trailing content) -> OFF.
+        assertFalse(
+            U23RolloutPolicy.isProductionEnabled(
+                validated().copy(platformIncremental = "S921NKSUHZZHLX")
+            )
+        )
+        // Full Build.DISPLAY string is NOT the incremental -> OFF. DISPLAY is diagnostic
+        // only and never rollout authority.
+        assertFalse(
+            U23RolloutPolicy.isProductionEnabled(
+                validated().copy(platformIncremental = "CP2A.260605.016.S921NKSUHZZHL")
             )
         )
     }
@@ -82,7 +96,7 @@ class U23RolloutPolicyTest {
     fun blankEnvironment_neverFallsThroughToOn() {
         assertFalse(
             U23RolloutPolicy.isProductionEnabled(
-                U23Environment(manufacturer = "", model = "", sdk = 0, platformBuild = "")
+                U23Environment(manufacturer = "", model = "", sdk = 0, platformIncremental = "")
             )
         )
     }

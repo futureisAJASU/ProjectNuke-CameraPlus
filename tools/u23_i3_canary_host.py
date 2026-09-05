@@ -52,15 +52,19 @@ EXTERNAL_ROOT_ABS = "/storage/emulated/0/Android/data/%s/files/Pictures/U23I3Can
 
 EVIDENCE_REL = os.path.join("docs", "evidence", "U2_3_I3_canary_evidence.json")
 
-RUNS = [
+RUNS_PREFIX = [
     ("i3Seed6", "SEED", "i3Seed6"),
-    ("i3ColdHit", "HIT", "i3ColdHit"),
+]
+STABILIZE = ("i3Stabilize", "STABILIZE", "i3Stabilize")
+COLDHIT = ("i3ColdHit", "HIT", "i3ColdHit")
+RUNS_SUFFIX = [
     ("i3GenMismatch", "GEN_MISMATCH", "i3GenMismatch"),
     ("i3JpegSigKill", "SIG_KILL", "i3JpegSigKill"),
     ("i3HeifFtypKill", "FTYP_KILL", "i3HeifFtypKill"),
     ("i3ExactDelete", "DELETE", "i3ExactDelete"),
     ("i3FinalSweep", "CLEANUP", "i3FinalSweep"),
 ]
+MAX_COLDHIT_ATTEMPTS = 3
 
 
 class Fail(RuntimeError):
@@ -331,6 +335,74 @@ def delete_and_verify_result_absent(adb, serial):
     return not result_exists(adb, serial)
 
 
+def do_invocation(adb, serial, facts, head, app_sha, test_sha, version_code, version_name,
+                  device_wallclock, method, mode, expected_run_id, prev_rc):
+    """Run ONE process-cold invocation and build its record. Does NOT validate the
+    app result and does NOT require instrumentation to have passed, so callers can
+    retain a drifted cold-hit failure handoff. Aborts only on host-hygiene violations
+    (reset failure, missing handoff, runId mismatch). Returns (rec, app, inst, prev_rc).
+    app is None only if the test wrote nothing at all (unexpected crash)."""
+    print("[host] === %s (%s) ===" % (expected_run_id, mode))
+    cold = process_cold_block(adb, serial, facts["androidUser"], prev_rc)
+    reset_result(adb, serial)
+    if result_exists(adb, serial):
+        raise Fail("%s: result file still present after reset" % expected_run_id)
+    inst = run_instrumentation(adb, serial, method)
+    new_prev_rc = inst["instrumentationExitStatus"]
+    app = pull_result(adb, serial)
+    iso, epoch = host_now()
+    rec = {
+        "runId": expected_run_id,
+        "mode": mode,
+        "testMethod": method,
+        "gitHead": head,
+        "appApkSha256": app_sha,
+        "testApkSha256": test_sha,
+        "appVersionCode": version_code,
+        "appVersionName": version_name,
+        "buildType": "debug",
+        "adbSerial": serial,
+        "deviceModel": facts["deviceModel"],
+        "androidRelease": facts["androidRelease"],
+        "androidApi": facts["androidApi"],
+        "androidUser": facts["androidUser"],
+        "manufacturer": facts["manufacturer"],
+        "buildId": facts["buildId"],
+        "displayId": facts["displayId"],
+        "hostTimestampUtc": iso,
+        "hostTimestampEpochMs": epoch,
+        "deviceWallClockUtc": device_wallclock,
+    }
+    rec.update(cold)
+    rec.update(inst)
+    rec["appResult"] = app
+    if app is None:
+        return rec, None, inst, new_prev_rc
+    if app.get("runId") != expected_run_id:
+        raise Fail("%s: result runId mismatch expected=%r got=%r (stale or wrong run)" % (
+            expected_run_id, expected_run_id, app.get("runId")))
+    return rec, app, inst, new_prev_rc
+
+
+def run_must_pass(adb, serial, facts, head, app_sha, test_sha, version_code, version_name,
+                  device_wallclock, method, mode, expected_run_id, prev_rc):
+    """Run one invocation that must pass cleanly (seed, stabilize, C/D/E/F/sweep).
+    Aborts on any instrumentation failure, missing handoff, or validation failure.
+    Returns (rec, new_prev_rc)."""
+    rec, app, inst, new_prev_rc = do_invocation(
+        adb, serial, facts, head, app_sha, test_sha, version_code, version_name,
+        device_wallclock, method, mode, expected_run_id, prev_rc)
+    if not inst["instrumentationPassed"]:
+        print("[host] instrumentation tail:\n" + "\n".join(inst["instrumentationTail"]))
+        raise Fail("%s: instrumentation not a clean pass (rc=%d)" % (
+            expected_run_id, inst["instrumentationExitStatus"]))
+    if app is None:
+        raise Fail("%s: no valid per-invocation result file after instrumentation" % expected_run_id)
+    validate_i3(rec, mode, app)
+    print("[host] OK %s absentAfterForceStop=true" % expected_run_id)
+    return rec, new_prev_rc
+
+
 def wakefulness(adb, serial):
     _, out, _ = adb_shell(adb, serial, "dumpsys power 2>/dev/null | grep -E 'mWakefulness='")
     m = re.search(r"mWakefulness=(\w+)", out)
@@ -395,6 +467,12 @@ def validate_i3(rec, mode, app):
         if app.get("testOverride") != "UNSET":
             raise Fail("SEED: testOverride=%r != UNSET" % app.get("testOverride"))
     elif mode == "HIT":
+        # Accepted cold hit only: the test must report passed with exactly one recovery.
+        # Failed (drifted) attempts carry passed=false and are retained separately, never accepted.
+        if app.get("passed") is not True:
+            raise Fail("HIT: passed is not true (drifted attempt, not acceptable as the cold hit)")
+        if app.get("recoveriesExecuted") != 1:
+            raise Fail("HIT: recoveriesExecuted=%r != 1" % app.get("recoveriesExecuted"))
         if app.get("recovered") != 6:
             raise Fail("HIT: recovered=%r != 6" % app.get("recovered"))
         c = app.get("counters", {})
@@ -403,6 +481,9 @@ def validate_i3(rec, mode, app):
                 raise Fail("HIT: counter %s=%r != %d" % (k, c.get(k), v))
         if not app.get("zeroWriteVerified"):
             raise Fail("HIT: zeroWriteVerified not true")
+    elif mode == "STABILIZE":
+        if app.get("recovered") != 6 or app.get("jobsTotal") != 6:
+            raise Fail("STABILIZE: not 6/6 recovered")
     elif mode == "GEN_MISMATCH":
         if app.get("recovered") != 6:
             raise Fail("GEN_MISMATCH: not 6 recovered")
@@ -448,8 +529,14 @@ def main():
     sdk_dir = os.path.expandvars(r"%LOCALAPPDATA%\Android\Sdk")
 
     check_online(adb, args.serial)
-    verify_packages(adb, args.serial)
     if args.cleanup:
+        # Cleanup must not require pre-existing packages; if the app is gone there is
+        # nothing app-private left to clean.
+        try:
+            verify_packages(adb, args.serial)
+        except Fail:
+            print("[cleanup] packages not installed; nothing to clean")
+            return
         cleanup_cohort(adb, args.serial)
         return
     facts = device_facts(adb, args.serial)
@@ -470,6 +557,7 @@ def main():
     print("[host] testApk=%s sha256=%s" % (os.path.basename(test_apk), test_sha[:16]))
     install(adb, args.serial, app_apk, test_only=False)
     install(adb, args.serial, test_apk, test_only=True)
+    # Package verification AFTER installation for normal execution (never before it).
     verify_packages(adb, args.serial)
 
     adb_shell(adb, args.serial, "svc power stayon %s" % args.stayon)
@@ -477,58 +565,62 @@ def main():
     device_wallclock = dwo.strip()
 
     records = []
+    attempts = []
     prev_rc = None
     screen = {"wakefulnessBefore": "UNKNOWN", "wakefulnessAfter": "UNKNOWN", "screenOff": False}
     try:
-        for method, mode, expected_run_id in RUNS:
-            print("[host] === %s (%s) ===" % (expected_run_id, mode))
-            cold = process_cold_block(adb, args.serial, facts["androidUser"], prev_rc)
-
-            reset_result(adb, args.serial)
-            if result_exists(adb, args.serial):
-                raise Fail("%s: result file still present after reset" % expected_run_id)
-
-            inst = run_instrumentation(adb, args.serial, method)
-            prev_rc = inst["instrumentationExitStatus"]
-            if not inst["instrumentationPassed"]:
-                print("[host] instrumentation tail:\n" + "\n".join(inst["instrumentationTail"]))
-                raise Fail("%s: instrumentation not a clean pass (rc=%d)" % (expected_run_id, inst["instrumentationExitStatus"]))
-
-            app = pull_result(adb, args.serial)
-            if app is None:
-                raise Fail("%s: no valid per-invocation result file after instrumentation" % expected_run_id)
-            if app.get("runId") != expected_run_id:
-                raise Fail("%s: result runId mismatch expected=%r got=%r" % (expected_run_id, expected_run_id, app.get("runId")))
-
-            iso, epoch = host_now()
-            rec = {
-                "runId": expected_run_id,
-                "mode": mode,
-                "testMethod": method,
-                "gitHead": head,
-                "appApkSha256": app_sha,
-                "testApkSha256": test_sha,
-                "appVersionCode": version_code,
-                "appVersionName": version_name,
-                "buildType": "debug",
-                "adbSerial": args.serial,
-                "deviceModel": facts["deviceModel"],
-                "androidRelease": facts["androidRelease"],
-                "androidApi": facts["androidApi"],
-                "androidUser": facts["androidUser"],
-                "manufacturer": facts["manufacturer"],
-                "buildId": facts["buildId"],
-                "displayId": facts["displayId"],
-                "hostTimestampUtc": iso,
-                "hostTimestampEpochMs": epoch,
-                "deviceWallClockUtc": device_wallclock,
-            }
-            rec.update(cold)
-            rec.update(inst)
-            rec["appResult"] = app
-            validate_i3(rec, mode, app)
+        # Prefix: SEED (fresh cohort; not drift-sensitive, must pass).
+        for method, mode, expected_run_id in RUNS_PREFIX:
+            rec, prev_rc = run_must_pass(
+                adb, args.serial, facts, head, app_sha, test_sha, version_code, version_name,
+                device_wallclock, method, mode, expected_run_id, prev_rc)
             records.append(rec)
-            print("[host] OK %s absentAfterForceStop=true" % expected_run_id)
+
+        # Bounded cold-hit retry: STABILIZE-N -> force-stop/absent -> COLD-HIT-N (max 3).
+        # A drifted cold hit writes a failure handoff (passed=false); it is retained in
+        # attempts[] (machine-generated, never overwritten) and retried. PASS requires one
+        # exact stabilize -> absent -> fresh cold-hit -> first-recovery 6/6 hit.
+        accepted_hit = None
+        for attempt in range(1, MAX_COLDHIT_ATTEMPTS + 1):
+            print("[host] --- cold-hit attempt %d/%d: stabilize ---" % (attempt, MAX_COLDHIT_ATTEMPTS))
+            s_rec, prev_rc = run_must_pass(
+                adb, args.serial, facts, head, app_sha, test_sha, version_code, version_name,
+                device_wallclock, *STABILIZE, prev_rc)
+            records.append(s_rec)
+            print("[host] --- cold-hit attempt %d/%d: cold hit ---" % (attempt, MAX_COLDHIT_ATTEMPTS))
+            h_rec, h_app, h_inst, prev_rc = do_invocation(
+                adb, args.serial, facts, head, app_sha, test_sha, version_code, version_name,
+                device_wallclock, *COLDHIT, prev_rc)
+            if h_app is None:
+                print("[host] instrumentation tail:\n" + "\n".join(h_inst["instrumentationTail"]))
+                raise Fail("cold-hit attempt %d: no handoff at all (unexpected crash, not drift)" % attempt)
+            if h_inst["instrumentationPassed"] and h_app.get("passed") is True \
+                    and h_app.get("recoveriesExecuted") == 1:
+                validate_i3(h_rec, "HIT", h_app)
+                h_rec["attempt"] = attempt
+                records.append(h_rec)
+                accepted_hit = h_rec
+                print("[host] OK i3ColdHit (attempt %d) absentAfterForceStop=true" % attempt)
+                break
+            attempts.append({
+                "attempt": attempt,
+                "coldHitInstrumentationExitStatus": h_inst["instrumentationExitStatus"],
+                "coldHitPassed": h_app.get("passed"),
+                "recoveriesExecuted": h_app.get("recoveriesExecuted"),
+                "failureReason": h_app.get("failureReason"),
+                "counters": h_app.get("counters"),
+                "totalMs": h_app.get("totalMs"),
+            })
+            print("[host] cold-hit attempt %d rejected by drift; retained, retrying" % attempt)
+        if accepted_hit is None:
+            raise Fail("REOPEN: all %d cold-hit attempts hit volume drift; no true-cold first-recovery hit" % MAX_COLDHIT_ATTEMPTS)
+
+        # Suffix: C/D/E/F/Sweep (they create their own drift and are robust; must pass).
+        for method, mode, expected_run_id in RUNS_SUFFIX:
+            rec, prev_rc = run_must_pass(
+                adb, args.serial, facts, head, app_sha, test_sha, version_code, version_name,
+                device_wallclock, method, mode, expected_run_id, prev_rc)
+            records.append(rec)
 
         result_file_absent = delete_and_verify_result_absent(adb, args.serial)
         records[-1]["resultFileAbsentAfterPull"] = result_file_absent
@@ -559,7 +651,7 @@ def main():
             "api": 37,
             "platformIncremental": "S921NKSUHZZHL",
         },
-        "note": "Validated-target default-path pilot. The test override is never set; every run is gate-ON solely via U23RolloutPolicy. Each invocation is independently true process-cold (proven absent via explicit pidof/ps result types before each fresh instrumentation). Timestamps are the live HOST clock. appResult is the verbatim per-invocation handoff, correlated by runId. This tool aborts invalid runs and does not rewrite the final evidence; there is no rejected-attempt artifact.",
+        "note": "Validated-target default-path pilot. The test override is never set; every run is gate-ON solely via U23RolloutPolicy. Each invocation is independently true process-cold (proven absent via explicit pidof/ps result types before each fresh instrumentation). The cold hit is the FIRST and ONLY recovery in its fresh process (recoveriesExecuted=1); stabilization is a separate exited process. Timestamps are the live HOST clock. appResult is the verbatim per-invocation handoff, correlated by runId. Drifted cold-hit attempts are retained in attempts[] (machine-generated, never overwritten); this tool aborts invalid runs and does not rewrite the final evidence.",
         "gitHead": head,
         "appApkSha256": app_sha,
         "testApkSha256": test_sha,
@@ -571,11 +663,14 @@ def main():
         "adbSerial": args.serial,
         "device": facts,
         "generatedAt": {"hostTimestampUtc": gen_iso, "hostTimestampEpochMs": gen_epoch},
-        "sequence": [m for _, m, _ in RUNS],
+        "sequence": ["SEED", "STABILIZE", "HIT", "GEN_MISMATCH", "SIG_KILL", "FTYP_KILL", "DELETE", "CLEANUP"],
         "runs": records,
+        "attempts": attempts,
         "pilot": {
             "seedTotalMs": seed["appResult"].get("totalMs"),
+            "hitAttempt": hit.get("attempt"),
             "hitTotalMs": hit["appResult"].get("totalMs"),
+            "hitRecoveriesExecuted": hit["appResult"].get("recoveriesExecuted"),
             "hitCounters": hit["appResult"].get("counters"),
             "hitTimingsMs": hit["appResult"].get("timingsMs"),
             "hitZeroWriteVerified": hit["appResult"].get("zeroWriteVerified"),

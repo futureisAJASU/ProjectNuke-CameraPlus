@@ -30,12 +30,13 @@ import org.junit.runner.RunWith
  * Uses ONE new exact test-owned 6-job cohort (3 JPEG + 3 native HEIF) via the production
  * exporter. Invocations (host force-stops + proves process absent between each):
  *   1. i3Seed6        — (A) fresh cohort: 6 FULL, valid evidence issued for all 6.
- *   2. i3ColdHit      — (B) true process-cold, no changes: 6 hits, 0 full, zero-write.
- *   3. i3GenMismatch  — (C) unrelated test-owned mutation: 6 FULL volume-gen fallback.
- *   4. i3JpegSigKill  — (D) same-size JPEG signature kill: reject, FULL, SIGNATURE_INVALID.
- *   5. i3HeifFtypKill — (E) same-size HEIF ftyp kill: same required result.
- *   6. i3ExactDelete  — (F) exact deletion: PUBLIC_RESULT_REMOVED.
- *   7. i3FinalSweep   — exact cleanup of this cohort + auxiliary rows.
+ *   2. i3Stabilize    — (B0) quiet stable evidence cut (re-issue if drifted); separate process.
+ *   3. i3ColdHit      — (B1) true process-cold FIRST and ONLY recovery: 6 hits, zero-write.
+ *   4. i3GenMismatch  — (C) unrelated test-owned mutation: 6 FULL volume-gen fallback.
+ *   5. i3JpegSigKill  — (D) same-size JPEG signature kill: reject, FULL, SIGNATURE_INVALID.
+ *   6. i3HeifFtypKill — (E) same-size HEIF ftyp kill: same required result.
+ *   7. i3ExactDelete  — (F) exact deletion: PUBLIC_RESULT_REMOVED.
+ *   8. i3FinalSweep   — exact cleanup of this cohort + auxiliary rows.
  */
 @RunWith(AndroidJUnit4::class)
 class U23I3ProductionCanaryTest {
@@ -139,7 +140,44 @@ class U23I3ProductionCanaryTest {
         }
     }
 
-    // ------------------------------------------------------------- invocation 2 (B)
+    // ------------------------------------------------------------- invocation 2 (B0)
+
+    @Test
+    fun i3Stabilize() {
+        requirePolicyGate()
+        val root = i3Root()
+        val jobs = loadManifestJobs()
+        assertEquals(6, jobs.size)
+        // Stabilization ONLY: prepare a quiet stable evidence cut for the true-cold hit.
+        // Re-issues evidence if the volume generation drifted. Requires all 6 currently
+        // valid/evidenced. This is a separate exited process; the cold hit below runs fresh.
+        val t0 = SystemClock.elapsedRealtime()
+        var report = KeplerRecoveryCoordinator.recoverRoots(
+            listOf(root), ContextMediaStoreExportRecoveryAccess(context)
+        )
+        var passes = 1
+        while (jobs.any { evidenced(it) == null } && passes < 8) {
+            passes++
+            report = KeplerRecoveryCoordinator.recoverRoots(
+                listOf(root), ContextMediaStoreExportRecoveryAccess(context)
+            )
+        }
+        val totalMs = SystemClock.elapsedRealtime() - t0
+        assertEquals(6, report.jobs.size)
+        assertEquals(6, report.jobs.count { it.classification == KeplerJobRecoveryClassification.RECOVERED })
+        val missing = jobs.filter { evidenced(it) == null }.map { it.jobDir.name }
+        assertTrue("stabilize requires 6/6 currently valid evidence (missing=$missing)", missing.isEmpty())
+        val counters = U23Counters.snapshot()
+        log("i3Stabilize-DONE jobs=6 passes=$passes totalMs=$totalMs counters=$counters")
+        writeResult(baseResult("i3Stabilize", "STABILIZE")
+            .put("totalMs", totalMs)
+            .put("passes", passes)
+            .put("recovered", 6)
+            .put("jobsTotal", 6)
+            .put("counters", JSONObject(counters)))
+    }
+
+    // ------------------------------------------------------------- invocation 3 (B1)
 
     @Test
     fun i3ColdHit() {
@@ -147,50 +185,64 @@ class U23I3ProductionCanaryTest {
         val root = i3Root()
         val jobs = loadManifestJobs()
         assertEquals(6, jobs.size)
-        // Stabilize: absorb any volume drift since the seed (background MediaStore writes
-        // on a real device move the generation), re-issuing current evidence. The scenario
-        // recovery below must then hit inside a tight window.
-        val stab = KeplerRecoveryCoordinator.recoverRoots(
-            listOf(root), ContextMediaStoreExportRecoveryAccess(context)
-        )
-        assertEquals(6, stab.jobs.size)
-        assertEquals(6, stab.jobs.count { it.classification == KeplerJobRecoveryClassification.RECOVERED })
-        U23Counters.reset()
-        U23Timings.reset()
-        // Fingerprint AFTER stabilize so zero-write measures ONLY the scenario HIT below
-        // (the stabilize legitimately re-issues evidence and writes).
+        // Allowed before timing: manifest load, fingerprints, policy/UNSET asserts above.
+        // NO stabilize/warmup/preflight/refresh recovery before timing. EXACTLY ONE
+        // recoverRoots below; its wall time is the authoritative cold-hit timing.
         val beforeBytes = jobs.associate { it.jobDir.name to dirFingerprints(it.jobDir) }
+        var recoveriesExecuted = 0
         val t0 = SystemClock.elapsedRealtime()
+        recoveriesExecuted++
         val report = KeplerRecoveryCoordinator.recoverRoots(
             listOf(root), ContextMediaStoreExportRecoveryAccess(context)
         )
         val totalMs = SystemClock.elapsedRealtime() - t0
         val counters = U23Counters.snapshot()
         val timings = U23Timings.snapshot()
-        log("i3ColdHit report=${report.jobs.count { it.classification == KeplerJobRecoveryClassification.RECOVERED }}/6 counters=$counters totalMs=$totalMs")
-        // Scenario B: true process-cold, no MediaStore changes -> 6 fast-path hits, zero-write.
-        assertEquals(6, report.jobs.size)
-        assertEquals(6, report.jobs.count { it.classification == KeplerJobRecoveryClassification.RECOVERED })
-        assertEquals(6, counters["cheapInspections"])
-        assertEquals(6, counters["fastPathHits"])
-        assertEquals(0, counters["fullVerifierRuns"])
-        assertEquals(0, counters["fallbacks"])
-        var zeroWriteVerified = true
-        jobs.forEach { job ->
-            if (beforeBytes[job.jobDir.name] != dirFingerprints(job.jobDir)) zeroWriteVerified = false
-            assertEquals("zero-write i3ColdHit: ${job.jobDir.name}", beforeBytes[job.jobDir.name], dirFingerprints(job.jobDir))
+        log("i3ColdHit report=${report.jobs.count { it.classification == KeplerJobRecoveryClassification.RECOVERED }}/6 counters=$counters totalMs=$totalMs recoveries=$recoveriesExecuted")
+        try {
+            // Scenario B: the FIRST and ONLY recovery in this fresh process must hit 6/6.
+            // If background MediaStore activity moved the generation, this attempt did NOT
+            // pass; the failure handoff below lets the host retain it and retry bounded.
+            assertEquals(6, report.jobs.size)
+            assertEquals(6, report.jobs.count { it.classification == KeplerJobRecoveryClassification.RECOVERED })
+            assertEquals(6, counters["cheapInspections"])
+            assertEquals(6, counters["fastPathHits"])
+            assertEquals(0, counters["fullVerifierRuns"])
+            assertEquals(0, counters["fallbacks"])
+            var zeroWriteVerified = true
+            jobs.forEach { job ->
+                if (beforeBytes[job.jobDir.name] != dirFingerprints(job.jobDir)) zeroWriteVerified = false
+                assertEquals("zero-write i3ColdHit: ${job.jobDir.name}", beforeBytes[job.jobDir.name], dirFingerprints(job.jobDir))
+            }
+            writeResult(baseResult("i3ColdHit", "HIT")
+                .put("totalMs", totalMs)
+                .put("recoveriesExecuted", recoveriesExecuted)
+                .put("passed", true)
+                .put("recovered", 6)
+                .put("jobsTotal", 6)
+                .put("counters", JSONObject(counters))
+                .put("timingsMs", JSONObject(timingsMs(timings)))
+                .put("zeroWriteVerified", zeroWriteVerified))
+            log("i3ColdHit-DONE totalMs=$totalMs")
+        } catch (e: Throwable) {
+            // Retain the drifted/failed attempt so the host can record it and retry bounded.
+            // Written even though this instrumentation invocation reports failure.
+            runCatching {
+                writeResult(baseResult("i3ColdHit", "HIT")
+                    .put("totalMs", totalMs)
+                    .put("recoveriesExecuted", recoveriesExecuted)
+                    .put("passed", false)
+                    .put("failureReason", e.message ?: e.javaClass.simpleName)
+                    .put("recovered", report.jobs.count { it.classification == KeplerJobRecoveryClassification.RECOVERED })
+                    .put("jobsTotal", report.jobs.size)
+                    .put("counters", JSONObject(counters))
+                    .put("timingsMs", JSONObject(timingsMs(timings))))
+            }
+            throw e
         }
-        writeResult(baseResult("i3ColdHit", "HIT")
-            .put("totalMs", totalMs)
-            .put("recovered", 6)
-            .put("jobsTotal", 6)
-            .put("counters", JSONObject(counters))
-            .put("timingsMs", JSONObject(timingsMs(timings)))
-            .put("zeroWriteVerified", zeroWriteVerified))
-        log("i3ColdHit-DONE totalMs=$totalMs")
     }
 
-    // ------------------------------------------------------------- invocation 3 (C)
+    // ------------------------------------------------------------- invocation 4 (C)
 
     @Test
     fun i3GenMismatch() {
@@ -230,7 +282,7 @@ class U23I3ProductionCanaryTest {
         log("i3GenMismatch-DONE")
     }
 
-    // ------------------------------------------------------------- invocation 4 (D)
+    // ------------------------------------------------------------- invocation 5 (D)
 
     @Test
     fun i3JpegSigKill() {
@@ -280,7 +332,7 @@ class U23I3ProductionCanaryTest {
         log("i3JpegSigKill-DONE")
     }
 
-    // ------------------------------------------------------------- invocation 5 (E)
+    // ------------------------------------------------------------- invocation 6 (E)
 
     @Test
     fun i3HeifFtypKill() {
@@ -328,7 +380,7 @@ class U23I3ProductionCanaryTest {
         log("i3HeifFtypKill-DONE")
     }
 
-    // ------------------------------------------------------------- invocation 6 (F)
+    // ------------------------------------------------------------- invocation 7 (F)
 
     @Test
     fun i3ExactDelete() {
@@ -368,7 +420,7 @@ class U23I3ProductionCanaryTest {
         log("i3ExactDelete-DONE")
     }
 
-    // ------------------------------------------------------------- invocation 7: final sweep
+    // ------------------------------------------------------------- invocation 8: final sweep
 
     @Test
     fun i3FinalSweep() {
